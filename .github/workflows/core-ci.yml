@@ -380,8 +380,9 @@ jobs:
       - name: Terminal fixtures are current
         run: cargo run --locked -p kr-term --bin kr-term-fixtures -- --check
 
-      # Every crate in Cargo.lock, checked against the RustSec advisory database as it stands when
-      # this step runs. The action is the one definition of the check, which the advisories
+      # Every crate that Cargo.lock takes from the registry, checked against the RustSec advisory
+      # database as it stands when this step runs. A crate from Git is not checked; docs/README.md
+      # names them. The action is the one definition of the check, which the advisories
       # workflow also runs once a day. It runs whatever the steps before it did, and every check
       # after it runs whatever this one does, so an advisory published since the last run fails the
       # job without hiding any other result. The time limit is for a download or a database fetch
