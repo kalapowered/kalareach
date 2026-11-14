@@ -7213,9 +7213,11 @@ async fn the_queue_for_the_terminal_is_bounded_in_frames_as_well_as_in_bytes() {
             .contains("writes are already waiting for it, so these bytes were not accepted"),
         "{refusal:?}"
     );
-    // One place is kept back for the prefix of a paste delimiter that the recogniser can still
-    // hold and release by itself, so the queue never holds more frames than the bound.
-    assert_eq!(accepted, limit - 1, "frames accepted before the refusal");
+    // Every accepted write is promised the place of the entry the recogniser can still add after
+    // it, for as long as the write's batch waits, and an entry that is already queued is counted
+    // beside that promise until the write is done with. A stalled writer therefore leaves room
+    // for half the bound in one-byte writes, and the queue never holds more frames than the bound.
+    assert_eq!(accepted, limit / 2, "frames accepted before the refusal");
 
     release.send(()).expect("the writer is waiting");
     until_there_is_room(&mut typing, bytes_content(b"kr-end.".to_vec())).await;
