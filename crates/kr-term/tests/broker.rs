@@ -421,6 +421,30 @@ fn the_lane_respects_the_callers_reply_budget_and_keeps_the_rest() {
     assert_eq!(engine.lane().degradation().expired, 6);
 }
 
+/// KR-REQ-08.49: the caller's reply budget holds for the cursor reports that go first as it does
+/// for every other reply.
+///
+/// A caller that has room for one reply is given one cursor report and no more, and what is not
+/// given stays in the lane.
+#[test]
+fn the_reply_budget_holds_for_the_cursor_reports_that_go_first() {
+    let mut engine = engine();
+    engine.feed(b"\x1b[c\x1b[6n\x1b[6n", 0);
+    let budget = |replies| DrainBudget {
+        bytes: 1 << 20,
+        replies,
+    };
+
+    let none = engine.lane_mut().drain_within(owed(), budget(0), 0);
+    assert!(none.is_empty(), "a budget of no replies takes no report");
+    assert_eq!(engine.lane().pending(), 3, "and loses none");
+
+    let one = engine.lane_mut().drain_within(owed(), budget(1), 0);
+    assert_eq!(one.len(), 1, "a budget of one reply takes one report");
+    assert!(is_a_cursor_report(one[0].bytes()));
+    assert_eq!(engine.lane().pending(), 2, "the rest is still waiting");
+}
+
 /// KR-REQ-08.48: a reply never lands inside an unfinished paste or a half-delivered human input
 /// frame, unless the backend is qualified to take it inside a paste.
 #[test]
