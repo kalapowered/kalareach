@@ -2709,39 +2709,18 @@ impl Exclusive {
                 &[ActionRight::SessionView],
             ),
         );
-        let params = MembershipPresentParams {
-            lease,
-            authority: Nullable::null(),
-        };
-        let presented: Result<MembershipPresentResult, _> = pairing_calls::mutate_as(
+        let _: MembershipPresentResult = pairing_calls::mutate_as(
             self.host.environment_id,
             &mut local,
             ActionId::new(kr_ipc::new_uuid()),
             Method::MembershipPresent,
-            &params,
+            &MembershipPresentParams {
+                lease,
+                authority: Nullable::null(),
+            },
         )
-        .await;
-        match presented {
-            Ok(_) => {}
-            // A lease that ends sooner than the one before it owes the host a fence of its own, and
-            // the barrier that retires it withdraws every connection, the one the presentation
-            // arrived on included: when that barrier runs before the answer is told, the host does
-            // not show what became of the presentation, which stands. Asked again on a new
-            // connection the same lease is answered.
-            Err(error) if error.code == kr_protocol::error::ErrorCode::OutcomeUnknown => {
-                let mut again = self.local().await;
-                let _: MembershipPresentResult = pairing_calls::mutate_as(
-                    self.host.environment_id,
-                    &mut again,
-                    ActionId::new(kr_ipc::new_uuid()),
-                    Method::MembershipPresent,
-                    &params,
-                )
-                .await
-                .expect("the lease that stands is answered when it is presented again");
-            }
-            Err(error) => panic!("the host takes the lease for its local owner: {error:?}"),
-        }
+        .await
+        .expect("the host takes the lease for its local owner");
     }
 
     async fn finish(self) {
