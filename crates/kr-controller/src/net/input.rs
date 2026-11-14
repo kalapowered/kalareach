@@ -1,15 +1,1066 @@
 //! Terminal input on a stream of its own: the host's door for it.
 //!
 //! A device sends typing on a stream that carries nothing else, so a key never waits behind a
-//! control request and a control request never waits behind a key.
+//! control request and a control request never waits behind a key. The door admits the stream
+//! (the environment, the route, the grant's decision for `input.write`, one live stream for each
+//! attachment and a bound on the streams of one connection), opens a second link to the
+//! attachment's worker, and carries each frame across it.
+//!
+//! Two quantities are never mixed. The device's window ([`InputAck::Ready`]) is fixed for the
+//! stream's life and counts what the device has written and not had accepted. The host's credit
+//! toward the worker is in the worker's own unit ([`input_claim`]), belongs to one lease epoch and
+//! comes from the worker's events. A frame is forwarded only within credit, so the worker never has
+//! to refuse one for room.
+//!
+//! Four tasks serve one stream, none of which waits for another's work: the stream task reads
+//! frames, decides each one afresh and queues it; the lane writer writes the queue to the worker in
+//! the order it was read; the lane reader matches the worker's answers to the frames outstanding,
+//! in order, and applies its events; and the acknowledgement writer writes what the device is told.
 
-#[cfg(feature = "testing")]
-use std::sync::Mutex;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
-/// The streams of typing this host serves, and what each one has been given.
-#[derive(Debug, Default)]
+use kr_ipc::client::{LinkReader, LinkWriter};
+use kr_ipc::framed::FrameWhile;
+use kr_protocol::envelope::{ControlEvent, ControlFrame, Outcome, ParamsValue, Request, Response};
+use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::frame::StreamHeader;
+use kr_protocol::ids::{AttachmentId, ConnectionId, InputLeaseEpoch, InputSequence, RequestId};
+use kr_protocol::input::{
+    InputAck, InputClaim, InputContent, InputFrame, InputWindow, InputWriteParams, input_claim,
+};
+use kr_protocol::local::{ForwardedRequest, InputLane, InputLaneReady};
+use kr_protocol::method::Method;
+use kr_protocol::scalars::{Nullable, U64};
+use kr_transport::deadlines::DeadlineKind;
+use kr_transport::streams::{DataReader, DataWriter, StreamHandle};
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinSet;
+use tokio::time::Instant;
+
+use super::chunks::DataDoor;
+use super::dispatch::RemoteConnection;
+use super::proxy::CALL_TIMEOUT;
+
+/// What a worker states when it serves typing on a lane of its own.
+pub(crate) const INPUT_LANE_CAPABILITY: &str = "input_lane";
+
+/// How many frames the device may have written and not had accepted.
+const CLIENT_WINDOW_FRAMES: u32 = 32;
+
+/// How many encoded bytes the device may have written and not had accepted.
+const CLIENT_WINDOW_BYTES: u64 = 512 * 1024;
+
+/// How long a frame has from the moment the host passes it on to the worker's answer. The bound is
+/// absolute: waiting for the writer or for room in the socket does not renew it.
+const FRAME_DEADLINE: Duration = CALL_TIMEOUT;
+
+/// How long a detach waits for the worker's word that the attachment's epoch ended before the
+/// stream ends: the word comes on the lane's link and the detach on another, so neither is the
+/// other's cause.
+pub(super) const DETACH_NOTICE_WAIT: Duration = Duration::from_secs(2);
+
+/// How often an admission waiting for a route looks again, besides when a grant choice changes.
+const ROUTE_POLL: Duration = Duration::from_millis(25);
+
+/// The device's window, as `Ready` states it.
+fn client_window() -> InputWindow {
+    InputWindow {
+        frames: CLIENT_WINDOW_FRAMES,
+        bytes: U64::new(CLIENT_WINDOW_BYTES),
+    }
+}
+
+/// One live stream: how to end it, and what the worker has accepted on it.
+#[derive(Debug)]
+struct Live {
+    handle: StreamHandle,
+    /// The highest sequence the worker accepted, with its epoch, recorded before the device is
+    /// told. A position check reads it ([`InputStreams::accepted_count`]).
+    accepted: Mutex<Option<(InputLeaseEpoch, u64)>>,
+}
+
+impl Live {
+    fn record(&self, epoch: InputLeaseEpoch, through: u64) {
+        let mut accepted = self.accepted.lock().unwrap_or_else(PoisonError::into_inner);
+        let newer = match *accepted {
+            None => true,
+            Some((held, held_through)) => {
+                epoch.get() > held.get() || (epoch == held && through > held_through)
+            }
+        };
+        if newer {
+            *accepted = Some((epoch, through));
+        }
+    }
+
+    /// The highest accepted sequence of `epoch`, when the epoch is the one the record holds.
+    fn through(&self, epoch: InputLeaseEpoch) -> Option<u64> {
+        match *self.accepted.lock().unwrap_or_else(PoisonError::into_inner) {
+            Some((held, through)) if held == epoch => Some(through),
+            _ => None,
+        }
+    }
+}
+
+/// One attachment of one connection.
+type Key = (ConnectionId, AttachmentId);
+
+/// Why a stream was not given a place.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Refusal {
+    /// The stream was revoked before it was registered.
+    Revoked,
+    /// The connection already holds as many input streams as it may.
+    TooMany,
+}
+
+/// The streams of typing this host serves, and what each has been given.
+#[derive(Debug)]
 pub(super) struct InputStreams {
+    /// How many streams one connection may hold, which is also what the listener allows its peer
+    /// to open.
+    max_per_connection: usize,
+    live: Mutex<BTreeMap<Key, Arc<Live>>>,
     /// Where a suite has this host connect its input lanes, instead of the worker's own endpoint.
     #[cfg(feature = "testing")]
-    pub(super) lane_endpoint: Mutex<Option<kr_ipc::paths::Endpoint>>,
+    lane_endpoint: Mutex<Option<kr_ipc::paths::Endpoint>>,
+    /// How many stream tasks have ended, however they ended.
+    #[cfg(feature = "testing")]
+    tasks_ended: watch::Sender<u64>,
+}
+
+impl Default for InputStreams {
+    fn default() -> Self {
+        Self {
+            max_per_connection: kr_transport::listener::DEFAULT_MAX_INPUT_STREAMS,
+            live: Mutex::new(BTreeMap::new()),
+            #[cfg(feature = "testing")]
+            lane_endpoint: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            tasks_ended: watch::channel(0).0,
+        }
+    }
+}
+
+impl InputStreams {
+    /// How many input streams one connection may hold.
+    pub(super) const fn max_per_connection(&self) -> usize {
+        self.max_per_connection
+    }
+
+    fn live(&self) -> MutexGuard<'_, BTreeMap<Key, Arc<Live>>> {
+        self.live.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Makes `handle` the stream that serves `attachment` of `connection`, and revokes the stream
+    /// it replaces. A stream that is revoked already replaces nothing and is given no place, and a
+    /// connection that holds its bound of streams for other attachments is given no further one.
+    fn stand(
+        self: &Arc<Self>,
+        connection: ConnectionId,
+        attachment: AttachmentId,
+        handle: &StreamHandle,
+    ) -> Result<Arc<Standing>, Refusal> {
+        let key = (connection, attachment);
+        let live = Arc::new(Live {
+            handle: handle.clone(),
+            accepted: Mutex::new(None),
+        });
+        let mut registry = self.live();
+        if handle.is_revoked() {
+            return Err(Refusal::Revoked);
+        }
+        let others = registry
+            .keys()
+            .filter(|(held, other)| *held == connection && *other != attachment)
+            .count();
+        if others >= self.max_per_connection {
+            return Err(Refusal::TooMany);
+        }
+        let replaced = registry.insert(key, Arc::clone(&live));
+        drop(registry);
+        if let Some(older) = replaced {
+            older.handle.revoke();
+        }
+        Ok(Arc::new(Standing {
+            registry: Arc::clone(self),
+            key,
+            live,
+        }))
+    }
+
+    /// Revokes every stream of `connection`: its grant ended.
+    pub(super) fn revoke_connection(&self, connection: ConnectionId) {
+        let streams: Vec<Arc<Live>> = self
+            .live()
+            .iter()
+            .filter(|((held, _), _)| *held == connection)
+            .map(|(_, live)| Arc::clone(live))
+            .collect();
+        for stream in streams {
+            stream.handle.revoke();
+        }
+    }
+
+    /// How many frames of `epoch` the worker has accepted on the stream that serves `attachment`
+    /// of `connection`, when the stream stands and the epoch is the one it last accepted in.
+    #[allow(dead_code)]
+    pub(super) fn accepted_count(
+        &self,
+        connection: ConnectionId,
+        attachment: AttachmentId,
+        epoch: InputLeaseEpoch,
+    ) -> Option<u64> {
+        let live = self.live().get(&(connection, attachment)).map(Arc::clone)?;
+        live.through(epoch).map(|through| through + 1)
+    }
+}
+
+#[cfg(feature = "testing")]
+impl InputStreams {
+    pub(super) fn use_lane_at(&self, endpoint: kr_ipc::paths::Endpoint) {
+        *self
+            .lane_endpoint
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(endpoint);
+    }
+
+    pub(super) fn tasks_ended(&self) -> watch::Receiver<u64> {
+        self.tasks_ended.subscribe()
+    }
+
+    fn scripted_lane(&self) -> Option<kr_ipc::paths::Endpoint> {
+        self.lane_endpoint
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// Counts the end of a stream task, however the task ended, for a suite to wait for.
+#[cfg(feature = "testing")]
+struct TaskEnd<'a>(&'a InputStreams);
+
+#[cfg(feature = "testing")]
+impl Drop for TaskEnd<'_> {
+    fn drop(&mut self) {
+        self.0.tasks_ended.send_modify(|ended| *ended += 1);
+    }
+}
+
+/// One stream's place in the registry, which it keeps until it is let go and gives back only if
+/// it is still the stream that serves its attachment.
+#[derive(Debug)]
+struct Standing {
+    registry: Arc<InputStreams>,
+    key: Key,
+    live: Arc<Live>,
+}
+
+impl Drop for Standing {
+    fn drop(&mut self) {
+        let mut live = self.registry.live();
+        if live
+            .get(&self.key)
+            .is_some_and(|serving| Arc::ptr_eq(serving, &self.live))
+        {
+            live.remove(&self.key);
+        }
+    }
+}
+
+/// How a stream ends.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum End {
+    /// What the device is owed is written first, and the stream then finishes.
+    Graceful,
+    /// The stream is reset now. What was not yet written is lost; the device counts it uncertain.
+    Cut,
+}
+
+/// The credit the host holds toward the worker, and for which epoch.
+#[derive(Clone, Copy, Debug)]
+enum Window {
+    /// This lane's attachment holds no lease; `known` is the newest epoch the lane has heard of.
+    None { known: InputLeaseEpoch },
+    /// The lane's attachment holds the lease of `epoch`, and the worker has room for this much of
+    /// its typing.
+    Holder {
+        epoch: InputLeaseEpoch,
+        frames: u64,
+        bytes: u64,
+    },
+}
+
+impl Window {
+    const fn epoch(self) -> InputLeaseEpoch {
+        match self {
+            Self::None { known } => known,
+            Self::Holder { epoch, .. } => epoch,
+        }
+    }
+}
+
+/// A frame the worker has not yet answered.
+#[derive(Debug)]
+struct Outstanding {
+    request_id: RequestId,
+    epoch: InputLeaseEpoch,
+    sequence: u64,
+    deadline: Instant,
+}
+
+/// What a frame meets at the lane's current state.
+#[derive(Debug, Eq, PartialEq)]
+enum Routed {
+    /// Within credit for the lane's epoch: the credit is taken, and the frame goes on.
+    Forward(Instant),
+    /// Of an epoch that is not the lane's now: the host refuses it, and it costs the worker
+    /// nothing.
+    Stale,
+    /// Of an epoch whose first refusal has been recorded: no later frame of it is passed.
+    Dropped,
+    /// Of a newer epoch than the lane has a window for, or without credit for it yet.
+    Wait,
+}
+
+/// A frame the host has decided and queued for the worker.
+struct LaneFrame {
+    request_id: RequestId,
+    epoch: InputLeaseEpoch,
+    sequence: u64,
+    deadline: Instant,
+    standing: crate::service::FeedStanding,
+    frame: ControlFrame,
+}
+
+/// What the four tasks of one stream share.
+struct Flow {
+    state: Mutex<State>,
+    /// Counts every change of the state, so a task that has looked at it waits for the next.
+    version: watch::Sender<u64>,
+    live: Arc<Live>,
+    attachment: AttachmentId,
+}
+
+struct State {
+    window: Window,
+    outstanding: VecDeque<Outstanding>,
+    /// What the device is to be told, in the order it is to be told it.
+    acks: VecDeque<InputAck>,
+    /// The epoch whose first definite refusal has been recorded.
+    refused_epoch: Option<InputLeaseEpoch>,
+    ended: Option<End>,
+    next_request: u64,
+}
+
+impl Flow {
+    fn new(live: Arc<Live>, attachment: AttachmentId, ready: &InputLaneReady) -> Arc<Self> {
+        let window = if ready.holder {
+            Window::Holder {
+                epoch: ready.epoch,
+                frames: u64::from(ready.frames),
+                bytes: ready.bytes.get(),
+            }
+        } else {
+            Window::None { known: ready.epoch }
+        };
+        let mut acks = VecDeque::new();
+        acks.push_back(InputAck::Ready {
+            window: client_window(),
+        });
+        Arc::new(Self {
+            state: Mutex::new(State {
+                window,
+                outstanding: VecDeque::new(),
+                acks,
+                refused_epoch: None,
+                ended: None,
+                next_request: 1,
+            }),
+            version: watch::channel(0).0,
+            live,
+            attachment,
+        })
+    }
+
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn changed(&self) {
+        self.version.send_modify(|version| *version += 1);
+    }
+
+    fn subscribe(&self) -> watch::Receiver<u64> {
+        self.version.subscribe()
+    }
+
+    /// Ends the stream. The first end stands, except that a cut replaces a graceful end.
+    fn end(&self, how: End) {
+        {
+            let mut state = self.lock();
+            if state.ended != Some(End::Cut) {
+                state.ended = Some(how);
+            }
+        }
+        self.changed();
+    }
+
+    fn ended(&self) -> Option<End> {
+        self.lock().ended
+    }
+
+    fn next_request_id(&self) -> RequestId {
+        let mut state = self.lock();
+        let id = state.next_request;
+        state.next_request += 1;
+        RequestId::new(id)
+    }
+
+    /// Decides what a frame of `epoch` that claims `claim` meets, and takes the credit when it
+    /// goes on.
+    fn route(&self, epoch: InputLeaseEpoch, claim: InputClaim) -> Routed {
+        let mut state = self.lock();
+        {
+            if state.refused_epoch == Some(epoch) {
+                Routed::Dropped
+            } else {
+                match &mut state.window {
+                    Window::Holder {
+                        epoch: held,
+                        frames,
+                        bytes,
+                    } => {
+                        if epoch.get() < held.get() {
+                            Routed::Stale
+                        } else if epoch.get() > held.get() {
+                            Routed::Wait
+                        } else if *frames >= claim.frames as u64 && *bytes >= claim.bytes as u64 {
+                            *frames -= claim.frames as u64;
+                            *bytes -= claim.bytes as u64;
+                            Routed::Forward(Instant::now() + FRAME_DEADLINE)
+                        } else {
+                            Routed::Wait
+                        }
+                    }
+                    Window::None { known } => {
+                        if epoch.get() <= known.get() {
+                            Routed::Stale
+                        } else {
+                            Routed::Wait
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Records the first definite refusal of `epoch`, by the host, and queues the word for the
+    /// device. A refusal of an epoch that has one is not recorded again.
+    fn refuse(&self, epoch: InputLeaseEpoch, sequence: u64, error: ProtocolError) {
+        {
+            let mut state = self.lock();
+            if state.refused_epoch == Some(epoch) {
+                return;
+            }
+            state.refused_epoch = Some(epoch);
+            let accepted_through = self.live.through(epoch).map(InputSequence::new);
+            state.acks.push_back(InputAck::Refused {
+                epoch,
+                sequence: InputSequence::new(sequence),
+                accepted_through: Nullable(accepted_through),
+                error,
+            });
+        }
+        self.changed();
+    }
+
+    /// Takes back a frame that was entered as outstanding and was not written.
+    fn unsent(&self, request_id: RequestId) {
+        let mut state = self.lock();
+        if state
+            .outstanding
+            .back()
+            .is_some_and(|last| last.request_id == request_id)
+        {
+            state.outstanding.pop_back();
+        }
+    }
+
+    /// The deadline of the oldest frame the worker has not answered.
+    fn oldest_deadline(&self) -> Option<Instant> {
+        self.lock().outstanding.front().map(|front| front.deadline)
+    }
+
+    fn drained(&self) -> bool {
+        self.lock().outstanding.is_empty()
+    }
+
+    /// Matches one answer from the worker to the oldest frame outstanding. The worker answers a
+    /// lane in order, so an answer for any other frame is a breach.
+    fn answer(&self, response: &Response) -> bool {
+        {
+            let mut state = self.lock();
+            let Some(front) = state.outstanding.pop_front() else {
+                return false;
+            };
+            if front.request_id != response.request_id {
+                return false;
+            }
+            // Once an epoch's first refusal is recorded the content of the answers still in flight
+            // for it is ignored.
+            if state.refused_epoch != Some(front.epoch) {
+                match &response.outcome {
+                    Outcome::Ok(_) => {
+                        // Recorded before the device is told.
+                        self.live.record(front.epoch, front.sequence);
+                        match state.acks.back_mut() {
+                            Some(InputAck::Accepted { epoch, through })
+                                if *epoch == front.epoch =>
+                            {
+                                *through = InputSequence::new(front.sequence);
+                            }
+                            _ => state.acks.push_back(InputAck::Accepted {
+                                epoch: front.epoch,
+                                through: InputSequence::new(front.sequence),
+                            }),
+                        }
+                    }
+                    Outcome::Error(error) if error.code == ErrorCode::OutcomeUnknown => {
+                        return false;
+                    }
+                    Outcome::Error(error) => {
+                        state.refused_epoch = Some(front.epoch);
+                        let accepted_through =
+                            self.live.through(front.epoch).map(InputSequence::new);
+                        state.acks.push_back(InputAck::Refused {
+                            epoch: front.epoch,
+                            sequence: InputSequence::new(front.sequence),
+                            accepted_through: Nullable(accepted_through),
+                            error: error.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        self.changed();
+        true
+    }
+
+    /// Applies one event the worker wrote on the lane. Events of one lane apply in the order they
+    /// were written, and an older epoch never replaces a newer one.
+    fn event(&self, event: &ControlEvent) {
+        {
+            let mut state = self.lock();
+            match event {
+                ControlEvent::InputWindow(window) => {
+                    if window.epoch.get() >= state.window.epoch().get() {
+                        state.window = if window.holder {
+                            Window::Holder {
+                                epoch: window.epoch,
+                                frames: u64::from(window.frames),
+                                bytes: window.bytes.get(),
+                            }
+                        } else {
+                            Window::None {
+                                known: window.epoch,
+                            }
+                        };
+                    }
+                    if let Some(ended) = window.ended.0 {
+                        state.acks.push_back(InputAck::EpochEnded {
+                            epoch: ended.epoch,
+                            fenced_bytes: ended.fenced_bytes,
+                        });
+                    }
+                }
+                ControlEvent::InputCredit(credit) => {
+                    if let Window::Holder {
+                        epoch,
+                        frames,
+                        bytes,
+                    } = &mut state.window
+                        && *epoch == credit.epoch
+                    {
+                        *frames = frames.saturating_add(u64::from(credit.frames));
+                        *bytes = bytes.saturating_add(credit.bytes.get());
+                    }
+                }
+                ControlEvent::InputLaunchReserved(launch) => {
+                    if launch.attachment_id == self.attachment {
+                        state.acks.push_back(InputAck::LaunchReserved {
+                            launch: launch.launch,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.changed();
+    }
+}
+
+/// The word the device is given for a frame of an epoch that is not the lane's.
+fn lease_lost() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::LeaseLost,
+        "this view no longer holds the lease of the epoch its typing belongs to",
+    )
+}
+
+/// What an admission gives a stream that is not served.
+fn refusal(detail: &'static str) -> ProtocolError {
+    ProtocolError::new(ErrorCode::ResourceUnavailable, detail)
+}
+
+/// Serves one terminal-input stream until it ends.
+pub(super) async fn serve(door: Arc<DataDoor>, mut reader: DataReader, writer: DataWriter) {
+    #[cfg(feature = "testing")]
+    let _ended = TaskEnd(&door.host.input);
+    let handle = reader.handle();
+    let header = reader.header().clone();
+    let Some(admitted) = admit(&door, &header, &handle).await else {
+        handle.revoke();
+        return;
+    };
+    let Admitted {
+        session,
+        attachment,
+        standing,
+        ready,
+        lane_reader,
+        lane_writer,
+    } = admitted;
+    let flow = Flow::new(Arc::clone(&standing.live), attachment, &ready);
+    let (queue, queued) = mpsc::unbounded_channel();
+    let mut tasks = JoinSet::new();
+    tasks.spawn(write_lane(
+        lane_writer,
+        queued,
+        Arc::clone(&flow),
+        Arc::clone(&door.remote),
+    ));
+    tasks.spawn(read_lane(lane_reader, Arc::clone(&flow)));
+    let (acked, acks_flushed) = tokio::sync::oneshot::channel();
+    tasks.spawn({
+        let flow = Arc::clone(&flow);
+        async move {
+            write_acks(writer, &flow).await;
+            let _ = acked.send(());
+        }
+    });
+    run(&door, &mut reader, &flow, &queue, session, attachment).await;
+    match flow.ended() {
+        // What the device is owed is written, and the stream finishes. A write that the device
+        // does not read is cut by the write deadline.
+        Some(End::Graceful) => {
+            let _ = acks_flushed.await;
+        }
+        _ => handle.revoke(),
+    }
+    drop(standing);
+}
+
+/// What a stream is given once it is admitted and its lane is bound.
+struct Admitted {
+    session: kr_protocol::ids::SessionId,
+    attachment: AttachmentId,
+    standing: Arc<Standing>,
+    ready: InputLaneReady,
+    lane_reader: LinkReader,
+    lane_writer: LinkWriter,
+}
+
+/// Admits a stream, in the order of the plan: the environment, the route, the grant's decision for
+/// `input.write`, the registry (one stream for each attachment, and a bound for the connection),
+/// and the lane to the worker. Each step that refuses leaves the stream to be reset with nothing
+/// forwarded.
+async fn admit(
+    door: &Arc<DataDoor>,
+    header: &StreamHeader,
+    handle: &StreamHandle,
+) -> Option<Admitted> {
+    if header.resource.environment_id != door.remote.environment_id() {
+        return None;
+    }
+    let (Some(session), Some(attachment)) = (
+        header.resource.session_id.0,
+        header.resource.attachment_id.0,
+    ) else {
+        return None;
+    };
+    let mut deadline = door.deadlines.start(DeadlineKind::Admission);
+    // The route is fixed before the attach is dispatched, so a device that opens its stream after
+    // the attach's answer finds it fixed; one that opens earlier waits for the admission deadline.
+    let proxy = tokio::select! {
+        proxy = until_routed(&door.remote, session) => proxy?,
+        () = &mut deadline => return None,
+    };
+    door.remote.decide_an_input_frame(session).await.ok()?;
+    let standing = door
+        .host
+        .input
+        .stand(door.remote.connection_id(), attachment, handle)
+        .ok()?;
+    let lane = InputLane {
+        proxy_connection: proxy.connection_id(),
+        attachment_id: attachment,
+    };
+    let (lane_reader, lane_writer, ready) = tokio::select! {
+        opened = open_lane(door, &proxy, lane) => opened?,
+        () = &mut deadline => return None,
+    };
+    if handle.is_revoked() {
+        return None;
+    }
+    Some(Admitted {
+        session,
+        attachment,
+        standing,
+        ready,
+        lane_reader,
+        lane_writer,
+    })
+}
+
+/// Waits until this connection's route is fixed, and returns the link to the worker when the
+/// route is for `session`. A route for another session is no route for this stream.
+async fn until_routed(
+    remote: &Arc<RemoteConnection>,
+    session: kr_protocol::ids::SessionId,
+) -> Option<Arc<super::proxy::WorkerProxy>> {
+    loop {
+        if let Some((fixed, proxy)) = remote.fixed_input_route().await {
+            return (fixed == session).then_some(proxy);
+        }
+        tokio::select! {
+            () = remote.until_the_route_may_have_changed() => {}
+            () = tokio::time::sleep(ROUTE_POLL) => {}
+        }
+    }
+}
+
+/// Opens the lane and binds it: the worker answers with the epoch the lane starts in.
+async fn open_lane(
+    door: &Arc<DataDoor>,
+    proxy: &Arc<super::proxy::WorkerProxy>,
+    lane: InputLane,
+) -> Option<(LinkReader, LinkWriter, InputLaneReady)> {
+    #[cfg(feature = "testing")]
+    if let Some(endpoint) = door.host.input.scripted_lane() {
+        let connection = kr_ipc::endpoint::Connection::connect(&endpoint)
+            .await
+            .ok()?;
+        let (reader, writer) =
+            kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+        return bind(
+            LinkReader::over(proxy.level(), reader),
+            LinkWriter::over(proxy.level(), writer),
+            lane,
+        )
+        .await;
+    }
+    if !proxy.states(INPUT_LANE_CAPABILITY) {
+        return None;
+    }
+    let (reader, writer, _level) = door
+        .remote
+        .controller()
+        .open_input_lane(proxy.session_id(), door.remote.receive_limits())
+        .await
+        .ok()?;
+    bind(reader, writer, lane).await
+}
+
+/// Names the attachment the lane carries typing for, and reads the worker's answer.
+async fn bind(
+    mut reader: LinkReader,
+    mut writer: LinkWriter,
+    lane: InputLane,
+) -> Option<(LinkReader, LinkWriter, InputLaneReady)> {
+    writer.write(&ControlFrame::InputLane(lane)).await.ok()?;
+    match reader.read().await.ok()? {
+        ControlFrame::InputLaneReady(ready) => Some((reader, writer, ready)),
+        _ => None,
+    }
+}
+
+/// Reads the stream and routes each frame: forward it within credit, refuse it for a stale epoch,
+/// or hold it until the worker's window for its epoch arrives. Returns when the stream ends.
+///
+/// A read that is dropped part way resets the stream, so one read is kept pending across the
+/// loop's waits and is never raced away.
+async fn run(
+    door: &Arc<DataDoor>,
+    reader: &mut DataReader,
+    flow: &Arc<Flow>,
+    queue: &mpsc::UnboundedSender<LaneFrame>,
+    session: kr_protocol::ids::SessionId,
+    attachment: AttachmentId,
+) {
+    let handle = reader.handle();
+    let mut version = flow.subscribe();
+    let mut next = Box::pin(reader.read_message::<InputFrame>());
+    // Frames read and not yet routed, at most two: the one waiting for credit, and one more read
+    // to learn that the device has ended or reset the stream while nothing is credited.
+    let mut held: VecDeque<InputFrame> = VecDeque::new();
+    let mut reading = true;
+    let mut finished = false;
+    loop {
+        if flow.ended().is_some() || handle.is_revoked() {
+            return;
+        }
+        // Marked before the state is looked at, so a change after the look is never missed.
+        version.borrow_and_update();
+        if let Some(front) = held.front() {
+            let claim = input_claim(front.bytes.len());
+            match flow.route(front.epoch, claim) {
+                Routed::Forward(deadline) => {
+                    if let Some(frame) = held.pop_front() {
+                        forward(door, flow, queue, session, attachment, frame, deadline).await;
+                    }
+                    continue;
+                }
+                Routed::Stale => {
+                    if let Some(frame) = held.pop_front() {
+                        flow.refuse(frame.epoch, frame.sequence.get(), lease_lost());
+                    }
+                    continue;
+                }
+                Routed::Dropped => {
+                    held.pop_front();
+                    continue;
+                }
+                Routed::Wait => {}
+            }
+        }
+        // Reading goes on while nothing is held, and for one frame more while one waits.
+        let may_read = !finished && held.len() < 2;
+        if finished && held.is_empty() && flow.drained() {
+            // The device is done and what it wrote is answered: the stream finishes.
+            flow.end(End::Graceful);
+            return;
+        }
+        tokio::select! {
+            _ = version.changed() => {}
+            read = &mut next, if may_read && reading => {
+                match read {
+                    Ok(Some(frame)) => {
+                        held.push_back(frame);
+                        drop(next);
+                        next = Box::pin(reader.read_message::<InputFrame>());
+                    }
+                    Ok(None) => {
+                        finished = true;
+                        reading = false;
+                    }
+                    Err(_) => {
+                        flow.end(End::Cut);
+                        return;
+                    }
+                }
+            }
+            () = handle.revoked() => return,
+        }
+    }
+}
+
+/// Decides one frame afresh, as a key is decided, and queues it for the lane's writer.
+async fn forward(
+    door: &Arc<DataDoor>,
+    flow: &Arc<Flow>,
+    queue: &mpsc::UnboundedSender<LaneFrame>,
+    session: kr_protocol::ids::SessionId,
+    attachment: AttachmentId,
+    frame: InputFrame,
+    deadline: Instant,
+) {
+    let epoch = frame.epoch;
+    let sequence = frame.sequence.get();
+    let decision = match door.remote.decide_an_input_frame(session).await {
+        Ok(decision) => decision,
+        Err(error) => {
+            flow.refuse(epoch, sequence, error);
+            return;
+        }
+    };
+    let request_id = flow.next_request_id();
+    let params = InputWriteParams {
+        session_id: session,
+        attachment_id: attachment,
+        epoch,
+        sequence: frame.sequence,
+        input: InputContent::Bytes { bytes: frame.bytes },
+    };
+    let Ok(params) = ParamsValue::from_typed(&params) else {
+        flow.refuse(epoch, sequence, refusal("this typing could not be encoded"));
+        return;
+    };
+    let entry = Method::InputWrite.entry();
+    let request = Request {
+        request_id,
+        method: Method::InputWrite.into(),
+        method_version: entry.version,
+        params,
+    };
+    let frame = ControlFrame::ForwardedRead(Box::new(ForwardedRequest {
+        request,
+        actor: decision.actor,
+        authority_deadline_boot_ms: decision.authority_deadline,
+        history: None,
+    }));
+    let _ = queue.send(LaneFrame {
+        request_id,
+        epoch,
+        sequence,
+        deadline,
+        standing: decision.standing,
+        frame,
+    });
+}
+
+/// Writes the queue to the worker in the order the stream task read it, one frame at a time. The
+/// authority feed is asked immediately before each socket write, which a decision taken before a
+/// wait for the socket does not replace, and a frame keeps the deadline it was given.
+async fn write_lane(
+    mut writer: LinkWriter,
+    mut queued: mpsc::UnboundedReceiver<LaneFrame>,
+    flow: Arc<Flow>,
+    remote: Arc<RemoteConnection>,
+) {
+    let mut version = flow.subscribe();
+    loop {
+        version.borrow_and_update();
+        let item = tokio::select! {
+            item = queued.recv() => match item {
+                Some(item) => item,
+                None => return,
+            },
+            _ = version.changed() => {
+                if flow.ended().is_some() {
+                    return;
+                }
+                continue;
+            }
+        };
+        if flow.ended().is_some() {
+            return;
+        }
+        {
+            let mut state = flow.lock();
+            // Behind a refusal of its epoch: not passed on.
+            if state.refused_epoch == Some(item.epoch) {
+                continue;
+            }
+            state.outstanding.push_back(Outstanding {
+                request_id: item.request_id,
+                epoch: item.epoch,
+                sequence: item.sequence,
+                deadline: item.deadline,
+            });
+        }
+        flow.changed();
+        let written = tokio::time::timeout_at(
+            item.deadline,
+            writer.write_while(&item.frame, || remote.feed_admits(&item.standing)),
+        )
+        .await;
+        match written {
+            Ok(Ok(FrameWhile::Sent)) => {}
+            Ok(Ok(FrameWhile::Withdrawn)) => {
+                // The worker has none of the frame: it is refused, and the stream ends once the
+                // device has been told.
+                flow.unsent(item.request_id);
+                flow.refuse(
+                    item.epoch,
+                    item.sequence,
+                    ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "the authority behind this typing was withdrawn",
+                    ),
+                );
+                flow.end(End::Graceful);
+                return;
+            }
+            Ok(Ok(FrameWhile::Cut) | Err(_)) | Err(_) => {
+                flow.end(End::Cut);
+                return;
+            }
+        }
+    }
+}
+
+/// Reads the worker's side of the lane: an answer is matched to the oldest frame outstanding, and
+/// an event is applied. A worker that does not answer the oldest frame by its deadline, an answer
+/// for no frame and a frame of any other kind end the stream.
+async fn read_lane(mut reader: LinkReader, flow: Arc<Flow>) {
+    let mut version = flow.subscribe();
+    loop {
+        version.borrow_and_update();
+        let due = flow.oldest_deadline();
+        let read = tokio::select! {
+            read = reader.read() => read,
+            _ = version.changed() => {
+                if flow.ended() == Some(End::Cut) {
+                    return;
+                }
+                continue;
+            }
+            () = async {
+                match due {
+                    Some(due) => tokio::time::sleep_until(due).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                flow.end(End::Cut);
+                return;
+            }
+        };
+        match read {
+            Ok(ControlFrame::Response(response)) => {
+                if !flow.answer(&response) {
+                    flow.end(End::Cut);
+                    return;
+                }
+            }
+            Ok(ControlFrame::Event(event)) => flow.event(&event),
+            _ => {
+                flow.end(End::Cut);
+                return;
+            }
+        }
+    }
+}
+
+/// Writes what the device is told, in order. It never blocks the stream task or the lane, and a
+/// device that does not read what it is told is cut by the stream's write deadline: it loses the
+/// stream, not the connection.
+async fn write_acks(mut writer: DataWriter, flow: &Arc<Flow>) {
+    let mut version = flow.subscribe();
+    loop {
+        version.borrow_and_update();
+        let (next, ended) = {
+            let mut state = flow.lock();
+            (state.acks.pop_front(), state.ended)
+        };
+        if let Some(ack) = next {
+            if ended == Some(End::Cut) || writer.write_message(&ack).await.is_err() {
+                flow.end(End::Cut);
+                return;
+            }
+            continue;
+        }
+        match ended {
+            // Everything owed is written: finishing the stream is dropping its writer.
+            Some(End::Graceful) => return,
+            Some(End::Cut) => return,
+            None => {}
+        }
+        if version.changed().await.is_err() {
+            return;
+        }
+    }
 }

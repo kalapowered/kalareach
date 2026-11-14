@@ -33,7 +33,7 @@ use kr_protocol::method::Method;
 use kr_transport::clock::ContinuousClock;
 use kr_transport::deadlines::{DeadlineKind, Deadlines};
 use kr_transport::listener::{DataStreams, HostHandler, ReceivedFrame};
-use kr_transport::streams::{DataStream, StreamHandle};
+use kr_transport::streams::{DataReader, DataStream, DataWriter, StreamHandle};
 use tokio::sync::{OwnedMutexGuard, Semaphore};
 use tokio::task::JoinSet;
 
@@ -45,7 +45,8 @@ use crate::transfer::carries;
 ///
 /// The one list both the listener's configuration and the answer to `transfer.streams` are built
 /// from, so a host never says it takes a stream its listener resets.
-pub(crate) const ACCEPTED_STREAMS: [StreamKind; 1] = [StreamKind::AttachmentChunks];
+pub(crate) const ACCEPTED_STREAMS: [StreamKind; 2] =
+    [StreamKind::AttachmentChunks, StreamKind::TerminalInput];
 
 /// How many lookups of a device's uploads one device principal has running at once, across all its
 /// connections.
@@ -458,8 +459,9 @@ impl Drop for TaskEnd<'_> {
     }
 }
 
-/// What serves one connection's data streams.
-pub(super) struct ChunkDoor {
+/// What serves one connection's data streams: it reads each stream's header and gives the stream to
+/// the module that serves its kind.
+pub(super) struct DataDoor {
     pub(super) host: Arc<NetworkHost>,
     pub(super) remote: Arc<RemoteConnection>,
     pub(super) connection: iroh::endpoint::Connection,
@@ -468,7 +470,7 @@ pub(super) struct ChunkDoor {
     pub(super) clock: Arc<dyn ContinuousClock>,
 }
 
-impl ChunkDoor {
+impl DataDoor {
     /// Takes the connection's data streams as the transport hands them over, one task for each,
     /// until the connection ends. The tasks' set is reaped as they end, so a device that opens
     /// streams the host refuses does not grow it for the life of the connection, and ending this
@@ -489,11 +491,21 @@ impl ChunkDoor {
         }
     }
 
-    /// Admits one stream, and serves its frames until it ends.
+    /// Gives one stream to what serves its kind.
     async fn serve_stream(self: Arc<Self>, stream: DataStream) {
+        let (reader, writer) = stream.split();
+        match reader.header().kind {
+            StreamKind::AttachmentChunks => self.serve_chunks(reader, writer).await,
+            StreamKind::TerminalInput => super::input::serve(self, reader, writer).await,
+            // The listener resets a kind that is not in the accepted list, so none other arrives.
+            _ => reader.handle().revoke(),
+        }
+    }
+
+    /// Admits one attachment-chunk stream, and serves its frames until it ends.
+    async fn serve_chunks(self: Arc<Self>, mut reader: DataReader, writer: DataWriter) {
         #[cfg(feature = "testing")]
         let _ended = TaskEnd(&self.host.chunks);
-        let (mut reader, writer) = stream.split();
         let handle = reader.handle();
         let header = reader.header().clone();
         let principal = self.remote.principal();
