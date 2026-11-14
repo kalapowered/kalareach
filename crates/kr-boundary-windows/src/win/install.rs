@@ -3896,21 +3896,33 @@ impl Run {
         // the only steps are the move of the handle into a shared pointer and the call itself), and
         // the run's rollback marks the file through it wherever the file is.
         let hold = |made: Option<(&Arc<ffi::Handle>, &Path)>| {
-            let mut laid = ffi::locked(&self.laid);
-            // A replacement that the rename put at the manifest's name is the manifest from then
-            // on, and the object that an earlier save proved no longer has that name: its identity
-            // is dropped, so that the one object at the name is held once, as the replacement,
-            // until the write proves it (then it is the held manifest) or marks it.
-            if made.is_some_and(|(_, path)| path == self.paths.manifest) {
-                laid.manifest = None;
-            }
-            laid.replacement = made.map(|(handle, path)| MadeFile {
+            ffi::locked(&self.laid).replacement = made.map(|(handle, path)| MadeFile {
                 handle: Arc::clone(handle),
                 path: path.to_path_buf(),
             });
         };
-        let found = fresh::replace_whole(directory, &self.paths.manifest, &staging, &bytes, &hold)
-            .map_err(StoreError::from)?;
+        let found =
+            match fresh::replace_whole(directory, &self.paths.manifest, &staging, &bytes, &hold) {
+                Ok(found) => found,
+                Err(error) => {
+                    // Where the replacement that the rename put at the manifest's name is still
+                    // held (a read of the proof failed, or its mark failed), it is the manifest
+                    // from then on, and the object that an earlier save proved no longer has that
+                    // name: its identity is dropped, so that the one object at the name is held
+                    // once. Where the write marked the replacement because another object stands
+                    // at the name, the earlier identity stays, and the rollback names what stands
+                    // there instead of saying that its records are deleted.
+                    let mut laid = ffi::locked(&self.laid);
+                    if laid
+                        .replacement
+                        .as_ref()
+                        .is_some_and(|file| file.path == self.paths.manifest)
+                    {
+                        laid.manifest = None;
+                    }
+                    return Err(StoreError::from(error).into());
+                }
+            };
         // The manifest's identity is the proof's own handle, never an open of the name made later.
         // The earlier identity stays where it is until this assignment replaces it.
         ffi::locked(&self.laid).manifest = Some(MadeObject {
