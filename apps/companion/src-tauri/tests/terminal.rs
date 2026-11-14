@@ -1275,6 +1275,8 @@ async fn the_session_closing_a_detach_and_a_lost_link_end_the_view() {
                     &SessionDetachParams {
                         attachment_id: kr_protocol::scalars::Nullable::null(),
                         line_token: kr_protocol::scalars::Nullable::null(),
+                        after_input: None,
+                        fenced_report: false,
                     },
                 )
                 .await;

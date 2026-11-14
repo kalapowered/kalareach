@@ -625,6 +625,8 @@ async fn a_copy_of_a_mutation_in_the_transport_queue_is_told_the_outcome_is_unkn
     let detach = SessionDetachParams {
         attachment_id: Nullable::some(rig.attachment),
         line_token: Nullable::null(),
+        after_input: None,
+        fenced_report: false,
     };
     let (stall, detach_id) = rig.stall_own(Method::SessionDetach, &detach).await;
     let (told, queued, other) = the_copy_of_a_second_mutation_behind(&rig).await;
@@ -726,6 +728,8 @@ async fn a_key_sent_after_a_detach_on_its_own_connection_waits_for_it_and_is_ref
     let detach = SessionDetachParams {
         attachment_id: Nullable::some(rig.attachment),
         line_token: Nullable::null(),
+        after_input: None,
+        fenced_report: false,
     };
     let (stall, detach_id) = rig.stall_own(Method::SessionDetach, &detach).await;
     let (key, _) = rig.send_key(b"x").await;

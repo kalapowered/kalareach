@@ -2011,6 +2011,8 @@ async fn mutating(
                 &SessionDetachParams {
                     attachment_id: Nullable::some(attached.attachment.attachment_id),
                     line_token: Nullable::null(),
+                    after_input: None,
+                    fenced_report: false,
                 },
             )
             .await
@@ -2799,6 +2801,8 @@ async fn connections_that_keep_detached_identifiers_do_not_keep_their_places_whi
                 &SessionDetachParams {
                     attachment_id: Nullable::some(attached.attachment.attachment_id),
                     line_token: Nullable::null(),
+                    after_input: None,
+                    fenced_report: false,
                 },
             )
             .await

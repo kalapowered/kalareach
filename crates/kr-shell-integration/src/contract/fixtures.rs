@@ -669,6 +669,7 @@ fn launch(prompt: u64, buffer: u64, requester: AttachmentId, index: u8) -> Stimu
             command: LaunchCommand::Arguments(vec!["codex".to_owned(), "--resume".to_owned()]),
             expected_prompt_generation: PromptGeneration::new(prompt),
             expected_buffer_revision: EditorBufferRevision::new(buffer),
+            after_input: None,
         },
         requester,
         transaction: transaction(index),

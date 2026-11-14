@@ -1009,6 +1009,8 @@ impl View {
                         session_id: self.session_id,
                         attachment_id: self.attachment.attachment_id,
                         epoch,
+                        after_input: None,
+                        fenced_report: false,
                     };
                     self.mutation(request_id, Method::InputRelease, &params)
                         .await
@@ -1415,6 +1417,8 @@ impl View {
         let params = SessionDetachParams {
             attachment_id: Nullable::some(self.attachment.attachment_id),
             line_token: Nullable::null(),
+            after_input: None,
+            fenced_report: false,
         };
         let request_id = self.next_id();
         let _ = self
