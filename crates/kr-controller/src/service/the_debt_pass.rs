@@ -207,3 +207,53 @@ async fn the_pass_leaves_a_change_its_own_debt() {
     assert_eq!(revision(&controller).await, before + 2);
     drop(controller);
 }
+
+/// A task that looks at whether it is the daemon's last holder does not let the daemon go while
+/// its owner holds it, though another task that holds the daemon the same way begins between the
+/// two counts the look compares.
+///
+/// The first task is stopped between its counts, the second begins, and the first goes on. Neither
+/// may end while the owner holds the daemon; both end once the owner lets it go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_task_that_begins_between_the_two_counts_does_not_make_another_let_the_daemon_go() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (controller, _passes) = daemon_passing_by_hand(&temp).await;
+    // The tasks the start made are over before the pause is armed.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let daemon = Arc::downgrade(&controller);
+    let holding = |daemon: std::sync::Weak<Controller>| {
+        tokio::spawn(async move {
+            super::barrier::while_held(&daemon, async |_: &Arc<Controller>| {
+                std::future::pending::<()>().await;
+            })
+            .await
+        })
+    };
+    let (arrived, release) = controller.between_the_task_counts.arm();
+    let first = holding(daemon.clone());
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(WAIT))
+        .await
+        .expect("the wait ends")
+        .expect("the first task is between its counts");
+    let second = holding(daemon.clone());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    release.send(()).expect("the first task is waiting");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        !first.is_finished() && !second.is_finished(),
+        "the owner holds the daemon, so neither task lets it go: first {}, second {}",
+        first.is_finished(),
+        second.is_finished()
+    );
+
+    drop(controller);
+    let deadline = Instant::now() + WAIT;
+    while !(first.is_finished() && second.is_finished()) {
+        assert!(
+            Instant::now() < deadline,
+            "the tasks did not let the daemon go once its owner had"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(daemon.strong_count(), 0, "the daemon let go is gone");
+}
