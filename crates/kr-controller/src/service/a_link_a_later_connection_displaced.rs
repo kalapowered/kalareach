@@ -3,8 +3,10 @@
 //!
 //! The worker here stands for one of an earlier build, which gives a role to the connection whose
 //! presentation it decides last, so that a link this daemon opened and gave up on can take the
-//! authority from the one it opened after it. It answers the first statement a link carries with
-//! the words a worker says that in, on the first links it is asked, and acknowledges the rest.
+//! authority from the one it opened after it, and for a worker of this build, which refuses a
+//! presentation that comes after a later connection's was accepted. It answers the presentation or
+//! the first statement a link carries, whichever a case says, with the words a worker says that
+//! in, on the first links it is asked, and acknowledges the rest.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,11 +28,20 @@ use super::a_close_a_worker_never_answers as world;
 /// How long a case waits for the daemon to answer, and fails after. Nothing is decided by it.
 const WAIT: Duration = Duration::from_secs(60);
 
-/// A worker that refuses the first statement of its first links with `refusals`, one for each
-/// link in the order they are opened, as a worker whose connection was displaced does, and
-/// acknowledges the first statement of every link after them. `links` counts the connections it
-/// has accepted.
+/// What a worker refuses on its first links.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Refuses {
+    /// The generation a link presents.
+    ThePresentation,
+    /// The first statement a link carries after it has been accepted.
+    TheFirstStatement,
+}
+
+/// A worker that refuses `what` of its first links with `refusals`, one for each link in the
+/// order they are opened, as a worker whose connection was displaced does, and accepts and
+/// acknowledges every link after them. `links` counts the connections it has accepted.
 fn worker(
+    what: Refuses,
     refusals: &'static [&'static str],
     links: Arc<AtomicU64>,
 ) -> impl FnOnce(Listener, Arc<WorkerIdentity>, String) -> tokio::task::JoinHandle<()> {
@@ -53,6 +64,22 @@ fn worker(
                     let (mut reader, mut writer) = split(connection, StreamKind::Control);
                     let connection_id = ConnectionId::new(kr_ipc::new_uuid());
                     while let Ok(frame) = reader.read_message::<ControlFrame>().await {
+                        if what == Refuses::ThePresentation
+                            && matches!(frame, ControlFrame::GenerationToken(_))
+                            && let Some(words) = refusals.get(link)
+                        {
+                            let refusal = ControlFrame::Response(Response {
+                                request_id: RequestId::new(0),
+                                outcome: Outcome::Error(
+                                    ProtocolError::new(ErrorCode::PermissionDenied, *words)
+                                        .for_a_fenced_link(),
+                                ),
+                            });
+                            if writer.write_message(&refusal).await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
                         let handshaking = if matches!(frame, ControlFrame::LocalAccess(_)) {
                             None
                         } else {
@@ -74,7 +101,10 @@ fn worker(
                             continue;
                         }
                         let answer = match frame {
-                            ControlFrame::LocalAccess(access) => match refusals.get(link) {
+                            ControlFrame::LocalAccess(access) => match refusals
+                                .get(link)
+                                .filter(|_| what == Refuses::TheFirstStatement)
+                            {
                                 Some(words) => ControlFrame::Response(Response {
                                     request_id: RequestId::new(0),
                                     outcome: Outcome::Error(
@@ -105,6 +135,7 @@ fn worker(
 async fn a_link_displaced_before_its_first_exchange_is_opened_once_more_for_the_request() {
     let links = Arc::new(AtomicU64::new(0));
     let silent = world::fake_world_reached(worker(
+        Refuses::TheFirstStatement,
         &[LATER_CONNECTION_HOLDS_AUTHORITY],
         Arc::clone(&links),
     ))
@@ -121,12 +152,37 @@ async fn a_link_displaced_before_its_first_exchange_is_opened_once_more_for_the_
     drop(link);
 }
 
+/// KR-REQ-02.05: a link whose presentation is refused with those words, as a worker of this build
+/// refuses one that comes after a later connection's was accepted, is replaced by one more link in
+/// the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_displaced_at_its_presentation_is_opened_once_more_for_the_request() {
+    let links = Arc::new(AtomicU64::new(0));
+    let silent = world::fake_world_reached(worker(
+        Refuses::ThePresentation,
+        &[LATER_CONNECTION_HOLDS_AUTHORITY],
+        Arc::clone(&links),
+    ))
+    .await;
+    let link = tokio::time::timeout(WAIT, silent.controller.worker_client(&silent.worker))
+        .await
+        .expect("the daemon answers")
+        .expect("the request is given a link");
+    assert_eq!(
+        links.load(Ordering::SeqCst),
+        2,
+        "the refused link and the one that replaced it"
+    );
+    drop(link);
+}
+
 /// KR-REQ-02.05: the daemon opens one further link and no more: a second refusal with the same
 /// words is the request's answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_second_displacement_is_the_requests_answer() {
     let links = Arc::new(AtomicU64::new(0));
     let silent = world::fake_world_reached(worker(
+        Refuses::TheFirstStatement,
         &[
             LATER_CONNECTION_HOLDS_AUTHORITY,
             LATER_CONNECTION_HOLDS_AUTHORITY,
@@ -152,6 +208,7 @@ async fn a_second_displacement_is_the_requests_answer() {
 async fn a_refusal_of_another_kind_opens_no_further_link() {
     let links = Arc::new(AtomicU64::new(0));
     let silent = world::fake_world_reached(worker(
+        Refuses::TheFirstStatement,
         &["this worker holds no statement for this host"],
         Arc::clone(&links),
     ))
