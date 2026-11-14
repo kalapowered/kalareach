@@ -10454,3 +10454,92 @@ async fn a_session_that_refused_a_request_goes_on_serving() {
         .expect_err("the connection answers again, and refuses again");
     wired.close().await;
 }
+
+/// What the worker holds for the terminal and has promised to, in one read of the input domain: the
+/// sum that every write's admission is judged against.
+fn committed(runtime: &SessionRuntime) -> kr_worker::input_room::Cost {
+    let ledger = runtime.input().lock().ledger();
+    ledger.held.plus(ledger.reserved).plus(ledger.promised)
+}
+
+/// Types `bytes` as the next write of the lease `holder` holds, without handing the queue to the
+/// writer, and returns whether the worker accepted it.
+fn typed(wired: &Wired, holder: AttachmentId, sequence: u64, bytes: &[u8]) -> bool {
+    let mut session = wired.runtime.session();
+    let epoch = session.lease().epoch.get();
+    session
+        .write_input(
+            holder,
+            epoch,
+            sequence,
+            bytes,
+            None,
+            std::time::Instant::now(),
+        )
+        .is_ok()
+}
+
+/// KR-REQ-07.79: a key that the root editor's machine holds while its reader is asked is part of
+/// what the worker holds for the terminal. With the queue nearly full, a write that would fit if the
+/// held key were not counted is refused, and one that fits beside it is accepted: a client that keeps
+/// typing through a hold cannot pass the room by what the machine holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_the_machine_holds_counts_against_the_room_beside_a_full_queue() {
+    use kr_worker::input_room::ROOM;
+    const HELD_KEY: &[u8] = b"held";
+    /// What a write claims beyond its bytes: the end of a paste delimiter that the recogniser may
+    /// still add behind it.
+    const CLAIMED_BEYOND: usize = 6;
+
+    let clock = Arc::new(kr_transport::clock::ManualClock::new());
+    let mut wired = wired_holding_fences(&clock, None).await;
+    let holder = wired.holder();
+    // The terminal's writer stands on the first batch it takes, so what the case queues stays
+    // queued: the room is full of what the terminal has not taken.
+    let (_stopped, release) = wired.runtime.input().writer_hold().arm();
+    let mut sequence = 0;
+    let large = vec![b'x'; 60_000];
+    while ROOM.bytes - committed(&wired.runtime).bytes >= 64_000 {
+        assert!(
+            typed(&wired, holder, sequence, &large),
+            "the room had space"
+        );
+        sequence += 1;
+    }
+
+    // The machine is entered and its reader is asked: it holds the next key.
+    wired
+        .bridge
+        .send_event(enter(wired.session_id, 1, 1))
+        .await
+        .expect("enters");
+    asked_for_a_fence(&mut wired).await;
+    assert!(typed(&wired, holder, sequence, HELD_KEY));
+    sequence += 1;
+    assert_eq!(
+        wired
+            .runtime
+            .session()
+            .fence()
+            .expect("a driver")
+            .held()
+            .len(),
+        1,
+        "the machine holds what arrives while the reader is asked"
+    );
+
+    // What is left of the room with the machine's key counted. A write that claims that much plus
+    // the key's bytes would fit only if the key were left out.
+    let left = ROOM.bytes - committed(&wired.runtime).bytes;
+    let too_large = left + HELD_KEY.len() - CLAIMED_BEYOND;
+    assert!(
+        !typed(&wired, holder, sequence, &vec![b'y'; too_large]),
+        "a write was accepted that fits only when the key the machine holds is not counted"
+    );
+    assert!(
+        typed(&wired, holder, sequence, &vec![b'y'; left - CLAIMED_BEYOND]),
+        "a write that fits beside the held key was refused"
+    );
+    release.send(()).expect("lets the writer go");
+    wired.close().await;
+}
