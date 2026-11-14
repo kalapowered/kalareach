@@ -35,7 +35,7 @@ use kr_protocol::root::{
     ShellLaunchParams, ShellLaunchResult,
 };
 use kr_protocol::scalars::{CanonicalSet, Nullable, U64};
-use kr_protocol::session::{ClosureReason, Dimensions, DisplayNumber, ShellMode};
+use kr_protocol::session::{ClosureReason, Dimensions, DisplayNumber, SessionState, ShellMode};
 use kr_shell_integration::contract::events::{
     BridgeEvent, EofGesture, HooksActivated, LoadedModule, ModuleImports, ReaderIdle,
 };
@@ -10348,6 +10348,43 @@ async fn the_directory_of_a_closed_session_is_removed_at_the_first_try() {
     std::fs::remove_dir_all(&root).expect("the directory goes at the first try");
     // The directory is gone already, and the drop of the handle has nothing left to remove.
     drop(temp);
+}
+
+/// A fixture's guard asks for the close of its session when it is dropped, where the shell does not
+/// end with the session. The close is admitted at the drop, before the directory is removed.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_guarded_fixture_asks_for_a_close_when_it_is_dropped() {
+    let wired = wired().await;
+    let guard = kr_worker::testing::ClosedOnDrop::of(&wired.runtime);
+    assert_eq!(wired.runtime.session().state(), SessionState::Live);
+    drop(guard);
+    assert!(
+        matches!(
+            wired.runtime.session().state(),
+            SessionState::Closing | SessionState::Closed
+        ),
+        "the dropped guard did not ask for a close"
+    );
+    wired.close().await;
+}
+
+/// A fixture's guard asks for no close on Windows, where the shell ends with the session's drop and
+/// a close would hold the journal through the session's drain.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_guarded_fixture_asks_for_no_close_when_it_is_dropped() {
+    let wired = wired().await;
+    let guard = kr_worker::testing::ClosedOnDrop::of(&wired.runtime);
+    drop(guard);
+    assert!(
+        !matches!(
+            wired.runtime.session().state(),
+            SessionState::Closing | SessionState::Closed
+        ),
+        "the dropped guard asked for a close"
+    );
+    wired.close().await;
 }
 
 /// A session that refused a request goes on: the error answer ends nothing, and the same
