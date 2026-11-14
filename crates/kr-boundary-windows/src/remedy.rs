@@ -1311,7 +1311,8 @@ pub fn rollback_laid_stays(
             "{OPENING}, but a read of the name of what this run marked for removal failed, so it is not known whether it is gone: {}.{marked_words}",
             unconfirmed.join("; ")
         ),
-        (false, true) | (true, true) => format!(
+        (true, true) => format!("{OPENING}.{marked_words}"),
+        (false, true) => format!(
             "{OPENING}, but this run could not take away all that it laid in the data directory's place: {}.{unconfirmed_words}{marked_words}",
             stayed.join("; ")
         ),
@@ -1362,9 +1363,11 @@ pub fn left_alone(what: &str, name: &str, outcome: Option<Outcome>) -> String {
         None => format!(
             "{what} {name}: this run recorded the step that was to make it and holds no result that the step made it, so the rollback left it as it is"
         ),
-        Some(Outcome::Found | Outcome::Made) => format!(
+        Some(Outcome::Found) => format!(
             "{what} {name}: this run found it where it looked and did not make it, so the rollback left it as it is"
         ),
+        // A rollback acts on an object that its run made, so no step reaches this line with it.
+        Some(Outcome::Made) => format!("{what} {name}: this run made it"),
         Some(Outcome::Refused) => format!(
             "{what} {name}: this run found it where it looked, did not make it and went no further with it, so the rollback left it as it is"
         ),
@@ -1460,8 +1463,9 @@ impl FolderRecord {
     #[must_use]
     pub fn of(outcome: Option<Outcome>, has_identity: bool) -> FolderRecord {
         match (outcome, has_identity) {
-            (Some(Outcome::Found | Outcome::Refused), _) => FolderRecord::Found,
-            (_, false) => FolderRecord::NoIdentity,
+            (Some(Outcome::Found), _) => FolderRecord::Found,
+            // A folder never gets the result `refused`: the words that claim the least stand for it.
+            (Some(Outcome::Refused), _) | (_, false) => FolderRecord::NoIdentity,
             (Some(Outcome::Made), true) => FolderRecord::Made,
             (None, true) => FolderRecord::Intent,
         }
