@@ -650,15 +650,16 @@ impl FrameReader {
     }
 
     /// Completes with the error a read of the stream gives when the peer has reset it, carrying the
-    /// peer's own code, and with `None` when no reset can come any more because the stream was
-    /// finished and all of it received, or was stopped here. It takes no data from the stream, and
-    /// is safe to cancel.
+    /// peer's own code, or when the connection is lost, and with `None` when no reset can come any
+    /// more because the stream was finished and all of it received, or was stopped here. It takes
+    /// no data from the stream, and is safe to cancel.
     pub async fn peer_reset(&mut self) -> Option<TransportError> {
         match self.stream.received_reset().await {
             Ok(Some(code)) => Some(TransportError::Stream(
                 iroh::endpoint::ReadError::Reset(code).to_string(),
             )),
-            _ => None,
+            Err(error) => Some(TransportError::Stream(error.to_string())),
+            Ok(None) => None,
         }
     }
 

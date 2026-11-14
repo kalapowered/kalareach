@@ -7633,8 +7633,12 @@ async fn a_detach_is_taken_to_have_acted_unless_it_was_refused_before_it_could()
         "a refusal before the worker acts does not"
     );
     assert!(
-        !a_detach_may_have_acted(&error(ErrorCode::InvalidArgument)),
-        "nor does a refusal of the parameters"
+        a_detach_may_have_acted(&error(ErrorCode::InvalidArgument)),
+        "the size's own validation after the removal gives this code, so it counts"
+    );
+    assert!(
+        !a_detach_may_have_acted(&error(ErrorCode::AmbiguousAttachment)),
+        "nor does an attachment the link does not hold"
     );
     assert!(
         !a_detach_may_have_acted(&error(ErrorCode::DraftConflict)),
