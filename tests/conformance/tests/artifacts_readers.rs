@@ -404,6 +404,24 @@ fn a_step_up_is_refused_even_when_it_ends_inside_a_root() {
     }
 }
 
+/// The top of a drive, or of the file system, is no evidence folder: a value that is one is
+/// refused by each reader, spelled with one slash or with two.
+#[test]
+fn a_filesystem_root_as_the_value_is_refused() {
+    for reader in readers() {
+        let tops: &[&str] = if cfg!(windows) {
+            &[r"C:\", "C:/"]
+        } else {
+            &["/", "//"]
+        };
+        for top in tops {
+            let value = spelled_for(reader, Path::new(top));
+            let reading = reader.read(Some(value.as_os_str()), None);
+            assert_refused(reader, &reading, &format!("{top:?}"), OUTSIDE);
+        }
+    }
+}
+
 /// A line feed at the end of a value is not part of the value to a shell that reads it with a
 /// command substitution, so a `..` before it is the value's last name, and a step up.
 #[test]
@@ -719,6 +737,28 @@ mod windows_paths {
                 assert!(same(directory, &evidence), "{reader:?}: {directory:?}");
             }
         }
+    }
+
+    /// With the temporary folder at the top of a drive, Git Bash writes the whole drive under
+    /// `/tmp`, so a value written there is inside a root that is a drive's top by another name.
+    #[test]
+    fn a_drive_top_is_no_root_whatever_name_git_bash_gives_it() {
+        if shell().is_none() {
+            return;
+        }
+        let top = drive_root();
+        let value = Path::new("/tmp/Windows/kr-evidence");
+        let reading = Reader::Shell.read_with(
+            Some(value.as_os_str()),
+            Some(top.as_path()),
+            &[("RUNNER_TEMP", top.as_os_str())],
+        );
+        assert_refused(
+            Reader::Shell,
+            &reading,
+            "a folder under /tmp when /tmp is a drive's top",
+            OUTSIDE,
+        );
     }
 
     #[test]
