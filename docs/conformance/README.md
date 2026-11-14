@@ -102,6 +102,30 @@ this run is one part of the plan, and the result's `run.part` names the part. Th
 its plan as two parts, one in each job of its matrix, and a part that fails does not stop the
 other.
 
+### The report's own program
+
+Cargo runs each test binary of a step through the report's program, once to list the binary's tests and once to run it, and the steps that build the workspace link that program again. Before its first step the report copies its program into a new directory under the temporary directory, compares the bytes of the copy with the original, and gives Cargo the copy. A step that writes a damaged file at the original's path cannot break a later listing or run.
+
+The directory is named `kr-conformance-runner-<start time>-<process number>-<count>`. The report removes nothing, so each run leaves one copy of the program in the temporary directory, about 10 MB in a debug build, and the system or the person clears it.
+
+The report refuses before it runs a step, with the reason on its standard error and exit status 2, when it cannot read its program, cannot write the copy, finds the copy unequal to the original, or finds the temporary directory inside the repository or inside the target directory the steps build in. It refuses the same way when the copy's path holds a space, because Cargo takes its runner as one word: set `TMPDIR` (`TMP` on Windows) to a directory whose path holds none. It never falls back to the original.
+
+### A program a step could not run
+
+Each step runs once, and a failed step stays failed. The report removes no file, starts no program that signals a process or reads the system's logs or signatures, and never runs a step again. A source check holds that its own sources do none of these.
+
+A step failed because a program could not be run when its log holds Cargo's `could not execute process`, the runner's `could not start`, or the shell's `cannot execute binary file` for a path, together with exit status 126. Lines inside a test's captured output do not count. A test that ran and failed is a test failure, whatever it printed.
+
+For each such program, up to eight for a step, the report records in the step's `observation`, at the moment the step ends, the path, the log's own lines about it and what the path is. A link, or any object that is not a regular file, is named and not read. A regular file is read once, for at most 64 KiB and 10 seconds, and only if it is the file that was examined first (checked on Unix). The record holds its size, its first 32 bytes, when it was last written and when it was made where the system says, and its damage: a length under a page (4096 bytes), a first page of zeros, load commands that are malformed or run past the end of the file, or a segment that does. Where none of these shows, the report says "no damage seen". A script, an ELF or PE file and a universal binary are never shown as damaged. What the report cannot read it records as not read, with the reason. It scans no directory.
+
+The record decides nothing, and the exit status is the one a failed step gives: a failed step is a failed night. The summary lists the failed steps whose observation shows damage and whose log shows no failed test (`failed_with_damage_seen`) and the other failed steps (`failed_otherwise`), and the report's last line gives both counts. A test of a binary that the runner could not start is `not_run` with that reason, never `passed` or `not_built`.
+
+### A night whose failed steps all carry the observation
+
+A hosted macOS runner's data volume has returned I/O errors in bursts while a build ran. The linker writes its output through a memory map, so a program written in a burst can end empty or cut short with no error from the linker, and Cargo takes it for built. A damaged program does not show who damaged it. When every failed step of a night carries an observation with damage seen, the night fits that fault, and the person runs the failed job once more by hand. That run gets a new runner and a new disk, and its result is the night's. The report starts no such run, and no workflow does. A night with a failed step that carries no such observation is read as the repository's.
+
+The macOS job also keeps two diagnostics, each with its times: the kernel's lines about failed writes to storage over the job's window, in `disk-faults.txt` in the evidence directory, and the free-space samples, which its closing step prints as the lowest in each interval and as one reading every ten minutes. They decide nothing in the report. Each part does its own work. The report's program starts no program that signals a process or reads a log. `scripts/disk-report.sh` takes the samples and reads the kernel's log, and it signals no process: its sampler ends when a stop file holds its token, and its read of the log runs under `sudo -n`, which never asks for a password, and sets its own alarm, which ends the read after 90 seconds. Where `sudo -n` is refused a plain read follows, and where neither reads, the script says so.
+
 ### The classes of test in the landing workflow
 
 Section 21 names a tool for each class of test and asks for the tests' screenshots to be kept in
@@ -492,7 +516,7 @@ identifier's `references` and `figures`.
   ],
   "problems": [],
   "warnings": [],
-  "summary": { "identifiers": 652, "passed": 598, "failed": 0, "known_difference": 0, "not_run": 54, "known_differences": 2, "tests": { "passed": 4012, "failed": 0, "ignored": 31, "not_run": 188, "not_built": 22, "known_difference": 2 }, "failed_steps": [] }
+  "summary": { "identifiers": 652, "passed": 598, "failed": 0, "known_difference": 0, "not_run": 54, "known_differences": 2, "tests": { "passed": 4012, "failed": 0, "ignored": 31, "not_run": 188, "not_built": 22, "known_difference": 2 }, "failed_steps": [], "failed_with_damage_seen": [], "failed_otherwise": [] }
 }
 ```
 
@@ -500,6 +524,8 @@ identifier's `references` and `figures`.
 | --- | --- |
 | `run` | What was tested, with what, where: the commit (and whether tracked files differed from it), the toolchain, the machine, the terminal profile from its committed fixture, every package's version, the applications and how each was installed, the groups selected, and whether the whole terminal matrix was asked for (`all_terminals`) |
 | `steps` | Every command the run ran, as run, with its exit status, how long it took and its log, relative to the evidence directory. `needs` names the variables a step reads from the environment |
+| `steps[].observation` | Present on a failed step whose log names a program the system would not start: each program's path, the log's lines about it and what its file looked like when the step ended, and whether a test also failed in the log |
+| `summary.failed_with_damage_seen`, `summary.failed_otherwise` | The numbers of the failed steps that carry an observation with damage seen and no failed test, and of the other failed steps |
 | `identifiers` | Every identifier a test or a reference names and, in a run of every group, every row of section 21's and section 27's tables whether named or not |
 | `tests[].test` | The package, target and test name, or the TypeScript file and its titles as the run gave them, joined by ` > ` |
 | `tests[].source` | Where the key is written |
