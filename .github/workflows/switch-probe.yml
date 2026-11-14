@@ -1,7 +1,7 @@
 name: switch-probe
 
-# Measures a reader of the store's `current` beside a loop of switches on hosted Windows, with the
-# real-time protection on and off. It starts on a push to this one branch whose newest commit
+# Runs the store's tests, a loop of switches beside readers of `current`, and mutations of the
+# in-place switch on hosted Windows. It starts on a push to this one branch whose newest commit
 # message ends in "(run)", and nowhere else.
 on:
   push:
@@ -20,15 +20,22 @@ env:
 
 jobs:
   probe:
-    name: probe ${{ matrix.protection }} ${{ matrix.n }}
+    name: ${{ matrix.name }}
     if: ${{ endsWith(github.event.head_commit.message, '(run)') }}
     runs-on: windows-2025
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        protection: [on, off]
-        n: [1, 2, 3, 4]
+        include:
+          - { name: loop-1, kind: loop }
+          - { name: loop-2, kind: loop }
+          - { name: loop-3, kind: loop }
+          - { name: loop-4, kind: loop }
+          - { name: loop-5, kind: loop }
+          - { name: mutants-a, kind: mutants, ids: "M1 M2 M3" }
+          - { name: mutants-b, kind: mutants, ids: "M4 M5 M6" }
+          - { name: mutants-c, kind: mutants, ids: "M7" }
     steps:
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -49,25 +56,29 @@ jobs:
         id: libsodium
         uses: ./.github/actions/libsodium-archive
 
-      - name: Build the store's tests
-        run: cargo test --locked -p kr-ipc --test install --no-run
-
       - name: What this runner is
         run: |
           [System.Environment]::OSVersion.VersionString
           (Get-CimInstance Win32_Processor | Select-Object -First 1).Name
           (Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
-          Get-MpComputerStatus | Select-Object RealTimeProtectionEnabled, AntivirusEnabled, AMServiceEnabled | Format-List
-
-      - name: Set the real-time protection
-        if: ${{ matrix.protection == 'off' }}
-        run: |
-          Set-MpPreference -DisableRealtimeMonitoring $true
-          Start-Sleep -Seconds 5
           Get-MpComputerStatus | Select-Object RealTimeProtectionEnabled | Format-List
 
-      - name: Run the probe
+      - name: Build the store's tests
+        if: ${{ matrix.kind == 'loop' }}
+        run: cargo test --locked -p kr-ipc --test install --no-run
+
+      - name: Run the store's tests, as the landing workflow does
+        if: ${{ matrix.kind == 'loop' }}
+        run: cargo test --locked -p kr-ipc --test install -- --skip probe_current_during_a_switch
+
+      - name: Run the loop of switches beside readers
+        if: ${{ !cancelled() && matrix.kind == 'loop' }}
         env:
-          KR_PROBE_PROTECTION: ${{ matrix.protection }}
-          KR_PROBE_SECONDS: "150"
-        run: cargo test --locked -p kr-ipc --test install probe_current_during_a -- --nocapture --test-threads=1
+          KR_PROBE_PROTECTION: unchanged
+          KR_PROBE_SECONDS: "840"
+        run: cargo test --locked -p kr-ipc --test install probe_current_during_a_switch -- --nocapture --test-threads=1
+
+      - name: Run the mutations
+        if: ${{ matrix.kind == 'mutants' }}
+        shell: bash
+        run: bash .github/mutants/run-mutants.sh ${{ matrix.ids }}
