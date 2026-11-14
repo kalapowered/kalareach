@@ -39,9 +39,9 @@ for (const platform of ['darwin', 'linux', 'win32']) {
     ['build', '--ignore-version-mismatches'],
     ['build', '--target', 'aarch64-apple-darwin'],
     ['build', '-t', 'universal-apple-darwin', '--no-sign'],
-    // What follows a bare `--` is passed on to cargo, whatever it looks like.
-    ['build', '--', '--runner', 'x'],
-    ['build', '--ci', '--', '--no-bundle', '--locked', '--offline']
+    // What follows a bare `--` is passed on to cargo when it changes no output (see the words after it below).
+    ['build', '--', '--locked'],
+    ['build', '--ci', '--', '--locked', '--offline']
   ]) {
     held(`\`pnpm desktop ${argv.join(' ')}\` is run as it is given on ${platform}`, 'false', refused(argv, platform))
   }
@@ -157,9 +157,12 @@ for (const [platform, name, value] of [
 held('a variable that contains it is no matter', 'false', refused(['build'], 'linux', { CARGO_BUILD_TARGET_DIR: 'x', MY_CARGO_BUILD_TARGET: 'y' }))
 held('on macOS the name is read as it is spelled', 'false', refused(['build'], 'darwin', { cargo_build_target: 'x' }))
 
-// What follows a bare `--` goes to cargo, whose own `--config` can set the environment and the flags of the
-// build (the variable that the entry gives, `env.STATIC_VCRUNTIME` forced to `true`, among them) and whose
-// `--target` is read by none of the checks: both are refused on every platform, in every form.
+// What follows a bare `--` goes to cargo, which reads there what the checks above do not: `--config` can set the
+// environment and the flags of the build (the variable that the entry gives, `env.STATIC_VCRUNTIME` forced to
+// `true`, among them), `--target`, `--manifest-path`, `--lib`, `-p` and `--workspace` choose what is built (or
+// nothing, with exit 0, so that the bundle holds an earlier program), and `--release` and `--profile` choose the
+// build that is held. So only the words that change no output are taken, and every other word is refused on every
+// platform, with a message that names the word and says which words are taken.
 for (const platform of ['darwin', 'linux', 'win32']) {
   for (const argv of [
     ['build', '--', '--config', 'env.STATIC_VCRUNTIME.value="true"'],
@@ -168,26 +171,20 @@ for (const platform of ['darwin', 'linux', 'win32']) {
     ['build', '--', '--target', 'x86_64-pc-windows-msvc'],
     ['build', '--', '--target=aarch64-apple-darwin'],
     ['build', '--features', 'a', '--', '--target', 'x'],
-    // The build of libsodium's crate that is removed first is the one for the profile and the directory this
-    // command reads, so what cargo is given for either after the `--` is refused in every form.
     ['build', '--', '--profile', 'dev'],
     ['build', '--', '--profile=release-lto'],
     ['build', '--', '--release'],
     ['build', '--ci', '--', '-r'],
-    // Cargo reads a cluster of short flags from the left and ends it at the first letter that takes a value
-    // (`-p`, `-F`, `-j`, `-m`, `-Z`), so `r` is the release flag wherever only flags (`v`, `q`, `h`) stand before it.
     ['build', '--', '-rv'],
     ['build', '--', '-vr'],
     ['build', '--', '-qr'],
     ['build', '--', '-vvr'],
     ['build', '--debug', '--', '-vr'],
-    // Cargo takes no word after a second `--` (it ends in an error), and every word after the first is read.
     ['build', '--', '--', '-rv'],
+    ['build', '--', '--', '--locked'],
     ['build', '--', '--target-dir', 'C:/cached-target'],
     ['build', '--', '--target-dir=target-other'],
     ['build', '--', '--manifest-path', 'other/Cargo.toml'],
-    // Tauri reads its own options by prefix and Cargo ends in an error on a word it does not know, so a word
-    // that only begins with one of these names is refused too, with a value or without.
     ['build', '--', '--profile-x=dev'],
     ['build', '--', '--profile-x'],
     ['build', '--', '--releases'],
@@ -200,10 +197,57 @@ for (const platform of ['darwin', 'linux', 'win32']) {
     ['build', '--', '-mCargo.toml'],
     ['build', '--', '-mother/Cargo.toml'],
     ['build', '--', '-vm'],
-    ['build', '--', '-vm', 'other/Cargo.toml']
+    ['build', '--', '-vm', 'other/Cargo.toml'],
+    // The words that make cargo build something else, or nothing, and exit 0.
+    ['build', '--', '--lib'],
+    ['build', '--', '-p', 'companion-tauri'],
+    ['build', '--', '-pcompanion-tauri'],
+    ['build', '--', '--package', 'companion-tauri'],
+    ['build', '--', '--workspace', '--exclude', 'companion-tauri'],
+    ['build', '--', '--bins'],
+    ['build', '--', '--bin', 'x'],
+    ['build', '--', '--all-targets'],
+    ['build', '--', '-h'],
+    ['build', '--', '--help'],
+    ['build', '--', '--runner', 'x'],
+    ['build', '--ci', '--', '--no-bundle', '--locked', '--offline'],
+    // A value letter takes the rest of the word, so a package, a feature or a job count named `r` is still a word
+    // that is not taken.
+    ['build', '--', '-pr'],
+    ['build', '--', '-pm'],
+    ['build', '--', '-prelease'],
+    ['build', '--', '-p', 'mr'],
+    ['build', '--', '-vpr'],
+    ['build', '--', '-Fr'],
+    ['build', '--', '-jr'],
+    ['build', '--', '-Zunstable-options'],
+    // A value that follows an option is read with it: a word that is no value is refused with the option.
+    ['build', '--', '--color', '--release'],
+    ['build', '--', '--color'],
+    ['build', '--', '--color', 'sometimes'],
+    ['build', '--', '--message-format', '--release'],
+    ['build', '--', '--message-format=xml'],
+    ['build', '--', '-j'],
+    ['build', '--', '-j', 'many'],
+    ['build', '--', '-j', '--release'],
+    ['build', '--', '--jobs=x'],
+    ['build', '--', '--jobs', '4x'],
+    ['build', '--', '--timings=json'],
+    ['build', '--', '-vq'],
+    ['build', '--', '-v=1'],
+    ['build', '--', '--locked=true'],
+    ['build', '--', '--LOCKED'],
+    ['build', '--', 'x'],
+    ['build', '--', '--locked', 'x'],
+    // The name of an inherited property of an object is a word like any other.
+    ['build', '--', 'constructor'],
+    ['build', '--', 'constructor', 'x'],
+    ['build', '--', '__proto__', '--locked'],
+    ['build', '--', 'toString', '4']
   ]) {
-    held(`\`pnpm desktop ${argv.join(' ')}\` is refused on ${platform}, since cargo would be given its own setting`, 'true', refused(argv, platform))
+    held(`\`pnpm desktop ${argv.join(' ')}\` is refused on ${platform}, since cargo would be given a word that is not taken`, 'true', refused(argv, platform))
   }
+  // The words that change no output, with the forms of their values that cargo 1.97.1 takes.
   for (const argv of [
     ['build', '--', '--locked'],
     ['build', '--', '--offline', '--frozen'],
@@ -212,18 +256,32 @@ for (const platform of ['darwin', 'linux', 'win32']) {
     ['build', '--', '-vv'],
     ['build', '--', '-q'],
     ['build', '--', '-v', '--locked'],
-    // The letter after a letter that takes a value is that value: a package, a feature or a job count named `r`.
-    ['build', '--', '-pr'],
-    ['build', '--', '-pm'],
-    ['build', '--', '-pmy-crate'],
-    ['build', '--', '-prelease'],
-    ['build', '--', '-p', 'mr'],
-    ['build', '--', '-vpr'],
-    ['build', '--', '-vpm'],
-    ['build', '--', '-Fr'],
-    ['build', '--', '-jr']
+    ['build', '--', '-j', '4'],
+    ['build', '--', '-j4'],
+    ['build', '--', '-j=4'],
+    ['build', '--', '--jobs', '4'],
+    ['build', '--', '--jobs=4'],
+    ['build', '--', '-j', 'default'],
+    ['build', '--', '-j', '-1'],
+    ['build', '--', '--jobs=default'],
+    ['build', '--', '--color', 'always'],
+    ['build', '--', '--color=never'],
+    ['build', '--', '--message-format', 'json'],
+    ['build', '--', '--message-format=short'],
+    ['build', '--ci', '--', '--locked', '--color', 'auto', '-j', '2', '--message-format=json-render-diagnostics']
   ]) {
     held(`\`pnpm desktop ${argv.join(' ')}\` is run as it is given on ${platform}`, 'false', refused(argv, platform))
+  }
+  // The message names the word that is not taken and says that only the words that change no output are.
+  for (const [argv, named] of [
+    [['build', '--', '--lib'], '`--lib`'],
+    [['build', '--', '--locked', '-p', 'companion-tauri'], '`-p`'],
+    [['build', '--', '--color', '--release'], '`--color --release`'],
+    [['build', '--', '--color'], '`--color`']
+  ]) {
+    const answer = refusal(argv, platform, {})
+    held(`the refusal of \`pnpm desktop ${argv.join(' ')}\` names ${named}`, 'true', String(answer?.includes(`does not pass ${named} on`) ?? false))
+    held(`and says that only the words that change no output are taken on ${platform}`, 'true', String(answer?.includes('takes only') && answer?.includes('--locked') && answer?.includes('--message-format') ? true : false))
   }
 }
 
@@ -369,8 +427,14 @@ for (const name of ['SODIUM_LIB_DIR', 'sodium_lib_dir', 'SODIUM_USE_PKG_CONFIG',
   held('a name from the drive root is on the drive of the working directory', 'C:/c/cache', windowsName('/c/cache'))
   held('a name from the drive root follows the drive of the working directory', 'D:/c/cache', windowsName('/c/cache', 'D:\\a\\app'))
   held('a backslash name from the drive root is the same', 'C:/tmp', windowsName('\\tmp'))
-  held('a name with a drive and no separator is resolved', 'C:/work/app/cache', windowsName('C:cache'))
-  for (const name of ['/c/cache', '/tmp/x', '\\x', 'x', '..\\x', 'C:x', 'D:\\x', 'd:/x', '\\\\s\\sh\\x', '//s/sh/x']) {
+  held('a name with a UNC share is kept in both spellings', '//s/sh/x', windowsName('//s/sh/x'))
+  // A name with a drive and no separator after it is relative to the current directory of that drive, which the
+  // working directory, the placing script and the build do not read alike: it is refused, not resolved.
+  for (const name of ['C:cache', 'd:x', 'C:..\\x', 'C:']) {
+    held(`the name \`${name}\`, relative to the current directory of a drive, is no directory`, 'null', String(windowsName(name)))
+  }
+  held('a name with a drive and a separator is no such name', 'C:/x', windowsName('C:/x'))
+  for (const name of ['/c/cache', '/tmp/x', '\\x', 'x', '..\\x', 'D:\\x', 'd:/x', '\\\\s\\sh\\x', '//s/sh/x']) {
     held(
       `the name \`${name}\` is given to both readers with a drive or a server`,
       'true',
@@ -381,6 +445,7 @@ for (const name of ['SODIUM_LIB_DIR', 'sodium_lib_dir', 'SODIUM_USE_PKG_CONFIG',
   held('a name with a dot is resolved elsewhere', '/work/cache', posixName('../cache'))
   held('a name from the root is kept elsewhere', '/c/cache', posixName('/c/cache'))
   held('a Windows temporary path is a relative name elsewhere', '/work/app/C:/Users/a/named', posixName('C:\\Users\\a\\named'))
+  held('a name with a drive and no separator is a relative name elsewhere', '/work/app/C:cache', posixName('C:cache'))
 
   // The script itself, run for real on directories that hold other bytes: it compares what is in a
   // directory before anything is fetched, and refuses, so no network is needed and nothing is placed.
@@ -400,6 +465,10 @@ for (const name of ['SODIUM_LIB_DIR', 'sodium_lib_dir', 'SODIUM_USE_PKG_CONFIG',
     held('a named directory that holds other bytes is refused', 'null', String(byName.directory))
     held('the refusal names the script and the variable', 'true', String(byName.problem?.includes(SCRIPT) && byName.problem?.includes('SODIUM_DIST_DIR')))
     held('the refusal carries the script\'s own words', 'true', String(byName.problem?.includes('refused libsodium-1.0.22-msvc.zip')))
+    // A drive-relative name is refused with its own words before anything is placed.
+    const relativeToDrive = placeArchive({ SODIUM_DIST_DIR: 'C:cache' }, root, 'win32')
+    held('a name relative to the current directory of a drive is refused', 'null', String(relativeToDrive.directory))
+    held('and the refusal says why', 'true', String(relativeToDrive.problem?.includes('current directory of a drive') && relativeToDrive.problem?.includes('C:cache')))
     wrong(join(root, key))
     const byDefault = placeArchive({}, root, process.platform)
     held('the default directory that holds other bytes is refused too', 'null', String(byDefault.directory))
