@@ -187,7 +187,9 @@ for (const platform of ['darwin', 'linux', 'win32']) {
     ['build', '--', '--target-dir=target-other'],
     ['build', '--', '--manifest-path', 'other/Cargo.toml'],
     ['build', '--', '-m', 'other/Cargo.toml'],
+    ['build', '--', '-mCargo.toml'],
     ['build', '--', '-mother/Cargo.toml'],
+    ['build', '--', '-vm'],
     ['build', '--', '-vm', 'other/Cargo.toml']
   ]) {
     held(`\`pnpm desktop ${argv.join(' ')}\` is refused on ${platform}, since cargo would be given its own setting`, 'true', refused(argv, platform))
@@ -204,7 +206,12 @@ for (const platform of ['darwin', 'linux', 'win32']) {
     ['build', '--', '-v', '--locked'],
     // The letter after a letter that takes a value is that value: a package, a feature or a job count named `r`.
     ['build', '--', '-pr'],
+    ['build', '--', '-pm'],
+    ['build', '--', '-pmy-crate'],
+    ['build', '--', '-prelease'],
+    ['build', '--', '-p', 'mr'],
     ['build', '--', '-vpr'],
+    ['build', '--', '-vpm'],
     ['build', '--', '-Fr'],
     ['build', '--', '-jr']
   ]) {
@@ -259,6 +266,36 @@ for (const name of ['CL', 'cl', '_CL_', '_cl_']) {
   held(`${name} is no matter on macOS`, 'false', refused(['build'], 'darwin', { [name]: '/MD' }))
 }
 held('names that only contain CL are no matter on Windows', 'false', refused(['build'], 'win32', { CLANG: 'x', CL_X: 'x', MYCL: 'x', CARGO_CL_: 'x' }))
+
+// The `cc` crate, which compiles the C of the dependencies, adds the flags of `CFLAGS` and `CXXFLAGS` last,
+// after its own runtime option, with the host, target and per-target spellings of the name, so a flag there
+// can change the runtime that an object asks for. They are refused on Windows for the two MSVC targets.
+for (const name of [
+  'CFLAGS',
+  'cflags',
+  'CXXFLAGS',
+  'HOST_CFLAGS',
+  'TARGET_CFLAGS',
+  'host_cxxflags',
+  'TARGET_CXXFLAGS',
+  'CFLAGS_x86_64_pc_windows_msvc',
+  'CFLAGS_x86_64-pc-windows-msvc',
+  'CXXFLAGS_aarch64_pc_windows_msvc',
+  'cxxflags_aarch64-pc-windows-msvc'
+]) {
+  for (const value of ['-MD', '']) {
+    const answer = refusal(['build'], 'win32', { PATH: 'x', [name]: value })
+    held(`${name}=${JSON.stringify(value)} is refused on Windows`, 'true', String(answer !== null))
+    held(`the refusal for ${name} names the variable`, 'true', String(answer?.includes(name.toUpperCase()) ?? false))
+  }
+  held(`${name} is no matter on macOS`, 'false', refused(['build'], 'darwin', { [name]: '-MD' }))
+  held(`${name} is no matter on Linux`, 'false', refused(['build'], 'linux', { [name]: '-MD' }))
+}
+held(
+  'names that only contain CFLAGS, or that are for another target, are no matter on Windows',
+  'false',
+  refused(['build'], 'win32', { MYCFLAGS: 'x', CFLAGS2: 'x', CFLAGS_aarch64_linux_android: 'x', CXXFLAGS_i686_pc_windows_msvc: 'x', RUST_CFLAGS: 'x' })
+)
 
 // The crate that links libsodium takes a library directory (`SODIUM_LIB_DIR`) or a system's library
 // (`SODIUM_USE_PKG_CONFIG`) before it reads the archive that a digest holds, and links whatever those name.
