@@ -929,7 +929,12 @@ impl Controller {
                 .stated(" pending"),
             (!pending.is_empty()).then_some(
                 "A revocation is complete for a worker once it acknowledges the revision or is \
-                 confirmed ended.",
+                 confirmed ended. This host asks each pending worker again on its own, every 5 \
+                 seconds while the worker answers and less often, up to a minute, while it does \
+                 not; this check shows when every worker has acknowledged. The first answer to \
+                 the revocation is not rewritten then. The names of actions that won the \
+                 dispatch race arrive with a repeat of the revocation, and a worker keeps names \
+                 for its newest eight revocations only.",
             ),
         ));
         checks.push(self.descriptions.doctor_check(

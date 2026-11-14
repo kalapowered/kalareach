@@ -424,7 +424,7 @@ async fn debt_pass(
         if told {
             telling = None;
         } else {
-            match while_held(&daemon, async |controller: &Controller| {
+            match while_held(&daemon, async |controller: &Arc<Controller>| {
                 controller.withdraw(Capture::Left, &[]).await
             })
             .await
@@ -442,7 +442,7 @@ async fn debt_pass(
             let captured = std::mem::take(&mut untold);
             let daemon = daemon.clone();
             telling = Some(tokio::spawn(async move {
-                let told = while_held(&daemon, async |controller: &Controller| {
+                let told = while_held(&daemon, async |controller: &Arc<Controller>| {
                     controller.tell(&captured).await
                 })
                 .await;
@@ -460,7 +460,128 @@ async fn debt_pass(
     }
 }
 
-/// The evidence pass: at each of `passes` it asks the workers that still owe names for them.
+/// What came of telling a worker the revisions it has not fenced.
+pub(crate) enum Told {
+    /// The worker acknowledged the last of them.
+    Acknowledged(kr_protocol::worker::AuthorityRevisionAck),
+    /// The worker answered that its dispatch boundary is held for the moment. The exchange was
+    /// read to its end, so the link is good, and the worker has recorded what it owes.
+    Refused,
+    /// An exchange failed or ran out, so what the link holds nobody knows.
+    Failed,
+}
+
+/// What came of one exchange with a worker.
+enum Answer<T> {
+    /// The worker answered.
+    Given(T),
+    /// The worker refused for the moment, which is an answer.
+    Refused,
+    /// The exchange failed or ran out.
+    Failed,
+}
+
+/// Whether a worker's error says that it cannot decide now and the request is to be made again.
+fn refused_for_now(error: &kr_ipc::IpcError) -> bool {
+    matches!(
+        error,
+        kr_ipc::IpcError::IdentityUnavailable { detail, .. }
+            if detail.starts_with(ErrorCode::ResourceUnavailable.as_str())
+    )
+}
+
+/// What one ask of a pending worker came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Asked {
+    /// The worker acknowledged the revision in force.
+    Acknowledged,
+    /// The worker answered that its dispatch boundary is held for the moment.
+    Refused,
+    /// The link could not be opened, or the ask ran out, or it failed.
+    Failed,
+}
+
+/// How soon the daemon asks a pending worker again after an answer: the pass's own interval.
+const ASK_INTERVAL: std::time::Duration = DEBT_PASS_INTERVAL;
+
+/// How much earlier than its time an ask may be made, so that a worker due at the next pass is
+/// asked at it.
+const PASS_JITTER: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The longest the interval between two asks of a worker that does not answer grows to.
+const ASK_INTERVAL_LONGEST: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// When the pass next asks each worker it has asked.
+///
+/// A refusal costs one frame on a link that is still good, so the worker is asked again at the
+/// next pass. An ask that could not open a link or ran out costs a link attempt and the whole of
+/// its acknowledgement time: the interval before the next one, counted from its end, doubles from
+/// five seconds to a minute at most. An answer of any kind puts it back to five seconds. Only
+/// memory: the registry decides each pass who is pending.
+#[derive(Debug, Default)]
+pub(super) struct AskPace {
+    workers: BTreeMap<SessionId, Pace>,
+}
+
+/// One worker's place in the asking.
+#[derive(Debug, Clone, Copy)]
+struct Pace {
+    /// The interval after the last ask that did not answer.
+    interval: std::time::Duration,
+    /// The first instant it may be asked again.
+    next_at: tokio::time::Instant,
+}
+
+impl AskPace {
+    /// Forgets the workers that are no longer pending: an acknowledgement and an end both put the
+    /// worker back at the beginning.
+    fn keep_only(&mut self, pending: &[SessionId]) {
+        self.workers
+            .retain(|session_id, _| pending.contains(session_id));
+    }
+
+    /// Whether `session_id` may be asked at the pass that began at `tick`.
+    ///
+    /// A pass begins a little after its time, by as much as the wake-up took, and the next one
+    /// begins a little after its own: a worker asked at one pass is due at the next however the two
+    /// delays compare, which is what [`PASS_JITTER`] says.
+    fn due(&self, session_id: SessionId, tick: tokio::time::Instant) -> bool {
+        self.workers
+            .get(&session_id)
+            .is_none_or(|pace| tick + PASS_JITTER >= pace.next_at)
+    }
+
+    /// Records what the ask that began at `began` and ended at `ended` came to.
+    fn record(
+        &mut self,
+        session_id: SessionId,
+        asked: Asked,
+        began: tokio::time::Instant,
+        ended: tokio::time::Instant,
+    ) {
+        let pace = match asked {
+            Asked::Acknowledged | Asked::Refused => Pace {
+                interval: ASK_INTERVAL,
+                next_at: began + ASK_INTERVAL,
+            },
+            Asked::Failed => {
+                let interval = self
+                    .workers
+                    .get(&session_id)
+                    .map_or(ASK_INTERVAL, |pace| pace.interval);
+                let interval = (interval * 2).min(ASK_INTERVAL_LONGEST);
+                Pace {
+                    interval,
+                    next_at: ended + interval,
+                }
+            }
+        };
+        self.workers.insert(session_id, pace);
+    }
+}
+
+/// The evidence pass: at each of `passes` it asks the workers that still owe names for them, and
+/// then asks the workers that have not acknowledged the revision in force ([`AskPace`]).
 ///
 /// An announcement asks a busy worker for its pages only for so long ([`MAX_PAGE_RETRIES`]) and
 /// reports what it did not get. Nothing else would ask again, since the debt the revocation owed
@@ -469,16 +590,55 @@ async fn debt_pass(
 /// debt pass, whose barrier is what lets the host admit work again. They land in the report of the
 /// revision they belong to, which is what an answer to a repeat of that revocation reads.
 async fn evidence_pass(daemon: std::sync::Weak<Controller>, mut passes: PassSchedule) {
+    let mut pace = AskPace::default();
     loop {
         passes.next().await;
-        let held = while_held(&daemon, async |controller: &Controller| {
+        let tick = tokio::time::Instant::now();
+        let held = while_held(&daemon, async |controller: &Arc<Controller>| {
+            // The names that workers owe are asked for before any worker that is pending is, so
+            // that one worker that does not answer cannot stop them.
             controller.collect_names_owed().await;
+            controller.ask_pending_workers(&mut pace, tick).await;
         })
         .await;
         if held.is_none() {
             return;
         }
     }
+}
+
+/// Runs `futures` together on the task that awaits this, and answers what each returned, in order.
+///
+/// Nothing is spawned, so what is still running when this is dropped is dropped with it.
+async fn all_at_once<T>(
+    futures: impl IntoIterator<Item = impl std::future::Future<Output = T>>,
+) -> Vec<T> {
+    let mut running: Vec<_> = futures
+        .into_iter()
+        .map(|future| Some(Box::pin(future)))
+        .collect();
+    let mut answers: Vec<Option<T>> = running.iter().map(|_| None).collect();
+    std::future::poll_fn(|context| {
+        let mut waiting = false;
+        for (running, answer) in running.iter_mut().zip(answers.iter_mut()) {
+            if let Some(future) = running {
+                match future.as_mut().poll(context) {
+                    std::task::Poll::Ready(value) => {
+                        *answer = Some(value);
+                        *running = None;
+                    }
+                    std::task::Poll::Pending => waiting = true,
+                }
+            }
+        }
+        if waiting {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(())
+        }
+    })
+    .await;
+    answers.into_iter().flatten().collect()
 }
 
 /// Waits for the telling under way to end, and for ever while there is none.
@@ -500,7 +660,7 @@ async fn until_told(telling: &mut Option<tokio::task::JoinHandle<()>>) {
 /// has, it abandons the work and lets the daemon go.
 async fn while_held<T>(
     daemon: &std::sync::Weak<Controller>,
-    work: impl AsyncFnOnce(&Controller) -> T,
+    work: impl AsyncFnOnce(&Arc<Controller>) -> T,
 ) -> Option<T> {
     let controller = daemon.upgrade()?;
     let mut working = std::pin::pin!(work(&controller));
@@ -614,7 +774,21 @@ impl Controller {
                             // An exchange that failed or ran out leaves a client whose stream
                             // position nothing knows, so the link is closed rather than returned,
                             // and the path it was on is given up with it as it goes out of scope.
-                            answered.inspect(|_| link.give_back())
+                            // A refusal for the moment is an exchange read to its end: the link is
+                            // good, so it goes back, and the daemon's later asks of a worker that
+                            // stays busy use it instead of opening a link that waits at the
+                            // worker's dispatch boundary.
+                            match answered {
+                                Told::Acknowledged(ack) => {
+                                    link.give_back();
+                                    Some(ack)
+                                }
+                                Told::Refused => {
+                                    link.give_back();
+                                    None
+                                }
+                                Told::Failed => None,
+                            }
                         }
                     }
                     // The wait for the link ran out: another operation holds it, and what that
@@ -840,8 +1014,9 @@ impl Controller {
 
     /// Tells a worker the revisions it has not fenced, over the link the caller holds, oldest
     /// first, and answers the acknowledgement of the last, which is the one the barrier waits on.
-    /// It answers nothing when an exchange failed or ran out, `bound` after it began when one is
-    /// given.
+    /// It answers [`Told::Refused`] when the worker said that its dispatch boundary is held for
+    /// the moment, and [`Told::Failed`] when an exchange failed or ran out, `bound` after it began
+    /// when one is given.
     ///
     /// Each is a revision of its own, acknowledged as one ([`Self::note_earlier_acknowledgement`]).
     /// All are recorded as announced before any is sent, and with them what the result of each reads
@@ -856,7 +1031,7 @@ impl Controller {
         revision: AuthorityRevision,
         held: AuthorityRevision,
         bound: Option<std::time::Duration>,
-    ) -> Option<kr_protocol::worker::AuthorityRevisionAck> {
+    ) -> Told {
         let mut notices = self.revision_notices(revision, held, 0);
         let told: Vec<AuthorityRevision> = notices.iter().map(|notice| notice.revision).collect();
         self.leases.announced(session_id, held, &told);
@@ -864,24 +1039,40 @@ impl Controller {
         for notice in notices {
             #[cfg(feature = "testing")]
             self.record_announcement(session_id, &notice);
-            let ack = Self::exchange(bound, link.client().announce_revision(notice)).await?;
+            let ack = match Self::exchange(bound, link.client().announce_revision(notice)).await {
+                Answer::Given(ack) => ack,
+                Answer::Refused => return Told::Refused,
+                Answer::Failed => return Told::Failed,
+            };
             self.note_earlier_acknowledgement(session_id, binding, ack)
                 .await;
         }
         #[cfg(feature = "testing")]
         self.record_announcement(session_id, &last);
-        Self::exchange(bound, link.client().announce_revision(last)).await
+        match Self::exchange(bound, link.client().announce_revision(last)).await {
+            Answer::Given(ack) => Told::Acknowledged(ack),
+            Answer::Refused => Told::Refused,
+            Answer::Failed => Told::Failed,
+        }
     }
 
-    /// The answer of one exchange with a worker, or nothing when it failed or took longer than
-    /// `bound`.
+    /// The answer of one exchange with a worker, or what became of it when it gave none: refused
+    /// for the moment, or failed or took longer than `bound`.
     async fn exchange<T>(
         bound: Option<std::time::Duration>,
         exchange: impl std::future::Future<Output = std::result::Result<T, kr_ipc::IpcError>>,
-    ) -> Option<T> {
-        match bound {
-            Some(bound) => tokio::time::timeout(bound, exchange).await.ok()?.ok(),
-            None => exchange.await.ok(),
+    ) -> Answer<T> {
+        let answered = match bound {
+            Some(bound) => match tokio::time::timeout(bound, exchange).await {
+                Ok(answered) => answered,
+                Err(_) => return Answer::Failed,
+            },
+            None => exchange.await,
+        };
+        match answered {
+            Ok(answer) => Answer::Given(answer),
+            Err(error) if refused_for_now(&error) => Answer::Refused,
+            Err(_) => Answer::Failed,
         }
     }
 
@@ -1093,7 +1284,7 @@ impl Controller {
         let runtime = tokio::runtime::Handle::try_current().ok()?;
         let daemon = Arc::downgrade(self);
         let barrier = runtime.spawn(async move {
-            while_held(&daemon, async move |controller: &Controller| {
+            while_held(&daemon, async move |controller: &Arc<Controller>| {
                 controller.barrier(own).await
             })
             .await
@@ -1636,7 +1827,7 @@ impl Controller {
     ) {
         let daemon = Arc::downgrade(self);
         let task = tokio::spawn(async move {
-            while_held(&daemon, async move |controller: &Controller| {
+            while_held(&daemon, async move |controller: &Arc<Controller>| {
                 controller.read_back_what_workers_hold(&workers).await;
             })
             .await;
@@ -1719,6 +1910,97 @@ impl Controller {
             };
             self.collect_owed_evidence_within(session_id, binding, revision, &mut retries)
                 .await;
+        }
+    }
+
+    /// Asks the workers that have not acknowledged the revision in force, those whose pace
+    /// ([`AskPace`]) allows it at `tick`, and settles the fence this host owes once none is pending.
+    ///
+    /// Nothing else asks a worker again on a timer: an announcement asks each worker once, so a
+    /// worker that was refused for the moment, or could not be reached, stays pending until a start,
+    /// a restriction, a repeated change or a request that needs its lease asks it. The asks of one
+    /// pass are made together and each is bounded by [`crate::net::ACKNOWLEDGEMENT_TIMEOUT`], so
+    /// no worker is asked twice at once and one that does not answer does not hold the others.
+    /// A pending worker the directory does not list cannot be sent anything: what can be
+    /// established for it is whether it has ended, which is asked here.
+    pub(super) async fn ask_pending_workers(
+        self: &Arc<Self>,
+        pace: &mut AskPace,
+        tick: tokio::time::Instant,
+    ) {
+        if let Ok(pending) = self.revision_pending().await {
+            pace.keep_only(&pending);
+            let mut due = Vec::new();
+            for session_id in pending {
+                let listed = self.directory.lock().await.get(session_id).is_some();
+                if !listed {
+                    if let Err(error) = self.reconcile(session_id).await {
+                        eprintln!(
+                            "kr-controller: whether the worker of session {session_id} has ended \
+                             could not be established: {error}"
+                        );
+                    }
+                } else if pace.due(session_id, tick) {
+                    due.push(session_id);
+                }
+            }
+            let asks = due.into_iter().map(|session_id| async move {
+                #[cfg(feature = "testing")]
+                self.pending_asks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((session_id, tokio::time::Instant::now()));
+                let asked = self
+                    .ask_worker_revision(session_id)
+                    .await
+                    .unwrap_or(Asked::Failed);
+                (session_id, asked, tokio::time::Instant::now())
+            });
+            for (session_id, asked, ended) in all_at_once(asks).await {
+                pace.record(session_id, asked, tick, ended);
+            }
+        }
+        self.settle_the_fence_owed().await;
+    }
+
+    /// Settles the fence this host owes when every worker has acknowledged the revision in force
+    /// or is confirmed ended.
+    ///
+    /// The revision and the workers that have not acknowledged it are read in one section of the
+    /// registry, and the fence is settled only once the barrier as it stands holds for that
+    /// revision and the revision is still the one in force: a later revocation's fence is its own
+    /// and is never settled by this one.
+    async fn settle_the_fence_owed(&self) {
+        let revision = {
+            let registry = self.registry.lock().await;
+            let (Ok(Some(_)), Ok(revision), Ok(workers)) = (
+                registry.fence_owed(),
+                registry.authority_revision(),
+                registry.workers(),
+            ) else {
+                return;
+            };
+            if workers
+                .iter()
+                .any(|worker| worker.acknowledged_revision.get() < revision.get())
+            {
+                return;
+            }
+            revision
+        };
+        let Ok(barrier) = self.barrier_as_it_stands(revision).await else {
+            return;
+        };
+        if !barrier.holds() {
+            return;
+        }
+        let mut registry = self.registry.lock().await;
+        if registry
+            .authority_revision()
+            .is_ok_and(|now| now == revision)
+            && let Err(error) = registry.settle_fence(revision)
+        {
+            eprintln!("kr-controller: the fence this host owed could not be settled: {error}");
         }
     }
 

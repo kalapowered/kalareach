@@ -1394,7 +1394,12 @@ impl AuthorityBarrier {
             ),
             BarrierState::Pending => format!(
                 "this worker has not acknowledged revision {revision} and has not been confirmed \
-                 ended, so the revocation is not complete for it"
+                 ended, so the revocation is not complete for it. This host asks it again on its \
+                 own, and a later `kr doctor` shows when every worker has acknowledged; this \
+                 answer is not rewritten then. The names of actions that won the dispatch race \
+                 arrive with a repeat of this revocation, for the newest {} revocations a worker \
+                 holds names of",
+                kr_worker::journal::MAX_HELD_REVOCATIONS
             ),
         };
         // Revisions announced to this worker with this one, or before it, whose fences the result
