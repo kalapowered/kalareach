@@ -160,7 +160,10 @@ fn roots() -> Vec<PathBuf> {
     named.extend(std::env::var_os("RUNNER_TEMP").map(PathBuf::from));
     let mut roots: Vec<PathBuf> = Vec::new();
     for root in named.iter().filter(|root| root.is_absolute()) {
+        // A temporary folder that is a filesystem root (`/`, `C:\`) would admit every path on its
+        // disk, so it is no root.
         if let Ok(real) = real_path(root)
+            && real.parent().is_some()
             && !roots.contains(&real)
         {
             roots.push(real);
@@ -309,24 +312,18 @@ mod tests {
     /// Runs this test binary again with `value` as the variable (or none), as a program of its own,
     /// so that the variable is read from a real environment.
     fn read_in_a_run(value: Option<&OsStr>) -> std::process::Output {
-        read_in_a_run_from(value, None)
+        read_in_a_run_with(value, None, &[])
     }
 
-    /// As [`read_in_a_run`], with `directory` as the program's working directory.
-    fn read_in_a_run_from(value: Option<&OsStr>, directory: Option<&Path>) -> std::process::Output {
-        read_in_a_run_with(value, directory, None)
-    }
-
-    /// As [`read_in_a_run_from`], with `runner_temp` as the runner's temporary folder.
+    /// As [`read_in_a_run`], with `directory` as the program's working directory and `named` as
+    /// further variables of its environment. The runner's temporary folder is not inherited: only
+    /// a run that names it has one.
     fn read_in_a_run_with(
         value: Option<&OsStr>,
         directory: Option<&Path>,
-        runner_temp: Option<&str>,
+        named: &[(&str, &OsStr)],
     ) -> std::process::Output {
         let mut run = Command::new(std::env::current_exe().expect("this program"));
-        if let Some(runner_temp) = runner_temp {
-            run.env("RUNNER_TEMP", runner_temp);
-        }
         if let Some(directory) = directory {
             run.current_dir(directory);
         }
@@ -337,7 +334,9 @@ mod tests {
             "--test-threads=1",
         ])
         .env(CHILD, "1")
-        .env_remove(VARIABLE);
+        .env_remove(VARIABLE)
+        .env_remove("RUNNER_TEMP")
+        .envs(named.iter().copied());
         if let Some(value) = value {
             run.env(VARIABLE, value);
         }
@@ -383,14 +382,17 @@ mod tests {
         let source = std::env::current_dir()
             .expect("a working directory")
             .join("src");
-        let output =
-            read_in_a_run_with(Some(source.join("evidence").as_os_str()), None, Some("src"));
+        let output = read_in_a_run_with(
+            Some(source.join("evidence").as_os_str()),
+            None,
+            &[("RUNNER_TEMP", OsStr::new("src"))],
+        );
         assert!(!output.status.success(), "{output:?}");
 
         // A relative value that names a folder under the working directory, which is inside a
         // root, is still refused: the value has to be absolute.
         std::fs::create_dir(root.path().join("sub")).expect("makes a folder to name");
-        let output = read_in_a_run_from(Some(OsStr::new("sub")), Some(root.path()));
+        let output = read_in_a_run_with(Some(OsStr::new("sub")), Some(root.path()), &[]);
         assert!(!output.status.success(), "{output:?}");
         let words = String::from_utf8_lossy(&output.stderr);
         assert!(words.contains("not an absolute path"), "{words}");
@@ -400,5 +402,104 @@ mod tests {
         let own = printed(&output);
         assert!(own.is_dir(), "{}", own.display());
         std::fs::remove_dir(&own).expect("removes the run's own directory");
+    }
+
+    /// A folder beside this test program, which is outside every platform root.
+    fn beside_the_build() -> tempfile::TempDir {
+        let beside = std::env::current_exe().expect("this program");
+        tempfile::Builder::new()
+            .prefix("kr-test-artifacts-case-")
+            .tempdir_in(beside.parent().expect("a folder"))
+            .expect("a folder beside the build")
+    }
+
+    #[test]
+    fn the_runners_temporary_folder_is_a_root_of_a_run_that_names_it_and_of_no_other() {
+        let runner = beside_the_build();
+        let inside = runner.path().join("evidence");
+        let output = read_in_a_run_with(
+            Some(inside.as_os_str()),
+            None,
+            &[("RUNNER_TEMP", runner.path().as_os_str())],
+        );
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(printed(&output), real(runner.path()).join("evidence"));
+        let output = read_in_a_run(Some(inside.as_os_str()));
+        assert!(!output.status.success(), "{output:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slash_tmp_is_a_root_where_the_temporary_folder_names_another() {
+        let other = beside_the_build();
+        let inside =
+            Path::new("/tmp").join(format!("kr-test-artifacts-case-{}", std::process::id()));
+        let output = read_in_a_run_with(
+            Some(inside.as_os_str()),
+            None,
+            &[("TMPDIR", other.path().as_os_str())],
+        );
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    #[test]
+    fn a_temporary_folder_that_is_a_filesystem_root_admits_nothing_beside_the_other_roots() {
+        let top = OsStr::new(if cfg!(windows) { r"C:\" } else { "/" });
+        let elsewhere =
+            Path::new(if cfg!(windows) { r"C:\Windows" } else { "/usr" }).join("kr-evidence");
+        let output = read_in_a_run_with(
+            Some(elsewhere.as_os_str()),
+            None,
+            &[
+                ("TMPDIR", top),
+                ("TEMP", top),
+                ("TMP", top),
+                ("RUNNER_TEMP", top),
+            ],
+        );
+        assert!(!output.status.success(), "{output:?}");
+        let words = String::from_utf8_lossy(&output.stderr);
+        assert!(words.contains("temporary roots"), "{words}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_directory_of_a_runs_own_is_readable_by_this_account_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let own = make_own().expect("makes a directory");
+        let mode = std::fs::metadata(&own)
+            .expect("reads it")
+            .permissions()
+            .mode();
+        std::fs::remove_dir(&own).expect("removes it");
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_drive_folder_is_given_in_its_ordinary_form_and_an_extended_length_value_is_read() {
+        let root = temporary();
+        let real = real(root.path());
+        let text = real.to_str().expect("text");
+        assert!(!text.starts_with(r"\\?\"), "{text}");
+        assert_eq!(text.as_bytes()[1], b':', "{text}");
+        let extended = PathBuf::from(format!(r"\\?\{text}\evidence"));
+        assert_eq!(
+            confine_in(&extended, &[real.clone()]).expect("inside"),
+            real.join("evidence")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_runner_folder_that_depends_on_the_current_drive_is_no_root() {
+        let drive = Path::new(r"C:\");
+        let value = Path::new(r"C:\Windows").join("kr-evidence");
+        let output = read_in_a_run_with(
+            Some(value.as_os_str()),
+            Some(drive),
+            &[("RUNNER_TEMP", OsStr::new(r"\Windows"))],
+        );
+        assert!(!output.status.success(), "{output:?}");
     }
 }

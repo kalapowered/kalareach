@@ -35,6 +35,16 @@ const VARIABLE = 'KR_TEST_ARTIFACTS_DIR'
 
 const windows = platform() === 'win32'
 
+/**
+ * Whether `path` names one place whatever the current drive and directory are: `/…` off Windows;
+ * on Windows `C:\…`, a UNC path (`\\server\share\…`) or an extended-length path (`\\?\C:\…`). A path
+ * that depends on the current drive (`\folder`) or on a drive's current directory (`C:folder`) is
+ * rooted or has a drive, but is not fully qualified, and Node's `isAbsolute` accepts the first.
+ */
+export function fullyQualified(path: string, onWindows: boolean = windows): boolean {
+  return onWindows ? /^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/])/.test(path) : path.startsWith('/')
+}
+
 /** `path` with every link in it resolved: the part that exists by the system, the rest as written. */
 function resolveThrough(path: string): string {
   let probe = path
@@ -53,8 +63,10 @@ function roots(): string[] {
   const named = [tmpdir(), ...(windows ? [] : ['/tmp']), env['RUNNER_TEMP'] ?? '']
   const found: string[] = []
   for (const candidate of named) {
-    if (candidate === '' || !isAbsolute(candidate) || !existsSync(candidate)) continue
+    if (candidate === '' || !fullyQualified(candidate) || !existsSync(candidate)) continue
     const real = realpathSync.native(candidate)
+    // A temporary folder that is a filesystem root (`/`, `C:\`) would admit every path on its disk.
+    if (dirname(real) === real) continue
     if (!found.includes(real)) found.push(real)
   }
   return found
@@ -83,7 +95,7 @@ function inside(real: string, root: string): boolean {
  */
 export function confine(value: string): string {
   if (value === '') throw refused(value, 'it is empty')
-  if (!isAbsolute(value)) throw refused(value, 'it is not an absolute path')
+  if (!fullyQualified(value)) throw refused(value, 'it is not an absolute path')
   if (value.split(/[\\/]/).includes('..')) {
     throw refused(value, 'it steps up a directory with `..`')
   }

@@ -82,12 +82,34 @@ impl Reader {
         self.read_in(value, temporary, None)
     }
 
+    /// As [`Reader::read`], with `named` as further variables of the reader's environment.
+    fn read_with(
+        self,
+        value: Option<&OsStr>,
+        temporary: Option<&Path>,
+        named: &[(&str, &OsStr)],
+    ) -> Reading {
+        self.read_all(value, temporary, None, named)
+    }
+
     /// As [`Reader::read`], with `directory` as the reader's working directory.
     fn read_in(
         self,
         value: Option<&OsStr>,
         temporary: Option<&Path>,
         directory: Option<&Path>,
+    ) -> Reading {
+        self.read_all(value, temporary, directory, &[])
+    }
+
+    /// The reader run with everything a case can set: the runner's temporary folder is not
+    /// inherited, so only a case that names it has one.
+    fn read_all(
+        self,
+        value: Option<&OsStr>,
+        temporary: Option<&Path>,
+        directory: Option<&Path>,
+        named: &[(&str, &OsStr)],
     ) -> Reading {
         let root = repository();
         let mut run = match self {
@@ -120,7 +142,10 @@ impl Reader {
                 run
             }
         };
-        run.env_remove(VARIABLE).env("NO_COLOR", "1");
+        run.env_remove(VARIABLE)
+            .env_remove("RUNNER_TEMP")
+            .env("NO_COLOR", "1")
+            .envs(named.iter().copied());
         if let Some(directory) = directory {
             run.current_dir(directory);
         }
@@ -488,4 +513,170 @@ printf '%s\n' "$KR_RELEASE_APK" >"$kr_artifacts/release-tls-android/run.log"
         left.is_empty(),
         "the evidence folder was left behind: {left:?}"
     );
+}
+
+/// A folder beside the build, outside every platform root.
+fn beside_the_build() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("artifacts-readers-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("a folder beside the build")
+}
+
+#[test]
+fn the_runners_temporary_folder_is_a_root_of_a_run_that_names_it_and_of_no_other() {
+    for reader in readers() {
+        let runner = beside_the_build();
+        let value = runner.path().join("evidence");
+        let named = reader.read_with(
+            Some(value.as_os_str()),
+            None,
+            &[("RUNNER_TEMP", runner.path().as_os_str())],
+        );
+        assert!(named.succeeded, "{reader:?}: {named:?}");
+        let directory = named.directory.as_deref().expect("a directory");
+        assert!(
+            same(directory, &real(runner.path()).join("evidence")),
+            "{reader:?}: {directory:?}"
+        );
+        assert_refused(
+            reader,
+            &reader.read(Some(value.as_os_str()), None),
+            "a folder under a runner folder that was not named",
+            OUTSIDE,
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn slash_tmp_is_a_root_where_the_temporary_folder_names_another() {
+    for reader in readers() {
+        let other = beside_the_build();
+        let value = PathBuf::from(format!(
+            "/tmp/kr-artifacts-readers-{}/evidence",
+            std::process::id()
+        ));
+        let reading = reader.read(Some(value.as_os_str()), Some(other.path()));
+        assert!(reading.succeeded, "{reader:?}: {reading:?}");
+        assert!(
+            !value.exists(),
+            "{reader:?}: the reader makes nothing for a given value"
+        );
+    }
+}
+
+#[test]
+fn a_temporary_folder_that_is_a_filesystem_root_admits_nothing_beside_the_other_roots() {
+    let top = Path::new(if cfg!(windows) { r"C:\" } else { "/" });
+    for reader in readers() {
+        let outside = if cfg!(windows) {
+            PathBuf::from(r"C:\Windows\kr-evidence")
+        } else {
+            PathBuf::from("/usr/kr-evidence")
+        };
+        let reading = reader.read_with(
+            Some(outside.as_os_str()),
+            Some(top),
+            &[("RUNNER_TEMP", top.as_os_str())],
+        );
+        assert_refused(
+            reader,
+            &reading,
+            "a folder outside the roots when the temporary folder is a filesystem root",
+            OUTSIDE,
+        );
+    }
+}
+
+#[cfg(windows)]
+mod windows_paths {
+    use super::*;
+
+    const POWER: Reader = Reader::PowerShell;
+
+    fn drive_root() -> PathBuf {
+        PathBuf::from(r"C:\")
+    }
+
+    #[test]
+    fn a_runner_folder_that_depends_on_the_current_drive_is_no_root() {
+        if powershell().is_none() {
+            return;
+        }
+        let value = PathBuf::from(r"C:\Windows\kr-evidence");
+        let reading = POWER.read_all(
+            Some(value.as_os_str()),
+            None,
+            Some(&drive_root()),
+            &[("RUNNER_TEMP", OsStr::new(r"\Windows"))],
+        );
+        assert_refused(
+            POWER,
+            &reading,
+            "a folder under a drive-relative root",
+            OUTSIDE,
+        );
+    }
+
+    #[test]
+    fn a_value_that_depends_on_the_current_drive_or_a_drives_current_directory_is_refused() {
+        if powershell().is_none() {
+            return;
+        }
+        for value in [
+            r"\Windows\kr-evidence",
+            "C:kr-evidence",
+            r"C:Windows\kr-evidence",
+        ] {
+            let reading = POWER.read_all(Some(OsStr::new(value)), None, Some(&drive_root()), &[]);
+            assert_refused(POWER, &reading, value, "not an absolute path");
+        }
+    }
+
+    #[test]
+    fn an_extended_length_value_inside_the_temporary_folder_is_read() {
+        if powershell().is_none() {
+            return;
+        }
+        let temporary = tempfile::tempdir().expect("a temporary folder");
+        let ordinary = real(temporary.path());
+        let extended = PathBuf::from(format!(r"\\?\{}\evidence", ordinary.display()));
+        let reading = POWER.read(Some(extended.as_os_str()), None);
+        assert!(reading.succeeded, "{reading:?}");
+        let directory = reading.directory.as_deref().expect("a directory");
+        assert!(same(directory, &ordinary.join("evidence")), "{directory:?}");
+    }
+
+    #[test]
+    fn a_unc_value_is_read_under_a_unc_runner_folder_and_refused_without_one() {
+        if powershell().is_none() {
+            return;
+        }
+        let temporary = tempfile::tempdir().expect("a temporary folder");
+        let ordinary = real(temporary.path());
+        let text = ordinary.to_string_lossy().into_owned();
+        // The machine's own administrative share of the drive: the same folder, by a UNC path.
+        let unc = PathBuf::from(format!(r"\\localhost\{}${}", &text[..1], &text[2..]));
+        if std::fs::metadata(&unc).is_err() {
+            eprintln!(
+                "{} cannot be reached here: the UNC case is not run",
+                unc.display()
+            );
+            return;
+        }
+        let value = unc.join("evidence");
+        let named = POWER.read_with(
+            Some(value.as_os_str()),
+            None,
+            &[("RUNNER_TEMP", unc.as_os_str())],
+        );
+        assert!(named.succeeded, "{named:?}");
+        assert_refused(
+            POWER,
+            &POWER.read(Some(value.as_os_str()), None),
+            "a UNC value under no UNC root",
+            OUTSIDE,
+        );
+    }
 }
