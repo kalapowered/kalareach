@@ -538,6 +538,13 @@ impl TerminalEngine {
         self.engine.lane().pending() > 0
     }
 
+    /// Returns when the first reply that waits in the response lane lapses, as a reading of the
+    /// session's continuous clock, when any does.
+    #[must_use]
+    pub fn next_reply_expiry_ms(&self) -> Option<u64> {
+        self.engine.lane().next_expiry_ms()
+    }
+
     /// Returns how many replies the response lane has dropped because each waited past its
     /// deadline, for this host's own tests.
     #[cfg(feature = "testing")]

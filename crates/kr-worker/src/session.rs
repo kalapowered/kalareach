@@ -3620,7 +3620,16 @@ impl Session {
         // a closed gate holds back is let out by the keystroke that opens the gate.
         let waiting = self.engine.replies_pending() && input.lane_gate().allows_write();
         input.set_replies_waiting(waiting);
+        // An answer that waits is also dropped at its deadline when no room comes back and nothing
+        // else happens, so the pump is told when that deadline is, and looks again then.
+        let expiry = waiting
+            .then(|| self.engine.next_reply_expiry_ms())
+            .flatten();
+        let expiry_changed = input.set_reply_expiry(expiry);
         drop(input);
+        if expiry_changed {
+            shared.wake_pump();
+        }
         // The machine's answer to them can let more out, and is looked at again, which must find
         // this batch already queued.
         if let Some(Applied { mut outcome, owed }) = applied {
