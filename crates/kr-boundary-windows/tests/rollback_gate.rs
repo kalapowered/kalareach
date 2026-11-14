@@ -22,6 +22,16 @@ fn install_source() -> String {
     source[..end].to_owned()
 }
 
+/// The source of the write that replaces a record whole, whose unit cases are left out too.
+fn fresh_source() -> String {
+    let source =
+        fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/win/fresh.rs")).unwrap();
+    let end = source
+        .find("\n#[cfg(test)]\nmod tests {")
+        .unwrap_or(source.len());
+    source[..end].to_owned()
+}
+
 /// The text of the function that starts with `signature`, to the closing brace at the start of a
 /// line.
 fn body_of<'a>(source: &'a str, signature: &str) -> &'a str {
@@ -350,9 +360,7 @@ fn the_ending_after_a_failed_save_is_chosen_from_the_stage_at_which_the_save_fai
     assert!(code_of(body_of(&source, "fn save(")).contains("self.save_noting(&Cell::new(false))"));
     // The write tells the run the manifest's path only after its rename, and the replacement's own
     // path before it.
-    let fresh =
-        fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/win/fresh.rs")).unwrap();
-    let whole = code_of(body_of(&fresh, "pub fn replace_whole("));
+    let whole = code_of(body_of(&fresh_source(), "pub fn replace_whole("));
     let created = whole.find("hold(Some((&handle, staging)));").unwrap();
     let rename = whole
         .find("rename_by_handle(&handle, directory, &name)")
@@ -572,6 +580,37 @@ fn a_replacement_that_became_the_manifest_is_taken_as_the_manifest() {
         .unwrap();
     assert!(split < first && first < prior && prior < staging);
     assert!(staging < published && published < manifest);
+}
+
+/// Where a read of the proof shows that another object, or none, stands at the manifest's name and
+/// the mark of the replacement fails too, the write holds the replacement with the path that it was
+/// made at and not the manifest's, so that the run keeps the earlier manifest's identity and the
+/// ending names what stands there; where a read failed, nothing is established and the replacement
+/// stays held at the manifest's path.
+#[test]
+fn a_replacement_that_could_not_be_marked_where_another_object_stands_is_not_held_at_the_manifests_path()
+ {
+    let whole = code_of(body_of(&fresh_source(), "pub fn replace_whole("));
+    let arm = whole
+        .find("Err(Unproved::NotTheRecord(failure)) => {")
+        .expect("the proof's answer that another object stands at the name");
+    let unread = whole
+        .find("Err(Unproved::Unread(failure)) =>")
+        .expect("the proof's read that failed");
+    assert!(arm < unread);
+    let other = &whole[arm..unread];
+    let marked = other
+        .find("hold(None);")
+        .expect("a replacement that was marked is let go");
+    let failed = other.find("Err(error) => {").expect("the mark's failure");
+    let kept = other
+        .find("hold(Some((&handle, staging)));")
+        .expect("a replacement that could not be marked is held at the path it was made at");
+    assert!(marked < failed && failed < kept);
+    assert_eq!(count(other, "hold("), 2);
+    // A read that failed shows nothing about the name: the replacement stays held where the rename
+    // put it, and the write tells the run nothing more.
+    assert_eq!(count(&whole[unread..], "hold("), 0);
 }
 
 /// A service that stands at the broker's name when a new installation looks is refused at the first

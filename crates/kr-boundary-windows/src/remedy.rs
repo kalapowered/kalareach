@@ -1244,7 +1244,7 @@ pub fn data_made_ending(directory: &Taken, data: &str, folder: &Taken, above: &s
         }
         if !unconfirmed.is_empty() {
             sentences.push(format!(
-                "This run marked for removal what it made, and a read of its name afterwards failed, so it is not known whether it is gone: {}.",
+                "This run marked objects that it made for removal, and no read of their names afterwards showed whether they are gone: {}.",
                 unconfirmed.join("; ")
             ));
         }
@@ -1296,19 +1296,19 @@ pub fn rollback_laid_stays(
         )
     };
     const OPENING: &str = "The rollback's steps that undo the policy, the service, the accounts and the program directory ended without a failure";
-    // What was marked and could not be read afterwards is neither kept nor gone: its own sentence
-    // says that the mark was set and the read failed.
+    // What was marked and not read back afterwards is neither kept nor gone: its own sentence says
+    // that no read showed it, and each entry says whether a read failed or none was made.
     let unconfirmed_words = if unconfirmed.is_empty() {
         String::new()
     } else {
         format!(
-            " It marked for removal, and a read of its name afterwards failed, so it is not known whether it is gone: {}.",
+            " It marked objects for removal, and no read of their names afterwards showed whether they are gone: {}.",
             unconfirmed.join("; ")
         )
     };
     match (stayed.is_empty(), folder.is_empty()) {
         (true, true) if !unconfirmed.is_empty() => format!(
-            "{OPENING}, but a read of the name of what this run marked for removal failed, so it is not known whether it is gone: {}.{marked_words}",
+            "{OPENING}, but this run marked objects for removal and no read of their names afterwards showed whether they are gone: {}.{marked_words}",
             unconfirmed.join("; ")
         ),
         (true, true) => format!("{OPENING}.{marked_words}"),
@@ -1452,10 +1452,14 @@ pub enum FolderRecord {
     Made,
     /// The step's record and the identity, and no result: a run that died between the two writes.
     Intent,
-    /// No identity: nothing shows which folder the installation made, with a result or without.
+    /// No identity: nothing shows which folder the installation made, with the result `made` or
+    /// with none.
     NoIdentity,
     /// The result `found`: the folder stood there before the installation.
     Found,
+    /// The result `refused`, which the removal does not act on: no folder is given it, and the
+    /// words say only what the manifest holds.
+    Refused,
 }
 
 impl FolderRecord {
@@ -1464,8 +1468,10 @@ impl FolderRecord {
     pub fn of(outcome: Option<Outcome>, has_identity: bool) -> FolderRecord {
         match (outcome, has_identity) {
             (Some(Outcome::Found), _) => FolderRecord::Found,
-            // A folder never gets the result `refused`: the words that claim the least stand for it.
-            (Some(Outcome::Refused), _) | (_, false) => FolderRecord::NoIdentity,
+            // A folder never gets the result `refused`, with an identity or without one: the record
+            // says what the manifest holds and claims no more.
+            (Some(Outcome::Refused), _) => FolderRecord::Refused,
+            (_, false) => FolderRecord::NoIdentity,
             (Some(Outcome::Made), true) => FolderRecord::Made,
             (None, true) => FolderRecord::Intent,
         }
@@ -1536,6 +1542,11 @@ pub fn folder_words(folder: &str, record: FolderRecord, read: Option<&FolderRead
         FolderRecord::Found => {
             return format!(
                 "{folder}: the manifest records that it stood there before the installation, so the removal left it, also where it is empty"
+            );
+        }
+        FolderRecord::Refused => {
+            return format!(
+                "{folder}: the manifest records it with the result `refused`, which the removal does not act on, so the removal left it"
             );
         }
     };

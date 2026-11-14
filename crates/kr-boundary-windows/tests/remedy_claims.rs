@@ -370,9 +370,7 @@ fn the_ending_of_what_a_run_made_claims_each_object_only_where_the_cleanup_came_
             // have been marked and read back with a failure, and the words say that it is not
             // known whether it is gone: they do not say that it stays.
             assert_eq!(
-                text.contains(
-                    "a read of its name afterwards failed, so it is not known whether it is gone"
-                ),
+                text.contains("no read of their names afterwards showed whether they are gone"),
                 unconfirmed,
                 "{label}"
             );
@@ -659,10 +657,46 @@ fn the_ending_of_a_rollback_that_could_not_take_away_all_names_each_object_and_g
     assert!(!only.contains("stays"), "{only}");
     assert!(
         only.ends_with(&format!(
-            "but a read of the name of what this run marked for removal failed, so it is not known whether it is gone: {read_failed}."
+            "but this run marked objects for removal and no read of their names afterwards showed whether they are gone: {read_failed}."
         )),
         "{only}"
     );
+    // The words that stand before the entries claim neither that a read failed (an entry may say
+    // that none was made) nor the singular for a list: each entry says which, and the words say only
+    // that no read showed whether the objects are gone.
+    let none_made = "C:\\Data (it was marked for removal, and no read of its name was made, so whether it is gone is not known)".to_owned();
+    for entries in [
+        vec![read_failed.clone()],
+        vec![none_made.clone()],
+        vec![read_failed.clone(), none_made.clone()],
+    ] {
+        for text in [
+            rollback_laid_stays(&[], &[], &entries, &[]),
+            rollback_laid_stays(&["C:\\Data (w)".to_owned()], &[], &entries, &[]),
+        ] {
+            let mut generic = text.clone();
+            for entry in &entries {
+                generic = generic.replace(entry.as_str(), "");
+            }
+            assert!(!generic.contains("failed"), "{generic}");
+            assert!(!generic.contains("is gone"), "{generic}");
+            assert!(!generic.contains("a read of its name"), "{generic}");
+        }
+    }
+    let why = "it was marked for removal, and no read of its name was made, so whether it is gone is not known";
+    let made = data_made_ending(
+        &Taken::Unconfirmed(why.to_owned()),
+        "D",
+        &Taken::Marked,
+        "A",
+    );
+    let generic = made.replace(&format!("D ({why})"), "");
+    assert!(
+        generic.contains("no read of their names afterwards showed whether they are gone"),
+        "{made}"
+    );
+    assert!(!generic.contains("failed"), "{made}");
+    assert!(!generic.contains("is gone"), "{made}");
     // Beside what a read kept, it has a sentence of its own after the kept objects.
     let beside = rollback_laid_stays(
         &["C:\\Data (w)".to_owned()],
@@ -678,7 +712,7 @@ fn the_ending_of_a_rollback_that_could_not_take_away_all_names_each_object_and_g
     );
     assert!(
         beside.ends_with(&format!(
-            " It marked for removal, and a read of its name afterwards failed, so it is not known whether it is gone: {read_failed}."
+            " It marked objects for removal, and no read of their names afterwards showed whether they are gone: {read_failed}."
         )),
         "{beside}"
     );
@@ -689,7 +723,8 @@ fn the_ending_of_a_rollback_that_could_not_take_away_all_names_each_object_and_g
     let with_folder = rollback_laid_stays(&[], &folder, std::slice::from_ref(&read_failed), &[]);
     assert!(with_folder.contains("could not take away the folder above the program directory that it made: C:\\Above\\Folder (the platform refused"), "{with_folder}");
     assert!(
-        with_folder.contains("It marked for removal, and a read of its name afterwards failed"),
+        with_folder
+            .contains("It marked objects for removal, and no read of their names afterwards"),
         "{with_folder}"
     );
     for text in [&one, &two] {
@@ -1032,11 +1067,14 @@ fn the_removal_takes_the_folder_above_the_program_directory_only_where_the_insta
         FolderRecord::Found
     );
     // A result of refused belongs to the service: no folder has it, and it is never read as a folder
-    // to remove or as one that stood there before the installation.
-    assert_eq!(
-        FolderRecord::of(Some(Outcome::Refused), true),
-        FolderRecord::NoIdentity
-    );
+    // to remove or as one that stood there before the installation, and the words do not say that
+    // the manifest records no identity where it records one.
+    for has_identity in [true, false] {
+        assert_eq!(
+            FolderRecord::of(Some(Outcome::Refused), has_identity),
+            FolderRecord::Refused
+        );
+    }
     assert_eq!(
         FolderRecord::of(Some(Outcome::Found), false),
         FolderRecord::Found
@@ -1056,6 +1094,7 @@ fn the_removal_takes_the_folder_above_the_program_directory_only_where_the_insta
         (FolderRecord::Intent, true),
         (FolderRecord::NoIdentity, false),
         (FolderRecord::Found, false),
+        (FolderRecord::Refused, false),
     ] {
         assert_eq!(record.is_read(), read, "{record:?}");
     }
@@ -1074,6 +1113,7 @@ fn the_removal_takes_the_folder_above_the_program_directory_only_where_the_insta
         FolderRecord::Intent,
         FolderRecord::NoIdentity,
         FolderRecord::Found,
+        FolderRecord::Refused,
     ] {
         for read in std::iter::once(None).chain(reads.iter().map(Some)) {
             let act = folder_act(record, read);
@@ -1095,6 +1135,7 @@ fn the_removal_takes_the_folder_above_the_program_directory_only_where_the_insta
         FolderRecord::Intent,
         FolderRecord::NoIdentity,
         FolderRecord::Found,
+        FolderRecord::Refused,
     ] {
         for read in std::iter::once(None).chain(reads.iter().map(Some)) {
             let text = folder_words(folder, record, read);
@@ -1110,6 +1151,12 @@ fn the_removal_takes_the_folder_above_the_program_directory_only_where_the_insta
             && found.contains("also where it is empty"),
         "{found}"
     );
+    let refused = folder_words(folder, FolderRecord::Refused, None);
+    assert!(
+        refused.contains("with the result `refused`, which the removal does not act on"),
+        "{refused}"
+    );
+    assert!(!refused.contains("no identity"), "{refused}");
     let holds = folder_words(folder, FolderRecord::Made, Some(&FolderRead::Holds(1)));
     assert!(holds.contains("found 1 entry in it"), "{holds}");
     let other = folder_words(folder, FolderRecord::Made, Some(&FolderRead::Other));
