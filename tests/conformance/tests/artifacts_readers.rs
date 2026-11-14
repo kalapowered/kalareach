@@ -15,8 +15,10 @@ use std::process::Command;
 const VARIABLE: &str = "KR_TEST_ARTIFACTS_DIR";
 
 /// On Windows, Git Bash processes that run together have been seen to read `/tmp` as the top of a
-/// drive when one of them was given that top as its temporary folder, and a reader then takes the
-/// whole drive for a root. The cases therefore run one Git Bash at a time.
+/// drive when one of them was given that top as its temporary folder: the processes of one user
+/// appear to share one table of mounts, which the first of them makes from its own temporary
+/// folder. The cases therefore run one Git Bash at a time, so that each reads the `/tmp` that its
+/// own environment makes. The lock holds for the cases of this test binary only.
 #[cfg(windows)]
 static ONE_GIT_BASH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

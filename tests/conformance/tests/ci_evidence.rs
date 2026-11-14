@@ -1089,6 +1089,8 @@ const LIST: &[Listed] = &[
     // Reader: the one reader of the variable for TypeScript.
     reader("apps/companion/e2e/evidence.ts"),
     // The TypeScript reader's own cases: they set the variable and match its name in the refusal.
+    // A line puts the name into a constant, so each later use of the constant in this file passes
+    // unseen: the file is read as a reader's cases.
     lines(
         "apps/companion/test/artefacts-dir.test.ts",
         &[
@@ -1336,6 +1338,8 @@ const LIST: &[Listed] = &[
         )],
     ),
     // The shell and PowerShell readers' own cases: they set the variable and read it back from the child.
+    // A line puts the name into a constant, so each later use of the constant in this file passes
+    // unseen: the file is read as a reader's cases.
     lines(
         "tests/conformance/tests/artifacts_readers.rs",
         &[
@@ -1580,7 +1584,12 @@ fn repository_files(root: &Path) -> Vec<String> {
 ///
 /// Not seen: a name put together at run time or spelled with an escape (no file holds its bytes),
 /// and a value that reaches a program in an argument instead of the variable (the conformance
-/// runner's `--evidence` passes the same check).
+/// runner's `--evidence` passes the same check). A pinned line holds its text and its count, not
+/// its place: it can move inside its file (a bare workflow line into the heredoc of a `run:`
+/// script) or have a step's `uses:` changed above it, and only the file's diff shows that. A line
+/// that puts the name into a constant opens the later uses of that constant in its file, which is
+/// why the two files that do so (`artifacts_readers.rs` and `artefacts-dir.test.ts`, each holding
+/// the readers' own cases) are said to in their entries.
 #[test]
 fn the_artifacts_variable_stands_only_in_the_files_the_list_names() {
     let root = repository();
