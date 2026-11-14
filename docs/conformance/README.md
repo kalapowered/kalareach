@@ -112,7 +112,7 @@ The report refuses before it runs a step, with the reason on its standard error 
 
 ### A program a step could not run
 
-Each step runs once, and a failed step stays failed. The report removes no file, starts no program that signals a process or reads the system's logs or signatures, and never runs a step again. A source check holds that its own sources do none of these.
+Each step runs once, and a failed step stays failed. The case `a_step_that_could_not_run_a_program_fails_once_and_keeps_the_file_as_it_was_seen` (in `tests/observation.rs`) counts the runs of a failed step and holds that rule. The report's program removes and replaces no file, signals no process, and starts no program that does either, reads the system's logs or reads its signatures. A source check holds this for the program's own sources, apart from the items under `#[cfg(test)]`. It reads every source file under `src` as Rust tokens and refuses a string that starts `kill`, `pkill`, `killall`, `taskkill`, `ps`, `codesign`, `log`, `sudo`, `rm`, `unlink` or `rmdir` (as a command, a path or the first word of a shell command), a call of `remove_file`, `remove_dir`, `remove_dir_all`, `rename`, `unlink`, `rmdir`, `kill`, `killpg`, `process_group` or `TerminateProcess`, and the names `SIGKILL` and `SIGTERM`. It does not read the programs the steps run, which are the plan's.
 
 A step failed because a program could not be run when its log holds Cargo's `could not execute process`, the runner's `could not start`, or the shell's `cannot execute binary file` for a path, together with exit status 126. Lines inside a test's captured output do not count. A test that ran and failed is a test failure, whatever it printed.
 
