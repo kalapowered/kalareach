@@ -108,6 +108,8 @@ pub const fn admit(held: Cost, claim: Cost) -> Result<(), Full> {
 pub struct InputRoom {
     frames: AtomicUsize,
     bytes: AtomicUsize,
+    /// How many of the entries are the host's own answers, which have a share of their own.
+    replies: AtomicUsize,
 }
 
 impl InputRoom {
@@ -120,10 +122,20 @@ impl InputRoom {
         }
     }
 
+    /// Returns how many of the entries held are the host's own answers.
+    #[must_use]
+    pub fn held_replies(&self) -> usize {
+        self.replies.load(Ordering::Acquire)
+    }
+
     /// Charges what a batch costs, as it is queued.
-    pub(crate) fn charge(&self, cost: Cost) {
+    pub(crate) fn charge(&self, batch: &InputBatch) {
+        let cost = Cost::of(batch);
         self.frames.fetch_add(cost.frames, Ordering::AcqRel);
         self.bytes.fetch_add(cost.bytes, Ordering::AcqRel);
+        if matches!(batch, InputBatch::Reply { .. }) {
+            self.replies.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     /// Takes the debt of one batch the writer has taken, which the writer pays back as it goes.
@@ -131,6 +143,7 @@ impl InputRoom {
         Owed {
             room: Arc::clone(self),
             left: Cost::of(batch),
+            reply: matches!(batch, InputBatch::Reply { .. }),
         }
     }
 
@@ -138,7 +151,16 @@ impl InputRoom {
     /// cannot pass below nothing: a mistake in what is given back would show as a count that is
     /// wrong, not as one that wraps and refuses every write for good.
     fn give_back(&self, cost: Cost) {
-        for (held, cost) in [(&self.frames, cost.frames), (&self.bytes, cost.bytes)] {
+        self.give_back_counts(cost, 0);
+    }
+
+    /// As [`Self::give_back`], with the answers among the entries that go.
+    fn give_back_counts(&self, cost: Cost, replies: usize) {
+        for (held, cost) in [
+            (&self.frames, cost.frames),
+            (&self.bytes, cost.bytes),
+            (&self.replies, replies),
+        ] {
             if cost > 0 {
                 let before = held
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
@@ -160,6 +182,8 @@ impl InputRoom {
 pub(crate) struct Owed {
     room: Arc<InputRoom>,
     left: Cost,
+    /// Whether the entry is one of the host's own answers.
+    reply: bool,
 }
 
 impl Owed {
@@ -173,6 +197,7 @@ impl Owed {
 
 impl Drop for Owed {
     fn drop(&mut self) {
-        self.room.give_back(self.left);
+        self.room
+            .give_back_counts(self.left, usize::from(self.reply));
     }
 }
