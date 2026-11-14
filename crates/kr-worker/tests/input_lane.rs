@@ -723,12 +723,10 @@ async fn a_takeover_with_the_credit_in_flight_refuses_every_frame_and_the_next_w
     release.send(()).expect("lets the writer go");
     rig.drained().await;
     let again = rig.acquire(attachment).await;
-    let window = loop {
-        match lane.next().await.expect("the lane stays open") {
-            Seen::Window(window) => break window,
-            Seen::Credit(credit) => panic!("credit was owed for an epoch that ended: {credit:?}"),
-            Seen::Answer(..) => panic!("an answer with nothing sent"),
-        }
+    let window = match lane.next().await.expect("the lane stays open") {
+        Seen::Window(window) => window,
+        Seen::Credit(credit) => panic!("credit was owed for an epoch that ended: {credit:?}"),
+        Seen::Answer(..) => panic!("an answer with nothing sent"),
     };
     assert!(window.holder && window.ended.0.is_none());
     assert_eq!(window.epoch, again);
@@ -1002,7 +1000,21 @@ async fn credit_arrives_while_a_commit_holds_the_session() {
     let attachment = rig.attach().await;
     let epoch = rig.acquire(attachment).await;
     let mut lane = rig.lane(attachment).await;
-    let commit = rig.runtime.session();
+    // A thread of the case holds the session, as a commit does, until the case lets it go.
+    let (held, holding) = std::sync::mpsc::channel::<()>();
+    let (let_go, letting_go) = std::sync::mpsc::channel::<()>();
+    let commit = {
+        let runtime = Arc::clone(&rig.runtime);
+        std::thread::spawn(move || {
+            let _commit = runtime.session();
+            held.send(()).expect("says it holds the session");
+            let _ = letting_go.recv();
+        })
+    };
+    tokio::task::spawn_blocking(move || holding.recv_timeout(WAIT))
+        .await
+        .expect("the wait ran")
+        .expect("the session was taken");
     let each = input_claim(1);
     for index in 0..8 {
         lane.send(&[letter(index)]).await;
@@ -1018,8 +1030,9 @@ async fn credit_arrives_while_a_commit_holds_the_session() {
         )
         .await;
     assert!(others.is_empty(), "{others:?}");
-    // The credit came with the session still held by this case.
-    drop(commit);
+    // The credit came with the session still held by the case's thread.
+    let_go.send(()).expect("lets the session go");
+    commit.join().expect("the thread ended");
     rig.finish().await;
 }
 
