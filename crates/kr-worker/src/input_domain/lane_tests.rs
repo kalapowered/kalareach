@@ -603,3 +603,61 @@ fn a_release_returns_the_reservation_to_the_room() {
     rig.release(&view);
     assert_eq!(rig.input.ledger().reserved, Cost::default());
 }
+
+/// What a give-back that lands on another thread while a top-up runs leaves behind. The writer's
+/// give-back takes no lock: it lowers the counters and then asks for a top-up. A top-up that read the
+/// counters and only then cleared the request would erase a request made in between, and the window
+/// would stay smaller than it should be with nothing left to ask for it. The task that serves the
+/// requests runs a top-up whenever one is due, so once the writer is done and the last request has
+/// been served the window is whole.
+#[test]
+fn a_give_back_on_another_thread_while_a_top_up_runs_is_never_lost() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    for _ in 0..4_000 {
+        let mut rig = Rig::new();
+        let mut view = View::new();
+        rig.take(&mut view);
+        let lane = rig.bind(&view);
+        for _ in 0..3 {
+            rig.write(&mut view, Some(lane.id), b"k").expect("accepted");
+        }
+        let batches = rig.input.take_pending();
+        let room = rig.input.input_room();
+        let shared = InputShared::new(rig.input);
+        let finished = Arc::new(AtomicBool::new(false));
+        let task = {
+            let (shared, room, finished) = (
+                Arc::clone(&shared),
+                Arc::clone(&room),
+                Arc::clone(&finished),
+            );
+            std::thread::spawn(move || {
+                while !finished.load(Ordering::Acquire) {
+                    if room.topup().is_due() {
+                        shared.lock().top_up();
+                    }
+                }
+            })
+        };
+        let writer = std::thread::spawn(move || {
+            for batch in batches {
+                std::thread::yield_now();
+                drop(batch);
+            }
+        });
+        writer.join().expect("the writer ran");
+        finished.store(true, Ordering::Release);
+        task.join().expect("the task ran");
+        // The task's last pass serves a request that was made after its loop looked.
+        if room.topup().is_due() {
+            shared.lock().top_up();
+        }
+        let ledger = shared.lock().ledger();
+        assert_eq!(
+            ledger.reserved, LANE_WINDOW,
+            "a give-back was lost: the window is smaller than the bound with every claim done with"
+        );
+    }
+}
