@@ -3,8 +3,8 @@
 //! Time passes on a [`Made`] clock only when a case moves it or when a wait of its own runs out, so
 //! what a run waited is read off the clock by a condition and never measured. A wait that runs out
 //! moves the clock to the moment it was asked to wait until; one that is given a message waits for
-//! the message and moves nothing. The one real wait here is the guard on a message that never
-//! comes, which ends a case that has a fault and no other.
+//! the message and moves nothing. The one real wait here is the receive in `Wait::Message`, which
+//! ends when the message comes, or at a guard when none does.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -91,10 +91,10 @@ impl Made {
 }
 
 /// What a clock that a case moves cannot see: a wait that does not go through the wait a run is
-/// given. These cases hold, by a scan of the words that block, that the code a hook run executes
-/// waits only through that wait, the system's wait that `run` passes (held by its text), the
-/// claim's clock and pause (held by their text), and the run's work, which a run abandons at its
-/// deadline. The scan checks words, and its case names its limits.
+/// given. These cases hold, by a scan of the words that block and of two names, that the code a
+/// hook run executes waits only through that wait; that the wiring that gives a run the system's
+/// clock, the system's wait and the claim is held by its text; and that the claim's clock and pause
+/// are held by their text. The scan checks words, and its case names its limits.
 #[cfg(test)]
 mod waits_only_through_the_seam {
     /// What blocks a thread for a time or until another thread acts, as it is written.
@@ -115,6 +115,21 @@ mod waits_only_through_the_seam {
     /// The name of the system's wait, which a run is given and which only the entries that give it
     /// may name.
     const SYSTEM_WAIT: &str = "wait_by";
+
+    /// The name of the claim's entry, which a run is given and which only the entries that give it
+    /// may name: a second call of it is a second wait of up to the claim's time.
+    const CLAIM_ENTRY: &str = "claim_answer";
+
+    /// The functions of a file that may hold what the scan looks for.
+    #[derive(Clone, Copy, Default)]
+    struct Allowed<'a> {
+        /// A blocking word.
+        blocking: &'a [&'a str],
+        /// The name of the system's wait.
+        system_wait: &'a [&'a str],
+        /// The name of the claim's entry.
+        claim: &'a [&'a str],
+    }
 
     /// `line` without a `//` comment at its end. A `//` inside a string literal is not a comment
     /// (a character literal or a raw string that holds a quote is not told apart).
@@ -173,18 +188,19 @@ mod waits_only_through_the_seam {
         lines
     }
 
-    /// The lines of `source`, up to its test module, that hold a blocking wait outside a comment,
-    /// or name the system's wait, as the function they are in and the line. A blocking word is
-    /// left out in the functions named in `allowed`, and the system's wait in those named in
-    /// `system_in`.
-    fn blocking_waits(source: &str, allowed: &[&str], system_in: &[&str]) -> Vec<String> {
+    /// The lines of `source`, up to its test module, that hold a blocking word outside a comment,
+    /// or name the system's wait or the claim's entry, as the function they are in and the line.
+    /// Each is left out in the functions that `allowed` names for it.
+    fn blocking_waits(source: &str, allowed: Allowed) -> Vec<String> {
         code_lines(source)
             .into_iter()
             .filter(|(name, code)| {
-                let blocks = !allowed.contains(&name.as_str())
+                let name = name.as_str();
+                let blocks = !allowed.blocking.contains(&name)
                     && BLOCKING.iter().any(|word| code.contains(word));
-                let system = !system_in.contains(&name.as_str()) && code.contains(SYSTEM_WAIT);
-                blocks || system
+                let system = !allowed.system_wait.contains(&name) && code.contains(SYSTEM_WAIT);
+                let claim = !allowed.claim.contains(&name) && code.contains(CLAIM_ENTRY);
+                blocks || system || claim
             })
             .map(|(name, code)| format!("in `{name}`: {}", code.trim()))
             .collect()
@@ -215,6 +231,11 @@ mod waits_only_through_the_seam {
         squashed(&code[opens.min(closes)..closes].concat())
     }
 
+    /// Whether the code of the function `name` in `source` holds `call`, as it is written.
+    fn holds(source: &str, name: &str, call: &str) -> bool {
+        body_of(source, name).contains(&squashed(call))
+    }
+
     /// A hook run waits only through the wait it is given, which is what a clock that a case
     /// moves holds: there is no other wait in what the run executes that the scan can see, so no
     /// case passes with such a wait it cannot see.
@@ -222,17 +243,27 @@ mod waits_only_through_the_seam {
     /// - `wait_by` is the system's wait that `run` passes, and `start` and `finish` are the report
     ///   writer's own thread and its closing wait, which the channel server runs and a hook run
     ///   never does.
-    /// - The system's wait is named only in its definition, in `run` and in `report_by`, and its
-    ///   one line of code is held by its text; no other function may call it, which is how a second
-    ///   wait on the system's clock after the one a run is given would be found.
-    /// - `claim_answer` passes the system's clock and the pause of a millisecond to `claim`, whose
-    ///   waits are then given by its caller, and its one statement is held by its text.
+    /// - The system's wait is named only in its definition, in `run` and in `report_by`; the claim's
+    ///   entry only in `run`, in the wrapper that `hook.rs` gives it and in its definition in
+    ///   `helper.rs`. A second call of either elsewhere is found.
+    /// - What gives a run the system's clock, the system's wait and the claim is held by its text:
+    ///   `run`'s call of `run_with`, `report_by`'s call of `report_with`, the wrapper's one
+    ///   statement, `wait_by`'s one line, and `claim_answer`'s one statement in `helper.rs`, which
+    ///   passes the system's clock and the pause of a millisecond to `claim`, whose waits are then
+    ///   given by its caller.
     ///
-    /// The scan finds words and has limits: a word in a string literal is found; a character
-    /// literal or a raw string that holds a quote, a `/* */` comment, a primitive that is not in
-    /// the list (a `select!`, blocking input or output, a spin on the clock) and a path call such
-    /// as `Receiver::recv(&rx)` are not told apart or not found; and a name allows every function
-    /// of that name in its file.
+    /// The scan finds words and has limits:
+    /// - A word in a string literal is found; a character literal or a raw string that holds a
+    ///   quote, a string that spans lines, and a `/* */` comment are not told apart.
+    /// - A primitive that is not in the list is not found: a `select!`, blocking input or output, a
+    ///   spin on the clock, a path call such as `Receiver::recv(&rx)`, a lock that another thread
+    ///   holds (`std::io::stderr().lock()` after the diagnostic, while the stalled writer holds
+    ///   it).
+    /// - A call of a function that waits inside it is not followed: `report_by` reaches `wait_by`,
+    ///   and `kr_ipc::install::this_process()` can wait.
+    /// - A name holds what a function contains, not where it runs: `observe` is safe only while
+    ///   the work that `run` gives `run_with` is its one caller, and `start` and `finish` allow
+    ///   every function of that name in `lib.rs`.
     #[test]
     fn a_hook_run_waits_only_through_the_wait_it_is_given() {
         let (hook, lib, helper) = (
@@ -240,22 +271,65 @@ mod waits_only_through_the_seam {
             include_str!("lib.rs"),
             include_str!("helper.rs"),
         );
-        for (file, source, allowed, system_in) in [
-            ("hook.rs", hook, &["observe"][..], &["run"][..]),
+        for (file, source, allowed) in [
+            (
+                "hook.rs",
+                hook,
+                Allowed {
+                    blocking: &["observe"],
+                    system_wait: &["run"],
+                    claim: &["run", "claim_answer"],
+                },
+            ),
             (
                 "lib.rs",
                 lib,
-                &["wait_by", "start", "finish"][..],
-                &["wait_by", "report_by"][..],
+                Allowed {
+                    blocking: &["wait_by", "start", "finish"],
+                    system_wait: &["wait_by", "report_by"],
+                    claim: &[],
+                },
             ),
-            ("helper.rs", helper, &["claim_answer"][..], &[][..]),
+            (
+                "helper.rs",
+                helper,
+                Allowed {
+                    blocking: &["claim_answer"],
+                    system_wait: &[],
+                    claim: &["claim_answer"],
+                },
+            ),
         ] {
-            let found = blocking_waits(source, allowed, system_in);
+            let found = blocking_waits(source, allowed);
             assert!(
                 found.is_empty(),
                 "{file} waits other than through the wait a run is given: {found:#?}"
             );
         }
+        assert!(
+            holds(
+                hook,
+                "run",
+                "run_with(started, move |started| observe(application, started), claim_answer, \
+                 answer, |bytes| { use std::io::Write as _; \
+                 let _ = std::io::stderr().lock().write_all(bytes); }, \
+                 std::time::Instant::now, crate::wait_by,);"
+            ),
+            "what gives a run its work, its claim, its answer, its clock and its wait is not what it was"
+        );
+        assert_eq!(
+            body_of(hook, "claim_answer"),
+            squashed("#[cfg(unix)] crate::helper::claim_answer();"),
+            "the claim's wrapper is not what it was"
+        );
+        assert_eq!(
+            body_of(lib, "report_by"),
+            squashed(
+                "report_with(line, by, |bytes| { use std::io::Write as _; \
+                 let _ = std::io::stderr().lock().write_all(bytes); }, wait_by,);"
+            ),
+            "what gives a report the system's wait is not what it was"
+        );
         assert_eq!(
             body_of(lib, "wait_by"),
             squashed(
@@ -274,42 +348,45 @@ mod waits_only_through_the_seam {
     }
 
     /// The scan finds each word it looks for, in any function that is not allowed, and passes a
-    /// comment, an allowed function by its name, and a test module; it finds the system's wait
-    /// outside the functions that may name it, and it holds a function's text.
+    /// comment, an allowed function by its name, and a test module; it finds the system's wait and
+    /// the claim's entry outside the functions that may name them, and it holds a function's text.
     #[test]
     fn the_scan_finds_every_blocking_wait_and_passes_a_comment() {
+        let none = Allowed::default();
         // Joining a path takes an argument and waits for nothing; joining a thread does not.
         let path = "fn hand_over() {\n    let at = dir.join(\"bin\");\n}\n";
-        assert!(
-            blocking_waits(path, &[], &[]).is_empty(),
-            "a path is joined"
-        );
+        assert!(blocking_waits(path, none).is_empty(), "a path is joined");
         // A `//` inside a string is not a comment, so the word after it is found.
         let string = "fn run_with() {\n    let at = \"a//b\"; outcome.recv_timeout(d);\n}\n";
-        assert_eq!(blocking_waits(string, &[], &[]).len(), 1, "after a string");
+        assert_eq!(blocking_waits(string, none).len(), 1, "after a string");
         for word in BLOCKING {
             let wait = format!("fn run_with() {{\n    let _ = outcome {word} 5;\n}}\n");
-            assert_eq!(
-                blocking_waits(&wait, &[], &[]).len(),
-                1,
-                "`{word}` is found"
-            );
+            assert_eq!(blocking_waits(&wait, none).len(), 1, "`{word}` is found");
             let nested =
                 format!("impl Run {{\n    fn finish(&self) {{\n        {word}\n    }}\n}}\n");
             assert_eq!(
-                blocking_waits(&nested, &[], &[]).len(),
+                blocking_waits(&nested, none).len(),
                 1,
                 "`{word}` in a method is found"
             );
+            let finish = Allowed {
+                blocking: &["finish"],
+                ..none
+            };
             assert_eq!(
-                blocking_waits(&nested, &["finish"], &[]),
+                blocking_waits(&nested, finish),
                 Vec::<String>::new(),
                 "`{word}` in an allowed function passes"
             );
             let other =
                 format!("fn run_with() {{\n    {word}\n}}\nfn wait_by() {{\n    {word}\n}}\n");
+            let wait_by = Allowed {
+                blocking: &["wait_by"],
+                system_wait: &["wait_by"],
+                ..none
+            };
             assert_eq!(
-                blocking_waits(&other, &["wait_by"], &["wait_by"]),
+                blocking_waits(&other, wait_by),
                 ["in `run_with`: ".to_owned() + word],
                 "only the function that is not allowed is found"
             );
@@ -320,38 +397,49 @@ mod waits_only_through_the_seam {
             ] {
                 let source = format!("fn run_with() {{\n{comment}\n}}\n");
                 assert!(
-                    blocking_waits(&source, &[], &[]).is_empty(),
+                    blocking_waits(&source, none).is_empty(),
                     "`{comment}` is a comment"
                 );
             }
             let after_a_short_one = format!("fn quick() {{}}\nfn wait_by() {{\n    {word}\n}}\n");
             assert!(
-                blocking_waits(&after_a_short_one, &["wait_by"], &["wait_by"]).is_empty(),
+                blocking_waits(&after_a_short_one, wait_by).is_empty(),
                 "a function on one line does not hold the next one's name"
             );
             let tests = format!("fn run_with() {{}}\n#[cfg(test)]\nmod tests {{\n    {word}\n}}\n");
             assert!(
-                blocking_waits(&tests, &[], &[]).is_empty(),
+                blocking_waits(&tests, none).is_empty(),
                 "`{word}` in the test module passes"
             );
             let item = format!("static WAIT: u64 = {word};\n");
             assert_eq!(
-                blocking_waits(&item, &[], &[]).len(),
+                blocking_waits(&item, none).len(),
                 1,
                 "`{word}` outside a function is found"
             );
         }
-        // The system's wait is named only where it is allowed.
+        // The system's wait and the claim's entry are named only where they are allowed.
         let call =
             "fn write_by() {\n    let _ = wait_by(&done, by);\n}\nfn run() {\n    wait_by,\n}\n";
+        let entries = Allowed {
+            system_wait: &["run"],
+            claim: &["run"],
+            ..none
+        };
         assert_eq!(
-            blocking_waits(call, &[], &["run"]),
+            blocking_waits(call, entries),
             ["in `write_by`: let _ = wait_by(&done, by);"],
             "a call of the system's wait outside the entries is found"
         );
+        let twice = "fn run_with() {\n    claim();\n    claim_answer();\n}\nfn run() {\n    claim_answer,\n}\n";
+        assert_eq!(
+            blocking_waits(twice, entries),
+            ["in `run_with`: claim_answer();"],
+            "a second call of the claim's entry is found"
+        );
         assert!(
-            blocking_waits("fn run() {\n    // wait_by\n}\n", &[], &[]).is_empty(),
-            "a comment names it"
+            blocking_waits("fn run() {\n    // wait_by claim_answer\n}\n", none).is_empty(),
+            "a comment names them"
         );
         // A function's text is held however a formatter breaks its lines, and a change shows.
         let wait = "pub(crate) fn wait_by(\n    c: &C,\n) -> R {\n    c.recv_timeout(by)\n}\n";
@@ -360,5 +448,20 @@ mod waits_only_through_the_seam {
         assert_ne!(body_of(&longer, "wait_by"), "c.recv_timeout(by)");
         let broken = "fn claim_answer() {\n    claim(\n        a,\n        || {\n            go();\n        },\n    );\n}\n";
         assert_eq!(body_of(broken, "claim_answer"), "claim(a,||{go();});");
+        // What gives a run its wait is held: the wait itself, and a clock with time added, are not
+        // the text that is held.
+        let wiring = "fn run() {\n    run_with(\n        started,\n        std::time::Instant::now,\n        crate::wait_by,\n    );\n}\n";
+        let held = "run_with(started, std::time::Instant::now, crate::wait_by,);";
+        assert!(holds(wiring, "run", held), "the text that is held");
+        let later_wait = wiring.replace(
+            "crate::wait_by,",
+            "|c, by| crate::wait_by(c, by + std::time::Duration::from_millis(50)),",
+        );
+        assert!(!holds(&later_wait, "run", held), "a wait with time added");
+        let later_clock = wiring.replace(
+            "std::time::Instant::now,",
+            "|| std::time::Instant::now() + std::time::Duration::from_millis(300),",
+        );
+        assert!(!holds(&later_clock, "run", held), "a clock with time added");
     }
 }
