@@ -35,9 +35,9 @@ struct Package {
     source: Option<String>,
 }
 
-/// What this check reads of a lock: the packages, and `found`, each entry of the root's
-/// `patch.unused` as `name version` together with each report of something that this check cannot
-/// read.
+/// What this check reads of a lock: the packages (the root's `package` array and, as cargo reads
+/// it, the legacy `root` table as one more), and `found`, each entry of the root's `patch.unused`
+/// as `name version` together with each report of something that this check cannot read.
 struct Lock {
     packages: Vec<Package>,
     found: Vec<String>,
@@ -51,6 +51,22 @@ fn render(entry: &Value) -> String {
         name => name,
     };
     format!("{name} {}", field("version")).trim().to_owned()
+}
+
+/// Adds a package of the lock, or reports why this check cannot read it: its name and its source,
+/// when it has one, have to be strings.
+fn read_package(read: &mut Lock, place: &str, package: &Value) {
+    let name = package.get("name").and_then(Value::as_str);
+    let source = package.get("source").map(Value::as_str);
+    match (name, source) {
+        (Some(name), None | Some(Some(_))) => read.packages.push(Package {
+            name: name.to_owned(),
+            source: source.flatten().map(str::to_owned),
+        }),
+        _ => read.found.push(format!(
+            "{place} of the lock has no string name, or has a source that is not a string"
+        )),
+    }
 }
 
 /// Reads a lock file. A patch entry that nothing used is an entry of `patch.unused` at the root,
@@ -70,23 +86,16 @@ fn read_lock(lock: &str) -> Lock {
             return read;
         }
     };
+    match root.get("root") {
+        None => {}
+        Some(package @ Value::Table(_)) => read_package(&mut read, "the `root` package", package),
+        Some(_) => read.found.push("`root` is not a table".to_owned()),
+    }
     match root.get("package") {
         None => {}
         Some(Value::Array(packages)) => {
             for (index, package) in packages.iter().enumerate() {
-                let name = package.get("name").and_then(Value::as_str);
-                let source = package.get("source").map(Value::as_str);
-                match (name, source) {
-                    (Some(name), None | Some(Some(_))) => read.packages.push(Package {
-                        name: name.to_owned(),
-                        source: source.flatten().map(str::to_owned),
-                    }),
-                    _ => read.found.push(format!(
-                        "package {} of the lock has no string name, or has a source that is not a \
-                         string",
-                        index + 1
-                    )),
-                }
+                read_package(&mut read, &format!("package {}", index + 1), package);
             }
         }
         Some(_) => read
@@ -210,6 +219,9 @@ fn what_the_check_cannot_read_fails_it_and_what_holds_no_entry_does_not() {
         "version = 4\n\n[[package]]\nversion = \"1.0.0\"\n",
         "version = 4\n\n[[package]]\nname = \"a\"\nsource = 4\n",
         "version = 4\npackage = \"x\"\n",
+        "version = 4\n\n[root]\nversion = \"1.0.0\"\n",
+        "version = 4\n\n[root]\nname = \"a\"\nsource = 4\n",
+        "version = 4\nroot = \"x\"\n",
     ];
     for lock in not_read {
         assert_eq!(read_lock(lock).found.len(), 1, "{lock:?}");
@@ -298,25 +310,45 @@ fn read_patches(manifest: &str) -> Result<Vec<Patch>, String> {
     Ok(patches)
 }
 
-/// What counts as one repository: the same scheme, host, port, user name and path, where the
-/// letter case of the scheme and the host does not matter, a port that is the scheme's default is
-/// no port, and the path ignores a final `/` and a final `.git`. The rest of the path is compared
-/// as it is written.
-fn repository_of(url: &Url) -> (String, String, Option<u16>, String, String) {
-    let path = url.path().trim_end_matches('/');
-    let path = path.strip_suffix(".git").unwrap_or(path);
-    (
-        url.scheme().to_ascii_lowercase(),
-        url.host_str().unwrap_or_default().to_ascii_lowercase(),
-        url.port_or_known_default(),
-        url.username().to_owned(),
-        path.to_owned(),
-    )
+/// A Git URL in the form by which cargo identifies a repository, the same steps as the
+/// `CanonicalUrl` of cargo 1.97 (`src/cargo/util/canonical_url.rs`, commit `c980f4866`): a URL that
+/// cannot be a base has none; one final `/` goes; and for a scheme without a `+`, a URL whose host
+/// is exactly `github.com` takes the scheme `https` and a lower-case path, and a final `.git` of the
+/// path goes.
+///
+/// Two URLs are one repository when these forms are equal. So the host's letter case makes no
+/// difference for `http` and `https`, whose host the URL parser lowers, and does for another scheme,
+/// which it leaves as written; a `.git` suffix and a final `/` make none; the path's letter case
+/// makes none on `github.com` and does elsewhere; the scheme makes none on `github.com` and does
+/// elsewhere; a default port is no port; and the user name and the rest of the URL count.
+fn canonical_url(url: &Url) -> Option<Url> {
+    if url.cannot_be_a_base() {
+        return None;
+    }
+    let mut url = url.clone();
+    if url.path().ends_with('/') {
+        url.path_segments_mut().ok()?.pop_if_empty();
+    }
+    if !url.scheme().contains('+') {
+        if url.host_str() == Some("github.com") {
+            url = format!("https{}", &url[url::Position::AfterScheme..])
+                .parse()
+                .ok()?;
+            let path = url.path().to_lowercase();
+            url.set_path(&path);
+        }
+        if url.path().ends_with(".git") {
+            let last = url.path_segments()?.next_back()?.to_owned();
+            let last = last.strip_suffix(".git")?;
+            url.path_segments_mut().ok()?.pop().push(last);
+        }
+    }
+    Some(url)
 }
 
 /// Whether the lock's `source` of a package is the entry's repository at the entry's revision, in
 /// the form cargo writes: `git+<url>?rev=<revision>#<commit>`, where the commit starts with the
-/// revision. The URLs are compared as [`repository_of`] says; the revision is compared as written.
+/// revision. The URLs are compared as [`canonical_url`] says; the revision is compared as written.
 fn comes_from_the_entry(source: &str, git: &str, rev: &str) -> bool {
     let Some((location, commit)) = source
         .strip_prefix("git+")
@@ -324,14 +356,16 @@ fn comes_from_the_entry(source: &str, git: &str, rev: &str) -> bool {
     else {
         return false;
     };
-    let (Ok(location), Ok(entry)) = (Url::parse(location), Url::parse(git)) else {
+    let (Ok(mut location), Ok(entry)) = (Url::parse(location), Url::parse(git)) else {
         return false;
     };
-    location.query() == Some(format!("rev={rev}").as_str())
+    let asks_for_the_revision = location.query() == Some(format!("rev={rev}").as_str());
+    location.set_query(None);
+    asks_for_the_revision
         && commit.starts_with(rev)
         && entry.query().is_none()
         && entry.fragment().is_none()
-        && repository_of(&location) == repository_of(&entry)
+        && canonical_url(&location).is_some_and(|location| canonical_url(&entry) == Some(location))
 }
 
 /// What the lock holds against each patch entry of the manifest: exactly one package of the crate's
@@ -447,54 +481,94 @@ fn a_package_is_read_by_its_data_and_not_by_its_spelling() {
     assert!(problems[0].contains(REGISTRY), "{problems:?}");
 }
 
-/// Two spellings of a repository's URL are one repository as [`repository_of`] says: the letter
-/// case of the scheme and the host, the default port, a final `.git` and a final `/` make no
-/// difference, and anything else does.
+/// The legacy `[root]` table of a lock is a package that cargo reads with the `[[package]]` ones,
+/// so a second package of a patched name written there is counted.
+#[test]
+fn a_second_package_under_the_legacy_root_table_is_counted() {
+    let lock = fixture("two-packages-lock.txt").replacen("[[package]]", "[root]", 1);
+    let lock = read_lock(&lock);
+    assert_eq!(lock.packages.len(), 2);
+    assert!(lock.found.is_empty(), "{:?}", lock.found);
+    let problems = patch_problems(&manifest_with(GIT_ENTRY), &lock);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].contains("2 packages"), "{problems:?}");
+}
+
+/// Two URLs are one repository when the forms that cargo identifies them by are equal
+/// ([`canonical_url`]). Each of the equal spellings below is a manifest URL against a lock that
+/// holds the plain one, or a lock URL against a manifest that holds the plain one.
 #[test]
 fn a_repository_is_the_same_repository_in_every_spelling_of_its_url() {
-    let lock = lock_with(&[("noq-proto", GIT_SOURCE)]);
-    for url in [
-        "https://github.com/kalapowered/noq",
+    let udp_entry = |url: &str| format!("noq-udp = {{ git = \"{url}\", rev = \"ab\" }}");
+    let problems = |manifest_url: &str, lock_url: &str| {
+        let entry = entry_at(manifest_url);
+        let source = GIT_SOURCE.replacen("https://github.com/kalapowered/noq", lock_url, 1);
+        patch_problems(
+            &manifest_with(&entry),
+            &lock_with(&[("noq-proto", source.as_str())]),
+        )
+    };
+    let plain = "https://github.com/kalapowered/noq";
+    for spelling in [
         "https://GITHUB.COM/kalapowered/noq",
         "HTTPS://github.com/kalapowered/noq",
         "https://github.com/kalapowered/noq.git",
         "https://github.com/kalapowered/noq/",
         "https://github.com:443/kalapowered/noq",
+        "https://github.com/KalaPowered/noq",
+        "https://github.com/KalaPowered/Noq.git",
+        "https://GitHub.com/KALAPOWERED/NOQ/",
+        "http://github.com/kalapowered/noq",
+        "ssh://github.com/kalapowered/noq",
     ] {
-        let manifest = manifest_with(&entry_at(url));
         assert_eq!(
-            patch_problems(&manifest, &lock),
+            problems(spelling, plain),
             Vec::<String>::new(),
-            "{url}"
+            "{spelling}"
+        );
+        assert_eq!(
+            problems(plain, spelling),
+            Vec::<String>::new(),
+            "{spelling}"
         );
     }
-    let with_suffix = GIT_SOURCE.replacen("noq?", "noq.git?", 1);
-    let lock = lock_with(&[("noq-proto", with_suffix.as_str())]);
-    assert_eq!(
-        patch_problems(&manifest_with(GIT_ENTRY), &lock),
-        Vec::<String>::new()
-    );
-    // The URL parser leaves the host of a scheme it does not know as it is written.
-    let over_ssh = GIT_SOURCE.replacen("https://", "ssh://", 1);
-    let lock = lock_with(&[("noq-proto", over_ssh.as_str())]);
-    let manifest = manifest_with(&entry_at("ssh://GitHub.com/kalapowered/noq"));
-    assert_eq!(patch_problems(&manifest, &lock), Vec::<String>::new());
-    let lock = lock_with(&[("noq-proto", GIT_SOURCE)]);
     for url in [
         "https://github.com/kalapowered/other",
         "https://github.com/kalapowered",
-        "https://github.com/KalaPowered/noq",
-        "http://github.com/kalapowered/noq",
         "https://github.com:8443/kalapowered/noq",
         "https://user@github.com/kalapowered/noq",
         "https://example.org/kalapowered/noq",
         "https://github.com/kalapowered/noq?branch=main",
         "https://github.com/kalapowered/noq#main",
         "github.com/kalapowered/noq",
+        "ssh://GitHub.com/kalapowered/noq",
     ] {
-        let manifest = manifest_with(&entry_at(url));
-        let problems = patch_problems(&manifest, &lock);
-        assert_eq!(problems.len(), 1, "{url}: {problems:?}");
+        assert_eq!(problems(url, plain).len(), 1, "{url}");
+    }
+    // A URL that cannot be a base, as `host:path` is, names no repository, not even against itself.
+    let scp = "github.com:kalapowered/noq";
+    assert_eq!(problems(scp, scp).len(), 1);
+    // A scheme with a `+` is not a plain Git URL, and cargo canonicalises it no further.
+    let plus = "git+https://github.com/KalaPowered/noq";
+    assert!(problems(plus, plus).is_empty());
+    assert_eq!(
+        problems(plus, "git+https://github.com/kalapowered/noq").len(),
+        1
+    );
+    // Another host: the scheme and the path's case count, the host's case counts only for a scheme
+    // whose host the URL parser lowers.
+    let lock = lock_with(&[("noq-udp", "git+https://example.org/u?rev=ab#abcdef")]);
+    for (url, equal) in [
+        ("https://example.org/u", true),
+        ("https://EXAMPLE.org/u", true),
+        ("https://example.org/u.git", true),
+        ("https://example.org/u/", true),
+        ("https://example.org/U", false),
+        ("http://example.org/u", false),
+        ("ssh://example.org/u", false),
+    ] {
+        let found = patch_problems(&manifest_with(&udp_entry(url)), &lock).len();
+        assert_eq!(found, usize::from(!equal), "{url}");
     }
 }
 
@@ -656,11 +730,13 @@ fn a_manifest_is_read_as_data_in_every_spelling_that_toml_gives_it() {
         )),
         format!("note = '''\n[workspace]\n'''\n{}", manifest_with(GIT_ENTRY)),
         format!(
-            "[workspace]\npatch = {{ crates-io = {{ noq-proto = {{ git = \"{git}\", rev = \"{rev}\" }} }} }}\n"
+            "patch = {{ crates-io = {{ noq-proto = {{ git = \"{git}\", rev = \"{rev}\" }} }} }}\n\n[workspace]\nmembers = []\n"
         ),
         format!("\u{feff}{}", manifest_with(GIT_ENTRY)),
         manifest_with(GIT_ENTRY).replace('\n', "\r\n"),
     ] {
+        let patches = read_patches(&manifest).expect("a manifest that parses");
+        assert_eq!(patches.len(), 1, "{manifest:?}");
         let problems = patch_problems(&manifest, &lock);
         assert!(problems.is_empty(), "{manifest:?}: {problems:?}");
     }
@@ -675,11 +751,9 @@ fn a_manifest_is_read_as_data_in_every_spelling_that_toml_gives_it() {
 /// The sentence of `docs/README.md` that the list of crates taken from Git follows.
 const LIST_INTRO: &str = "Core's lock takes these crates from Git:";
 
-/// Whether a line starts a Markdown list item, in any marker.
+/// Whether a line starts a Markdown list item: a marker, then a space, a tab or the end of the line.
 fn starts_a_list_item(text: &str) -> bool {
-    let Some((marker, _)) = text.split_once(' ') else {
-        return false;
-    };
+    let (marker, _) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
     matches!(marker, "-" | "*" | "+")
         || marker
             .strip_suffix(['.', ')'])
@@ -875,6 +949,12 @@ fn a_list_structure_that_the_reader_does_not_know_fails_with_its_line() {
         ("1. from a fork: `a`\n", 4),
         ("- from a fork: `a`\n  - nested: `b`\n", 5),
         ("- from a fork: `a`\n\n  1) nested: `b`\n", 6),
+        ("*\tfrom a fork: `a`\n", 4),
+        ("1.\tfrom a fork: `a`\n", 4),
+        ("- from a fork: `a`\n\n-\tfrom upstream: `stale-crate`\n", 6),
+        ("- from a fork: `a`\n\t- nested: `b`\n", 5),
+        ("- from a fork: `a`\n\n\t-\tnested: `b`\n", 6),
+        ("- from a fork: `a`\n\n-\n", 6),
         ("- from a fork `a`\n", 4),
         ("- from a fork: `a` and `b`\n", 4),
         ("- from a fork: `a`, , `b`\n", 4),
