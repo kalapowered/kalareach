@@ -806,8 +806,9 @@ impl Controller {
             // host's own device identity and key: the local caller proves no key, the operating
             // system identity the socket authenticated is the proof. The event it answers with
             // derives from the one an earlier presentation left, so the answer is a copy, but for
-            // the answer of a presentation whose own effect withdrew the whole host through the
-            // barrier it waited for, which settles with the proof of it.
+            // the answer of a presentation whose own change (a lease that ends sooner, or a chain
+            // that drops a lease, with a lease that is new or was in force) withdrew the whole host
+            // through the barrier it waited for, which settles with the proof of it.
             (LocalWrite::Derived(_), Method::MembershipPresent) => self
                 .membership_present_settled(
                     self.local_owner_device(),

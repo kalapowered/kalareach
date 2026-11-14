@@ -1067,13 +1067,15 @@ impl Controller {
 
     /// `membership.present` for the host's own local owner, settled as the local door tells it.
     ///
-    /// A presentation that installs a lease that ends sooner than the one before it owes the whole
-    /// host a fence of its own, and the barrier that retires it withdraws every connection, the one
-    /// the presentation arrived on included. The presentation waits for that barrier, as a request
-    /// that withdraws the host does, and settles with the proof of it ([`HostWithdrawal`]): the
-    /// answer of the request that installed the lease is then told while that revision is still
-    /// the one in force. Every other answer, a repeat of a lease in force and a refusal among them,
-    /// derives from an earlier event and is a copy.
+    /// A presentation whose own change owes the whole host a fence has two causes: it installs a
+    /// lease that ends sooner than the one before it, or it brings a chain that drops a lease,
+    /// whether the lease it presents is new or was already in force. The barrier that retires that
+    /// fence withdraws every connection, the one the presentation arrived on included. The
+    /// presentation waits for that barrier, as a request that withdraws the host does, and settles
+    /// with the proof of it ([`HostWithdrawal`]): the answer is then told while that revision is
+    /// still the one in force, since the only movement is the request's own. Every other answer,
+    /// a repeat of a lease in force with no change of its own and a refusal among them, derives
+    /// from an earlier event and is a copy.
     ///
     /// [`HostWithdrawal`]: super::barrier::HostWithdrawal
     pub(crate) async fn membership_present_settled(
@@ -1091,11 +1093,14 @@ impl Controller {
             return crate::given::Settled::of(Given::copied(answered));
         };
         match self.barrier_proving(own).await {
-            Ok((_barrier, proof)) => {
-                crate::given::Settled::withdrawing(Given::fresh(answered), proof)
+            Ok((_barrier, Some(proof))) => {
+                crate::given::Settled::withdrawing(Given::fresh(answered), Some(proof))
             }
-            // The barrier could not be raised: a fence is owed, which the door asks about.
-            Err(_) => crate::given::Settled::of(Given::copied(answered)),
+            // A barrier that gave no proof, or that could not be raised (a fence may be owed, or the
+            // registration may be gone), proves nothing of this request's own: the answer is a
+            // copy, which the door tells only under the strict check. The connection that the
+            // host-wide barrier withdrew fails it, so the caller is told it is not shown.
+            Ok((_barrier, None)) | Err(_) => crate::given::Settled::of(Given::copied(answered)),
         }
     }
 
