@@ -174,13 +174,40 @@ for (const platform of ['darwin', 'linux', 'win32']) {
     ['build', '--', '--profile=release-lto'],
     ['build', '--', '--release'],
     ['build', '--ci', '--', '-r'],
+    // Cargo reads a cluster of short flags from the left and ends it at the first letter that takes a value
+    // (`-p`, `-F`, `-j`, `-m`, `-Z`), so `r` is the release flag wherever only flags (`v`, `q`, `h`) stand before it.
+    ['build', '--', '-rv'],
+    ['build', '--', '-vr'],
+    ['build', '--', '-qr'],
+    ['build', '--', '-vvr'],
+    ['build', '--debug', '--', '-vr'],
+    // Cargo takes no word after a second `--` (it ends in an error), and every word after the first is read.
+    ['build', '--', '--', '-rv'],
     ['build', '--', '--target-dir', 'C:/cached-target'],
     ['build', '--', '--target-dir=target-other'],
-    ['build', '--', '--manifest-path', 'other/Cargo.toml']
+    ['build', '--', '--manifest-path', 'other/Cargo.toml'],
+    ['build', '--', '-m', 'other/Cargo.toml'],
+    ['build', '--', '-mother/Cargo.toml'],
+    ['build', '--', '-vm', 'other/Cargo.toml']
   ]) {
     held(`\`pnpm desktop ${argv.join(' ')}\` is refused on ${platform}, since cargo would be given its own setting`, 'true', refused(argv, platform))
   }
-  for (const argv of [['build', '--', '--locked'], ['build', '--', '--offline', '--frozen'], ['build', '--', '--configuration'], ['build', '--', '--profile-x'], ['build', '--', '--releases']]) {
+  for (const argv of [
+    ['build', '--', '--locked'],
+    ['build', '--', '--offline', '--frozen'],
+    ['build', '--', '--configuration'],
+    ['build', '--', '--profile-x'],
+    ['build', '--', '--releases'],
+    ['build', '--', '-v'],
+    ['build', '--', '-vv'],
+    ['build', '--', '-q'],
+    ['build', '--', '-v', '--locked'],
+    // The letter after a letter that takes a value is that value: a package, a feature or a job count named `r`.
+    ['build', '--', '-pr'],
+    ['build', '--', '-vpr'],
+    ['build', '--', '-Fr'],
+    ['build', '--', '-jr']
+  ]) {
     held(`\`pnpm desktop ${argv.join(' ')}\` is run as it is given on ${platform}`, 'false', refused(argv, platform))
   }
 }
