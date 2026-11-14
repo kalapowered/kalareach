@@ -795,6 +795,24 @@ mod tests {
     }
 
     #[test]
+    fn a_load_command_shorter_than_eight_bytes_is_damage_and_is_not_stepped_over() {
+        // A header that claims three commands whose first has size 0 would otherwise stay at one
+        // offset for as many commands as it claims, which a damaged file can set to 2^32 - 1.
+        let mut empty = mach_o(8192, 72, 100);
+        empty[16..20].copy_from_slice(&3_u32.to_le_bytes());
+        for size in [0_u32, 7] {
+            empty[36..40].copy_from_slice(&size.to_le_bytes());
+            let found = damage_of(&empty, 8192);
+            assert!(
+                found
+                    .as_deref()
+                    .is_some_and(|text| text.contains(&format!("at byte 32 is {size} bytes"))),
+                "{found:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_short_script_or_a_program_of_another_system_is_not_shown_to_be_damaged() {
         assert_eq!(damage_of(b"#!/bin/sh\nexit 1\n", 17), None);
         assert_eq!(damage_of(b"\x7fELF\x02\x01", 6), None);

@@ -1,11 +1,12 @@
 //! The program that Cargo runs each test binary through is a private copy of the report's own
 //! program, on every platform: damage to the program's shared file after the copy was made does
-//! not reach a listing or a run.
+//! not reach a listing or a run, and a run whose build directory is the copy's place is refused
+//! before its first step.
 
 use std::path::{Path, PathBuf};
 
 use kr_conformance::plan::{Group, Platform, Step};
-use kr_conformance::report::{self, Options, Outcome};
+use kr_conformance::report::{self, Options, Outcome, Stopped};
 
 fn tree(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -14,17 +15,12 @@ fn tree(name: &str) -> PathBuf {
         .join(name)
 }
 
-#[test]
-fn the_runner_cargo_gets_is_a_copy_that_stays_whole_when_the_original_is_damaged() {
-    let held = tempfile::tempdir().expect("a directory");
-    let program = Path::new(env!("CARGO_BIN_EXE_kr-conformance"));
-    let shared = held.path().join(program.file_name().expect("a file name"));
-    std::fs::copy(program, &shared).expect("a program to damage");
-    let evidence = tempfile::tempdir().expect("an evidence directory");
-    let target = std::env::temp_dir().join("kr-conformance-fixture-target-private-runner");
-    let options = Options {
+/// The report over the `forms` tree's tests, run through `lister`, with `target` as the directory
+/// its steps build in.
+fn options(evidence: &Path, lister: PathBuf, target: &Path) -> Options {
+    Options {
         root: tree("forms"),
-        evidence: kr_conformance::evidence::check_directory(evidence.path())
+        evidence: kr_conformance::evidence::check_directory(evidence)
             .expect("inside the temporary directory"),
         selection: Some(vec![Group::Rust]),
         all_terminals: false,
@@ -38,13 +34,24 @@ fn the_runner_cargo_gets_is_a_copy_that_stays_whole_when_the_original_is_damaged
             "the tree's tests",
             &["test", "--locked", "--workspace", "--no-fail-fast"],
         )]),
-        lister: shared.clone(),
+        lister,
         environment: vec![(
             "CARGO_TARGET_DIR".to_owned(),
             target.to_string_lossy().into_owned(),
         )],
         part: None,
-    };
+    }
+}
+
+#[test]
+fn the_runner_cargo_gets_is_a_copy_that_stays_whole_when_the_original_is_damaged() {
+    let held = tempfile::tempdir().expect("a directory");
+    let program = Path::new(env!("CARGO_BIN_EXE_kr-conformance"));
+    let shared = held.path().join(program.file_name().expect("a file name"));
+    std::fs::copy(program, &shared).expect("a program to damage");
+    let evidence = tempfile::tempdir().expect("an evidence directory");
+    let target = std::env::temp_dir().join("kr-conformance-fixture-target-private-runner");
+    let options = options(evidence.path(), shared.clone(), &target);
     let mut damaged = false;
     let document = report::run(&options, &mut |line| {
         if line.starts_with("step 1 of 1") {
@@ -70,4 +77,21 @@ fn the_runner_cargo_gets_is_a_copy_that_stays_whole_when_the_original_is_damaged
         tests.iter().all(|test| test.outcome == Outcome::Passed),
         "{tests:?}"
     );
+}
+
+#[test]
+fn a_build_directory_that_is_the_temporary_directory_ends_the_run_before_its_first_step() {
+    let evidence = tempfile::tempdir().expect("an evidence directory");
+    let lister = PathBuf::from(env!("CARGO_BIN_EXE_kr-conformance"));
+    let options = options(evidence.path(), lister, &std::env::temp_dir());
+    let mut announced = 0;
+    let result = report::run(&options, &mut |_| announced += 1);
+    match result {
+        Err(Stopped::PrivateCopy(problem)) => {
+            assert!(problem.contains("where a step builds"), "{problem}");
+        }
+        Err(other) => panic!("{other:?}"),
+        Ok(_) => panic!("the run went on with the copy in a build directory"),
+    }
+    assert_eq!(announced, 0, "a step was announced");
 }
