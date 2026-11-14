@@ -732,6 +732,23 @@ fn windows() -> Vec<Step> {
         ),
         Step::cargo(
             Group::Rust,
+            "the Rust reader of the evidence directory",
+            &["test", "--locked", "-p", "kr-test-artifacts"],
+        ),
+        Step::cargo(
+            Group::Rust,
+            "the PowerShell and shell readers of the evidence directory",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-conformance",
+                "--test",
+                "artifacts_readers",
+            ],
+        ),
+        Step::cargo(
+            Group::Rust,
             "the worker's library",
             &["test", "--locked", "-p", "kr-worker", "--lib"],
         ),
