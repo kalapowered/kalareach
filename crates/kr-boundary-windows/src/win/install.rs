@@ -3959,9 +3959,18 @@ impl Run {
             };
         let unread = |error: &dyn std::fmt::Display| remedy::NotProved::Unread(error.to_string());
         let at_name = file_key(&opened).map_err(|error| unread(&error))?;
-        let held = match &ffi::locked(&self.laid).manifest {
-            Some(made) => file_key(&made.identity).map_err(|error| unread(&error))?,
-            None => return Err(remedy::NotProved::Differs),
+        // The object that the last proved write made, or the replacement that a rename put at the
+        // manifest's name and that no proof has judged: it is the run's own record, and a read of
+        // the name that finds it finds the manifest that this run holds.
+        let held = {
+            let laid = ffi::locked(&self.laid);
+            match (&laid.manifest, &laid.replacement) {
+                (Some(made), _) => file_key(&made.identity).map_err(|error| unread(&error))?,
+                (None, Some(file)) if file.path == self.paths.manifest => {
+                    file_key(&file.handle).map_err(|error| unread(&error))?
+                }
+                _ => return Err(remedy::NotProved::Differs),
+            }
         };
         if held != at_name {
             return Err(remedy::NotProved::Differs);
@@ -7167,6 +7176,8 @@ mod tests {
                 Some(run.paths.manifest.clone())
             );
         }
+        // A read of the manifest's name takes the published replacement as the run's own record.
+        run.manifest_on_disk().unwrap();
         let rolled = run.take_away();
         assert!(rolled.stayed.is_empty(), "{rolled:?}");
         let prior = rolled
