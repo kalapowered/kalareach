@@ -7217,6 +7217,38 @@ mod tests {
         assert_eq!(std::fs::read_dir(&run.paths.data).unwrap().count(), 1);
     }
 
+    /// The refusal of a service that stands at the broker's name, where the one save of its result
+    /// fails: the error says the refusal and the failed save (not the save's error alone), and the
+    /// result `refused` stands in the run's manifest, which a rollback acts on. A run before its
+    /// first write has nothing on disk after it.
+    #[cfg(feature = "testing")]
+    #[test]
+    fn a_refusal_whose_save_fails_says_the_refusal_and_the_failed_save_and_keeps_refused_in_the_manifest()
+     {
+        let _one = ffi::locked(&FORCED);
+        let top = tempfile::tempdir().unwrap();
+        let mut run = unwritten_run(top.path(), true);
+        crate::manifest::forced::fail_the_next("replacement");
+        let error = refuse_service(&mut run).to_string();
+        assert!(
+            error.contains("this run did not make it and has not changed it"),
+            "{error}"
+        );
+        assert!(
+            error.contains("writing the record of this refusal also failed"),
+            "{error}"
+        );
+        assert!(error.contains("a failure forced for a case"), "{error}");
+        assert_eq!(
+            run.manifest
+                .find(ObjectKind::Service, SERVICE)
+                .unwrap()
+                .outcome,
+            Some(Outcome::Refused)
+        );
+        assert!(!run.paths.manifest.try_exists().unwrap());
+    }
+
     /// A save whose rename put an object at the manifest's name and whose proof then failed may
     /// have published the record, and the ending says so: the record that this run held is at the
     /// manifest's name after it.
