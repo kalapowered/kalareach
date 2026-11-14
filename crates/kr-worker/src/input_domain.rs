@@ -147,6 +147,18 @@ impl InputShared {
         writes.lease_batches_queued()
     }
 
+    /// Returns the stop the terminal's writer stands in when it has taken a batch, for this host's
+    /// own tests.
+    ///
+    /// A writer that is held takes nothing from the queue behind it, which is the one way to fill
+    /// the queue for certain: an application that merely stops reading still leaves room in the
+    /// terminal's own input queue, and how much differs between platforms.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn writer_hold(&self) -> Arc<crate::testing::Stall> {
+        Arc::clone(&self.lock().writer().writer_hold)
+    }
+
     /// Asks the pump to take the session and do what is owed.
     pub fn wake_pump(&self) {
         self.pump.notify_one();
@@ -323,6 +335,9 @@ pub(crate) struct WriterHandles {
     /// What the writer wrote to the pseudo-terminal, for this host's own tests.
     #[cfg(feature = "testing")]
     pub(crate) terminal_writes: Arc<crate::testing::TerminalWrites>,
+    /// The stop the writer stands in when it has taken a batch, for this host's own tests.
+    #[cfg(feature = "testing")]
+    pub(crate) writer_hold: Arc<crate::testing::Stall>,
 }
 
 impl WriterHandles {
@@ -339,6 +354,8 @@ impl WriterHandles {
             lease_change_queued: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "testing")]
             terminal_writes: Arc::default(),
+            #[cfg(feature = "testing")]
+            writer_hold: Arc::default(),
         }
     }
 }
@@ -1190,9 +1207,10 @@ impl InputDomain {
     ///
     /// Key records are spelled here, under the lock that accepts them, as the session's terminal
     /// asks for them, and what comes out is handed on exactly as bytes are. The lease and the
-    /// sequence are checked first and the spelling second, and both come before the write takes its
-    /// sequence number, so a write refused for being too long, or for an encoding that key records
-    /// cannot express, takes no number and the same one is accepted again.
+    /// sequence are checked first and the spelling second, and everything that can refuse a write
+    /// comes before the write takes its sequence number: a write refused for being too long, for an
+    /// encoding that key records cannot express, for want of room or because the managed session is
+    /// not yet taking input takes no number, and the same one is accepted when it is offered again.
     ///
     /// # Errors
     ///
@@ -1221,16 +1239,19 @@ impl InputDomain {
                     .to_owned(),
             });
         }
+        // Every refusal comes before the frame takes its sequence number. A frame that is refused
+        // has been accepted by nobody, so the same number is the one the next try carries, and the
+        // client that offers it again once there is room has not lost its place in the stream.
+        // Spelling comes after the lease check, so a caller that holds nothing spells nothing.
+        lease_refusal(self.lease.check_write(attachment_id, epoch, sequence))?;
         let spelled;
         let bytes: &[u8] = match entering {
             Entering::Bytes(bytes) => bytes,
             Entering::Keys(keys) => {
-                lease_refusal(self.lease.check_write(attachment_id, epoch, sequence))?;
                 spelled = self.spell(keys)?;
                 &spelled
             }
         };
-        lease_refusal(self.lease.accept_write(attachment_id, epoch, sequence))?;
         // The budget is checked before the recogniser is fed, so a refused frame leaves the
         // framing exactly as it was: what is refused is the whole frame, not part of it. A push
         // can also release a prefix it was holding, which is at most one delimiter short of a
@@ -1259,6 +1280,12 @@ impl InputDomain {
             // behind it and no prefix waiting on a timer.
             return Err(unauthenticated());
         }
+        // The frame is accepted from here. Its bytes enter the recogniser, which cannot take them
+        // back, so a second offer of the same number would put them in twice. The one refusal that
+        // can still follow is the root editor's machine saying that the session is closing, which
+        // takes no more input from anybody, so the number it spends is never offered again. The
+        // check above ran in this same hold of the domain, so the number is the one expected.
+        lease_refusal(self.lease.accept_write(attachment_id, epoch, sequence))?;
         let gate_was_open = self.gate_is_open();
         let outcome = self.framer.push(bytes, now);
         let mut owed = Vec::new();
