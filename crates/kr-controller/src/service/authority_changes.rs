@@ -309,35 +309,41 @@ impl Controller {
         }
     }
 
-    /// The barrier of `given`, with the entry of each worker that was pending in it, or had names to
-    /// give, replaced by the daemon's own entry for it now. `None` when the barrier as it stands
-    /// cannot be read.
+    /// The barrier of `given` as it reads now: [`barrier_read_again`] of it and the barrier as it
+    /// stands, with the sessions whose closure the registry holds. `None` when the barrier as it
+    /// stands cannot be read.
     ///
-    /// A worker that was pending is asked again first, and its entry is replaced by what it says
-    /// when that is an answer: the revision acknowledged, or installed with no names held for it.
-    /// A worker that is still pending keeps the entry it had. An entry that had names to give is
-    /// replaced when the daemon's own carries at least what `given` held of it and has fewer names
-    /// still to come.
+    /// A worker that was pending is asked again first. Its entry is replaced by what it says when
+    /// that is an answer (the revision acknowledged, or installed with no names held for it) and
+    /// the replacement carries every name `given` held of it, and by the worker's ending when the
+    /// registry holds its closure.
     async fn with_the_names_since(
         &self,
         audience: Audience,
         named: Option<kr_protocol::ids::GrantId>,
         given: &kr_protocol::sharing::RevocationResult,
     ) -> Option<kr_protocol::action::RevocationBarrier> {
-        let pending: Vec<kr_protocol::ids::SessionId> = given
-            .barrier
-            .workers
-            .iter()
-            .filter(|worker| !worker.state.holds())
-            .map(|worker| worker.session_id)
-            .collect();
+        let pending = given.barrier.pending();
         self.ask_again(&pending).await;
         let live = self
             .barrier_as_it_stands(given.authority_revision)
             .await
             .ok()?;
         let live = self.barrier_for(audience, named, live).ok()?;
-        Some(barrier_read_again(&given.barrier, &live))
+        // A worker that ended and names nothing is not in the barrier as it stands, so the
+        // registry's closure is what says that a pending one has ended.
+        let registry = self.registry.lock().await;
+        let closed = pending
+            .into_iter()
+            .filter(|session_id| live.workers.iter().all(|now| now.session_id != *session_id))
+            .filter(|session_id| {
+                registry
+                    .closure(*session_id)
+                    .is_ok_and(|closure| closure.is_some())
+            })
+            .collect();
+        drop(registry);
+        Some(barrier_read_again(&given.barrier, &live, &closed))
     }
 
     /// Asks each of `sessions` for its acknowledgement of the revision in force, together, each
@@ -3523,34 +3529,77 @@ fn open_number(
         .map(|reservation| reservation.display_number))
 }
 
-/// The barrier of a kept answer as it reads now, given the barrier as it stands.
+/// The barrier of a kept answer as it reads now, given the barrier as it stands and the workers
+/// of the answer whose session has since closed.
+///
+/// A worker that was pending takes the daemon's entry for it when that is an answer and carries
+/// every name the kept answer gave, and a worker that has ended takes an ending that keeps what
+/// the answer held of it. A worker that owed names takes the daemon's entry when
+/// [`carries_what_was_given`]. A kept answer is cut when a host has more workers than a frame
+/// carries, and it keeps the workers that have not held before any that has, so the workers it
+/// left out that the barrier as it stands counts pending are added: what the repeated answer says
+/// of whether the barrier holds is what the whole barrier says.
 fn barrier_read_again(
     given: &kr_protocol::action::RevocationBarrier,
     live: &kr_protocol::action::RevocationBarrier,
+    closed: &std::collections::BTreeSet<SessionId>,
 ) -> kr_protocol::action::RevocationBarrier {
     let mut barrier = given.clone();
     for worker in &mut barrier.workers {
+        let now = live
+            .workers
+            .iter()
+            .find(|now| now.session_id == worker.session_id);
         if !worker.state.holds() {
-            if let Some(now) = live.workers.iter().find(|now| {
-                now.session_id == worker.session_id
-                    && (now.state.holds() || now.acknowledged_revision.0.is_some())
-            }) {
-                *worker = now.clone();
+            match now {
+                Some(now)
+                    if (now.state.holds() || now.acknowledged_revision.0.is_some())
+                        && keeps_the_names(now, worker) =>
+                {
+                    *worker = now.clone();
+                }
+                None if closed.contains(&worker.session_id) => {
+                    *worker = crate::authority::ended_since(worker);
+                }
+                _ => {}
             }
             continue;
         }
-        if worker.names_pending.get() == 0 {
-            continue;
-        }
-        if let Some(now) = live
-            .workers
-            .iter()
-            .find(|now| now.session_id == worker.session_id && carries_what_was_given(now, worker))
+        if worker.names_pending.get() > 0
+            && let Some(now) = now
+            && carries_what_was_given(now, worker)
         {
             *worker = now.clone();
         }
     }
+    for now in live.workers.iter().filter(|now| !now.state.holds()) {
+        if barrier
+            .workers
+            .iter()
+            .all(|worker| worker.session_id != now.session_id)
+        {
+            barrier.workers.push(now.clone());
+        }
+    }
+    barrier.workers_total =
+        kr_protocol::scalars::U64::new(given.workers_total.get().max(live.workers_total.get()));
     barrier
+}
+
+/// Whether the daemon's entry for a worker has every name an answer gave of it.
+fn keeps_the_names(
+    now: &kr_protocol::action::WorkerBarrier,
+    given: &kr_protocol::action::WorkerBarrier,
+) -> bool {
+    given
+        .rejected_actions
+        .iter()
+        .all(|name| now.rejected_actions.contains(name))
+        && given.possibly_executed.iter().all(|name| {
+            now.possibly_executed
+                .iter()
+                .any(|held| held.action_id == name.action_id && held.actor_id == name.actor_id)
+        })
 }
 
 /// Whether the daemon's entry for a worker now can stand in for the one an answer was given with:
@@ -3570,15 +3619,7 @@ fn carries_what_was_given(
     now.state.holds()
         && (now.names_pending.get() < given.names_pending.get() || ended_since)
         && now.omitted_actions.get() <= given.omitted_actions.get()
-        && given
-            .rejected_actions
-            .iter()
-            .all(|name| now.rejected_actions.contains(name))
-        && given.possibly_executed.iter().all(|name| {
-            now.possibly_executed
-                .iter()
-                .any(|held| held.action_id == name.action_id && held.actor_id == name.actor_id)
-        })
+        && keeps_the_names(now, given)
 }
 
 #[cfg(test)]
@@ -3608,7 +3649,7 @@ mod tests {
     use crate::authority::AdmittedMutation;
     use crate::service::Controller;
     use crate::service::admission::AdmittedConnection;
-    use crate::service::authority_changes::carries_what_was_given;
+    use crate::service::authority_changes::{barrier_read_again, carries_what_was_given};
     use crate::service::net::devices::DeviceRecord;
     use crate::service::net::tests::{daemon_on, manual_clocks};
 
@@ -4136,6 +4177,155 @@ mod tests {
         assert!(
             !carries_what_was_given(&entry(&[10, 11, 12], 3, 4, 0), &given),
             "no fewer names to come"
+        );
+    }
+
+    /// A worker's entry as a repeat's merge reads one.
+    fn worker_entry(
+        session: u8,
+        state: kr_protocol::action::BarrierState,
+        names: &[u8],
+        pending: u64,
+    ) -> kr_protocol::action::WorkerBarrier {
+        use kr_protocol::action::{FencedAction, WorkerBarrier};
+        use kr_protocol::ids::{ActorId, SessionId};
+        use kr_protocol::scalars::U64;
+
+        let phone = ActorId::new("device:phone").expect("an actor");
+        WorkerBarrier {
+            session_id: SessionId::new(uuid(session)),
+            state,
+            acknowledged_revision: Nullable::null(),
+            rejected_actions: names
+                .iter()
+                .map(|byte| FencedAction {
+                    actor_id: phone.clone(),
+                    action_id: ActionId::new(uuid(*byte)),
+                })
+                .collect(),
+            rejected_actions_total: U64::new(names.len() as u64),
+            possibly_executed: Vec::new(),
+            possibly_executed_total: U64::new(0),
+            omitted_actions: U64::new(0),
+            names_pending: U64::new(pending),
+            detail: String::new(),
+        }
+    }
+
+    /// KR-REQ-09.12, KR-REQ-10.45: a repeat never reads a barrier as holding while a worker that
+    /// the kept answer left out is still pending.
+    ///
+    /// An answer is cut when a host has more workers than a frame carries, and it keeps the workers
+    /// that have not held before any that has. The workers it lists can all have acknowledged by
+    /// the time of the repeat while one it left out has not; the barrier as it stands names that
+    /// one, and the repeated answer, cut again, says so.
+    #[test]
+    fn a_repeat_reads_a_worker_the_kept_answer_left_out_as_pending_still() {
+        use kr_protocol::action::{BarrierState, RevocationBarrier};
+        use kr_protocol::scalars::U64;
+
+        let revision = AuthorityRevision::new(5);
+        let mut given = RevocationBarrier::new(
+            revision,
+            vec![worker_entry(1, BarrierState::Pending, &[], 0)],
+        );
+        given.workers_total = U64::new(2);
+        let live = RevocationBarrier::new(
+            revision,
+            vec![
+                worker_entry(1, BarrierState::Acknowledged, &[], 0),
+                worker_entry(2, BarrierState::Pending, &[], 0),
+            ],
+        );
+
+        let read = barrier_read_again(&given, &live, &std::collections::BTreeSet::new());
+        assert!(
+            !read.holds(),
+            "the worker the kept answer left out is still pending: {read:?}"
+        );
+        assert_eq!(read.workers_total.get(), 2, "{read:?}");
+        let cut =
+            kr_protocol::sharing::RevocationResult::bounded(revision, std::iter::empty(), read);
+        assert!(
+            !cut.barrier.holds(),
+            "the answer cut again does not hold either: {:?}",
+            cut.barrier
+        );
+        assert_eq!(cut.barrier.workers_total.get(), 2);
+    }
+
+    /// KR-REQ-09.13: the entry that replaces a pending one keeps every name the kept answer gave it.
+    ///
+    /// A pending entry can carry names from the earlier notices of its announcement. When the
+    /// daemon's own entry has lost some of them, as it does once a later revision's report has gone,
+    /// it is not the same answer with the worker's acknowledgement added: the repeat keeps the
+    /// entry it was given.
+    #[test]
+    fn a_pending_entry_is_replaced_only_by_one_that_carries_the_names_it_gave() {
+        use kr_protocol::action::{BarrierState, RevocationBarrier};
+
+        let revision = AuthorityRevision::new(5);
+        let given = RevocationBarrier::new(
+            revision,
+            vec![worker_entry(1, BarrierState::Pending, &[10, 11], 0)],
+        );
+        let lost_one = RevocationBarrier::new(
+            revision,
+            vec![worker_entry(1, BarrierState::Acknowledged, &[10, 12], 0)],
+        );
+        let kept_all = RevocationBarrier::new(
+            revision,
+            vec![worker_entry(
+                1,
+                BarrierState::Acknowledged,
+                &[10, 11, 12],
+                0,
+            )],
+        );
+        let nobody = std::collections::BTreeSet::new();
+
+        let read = barrier_read_again(&given, &lost_one, &nobody);
+        assert_eq!(
+            read.workers[0], given.workers[0],
+            "an entry that lost a name the answer gave does not replace it"
+        );
+        let read = barrier_read_again(&given, &kept_all, &nobody);
+        assert_eq!(
+            read.workers[0], kept_all.workers[0],
+            "an entry that carries every name it gave does"
+        );
+    }
+
+    /// KR-REQ-09.12, KR-REQ-10.45: a pending entry the barrier as it stands has nothing for is
+    /// resolved by the worker's closure, and keeps what the kept answer held of it.
+    ///
+    /// The barrier lets go of a worker that ended and names nothing, so a worker that was pending
+    /// and has closed since is not in it. Without a closure the entry stays pending.
+    #[test]
+    fn a_pending_entry_with_no_live_entry_is_resolved_by_the_closure_and_keeps_its_names() {
+        use kr_protocol::action::{BarrierState, RevocationBarrier};
+
+        let revision = AuthorityRevision::new(5);
+        let given = RevocationBarrier::new(
+            revision,
+            vec![worker_entry(1, BarrierState::Pending, &[10], 0)],
+        );
+        let live = RevocationBarrier::new(revision, Vec::new());
+        let closed: std::collections::BTreeSet<_> = [given.workers[0].session_id].into();
+
+        let read = barrier_read_again(&given, &live, &closed);
+        assert_eq!(read.workers[0].state, BarrierState::Ended, "{read:?}");
+        assert_eq!(
+            read.workers[0].rejected_actions, given.workers[0].rejected_actions,
+            "the names the kept answer held are kept"
+        );
+        assert!(read.holds(), "{read:?}");
+
+        let read = barrier_read_again(&given, &live, &std::collections::BTreeSet::new());
+        assert_eq!(
+            read.workers[0].state,
+            BarrierState::Pending,
+            "a worker that has not closed stays pending: {read:?}"
         );
     }
 }
