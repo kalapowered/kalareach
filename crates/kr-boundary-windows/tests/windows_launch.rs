@@ -2778,13 +2778,24 @@ fn the_four_ways_to_start_a_program_outside_the_job_start_nothing_from_a_launche
     let mut job = Job::new(Limits::INVOCATION).unwrap();
     let program = fixture.stand_in.display().to_string();
     let scratch = fixture.scratch.display().to_string();
+    // Each way writes down what its own commands answered (output, error text and exit code), so
+    // that the run's output says which party refused it: the boundary's own means or another
+    // party's, such as the machine's malware protection.
     let script = format!(
         r#"$m = '{program}'; $d = '{scratch}'
 'ran' | Out-File -FilePath "$d\ran.txt"
-function Form($name, [scriptblock]$body) {{ try {{ & $body; "$name finished" }} catch {{ "$name failed: $($_.Exception.GetType().Name) $($_.Exception.Message.Trim())" }} }}
+function Form($name, [scriptblock]$body) {{ try {{ & $body; "$name finished" }} catch {{ "$name failed: $($_.Exception.GetType().Name) 0x$($_.Exception.HResult.ToString('X8')) $($_.Exception.Message.Trim())" }} }}
+function Native($label, [scriptblock]$call) {{
+  try {{
+    $all = @(& $call 2>&1); $code = $LASTEXITCODE
+    $out = (($all | Where-Object {{ $_ -isnot [System.Management.Automation.ErrorRecord] }} | Out-String).Trim() -replace '\s+', ' ')
+    $err = (($all | Where-Object {{ $_ -is [System.Management.Automation.ErrorRecord] }} | Out-String).Trim() -replace '\s+', ' ')
+    "$label exit $code; stdout: $out; stderr: $err"
+  }} catch {{ "$label could not start: $($_.Exception.GetType().Name) 0x$($_.Exception.HResult.ToString('X8')) $($_.Exception.Message.Trim() -replace '\s+', ' ')" }}
+}}
 Form 'wmi' {{ $r = ([wmiclass]'Win32_Process').Create("`"$m`" marker `"$d\wmi.txt`""); "wmi returned $($r.ReturnValue)" }}
-Form 'task' {{ schtasks.exe /create /tn KrLaunchTask /tr "`"$m`" marker `"$d\task.txt`"" /sc once /st 00:00 /f; schtasks.exe /run /tn KrLaunchTask }}
-Form 'bits' {{ bitsadmin.exe /create /download KrLaunchJob; bitsadmin.exe /addfile KrLaunchJob C:\Windows\System32\drivers\etc\hosts "$d\bits-out.txt"; bitsadmin.exe /setnotifycmdline KrLaunchJob $m "x marker $d\bits.txt"; bitsadmin.exe /resume KrLaunchJob; Start-Sleep 10; bitsadmin.exe /complete KrLaunchJob }}
+Form 'task' {{ Native 'schtasks /create' {{ schtasks.exe /create /tn KrLaunchTask /tr "`"$m`" marker `"$d\task.txt`"" /sc once /st 00:00 /f }}; Native 'schtasks /run' {{ schtasks.exe /run /tn KrLaunchTask }} }}
+Form 'bits' {{ Native 'bitsadmin /create' {{ bitsadmin.exe /create /download KrLaunchJob }}; Native 'bitsadmin /addfile' {{ bitsadmin.exe /addfile KrLaunchJob C:\Windows\System32\drivers\etc\hosts "$d\bits-out.txt" }}; Native 'bitsadmin /setnotifycmdline' {{ bitsadmin.exe /setnotifycmdline KrLaunchJob $m "x marker $d\bits.txt" }}; Native 'bitsadmin /resume' {{ bitsadmin.exe /resume KrLaunchJob }}; Start-Sleep 10; Native 'bitsadmin /complete' {{ bitsadmin.exe /complete KrLaunchJob }} }}
 Form 'com' {{ $a = [Activator]::CreateInstance([type]::GetTypeFromProgID('MMC20.Application')); $a.Document.ActiveView.ExecuteShellCommand($m, $d, "marker `"$d\com.txt`"", '7') }}
 'done' | Out-File -FilePath "$d\done.txt""#
     );
