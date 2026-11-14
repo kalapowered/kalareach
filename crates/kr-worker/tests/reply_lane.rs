@@ -261,22 +261,29 @@ async fn answers_past_their_share_wait_in_the_lane_and_are_let_out_when_places_c
     let (clock, time) = manual();
     let mut fixture = Fixture::new(time);
     let share = kr_worker::session::MAX_PENDING_REPLY_FRAMES;
+    let answers = |batches: &[InputBatch]| {
+        batches
+            .iter()
+            .filter(|batch| matches!(batch, InputBatch::Reply { .. }))
+            .count()
+    };
 
     let _ = fixture.session.ingest_output(&QUESTION.repeat(share));
     // The batches stay in hand, as they are while the writer holds them, so what they are charged
     // is still charged when the room is read.
     let mut in_hand = fixture.session.take_pending_input();
-    assert_eq!(in_hand.len(), share, "the share is answered");
+    assert_eq!(answers(&in_hand), share, "the share is answered");
 
     // A second later, the rate allows more questions, and the share is spent.
     clock.advance(Duration::from_secs(1));
     let _ = fixture.session.ingest_output(&QUESTION.repeat(10));
-    assert!(
-        fixture.session.take_pending_input().is_empty(),
+    assert_eq!(
+        answers(&fixture.session.take_pending_input()),
+        0,
         "no answer is queued past the share"
     );
     assert!(
-        fixture.session.replies_pending(),
+        fixture.session.input().lock().replies_waiting(),
         "the questions past it are kept in the lane"
     );
     let room = fixture.session.input().lock().input_room();
@@ -291,11 +298,11 @@ async fn answers_past_their_share_wait_in_the_lane_and_are_let_out_when_places_c
     in_hand.clear();
     fixture.session.pump_replies();
     assert_eq!(
-        fixture.session.take_pending_input().len(),
+        answers(&fixture.session.take_pending_input()),
         10,
         "what waited for room is answered"
     );
-    assert!(!fixture.session.replies_pending());
+    assert!(!fixture.session.input().lock().replies_waiting());
 }
 
 /// Section 9: a wall clock stepped an hour forward while a reply waits does not drop it. The reply
