@@ -4637,9 +4637,10 @@ async fn a_carrier_that_reads_the_feed_again_clears_what_the_clock_said() {
     assert_eq!(check.status, DoctorStatus::Ok, "{check:?}");
 }
 
-/// As [`within`], for a pass that begins as soon as a look the case released finds the clock past
-/// the end of the wait: a carrier that does not look, or looks and does not begin it, ends the case
-/// here and not at `within`'s limit.
+/// As [`within`], for a wait that takes no pass: the look that the carrier takes at the clock once
+/// the pass the case waited for has ended. A carrier that does not look ends the case here and not
+/// at `within`'s limit. A wait for a whole pass is `within`'s: a busy machine makes a pass slow, and
+/// this bound only has to catch a carrier that never asks.
 async fn soon<T>(what: &str, work: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(Duration::from_secs(30), work)
         .await
@@ -4699,7 +4700,7 @@ async fn a_carrier_that_slept_through_its_wait_reads_the_feed_within_five_second
     // The machine slept five minutes, and the next look begins a pass.
     moved.advance_continuous(Duration::from_secs(5 * 60));
     release.notify_one();
-    soon("the pass the sleep owed", async {
+    within("the pass the sleep owed", async {
         while rig.arrivals("read") == reads || *passes.borrow_and_update() <= seen {
             passes.changed().await.expect("the carrier is running");
         }
@@ -4748,7 +4749,7 @@ async fn a_machine_that_slept_after_a_pass_recorded_its_synchronisation_asks_the
     // The first look after the sleep finds the end of the poll behind the clock, and a pass begins.
     let release = a_look("the carrier looks at the clock", &looks).await;
     release.notify_one();
-    soon("the pass the sleep owed", async {
+    within("the pass the sleep owed", async {
         while rig.arrivals("read") == reads || *passes.borrow_and_update() <= seen {
             passes.changed().await.expect("the carrier is running");
         }
@@ -4814,7 +4815,7 @@ async fn a_carrier_that_slept_past_a_delay_the_feed_named_reads_the_feed_within_
     // The machine slept past it, and the timer's clock still holds all of it.
     moved.advance_continuous(Duration::from_secs(5 * 60));
     release.notify_one();
-    soon("the pass the sleep owed", async {
+    within("the pass the sleep owed", async {
         while rig.arrivals("read") == reads || *passes.borrow_and_update() <= seen {
             passes.changed().await.expect("the carrier is running");
         }
@@ -4865,7 +4866,7 @@ async fn a_wake_after_a_sleep_past_a_delay_the_feed_named_asks_the_feed_at_once(
     // The machine slept past the delay, and a connection wakes the carrier before a look does.
     moved.advance_continuous(Duration::from_secs(5 * 60));
     rig.runtime().wake();
-    soon("the pass the wake owed", async {
+    within("the pass the wake owed", async {
         while rig.arrivals("read") == reads || *passes.borrow_and_update() <= seen {
             passes.changed().await.expect("the carrier is running");
         }
