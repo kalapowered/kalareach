@@ -228,24 +228,27 @@ impl PrivateTempDir {
 /// the folder it is in until its holder lets go. Elsewhere it is the refusal "directory not
 /// empty": another thread made a file in the tree while it was removed, as the drop of a listener
 /// makes its lock file again when a task that was aborted is cancelled beside the removal, and the
-/// next removal takes that file as well. A permission's refusal is final at once. A holder that
-/// goes on for longer than this is a fixture that did not end it: the drop says so on the error
-/// output when the line is written (the process can end before), which names the case, and the
-/// directory is left to the cleanup of the temporary folder. A case that needs the tree gone, as
-/// one that starts a daemon whose own sweep holds a file for up to thirty seconds does, waits for
-/// it itself.
+/// next removal takes that file as well. Elsewhere a permission's refusal is final at once, and on
+/// Windows it is tried again like every other refusal. A holder that goes on for longer than this
+/// is a fixture that did not end it: the drop says so on the error output when the line is written
+/// (the process can end before), which names the case, and the directory is left to the cleanup of
+/// the temporary folder. A case that needs the tree gone, as one that starts a daemon whose own
+/// sweep holds a file for up to thirty seconds does, waits for it itself.
 pub const REMOVAL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// How long the drop of a [`PrivateTempDir`] waits for the line it says to be written.
+/// How long the drop of a [`PrivateTempDir`] waits for its own line to be written: a bound on the
+/// wait, which a standard error that has stopped draining is the only one to pay, and not a time
+/// that a case's result depends on.
 ///
-/// An ordinary process takes the line in a moment, and a process that ends right after the drop
-/// then keeps it. A standard error that has stopped draining takes none, and holds the drop for
-/// this time only.
-const LINE_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+/// A stream that takes the line has it written as soon as the thread that writes it runs, and the
+/// drop goes on then; the bound is long enough for a thread of a loaded machine to run in, so that
+/// a process that ends right after the drop keeps its line. A stalled stream holds the drop for the
+/// whole of it, once.
+const LINE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Whether the refusal `error` of a removal is one that time can end: any refusal on Windows, and
 /// elsewhere "directory not empty", which means that another thread made a file in the tree while
-/// it was removed. A permission's refusal on any platform that has one stays as it is.
+/// it was removed. Elsewhere a permission's refusal stays as it is.
 fn time_can_end(error: &std::io::Error) -> bool {
     cfg!(windows) || error.kind() == std::io::ErrorKind::DirectoryNotEmpty
 }
@@ -299,9 +302,10 @@ impl Drop for PrivateTempDir {
     /// The removal is refused when another thread makes a file in the tree while it is removed, as
     /// the drop of a listener does when a task that was aborted is cancelled on another thread
     /// beside the removal, and on Windows when a thread or a process still holds a file open
-    /// without sharing. Such a holder is usually something that is ending and lets go in a moment,
-    /// so the removal is tried again while the refusal is one that time can end, and for no longer
-    /// than `REMOVAL_PATIENCE` (two seconds); a permission's refusal is final at once.
+    /// without sharing. Such a holder is usually something that is ending and lets go soon, so the
+    /// removal is tried again while the refusal is one that time can end, and for no longer than
+    /// `REMOVAL_PATIENCE` (two seconds); elsewhere than on Windows a permission's refusal is final
+    /// at once.
     ///
     /// What is not removed at the end is said on the error output, outside what a test's capture
     /// keeps, by a thread of its own that the drop waits for no longer than `LINE_WAIT`: a standard
@@ -862,6 +866,22 @@ mod tests {
         }
     }
 
+    /// Whether this user is one that a mode refuses nothing to, as a privileged user removes what
+    /// a mode refuses to anyone else, so that a case that needs a refusal has nothing to show. It
+    /// says so on the standard error, around what the test harness captures and shows only for a
+    /// case that fails, so that the run names the case it did not exercise.
+    #[cfg(unix)]
+    fn a_mode_refuses_nothing_to_this_user() -> bool {
+        use std::io::Write as _;
+
+        let privileged = rustix::process::getuid().is_root();
+        if privileged {
+            let _ = std::io::stderr()
+                .write_all(b"skipped: a mode refuses nothing to a privileged user\n");
+        }
+        privileged
+    }
+
     /// Says on the standard output what a panic of the process that a case runs again is, so that a
     /// failure before the drop names itself in what the case that runs it reads: the default hook
     /// writes to the standard error, which a process with a full one waits on.
@@ -883,9 +903,10 @@ mod tests {
     /// Runs the case `name` again as a process of its own, with `directory` named for it, and reads
     /// what it wrote when it has ended. The process ends on its own, and it is ended by its pid
     /// when it has not ended in `WATCHDOG`, which is a limit on how long a failure takes to show
-    /// and not a claim about how long the process takes.
+    /// and not a claim about how long the process takes. `if_stuck` says what a process that did
+    /// not end was waiting for, as the case that runs it knows it.
     #[cfg(unix)]
-    fn run_again(name: &str, directory: &std::path::Path) -> Ended {
+    fn run_again(name: &str, directory: &std::path::Path, if_stuck: &str) -> Ended {
         use std::io::Read as _;
         use std::process::{Command, Stdio};
 
@@ -923,7 +944,7 @@ mod tests {
             .read_to_string(&mut said)
             .expect("reads its standard output");
         let Ok(status) = timely else {
-            panic!("the process did not end in {WATCHDOG:?}: its drop waited for a reader: {said}");
+            panic!("the process did not end in {WATCHDOG:?}: {if_stuck}: {said}");
         };
         let mut written = String::new();
         standard_error
@@ -937,7 +958,7 @@ mod tests {
     }
 
     /// The drop of a directory whose removal is refused says so on the standard error without
-    /// waiting for it: with the standard error full and read by no one, the drop returns and the
+    /// waiting for a reader: with the standard error full and read by no one, the drop returns and the
     /// process ends. The removal is refused because the directory's parent does not let it go,
     /// which time does not change.
     ///
@@ -958,14 +979,16 @@ mod tests {
             println!("the drop returned");
             return;
         }
-        if rustix::process::getuid().is_root() {
-            // A privileged user removes what a mode refuses to anyone else, so nothing is refused.
-            eprintln!("skipped: a mode refuses nothing to a privileged user");
+        if a_mode_refuses_nothing_to_this_user() {
             return;
         }
 
         let refused = Refused::new();
-        let ended = run_again(NAME, &refused.directory);
+        let ended = run_again(
+            NAME,
+            &refused.directory,
+            "its drop waited for a reader of the standard error",
+        );
 
         assert!(
             ended.status.success() && ended.standard_output.contains("the drop returned"),
@@ -992,13 +1015,16 @@ mod tests {
             });
             std::process::exit(0);
         }
-        if rustix::process::getuid().is_root() {
-            eprintln!("skipped: a mode refuses nothing to a privileged user");
+        if a_mode_refuses_nothing_to_this_user() {
             return;
         }
 
         let refused = Refused::new();
-        let ended = run_again(NAME, &refused.directory);
+        let ended = run_again(
+            NAME,
+            &refused.directory,
+            "it did not end after the drop of its directory",
+        );
 
         assert!(
             ended.status.success(),
