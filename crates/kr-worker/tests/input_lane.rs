@@ -356,7 +356,9 @@ impl Rig {
     }
 
     /// A rig whose application does not read its terminal until [`Self::let_the_application_read`]:
-    /// what the worker writes to it waits in the terminal, which holds only a little.
+    /// what the worker writes to it waits in the terminal, which holds only a little. It keeps
+    /// what it reads with the suite's own program and not with the system's `tee`
+    /// ([`common::KEEPS_WHAT_IT_READS`] says why): a late reader is handed a backlog.
     async fn start_unreading() -> Self {
         Self::start_built(None, false, true).await
     }
