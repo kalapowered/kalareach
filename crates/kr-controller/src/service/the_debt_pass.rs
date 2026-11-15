@@ -208,52 +208,245 @@ async fn the_pass_leaves_a_change_its_own_debt() {
     drop(controller);
 }
 
+/// How long a case waits for a step that correct code does not let happen. A task that has to wait
+/// for the task count while a look holds it has nothing else to do, so this only has to outlast
+/// the scheduling of a task that is ready to run.
+const BLOCKED_FOR: Duration = Duration::from_secs(1);
+
+/// What a task that holds the daemon through `while_held` tells a case, in the order it happens.
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    /// Just before the task asks to hold the daemon, which takes the task count.
+    AboutToBegin,
+    /// The task's work has begun, which is after the task is counted.
+    Began,
+    /// The task's work is over, and the task stands where it is about to leave the count.
+    AboutToLeave,
+    /// The task has left the count and let the daemon go.
+    Ended,
+    /// The task stands between the two counts of a look, holding the task count.
+    Looking,
+}
+
+/// A task that holds the daemon through `while_held` for work that lasts until it is told to
+/// finish, and what it says as it goes.
+///
+/// A case waits on what the task says, never on the runtime's timers: a task that stands at a
+/// look holds a thread of the runtime, and a task that waits for the task count holds another, and
+/// either may be the thread that drives the timers. The case's own thread is not one of the
+/// runtime's, so it can wait on a channel while they stand.
+struct Holder {
+    task: tokio::task::JoinHandle<()>,
+    says: std::sync::mpsc::Sender<Step>,
+    steps: std::sync::mpsc::Receiver<Step>,
+    begin: Option<oneshot::Sender<()>>,
+    finish: Option<oneshot::Sender<()>>,
+}
+
+impl Holder {
+    /// Spawns the task. It does nothing until [`Holder::begin`], so that a case can stop it at its
+    /// first look.
+    fn new(daemon: &std::sync::Weak<Controller>) -> Self {
+        let daemon = daemon.clone();
+        let (begin, begins) = oneshot::channel();
+        let (finish, finishes) = oneshot::channel();
+        let (says, steps) = std::sync::mpsc::channel();
+        let task = tokio::spawn({
+            let says = says.clone();
+            async move {
+                let _ = begins.await;
+                let _ = says.send(Step::AboutToBegin);
+                let in_work = says.clone();
+                let _ = super::barrier::while_held(&daemon, async move |_: &Arc<Controller>| {
+                    let _ = in_work.send(Step::Began);
+                    let _ = finishes.await;
+                })
+                .await;
+                let _ = says.send(Step::Ended);
+            }
+        });
+        Self {
+            task,
+            says,
+            steps,
+            begin: Some(begin),
+            finish: Some(finish),
+        }
+    }
+
+    fn begin(&mut self) {
+        let _ = self.begin.take().expect("a task begins once").send(());
+    }
+
+    fn finish(&mut self) {
+        let _ = self.finish.take().expect("a task finishes once").send(());
+    }
+
+    /// Stops the task at its next look between the two counts, where it says [`Step::Looking`]
+    /// and waits for the answer to be used.
+    fn stop_at_its_next_look(&self, controller: &Controller) -> std::sync::mpsc::SyncSender<()> {
+        let says = self.says.clone();
+        controller
+            .between_the_task_counts
+            .arm_for(self.task.id(), move || {
+                let _ = says.send(Step::Looking);
+            })
+    }
+
+    /// Stops the task when its work is over, before it leaves the count, where it says
+    /// [`Step::AboutToLeave`] and waits for the answer to be used. Past its look, so the task has
+    /// no look left to wait in.
+    fn stop_before_it_leaves(&self, controller: &Controller) -> std::sync::mpsc::SyncSender<()> {
+        let says = self.says.clone();
+        controller
+            .before_a_task_leaves_the_count
+            .arm_for(self.task.id(), move || {
+                let _ = says.send(Step::AboutToLeave);
+            })
+    }
+
+    /// The next step the task says, or `None` when it says none within `within`.
+    fn next_within(&self, within: Duration) -> Option<Step> {
+        self.steps.recv_timeout(within).ok()
+    }
+
+    /// Waits for the task to say `step` as its next, and fails with `otherwise` when it says
+    /// something else or nothing.
+    fn says(&self, step: Step, otherwise: &str) {
+        let said = self.next_within(WAIT);
+        assert_eq!(said.as_ref(), Some(&step), "{otherwise}");
+    }
+}
+
+/// The first task of a case, begun and stopped at its first look between the two counts: it holds
+/// the daemon, is counted, and holds the task count while the case goes on.
+fn stopped_between_its_counts(
+    daemon: &std::sync::Weak<Controller>,
+    controller: &Controller,
+) -> (Holder, std::sync::mpsc::SyncSender<()>) {
+    let mut first = Holder::new(daemon);
+    let release = first.stop_at_its_next_look(controller);
+    first.begin();
+    first.says(Step::AboutToBegin, "the first task begins");
+    first.says(Step::Began, "the first task's work begins");
+    first.says(
+        Step::Looking,
+        "the first task looks and stands between its counts",
+    );
+    (first, release)
+}
+
+/// Lets the stopped first task go on from its look, and says that it did not let the daemon go
+/// there: a task that did would say [`Step::Ended`], and one that did not stands at its next look,
+/// which is let go at once.
+fn goes_on_from_its_look(
+    controller: &Controller,
+    first: &Holder,
+    release: &std::sync::mpsc::SyncSender<()>,
+) {
+    let release_next = first.stop_at_its_next_look(controller);
+    release.send(()).expect("the first task waits at its look");
+    first.says(
+        Step::Looking,
+        "the first task let the daemon go while its owner holds it",
+    );
+    release_next
+        .send(())
+        .expect("the first task waits at its next look");
+}
+
 /// A task that looks at whether it is the daemon's last holder does not let the daemon go while
 /// its owner holds it, though another task that holds the daemon the same way begins between the
 /// two counts the look compares.
 ///
-/// The first task is stopped between its counts, the second begins, and the first goes on. Neither
-/// may end while the owner holds the daemon; both end once the owner lets it go.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+/// The first task stands between its counts, holding the task count, and the second asks to begin.
+/// The second may not begin while the first stands there: it counts itself under the same lock. A
+/// look that does not keep the lock lets it begin at once, and the case would see that. Then the
+/// first goes on, and it does not let the daemon go, because the owner holds it, though the
+/// second holds it too. Both end once the owner lets the daemon go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_task_that_begins_between_the_two_counts_does_not_make_another_let_the_daemon_go() {
     let temp = kr_ipc::testing::TempHost::create();
     let (controller, _passes) = daemon_passing_by_hand(&temp).await;
-    // The tasks the start made are over before the pause is armed.
-    tokio::time::sleep(Duration::from_millis(300)).await;
     let daemon = Arc::downgrade(&controller);
-    let holding = |daemon: std::sync::Weak<Controller>| {
-        tokio::spawn(async move {
-            super::barrier::while_held(&daemon, async |_: &Arc<Controller>| {
-                std::future::pending::<()>().await;
-            })
-            .await
-        })
-    };
-    let (arrived, release) = controller.between_the_task_counts.arm();
-    let first = holding(daemon.clone());
-    tokio::task::spawn_blocking(move || arrived.recv_timeout(WAIT))
-        .await
-        .expect("the wait ends")
-        .expect("the first task is between its counts");
-    let second = holding(daemon.clone());
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    release.send(()).expect("the first task is waiting");
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    assert!(
-        !first.is_finished() && !second.is_finished(),
-        "the owner holds the daemon, so neither task lets it go: first {}, second {}",
-        first.is_finished(),
-        second.is_finished()
+    let (first, release) = stopped_between_its_counts(&daemon, &controller);
+
+    let mut second = Holder::new(&daemon);
+    second.begin();
+    second.says(Step::AboutToBegin, "the second task asks to begin");
+    assert_eq!(
+        second.next_within(BLOCKED_FOR),
+        None,
+        "the second task began while the first stood between its counts, so the first look no \
+         longer holds the task count there"
+    );
+
+    goes_on_from_its_look(&controller, &first, &release);
+    second.says(
+        Step::Began,
+        "the second task begins once the first look is over",
     );
 
     drop(controller);
-    let deadline = Instant::now() + WAIT;
-    while !(first.is_finished() && second.is_finished()) {
-        assert!(
-            Instant::now() < deadline,
-            "the tasks did not let the daemon go once its owner had"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    first.says(
+        Step::Ended,
+        "the first task lets the daemon go once its owner has",
+    );
+    second.says(
+        Step::Ended,
+        "the second task lets the daemon go once its owner has",
+    );
+    assert_eq!(daemon.strong_count(), 0, "the daemon let go is gone");
+}
+
+/// A task that looks at whether it is the daemon's last holder does not let the daemon go while
+/// its owner holds it, though another task that holds the daemon the same way ends between the two
+/// counts the look compares.
+///
+/// A task that ends takes itself out of the count first and lets go of the daemon after. The
+/// second task's work is over and it stands before leaving the count. Then the first task stands
+/// between its counts, holding the task count, with the second still in it, and the second is let
+/// go on. It may not leave the count while the first stands there. A look that does not keep the
+/// lock lets it leave both, and the case would see that: the first would read the task count with
+/// the second in it and the daemon's count without it. Then the first goes on, and it does not
+/// let the daemon go. Both end once the owner lets the daemon go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_task_that_ends_between_the_two_counts_does_not_make_another_let_the_daemon_go() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (controller, _passes) = daemon_passing_by_hand(&temp).await;
+    let daemon = Arc::downgrade(&controller);
+    let mut second = Holder::new(&daemon);
+    let leave = second.stop_before_it_leaves(&controller);
+    second.begin();
+    second.says(Step::AboutToBegin, "the second task begins");
+    second.says(Step::Began, "the second task's work begins");
+    second.finish();
+    second.says(
+        Step::AboutToLeave,
+        "the second task's work ends and it stands before it leaves the count",
+    );
+    let (first, release) = stopped_between_its_counts(&daemon, &controller);
+
+    leave
+        .send(())
+        .expect("the second task waits before it leaves the count");
+    assert_eq!(
+        second.next_within(BLOCKED_FOR),
+        None,
+        "the second task left the count and let the daemon go while the first stood between its \
+         counts, so the first look no longer holds the task count there"
+    );
+
+    goes_on_from_its_look(&controller, &first, &release);
+    second.says(
+        Step::Ended,
+        "the second task leaves the count once the first look is over",
+    );
+
+    drop(controller);
+    first.says(
+        Step::Ended,
+        "the first task lets the daemon go once its owner has",
+    );
     assert_eq!(daemon.strong_count(), 0, "the daemon let go is gone");
 }
