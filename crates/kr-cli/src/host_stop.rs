@@ -923,15 +923,7 @@ async fn stop_the_daemon(
     match ended {
         End::Gone => {
             progress.remove_marker();
-            let cut = match unsettled {
-                Some(count) if count > 0 => shown!(
-                    " {} session creates were still under way after {} seconds, when the daemon \
-                     went on with its stop. Each of them finished or ended with the daemon.",
-                    count,
-                    STOP_SETTLE_MS / 1000
-                ),
-                _ => Shown::said(""),
-            };
+            let cut = creates_under_way(unsettled);
             let process = named.map_or_else(|| Shown::said(""), |pid| shown!(" (process {})", pid));
             done(
                 &shown!(
@@ -949,21 +941,8 @@ async fn stop_the_daemon(
         }
         End::Successor(successor) => {
             progress.remove_marker();
-            let old = named.map_or_else(
-                || Shown::said("The control daemon"),
-                |pid| shown!("The control daemon (process {})", pid),
-            );
-            let now = successor.map_or_else(
-                || Shown::said("another control daemon"),
-                |pid| shown!("process {}", pid),
-            );
             done(
-                &shown!(
-                    "{} ended; {} now holds environment {}, so something started it again.",
-                    old,
-                    now,
-                    id
-                ),
+                &successor_said(id, named, successor, unsettled),
                 &result(Knows::Ended),
                 json,
                 earlier,
@@ -999,6 +978,45 @@ async fn stop_the_daemon(
             )
         }
     }
+}
+
+/// What the creates that the daemon's stop went on without add to a result that saw it end: a
+/// space and the sentence where the answer gave a count above zero, and nothing otherwise.
+fn creates_under_way(unsettled: Option<u64>) -> Shown {
+    match unsettled {
+        Some(count) if count > 0 => shown!(
+            " {} session creates were still under way after {} seconds, when the daemon went on \
+             with its stop. Each of them finished or ended with the daemon.",
+            count,
+            STOP_SETTLE_MS / 1000
+        ),
+        _ => Shown::said(""),
+    }
+}
+
+/// What the command says where the daemon ended and another holds the environment: the old process
+/// and the new one where the command read them, and the creates that the stop went on without.
+fn successor_said(
+    id: EnvironmentId,
+    old: Option<u64>,
+    successor: Option<u64>,
+    unsettled: Option<u64>,
+) -> Shown {
+    let old = old.map_or_else(
+        || Shown::said("The control daemon"),
+        |pid| shown!("The control daemon (process {})", pid),
+    );
+    let now = successor.map_or_else(
+        || Shown::said("another control daemon"),
+        |pid| shown!("process {}", pid),
+    );
+    shown!(
+        "{} ended; {} now holds environment {}, so something started it again.{}",
+        old,
+        now,
+        id,
+        creates_under_way(unsettled)
+    )
 }
 
 /// Whether a refusal of the stop is the daemon's own, with nothing more to ask: any refusal but
@@ -1691,5 +1709,32 @@ mod tests {
         )
         .to_string();
         assert_eq!(other, "the install lock could not be tried");
+    }
+    /// A result that saw the daemon end gives the count of creates that the stop went on without,
+    /// by one sentence, where the answer gave a count above zero: the successor's text too.
+    #[test]
+    fn a_successors_text_gives_the_count_of_creates_by_the_sentence_of_the_stop() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let id = temp.environment().environment_id();
+        let sentence = " 3 session creates were still under way after 10 seconds, when the daemon went on with its stop. Each of them finished or ended with the daemon.";
+        assert_eq!(creates_under_way(Some(3)).to_string(), sentence);
+        assert_eq!(creates_under_way(Some(0)).to_string(), "");
+        assert_eq!(creates_under_way(None).to_string(), "");
+        let with = successor_said(id, Some(7), Some(9), Some(3)).to_string();
+        assert!(
+            with.starts_with(
+                "The control daemon (process 7) ended; process 9 now holds environment "
+            ),
+            "{with}"
+        );
+        assert!(
+            with.ends_with(&format!("so something started it again.{sentence}")),
+            "{with}"
+        );
+        let without = successor_said(id, None, None, Some(0)).to_string();
+        assert!(
+            without.ends_with("so something started it again."),
+            "{without}"
+        );
     }
 }
