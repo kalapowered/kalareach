@@ -595,6 +595,7 @@ export type FailureKind =
   | 'another_device_waiting'
   | 'host_unreachable'
   | 'relay_capacity'
+  | 'relay_fault'
   | 'host_mismatch'
   | 'already_paired'
   | 'not_an_invitation'
@@ -610,6 +611,18 @@ export type FailureKind =
 export interface PairingFailure {
   readonly kind: FailureKind
   readonly tries_left: number | null
+  /**
+   * The paths that still work, each exactly as the managed relay service wrote it, in the order it
+   * wrote them. Present only with `relay_capacity`, and only when the service named at least one.
+   * The page shows each as text and never builds one.
+   */
+  readonly alternatives?: readonly string[]
+  /**
+   * This device's own wait, in whole seconds from the moment the attempt ended until it asks the
+   * managed relay service again. Present with `relay_capacity` and `relay_fault`, and with no other
+   * kind. At most a day, and 0 is possible. The page says it once and never counts it down.
+   */
+  readonly retry_after_seconds?: number
 }
 
 /** What a paired host is shown as. */
