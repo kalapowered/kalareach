@@ -1835,12 +1835,14 @@ async fn kr_req_09_09_a_binding_that_moves_after_the_admission_is_refused_at_the
     }
 }
 
-/// A transport whose own admission runs a step the test gives it, as a wait for the transport's
-/// locks does for a binding that moves meanwhile, and that counts what it was asked to carry.
+/// A transport whose own admission runs a step the test gives it at the admission it names, as a
+/// wait for the transport's locks does for a binding that moves meanwhile, and that counts what it
+/// was asked to carry.
 #[derive(Default)]
 struct MovingBindingUpstream {
     carried: std::sync::atomic::AtomicUsize,
-    in_its_admission: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    admissions: std::sync::atomic::AtomicUsize,
+    in_its_admission: std::sync::Mutex<Option<(usize, Box<dyn FnOnce() + Send>)>>,
 }
 
 impl std::fmt::Debug for MovingBindingUpstream {
@@ -1851,11 +1853,23 @@ impl std::fmt::Debug for MovingBindingUpstream {
 
 impl UpstreamDispatch for MovingBindingUpstream {
     fn admit(&self, _request: &UpstreamRequest) -> Result<(), BrokerError> {
-        let step = self
-            .in_its_admission
-            .lock()
-            .expect("the record is not poisoned")
-            .take();
+        let call = self
+            .admissions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let step = {
+            let mut slot = self
+                .in_its_admission
+                .lock()
+                .expect("the record is not poisoned");
+            match slot.take() {
+                Some((at, step)) if at == call => Some(step),
+                other => {
+                    *slot = other;
+                    None
+                }
+            }
+        };
         if let Some(step) = step {
             step();
         }
@@ -1874,7 +1888,8 @@ impl UpstreamDispatch for MovingBindingUpstream {
 }
 
 /// KR-REQ-09.09: the binding revision is compared again after the transport's own admission, which
-/// takes locks of its own. The binding moves inside that admission, after the broker's first
+/// takes locks of its own. The binding moves inside the permit's admission (the second the transport
+/// is asked: the first is the broker's own, made under its lock), after the broker's first
 /// comparison passed: the answer sends nothing, its receipt is `refused` and the resource stays
 /// answerable. The control: with the binding where it was, the same answer is carried.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1889,15 +1904,21 @@ async fn kr_req_09_09_a_binding_that_moves_in_the_transports_admission_is_refuse
             *upstream
                 .in_its_admission
                 .lock()
-                .expect("the record is not poisoned") = Some(Box::new(move || {
-                broker
-                    .advance_binding(
-                        instance(),
-                        Some(kr_protocol::ids::AgentThreadId::new("thread-2").expect("a thread")),
-                        TimestampMs::new(5),
-                    )
-                    .expect("the binding moves");
-            }));
+                .expect("the record is not poisoned") = Some((
+                2,
+                Box::new(move || {
+                    broker
+                        .advance_binding(
+                            instance(),
+                            Some(
+                                kr_protocol::ids::AgentThreadId::new("thread-2")
+                                    .expect("a thread"),
+                            ),
+                            TimestampMs::new(5),
+                        )
+                        .expect("the binding moves");
+                }),
+            ));
         }
         let mut client = cli(&host).await;
         let mutation = approval_mutation(&client, &host, 22, resource_id);
