@@ -2333,45 +2333,47 @@ async fn a_batch_whose_authority_ran_out_while_it_waited_is_never_written() {
     // so the room's return says that it has met all three.
     let room = runtime.input().lock().input_room();
     until_the_room_holds(&room, kr_worker::input_room::Cost::default()).await;
-    let mut session = runtime.session();
-    assert_eq!(
-        session.input().lock().input_room().held(),
-        kr_worker::input_room::Cost::default(),
-        "the room the dropped batches held is given back, their entries as well as their bytes"
-    );
-    // The first of them was dropped at its deadline. What follows it in the epoch is not written,
-    // whatever its own deadline: the application would get the end of what the person typed
-    // without its beginning. All three stay counted against the lease until it ends.
-    assert_eq!(
-        u64::try_from(session.input().lock().queued_lease_bytes().load()).expect("a count"),
-        first_dropped + following,
-        "the lease's share of the three stays until the lease ends"
-    );
-    let (_, fenced) = session
-        .release_input(id, epoch, None)
-        .expect("the holder releases");
-    assert_eq!(
-        fenced,
-        first_dropped + following,
-        "the end of the lease counts the dropped batch and what followed it"
-    );
-
-    // The next epoch is written. Its batch is echoed behind anything of the first that a faulty
-    // writer had put in front of it, so the echo of this one settles what the first did.
-    let epoch = session
-        .acquire_input(id, connection(), None)
-        .expect("the holder takes the keys again")
-        .lease
-        .epoch
-        .get();
+    // The session's guard is held in this block only, so that none is held across the wait below.
     {
+        let mut session = runtime.session();
+        assert_eq!(
+            session.input().lock().input_room().held(),
+            kr_worker::input_room::Cost::default(),
+            "the room the dropped batches held is given back, their entries as well as their bytes"
+        );
+        // The first of them was dropped at its deadline. What follows it in the epoch is not
+        // written, whatever its own deadline: the application would get the end of what the
+        // person typed without its beginning. All three stay counted against the lease until it
+        // ends.
+        assert_eq!(
+            u64::try_from(session.input().lock().queued_lease_bytes().load()).expect("a count"),
+            first_dropped + following,
+            "the lease's share of the three stays until the lease ends"
+        );
+        let (_, fenced) = session
+            .release_input(id, epoch, None)
+            .expect("the holder releases");
+        assert_eq!(
+            fenced,
+            first_dropped + following,
+            "the end of the lease counts the dropped batch and what followed it"
+        );
+
+        // The next epoch is written. Its batch is echoed behind anything of the first that a
+        // faulty writer had put in front of it, so the echo of this one settles what the first
+        // did.
+        let epoch = session
+            .acquire_input(id, connection(), None)
+            .expect("the holder takes the keys again")
+            .lease
+            .epoch
+            .get();
         let later = kr_ipc::clock::SharedClock::boot_elapsed_ms(&clock) + 60_000;
         session
             .write_input(id, epoch, 0, b"kr-next", Some(later), Instant::now())
             .expect("accepted");
         runtime.flush_input();
     }
-    drop(session);
     let seen = retained_within(&runtime, b"kr-next", Duration::from_secs(10)).await;
     for dropped in [&b"kr-expired"[..], b"kr-after-one", b"kr-after-two"] {
         assert!(
