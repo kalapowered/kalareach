@@ -739,8 +739,8 @@ enum Asked {
 /// Sends the request, says that it left, and waits for its answer.
 ///
 /// The answer is read from the connection, and anything but a whole answer to this request is an
-/// unknown outcome: a daemon that ends for another cause gets no answer, and on Windows an answer
-/// of more than about 4.5 KiB can be cut at the exit.
+/// unknown outcome: a daemon that ends for another cause gets no answer, and the daemon stops when
+/// its write of the answer has completed, failed or reached its bound, so an answer can be cut.
 async fn ask(
     client: &mut LocalClient,
     environment_id: EnvironmentId,
