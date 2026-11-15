@@ -544,6 +544,7 @@ async fn open_or_start_within(
     let installation = paths.open_environment_id()?;
     if environment.environment_id != installation {
         return Err(resolve::not_running(
+            &environment.paths,
             &error,
             shown!(
                 "start the control daemon, kr-controller, for it; the standalone start serves this \
@@ -562,7 +563,11 @@ async fn open_or_start_within(
                 managed(&environment.paths, &endpoint, &error, bounds, &[]).await?;
             Ok((ours(client)?, started))
         }
-        None => Err(resolve::not_running(&error, chosen.setup_action())),
+        None => Err(resolve::not_running(
+            &environment.paths,
+            &error,
+            chosen.setup_action(),
+        )),
     }
 }
 
@@ -592,6 +597,7 @@ async fn find(
         ))),
         Reached::Refused(error) if nothing_listening(&error) => Ok(Found::Vacant(error)),
         Reached::Refused(error) => Err(resolve::not_running(
+            &environment.paths,
             &error,
             Shown::said(resolve::SETUP_ACTION),
         )),
@@ -647,7 +653,7 @@ pub async fn start_by_service(
 
 /// The client of a daemon found by a look that listed no other major than this command's: the
 /// daemon states this command's major, or the look would not have admitted it.
-fn ours(listed: Listed) -> Result<LocalClient> {
+pub(crate) fn ours(listed: Listed) -> Result<LocalClient> {
     match listed {
         Listed::Ours(client) => Ok(*client),
         Listed::Other(_) => Err(CliError::Other(Shown::said(
@@ -657,7 +663,7 @@ fn ours(listed: Listed) -> Result<LocalClient> {
 }
 
 /// What one attempt to reach a daemon found.
-enum Reached {
+pub(crate) enum Reached {
     /// A daemon answered, and this is the connection to it.
     Answered(Box<Listed>),
     /// Something accepted the connection and did not answer within the bound.
@@ -668,7 +674,11 @@ enum Reached {
 
 /// Makes one attempt to reach the daemon at `endpoint`, the connection and its hello together
 /// bounded by `bound`.
-async fn reach(endpoint: &kr_ipc::paths::Endpoint, bound: Duration, majors: &[u16]) -> Reached {
+pub(crate) async fn reach(
+    endpoint: &kr_ipc::paths::Endpoint,
+    bound: Duration,
+    majors: &[u16],
+) -> Reached {
     match tokio::time::timeout(
         bound,
         LocalClient::connect_listing(endpoint, LocalClientKind::Cli, crate::build_id(), majors),
@@ -691,7 +701,7 @@ fn unanswered(message: Shown) -> CliError {
 
 /// Whether a failure to reach a daemon says that nothing is listening, rather than that something
 /// answered and could not be used.
-fn nothing_listening(error: &kr_ipc::IpcError) -> bool {
+pub(crate) fn nothing_listening(error: &kr_ipc::IpcError) -> bool {
     matches!(
         error,
         kr_ipc::IpcError::Socket { source, .. }
@@ -978,7 +988,7 @@ async fn managed(
     majors: &[u16],
 ) -> Result<(Listed, Option<Started>)> {
     let refused = |refusal| match refusal {
-        service_manager::Refusal::NotSetUp(why) => resolve::not_running(error, why),
+        service_manager::Refusal::NotSetUp(why) => resolve::not_running(environment, error, why),
         service_manager::Refusal::Failed(why) => unanswered(shown!(
             "the service manager did not start the control daemon for environment {}: {}",
             environment.environment_id(),
@@ -1038,13 +1048,14 @@ async fn managed(
 /// none this build writes definitions for.
 #[cfg(not(unix))]
 async fn managed(
-    _environment: &EnvironmentPaths,
+    environment: &EnvironmentPaths,
     _endpoint: &kr_ipc::paths::Endpoint,
     error: &kr_ipc::IpcError,
     _bounds: Bounds,
     _majors: &[u16],
 ) -> Result<(Listed, Option<Started>)> {
     Err(resolve::not_running(
+        environment,
         error,
         Shown::said(
             "this environment chooses the service start, which this platform does not have; start \

@@ -345,7 +345,7 @@ pub async fn writers_lock(
 /// Forced on every platform. A daemon asked to stop with SIGTERM begins a graceful end and goes on
 /// until a write in progress has finished, so a plain `kill` no longer ends one that is stuck in
 /// it. On Windows a daemon has no window to ask to close, and `taskkill` without `/F` refuses it.
-const STOP_COMMAND: &str = if cfg!(windows) {
+pub(crate) const STOP_COMMAND: &str = if cfg!(windows) {
     "taskkill /F /PID"
 } else {
     "kill -KILL"

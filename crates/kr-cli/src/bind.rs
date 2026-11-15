@@ -141,47 +141,43 @@ pub enum Membership {
 /// How long one worker is given to say whether this process is its own.
 pub const MEMBERSHIP_PROBE_DEADLINE: Duration = Duration::from_secs(5);
 
-/// Asks every live session's worker whether this process is inside its session.
+/// What a walk over the sessions' descriptors found, in the order it found it.
+enum Walked {
+    /// A worker that is live: its descriptor names this boot and the kernel reports its process
+    /// running.
+    Worker(WorkerDescriptor),
+    /// Something that could hold this process and was not established, with the reason.
+    Undecided(Shown),
+}
+
+/// Walks every environment's descriptors and says which workers are live and what could not be
+/// established. A worker from another boot, or whose process has ended, holds nothing and is
+/// passed over.
 ///
-/// A worker counts as live when its descriptor names this boot and the kernel reports its process
-/// running: a worker from another boot, or whose process has ended, holds nothing and is passed
-/// over. Only when every live worker has established that this process is not its own is the
-/// answer [`Membership::Outside`]; a worker that says it is makes the answer
-/// [`Membership::Inside`], and anything else, a worker that could not establish it included,
-/// leaves it [`Membership::Unknown`].
-pub async fn membership(build_id: &BuildId) -> Membership {
-    let paths = match kr_ipc::paths::HostPaths::discover() {
-        Ok(paths) => paths,
-        Err(error) => {
-            return Membership::Unknown(shown!(
-                "this host's directories cannot be found: {}",
-                Shown::ipc(&error)
-            ));
-        }
-    };
-    let boot = match kr_ipc::identity::boot_identity() {
-        Ok(boot) => boot,
-        Err(error) => {
-            return Membership::Unknown(shown!(
-                "this boot cannot be identified: {}",
-                Shown::ipc(&error)
-            ));
-        }
-    };
-    let environments = match every_environment(&paths) {
-        Ok(environments) => environments,
-        Err(why) => return Membership::Unknown(why),
-    };
-    let mut undecided = None;
+/// # Errors
+///
+/// The reason the walk could not be made at all: this host's directories, this boot or the list of
+/// environments could not be read, which leaves the answer unknown.
+fn walk() -> std::result::Result<Vec<Walked>, Shown> {
+    let paths = kr_ipc::paths::HostPaths::discover().map_err(|error| {
+        shown!(
+            "this host's directories cannot be found: {}",
+            Shown::ipc(&error)
+        )
+    })?;
+    let boot = kr_ipc::identity::boot_identity()
+        .map_err(|error| shown!("this boot cannot be identified: {}", Shown::ipc(&error)))?;
+    let environments = every_environment(&paths)?;
+    let mut walked = Vec::new();
     for known in environments {
         let entries = match kr_ipc::descriptor::read_all(&known.paths) {
             Ok(entries) => entries,
             Err(error) => {
-                undecided.get_or_insert(shown!(
+                walked.push(Walked::Undecided(shown!(
                     "the sessions of environment {} cannot be listed: {}",
                     known.environment_id,
                     Shown::ipc(&error)
-                ));
+                )));
                 continue;
             }
         };
@@ -191,10 +187,10 @@ pub async fn membership(build_id: &BuildId) -> Membership {
                 // The reason is the descriptor reader's own text about a file it found, and is not
                 // repeated: which file, and that it could not be read, is what establishes nothing.
                 Err(_) => {
-                    undecided.get_or_insert(shown!(
+                    walked.push(Walked::Undecided(shown!(
                         "the session descriptor {} cannot be read",
                         Shown::stored(&entry.path, &[], &["kr"])
-                    ));
+                    )));
                     continue;
                 }
             };
@@ -204,34 +200,145 @@ pub async fn membership(build_id: &BuildId) -> Membership {
             match kr_ipc::identity::process_state(&descriptor.process_start_identity) {
                 ProcessState::Ended => continue,
                 ProcessState::Unknown { .. } => {
-                    undecided.get_or_insert(shown!(
+                    walked.push(Walked::Undecided(shown!(
                         "whether the worker of session {} is running cannot be read",
                         descriptor.session_id
-                    ));
+                    )));
                     continue;
                 }
                 ProcessState::Running => {}
             }
-            let session_id = descriptor.session_id;
-            let bound = Bound { descriptor };
-            let answered =
-                tokio::time::timeout(MEMBERSHIP_PROBE_DEADLINE, probe(&bound, build_id.clone()))
-                    .await
-                    .unwrap_or_else(|_| Probe::Silent(Shown::said("it did not answer in time")));
-            match answered {
-                Probe::Inside => return Membership::Inside(session_id),
-                Probe::Outside => {}
-                Probe::Silent(why) => {
-                    undecided.get_or_insert(shown!(
-                        "the worker of session {} did not say whether this process is its own: {}",
-                        session_id,
-                        why
-                    ));
+            walked.push(Walked::Worker(descriptor));
+        }
+    }
+    Ok(walked)
+}
+
+/// What one live worker said, within [`MEMBERSHIP_PROBE_DEADLINE`].
+async fn answered(descriptor: WorkerDescriptor, build_id: BuildId) -> Probe {
+    let bound = Bound { descriptor };
+    tokio::time::timeout(MEMBERSHIP_PROBE_DEADLINE, probe(&bound, build_id))
+        .await
+        .unwrap_or_else(|_| Probe::Silent(Shown::said("it did not answer in time")))
+}
+
+/// The reason that a worker that gave neither answer leaves the membership unknown.
+fn silent(session_id: SessionId, why: &Shown) -> Shown {
+    shown!(
+        "the worker of session {} did not say whether this process is its own: {}",
+        session_id,
+        *why
+    )
+}
+
+/// Asks every live session's worker whether this process is inside its session.
+///
+/// A worker counts as live when its descriptor names this boot and the kernel reports its process
+/// running: a worker from another boot, or whose process has ended, holds nothing and is passed
+/// over. Only when every live worker has established that this process is not its own is the
+/// answer [`Membership::Outside`]; a worker that says it is makes the answer
+/// [`Membership::Inside`], and anything else, a worker that could not establish it included,
+/// leaves it [`Membership::Unknown`].
+pub async fn membership(build_id: &BuildId) -> Membership {
+    let walked = match walk() {
+        Ok(walked) => walked,
+        Err(why) => return Membership::Unknown(why),
+    };
+    let mut undecided = None;
+    for item in walked {
+        match item {
+            Walked::Undecided(why) => {
+                undecided.get_or_insert(why);
+            }
+            Walked::Worker(descriptor) => {
+                let session_id = descriptor.session_id;
+                match answered(descriptor, build_id.clone()).await {
+                    Probe::Inside => return Membership::Inside(session_id),
+                    Probe::Outside => {}
+                    Probe::Silent(why) => {
+                        undecided.get_or_insert(silent(session_id, &why));
+                    }
                 }
             }
         }
     }
     undecided.map_or(Membership::Outside, Membership::Unknown)
+}
+
+/// Asks every live session's worker at once, as [`membership`] asks them in turn, and answers as
+/// it does: the first worker that says this process is its own ends the question, and the wait for
+/// the others is one [`MEMBERSHIP_PROBE_DEADLINE`] and not one for each worker.
+pub async fn membership_together(build_id: &BuildId) -> Membership {
+    let walked = match walk() {
+        Ok(walked) => walked,
+        Err(why) => return Membership::Unknown(why),
+    };
+    let build_id = build_id.clone();
+    ask_together(walked, move |descriptor| {
+        answered(descriptor, build_id.clone())
+    })
+    .await
+}
+
+/// Starts the question to every worker in `walked` before it waits for any answer, and reads the
+/// answers as [`membership`] does. `ask` is how one worker is asked.
+async fn ask_together<F, Fut>(walked: Vec<Walked>, ask: F) -> Membership
+where
+    F: Fn(WorkerDescriptor) -> Fut,
+    Fut: std::future::Future<Output = Probe> + Send + 'static,
+{
+    let mut asking = tokio::task::JoinSet::new();
+    let mut slots = Vec::with_capacity(walked.len());
+    for (place, item) in walked.into_iter().enumerate() {
+        slots.push(match item {
+            Walked::Undecided(why) => Slot::Undecided(why),
+            Walked::Worker(descriptor) => {
+                let session_id = descriptor.session_id;
+                let question = ask(descriptor);
+                asking.spawn(async move { (place, question.await) });
+                Slot::Asked(session_id, None)
+            }
+        });
+    }
+    while let Some(joined) = asking.join_next().await {
+        // A probe that panicked or was aborted gave no answer, which leaves its slot unsaid.
+        let Ok((place, answer)) = joined else {
+            continue;
+        };
+        if let Probe::Inside = answer
+            && let Slot::Asked(session_id, _) = &slots[place]
+        {
+            return Membership::Inside(*session_id);
+        }
+        if let Slot::Asked(_, said) = &mut slots[place] {
+            *said = Some(answer);
+        }
+    }
+    let mut undecided = None;
+    for slot in slots {
+        match slot {
+            Slot::Undecided(why) => {
+                undecided.get_or_insert(why);
+            }
+            Slot::Asked(_, Some(Probe::Outside)) => {}
+            Slot::Asked(session_id, Some(Probe::Silent(why))) => {
+                undecided.get_or_insert(silent(session_id, &why));
+            }
+            Slot::Asked(session_id, _) => {
+                undecided.get_or_insert(silent(
+                    session_id,
+                    &Shown::said("its probe did not end with an answer"),
+                ));
+            }
+        }
+    }
+    undecided.map_or(Membership::Outside, Membership::Unknown)
+}
+
+/// A place in the order of a walk: what could not be established, or a worker and what it said.
+enum Slot {
+    Undecided(Shown),
+    Asked(SessionId, Option<Probe>),
 }
 
 /// Refuses unless this process is outside every KalaReach session.
@@ -276,6 +383,58 @@ pub async fn require_outside(build_id: &BuildId, because: &'static str) -> Resul
             why,
             because
         ))),
+    }
+}
+
+/// Where a command that ends or restarts the control daemon is run, said to a person it refuses.
+const WHERE_TO_RUN: &str = "Run it in a terminal of this account that is not a KalaReach session, \
+    such as a terminal window that was not opened through the KalaReach profile, or an SSH login.";
+
+/// Refuses a command that ends or restarts the control daemon where it is run from inside a
+/// session, which is an accident and not an attack: code that runs as this account can end the
+/// daemon with the platform's own tools, and this guard does not claim to stop it.
+///
+/// `KR_SESSION` or `KR_ATTACHMENT` set here refuses at once. Otherwise every live session's worker
+/// is asked at once ([`membership_together`]) whether this process is inside its session, so that
+/// a process whose environment was cleaned is still found; the command is refused when one says it
+/// is. A worker that cannot say lets the command go on, where [`require_outside`] refuses: a host
+/// that has to be restarted may hold a worker that does not answer.
+///
+/// `command` is the command as a person types it, and `what_goes_on` is what the refusal says of
+/// the sessions meanwhile.
+///
+/// # Errors
+///
+/// Returns a refusal with `PERMISSION_DENIED`, in its own words, that says nothing was stopped.
+pub async fn require_outside_to_end_a_daemon(
+    build_id: &BuildId,
+    command: &'static str,
+    what_goes_on: &'static str,
+) -> Result<()> {
+    for variable in [
+        crate::resolve::SESSION_VARIABLE,
+        crate::resolve::ATTACHMENT_VARIABLE,
+    ] {
+        if std::env::var_os(variable).is_some() {
+            return Err(inside(shown!(
+                "{} runs outside a KalaReach session, and {} is set here. {} Nothing was stopped. {}",
+                command,
+                variable,
+                WHERE_TO_RUN,
+                what_goes_on
+            )));
+        }
+    }
+    match membership_together(build_id).await {
+        Membership::Inside(session_id) => Err(inside(shown!(
+            "{} runs outside a KalaReach session, and this process is inside session {}. {} \
+             Nothing was stopped. {}",
+            command,
+            session_id,
+            WHERE_TO_RUN,
+            what_goes_on
+        ))),
+        Membership::Outside | Membership::Unknown(_) => Ok(()),
     }
 }
 
@@ -482,4 +641,100 @@ fn decode<T: kr_protocol::wire::WireMessage>(value: ParamsValue) -> Result<T> {
             Shown::cbor(&error)
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use kr_protocol::ids::{EnvironmentId, SessionEpoch};
+    use kr_protocol::scalars::{AuthorisationKey, TimestampMs, Uuid};
+
+    use super::*;
+
+    /// A descriptor that names a session and nothing a question reaches: the question is asked of
+    /// the test's own closure.
+    fn worker(session: u8) -> WorkerDescriptor {
+        WorkerDescriptor {
+            session_id: SessionId::new(Uuid::from_bytes([session; 16])),
+            session_epoch: SessionEpoch::V1,
+            environment_id: EnvironmentId::new(Uuid::from_bytes([0xe0; 16])),
+            display_number: kr_protocol::session::DisplayNumber::new(u64::from(session)),
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            process_start_identity: kr_ipc::identity::current_process_start_identity()
+                .expect("a process identity"),
+            protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+            endpoint: String::new(),
+            worker_public_key: AuthorisationKey::from_bytes([1; 32]),
+            worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+            published_at_ms: TimestampMs::new(0),
+        }
+    }
+
+    fn walked(sessions: &[u8]) -> Vec<Walked> {
+        sessions
+            .iter()
+            .map(|session| Walked::Worker(worker(*session)))
+            .collect()
+    }
+
+    /// How long a case waits for something that is going to happen: a bound on a hang.
+    const LIVENESS: Duration = Duration::from_secs(60);
+
+    /// Two workers that answer only once both have been asked: asked in turn, the first would wait
+    /// for the second for ever, so the order of the questions is what the case shows, and no time.
+    #[tokio::test]
+    async fn the_workers_are_asked_together_and_not_in_turn() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let answered = tokio::time::timeout(
+            LIVENESS,
+            ask_together(walked(&[1, 2]), move |_| {
+                let barrier = Arc::clone(&barrier);
+                async move {
+                    barrier.wait().await;
+                    Probe::Outside
+                }
+            }),
+        )
+        .await
+        .expect("both workers were asked before either answered");
+        assert_eq!(answered, Membership::Outside);
+    }
+
+    /// The first worker that says this process is its own ends the question, and a worker that
+    /// never answers is not waited for: the control of the case above.
+    #[tokio::test]
+    async fn the_first_worker_that_holds_the_process_ends_the_question() {
+        let answered = tokio::time::timeout(
+            LIVENESS,
+            ask_together(walked(&[1, 2]), |descriptor| async move {
+                if descriptor.display_number.0.get() == 2 {
+                    Probe::Inside
+                } else {
+                    std::future::pending().await
+                }
+            }),
+        )
+        .await
+        .expect("the answer of the worker that holds the process ends the question");
+        assert_eq!(
+            answered,
+            Membership::Inside(SessionId::new(Uuid::from_bytes([2; 16])))
+        );
+    }
+
+    /// A worker that gives neither answer leaves the membership unknown, which the commands that
+    /// end a daemon let go on, where the guard of a command that shows a secret refuses.
+    #[tokio::test]
+    async fn a_worker_that_cannot_say_leaves_the_membership_unknown() {
+        let answered = ask_together(walked(&[1, 2]), |descriptor| async move {
+            if descriptor.display_number.0.get() == 1 {
+                Probe::Outside
+            } else {
+                Probe::Silent(Shown::said("it did not answer in time"))
+            }
+        })
+        .await;
+        assert!(matches!(answered, Membership::Unknown(_)), "{answered:?}");
+    }
 }
