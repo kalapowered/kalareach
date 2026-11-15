@@ -2845,6 +2845,213 @@ async fn a_prefix_made_only_of_the_newer_bytes_keeps_the_newer_deadline() {
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
+/// KR-REQ-08.64, in part.
+///
+/// A forwarded batch made of two writes carries the tighter of their deadlines: the delimiter that
+/// the first write began and the second completed is the first write's, and when that deadline
+/// has passed before the writer meets it, the delimiter is not written. The epoch's first drop
+/// then fences what follows, the byte the second write left held among it, and the epoch's end
+/// counts all seven bytes. The next epoch's batch is the sentinel: whatever of the first epoch
+/// reached the application would be in front of it.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console begins its output with mode sequences of its own and holds back an unfinished sequence, which this case reads as the application's bytes"
+)]
+async fn a_forwarded_batch_made_of_two_writes_is_dropped_by_the_tighter_deadline() {
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(
+        &host,
+        "stty raw -echo; printf '\\033[?2004hkr-ready.'; exec cat",
+    );
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let id = attach(&mut session, &terminal(session_id, Some("xterm-256color")));
+    let held = session
+        .acquire_input(id, connection(), None)
+        .expect("the keys");
+    let epoch = held.lease.epoch.get();
+
+    let clock = kr_ipc::clock::ManualSharedClock::new();
+    let runtime = Arc::new(
+        SessionRuntime::start(session, std::sync::Arc::new(clock.clone())).expect("starts"),
+    );
+    retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
+    let now = kr_ipc::clock::SharedClock::boot_elapsed_ms(&clock);
+    let early = now + 1_000;
+    let late = now + 600_000;
+
+    // The recogniser's timer waits at its deadline if it comes due, so that it does not forward
+    // the held byte before the case has said what the clock reads.
+    let (_reached, go) = runtime.pause_the_timer_at_its_deadline();
+    {
+        let mut session = runtime.session();
+        let accepted = session
+            .write_input(id, epoch, 0, b"\x1b[20", Some(early), Instant::now())
+            .expect("accepted");
+        assert_eq!(accepted.held_prefix_bytes, 4);
+        // This write finishes the delimiter and starts a prefix of its own out of its last byte.
+        let accepted = session
+            .write_input(id, epoch, 1, b"0~\x1b", Some(late), Instant::now())
+            .expect("accepted");
+        assert_eq!(
+            (accepted.forwarded_bytes, accepted.held_prefix_bytes),
+            (6, 1),
+            "the delimiter goes and one byte of the next one is held"
+        );
+        // The first write's authority runs out before the writer meets its delimiter.
+        clock.advance(Duration::from_secs(5));
+        let released =
+            session.expire_paste_prefix(Instant::now() + std::time::Duration::from_secs(1));
+        assert_eq!(released, 1, "the held byte is released by its own deadline");
+        runtime.flush_input();
+    }
+    let room = runtime.input().lock().input_room();
+    until_the_room_holds(&room, kr_worker::input_room::Cost::default()).await;
+    let _ = go.send(());
+    let (_, fenced) = runtime
+        .session()
+        .release_input(id, epoch, None)
+        .expect("the holder releases");
+    assert_eq!(
+        fenced, 7,
+        "the end counts the delimiter, which the first write's deadline dropped, and the byte that followed it"
+    );
+
+    {
+        let mut session = runtime.session();
+        let epoch = session
+            .acquire_input(id, connection(), None)
+            .expect("the holder takes the keys again")
+            .lease
+            .epoch
+            .get();
+        let later = kr_ipc::clock::SharedClock::boot_elapsed_ms(&clock) + 60_000;
+        session
+            .write_input(id, epoch, 0, b"kr-next", Some(later), Instant::now())
+            .expect("accepted");
+        runtime.flush_input();
+    }
+    let seen = retained_within(&runtime, b"kr-next", Duration::from_secs(10)).await;
+    assert!(
+        contains(&seen, b"kr-ready.kr-next"),
+        "nothing of the first epoch reached the application: {seen:?}"
+    );
+    assert!(
+        !contains(&seen, PASTE_START),
+        "the delimiter the first write's deadline dropped was not written: {seen:?}"
+    );
+
+    runtime.close(ClosureReason::CloseRequested).1.release();
+}
+
+/// KR-REQ-08.64, in part.
+///
+/// A host's answer never goes into a paste that a dropped batch was to close. A batch opens a
+/// paste and is written; the batch that closes it is accepted, and its authority runs out before
+/// the writer meets it. The response lane reads the accepted stream, which says the paste is
+/// closed, so the application's next question is answered at once. The writer ends the
+/// application's open paste at the epoch's first drop, so the answer comes after the end of the
+/// paste and not inside it, and the epoch's end writes no second terminator.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console begins its output with mode sequences of its own and holds back an unfinished sequence, which this case reads as the application's bytes"
+)]
+async fn a_reply_comes_after_the_end_of_a_paste_whose_closing_batch_the_writer_dropped() {
+    const PASTE_END: &[u8] = b"\x1b[201~";
+    let host = kr_ipc::testing::TempHost::create();
+    let mut config = configuration(
+        &host,
+        "stty raw -echo; printf '\\033[?2004hkr-ready.'; exec cat",
+    );
+    let clock = kr_ipc::clock::ManualSharedClock::new();
+    config.time.continuous = Arc::new(clock.clone());
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let id = attach(&mut session, &terminal(session_id, Some("xterm-256color")));
+    let epoch = session
+        .acquire_input(id, connection(), None)
+        .expect("the keys")
+        .lease
+        .epoch
+        .get();
+    let runtime = Arc::new(
+        SessionRuntime::start(session, std::sync::Arc::new(clock.clone())).expect("starts"),
+    );
+    retained_within(&runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
+    let now = kr_ipc::clock::SharedClock::boot_elapsed_ms(&clock);
+
+    // The batch that opens the paste is written under an authority that stands.
+    {
+        let mut session = runtime.session();
+        session
+            .write_input(
+                id,
+                epoch,
+                0,
+                b"\x1b[200~kr-pasted",
+                Some(now + 600_000),
+                Instant::now(),
+            )
+            .expect("accepted");
+        runtime.flush_input();
+    }
+    retained_within(&runtime, b"kr-pasted", LIVENESS_DEADLINE).await;
+
+    // The batch that closes it is accepted, its authority runs out before the writer meets it,
+    // and the application asks a question. The answer is behind it.
+    {
+        let mut session = runtime.session();
+        session
+            .write_input(id, epoch, 1, PASTE_END, Some(now + 1_000), Instant::now())
+            .expect("accepted");
+        session.ingest_output(STATUS_QUESTION);
+        clock.advance(Duration::from_millis(1_500));
+        runtime.flush_input();
+    }
+    let seen = retained_within(&runtime, STATUS_ANSWER, LIVENESS_DEADLINE).await;
+    assert!(
+        contains(&seen, b"\x1b[200~kr-pasted\x1b[201~\x1b[0n"),
+        "the answer came inside a paste that was left open: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    // The epoch's end counts the closing batch, which was never written, and the writer's own
+    // terminator is not a keystroke of the lease: it is not counted. The next epoch's batch
+    // shows that the end wrote no second one.
+    let (_, fenced) = runtime
+        .session()
+        .release_input(id, epoch, None)
+        .expect("the holder releases");
+    assert_eq!(fenced, 6, "the end counts the closing batch");
+    {
+        let mut session = runtime.session();
+        let epoch = session
+            .acquire_input(id, connection(), None)
+            .expect("the holder takes the keys again")
+            .lease
+            .epoch
+            .get();
+        let later = kr_ipc::clock::SharedClock::boot_elapsed_ms(&clock) + 60_000;
+        session
+            .write_input(id, epoch, 0, b"kr-next", Some(later), Instant::now())
+            .expect("accepted");
+        runtime.flush_input();
+    }
+    let seen = retained_within(&runtime, b"kr-next", LIVENESS_DEADLINE).await;
+    assert_eq!(
+        count(&seen, PASTE_END),
+        1,
+        "the paste was ended once: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    runtime.close(ClosureReason::CloseRequested).1.release();
+}
+
 // ---------------------------------------------------------------------------------------------
 // KR-PERF-002: what the recogniser's deadline does not wait for.
 // ---------------------------------------------------------------------------------------------
