@@ -2760,6 +2760,7 @@ impl DispatchHold {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_writer_ends_the_paste_it_abandons_part_way_before_a_reply_is_written() {
     const BODY: usize = 60_000;
+    const ANSWER: &[u8] = b"\x1b[0n";
     const END_AND_ANSWER: &[u8] = b"\x1b[201~\x1b[0n";
     let mut rig = Rig::start_unreading().await;
     let attachment = rig.attach().await;
@@ -2786,21 +2787,26 @@ async fn the_writer_ends_the_paste_it_abandons_part_way_before_a_reply_is_writte
 
     // What the application has: the part of the paste that was written, the end of the paste that
     // the writer wrote in its place, and then the answer. How much of the paste was written is
-    // for the epoch's end to say.
+    // for the epoch's end to say. The answer is waited for, and what stands in front of it is
+    // asserted: a writer that leaves the paste open gets the answer there all the same.
     tokio::time::timeout(WAIT, async {
-        while !rig.received().ends_with(END_AND_ANSWER) {
+        while !rig.received().ends_with(ANSWER) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
     .unwrap_or_else(|_| {
         panic!(
-            "the application did not get the end of the paste and then the answer, but {} bytes \
-             ending {:?}",
-            rig.received().len(),
-            String::from_utf8_lossy(&rig.received()[rig.received().len().saturating_sub(24)..])
+            "the application was not given the answer: it has {} bytes",
+            rig.received().len()
         )
     });
+    let received = rig.received();
+    assert!(
+        received.ends_with(END_AND_ANSWER),
+        "the answer came inside a paste that was left open: the application's bytes end {:?}",
+        String::from_utf8_lossy(&received[received.len().saturating_sub(24)..])
+    );
     boundary.release();
 
     let notice = the_notice_after_the_room_came_back(&rig, &mut lane).await;
