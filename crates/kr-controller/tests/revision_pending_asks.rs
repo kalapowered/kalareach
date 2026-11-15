@@ -12,13 +12,15 @@ mod net_support;
 use std::sync::Arc;
 use std::time::Duration;
 
+use kr_controller::registry::LaunchPhase;
 use kr_controller::service::{Controller, DEBT_PASS_INTERVAL};
 use kr_protocol::ids::{ActorId, SessionEpoch, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::Nullable;
 use kr_protocol::sharing::{RoleSelection, SessionRole};
 use net_support::worker::{Adopted, Worker, share};
-use net_support::{Host, on_the_host, recipient};
+use net_support::{Host, Stopped, on_the_host, recipient};
+use rusqlite::params;
 
 /// How long a case waits for something the daemon does on its own timer, past the passes it is
 /// owed.
@@ -1434,6 +1436,19 @@ struct RestartedAtAHeldBoundary {
 }
 
 async fn restarted_with_the_boundary_held() -> RestartedAtAHeldBoundary {
+    restarted_with_the_boundary_held_after(|_, _| {}).await
+}
+
+/// As [`restarted_with_the_boundary_held`], for a session whose worker the daemon that stopped had
+/// claimed and not yet recorded: its reservation is a claim nobody resolved, and the registry has
+/// no row of the worker. The start's look is then the claim's, which no list of the rows makes.
+async fn restarted_with_a_claim_and_the_boundary_held() -> RestartedAtAHeldBoundary {
+    restarted_with_the_boundary_held_after(leave_the_claim_unresolved).await
+}
+
+async fn restarted_with_the_boundary_held_after(
+    leave: impl FnOnce(&Stopped, SessionId),
+) -> RestartedAtAHeldBoundary {
     let Adopted {
         host,
         owner: _,
@@ -1441,6 +1456,7 @@ async fn restarted_with_the_boundary_held() -> RestartedAtAHeldBoundary {
     } = Adopted::start(1).await;
     let held = workers[0].hold_the_dispatch_boundary().await;
     let stopped = host.shut_down().await;
+    leave(&stopped, workers[0].session_id);
     let settings = stopped.settings().clone();
     let host = stopped.start(settings).await;
     RestartedAtAHeldBoundary {
@@ -1448,6 +1464,39 @@ async fn restarted_with_the_boundary_held() -> RestartedAtAHeldBoundary {
         workers,
         held,
     }
+}
+
+/// Records the session's reservation as claimed by the worker's own key, and takes the worker's row
+/// away, as a daemon that ended between the worker's claim and the record of the worker leaves
+/// them.
+fn leave_the_claim_unresolved(stopped: &Stopped, session_id: SessionId) {
+    let tree = stopped.tree();
+    let connection = rusqlite::Connection::open(tree.environment().registry_database())
+        .expect("opens the registry");
+    let session = session_id.get();
+    let key: Vec<u8> = connection
+        .query_row(
+            "SELECT public_key FROM workers WHERE session_id = ?1",
+            params![session.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("the worker's row");
+    connection
+        .execute(
+            "UPDATE reservations SET phase = ?2, claimed_key = ?3 WHERE session_id = ?1",
+            params![
+                session.as_bytes().as_slice(),
+                LaunchPhase::Claimed.as_str(),
+                key.as_slice()
+            ],
+        )
+        .expect("the reservation is a claim");
+    connection
+        .execute(
+            "DELETE FROM workers WHERE session_id = ?1",
+            params![session.as_bytes().as_slice()],
+        )
+        .expect("the worker's row is taken away");
 }
 
 /// The sessions one `session.list` names.
@@ -1484,6 +1533,11 @@ async fn read_is_served(client: &mut kr_ipc::client::LocalClient, session_id: Se
         .is_ok()
 }
 
+/// What a look that waits for a presentation under way would not meet: the bound that look waits
+/// for is [`kr_controller::directory::RECONNECT_TIMEOUT`], and nothing else ends it while the
+/// worker's boundary is held.
+const ANSWERED_AT_ONCE: Duration = Duration::from_secs(3);
+
 /// KR-REQ-09.12, KR-ACC-022: a client that polls `session.list` while a restarted daemon's worker
 /// holds its dispatch boundary adds no presentation at that boundary.
 ///
@@ -1494,9 +1548,9 @@ async fn read_is_served(client: &mut kr_ipc::client::LocalClient, session_id: Se
 /// worker, so a look that presented anew would leave one more at each poll, and an hour of polling
 /// would take the connections of the worker, its owner's own included. The three lists run
 /// together; the worker's count of the presentations waiting is what shows how many the daemon
-/// made, and it is the same after the lists as after the start. The lists are answered within two
-/// of the bound, which is what a look that waits for the presentation under way, one list after the
-/// other, would not be.
+/// made, and it is the same after the lists as after the start. The lists are then answered in less
+/// than two bounds, which looks that waited for the presentation under way, one list after the
+/// other, would not manage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_list_polled_while_a_boundary_is_held_leaves_one_presentation_at_it() {
     let RestartedAtAHeldBoundary {
@@ -1509,12 +1563,16 @@ async fn a_list_polled_while_a_boundary_is_held_leaves_one_presentation_at_it() 
     let mut first = host.client().await;
     let mut second = host.client().await;
     let mut third = host.client().await;
+    // Three bounds and the slack: the lists of a daemon that waits for each presentation, one after
+    // the other, end inside it, so that the count below is read for them too.
+    let began = tokio::time::Instant::now();
     tokio::time::timeout(
-        kr_controller::directory::RECONNECT_TIMEOUT * 2 + SLACK,
+        kr_controller::directory::RECONNECT_TIMEOUT * 3 + SLACK * 2,
         async { tokio::join!(listed(&mut first), listed(&mut second), listed(&mut third)) },
     )
     .await
-    .expect("the three lists were answered within two bounds of a look at the worker");
+    .expect("the three lists were answered");
+    let took = began.elapsed();
     assert_eq!(
         service.presentations_waiting_for_tests(),
         at_the_start,
@@ -1526,19 +1584,25 @@ async fn a_list_polled_while_a_boundary_is_held_leaves_one_presentation_at_it() 
             .presentation_in_flight_for_tests(workers[0].session_id),
         "the one presentation is still under way"
     );
+    assert!(
+        took < kr_controller::directory::RECONNECT_TIMEOUT * 2 + SLACK,
+        "the three lists took {took:?}: a look that waits for the presentation under way holds up \
+         the lists after it"
+    );
     held.release();
     host.stop().await;
     drop(workers);
 }
 
 /// KR-REQ-09.12, KR-ACC-022: the answer of a presentation that outlived the look that made it is
-/// used: once the boundary is let go, the next read reaches the session's worker, and the worker is
-/// presented to no further time for it.
+/// used: once the boundary is let go and the presentation's task has ended, the next read reaches
+/// the session's worker, and no further challenge is presented for it.
 ///
 /// The worker decides the presentation when the hold ends, long after the start's look gave up on
-/// it. The next read finds that answer and adopts the worker on it, with no restart of the daemon.
-/// The daemon's count of the challenges its recoveries presented is what shows a second one: the
-/// connections it opens to an adopted worker for its own purposes are not recoveries'.
+/// it. The next look after the task has ended finds that answer and adopts the worker on it, with
+/// no restart of the daemon; adopting opens the daemon's normal link, which presents the
+/// generation once more and is not a challenge. The daemon's count of the challenges its recoveries
+/// presented is what shows a second one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn the_answer_of_a_presentation_that_outlived_its_look_is_used_when_the_boundary_is_let_go() {
     let RestartedAtAHeldBoundary {
@@ -1547,10 +1611,11 @@ async fn the_answer_of_a_presentation_that_outlived_its_look_is_used_when_the_bo
         held,
     } = restarted_with_the_boundary_held().await;
     let worker = &workers[0];
+    let session_id = worker.session_id;
     let service = Arc::clone(&worker.service);
     let mut client = host.client().await;
     assert!(
-        !read_is_served(&mut client, worker.session_id).await,
+        !read_is_served(&mut client, session_id).await,
         "a worker whose boundary is held is not reached"
     );
 
@@ -1561,13 +1626,25 @@ async fn the_answer_of_a_presentation_that_outlived_its_look_is_used_when_the_bo
         || service.presentations_waiting_for_tests() == 0,
     )
     .await;
+    // The decision comes before the task has asked for the description and ended: a read between
+    // them passes the session over.
+    until(
+        Duration::from_secs(10),
+        "the end of the task of the presentation",
+        || {
+            !host
+                .controller()
+                .presentation_in_flight_for_tests(session_id)
+        },
+    )
+    .await;
     assert_eq!(
         host.controller().challenges_presented_for_tests(),
         1,
         "the start's look presented the one challenge"
     );
     assert!(
-        read_is_served(&mut client, worker.session_id).await,
+        read_is_served(&mut client, session_id).await,
         "the next read of the session reaches the worker"
     );
     assert_eq!(
@@ -1580,23 +1657,23 @@ async fn the_answer_of_a_presentation_that_outlived_its_look_is_used_when_the_bo
 }
 
 /// KR-REQ-09.12, KR-ACC-022: a closure while a presentation waits at a held boundary ends the
-/// daemon's part in it, and the daemon's stop does not wait for it.
+/// daemon's task of it, with the daemon still running.
 ///
-/// The presentation is the daemon's task. The session's closure takes its entry away, and the task
-/// ends with it; a stop that follows lets the daemon go while the worker's boundary is still held.
+/// The presentation is the task of the session's opening. The closure takes the opening away, and
+/// the task ends with it: the worker's boundary is still held, and nothing of the daemon waits at
+/// it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_closure_while_a_presentation_waits_ends_it_and_the_stop_does_not_wait_for_it() {
+async fn a_closure_while_a_presentation_waits_ends_its_task() {
     let RestartedAtAHeldBoundary {
         host,
         workers,
         held,
     } = restarted_with_the_boundary_held().await;
     let session_id = workers[0].session_id;
-    assert!(
-        host.controller()
-            .presentation_in_flight_for_tests(session_id),
-        "the start's look left its presentation under way"
-    );
+    let task_runs = host
+        .controller()
+        .presentation_task_running_for_tests(session_id);
+    assert!(task_runs(), "the start's look left its task running");
     host.controller()
         .retire(&kr_protocol::session::ClosureRecord {
             session_id,
@@ -1612,13 +1689,40 @@ async fn a_closure_while_a_presentation_waits_ends_it_and_the_stop_does_not_wait
         })
         .await
         .expect("the closure is recorded");
+    until(
+        Duration::from_secs(10),
+        "the end of the presentation's task after the closure, with the daemon running",
+        || !task_runs(),
+    )
+    .await;
     assert!(
         !host
             .controller()
             .presentation_in_flight_for_tests(session_id),
-        "the closure ended the presentation's entry"
+        "the closure took the opening away"
     );
+    host.stop().await;
+    held.release();
+    drop(workers);
+}
 
+/// KR-REQ-09.12, KR-ACC-022: a daemon's stop does not wait for a presentation that waits at a held
+/// boundary, and the task of it does not keep the daemon.
+///
+/// Nothing ends the presentation but the stop: no closure, no decision of the worker. The daemon
+/// still lets go of everything it holds while the boundary is held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_stop_while_a_presentation_waits_does_not_wait_for_it() {
+    let RestartedAtAHeldBoundary {
+        host,
+        workers,
+        held,
+    } = restarted_with_the_boundary_held().await;
+    assert!(
+        host.controller()
+            .presentation_in_flight_for_tests(workers[0].session_id),
+        "the start's look left its presentation under way"
+    );
     let daemon = Arc::downgrade(host.controller());
     host.stop().await;
     until(
@@ -1628,5 +1732,99 @@ async fn a_closure_while_a_presentation_waits_ends_it_and_the_stop_does_not_wait
     )
     .await;
     held.release();
+    drop(workers);
+}
+
+/// KR-REQ-09.12, KR-ACC-022: a look at the claim of a worker that the start could not reach is
+/// answered at once while the start's presentation is still under way, and presents nothing.
+///
+/// The worker's reservation is a claim and the registry holds no row of it, so the look that a list
+/// makes at every claim is the only one that reaches it, and no scan of rows passes it over. The
+/// start's challenge waited its five seconds and left the presentation at the held boundary. A list
+/// is then answered at once, with no wait for that presentation and none added to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_claim_whose_presentation_waits_is_looked_at_again_at_once() {
+    let RestartedAtAHeldBoundary {
+        host,
+        workers,
+        held,
+    } = restarted_with_a_claim_and_the_boundary_held().await;
+    let session_id = workers[0].session_id;
+    let service = Arc::clone(&workers[0].service);
+    assert!(
+        host.controller()
+            .presentation_in_flight_for_tests(session_id),
+        "the start's look at the claim left its presentation under way"
+    );
+    let presented = host.controller().challenges_presented_for_tests();
+    assert_eq!(presented, 1, "the start's look presented the one challenge");
+    let waiting = service.presentations_waiting_for_tests();
+    let mut client = host.client().await;
+    tokio::time::timeout(ANSWERED_AT_ONCE, listed(&mut client))
+        .await
+        .expect("the list was answered at once, with no wait for the presentation under way");
+    assert_eq!(
+        host.controller().challenges_presented_for_tests(),
+        presented,
+        "a look at the claim while its presentation is under way presents no second challenge"
+    );
+    assert_eq!(
+        service.presentations_waiting_for_tests(),
+        waiting,
+        "nothing is added at the held boundary"
+    );
+    held.release();
+    host.stop().await;
+    drop(workers);
+}
+
+/// KR-REQ-09.12, KR-ACC-022: a list that arrives while another look's presentation waits is
+/// answered while that look still holds the worker's reservation through its wait.
+///
+/// The first list presents to the unlisted worker and waits for its answer, which the held boundary
+/// does not give, and holds the worker's reservation for that wait. The second list finds the
+/// presentation under way and passes the row over before it asks for the reservation, so it does
+/// not wait for the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_list_is_answered_while_another_look_holds_the_reservation_through_its_wait() {
+    let Adopted {
+        host,
+        owner: _,
+        workers,
+    } = Adopted::start(1).await;
+    let session_id = workers[0].session_id;
+    let service = Arc::clone(&workers[0].service);
+    // As a start that could not verify the worker leaves it, with its boundary held after.
+    host.controller().forget_worker_for_tests(session_id).await;
+    let held = workers[0].hold_the_dispatch_boundary().await;
+    let mut first = host.client().await;
+    let mut second = host.client().await;
+    let first_list = tokio::spawn(async move { listed(&mut first).await });
+    until(
+        Duration::from_secs(10),
+        "the first look's presentation at the held boundary",
+        || {
+            service.presentations_waiting_for_tests() == 1
+                && host
+                    .controller()
+                    .presentation_in_flight_for_tests(session_id)
+        },
+    )
+    .await;
+    tokio::time::timeout(ANSWERED_AT_ONCE, listed(&mut second))
+        .await
+        .expect("the second list was answered at once, with no wait for the reservation");
+    assert!(
+        !first_list.is_finished(),
+        "the second list was answered while the first look still waited for its presentation"
+    );
+    assert_eq!(
+        service.presentations_waiting_for_tests(),
+        1,
+        "the second list added no presentation"
+    );
+    held.release();
+    first_list.await.expect("the first list ends");
+    host.stop().await;
     drop(workers);
 }

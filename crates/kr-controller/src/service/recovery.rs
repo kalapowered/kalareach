@@ -400,6 +400,9 @@ impl Controller {
             registry.workers()?
         };
         for row in rows {
+            // A row whose presentation is under way is passed over here, before its reservation
+            // is taken: the challenge's own door would answer `None` for it, but only after the
+            // look had waited for a reservation that another look holds through its wait.
             if self.directory.lock().await.get(row.session_id).is_some()
                 || self.presentation_in_flight(row.session_id)
             {
@@ -435,7 +438,8 @@ impl Controller {
                 .await
             {
                 // A presentation to this worker is under way, which nothing here adds to; its
-                // answer is taken by the first look after the worker has decided.
+                // answer is taken by the first look after its task has ended, which is after
+                // the worker has decided and the description has been asked for.
                 Ok(None) => {}
                 Ok(Some((proof, described, level))) => {
                     self.adopt(
@@ -533,6 +537,9 @@ impl Controller {
             // closure is the fact, and a row written after it would be a worker for a session that
             // has ended, with nothing left to end it.
             if registry.closure(proof.session_id)?.is_some() {
+                // The closure took the session's opening away, and a look that read its rows
+                // before the closure may have made one since; nothing is left to use it.
+                self.forget_opening(proof.session_id);
                 return Ok(());
             }
             // The desktop it says it is bound to, where it was asked and described its own session:
