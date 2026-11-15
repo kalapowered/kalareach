@@ -2702,10 +2702,17 @@ impl SignedInAccount {
     /// A subject other than the sign-in's means the two answers disagree about who signed in, so
     /// the sign-in is undone and revoked. A service that cannot be asked leaves the grant as it is.
     ///
+    /// `stands` says whether the caller's authority for the sign-in still holds. It is asked under
+    /// the account's hold, after the service has answered and the grant is read, immediately before
+    /// the address and name are written: that wait is the service's and the hold's, and the
+    /// authority can end in it. Where it says no, nothing is written and the outcome is
+    /// [`IdentityRead::Unread`], as when the service cannot be asked: the grant the sign-in kept is
+    /// left as it is.
+    ///
     /// # Errors
     ///
     /// Returns an error when no account is signed in or the store cannot be read.
-    pub async fn complete_identity(&self) -> Result<IdentityRead> {
+    pub async fn complete_identity(&self, stands: impl Fn() -> bool) -> Result<IdentityRead> {
         let access = self.token("openid").await?;
         // The token and the grant it belongs to are taken together under the lock: a grant that
         // another sign-in, here or in another process, put in its place meanwhile is not the one
@@ -2739,6 +2746,9 @@ impl SignedInAccount {
                 if let Some(mut current) = self.read_grant()?
                     && current.grant_id == grant.grant_id
                 {
+                    if !stands() {
+                        return Ok(IdentityRead::Unread);
+                    }
                     current.email = identity.email;
                     current.name = identity.name;
                     self.write_grant(&current)?;
