@@ -3511,7 +3511,7 @@ async fn a_detach_that_names_no_attachment_and_follows_typing_is_refused_for_a_w
         "nothing was forwarded: {:?}",
         forwarded(&sent)
     );
-    assert_eq!(position_refusals(&rig), 0, "no position was judged");
+    assert_eq!(position_refusals(&rig), 0, "no position was refused");
     assert_eq!(
         rig.adopted.workers[0].attachments(),
         1,
@@ -3544,7 +3544,7 @@ async fn a_detach_that_names_no_attachment_and_follows_typing_is_refused_by_the_
     .await
     .expect_err("the worker has no such line");
     assert_eq!(refused.code, ErrorCode::AmbiguousAttachment);
-    assert_eq!(position_refusals(&rig), 0, "the host judged no position");
+    assert_eq!(position_refusals(&rig), 0, "the host refused no position");
     assert_eq!(
         rig.adopted.workers[0].attachments(),
         1,
