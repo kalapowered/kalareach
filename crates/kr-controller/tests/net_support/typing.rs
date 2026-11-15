@@ -5,7 +5,7 @@
 //! uses this and nothing else, so that none of them depends on which way the host carries the
 //! typing to the worker.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kr_client::error::ClientError;
 use kr_client::input::{
@@ -14,10 +14,40 @@ use kr_client::input::{
 use kr_client::session::Session;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{AttachmentId, EnvironmentId, InputLeaseEpoch, SessionId};
+use kr_transport::TransportError;
 
 /// How long [`Typing::type_bytes`] waits for the host to accept what it sent. A host that holds the
 /// stream open and accepts nothing would otherwise hold the case for good.
 const ACCEPTANCE_WAIT: Duration = Duration::from_secs(60);
+
+/// How long after it began an open may end and still be the host's refusal. The client waits ten
+/// seconds for the host's first word and the host's admission ends near ten, so an open that ended
+/// later than this ran out of time and was not refused.
+const OPEN_REFUSED_WITHIN: Duration = Duration::from_secs(8);
+
+/// How the host turned away typing that names an attachment which the connection did not make.
+///
+/// The two paths to the worker answer differently, and a case that holds either takes no side. A
+/// worker that serves the input lane binds a lane only for an attachment that the connection's own
+/// proxy owns, so the host ends the stream before its first word. A worker that does not takes each
+/// frame as a request on the proxy's link, refuses it, and the host ends the stream or tells the
+/// refusal after the lane has opened.
+#[derive(Debug)]
+pub enum TurnedAway {
+    /// The lane path: the host ended the stream before its first word.
+    Open(String),
+    /// The serial path: the lane opened and the host turned the frame away.
+    Frame(String),
+}
+
+impl std::fmt::Display for TurnedAway {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open(why) => write!(formatter, "the lane path answered: {why}"),
+            Self::Frame(why) => write!(formatter, "the serial path answered: {why}"),
+        }
+    }
+}
 
 /// Why bytes were not typed.
 #[derive(Debug)]
@@ -126,6 +156,107 @@ impl Typing {
             events,
             epoch: None,
         })
+    }
+
+    /// Opens the lane of `attachment_id` and says, in words, when the host ended the stream before
+    /// its first word.
+    ///
+    /// The connection must have its route to the worker already, which a request that names the
+    /// session fixes: without it the host's admission waits for a route and ends near its own
+    /// deadline, and that end is no refusal.
+    ///
+    /// # Errors
+    ///
+    /// Returns what happened, in words, when the lane opened, when the open ran out of time (the
+    /// client's own deadline, or an end later than [`OPEN_REFUSED_WITHIN`]), or when it failed in
+    /// any other way.
+    pub async fn refused_open(
+        session: &Session,
+        environment_id: EnvironmentId,
+        session_id: SessionId,
+        attachment_id: AttachmentId,
+    ) -> Result<String, String> {
+        match Self::open_judged(session, environment_id, session_id, attachment_id).await? {
+            Ok(_lane) => Err("the lane opened".to_owned()),
+            Err(ended) => Ok(ended),
+        }
+    }
+
+    /// Puts typing for an attachment that this connection did not make to the host, under the
+    /// lease epoch the attachment held, and says how the host turned it away.
+    ///
+    /// The connection must have its route to the worker already (see [`Self::refused_open`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns what happened, in words, when the typing was not turned away: the lane's open ran
+    /// out of time or failed in another way, the host accepted the bytes, or its answer was not a
+    /// refusal, an end of the lease or an end of the stream.
+    pub async fn replay(
+        session: &Session,
+        environment_id: EnvironmentId,
+        session_id: SessionId,
+        attachment_id: AttachmentId,
+        epoch: InputLeaseEpoch,
+        bytes: &[u8],
+    ) -> Result<TurnedAway, String> {
+        let mut lane =
+            match Self::open_judged(session, environment_id, session_id, attachment_id).await? {
+                Ok(lane) => lane,
+                Err(ended) => return Ok(TurnedAway::Open(ended)),
+            };
+        match lane.type_bytes(epoch, bytes).await {
+            Ok(written) => Err(format!("the host accepted the typing: {written:?}")),
+            Err(NotTyped::Refused(error)) if error.code != ErrorCode::OutcomeUnknown => {
+                Ok(TurnedAway::Frame(format!(
+                    "the lane opened and the host refused the frame: {error}"
+                )))
+            }
+            Err(NotTyped::LeaseEnded(told)) => Ok(TurnedAway::Frame(format!(
+                "the lane opened and the host said the attachment no longer holds the lease of epoch {}",
+                told.get()
+            ))),
+            Err(ended @ NotTyped::Ended(EndCause::Reset)) => Ok(TurnedAway::Frame(format!(
+                "the lane opened and the host ended the stream while the connection stood: {ended}"
+            ))),
+            Err(other) => Err(format!(
+                "the lane opened and the typing was not turned away by the host: {other}"
+            )),
+        }
+    }
+
+    /// Opens the lane. The outer error is a failure to turn away in words; the inner one is the
+    /// host ending the stream before its first word, in time.
+    async fn open_judged(
+        session: &Session,
+        environment_id: EnvironmentId,
+        session_id: SessionId,
+        attachment_id: AttachmentId,
+    ) -> Result<Result<Self, String>, String> {
+        let begun = Instant::now();
+        match Self::open(session, environment_id, session_id, attachment_id).await {
+            Ok(lane) => Ok(Ok(lane)),
+            Err(NotTyped::Opening(ClientError::Transport(TransportError::Stream(why)))) => {
+                let took = begun.elapsed();
+                if took < OPEN_REFUSED_WITHIN {
+                    Ok(Err(format!(
+                        "the host ended the stream before its first word, {took:?} after the open began ({why})"
+                    )))
+                } else {
+                    Err(format!(
+                        "the open ended {took:?} after it began, near the admission's deadline: it ran out of time and was not refused ({why})"
+                    ))
+                }
+            }
+            Err(NotTyped::Opening(ClientError::Transport(TransportError::Deadline(kind)))) => {
+                Err(format!(
+                    "the open ran out of time ({kind:?} deadline of the client): it was not refused"
+                ))
+            }
+            Err(other) => Err(format!(
+                "the lane did not open, and not because the host ended the stream: {other}"
+            )),
+        }
     }
 
     /// The lane itself, for a case that needs more of it than typing and waiting.

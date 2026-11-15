@@ -8332,50 +8332,34 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
         once(prompts, replies)
             .unwrap_or_else(|why| panic!("no duplicate work after reconnecting: {why}"));
         // The old attachment's next input, on the new connection, is turned away by the host. The
-        // keyboard's own lane ended with the old connection, so the input goes on a fresh lane that
-        // the case opens for the old attachment on the new connection, and the host is asked. The
-        // host admits a lane once its connection has its route to the worker, which a request that
-        // names the session fixes: the snapshot below.
+        // keyboard's own lane ended with the old connection, so the input goes on a lane that the
+        // case opens for the old attachment on the new connection. The host admits a lane once its
+        // connection has its route to the worker, which a request that names the session fixes:
+        // the snapshot below. It then answers by the path that carries typing to the worker: on the
+        // worker's lane path the worker binds a lane only for an attachment that the connection's
+        // own link owns, so the host ends the stream before its first word; on the serial path the
+        // lane opens and the frame is turned away. Either passes; an open that ran out of time, or
+        // typing that the host accepted, fails the part. The evidence says which path answered.
         let (old_attachment, old_epoch, _) = old;
         let _ = events_snapshot(
             &logged.agent.session.remote,
             stage.runtime,
             logged.agent.session.session_id,
         );
-        let stale = stage.runtime.block_on(async {
-            let remote = &logged.agent.session.remote;
-            let mut lane = kr_e2e_m1b::typing::Typing::open(
-                remote.session(),
-                remote.environment_id(),
+        let stale_by_the_host = stage
+            .runtime
+            .block_on(kr_e2e_m1b::typing::Typing::replay(
+                logged.agent.session.remote.session(),
+                logged.agent.session.remote.environment_id(),
                 logged.agent.session.session_id,
                 old_attachment,
-            )
-            .await?;
-            lane.type_bytes(old_epoch, account.clear.as_bytes()).await
-        });
-        // What turned it away is the host's: its refusal with a code, its word that the lease of
-        // the epoch ended, or its end of the stream while the connection stood (the host ends the
-        // stream of a worker's refusal that it cannot tell was given before acceptance). A lane that
-        // did not open, or typing that nothing answered, never put the old attachment to a decision.
-        let stale_by_the_host = match stale {
-            Err(kr_e2e_m1b::typing::NotTyped::Refused(error)) => {
-                format!("the host refused it: {error}")
-            }
-            Err(kr_e2e_m1b::typing::NotTyped::LeaseEnded(epoch)) => format!(
-                "the host said the old attachment no longer holds the lease of epoch {}",
-                epoch.get()
-            ),
-            Err(
-                not_typed @ kr_e2e_m1b::typing::NotTyped::Ended(kr_client::input::EndCause::Reset),
-            ) => {
-                format!("the host ended the stream without accepting it: {not_typed}")
-            }
-            Err(other) => panic!(
-                "the old attachment's next input is turned away by the host, on a lane that \
-                 opened: {other}"
-            ),
-            Ok(written) => panic!("the old attachment's next input is refused: {written:?}"),
-        };
+                old_epoch,
+                account.clear.as_bytes(),
+            ))
+            .unwrap_or_else(|why| {
+                panic!("the old attachment's next input is turned away by the host: {why}")
+            })
+            .to_string();
         // The control: the same prompt sent again, on a keyboard of the new connection's own, and
         // the count, read again, is two.
         logged.keyboard = keyboard(stage, &logged.agent.session);
@@ -8406,7 +8390,7 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
             "admission": "the agent's conversation held the prompt, and no screen the device was sent from the submission until it disconnected showed the reply mark or the code in upper case",
             "markers": { "reply_begins": begin, "reply_ends": end, "screen_reply_mark": account.reply_mark, "looked_for": code_start },
             "cutoff": { "reader_stopped": reader_stopped, "fresh_screens": fresh_screens },
-            "reconciled": { "attachment": old.0.to_string(), "epoch": old.1.get(), "next_sequence": old.2, "stale_input": { "turned_away_by": "the host, on a lane opened for the old attachment on the new connection", "what": stale_by_the_host } },
+            "reconciled": { "attachment": old.0.to_string(), "epoch": old.1.get(), "next_sequence": old.2, "stale_input": { "turned_away_by": "the host, on a lane opened for the old attachment on the new connection", "answered": stale_by_the_host } },
             "after_reconnect": { "prompts": prompts, "finished_replies": replies, "shows": end, "seen": shown_in_log(stage, "the redrawn reply", &redrawn, &end) },
             "control": { "what": "the same prompt sent again", "breaks_property": true, "prompts": prompts_twice, "finished_replies": replies_twice, "check": control.err() },
         });
