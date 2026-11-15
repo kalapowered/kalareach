@@ -4365,6 +4365,51 @@ mod tests {
         );
     }
 
+    /// KR-REQ-09.13: a repeat's read adds only revisions below the entry's own. A revision at or
+    /// above it that the worker has a report for is not read by the entry, whatever a record lists.
+    #[test]
+    fn a_repeats_read_through_adds_no_revision_at_or_above_the_entrys_own() {
+        let barrier = barrier();
+        let binding = barrier.bind(session(1));
+        assert!(barrier.acknowledge(
+            session(1),
+            binding,
+            revision(5),
+            evidence(vec![action(10)], Vec::new()),
+        ));
+        assert!(barrier.acknowledge(
+            session(1),
+            binding,
+            revision(6),
+            evidence(vec![action(11)], Vec::new()),
+        ));
+        let above = BTreeMap::from([(session(1), vec![revision(5), revision(6)])]);
+        let (entry, reads) = barrier.report_reading(revision(5), [session(1)], &above);
+        assert_eq!(entry.workers[0].rejected_actions.len(), 1, "{entry:?}");
+        assert_eq!(reads.get(&session(1)), Some(&reads_of(&[5], &[])));
+    }
+
+    /// KR-REQ-09.13: an entry whose own revision has no report held says that it only names it,
+    /// though the reports it carries are held and accounted for: it reads its own revision and has
+    /// none of its names.
+    #[test]
+    fn an_entry_whose_own_report_is_not_held_only_names_its_own_revision() {
+        let barrier = barrier();
+        let binding = barrier.bind(session(1));
+        barrier.announced(session(1), revision(0), &told(4, 5));
+        assert!(barrier.acknowledge(
+            session(1),
+            binding,
+            revision(4),
+            evidence(vec![action(10)], Vec::new()),
+        ));
+        assert_eq!(
+            reads_for(&barrier, revision(5)),
+            Some(reads_of(&[4], &[5])),
+            "the carried report is accounted for and the revision's own is only named"
+        );
+    }
+
     /// KR-REQ-09.13: the record describes the entry it was taken with, whatever goes afterwards. The
     /// entry and its reads come from one report; a report that goes for room after it is captured
     /// is not in the record, so a later entry that has lost it is not covered by the captured one.
