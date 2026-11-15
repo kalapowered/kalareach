@@ -156,11 +156,14 @@ async fn a_reply_read_from_a_record_is_not_written_whole_when_a_fence_is_owed_be
  {
     use kr_protocol::ids::{ActorId, ConnectionId};
 
-    for lands in [
-        FenceLands::Never,
-        FenceLands::Before,
-        FenceLands::DuringTheWait,
-    ] {
+    for (conflict, lands) in [false, true].into_iter().flat_map(|conflict| {
+        [
+            FenceLands::Never,
+            FenceLands::Before,
+            FenceLands::DuringTheWait,
+        ]
+        .map(|lands| (conflict, lands))
+    }) {
         let (_temp, controller, mut writer, mut reader) = connected(false).await;
         let connection_id = ConnectionId::new(kr_ipc::new_uuid());
         let revision = controller.policy().authority_revision();
@@ -171,12 +174,20 @@ async fn a_reply_read_from_a_record_is_not_written_whole_when_a_fence_is_owed_be
                 revision,
             ),
         );
-        // More than a socket holds, so the write waits for the peer to read.
+        // More than a socket holds, so the write waits for the peer to read. A conflict is a reply
+        // that says another request spent the identifier.
         let answer = ControlFrame::Response(Response {
             request_id: REQUEST,
-            outcome: Outcome::Ok(
-                ParamsValue::from_typed(&"x".repeat(256 * 1024)).expect("a large value"),
-            ),
+            outcome: if conflict {
+                Outcome::Error(kr_protocol::error::ProtocolError::new(
+                    ErrorCode::IdConflict,
+                    "x".repeat(256 * 1024),
+                ))
+            } else {
+                Outcome::Ok(
+                    ParamsValue::from_typed(&"x".repeat(256 * 1024)).expect("a large value"),
+                )
+            },
         });
         if matches!(lands, FenceLands::Before) {
             controller.hold_fence(true);
@@ -192,10 +203,17 @@ async fn a_reply_read_from_a_record_is_not_written_whole_when_a_fence_is_owed_be
                         &answer,
                         Some(Method::PrivacySet),
                         REQUEST,
-                        Some(crate::given::local_door::FromARecord::for_a_case(
-                            connection_id,
-                            revision,
-                        )),
+                        Some(if conflict {
+                            crate::given::local_door::FromARecord::for_a_conflict_case(
+                                connection_id,
+                                revision,
+                            )
+                        } else {
+                            crate::given::local_door::FromARecord::for_a_case(
+                                connection_id,
+                                revision,
+                            )
+                        }),
                     )
                     .await;
                 // The connection ends with the writer, as it does when the daemon's loop stops.
@@ -214,7 +232,10 @@ async fn a_reply_read_from_a_record_is_not_written_whole_when_a_fence_is_owed_be
         let stood = writing.await.expect("the write ends");
         match (lands, read) {
             (FenceLands::Never, Ok(read)) => {
-                assert_eq!(read, answer, "the whole answer is read");
+                assert_eq!(
+                    read, answer,
+                    "the whole answer is read, a conflict: {conflict}"
+                );
                 assert!(stood);
             }
             (FenceLands::Before, Ok(ControlFrame::Response(response)))
@@ -222,17 +243,27 @@ async fn a_reply_read_from_a_record_is_not_written_whole_when_a_fence_is_owed_be
                 let Outcome::Error(told) = response.outcome else {
                     panic!("{lands:?}: the stored answer reached the caller");
                 };
-                assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{lands:?}: {told:?}");
-                assert_eq!(
-                    told.message,
-                    crate::error::ControllerError::outcome_not_shown()
-                        .to_protocol_error()
-                        .message
-                );
+                if conflict {
+                    // The request had no effect of its own: the caller is told the refusal of
+                    // the check that failed, not an unknown outcome.
+                    assert_eq!(
+                        told.code,
+                        ErrorCode::PermissionDenied,
+                        "a conflict, {lands:?}: {told:?}"
+                    );
+                } else {
+                    assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{lands:?}: {told:?}");
+                    assert_eq!(
+                        told.message,
+                        crate::error::ControllerError::outcome_not_shown()
+                            .to_protocol_error()
+                            .message
+                    );
+                }
             }
             // The peer had part of it, so the connection ended and the answer is never whole.
             (FenceLands::DuringTheWait, Err(_)) => assert!(!stood),
-            (lands, read) => panic!("{lands:?}: {read:?}"),
+            (lands, read) => panic!("a conflict: {conflict}, {lands:?}: {read:?}"),
         }
     }
 }

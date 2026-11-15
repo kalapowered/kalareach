@@ -50,6 +50,10 @@ pub(crate) struct DoorReply {
 pub(crate) struct FromARecord {
     connection_id: ConnectionId,
     admitted: Option<AuthorityRevision>,
+    /// Whether the reply says another request spent the identifier of this one. That request has
+    /// no effect of its own, so where the standing no longer holds the person is told the refusal
+    /// of the check that failed; a copy of what an earlier request did is told as not shown.
+    conflict: bool,
 }
 
 impl FromARecord {
@@ -63,6 +67,20 @@ impl FromARecord {
         Self {
             connection_id,
             admitted: Some(admitted),
+            conflict: false,
+        }
+    }
+
+    /// As [`Self::for_a_case`], for a reply that says another request spent the identifier.
+    #[cfg(test)]
+    pub(crate) const fn for_a_conflict_case(
+        connection_id: ConnectionId,
+        admitted: AuthorityRevision,
+    ) -> Self {
+        Self {
+            connection_id,
+            admitted: Some(admitted),
+            conflict: true,
         }
     }
 
@@ -71,6 +89,16 @@ impl FromARecord {
         controller
             .check_retained_answer(self.connection_id, self.admitted)
             .is_ok()
+    }
+
+    /// What is written in place of the reply, once it no longer stands: the refusal of the check
+    /// that failed for a reply that says an identifier was spent, and the outcome that is not shown
+    /// for a copy of what an earlier request did.
+    pub(crate) fn withheld(&self, controller: &Controller, request_id: RequestId) -> ControlFrame {
+        match controller.check_retained_answer(self.connection_id, self.admitted) {
+            Err(refusal) if self.conflict => refused_with(request_id, &refusal),
+            _ => respond(request_id, Err(ControllerError::outcome_not_shown())),
+        }
     }
 }
 
@@ -207,6 +235,7 @@ pub(crate) async fn told(settled: Settled<ControlFrame>, standing: &Standing<'_>
     let record_standing = FromARecord {
         connection_id,
         admitted,
+        conflict: false,
     };
     let frame = match origin {
         Origin::Withheld => not_shown(),
@@ -220,7 +249,10 @@ pub(crate) async fn told(settled: Settled<ControlFrame>, standing: &Standing<'_>
         Origin::Fresh if names_a_reused_identifier(&answer) => {
             match controller.check_retained_answer(connection_id, admitted) {
                 Ok(()) => {
-                    from_a_record = Some(record_standing);
+                    from_a_record = Some(FromARecord {
+                        conflict: true,
+                        ..record_standing
+                    });
                     answer
                 }
                 Err(refusal) => refused_with(request_id, &refusal),

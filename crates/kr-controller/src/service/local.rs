@@ -305,7 +305,8 @@ impl Controller {
     /// An answer read from a record is written only while the standing it passed the kept
     /// answer's check under holds (`from_a_record`): it is asked at the same places, the fence this
     /// host owes and the registration at its revision. One none of which has gone is taken back and
-    /// the outcome is told as not shown, and one the peer has part of ends the connection. After
+    /// the outcome is told as not shown, or, for a reply that says an identifier was spent, the
+    /// refusal of the check that failed; one the peer has part of ends the connection. After
     /// the last ask before the transport takes a byte the bytes are the transport's, and no later
     /// ask exists.
     pub(crate) async fn write_answer(
@@ -356,10 +357,9 @@ impl Controller {
                         begun = false;
                         continue;
                     }
-                    let reply = if record_stands() {
-                        self.lease_ended_reply(request_id, method)
-                    } else {
-                        respond(request_id, Err(ControllerError::outcome_not_shown()))
+                    let reply = match from_a_record {
+                        Some(record) if !record.stands(self) => record.withheld(self, request_id),
+                        _ => self.lease_ended_reply(request_id, method),
                     };
                     return writer.write_message(&reply).await.is_ok();
                 }

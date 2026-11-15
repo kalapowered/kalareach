@@ -726,7 +726,7 @@ impl RemoteConnection {
         // The rights this request was decided with: the grant as this host's policy and its
         // configured ceiling leave it. They are what the worker is told the host checked.
         let decided = match self.ask_mutation(mutation, entry) {
-            Ok(decided) => decided,
+            Ok(decided) => decided.admitted_under(validated),
             Err(error) => return Err(error),
         };
         *asked = Some(decided.clone());
