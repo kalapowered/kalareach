@@ -648,6 +648,57 @@ async fn a_close_that_cannot_read_the_directory_in_time_closes_nothing() {
     serving.abort();
 }
 
+/// A close of a session that this daemon holds no worker for, and knows no closure of, reads the
+/// registry inside the budget of the exchange. A registry that does not answer in that time has not
+/// said that no closure is recorded, so the caller is told that the outcome is not known, and not
+/// that the session is unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_that_cannot_read_the_registry_for_a_closure_is_not_told_the_session_is_unknown() {
+    let Silent {
+        _temp,
+        controller,
+        environment_id,
+        session_id,
+        actor,
+        accepted,
+        serving,
+        ..
+    } = silent_worker().await;
+    acknowledged(&controller, session_id);
+    let carried = admission(&controller, accepted).await;
+    controller.directory.lock().await.remove(session_id);
+
+    // Something else is holding the registry for longer than a closure may take.
+    let held = controller.registry.lock().await;
+    let started = tokio::time::Instant::now();
+    let answered = tokio::time::timeout(
+        CLOSE_EXCHANGE + Duration::from_secs(3),
+        controller.session_close(
+            &close_request(environment_id, session_id),
+            &actor,
+            Some(accepted),
+            carried,
+        ),
+    )
+    .await;
+    let waited = started.elapsed();
+    drop(held);
+    let refused = answered
+        .unwrap_or_else(|_| panic!("the close was still reading the registry after {waited:?}"))
+        .into_answer_for_test()
+        .expect_err("a registry that does not answer gives no closure");
+    assert!(
+        waited >= CLOSE_EXCHANGE - Duration::from_secs(1),
+        "the registry was given the time a closure may take: {waited:?}"
+    );
+    assert_eq!(
+        refused.code(),
+        ErrorCode::OutcomeUnknown,
+        "the caller is told the outcome is not known, not that the session is unknown: {refused}"
+    );
+    serving.abort();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_client_is_retired_rather_than_held_for_the_next_caller() {
     let Silent {
