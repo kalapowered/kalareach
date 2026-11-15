@@ -33,6 +33,8 @@ use super::BlockingPause;
 use super::DeregistrationHold;
 #[cfg(any(feature = "testing", test))]
 use super::ReadPause;
+#[cfg(feature = "testing")]
+use super::ThreadPause;
 
 /// How long a daemon's start spends looking at the worker jobs its environment still has defined.
 ///
@@ -1216,6 +1218,10 @@ impl Controller {
             after_a_route_answers: ReadPause::default(),
             #[cfg(feature = "testing")]
             before_a_reply_is_told: ReadPause::default(),
+            #[cfg(feature = "testing")]
+            before_the_policy_lock: ThreadPause::default(),
+            #[cfg(feature = "testing")]
+            before_the_shares_lock: ThreadPause::default(),
             #[cfg(feature = "testing")]
             replies_written: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "testing")]

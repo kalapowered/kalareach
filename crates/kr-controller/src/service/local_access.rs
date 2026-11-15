@@ -241,12 +241,15 @@ impl Controller {
 
     /// What the host's local owner may do now.
     pub(crate) fn local_owner_bound_now(&self) -> LocalOwnerBound {
+        // The clocks are read after the policy lock is taken, which a policy commit holds across
+        // its storage writes.
+        let policy = self
+            .policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = self.clock.now();
         let now_ms = self.settled_utc_now();
-        self.policy
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .local_owner_bound(self.local_owner_device(), now, now_ms)
+        policy.local_owner_bound(self.local_owner_device(), now, now_ms)
     }
 
     /// Whether the host is exclusively organisation-managed and its local owner has no live
@@ -274,15 +277,21 @@ impl Controller {
         if kr_protocol::method::local_hold(method) == kr_protocol::method::LocalHold::Free {
             return Ok(None);
         }
-        // The continuous clock is read first and the wall clock after it, so a pause between the
-        // two readings shortens the time laid over the continuous clock and never lengthens it.
-        let now = self.clock.now();
-        let now_ms = self.settled_utc_now();
-        let bound = self
+        #[cfg(feature = "testing")]
+        self.before_the_policy_lock.wait();
+        // The clocks are read after the policy lock is taken: a policy commit holds that lock
+        // across its storage writes, and a lease that ended while the lock was awaited must not be
+        // read against a time taken before the wait. The continuous clock is read first and the
+        // wall clock after it, so a pause between the two readings shortens the time laid over the
+        // continuous clock and never lengthens it.
+        let policy = self
             .policy
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .local_owner_bound(self.local_owner_device(), now, now_ms);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.clock.now();
+        let now_ms = self.settled_utc_now();
+        let bound = policy.local_owner_bound(self.local_owner_device(), now, now_ms);
+        drop(policy);
         match bound {
             LocalOwnerBound::Open => Ok(None),
             LocalOwnerBound::Closed => Err(LeaseNotLive {

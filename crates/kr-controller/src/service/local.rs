@@ -331,7 +331,9 @@ impl Controller {
         };
         let record_stands = || from_a_record.is_none_or(|record| record.stands(self));
         let lease_holds = || leased.is_none_or(|method| self.local_hold(method).is_ok());
-        let permitted = || record_stands() && lease_holds();
+        // The lease is asked first: its reading waits for the policy lock, which a policy commit
+        // holds across its storage writes, and the record's fence is read after that wait.
+        let permitted = || lease_holds() && record_stands();
         let mut begun = false;
         loop {
             let attempt = if begun {
@@ -407,6 +409,26 @@ impl Controller {
         tokio::sync::oneshot::Sender<()>,
     ) {
         self.after_a_route_answers.arm()
+    }
+
+    /// Arms the pause the next reading of the local owner's lease for a held method stops at before
+    /// it takes the policy lock. Returns the end that says the reading has arrived, and the end
+    /// that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_the_policy_lock(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.before_the_policy_lock.arm()
+    }
+
+    /// Arms the pause the next check of the authority feed on a network connection stops at before
+    /// it takes the connection's shares lock. Returns the end that says the check has arrived, and
+    /// the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_the_shares_lock(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.before_the_shares_lock.arm()
     }
 
     /// Arms the pause the next answer the local door tells stops at as it begins to tell it, so

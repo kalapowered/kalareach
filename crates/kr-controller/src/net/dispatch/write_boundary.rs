@@ -3892,3 +3892,47 @@ async fn an_answer_whose_decision_is_lost_before_every_write_is_told_by_what_it_
         drop(controller);
     }
 }
+
+/// KR-REQ-09.09: the registration check of a network connection reads the fence this host owes
+/// after the last lock that it takes. The authority feed's check takes the connection's shares
+/// lock, and a fence published while it waits for that lock is read afterwards: the check refuses,
+/// and the write or the reply it stands for does not land. The control: with no fence the check
+/// passes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_registration_check_that_waits_for_the_shares_lock_meets_a_fence_owed_in_the_wait() {
+    for owed in [false, true] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::super::tests::daemon(&temp).await;
+        let (connection, _recording) =
+            paired_connection(&controller, 71, &[ActionRight::SessionView]);
+        let admission = crate::authority::AdmittedMutation {
+            connection_id: connection.connection_id,
+            admitted_revision: connection
+                .admitted_at()
+                .await
+                .expect("the connection is admitted"),
+            deadline: None,
+        };
+        let (arrived, go) = controller.pause_before_the_shares_lock();
+        let checking = {
+            let controller = Arc::clone(&controller);
+            tokio::task::spawn_blocking(move || controller.check_registration(&admission))
+        };
+        // The check has read the fence once and is at the shares lock, where it waits.
+        tokio::task::spawn_blocking(move || {
+            arrived.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await
+        .expect("the wait ends")
+        .expect("the check reaches the shares lock");
+        controller.hold_fence(owed);
+        go.send(()).expect("the check goes on");
+        let checked = checking.await.expect("the check ends");
+        controller.hold_fence(false);
+        assert_eq!(
+            checked.is_err(),
+            owed,
+            "a fence owed in the wait: {owed}: {checked:?}"
+        );
+    }
+}

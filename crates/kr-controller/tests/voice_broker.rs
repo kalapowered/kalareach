@@ -1957,6 +1957,58 @@ async fn a_sign_in_completed_after_its_authority_ended_keeps_no_grant_and_revoke
     }
 }
 
+/// KR-REQ-09.09 and 17.54: the ask that stands under the account's hold reads the owner's lease
+/// first and the fence this host owes after it, because the reading of the lease waits for the
+/// policy lock, which a policy commit holds across its storage writes. A fence owed in that wait
+/// stops the sign-in: no grant is kept, what the service issued is revoked, and the browser is told
+/// why. The control: with no fence owed the same sign-in is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_whose_lease_reading_waits_for_the_policy_lock_and_meets_a_fence_keeps_no_grant()
+{
+    for owed in [false, true] {
+        let broker = Broker::start().await;
+        let owner = DeviceKeys::generate().expect("owner keys");
+        let host =
+            net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+        listen_for_sign_ins(&host);
+        let (url, address) = start_sign_in(&host).await;
+        broker.expect_sign_in(&url);
+
+        let (arrived, go) = host.controller().pause_before_the_policy_lock();
+        let (page, ()) = tokio::join!(browser_answers(&address, &url, "the-code"), async {
+            tokio::task::spawn_blocking(move || {
+                arrived.recv_timeout(std::time::Duration::from_secs(30))
+            })
+            .await
+            .expect("the wait ends")
+            .expect("the sign-in's ask reads the lease");
+            host.controller().hold_fence(owed);
+            go.send(()).expect("the reading goes on");
+        });
+        host.controller().hold_fence(false);
+        let report = settled(&host).await;
+        if owed {
+            assert!(
+                page.contains("authority for this sign-in ended"),
+                "the browser is told why: {page}"
+            );
+            assert_eq!(report.state, AccountState::SignedOut, "no grant is kept");
+            assert_eq!(
+                broker.revoked(),
+                [broker.refresh(1)],
+                "what the service issued is revoked"
+            );
+        } else {
+            assert!(
+                matches!(report.state, AccountState::SignedIn { .. }),
+                "{report:?}"
+            );
+            assert!(broker.revoked().is_empty());
+        }
+        host.stop().await;
+    }
+}
+
 /// KR-REQ-17.54: a host that is exclusively organisation-managed answers to its owner's membership
 /// lease, and a sign-in whose person completes it after that lease no longer stands keeps no grant
 /// on the host: what the service issued is revoked and the browser is told why. The host is made

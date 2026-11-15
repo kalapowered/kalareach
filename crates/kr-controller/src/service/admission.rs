@@ -145,6 +145,8 @@ impl Controller {
                 // delegated from, so the removal reaches it when it does not reach the pairing
                 // grant.
                 self.feed_refusal(connection.grant.as_ref()).or_else(|| {
+                    #[cfg(feature = "testing")]
+                    self.before_the_shares_lock.wait();
                     connection
                         .shares
                         .lock()
@@ -821,7 +823,9 @@ impl Controller {
                 detail: crate::authority::AdmissionLapse::Expired.to_string(),
             });
         }
-        Ok(())
+        // The feed's check took the connection's shares lock, and a fence that was published while
+        // it waited is read here, after that lock, as the last reading of the check.
+        self.check_fence()
     }
 
     /// Returns the authority revision a connection was admitted under.
