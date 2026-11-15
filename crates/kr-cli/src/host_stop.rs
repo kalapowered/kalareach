@@ -594,12 +594,7 @@ fn vacant(
 }
 
 /// Something accepted the connection and did not answer within `bound`.
-fn silent(
-    environment: &KnownEnvironment,
-    none: &Facts,
-    json: bool,
-    bound: Duration,
-) -> Completion {
+fn silent(environment: &KnownEnvironment, none: &Facts, json: bool, bound: Duration) -> Completion {
     match lock_held(&environment.paths) {
         Ok(true) => holds_and_is_silent(environment, none, json),
         _ => failed(
@@ -1003,11 +998,7 @@ async fn refused(
         ),
         Ok(Ok(Err(other))) => failed(CliError::Refused(other), none, json),
         Ok(Err(error)) => failed(CliError::Ipc(error), none, json),
-        Err(_) => failed(
-            CliError::Refused(error),
-            none,
-            json,
-        ),
+        Err(_) => failed(CliError::Refused(error), none, json),
     }
 }
 
@@ -1019,7 +1010,11 @@ fn not_ended(
     (answered, holder): (Option<u64>, Option<&ProcessStartIdentity>),
 ) -> Shown {
     let ends_with = match answered
-        .or_else(|| holder.filter(|holder| runs_the_daemon(holder)).map(|holder| holder.pid.get()))
+        .or_else(|| {
+            holder
+                .filter(|holder| runs_the_daemon(holder))
+                .map(|holder| holder.pid.get())
+        })
         .or_else(|| named_daemon(environment))
     {
         Some(pid) => shown!(
@@ -1201,11 +1196,27 @@ mod tests {
         let own = Some("kr-controller/0.78.0+aaaaaaaaaaaa");
         let same = "kr-controller/0.78.0+aaaaaaaaaaaa";
         let earlier = "kr-controller/0.77.0+bbbbbbbbbbbb";
-        assert!(is_the_daemons_own_refusal(own, same, ErrorCode::PermissionDenied));
-        assert!(!is_the_daemons_own_refusal(own, earlier, ErrorCode::PermissionDenied));
+        assert!(is_the_daemons_own_refusal(
+            own,
+            same,
+            ErrorCode::PermissionDenied
+        ));
+        assert!(!is_the_daemons_own_refusal(
+            own,
+            earlier,
+            ErrorCode::PermissionDenied
+        ));
         // Outside a store the build name tells nothing, so the probe decides.
-        assert!(!is_the_daemons_own_refusal(None, same, ErrorCode::PermissionDenied));
-        assert!(is_the_daemons_own_refusal(None, same, ErrorCode::InvalidArgument));
+        assert!(!is_the_daemons_own_refusal(
+            None,
+            same,
+            ErrorCode::PermissionDenied
+        ));
+        assert!(is_the_daemons_own_refusal(
+            None,
+            same,
+            ErrorCode::InvalidArgument
+        ));
     }
 
     /// The wait for the daemon's end gives up at its bound with the daemon not ended where a
@@ -1233,7 +1244,10 @@ mod tests {
         )
         .await
         .expect("the wait ends at its bound");
-        assert!(matches!(waited, End::NotEnded), "a live holder is not an end");
+        assert!(
+            matches!(waited, End::NotEnded),
+            "a live holder is not an end"
+        );
         drop(held);
         let ended = identity::ended_process_identity(std::process::id());
         let waited = wait_for_the_end(
@@ -1244,6 +1258,9 @@ mod tests {
             Duration::from_secs(60),
         )
         .await;
-        assert!(matches!(waited, End::Gone), "no holder and a process that has gone is the end");
+        assert!(
+            matches!(waited, End::Gone),
+            "no holder and a process that has gone is the end"
+        );
     }
 }

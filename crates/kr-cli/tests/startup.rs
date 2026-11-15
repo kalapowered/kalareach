@@ -5412,7 +5412,9 @@ fn kr_host_stop_ends_the_daemon_and_no_session_goes_with_it() {
     let runtime = runtime();
     let mut before = runtime.block_on(async {
         let mut terminal = Typing::attach(&host, session_id, true).await;
-        terminal.type_line("KR_STOP_KEPT=kept; echo first-$KR_STOP_KEPT").await;
+        terminal
+            .type_line("KR_STOP_KEPT=kept; echo first-$KR_STOP_KEPT")
+            .await;
         terminal.shown("first-kept").await;
         terminal
     });
@@ -5422,7 +5424,11 @@ fn kr_host_stop_ends_the_daemon_and_no_session_goes_with_it() {
     assert!(output.status.success(), "{stopped}");
     assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(stop_of(&stopped), "ended", "{stopped}");
-    assert_eq!(stopped["pid"].as_u64(), Some(u64::from(daemon)), "{stopped}");
+    assert_eq!(
+        stopped["pid"].as_u64(),
+        Some(u64::from(daemon)),
+        "{stopped}"
+    );
     assert_eq!(stopped["unsettled"].as_u64(), Some(0), "{stopped}");
 
     assert!(host.running().is_empty(), "the daemon has ended");
@@ -5526,7 +5532,10 @@ fn two_kr_host_stops_at_once_both_succeed_and_one_daemon_ends() {
     let (host, _session_id, _created, _daemon) = a_host_with_a_session();
     let first = start(host.kr(&["--json", "host", "stop"]));
     let second = start(host.kr(&["--json", "host", "stop"]));
-    let results = [first.finish("the first stop"), second.finish("the second stop")];
+    let results = [
+        first.finish("the first stop"),
+        second.finish("the second stop"),
+    ];
     for output in &results {
         let stopped = document(output, "kr host stop");
         assert!(output.status.success(), "{stopped}");
@@ -5537,7 +5546,10 @@ fn two_kr_host_stops_at_once_both_succeed_and_one_daemon_ends() {
     }
     assert!(host.running().is_empty(), "the daemon ended");
     assert!(!lock_is_held(&host));
-    assert!(attempts(&host).is_empty(), "each command removed its own record");
+    assert!(
+        attempts(&host).is_empty(),
+        "each command removed its own record"
+    );
 }
 
 /// KR-REQ-07.12 (no daemon, and a holder that does not answer): with no daemon, the command says
@@ -5729,7 +5741,9 @@ impl TestDaemon {
                                                         pid: kr_protocol::scalars::U64::new(
                                                             u64::from(*pid),
                                                         ),
-                                                        unsettled: kr_protocol::scalars::U64::new(0),
+                                                        unsettled: kr_protocol::scalars::U64::new(
+                                                            0,
+                                                        ),
                                                         launch: Nullable::null(),
                                                     },
                                                 )
@@ -5760,7 +5774,13 @@ impl TestDaemon {
     /// Waits until the daemon has received `method`, which is how a test knows a request left.
     fn until_it_received(&self, method: &str) {
         let started = Instant::now();
-        while !self.received.lock().expect("the record").iter().any(|got| got == method) {
+        while !self
+            .received
+            .lock()
+            .expect("the record")
+            .iter()
+            .any(|got| got == method)
+        {
             assert!(
                 started.elapsed() < LIVENESS_DEADLINE,
                 "the test daemon never received {method}"
@@ -5775,12 +5795,14 @@ impl TestDaemon {
 
     /// Lets a held stop be answered.
     fn let_go(&self) {
-        self.release.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.release
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Stops listening, so that the endpoint is vacant again.
     fn end(&mut self) {
-        self.release.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.release
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -5798,7 +5820,12 @@ const NOBODY: u32 = 4_194_000;
 #[test]
 fn a_hangup_after_the_request_has_left_does_not_end_kr_host_stop() {
     let host = Standalone::create();
-    let mut daemon = TestDaemon::serve(&host, "kr-controller/9.9.9", OnStop::HoldThenAnswer(NOBODY), true);
+    let mut daemon = TestDaemon::serve(
+        &host,
+        "kr-controller/9.9.9",
+        OnStop::HoldThenAnswer(NOBODY),
+        true,
+    );
     let running = start(host.kr(&["--json", "host", "stop"]));
     daemon.until_it_received("host.stop");
     signal("HUP", running.child.as_ref().expect("the child").id());
@@ -5819,7 +5846,12 @@ fn a_hangup_after_the_request_has_left_does_not_end_kr_host_stop() {
 #[test]
 fn an_interrupt_after_the_request_has_left_says_what_may_be_so_and_the_record_stands() {
     let host = Standalone::create();
-    let mut daemon = TestDaemon::serve(&host, "kr-controller/9.9.9", OnStop::HoldThenAnswer(NOBODY), true);
+    let mut daemon = TestDaemon::serve(
+        &host,
+        "kr-controller/9.9.9",
+        OnStop::HoldThenAnswer(NOBODY),
+        true,
+    );
     let running = start(host.kr(&["host", "stop"]));
     daemon.until_it_received("host.stop");
     signal("INT", running.child.as_ref().expect("the child").id());
@@ -5827,13 +5859,22 @@ fn an_interrupt_after_the_request_has_left_says_what_may_be_so_and_the_record_st
     assert_eq!(output.status.code(), Some(1));
     let said = String::from_utf8_lossy(&output.stderr);
     assert!(said.contains("Asked the control daemon"), "{said}");
-    assert!(said.contains("an interrupt does not cancel the stop"), "{said}");
+    assert!(
+        said.contains("an interrupt does not cancel the stop"),
+        "{said}"
+    );
     assert!(said.contains("interrupted while it asked"), "{said}");
     assert!(said.contains("may have taken the request"), "{said}");
     let records = attempts(&host);
     assert_eq!(records.len(), 1, "the interrupted command's record stands");
-    assert_eq!(records[0].attempt.phase, kr_controller::attempt::Phase::Asking);
-    assert_eq!(records[0].standing(), kr_controller::attempt::Standing::Gone);
+    assert_eq!(
+        records[0].attempt.phase,
+        kr_controller::attempt::Phase::Asking
+    );
+    assert_eq!(
+        records[0].standing(),
+        kr_controller::attempt::Standing::Gone
+    );
 
     // The daemon is gone, and the next command that says no daemon runs gives the record.
     daemon.end();
@@ -5841,9 +5882,15 @@ fn an_interrupt_after_the_request_has_left_says_what_may_be_so_and_the_record_st
     assert!(output.status.success());
     let said = String::from_utf8_lossy(&output.stderr);
     assert!(said.contains("The last record of a kr host stop"), "{said}");
-    assert!(said.contains("What happened after that is not recorded"), "{said}");
+    assert!(
+        said.contains("What happened after that is not recorded"),
+        "{said}"
+    );
     assert!(String::from_utf8_lossy(&output.stdout).contains("No control daemon runs"));
-    assert!(attempts(&host).is_empty(), "the command removed the record it said");
+    assert!(
+        attempts(&host).is_empty(),
+        "the command removed the record it said"
+    );
 
     // A reader of the words that no daemon runs gives a record and removes none.
     let again = start(host.kr(&["host", "stop"])).finish("kr host stop");
@@ -5856,13 +5903,27 @@ fn an_interrupt_after_the_request_has_left_says_what_may_be_so_and_the_record_st
 #[test]
 fn a_reader_of_no_daemon_gives_the_record_of_a_killed_stop_and_removes_nothing() {
     let host = Standalone::create();
-    let mut daemon = TestDaemon::serve(&host, "kr-controller/9.9.9", OnStop::HoldThenAnswer(NOBODY), true);
+    let mut daemon = TestDaemon::serve(
+        &host,
+        "kr-controller/9.9.9",
+        OnStop::HoldThenAnswer(NOBODY),
+        true,
+    );
     let mut running = start(host.kr(&["host", "stop"]));
     daemon.until_it_received("host.stop");
-    running.child.as_mut().expect("the child").kill().expect("kills the command");
+    running
+        .child
+        .as_mut()
+        .expect("the child")
+        .kill()
+        .expect("kills the command");
     let _ = running.finish("the killed kr host stop");
     daemon.end();
-    assert_eq!(attempts(&host).len(), 1, "the killed command left its record");
+    assert_eq!(
+        attempts(&host).len(),
+        1,
+        "the killed command left its record"
+    );
 
     let output = start(host.new_session()).finish("kr new");
     assert!(!output.status.success());
@@ -5897,13 +5958,24 @@ fn a_stop_with_no_answer_is_an_unknown_outcome_and_the_command_looks_at_the_lock
 #[test]
 fn a_daemon_that_lists_no_stop_is_left_as_it_is_and_a_refusal_of_its_own_is_shown() {
     let host = Standalone::create();
-    let mut daemon = TestDaemon::serve(&host, "kr-controller/0.1.0+aaaaaaaaaaaa", OnStop::Refuse, true);
+    let mut daemon = TestDaemon::serve(
+        &host,
+        "kr-controller/0.1.0+aaaaaaaaaaaa",
+        OnStop::Refuse,
+        true,
+    );
     let output = start(host.kr(&["host", "stop"])).finish("kr host stop");
     assert_eq!(output.status.code(), Some(1));
     let said = String::from_utf8_lossy(&output.stderr);
-    assert!(said.contains("is of another build and takes no stop request"), "{said}");
+    assert!(
+        said.contains("is of another build and takes no stop request"),
+        "{said}"
+    );
     assert!(said.contains("Nothing was stopped."), "{said}");
-    assert!(said.contains("kr host update or kr host rollback"), "{said}");
+    assert!(
+        said.contains("kr host update or kr host rollback"),
+        "{said}"
+    );
     assert_eq!(
         daemon.received(),
         ["host.info", "host.stop", "backup.status"],
@@ -5913,14 +5985,28 @@ fn a_daemon_that_lists_no_stop_is_left_as_it_is_and_a_refusal_of_its_own_is_show
     assert!(attempts(&host).is_empty());
     daemon.end();
 
-    let mut lease = TestDaemon::serve(&host, "kr-controller/0.1.0+aaaaaaaaaaaa", OnStop::Refuse, false);
+    let mut lease = TestDaemon::serve(
+        &host,
+        "kr-controller/0.1.0+aaaaaaaaaaaa",
+        OnStop::Refuse,
+        false,
+    );
     let output = start(host.kr(&["host", "stop"])).finish("kr host stop");
     assert_eq!(output.status.code(), Some(8));
     let said = String::from_utf8_lossy(&output.stderr);
-    assert!(said.contains("the check that tells which was refused too"), "{said}");
-    assert!(said.contains("this host's grant does not carry the right"), "{said}");
+    assert!(
+        said.contains("the check that tells which was refused too"),
+        "{said}"
+    );
+    assert!(
+        said.contains("this host's grant does not carry the right"),
+        "{said}"
+    );
     assert!(!said.contains("another build"), "{said}");
-    assert_eq!(lease.received(), ["host.info", "host.stop", "backup.status"]);
+    assert_eq!(
+        lease.received(),
+        ["host.info", "host.stop", "backup.status"]
+    );
     lease.end();
 }
 
