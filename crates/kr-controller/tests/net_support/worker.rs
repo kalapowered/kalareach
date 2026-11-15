@@ -1124,21 +1124,24 @@ pub async fn revoke(host: &Host, grant_id: kr_protocol::ids::GrantId) {
 }
 
 /// Types `text` into the terminal of `session_id` as a device that is paired with the host and may
-/// type does. The connection that typed is returned with the device: the attachment lives as long as
-/// the connection does, and the screen keeps what was typed after it is gone.
+/// type does, on the input lane of its attachment. The connection that typed is returned with the
+/// device and the lane: the attachment lives as long as the connection does, and the screen keeps
+/// what was typed after it is gone.
 pub async fn type_into(
     host: &Host,
     owner: &DeviceKeys,
     session_id: SessionId,
     text: &str,
-) -> (kr_client::session::Session, super::Device) {
+) -> (
+    kr_client::session::Session,
+    super::Device,
+    super::typing::Typing,
+) {
     use kr_protocol::attachment::{
         AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
     };
     use kr_protocol::envelope::ParamsValue;
-    use kr_protocol::input::{
-        InputAcquireParams, InputAcquireResult, InputContent, InputWriteParams,
-    };
+    use kr_protocol::input::{InputAcquireParams, InputAcquireResult};
     use kr_protocol::scalars::DurationMs;
 
     let typist = super::Device::create().await;
@@ -1203,19 +1206,17 @@ pub async fn type_into(
         .expect("the lease is settled")
         .to_typed()
         .expect("a lease");
-    session
-        .write_input(&InputWriteParams {
-            session_id,
-            attachment_id,
-            epoch: acquired.lease.epoch,
-            sequence: kr_protocol::ids::InputSequence::new(0),
-            input: InputContent::Bytes {
-                bytes: kr_protocol::scalars::Bytes::new(text.as_bytes().to_vec()),
-            },
-        })
+    // The typing is accepted before the connection is handed back, as the one call that typed here
+    // was done once the host had answered it.
+    let mut input =
+        super::typing::Typing::open(&session, host.environment_id, session_id, attachment_id)
+            .await
+            .expect("the input lane opens");
+    input
+        .type_bytes(acquired.lease.epoch, text.as_bytes())
         .await
         .expect("the input is accepted");
-    (session, typist)
+    (session, typist, input)
 }
 
 /// An upstream that takes every prompt and answers it only once it is released, so a prompt stays

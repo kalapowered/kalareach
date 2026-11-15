@@ -561,7 +561,7 @@ async fn a_refusal_the_feed_raises_releases_what_a_remote_device_holds_at_its_wo
         workers,
     } = net_support::worker::Adopted::start(1).await;
     let worker = &workers[0];
-    let (session, _typist) =
+    let (session, _typist, _input) =
         net_support::worker::type_into(&host, &owner, worker.session_id, "x").await;
     assert_eq!(
         worker.attachments(),

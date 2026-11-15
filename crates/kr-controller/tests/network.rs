@@ -23,6 +23,11 @@
 #[allow(dead_code)]
 #[path = "net_support/pairing.rs"]
 mod pairing_calls;
+#[allow(dead_code)]
+#[path = "net_support/typing.rs"]
+mod typing;
+
+use typing::Typing;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -967,9 +972,11 @@ async fn received_without_applying(
     panic!("the session's output never carried {wanted:?}: {seen:?}");
 }
 
-/// Takes the input lease, types `text`, and waits for [`MARKER`] to come back as output.
+/// Takes the input lease, types `text` on the attachment's input lane, and waits for [`MARKER`] to
+/// come back as output.
 async fn type_and_observe(
     session: &Session,
+    input: &mut Typing,
     environment_id: EnvironmentId,
     session_id: SessionId,
     attachment_id: AttachmentId,
@@ -977,6 +984,7 @@ async fn type_and_observe(
 ) -> String {
     type_and_wait_for(
         session,
+        input,
         environment_id,
         session_id,
         attachment_id,
@@ -986,9 +994,11 @@ async fn type_and_observe(
     .await
 }
 
-/// Takes the input lease, types `text`, and waits for `wanted` to come back as output.
+/// Takes the input lease, types `text` on the attachment's input lane, and waits for `wanted` to
+/// come back as output.
 async fn type_and_wait_for(
     session: &Session,
+    input: &mut Typing,
     environment_id: EnvironmentId,
     session_id: SessionId,
     attachment_id: AttachmentId,
@@ -1021,25 +1031,13 @@ async fn type_and_wait_for(
     .to_typed()
     .expect("a lease");
     let mut events = session.events();
-    let written: InputWriteResult = within_patience(
-        "the host to accept the typed input",
-        session.write_input(&InputWriteParams {
-            session_id,
-            attachment_id,
-            epoch: acquired.lease.epoch,
-            // A lease starts its ordered stream at zero, and a reconnect starts a new one.
-            sequence: kr_protocol::ids::InputSequence::new(0),
-            input: InputContent::Bytes {
-                bytes: kr_protocol::scalars::Bytes::new(text.as_bytes().to_vec()),
-            },
-        }),
-    )
-    .await
-    .expect("the input is accepted");
-    assert!(
-        written.forwarded_bytes.get() > 0,
-        "the bytes reached the application"
-    );
+    // A lease starts its ordered stream at zero: the lane begins the lease's epoch with the
+    // first frame, and the output the caller waits for is what shows the bytes reached the
+    // application.
+    input
+        .type_bytes(acquired.lease.epoch, text.as_bytes())
+        .await
+        .expect("the input is accepted");
     observe(session, &mut events, wanted).await
 }
 
@@ -1243,8 +1241,12 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
         attached.subscribed.gap.as_ref().is_none(),
         "a fresh subscription has no gap in its history"
     );
+    let mut input = Typing::open(&session, host.environment_id, session_id, attached.typing)
+        .await
+        .expect("the input lane opens");
     let seen = type_and_observe(
         &session,
+        &mut input,
         host.environment_id,
         session_id,
         attached.typing,
@@ -1257,16 +1259,11 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
     // puts the first command's bytes behind the position the client carries below, whatever this
     // host's shell printed before any of this started.
     let mut events = session.events();
-    session
-        .write_input(&InputWriteParams {
-            session_id,
-            attachment_id: attached.typing,
-            epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
-            sequence: kr_protocol::ids::InputSequence::new(1),
-            input: InputContent::Bytes {
-                bytes: kr_protocol::scalars::Bytes::new(SECOND_MARKER_COMMAND.as_bytes().to_vec()),
-            },
-        })
+    input
+        .type_bytes(
+            kr_protocol::ids::InputLeaseEpoch::new(1),
+            SECOND_MARKER_COMMAND.as_bytes(),
+        )
         .await
         .expect("the second command is accepted");
     let seen = observe(&session, &mut events, SECOND_MARKER).await;
@@ -1275,16 +1272,8 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
     // Something is typed that the device will *not* apply, and then its connection is lost. What
     // matters below is that the device never applied it, so the restoration has to bring it.
     let away = "printf 'while%s-away\n' -it\n";
-    session
-        .write_input(&InputWriteParams {
-            session_id,
-            attachment_id: attached.typing,
-            epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
-            sequence: kr_protocol::ids::InputSequence::new(2),
-            input: InputContent::Bytes {
-                bytes: kr_protocol::scalars::Bytes::new(away.as_bytes().to_vec()),
-            },
-        })
+    input
+        .type_bytes(kr_protocol::ids::InputLeaseEpoch::new(1), away.as_bytes())
         .await
         .expect("the third batch is accepted");
 
@@ -1619,8 +1608,12 @@ async fn a_revoked_device_is_fenced_before_it_is_served_again() {
     // The subscription is running and quiet: the device types a command whose output ends with a
     // word of its own and leaves no shell to write after it, and reads up to the word. Nothing is
     // on its way to the device, so no frame waits for the relay when the revocation lands.
+    let mut input = Typing::open(&session, host.environment_id, session_id, attached.typing)
+        .await
+        .expect("the input lane opens");
     let seen = type_and_wait_for(
         &session,
+        &mut input,
         host.environment_id,
         session_id,
         attached.typing,
@@ -1787,8 +1780,12 @@ async fn subscribed_under_a_failed_widening(
     // A device connects under the wider ceiling, and its subscription runs.
     let session = connect(daemon, &device, &record).await;
     let attached = attach(&session, host.environment_id, session_id).await;
+    let mut input = Typing::open(&session, host.environment_id, session_id, attached.typing)
+        .await
+        .expect("the input lane opens");
     let seen = type_and_observe(
         &session,
+        &mut input,
         host.environment_id,
         session_id,
         attached.typing,
@@ -1975,8 +1972,12 @@ async fn a_grant_the_clock_floor_expired_ends_the_subscription_and_stays_expired
 
     let session = connect(&daemon, &device, &record).await;
     let attached = attach(&session, host.environment_id, session_id).await;
+    let mut input = Typing::open(&session, host.environment_id, session_id, attached.typing)
+        .await
+        .expect("the input lane opens");
     let seen = type_and_observe(
         &session,
+        &mut input,
         host.environment_id,
         session_id,
         attached.typing,
@@ -2055,8 +2056,12 @@ async fn a_lapsed_offline_bound_stops_a_running_subscription_and_leaves_the_gran
 
     let session = connect(&daemon, &device, &record).await;
     let attached = attach(&session, host.environment_id, session_id).await;
+    let mut input = Typing::open(&session, host.environment_id, session_id, attached.typing)
+        .await
+        .expect("the input lane opens");
     let seen = type_and_observe(
         &session,
+        &mut input,
         host.environment_id,
         session_id,
         attached.typing,
@@ -2065,16 +2070,11 @@ async fn a_lapsed_offline_bound_stops_a_running_subscription_and_leaves_the_gran
     .await;
     assert!(seen.contains(MARKER));
     let mut events = session.events();
-    session
-        .write_input(&InputWriteParams {
-            session_id,
-            attachment_id: attached.typing,
-            epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
-            sequence: kr_protocol::ids::InputSequence::new(1),
-            input: InputContent::Bytes {
-                bytes: kr_protocol::scalars::Bytes::new(TICKING_COMMAND.as_bytes().to_vec()),
-            },
-        })
+    input
+        .type_bytes(
+            kr_protocol::ids::InputLeaseEpoch::new(1),
+            TICKING_COMMAND.as_bytes(),
+        )
         .await
         .expect("the loop is typed");
     received_without_applying(&mut events, TICK).await;
@@ -2394,8 +2394,12 @@ async fn a_members_running_subscription_ends_with_its_lease_and_a_new_lease_serv
     let session = world.connect().await;
     world.present(&session).await;
     let attached = attach(&session, environment_id, session_id).await;
+    let mut input = Typing::open(&session, environment_id, session_id, attached.typing)
+        .await
+        .expect("the input lane opens");
     let seen = type_and_observe(
         &session,
+        &mut input,
         environment_id,
         session_id,
         attached.typing,
@@ -2405,16 +2409,11 @@ async fn a_members_running_subscription_ends_with_its_lease_and_a_new_lease_serv
     assert!(seen.contains(MARKER));
     let mut events = session.events();
     let flag = world.host.tree().root().join("flag");
-    session
-        .write_input(&InputWriteParams {
-            session_id,
-            attachment_id: attached.typing,
-            epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
-            sequence: kr_protocol::ids::InputSequence::new(1),
-            input: InputContent::Bytes {
-                bytes: kr_protocol::scalars::Bytes::new(flag_loop(&flag).into_bytes()),
-            },
-        })
+    input
+        .type_bytes(
+            kr_protocol::ids::InputLeaseEpoch::new(1),
+            flag_loop(&flag).as_bytes(),
+        )
         .await
         .expect("the loop is typed");
     received_without_applying(&mut events, TICK).await;
@@ -3385,8 +3384,12 @@ async fn a_device_pairs_and_attaches_through_a_relay_and_losing_it_leaves_the_se
     .expect("the paired device connects over the relay");
     let session = Session::start(Arc::new(transport)).expect("a session");
     let attached = attach(&session, host.environment_id, session_id).await;
+    let mut input = Typing::open(&session, host.environment_id, session_id, attached.typing)
+        .await
+        .expect("the input lane opens");
     let seen = type_and_observe(
         &session,
+        &mut input,
         host.environment_id,
         session_id,
         attached.typing,
@@ -3547,8 +3550,12 @@ async fn a_relay_quota_disconnect_leaves_the_terminal_worker_running() {
     .expect("the paired device connects over the relay");
     let session = Session::start(Arc::new(transport)).expect("a session");
     let attached = attach(&session, host.environment_id, session_id).await;
+    let mut input = Typing::open(&session, host.environment_id, session_id, attached.typing)
+        .await
+        .expect("the input lane opens");
     let seen = type_and_observe(
         &session,
+        &mut input,
         host.environment_id,
         session_id,
         attached.typing,
@@ -3562,16 +3569,11 @@ async fn a_relay_quota_disconnect_leaves_the_terminal_worker_running() {
     // end the path before the acknowledgement came back. Then what is left of the allowance is less
     // than the command prints, and the barrier is released, so the session's own output spends it.
     let barrier = host.tree().root().join(SPENDING_BARRIER);
-    session
-        .write_input(&InputWriteParams {
-            session_id,
-            attachment_id: attached.typing,
-            epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
-            sequence: kr_protocol::ids::InputSequence::new(1),
-            input: InputContent::Bytes {
-                bytes: kr_protocol::scalars::Bytes::new(spending_command().into_bytes()),
-            },
-        })
+    input
+        .type_bytes(
+            kr_protocol::ids::InputLeaseEpoch::new(1),
+            spending_command().as_bytes(),
+        )
         .await
         .expect("the command is accepted");
     relay.allow_only(ALLOWANCE_LEFT);
@@ -5477,45 +5479,63 @@ async fn a_reconnect_opens_a_new_input_stream_and_replays_no_input() {
     let attached = attach(&session, environment_id, session_id).await;
     let old = acquire(&session, environment_id, session_id, attached.typing).await;
     let mut lane = kr_transport::reconnect::InputLane::new(first_connection, old.lease.epoch);
-    let typed = |sequence: u64, command: &str| InputWriteParams {
-        session_id,
-        attachment_id: attached.typing,
-        epoch: old.lease.epoch,
-        sequence: kr_protocol::ids::InputSequence::new(sequence),
-        input: InputContent::Bytes {
-            bytes: kr_protocol::scalars::Bytes::new(command.as_bytes().to_vec()),
-        },
-    };
+    let old_attachment = attached.typing;
+    let mut input = Typing::open(&session, environment_id, session_id, old_attachment)
+        .await
+        .expect("the input lane opens");
     let mut events = session.events();
     let sent = lane.next_sequence();
-    session
-        .write_input(&typed(0, MARKER_COMMAND))
+    input
+        .type_bytes(old.lease.epoch, MARKER_COMMAND.as_bytes())
         .await
         .expect("the first command is accepted");
     lane.acknowledge(sent);
     observe(&session, &mut events, MARKER).await;
 
-    // The second command is handed to the connection, and the connection is lost before its
-    // answer can come back: its delivery is uncertain.
+    // The second command is handed to the connection, and the connection is lost before the
+    // host's acceptance can come back: its delivery is uncertain. The lane admits the command and
+    // the case reads what the lane has told so far, which is nothing of it, before the
+    // connection ends; the lane's own end then tells where the epoch's frames stand.
     lane.next_sequence();
     {
-        let uncertain = typed(1, UNCERTAIN_COMMAND);
-        let pending = session.write_input(&uncertain);
-        tokio::pin!(pending);
-        let answered = tokio::select! {
-            biased;
-            answered = &mut pending => Some(answered),
-            () = std::future::ready(()) => None,
-        };
-        assert!(
-            answered.is_none(),
-            "the answer came back before the connection could be lost: {answered:?}"
-        );
+        input
+            .lane()
+            .try_send(UNCERTAIN_COMMAND.as_bytes())
+            .expect("the lane takes the second command");
+        while let Some(told) = input.events().try_recv() {
+            assert!(
+                !matches!(&told, kr_client::input::InputEvent::Accepted { through, .. } if through.get() >= 1),
+                "the acceptance came back before the connection could be lost: {told:?}"
+            );
+        }
         session.close();
-        pending
-            .await
-            .expect_err("the connection ended before the second command's answer");
+        let ended = within_patience("the lane to end with the connection", async {
+            loop {
+                match input.events().recv().await {
+                    Some(kr_client::input::InputEvent::Ended { sets, .. }) => return sets,
+                    Some(kr_client::input::InputEvent::Accepted { through, .. })
+                        if through.get() >= 1 =>
+                    {
+                        panic!("the second command was accepted before the connection ended")
+                    }
+                    Some(_) => {}
+                    None => panic!("the lane told nothing of its end"),
+                }
+            }
+        })
+        .await
+        .expect("the lane's end tells where the epoch's frames stand");
+        assert_eq!(
+            (
+                ended.accepted.frames,
+                ended.refused.frames,
+                ended.uncertain.frames + ended.unsent.frames
+            ),
+            (1, 0, 1),
+            "the first command was accepted, and the second never was: {ended:?}"
+        );
     }
+    drop(input);
     let carried =
         kr_client::reconnect::ClientState::from_session(&session, Some(lane.close())).await;
     assert!(
@@ -5545,12 +5565,16 @@ async fn a_reconnect_opens_a_new_input_stream_and_replays_no_input() {
 
     // A client that replayed would send each command again exactly as it went, under the old
     // connection's attachment, lease and sequence. Neither is carried on this connection.
-    for (sequence, command) in [(0, MARKER_COMMAND), (1, UNCERTAIN_COMMAND)] {
-        let refused = session
-            .write_input(&typed(sequence, command))
-            .await
-            .expect_err("the old connection's input stream is not carried across a reconnect");
-        assert_ne!(refused.code(), ErrorCode::OutcomeUnknown, "{refused}");
+    for command in [MARKER_COMMAND, UNCERTAIN_COMMAND] {
+        let refused = match Typing::open(&session, environment_id, session_id, old_attachment).await
+        {
+            Err(refused) => refused,
+            Ok(mut replayed) => replayed
+                .type_bytes(old.lease.epoch, command.as_bytes())
+                .await
+                .expect_err("the old connection's input stream is not carried across a reconnect"),
+        };
+        assert_ne!(refused.code(), Some(ErrorCode::OutcomeUnknown), "{refused}");
     }
 
     // A new attachment's lease is a new input stream, and it starts at sequence zero.
@@ -5561,19 +5585,13 @@ async fn a_reconnect_opens_a_new_input_stream_and_replays_no_input() {
         "the new stream is under a lease of its own"
     );
     let mut events = session.events();
-    let written = session
-        .write_input(&InputWriteParams {
-            session_id,
-            attachment_id: attached.typing,
-            epoch: new.lease.epoch,
-            sequence: kr_protocol::ids::InputSequence::new(0),
-            input: InputContent::Bytes {
-                bytes: kr_protocol::scalars::Bytes::new(SECOND_MARKER_COMMAND.as_bytes().to_vec()),
-            },
-        })
+    let mut input = Typing::open(&session, environment_id, session_id, attached.typing)
+        .await
+        .expect("the input lane opens");
+    input
+        .type_bytes(new.lease.epoch, SECOND_MARKER_COMMAND.as_bytes())
         .await
         .expect("the new stream's first batch is accepted");
-    assert!(written.forwarded_bytes.get() > 0);
     observe(&session, &mut events, SECOND_MARKER).await;
 
     // Each command ran as often as it was delivered, and no more: the acknowledged one once, the
@@ -5673,34 +5691,22 @@ async fn one_responder_answers_a_query_with_a_local_and_a_remote_client_attached
     let session = connect(&daemon, &device, &record).await;
     let attached = attach(&session, environment_id, session_id).await;
     let lease = acquire(&session, environment_id, session_id, attached.typing).await;
+    let mut input = Typing::open(&session, environment_id, session_id, attached.typing)
+        .await
+        .expect("the input lane opens");
     let mut events = session.events();
     // The shell asks the terminal what it is, waits for the answer's line to end, and says it went
     // on. The answer the host writes into its input is echoed back out as ordinary text.
-    session
-        .write_input(&InputWriteParams {
-            session_id,
-            attachment_id: attached.typing,
-            epoch: lease.lease.epoch,
-            sequence: kr_protocol::ids::InputSequence::new(0),
-            input: InputContent::Bytes {
-                bytes: kr_protocol::scalars::Bytes::new(
-                    b"printf '\\033[c'; read -r _; printf 'kala%s-after\\n' reach\n".to_vec(),
-                ),
-            },
-        })
+    input
+        .type_bytes(
+            lease.lease.epoch,
+            b"printf '\\033[c'; read -r _; printf 'kala%s-after\\n' reach\n",
+        )
         .await
         .expect("the command is accepted");
     let answered = observe(&session, &mut events, "[?62;22c").await;
-    session
-        .write_input(&InputWriteParams {
-            session_id,
-            attachment_id: attached.typing,
-            epoch: lease.lease.epoch,
-            sequence: kr_protocol::ids::InputSequence::new(1),
-            input: InputContent::Bytes {
-                bytes: kr_protocol::scalars::Bytes::new(b"\n".to_vec()),
-            },
-        })
+    input
+        .type_bytes(lease.lease.epoch, b"\n")
         .await
         .expect("the line ends");
     let remote = format!(
@@ -5798,8 +5804,12 @@ async fn kr_req_25_10_a_device_given_the_screen_is_shown_it_and_follows_it_until
     let typist_record = pair(&daemon, &typist, &owner).await;
     let typing = connect(&daemon, &typist, &typist_record).await;
     let attached = attach(&typing, host.environment_id, session_id).await;
+    let mut input = Typing::open(&typing, host.environment_id, session_id, attached.typing)
+        .await
+        .expect("the input lane opens");
     let printed = type_and_observe(
         &typing,
+        &mut input,
         host.environment_id,
         session_id,
         attached.typing,
@@ -5959,16 +5969,11 @@ async fn kr_req_25_10_a_device_given_the_screen_is_shown_it_and_follows_it_until
         .await
         .expect("the share includes the live screen, so the device subscribes");
     restoration.subscribed().expect("the order is kept");
-    typing
-        .write_input(&InputWriteParams {
-            session_id,
-            attachment_id: attached.typing,
-            epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
-            sequence: kr_protocol::ids::InputSequence::new(1),
-            input: InputContent::Bytes {
-                bytes: kr_protocol::scalars::Bytes::new(SECOND_MARKER_COMMAND.as_bytes().to_vec()),
-            },
-        })
+    input
+        .type_bytes(
+            kr_protocol::ids::InputLeaseEpoch::new(1),
+            SECOND_MARKER_COMMAND.as_bytes(),
+        )
         .await
         .expect("the second command is accepted");
     let seen = observe(&session, &mut events, SECOND_MARKER).await;
@@ -6497,8 +6502,12 @@ async fn kr_req_25_10_a_recipient_whose_share_is_withdrawn_is_sent_nothing_more(
     let typing = connect(&daemon, &typist, &typist_record).await;
     let attached = attach(&typing, host.environment_id, session_id).await;
     // The typist holds the input lease before anything is shared.
+    let mut input = Typing::open(&typing, host.environment_id, session_id, attached.typing)
+        .await
+        .expect("the input lane opens");
     let printed = type_and_observe(
         &typing,
+        &mut input,
         host.environment_id,
         session_id,
         attached.typing,
@@ -6510,16 +6519,11 @@ async fn kr_req_25_10_a_recipient_whose_share_is_withdrawn_is_sent_nothing_more(
         watching_a_shared_screen(&daemon, &host, &owner, &mut local, session_id, None).await;
 
     // While the share stands the recipient follows the screen.
-    typing
-        .write_input(&InputWriteParams {
-            session_id,
-            attachment_id: attached.typing,
-            epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
-            sequence: kr_protocol::ids::InputSequence::new(1),
-            input: InputContent::Bytes {
-                bytes: kr_protocol::scalars::Bytes::new(SECOND_MARKER_COMMAND.as_bytes().to_vec()),
-            },
-        })
+    input
+        .type_bytes(
+            kr_protocol::ids::InputLeaseEpoch::new(1),
+            SECOND_MARKER_COMMAND.as_bytes(),
+        )
         .await
         .expect("the second command is accepted");
     let followed = observe(&watching.session, &mut watching.events, SECOND_MARKER).await;
@@ -6534,9 +6538,11 @@ async fn kr_req_25_10_a_recipient_whose_share_is_withdrawn_is_sent_nothing_more(
     )
     .await;
 
-    // The screen changes after that, and the recipient is not sent the change.
+    // The screen changes after that, and the recipient is not sent the change. The typist takes
+    // the lease again, so its lane begins the new epoch.
     let printed = type_and_wait_for(
         &typing,
+        &mut input,
         host.environment_id,
         session_id,
         attached.typing,
@@ -6589,17 +6595,12 @@ async fn kr_req_10_45_a_devices_own_grant_changes_leave_another_devices_input_le
     let typing = connect(&daemon, &typist, &typist_record).await;
     let attached = attach(&typing, environment_id, session_id).await;
     let lease = acquire(&typing, environment_id, session_id, attached.typing).await;
+    let mut input = Typing::open(&typing, environment_id, session_id, attached.typing)
+        .await
+        .expect("the input lane opens");
     let mut events = typing.events();
-    typing
-        .write_input(&InputWriteParams {
-            session_id,
-            attachment_id: attached.typing,
-            epoch: lease.lease.epoch,
-            sequence: kr_protocol::ids::InputSequence::new(0),
-            input: InputContent::Bytes {
-                bytes: kr_protocol::scalars::Bytes::new(MARKER_COMMAND.as_bytes().to_vec()),
-            },
-        })
+    input
+        .type_bytes(lease.lease.epoch, MARKER_COMMAND.as_bytes())
         .await
         .expect("the first command is accepted");
     assert!(observe(&typing, &mut events, MARKER).await.contains(MARKER));
@@ -6683,16 +6684,8 @@ async fn kr_req_10_45_a_devices_own_grant_changes_leave_another_devices_input_le
     assert!(withdrawn.revoked_grants.contains(&delegated.grant.grant_id));
 
     // The typist writes again at the epoch and the sequence it was on.
-    typing
-        .write_input(&InputWriteParams {
-            session_id,
-            attachment_id: attached.typing,
-            epoch: lease.lease.epoch,
-            sequence: kr_protocol::ids::InputSequence::new(1),
-            input: InputContent::Bytes {
-                bytes: kr_protocol::scalars::Bytes::new(SECOND_MARKER_COMMAND.as_bytes().to_vec()),
-            },
-        })
+    input
+        .type_bytes(lease.lease.epoch, SECOND_MARKER_COMMAND.as_bytes())
         .await
         .expect("the typist still holds its lease");
     assert!(
