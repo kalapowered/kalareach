@@ -1384,6 +1384,14 @@ pub enum HostCommand {
     TerminalProfile(TerminalProfileArguments),
     /// Show or choose how `kr new` starts this environment's control daemon when none is running.
     Startup(StartupArguments),
+    /// Ask this installation's control daemon to stop, wait until it has ended, and say what that
+    /// left. No session is stopped: its workers keep running, a local attach keeps working, and the
+    /// next daemon finds the sessions again; paired devices' connections close until a daemon runs.
+    /// The command refuses where `KR_SESSION` or `KR_ATTACHMENT` is set or a session's worker
+    /// says the command runs inside its session; run it in a terminal window that was not opened
+    /// through the KalaReach profile, or an SSH login. An interrupt after the request has left does
+    /// not cancel the stop.
+    Stop,
     /// Show which network and services this host selects, join the service that publishes a
     /// description of itself, or leave it.
     Network(NetworkArguments),

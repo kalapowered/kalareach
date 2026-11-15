@@ -53,9 +53,9 @@
 pub mod admit;
 #[cfg(windows)]
 pub mod archive;
-mod formats;
-mod handover;
-mod inventory;
+pub(crate) mod formats;
+pub(crate) mod handover;
+pub(crate) mod inventory;
 pub mod release;
 
 use std::path::PathBuf;

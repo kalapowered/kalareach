@@ -1383,6 +1383,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                 }
                 Ok(Completion::Done)
             }
+            HostCommand::Stop => kr_cli::host_stop::run(&paths, cli.json).await,
             HostCommand::Startup(startup) => {
                 kr_cli::startup::run(&paths, &startup, cli.json)?;
                 Ok(Completion::Done)

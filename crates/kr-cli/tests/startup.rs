@@ -5195,3 +5195,765 @@ fn a_daemon_started_outside_a_service_asks_for_no_scope() {
         "and the daemon is not in a scope of its own"
     );
 }
+
+// -------------------------------------------------------------------------------------------------
+// `kr host stop`
+// -------------------------------------------------------------------------------------------------
+
+/// A terminal attached to a session on its worker's own endpoint, that types into the session and
+/// reads what it shows, with the daemon in the middle or not there at all.
+struct Typing {
+    client: LocalClient,
+    session_id: SessionId,
+    attachment_id: AttachmentId,
+    epoch: Option<kr_protocol::ids::InputLeaseEpoch>,
+    sequence: u64,
+    seen: String,
+}
+
+impl Typing {
+    async fn attach(host: &Standalone, session_id: SessionId, keys: bool) -> Self {
+        let descriptor = kr_ipc::descriptor::read_all(&host.tree.environment())
+            .expect("reads the runtime directory")
+            .into_iter()
+            .filter_map(|entry| entry.descriptor.ok())
+            .find(|descriptor| descriptor.session_id == session_id)
+            .expect("the session's descriptor is published");
+        let endpoint =
+            kr_ipc::paths::Endpoint::from_path(&descriptor.endpoint).expect("an endpoint");
+        let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("reaches the worker");
+        client
+            .verify_worker(&descriptor)
+            .await
+            .expect("the worker answers its descriptor's challenge");
+        let target = ActionTarget {
+            environment_id: descriptor.environment_id,
+            session_id: Nullable::some(session_id),
+            session_epoch: Nullable::some(SessionEpoch::V1),
+            application_instance_id: Nullable::null(),
+            agent_binding_revision: Nullable::null(),
+        };
+        let mut requested = CanonicalSet::new();
+        requested.insert(AttachmentCapability::ObserveTerminal);
+        requested.insert(AttachmentCapability::Input);
+        let attached: SessionAttachResult = client
+            .mutate(
+                Method::SessionAttach,
+                ActionId::new(kr_ipc::new_uuid()),
+                target.clone(),
+                &SessionAttachParams {
+                    session_id,
+                    mode: AttachMode::Terminal,
+                    claim_geometry: false,
+                    dimensions: Nullable::some(Dimensions::new(120, 40)),
+                    terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                    requested,
+                },
+            )
+            .await
+            .expect("the call reaches the worker")
+            .expect("the attach succeeds")
+            .to_typed()
+            .expect("decodes");
+        let attachment_id = attached.attachment.attachment_id;
+        let epoch = if keys {
+            let lease: kr_protocol::input::InputAcquireResult = client
+                .mutate(
+                    Method::InputAcquire,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    target,
+                    &kr_protocol::input::InputAcquireParams {
+                        session_id,
+                        attachment_id,
+                        expected_epoch: Nullable::null(),
+                    },
+                )
+                .await
+                .expect("the call reaches the worker")
+                .expect("the lease is acquired")
+                .to_typed()
+                .expect("decodes");
+            Some(lease.lease.epoch)
+        } else {
+            None
+        };
+        let mut streams = CanonicalSet::new();
+        streams.insert(kr_protocol::recovery::EventStream::Output);
+        client
+            .request(
+                Method::EventsSubscribe,
+                &kr_protocol::recovery::EventsSubscribeParams {
+                    session_id,
+                    attachment_id,
+                    streams,
+                    from_cursor: Nullable::null(),
+                },
+            )
+            .await
+            .expect("the call reaches the worker")
+            .expect("the worker subscribes the terminal");
+        Self {
+            client,
+            session_id,
+            attachment_id,
+            epoch,
+            sequence: 0,
+            seen: String::new(),
+        }
+    }
+
+    /// Types one line into the session, under this terminal's lease.
+    async fn type_line(&mut self, line: &str) {
+        let epoch = self.epoch.expect("this terminal holds the keys");
+        self.client
+            .request(
+                Method::InputWrite,
+                &kr_protocol::input::InputWriteParams {
+                    session_id: self.session_id,
+                    attachment_id: self.attachment_id,
+                    epoch,
+                    sequence: kr_protocol::ids::InputSequence::new(self.sequence),
+                    input: kr_protocol::input::InputContent::Bytes {
+                        bytes: kr_protocol::scalars::Bytes::new(format!("{line}\n").into_bytes()),
+                    },
+                },
+            )
+            .await
+            .expect("the call reaches the worker")
+            .expect("the worker takes the line");
+        self.sequence += 1;
+    }
+
+    /// Reads until `marker` has reached this terminal.
+    async fn shown(&mut self, marker: &str) {
+        use kr_protocol::envelope::ControlFrame;
+
+        let deadline = tokio::time::Instant::now() + LIVENESS_DEADLINE;
+        while !self.seen.contains(marker) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, self.client.recv()).await {
+                Ok(Ok(ControlFrame::Notification(notification)))
+                    if notification.event_type.as_str() == "session.output" =>
+                {
+                    if let Ok(event) = notification
+                        .payload
+                        .to_typed::<kr_protocol::recovery::OutputEvent>()
+                    {
+                        self.seen
+                            .push_str(&String::from_utf8_lossy(event.bytes.as_slice()));
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => panic!(
+                    "waited for {marker:?} and the connection ended ({error}): {:?}",
+                    self.seen
+                ),
+                Err(_) => panic!("waited for {marker:?}: {:?}", self.seen),
+            }
+        }
+    }
+}
+
+/// A host with a daemon and one live session, the daemon's process and the session.
+fn a_host_with_a_session() -> (Standalone, SessionId, Value, u32) {
+    let host = Standalone::create();
+    host.select_standalone();
+    let output = start(host.new_session()).finish("kr new");
+    let created = document(&output, "kr new");
+    assert!(output.status.success(), "{created}");
+    let session_id: SessionId = created["session_id"]
+        .as_str()
+        .expect("a session identifier")
+        .parse()
+        .expect("parses");
+    let daemon = host.one_daemon();
+    (host, session_id, created, daemon)
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime")
+}
+
+/// What `kr host stop` keeps apart in its result.
+fn stop_of(document: &Value) -> &str {
+    document["stop"].as_str().expect("a stop member")
+}
+
+/// Whether anything holds the environment's singleton lock.
+fn lock_is_held(host: &Standalone) -> bool {
+    let environment = host.tree.environment();
+    matches!(
+        kr_controller::singleton::SingletonLock::hold(
+            &environment.singleton_lock(),
+            host.tree.environment_id()
+        ),
+        Err(kr_controller::ControllerError::AlreadyRunning { .. })
+    )
+}
+
+/// The record each attempt keeps, as the next command reads it.
+fn attempts(host: &Standalone) -> Vec<kr_controller::attempt::Recorded> {
+    kr_controller::attempt::recorded(&host.tree.environment())
+}
+
+/// KR-REQ-02.03, KR-REQ-05.01 (the stop's half): `kr host stop` ends the daemon, and no session goes
+/// with it. The daemon's process answered with its number has ended, the endpoint is gone and the
+/// lock is free; a terminal attached before the stop goes on reading and writing, the variable the
+/// shell was given stands, and a terminal attached after it works with no daemon. The command's
+/// own record of the attempt is gone once it has seen the end.
+#[test]
+fn kr_host_stop_ends_the_daemon_and_no_session_goes_with_it() {
+    let (host, session_id, _created, daemon) = a_host_with_a_session();
+    let runtime = runtime();
+    let mut before = runtime.block_on(async {
+        let mut terminal = Typing::attach(&host, session_id, true).await;
+        terminal.type_line("KR_STOP_KEPT=kept; echo first-$KR_STOP_KEPT").await;
+        terminal.shown("first-kept").await;
+        terminal
+    });
+
+    let output = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
+    let stopped = document(&output, "kr host stop");
+    assert!(output.status.success(), "{stopped}");
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(stop_of(&stopped), "ended", "{stopped}");
+    assert_eq!(stopped["pid"].as_u64(), Some(u64::from(daemon)), "{stopped}");
+    assert_eq!(stopped["unsettled"].as_u64(), Some(0), "{stopped}");
+
+    assert!(host.running().is_empty(), "the daemon has ended");
+    assert!(!host.answers(), "nothing answers on the endpoint");
+    assert!(!lock_is_held(&host), "the environment's lock is free");
+    assert!(attempts(&host).is_empty(), "the command removed its record");
+
+    let after = runtime.block_on(async {
+        before.type_line("echo second-$KR_STOP_KEPT").await;
+        before.shown("second-kept").await;
+        // A new attachment, made with no daemon, reads what the session writes next.
+        let mut after = Typing::attach(&host, session_id, false).await;
+        before.type_line("echo third-$KR_STOP_KEPT").await;
+        after.shown("third-kept").await;
+        after
+    });
+    drop((before, after));
+}
+
+/// The worker of a session, by the process the descriptor names.
+fn worker_of(host: &Standalone, session_id: SessionId) -> u32 {
+    let descriptor = kr_ipc::descriptor::read_all(&host.tree.environment())
+        .expect("reads the runtime directory")
+        .into_iter()
+        .filter_map(|entry| entry.descriptor.ok())
+        .find(|descriptor| descriptor.session_id == session_id)
+        .expect("the session's descriptor is published");
+    u32::try_from(descriptor.process_start_identity.pid.get()).expect("a process number")
+}
+
+/// Sends a signal to a process of this test's own tree, by its number.
+fn signal(name: &str, pid: u32) {
+    let sent = spawning(|| {
+        Command::new("/bin/kill")
+            .arg(format!("-{name}"))
+            .arg(pid.to_string())
+            .status()
+    })
+    .expect("runs kill");
+    assert!(sent.success(), "sends {name} to {pid}");
+}
+
+/// KR-REQ-07.58 (the guard): `kr host stop` refuses where the session variables are set, and where
+/// a live session's worker says the process is its own, and the daemon that answered before
+/// answers after. The worker's word is what the second form shows: the command typed into the
+/// session's shell with both variables taken out, as a workflow's shell node would run it, is
+/// refused. The control: a worker that cannot say lets the command go on, and the daemon stops.
+#[test]
+fn kr_host_stop_is_refused_inside_a_session_and_goes_on_where_a_worker_cannot_say() {
+    let (host, session_id, _created, daemon) = a_host_with_a_session();
+    for variable in ["KR_SESSION", "KR_ATTACHMENT"] {
+        let mut command = host.kr(&["--json", "host", "stop"]);
+        command.env(variable, "x");
+        let output = start(command).finish("kr host stop");
+        let refused = document(&output, "kr host stop");
+        assert_eq!(output.status.code(), Some(8), "{variable}: {refused}");
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(refused["code"], "PERMISSION_DENIED", "{refused}");
+        assert_eq!(stop_of(&refused), "not_asked", "{refused}");
+    }
+    assert_eq!(host.running(), vec![daemon], "the daemon was not stopped");
+
+    // The worker's word: both variables are taken out, so only the worker can tell.
+    let said = host.tree.root().join("typed-stop.out");
+    let line = format!(
+        "env -u KR_SESSION -u KR_ATTACHMENT {runtime_variable}={runtime} {state_variable}={state} \
+         {kr} host stop > {said} 2>&1; echo done-$?",
+        runtime_variable = kr_ipc::paths::RUNTIME_DIR_VARIABLE,
+        runtime = host.tree.paths().runtime_root().display(),
+        state_variable = kr_ipc::paths::STATE_DIR_VARIABLE,
+        state = host.tree.paths().state_root().display(),
+        kr = installation().join("kr").display(),
+        said = said.display(),
+    );
+    let runtime = runtime();
+    runtime.block_on(async {
+        let mut terminal = Typing::attach(&host, session_id, true).await;
+        terminal.type_line(&line).await;
+        terminal.shown("done-8").await;
+    });
+    let typed = std::fs::read_to_string(&said).expect("the command's output");
+    assert!(typed.contains("inside session"), "{typed}");
+    assert!(typed.contains("Nothing was stopped"), "{typed}");
+    assert_eq!(host.running(), vec![daemon], "the daemon was not stopped");
+    assert!(host.answers());
+
+    // The control: a worker that is stopped cannot say, and the command goes on.
+    let worker = worker_of(&host, session_id);
+    signal("STOP", worker);
+    let output = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
+    signal("CONT", worker);
+    let stopped = document(&output, "kr host stop");
+    assert!(output.status.success(), "{stopped}");
+    assert_eq!(stop_of(&stopped), "ended", "{stopped}");
+    assert!(host.running().is_empty());
+}
+
+/// KR-REQ-07.12 (two stops at once): both commands end with success and one daemon has ended.
+#[test]
+fn two_kr_host_stops_at_once_both_succeed_and_one_daemon_ends() {
+    let (host, _session_id, _created, _daemon) = a_host_with_a_session();
+    let first = start(host.kr(&["--json", "host", "stop"]));
+    let second = start(host.kr(&["--json", "host", "stop"]));
+    let results = [first.finish("the first stop"), second.finish("the second stop")];
+    for output in &results {
+        let stopped = document(output, "kr host stop");
+        assert!(output.status.success(), "{stopped}");
+        assert!(
+            matches!(stop_of(&stopped), "ended" | "not_asked"),
+            "{stopped}"
+        );
+    }
+    assert!(host.running().is_empty(), "the daemon ended");
+    assert!(!lock_is_held(&host));
+    assert!(attempts(&host).is_empty(), "each command removed its own record");
+}
+
+/// KR-REQ-07.12 (no daemon, and a holder that does not answer): with no daemon, the command says
+/// so and exits 0. A process that holds the environment's lock and does not serve is not stopped:
+/// the command says that nothing was requested and exits 1, and names the process only where it
+/// runs this installation's daemon.
+#[test]
+fn kr_host_stop_says_when_no_daemon_runs_and_names_a_holder_that_does_not_answer() {
+    let host = Standalone::create();
+    let output = start(host.kr(&["host", "stop"])).finish("kr host stop");
+    assert!(output.status.success());
+    let said = String::from_utf8_lossy(&output.stdout);
+    assert!(said.contains("No control daemon runs"), "{said}");
+    assert!(said.contains("Nothing was stopped"), "{said}");
+
+    let lock = host.tree.environment().singleton_lock();
+    let held = kr_controller::singleton::SingletonLock::hold(&lock, host.tree.environment_id())
+        .expect("takes the lock");
+    for (program, named) in [("kr-controller", true), ("a-holder", false)] {
+        let copy = host.tree.root().join(program);
+        std::fs::copy("/bin/sleep", &copy).expect("copies sleep");
+        let mut holder = spawning(|| Command::new(&copy).arg("600").spawn()).expect("starts");
+        std::fs::write(&lock, format!("{}\n", holder.id())).expect("names the holder");
+        let output = start(host.kr(&["host", "stop"])).finish("kr host stop");
+        let _ = holder.kill();
+        let _ = holder.wait();
+        assert_eq!(output.status.code(), Some(1), "{program}");
+        let said = String::from_utf8_lossy(&output.stderr);
+        assert!(said.contains("No stop was requested"), "{said}");
+        assert_eq!(
+            said.contains(&format!("kill -KILL {}", holder.id())),
+            named,
+            "{program}: {said}"
+        );
+    }
+    drop(held);
+}
+
+/// What a test daemon does with a request to stop.
+#[derive(Clone)]
+enum OnStop {
+    /// Takes no notice of it until the test lets it go, and then answers with `pid`.
+    HoldThenAnswer(u32),
+    /// Closes the connection with no answer.
+    Cut,
+    /// Refuses it as a daemon that does not list the method does.
+    Refuse,
+}
+
+/// A daemon of this test's own that answers `host.info` and the probe the level documents, and
+/// does with a stop what the test says. It holds no lock and runs no session: it is what a person's
+/// `kr` meets, nothing more.
+struct TestDaemon {
+    received: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    release: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    socket: PathBuf,
+}
+
+impl TestDaemon {
+    /// Serves the tree's controller endpoint. `build` is what it reports in `host.info`, and
+    /// `probe_answered` whether it answers the probe or refuses it as the grant's own refusal.
+    fn serve(host: &Standalone, build: &str, on_stop: OnStop, probe_answered: bool) -> Self {
+        use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Response};
+
+        let environment = host.tree.environment();
+        let environment_id = host.tree.environment_id();
+        let endpoint = environment.controller_endpoint().expect("an endpoint");
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (heard, released, over) = (received.clone(), release.clone(), ended.clone());
+        let build = build.to_owned();
+        let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+        let boot_epoch = kr_ipc::identity::boot_epoch(&boot).expect("a boot epoch");
+        let info = kr_protocol::hostinfo::HostInfoResult {
+            build_id: BuildId::new(&build).expect("a build identifier"),
+            protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+            environment_id,
+            generation: kr_protocol::ids::ControllerGeneration::new(1),
+            boot_identity: boot.clone(),
+            started_at_ms: kr_protocol::scalars::TimestampMs::new(1_700_000_000_000),
+            live_sessions: kr_protocol::scalars::U64::new(0),
+            session_limit: kr_protocol::scalars::U64::new(8),
+            default_worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+            power: kr_protocol::desktop::SleepInhibitionState::off(
+                kr_protocol::desktop::InhibitionMechanism::None,
+                kr_protocol::desktop::PowerSource::Unknown,
+            ),
+            machine: None,
+            privacy: None,
+            default_shell_mode: None,
+        };
+        let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
+        let socket = PathBuf::from(endpoint.as_text());
+        let thread = std::thread::spawn(move || {
+            let runtime = runtime();
+            runtime.block_on(async move {
+                loop {
+                    if over.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    let accepted =
+                        tokio::time::timeout(Duration::from_millis(100), listener.accept()).await;
+                    let Ok(Ok((connection, peer))) = accepted else {
+                        continue;
+                    };
+                    let (mut reader, mut writer) =
+                        kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+                    let connection_id = kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid());
+                    while let Ok(frame) = reader.read_message::<ControlFrame>().await {
+                        let answer = match frame {
+                            ControlFrame::Hello(_) => ControlFrame::HelloAck(Box::new(
+                                kr_protocol::local::LocalHelloAck {
+                                    selected_version: kr_protocol::hello::PROTOCOL_VERSION,
+                                    role: kr_protocol::local::LocalRole::Controller,
+                                    connection_id,
+                                    environment_id,
+                                    boot_identity: boot.clone(),
+                                    peer: peer.to_wire(),
+                                    action_window: kr_protocol::hello::ActionWindow {
+                                        action_window_id: kr_protocol::ids::ActionWindowId::new(
+                                            "test-daemon",
+                                        )
+                                        .expect("a window identifier"),
+                                        connection_id,
+                                        boot_epoch,
+                                        issued_at_ms: kr_protocol::scalars::TimestampMs::new(0),
+                                        valid_for_ms: kr_protocol::scalars::DurationMs::new(
+                                            600_000,
+                                        ),
+                                    },
+                                    capabilities: CanonicalSet::new(),
+                                    max_receive: kr_protocol::hello::ReceiveLimits::default(),
+                                    build: Some(kr_protocol::local::LocalBuild {
+                                        build_id: BuildId::new(&build).expect("a build"),
+                                        protocol_version: kr_protocol::hello::PACKAGE_VERSION,
+                                    }),
+                                },
+                            )),
+                            ControlFrame::Request(request) => {
+                                let method = request.method.as_str().to_owned();
+                                heard.lock().expect("the record").push(method.clone());
+                                let outcome = match request.method.method() {
+                                    Some(Method::HostInfo) => Outcome::Ok(
+                                        ParamsValue::from_typed(&info).expect("encodes"),
+                                    ),
+                                    Some(Method::BackupStatus) if probe_answered => {
+                                        Outcome::Ok(ParamsValue::empty())
+                                    }
+                                    _ => Outcome::Error(kr_client::error::refusal(
+                                        kr_protocol::error::ErrorCode::PermissionDenied,
+                                        kr_client::shown::Shown::said(
+                                            "this host's grant does not carry the right",
+                                        ),
+                                    )),
+                                };
+                                ControlFrame::Response(Response {
+                                    request_id: request.request_id,
+                                    outcome,
+                                })
+                            }
+                            ControlFrame::Mutation(mutation) => {
+                                heard
+                                    .lock()
+                                    .expect("the record")
+                                    .push(mutation.method.as_str().to_owned());
+                                match &on_stop {
+                                    OnStop::Cut => break,
+                                    OnStop::Refuse => ControlFrame::Response(Response {
+                                        request_id: mutation.request_id,
+                                        outcome: Outcome::Error(kr_client::error::refusal(
+                                            kr_protocol::error::ErrorCode::PermissionDenied,
+                                            kr_client::shown::Shown::said(
+                                                "this method is not in this host's registry",
+                                            ),
+                                        )),
+                                    }),
+                                    OnStop::HoldThenAnswer(pid) => {
+                                        while !released.load(std::sync::atomic::Ordering::SeqCst) {
+                                            tokio::time::sleep(Duration::from_millis(20)).await;
+                                        }
+                                        ControlFrame::Response(Response {
+                                            request_id: mutation.request_id,
+                                            outcome: Outcome::Ok(
+                                                ParamsValue::from_typed(
+                                                    &kr_protocol::update::HostStopResult {
+                                                        pid: kr_protocol::scalars::U64::new(
+                                                            u64::from(*pid),
+                                                        ),
+                                                        unsettled: kr_protocol::scalars::U64::new(0),
+                                                        launch: Nullable::null(),
+                                                    },
+                                                )
+                                                .expect("encodes"),
+                                            ),
+                                        })
+                                    }
+                                }
+                            }
+                            _ => continue,
+                        };
+                        if writer.write_message(&answer).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+        });
+        Self {
+            received,
+            release,
+            ended,
+            thread: Some(thread),
+            socket,
+        }
+    }
+
+    /// Waits until the daemon has received `method`, which is how a test knows a request left.
+    fn until_it_received(&self, method: &str) {
+        let started = Instant::now();
+        while !self.received.lock().expect("the record").iter().any(|got| got == method) {
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "the test daemon never received {method}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn received(&self) -> Vec<String> {
+        self.received.lock().expect("the record").clone()
+    }
+
+    /// Lets a held stop be answered.
+    fn let_go(&self) {
+        self.release.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Stops listening, so that the endpoint is vacant again.
+    fn end(&mut self) {
+        self.release.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
+/// A number no process has: the process a test daemon says it is.
+const NOBODY: u32 = 4_194_000;
+
+/// KR-REQ-07.12 (the interrupts): once the request has left, a hangup does not end the command and
+/// the stop is carried to its end when the daemon answers. The command that waits is the control of
+/// the case below, which an interrupt ends.
+#[test]
+fn a_hangup_after_the_request_has_left_does_not_end_kr_host_stop() {
+    let host = Standalone::create();
+    let mut daemon = TestDaemon::serve(&host, "kr-controller/9.9.9", OnStop::HoldThenAnswer(NOBODY), true);
+    let running = start(host.kr(&["--json", "host", "stop"]));
+    daemon.until_it_received("host.stop");
+    signal("HUP", running.child.as_ref().expect("the child").id());
+    // Only now does the daemon answer: a command that the hangup ended has gone with its report.
+    daemon.let_go();
+    let output = running.finish("kr host stop");
+    let stopped = document(&output, "kr host stop");
+    assert!(output.status.success(), "{stopped}");
+    assert_eq!(stop_of(&stopped), "ended", "{stopped}");
+    assert_eq!(stopped["pid"].as_u64(), Some(u64::from(NOBODY)));
+    daemon.end();
+}
+
+/// KR-REQ-07.12 (the interrupts, and the record): an interrupt after the request has left says what
+/// may be so, exits 1 and does not cancel the stop. The command's record stands, and the next
+/// command that finds no daemon says what it recorded, as a record, and removes it once it has
+/// ended with its own result.
+#[test]
+fn an_interrupt_after_the_request_has_left_says_what_may_be_so_and_the_record_stands() {
+    let host = Standalone::create();
+    let mut daemon = TestDaemon::serve(&host, "kr-controller/9.9.9", OnStop::HoldThenAnswer(NOBODY), true);
+    let running = start(host.kr(&["host", "stop"]));
+    daemon.until_it_received("host.stop");
+    signal("INT", running.child.as_ref().expect("the child").id());
+    let output = running.finish("kr host stop");
+    assert_eq!(output.status.code(), Some(1));
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(said.contains("Asked the control daemon"), "{said}");
+    assert!(said.contains("an interrupt does not cancel the stop"), "{said}");
+    assert!(said.contains("interrupted while it asked"), "{said}");
+    assert!(said.contains("may have taken the request"), "{said}");
+    let records = attempts(&host);
+    assert_eq!(records.len(), 1, "the interrupted command's record stands");
+    assert_eq!(records[0].attempt.phase, kr_controller::attempt::Phase::Asking);
+    assert_eq!(records[0].standing(), kr_controller::attempt::Standing::Gone);
+
+    // The daemon is gone, and the next command that says no daemon runs gives the record.
+    daemon.end();
+    let output = start(host.kr(&["host", "stop"])).finish("kr host stop");
+    assert!(output.status.success());
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(said.contains("The last record of a kr host stop"), "{said}");
+    assert!(said.contains("What happened after that is not recorded"), "{said}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No control daemon runs"));
+    assert!(attempts(&host).is_empty(), "the command removed the record it said");
+
+    // A reader of the words that no daemon runs gives a record and removes none.
+    let again = start(host.kr(&["host", "stop"])).finish("kr host stop");
+    assert!(again.status.success());
+}
+
+/// KR-REQ-07.12 (a reader never removes): `kr new` with no start chosen says that no daemon runs and
+/// gives the record a killed `kr host stop` left, as a record and not as a claim of what happened
+/// after it, and leaves the record where it was.
+#[test]
+fn a_reader_of_no_daemon_gives_the_record_of_a_killed_stop_and_removes_nothing() {
+    let host = Standalone::create();
+    let mut daemon = TestDaemon::serve(&host, "kr-controller/9.9.9", OnStop::HoldThenAnswer(NOBODY), true);
+    let mut running = start(host.kr(&["host", "stop"]));
+    daemon.until_it_received("host.stop");
+    running.child.as_mut().expect("the child").kill().expect("kills the command");
+    let _ = running.finish("the killed kr host stop");
+    daemon.end();
+    assert_eq!(attempts(&host).len(), 1, "the killed command left its record");
+
+    let output = start(host.new_session()).finish("kr new");
+    assert!(!output.status.success());
+    let failed = document(&output, "kr new");
+    let said = failed["message"].as_str().expect("a message");
+    assert!(said.contains("The last record of a kr host stop"), "{said}");
+    assert!(said.contains("asking the control daemon"), "{said}");
+    assert_eq!(attempts(&host).len(), 1, "reading removed nothing");
+}
+
+/// KR-REQ-07.12 (a missing answer): a daemon that closes the connection with no answer to the stop
+/// leaves an unknown outcome, never "not stopped". The command looks at the lock, finds the
+/// environment free, and says that the daemon ended; the stop it reports is `ended`, with no
+/// process it did not learn.
+#[test]
+fn a_stop_with_no_answer_is_an_unknown_outcome_and_the_command_looks_at_the_lock() {
+    let host = Standalone::create();
+    let mut daemon = TestDaemon::serve(&host, "kr-controller/9.9.9", OnStop::Cut, true);
+    let output = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
+    let stopped = document(&output, "kr host stop");
+    assert!(output.status.success(), "{stopped}");
+    assert_eq!(stop_of(&stopped), "ended", "{stopped}");
+    assert!(stopped["pid"].is_null(), "{stopped}");
+    daemon.end();
+}
+
+/// KR-REQ-07.12 (an earlier daemon): a daemon that refuses the stop and answers the read that every
+/// build lists does not list the request. Nothing is stopped, no handover step is asked, the same
+/// daemon answers after the command, and the command exits 1 and says how to switch this host to
+/// another release. The control: a daemon that refuses the read too has refused as its own, which
+/// the command shows as the refusal with exit 8, with nothing else asked.
+#[test]
+fn a_daemon_that_lists_no_stop_is_left_as_it_is_and_a_refusal_of_its_own_is_shown() {
+    let host = Standalone::create();
+    let mut daemon = TestDaemon::serve(&host, "kr-controller/0.1.0+aaaaaaaaaaaa", OnStop::Refuse, true);
+    let output = start(host.kr(&["host", "stop"])).finish("kr host stop");
+    assert_eq!(output.status.code(), Some(1));
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(said.contains("is of another build and takes no stop request"), "{said}");
+    assert!(said.contains("Nothing was stopped."), "{said}");
+    assert!(said.contains("kr host update or kr host rollback"), "{said}");
+    assert_eq!(
+        daemon.received(),
+        ["host.info", "host.stop", "backup.status"],
+        "the stop, then the probe, and no step of an update's handover"
+    );
+    assert!(host.answers(), "the same daemon answers after the command");
+    assert!(attempts(&host).is_empty());
+    daemon.end();
+
+    let mut lease = TestDaemon::serve(&host, "kr-controller/0.1.0+aaaaaaaaaaaa", OnStop::Refuse, false);
+    let output = start(host.kr(&["host", "stop"])).finish("kr host stop");
+    assert_eq!(output.status.code(), Some(8));
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(said.contains("the check that tells which was refused too"), "{said}");
+    assert!(said.contains("this host's grant does not carry the right"), "{said}");
+    assert!(!said.contains("another build"), "{said}");
+    assert_eq!(lease.received(), ["host.info", "host.stop", "backup.status"]);
+    lease.end();
+}
+
+/// KR-REQ-07.12 (a reader that has gone): a `kr host stop` whose output nobody reads any more
+/// still stops the daemon and removes its own record, because what it says is not what it does.
+#[test]
+fn kr_host_stop_goes_on_when_nobody_reads_what_it_says() {
+    let (host, _session_id, _created, _daemon) = a_host_with_a_session();
+    let mut child = spawning(|| {
+        host.kr(&["host", "stop"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    })
+    .expect("kr starts");
+    drop(child.stdout.take());
+    drop(child.stderr.take());
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("waits for kr") {
+            break status;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "kr host stop did not end"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        status.success() || status.code().is_some(),
+        "the command ended by itself: {status:?}"
+    );
+    assert!(host.running().is_empty(), "the daemon ended");
+    assert!(!lock_is_held(&host));
+    assert!(attempts(&host).is_empty(), "the command removed its record");
+}

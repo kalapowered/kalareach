@@ -284,7 +284,9 @@ async fn open_controller_within(
 ) -> Result<LocalClient> {
     let endpoint = paths.controller_endpoint()?;
     match tokio::time::timeout(bound, connect(&endpoint, build_id, origin)).await {
-        Ok(connected) => connected.map_err(|error| not_running(&error, Shown::said(SETUP_ACTION))),
+        Ok(connected) => {
+            connected.map_err(|error| not_running(paths, &error, Shown::said(SETUP_ACTION)))
+        }
         Err(_) => Err(CliError::Unfinished {
             code: ErrorCode::EnvironmentUnavailable,
             message: shown!(
@@ -298,13 +300,19 @@ async fn open_controller_within(
 }
 
 /// The failure a command that needs a control daemon is given when none answers: what went wrong,
-/// and `action`, what the person does about it.
+/// and `action`, what the person does about it, and what a command that ended the daemon recorded
+/// of its attempt in `environment`, where it recorded one. Reading the record removes nothing.
 #[must_use]
-pub fn not_running(error: &kr_ipc::IpcError, action: Shown) -> CliError {
+pub fn not_running(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    error: &kr_ipc::IpcError,
+    action: Shown,
+) -> CliError {
     CliError::HostUnavailable(shown!(
-        "no KalaReach host is running for this environment: {}; {}",
+        "no KalaReach host is running for this environment: {}; {}{}",
         Shown::ipc(error),
-        action
+        action,
+        crate::host_stop::records_said(environment)
     ))
 }
 

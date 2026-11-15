@@ -70,6 +70,7 @@ pub mod error;
 pub mod export;
 pub mod helper;
 pub mod hold;
+pub mod host_stop;
 pub mod import;
 pub mod machine;
 pub mod mouse;
@@ -104,6 +105,16 @@ pub use crate::error::{CliError, Result};
 
 /// The release this build reports.
 pub const RELEASE: &str = env!("CARGO_PKG_VERSION");
+
+/// Returns the build identifier of the control daemon of the release this program belongs to, where
+/// that is a release of a store: the name a daemon of it reports in `host.info`. Outside a store
+/// every build of one version carries the same name, so no daemon is told from another by it.
+#[must_use]
+pub fn controller_build_of_this_release() -> Option<String> {
+    kr_ipc::install::this_process()
+        .ok()
+        .and_then(|running| running.release().map(|release| format!("kr-controller/{release}")))
+}
 
 /// Returns the build identifier this client presents: `kr/` and its release, which is the name of
 /// the installed release it runs from where it is one (`kr/0.2.0+4254aa6e62e5`).
