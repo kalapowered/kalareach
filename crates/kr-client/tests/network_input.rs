@@ -1072,8 +1072,10 @@ async fn a_refusal_of_the_first_frame_has_no_prefix() {
 }
 
 /// The host's notice that an epoch ended is told with its sets and the discarded count, even when
-/// the view has nothing outstanding.
-#[tokio::test]
+/// the view has nothing outstanding. It runs on a runtime with a second thread: a lane that did not
+/// freeze the epoch would keep a writer going round without waiting for anything, and on one
+/// thread that writer would starve the case, which could then not fail by an assertion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_notice_that_an_epoch_ended_carries_the_sets_and_the_fenced_count() {
     let mut rig = rig(2).await;
     rig.lane.begin_epoch(epoch(5)).expect("an epoch");
@@ -2737,6 +2739,15 @@ async fn an_acceptance_does_not_join_across_another_event() {
     rig.script.accept(5, 0);
     rig.script.marker(7);
     rig.script.accept(5, 1);
+    // The lane has applied all three, in the order they came, and the case has read none of them:
+    // the second acceptance meets the marker, which is the last event, and not the first
+    // acceptance.
+    within(async {
+        while rig.sets().accepted != count(2, 10) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
     let told = rig.settled().await;
     assert_eq!(told.len(), 3, "{told:?}");
     assert!(
@@ -2778,6 +2789,14 @@ async fn an_acceptance_does_not_join_across_epochs() {
         .until("the new epoch's frame", |seen| seen.frames.len() >= 2)
         .await;
     rig.script.accept(6, 0);
+    // The lane has applied the second acceptance as well, with the first still unread: the two
+    // stand together in the queue, and the second meets the first.
+    within(async {
+        while rig.sets().accepted != count(1, 5) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
     let told = rig.settled().await;
     let accepted: Vec<&InputEvent> = told
         .iter()
@@ -3022,6 +3041,8 @@ mod local {
         Turn,
         /// Part of the frame is with the worker, which takes no more until `Socket::free`.
         Write,
+        /// The worker's socket is gone: the write fails, and the connection's end is read later.
+        Broken,
     }
 
     /// A transport to a host on this machine: no data streams, one connection, requests answered by
@@ -3186,6 +3207,10 @@ mod local {
                 let stall = self.stalled.lock().expect("stalled").take();
                 if let Some(stall) = stall {
                     self.entered.notify_one();
+                    if matches!(stall, Stall::Broken) {
+                        self.ended.notify_one();
+                        return Err(ClientError::ConnectionEnded);
+                    }
                     let freed = tokio::time::timeout_at(not_after, self.freed.notified()).await;
                     match stall {
                         // The wait for the turn ends with the time, and nothing went.
@@ -3206,6 +3231,7 @@ mod local {
                                 return Ok(false);
                             }
                         }
+                        Stall::Broken => {}
                     }
                 } else if tokio::time::Instant::now() > not_after || !wanted() {
                     return Ok(false);
@@ -3243,6 +3269,9 @@ mod local {
         fn close(&self) {
             self.closed.store(true, Ordering::Release);
         }
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::Acquire)
+        }
     }
 
     async fn local_lane(
@@ -3277,6 +3306,27 @@ mod local {
         let event = tokio::time::timeout(Duration::from_secs(5), events.recv()).await;
         assert!(event.is_ok(), "the lane told nothing within five seconds");
         event.ok().flatten().expect("an event")
+    }
+
+    /// Every end that the lane tells: the first, which the case needs within a few seconds (a lane
+    /// that tells none fails the case here, by this assertion), and any that follows it once the
+    /// lane has had a second of the case's paused time to tell it.
+    async fn ends_of(events: &mut InputEvents) -> Vec<InputEvent> {
+        let mut ends = Vec::new();
+        loop {
+            let event = event_soon(events).await;
+            if matches!(event, InputEvent::Ended { .. }) {
+                ends.push(event);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        while let Some(event) = events.try_recv() {
+            if matches!(event, InputEvent::Ended { .. }) {
+                ends.push(event);
+            }
+        }
+        ends
     }
 
     /// Typing goes as ordered `input.write` requests, one at a time, each answered before the next
@@ -3628,6 +3678,71 @@ mod local {
         );
     }
 
+    /// A last request whose write is cut off by the bound, with the lane finished and no key behind
+    /// it, does not let the lane end as finished: the connection ended under the send, and the lane
+    /// ends once, with the connection's cause.
+    #[tokio::test(start_paused = true)]
+    async fn a_lane_whose_last_request_was_cut_off_with_the_connection_ends_with_its_cause() {
+        let (socket, session, lane, mut events) = local_lane(false).await;
+        socket.stall(Stall::Write);
+        lane.begin_epoch(epoch(5)).expect("an epoch");
+        let request = queue_request(&lane, &session, 1).await;
+        lane.finish();
+        socket.stalled_send().await;
+        let told = told_by_the_bound(request).await;
+        assert!(matches!(told, Err(ClientError::Withheld)), "{told:?}");
+        let ends = ends_of(&mut events).await;
+        assert_eq!(
+            ends.len(),
+            1,
+            "the lane tells its end once and never as finished: {ends:?}"
+        );
+        assert!(
+            matches!(
+                ends[0],
+                InputEvent::Ended {
+                    cause: EndCause::Connection { refusal: None },
+                    ..
+                }
+            ),
+            "{ends:?}"
+        );
+    }
+
+    /// A last request whose write fails because the worker closed its socket, with the lane
+    /// finished and no key behind it, does not let the lane end as finished either: the connection
+    /// broke under the send, and the lane ends once, with the connection's cause.
+    #[tokio::test(start_paused = true)]
+    async fn a_lane_whose_last_request_met_a_closed_socket_ends_with_the_connections_cause() {
+        let (socket, session, lane, mut events) = local_lane(false).await;
+        socket.stall(Stall::Broken);
+        lane.begin_epoch(epoch(5)).expect("an epoch");
+        let request = queue_request(&lane, &session, 1).await;
+        lane.finish();
+        socket.stalled_send().await;
+        let told = told_by_the_bound(request).await;
+        assert!(
+            matches!(told, Err(ClientError::SubmissionUncertain { .. })),
+            "what became of the frame is not known: {told:?}"
+        );
+        let ends = ends_of(&mut events).await;
+        assert_eq!(
+            ends.len(),
+            1,
+            "the lane tells its end once and never as finished: {ends:?}"
+        );
+        assert!(
+            matches!(
+                ends[0],
+                InputEvent::Ended {
+                    cause: EndCause::Connection { refusal: None },
+                    ..
+                }
+            ),
+            "{ends:?}"
+        );
+    }
+
     /// A lane that ends while a request waits for the connection's turn does not have it sent when
     /// the turn comes: the connection asks whether the lane still wants it.
     #[tokio::test(start_paused = true)]
@@ -3649,8 +3764,8 @@ mod local {
         );
     }
 
-    /// A local lane tells its completion as a network lane does: once its writer has written every
-    /// frame that was admitted before the finish, the lane ends as finished.
+    /// A local lane tells its completion as a network lane does: once its writer has gone through
+    /// the frames that were admitted before the finish, the lane ends as finished.
     #[tokio::test]
     async fn a_local_lane_finishes_when_its_writer_has_written_every_frame() {
         let (socket, session, lane, mut events) = local_lane(false).await;
@@ -3707,7 +3822,7 @@ mod local {
     }
 
     /// A key that the host has not answered holds every request behind it, and the lane queues 64 of
-    /// them: the 65th is refused as full, and nothing queued is lost.
+    /// them: the 65th is refused as full.
     #[tokio::test]
     async fn the_lane_queues_64_requests_behind_an_unanswered_key_and_refuses_the_65th() {
         let (socket, session, lane, _events) = local_lane(false).await;
