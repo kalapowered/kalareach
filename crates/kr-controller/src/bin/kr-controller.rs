@@ -315,6 +315,11 @@ async fn run(
         controller.generation()
     );
 
+    // Taken once the start has completed and before anything is served, so that a daemon that
+    // answers a request has it. A signal that arrives during the start ends the process at once,
+    // as it always has; the next start recovers what that cut short.
+    let stopped = stop_signal()?;
+
     let rendezvous_task =
         tokio::spawn(std::sync::Arc::clone(&controller).serve_rendezvous(rendezvous));
     let client_task = tokio::spawn(std::sync::Arc::clone(&controller).serve_clients(clients));
@@ -327,6 +332,9 @@ async fn run(
         result = client_task => result??,
         result = chunk_task => result?,
         result = tokio::signal::ctrl_c() => result?,
+        // The signal a service manager stops this daemon with. It ends the daemon as an interrupt
+        // does, and stops no session: the workers belong to the service manager.
+        () = stopped => {}
         // An update of this host, which a daemon of the new release replaces this one for. Like
         // any other stop, it stops no session: the workers belong to the service manager.
         () = controller.handed_over() => {
@@ -334,6 +342,21 @@ async fn run(
         }
     }
     Ok(())
+}
+
+/// Listens for SIGTERM, which launchd and systemd send at a stop, and resolves once it arrives.
+#[cfg(unix)]
+fn stop_signal() -> std::io::Result<impl Future<Output = ()>> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    Ok(async move {
+        terminate.recv().await;
+    })
+}
+
+/// A daemon on Windows is stopped by the request that stops it, so there is no signal to wait for.
+#[cfg(not(unix))]
+fn stop_signal() -> std::io::Result<impl Future<Output = ()>> {
+    Ok(std::future::pending())
 }
 
 /// Runs this process as the environment's starter.
