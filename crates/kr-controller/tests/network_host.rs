@@ -9,8 +9,10 @@
 //! owner's revocation of a device reaches the host through the signed authority feed, never as a
 //! live call on a paired connection.
 //!
-//! The daemon starts no worker, so every answer here is one it gives itself. Everything a test
-//! writes is in its own temporary host tree on the internal disk.
+//! The daemon starts no worker, so every answer here is one it gives itself, except in the cases
+//! that type into a session: those adopt a worker, and one of them holds the worker's lane to see
+//! what the suites' typing helper waits for. Everything a test writes is in its own temporary host
+//! tree on the internal disk.
 
 mod net_support;
 
@@ -19,12 +21,15 @@ use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::hostinfo::HostDoctorResult;
 use kr_protocol::hostinfo::configuration::{ConfigurationDocument, SecretReference};
-use kr_protocol::ids::ActionId;
+use kr_protocol::ids::{ActionId, InputSequence};
+use kr_protocol::local::InputLaneReady;
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::Nullable;
+use kr_protocol::scalars::{Nullable, U64};
 use kr_protocol::sharing::{DeviceRevokeParams, RevocationResult};
 use kr_protocol::skill::{AgentTarget, AgentToolsParams, InstallScope};
+use net_support::lane::ScriptedLane;
+use net_support::typing::Typing;
 use net_support::{Device, Host, RawDevice};
 
 fn typed<T: kr_protocol::wire::WireMessage>(value: &ParamsValue) -> T {
@@ -580,6 +585,86 @@ async fn a_refusal_the_feed_raises_releases_what_a_remote_device_holds_at_its_wo
     .await
     .expect("the worker lets go of what the device held");
     drop(session);
+    host.stop().await;
+    drop(workers);
+}
+
+/// How long the helper is watched after the frame is at the worker's lane, while the lane has not
+/// answered it. A helper that is wrong returns before this ends; a correct one never fails on it.
+const HELD_ACCEPTANCE_WATCH: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// The suites' typing helper returns once the host has accepted the frame it sent, and not before.
+/// The worker's lane holds its answers: the frame reaches the lane, the host has accepted nothing,
+/// and the helper has not returned. When the lane answers, the helper returns with the sequence of
+/// the frame that was accepted. The second frame is held the same way, behind the acceptance of the
+/// first, which does not stand for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn typing_returns_once_the_host_has_accepted_the_frame_and_not_before() {
+    let net_support::worker::Adopted {
+        host,
+        owner,
+        workers,
+    } = net_support::worker::Adopted::start(1).await;
+    let session_id = workers[0].session_id;
+    let typist = net_support::worker::a_typist(&host, &owner, session_id).await;
+    let lane = ScriptedLane::start(InputLaneReady {
+        epoch: typist.epoch,
+        holder: true,
+        frames: 64,
+        bytes: U64::new(512 * 1024),
+    });
+    host.network().use_input_lane_at(lane.endpoint());
+    let mut input = Typing::open(
+        &typist.session,
+        host.environment_id,
+        session_id,
+        typist.attachment_id,
+    )
+    .await
+    .expect("the input lane opens");
+
+    for (index, bytes) in [&b"first"[..], &b"second"[..]].into_iter().enumerate() {
+        lane.hold_answers();
+        let sequence = u64::try_from(index).expect("a small index");
+        let typing = input.type_bytes(typist.epoch, bytes);
+        tokio::pin!(typing);
+        // The helper is polled first, so a helper that returns without waiting is seen at once,
+        // and the select ends on the lane's side only with the frame at the lane and the helper
+        // still waiting.
+        tokio::select! {
+            biased;
+            returned = &mut typing => {
+                panic!("the helper returned before the host accepted the frame: {returned:?}");
+            }
+            () = lane.until("the frame of the helper", |frames| frames.len() == index + 1) => {}
+        }
+        let at_the_lane = lane.frames();
+        assert_eq!(
+            (
+                at_the_lane[index].epoch,
+                at_the_lane[index].sequence,
+                at_the_lane[index].bytes.as_slice()
+            ),
+            (typist.epoch.get(), sequence, bytes),
+            "the frame that the helper sent is the one at the lane"
+        );
+        assert!(
+            tokio::time::timeout(HELD_ACCEPTANCE_WATCH, &mut typing)
+                .await
+                .is_err(),
+            "the helper returned while the worker had not answered the frame"
+        );
+
+        lane.release_answers();
+        let accepted = typing
+            .await
+            .expect("the helper returns once the lane has answered the frame");
+        assert_eq!(accepted.epoch, typist.epoch);
+        assert_eq!(accepted.sequence, Some(InputSequence::new(sequence)));
+        assert_eq!(accepted.bytes, bytes.len());
+    }
+    drop(input);
+    drop(typist);
     host.stop().await;
     drop(workers);
 }
