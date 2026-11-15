@@ -5720,6 +5720,7 @@ async fn kr_req_23_34_a_retained_answer_of_the_daemons_own_is_decided_as_the_rea
                 &on_the_session(&viewer, method),
                 None,
                 &viewer.pairing_acting(),
+                kr_protocol::ids::AuthorityRevision::new(0),
             )
             .expect("a device that may view is answered")
             .expect("under the read of the receipt");
@@ -5730,6 +5731,7 @@ async fn kr_req_23_34_a_retained_answer_of_the_daemons_own_is_decided_as_the_rea
                 &on_the_session(&blind, method),
                 None,
                 &blind.pairing_acting(),
+                kr_protocol::ids::AuthorityRevision::new(0),
             )
             .expect_err("a device that may not view is not");
         assert_eq!(denied.code, kr_protocol::error::ErrorCode::PermissionDenied);
@@ -5744,7 +5746,8 @@ async fn kr_req_23_34_a_retained_answer_of_the_daemons_own_is_decided_as_the_rea
                 Method::SessionCreate,
                 &create,
                 Some(world.session_id),
-                &viewer.pairing_acting()
+                &viewer.pairing_acting(),
+                kr_protocol::ids::AuthorityRevision::new(0)
             )
             .expect("answered")
             .is_some(),
@@ -5756,7 +5759,8 @@ async fn kr_req_23_34_a_retained_answer_of_the_daemons_own_is_decided_as_the_rea
                 Method::SessionCreate,
                 &create,
                 Some(world.session_id),
-                &blind.pairing_acting()
+                &blind.pairing_acting(),
+                kr_protocol::ids::AuthorityRevision::new(0)
             )
             .is_err(),
         "and refused to a device that may not view it"
@@ -5770,14 +5774,26 @@ async fn kr_req_23_34_a_retained_answer_of_the_daemons_own_is_decided_as_the_rea
         let mut asked = on_the_session(&owner, method);
         asked.target.session_id = Nullable::null();
         let read = owner
-            .read_of_retained(method, &asked, None, &owner.pairing_acting())
+            .read_of_retained(
+                method,
+                &asked,
+                None,
+                &owner.pairing_acting(),
+                kr_protocol::ids::AuthorityRevision::new(0),
+            )
             .expect("a device that may manage the host is shown its challenge")
             .expect("under the read of the challenges");
         assert_eq!(read.shown_as, method);
         let mut refused = on_the_session(&nothing_to_manage, method);
         refused.target.session_id = Nullable::null();
         let denied = nothing_to_manage
-            .read_of_retained(method, &refused, None, &nothing_to_manage.pairing_acting())
+            .read_of_retained(
+                method,
+                &refused,
+                None,
+                &nothing_to_manage.pairing_acting(),
+                kr_protocol::ids::AuthorityRevision::new(0),
+            )
             .expect_err("a device that no longer holds the right is not");
         assert_eq!(denied.code, kr_protocol::error::ErrorCode::PermissionDenied);
 
@@ -5787,12 +5803,24 @@ async fn kr_req_23_34_a_retained_answer_of_the_daemons_own_is_decided_as_the_rea
         let named = on_the_session(&nothing_to_manage, method);
         assert!(named.target.session_id.is_present());
         let denied = nothing_to_manage
-            .read_of_retained(method, &named, None, &nothing_to_manage.pairing_acting())
+            .read_of_retained(
+                method,
+                &named,
+                None,
+                &nothing_to_manage.pairing_acting(),
+                kr_protocol::ids::AuthorityRevision::new(0),
+            )
             .expect_err("the session its target names does not decide it");
         assert_eq!(denied.code, kr_protocol::error::ErrorCode::PermissionDenied);
         let named = on_the_session(&owner, method);
         let read = owner
-            .read_of_retained(method, &named, None, &owner.pairing_acting())
+            .read_of_retained(
+                method,
+                &named,
+                None,
+                &owner.pairing_acting(),
+                kr_protocol::ids::AuthorityRevision::new(0),
+            )
             .expect("a device that may manage the host is shown its challenge")
             .expect("under the read of the challenges");
         assert_eq!(read.shown_as, method);
@@ -5807,7 +5835,8 @@ async fn kr_req_23_34_a_retained_answer_of_the_daemons_own_is_decided_as_the_rea
                 Method::CatalogueAdd,
                 &environment,
                 None,
-                &owner.pairing_acting()
+                &owner.pairing_acting(),
+                kr_protocol::ids::AuthorityRevision::new(0)
             )
             .expect("no read is asked of it")
             .is_none()

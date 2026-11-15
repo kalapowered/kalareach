@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use kr_protocol::envelope::{ControlEvent, ControlFrame};
-use kr_protocol::ids::{ActorId, ConnectionId, DeviceId};
+use kr_protocol::ids::{ActorId, AuthorityRevision, ConnectionId, DeviceId};
 use kr_protocol::scalars::{DurationMs, Nullable};
 
 use kr_protocol::method::Method;
@@ -1402,7 +1402,15 @@ async fn a_refusal_made_after_an_answer_is_told_by_what_the_answer_leaves_open()
         .ask(Some(session_id), Method::SessionRename.entry(), false)
         .expect("the action is decided");
     let kept = connection
-        .may_read_receipts(Some(session_id), Method::SessionRename, &action.acting)
+        .may_read_receipts(
+            Some(session_id),
+            Method::SessionRename,
+            &action.acting,
+            connection
+                .admitted_at()
+                .await
+                .expect("the connection is admitted"),
+        )
         .expect("the read of its receipt is decided");
     let read = connection
         .ask(Some(session_id), Method::SessionRead.entry(), false)
@@ -1609,6 +1617,10 @@ async fn a_kept_owner_confirmation_answer_is_told_as_unknown_when_a_feed_refusal
             &request,
             None,
             &pending.acting,
+            connection
+                .admitted_at()
+                .await
+                .expect("the connection is admitted"),
         )
         .expect("the read is decided")
         .expect("an owner confirmation's answer is decided");
@@ -1637,6 +1649,82 @@ async fn a_kept_owner_confirmation_answer_is_told_as_unknown_when_a_feed_refusal
     assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
     assert_eq!(told.message, super::outcome_not_shown().message);
     drop(controller);
+}
+
+/// KR-REQ-09.09: an answer kept from an earlier submission of an action passed the kept answer's
+/// check, then waits for the stream, and is asked the standing that check asked again where its
+/// bytes are handed to the transport. A fence this host comes to owe in that wait stops it: the
+/// stored answer does not leave and the device is told the outcome is not shown. The control: with
+/// no fence the same answer is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kept_answer_that_waits_for_the_stream_is_not_written_when_a_fence_is_owed_in_the_wait() {
+    use kr_protocol::envelope::{Outcome, ParamsValue, Response};
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::ids::RequestId;
+
+    for owed in [false, true] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::super::tests::daemon(&temp).await;
+        let stream = HeldStream::new(false);
+        let connection = paired_connection_writing_to(
+            &controller,
+            67,
+            &[ActionRight::SessionView, ActionRight::SessionRename],
+            Box::new(Arc::clone(&stream)),
+        );
+        let session_id = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid());
+        let action = connection
+            .ask(Some(session_id), Method::SessionRename.entry(), false)
+            .expect("the action is decided");
+        let kept = connection
+            .may_read_receipts(
+                Some(session_id),
+                Method::SessionRename,
+                &action.acting,
+                connection
+                    .admitted_at()
+                    .await
+                    .expect("the connection is admitted"),
+            )
+            .expect("the read of its receipt is decided");
+        let answer = ControlFrame::Response(Response {
+            request_id: RequestId::new(91),
+            outcome: Outcome::Ok(ParamsValue::empty()),
+        });
+        let (stood, ()) = tokio::join!(
+            connection.write_answer(
+                connection.output(),
+                super::decision::Answered {
+                    frame: answer.clone(),
+                    asked: Some(kept),
+                }
+            ),
+            async {
+                // The write waits for the stream's writer, which the peer has not freed.
+                stream.waited(1).await;
+                controller.hold_fence(owed);
+                stream.writer.add_permits(2);
+            }
+        );
+        controller.hold_fence(false);
+        assert!(stood, "the connection stands");
+        let frames = stream.frames();
+        if owed {
+            let [
+                ControlFrame::Response(Response {
+                    outcome: Outcome::Error(told),
+                    ..
+                }),
+            ] = frames.as_slice()
+            else {
+                panic!("only the outcome that is not shown was written: {frames:?}");
+            };
+            assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+            assert_eq!(told.message, super::outcome_not_shown().message);
+        } else {
+            assert_eq!(frames, [answer], "the kept answer was written");
+        }
+    }
 }
 
 /// KR-REQ-24.15: an answer decided before the feed removed this host is not written when the
@@ -2646,6 +2734,10 @@ async fn a_retained_answer_written_under_a_replacement_lease_without_view_is_not
                     Some(session_id),
                     Method::QuestionAnswer,
                     &connection.pairing_acting(),
+                    connection
+                        .admitted_at()
+                        .await
+                        .expect("the connection is admitted"),
                 )
                 .expect("the lease answers for the read")
         } else {
@@ -3471,7 +3563,13 @@ async fn an_answer_the_hosts_edits_make_too_large_for_the_device_is_not_written(
     let limited = output_receiving(&controller, &stream, &receiving(answer_before));
     assert_eq!(
         limited
-            .write_held(&answer, &[], None, Answers::Kept, None)
+            .write_held(
+                &answer,
+                &[],
+                None,
+                Answers::Kept(AuthorityRevision::new(0)),
+                None
+            )
             .await,
         Written::Sent
     );
@@ -3502,7 +3600,10 @@ async fn an_answer_the_hosts_edits_make_too_large_for_the_device_is_not_written(
             Answers::Action,
             kr_protocol::error::ErrorCode::InvalidArgument,
         ),
-        (Answers::Kept, kr_protocol::error::ErrorCode::OutcomeUnknown),
+        (
+            Answers::Kept(AuthorityRevision::new(0)),
+            kr_protocol::error::ErrorCode::OutcomeUnknown,
+        ),
     ] {
         let stream = HeldStream::new(false);
         stream.writer.add_permits(2);

@@ -1085,7 +1085,7 @@ impl RemoteConnection {
                         // happened: section 7's stop does not wait on this, and only the answer
                         // does, so a close not shown is not told as one refused.
                         if retained != Retained::Not {
-                            *asked = Some(decided.clone().kept());
+                            *asked = Some(decided.clone().kept(validated));
                             if self.admitted_to_answer(validated).is_err() {
                                 return Err(outcome_not_shown());
                             }
@@ -1093,6 +1093,7 @@ impl RemoteConnection {
                                 Some(session_id),
                                 Method::SessionClose,
                                 &decided.acting,
+                                validated,
                             ) {
                                 Ok(read) => *asked = Some(read),
                                 Err(_) => return Err(outcome_not_shown()),
@@ -1916,7 +1917,7 @@ impl RemoteConnection {
                 self.kept_copy(answer, entry.method, mutation, validated, &decided, asked)
                     .await
             }
-            Origin::Withheld => Err(self.withheld_answer(&decided, asked)),
+            Origin::Withheld => Err(self.withheld_answer(&decided, asked, validated)),
         }
     }
 }
@@ -1984,7 +1985,7 @@ impl RemoteConnection {
                         .kept_copy(answer, method, mutation, validated, decided, asked)
                         .await
                         .map(Some),
-                    Origin::Withheld => Err(self.withheld_answer(decided, asked)),
+                    Origin::Withheld => Err(self.withheld_answer(decided, asked, validated)),
                 }
             }
         }
