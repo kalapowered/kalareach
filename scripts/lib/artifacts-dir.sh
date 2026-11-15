@@ -45,7 +45,8 @@
 # (readable by this account only) and says where it is on standard error. The temporary folder is
 # the one TMPDIR names, else /tmp (and /tmp where TMPDIR holds a backslash off Windows), and on
 # Windows, where TMPDIR is not set or is /tmp or /tmp/ (a login shell's profile exports it so), the
-# one TEMP names.
+# one TEMP names. The directory is made under the temporary folder in the form that the reader's
+# own classifier returns for it, never in the form as it was written.
 #
 # The reader guards a test run against a mistake: for any value of the evidence variable, and any
 # temporary variable as a platform, a runner, one of our scripts or a developer's shell sets it,
@@ -106,12 +107,16 @@ _kr_artifacts_flat() {
   printf '%s\n' "$_kr_flat"
 }
 
+# A drive's letter is one of the 52 ASCII letters, listed out in each pattern below: a range such as
+# `A-Za-z` is read by collation under some locales (bash 3.2 in a UTF-8 locale takes `é` for a letter
+# of it), and a drive has no such letter.
+
 # Succeeds when $1, a folder as Windows writes it, is the top of a file system: a drive (`C:\`) or a
 # share (`\\server\share`), with or without the last backslash.
 _kr_artifacts_windows_top() {
   local _kr_top
   case "$1" in
-    [A-Za-z]: | [A-Za-z]:[\\/]) return 0 ;;
+    [abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ]: | [abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ]:[\\/]) return 0 ;;
     \\\\*)
       _kr_top="${1#\\\\}"
       _kr_top="${_kr_top%\\}"
@@ -205,7 +210,7 @@ _kr_artifacts_posix() {
       case "$_kr_v" in */*) return 2 ;; esac
       case "$_kr_v" in
         [Uu][Nn][Cc]'\'?*) _kr_v='\\'"${_kr_v:4}" ;;
-        [A-Za-z]:'\'*) ;;
+        [abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ]:'\'*) ;;
         *) return 2 ;;
       esac
       ;;
@@ -221,8 +226,8 @@ _kr_artifacts_posix() {
       case "$_kr_after" in '' | /*) return 2 ;; esac
       printf '//%s/%s\n' "$_kr_server" "$_kr_after"
       ;;
-    [A-Za-z]:[\\/]*) cygpath -u -- "$_kr_v" ;;
-    [A-Za-z]:* | [\\]*) return 1 ;;
+    [abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ]:[\\/]*) cygpath -u -- "$_kr_v" ;;
+    [abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ]:* | [\\]*) return 1 ;;
     /*) printf '%s\n' "${_kr_v//\\//}" ;;
     *) return 1 ;;
   esac
@@ -359,9 +364,11 @@ _kr_artifacts_confine() {
 # passes it over as a root), and on Windows, where TMPDIR is not set or is /tmp or /tmp/ (a login
 # shell's profile exports it so), the folder TEMP names: /tmp there is a folder that TEMP may not
 # name, and it is no root then. The folder is checked before the directory is made in it, so that a
-# temporary folder that is no root is left as it was.
+# temporary folder that is no root is left as it was. The directory is named under the folder in the
+# form that the classifier returns for it, and not in the form as it was written: a folder written
+# behind \\?\ in backslashes would hold a slash behind the prefix once a name was added to it.
 _kr_artifacts_own() {
-  local _kr_temporary="${TMPDIR:-/tmp}" _kr_made
+  local _kr_temporary="${TMPDIR:-/tmp}" _kr_folder _kr_form _kr_made
   if ! _kr_artifacts_windows; then
     case "$_kr_temporary" in *\\*) _kr_temporary=/tmp ;; esac
   fi
@@ -375,8 +382,16 @@ _kr_artifacts_own() {
       return 1
     }
   fi
-  _kr_artifacts_confine "$_kr_temporary/kr-test-artifacts.XXXXXX" "$_kr_temporary" > /dev/null || return 1
-  _kr_made="$(mktemp -d "$_kr_temporary/kr-test-artifacts.XXXXXX")" || {
+  # A folder that this reader does not take keeps its written form, which the check below refuses
+  # in the words for its spelling; so does a name with a line feed in it, since the conversion drops
+  # the line feeds at its end and would name another folder.
+  _kr_folder="$_kr_temporary"
+  case "$_kr_temporary" in
+    *$'\n'*) ;;
+    *) _kr_form="$(_kr_artifacts_posix "$_kr_temporary")" && _kr_folder="$(_kr_artifacts_trim "$_kr_form")" ;;
+  esac
+  _kr_artifacts_confine "$_kr_folder/kr-test-artifacts.XXXXXX" "$_kr_temporary" > /dev/null || return 1
+  _kr_made="$(mktemp -d "$_kr_folder/kr-test-artifacts.XXXXXX")" || {
     echo "kr-artifacts: no directory of this run's own can be made in the temporary folder '$_kr_temporary'" >&2
     return 1
   }
