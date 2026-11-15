@@ -162,7 +162,7 @@ struct Exception {
 
 /// Every place outside `HOME` that reads a code or words or handles a refused connection, and why it
 /// does not decide what a connection that was not opened means.
-const EXCEPTIONS: [Exception; 64] = [
+const EXCEPTIONS: [Exception; 67] = [
     Exception {
         file: "account/mod.rs",
         function: "usage",
@@ -346,6 +346,20 @@ const EXCEPTIONS: [Exception; 64] = [
         reason: "the refusal of a request to the sync service, which says whether the service is stopped; the service is no paired host",
     },
     Exception {
+        file: "mailbox.rs",
+        function: "is_short_budget",
+        needle: MATCHED,
+        lines: 1,
+        reason: "tells from a refusal of a request to the sync service whether it had no managed capacity for a new mailbox, so that the screen says a limit of the service; the service is no paired host",
+    },
+    Exception {
+        file: "mailbox.rs",
+        function: "is_short_budget",
+        needle: USED,
+        lines: 1,
+        reason: "the code of the same refusal of a request to the sync service; it decides nothing about a connection that was not opened",
+    },
+    Exception {
         file: "push.rs",
         function: "gateway_words",
         needle: MATCHED,
@@ -414,6 +428,13 @@ const EXCEPTIONS: [Exception; 64] = [
         needle: WORDS,
         lines: 1,
         reason: "ends the host's own words with a full stop before this computer's words follow; it chooses no words from them",
+    },
+    Exception {
+        file: "revocation.rs",
+        function: "told_the_alternatives",
+        needle: WORDS,
+        lines: 1,
+        reason: "ends the service's own words with a full stop before the alternatives it named follow; it chooses no words from them and reads no connection's refusal",
     },
     Exception {
         file: "settings/connected.rs",
