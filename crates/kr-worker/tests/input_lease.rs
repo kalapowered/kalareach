@@ -2480,49 +2480,79 @@ fn the_editor_enters(runtime: &Arc<SessionRuntime>, session_id: SessionId) {
 
 /// The root editor of [`powershell_root_session`] returns a line. It is owed no cursor report any
 /// more, and none came.
+///
+/// Returns the deadline that the pass which ended the hold left for the pump, as
+/// [`the_hold_ends_by`] reads it.
 #[cfg(not(windows))]
-fn the_editor_leaves(runtime: &Arc<SessionRuntime>, session_id: SessionId) {
-    use kr_protocol::ids::RequestId;
+fn the_editor_leaves(runtime: &Arc<SessionRuntime>, session_id: SessionId) -> Option<u64> {
     use kr_protocol::root::{
         EditorLeaveReason, PromptGeneration, ReaderRevision, RootEditorLeaveParams,
     };
     use kr_shell_integration::contract::events::BridgeEvent;
 
-    let event = BridgeEvent::EditorLeave(RootEditorLeaveParams {
-        session_id,
-        prompt_generation: PromptGeneration::new(1),
-        reader_revision: ReaderRevision::new(1),
-        reason: EditorLeaveReason::CommandAccepted,
-    });
-    let _ = runtime.drive_fence(|driver| driver.bridge_event(RequestId::new(2), &event));
+    the_hold_ends_by(
+        runtime,
+        &BridgeEvent::EditorLeave(RootEditorLeaveParams {
+            session_id,
+            prompt_generation: PromptGeneration::new(1),
+            reader_revision: ReaderRevision::new(1),
+            reason: EditorLeaveReason::CommandAccepted,
+        }),
+    )
 }
 
 /// The root editor of [`powershell_root_session`] reports itself idle, which it does once it is
 /// reading keys. It is owed no cursor report any more, and none came.
+///
+/// Returns the deadline that the pass which ended the hold left for the pump, as
+/// [`the_hold_ends_by`] reads it.
 #[cfg(not(windows))]
-fn the_editor_idles(runtime: &Arc<SessionRuntime>, session_id: SessionId) {
-    use kr_protocol::ids::RequestId;
+fn the_editor_idles(runtime: &Arc<SessionRuntime>, session_id: SessionId) -> Option<u64> {
     use kr_protocol::root::{
         CwdRevision, EditorBufferRevision, EditorKeymap, EditorState, KeyQueueSnapshot,
         PendingReaderInput, PromptGeneration, ReaderContext, ReaderRevision,
     };
     use kr_shell_integration::contract::events::{BridgeEvent, ReaderIdle};
 
-    let event = BridgeEvent::ReaderIdle(ReaderIdle {
-        session_id,
-        prompt_generation: PromptGeneration::new(1),
-        reader_revision: ReaderRevision::new(1),
-        reader_context: ReaderContext::Primary,
-        snapshot: KeyQueueSnapshot::drained(),
-        editor: EditorState {
-            buffer_empty: true,
-            buffer_revision: EditorBufferRevision::new(1),
-            keymap: EditorKeymap::Emacs,
-            pending: PendingReaderInput::NONE,
-        },
-        cwd_revision: CwdRevision::new(1),
-    });
-    let _ = runtime.drive_fence(|driver| driver.bridge_event(RequestId::new(2), &event));
+    the_hold_ends_by(
+        runtime,
+        &BridgeEvent::ReaderIdle(ReaderIdle {
+            session_id,
+            prompt_generation: PromptGeneration::new(1),
+            reader_revision: ReaderRevision::new(1),
+            reader_context: ReaderContext::Primary,
+            snapshot: KeyQueueSnapshot::drained(),
+            editor: EditorState {
+                buffer_empty: true,
+                buffer_revision: EditorBufferRevision::new(1),
+                keymap: EditorKeymap::Emacs,
+                pending: PendingReaderInput::NONE,
+            },
+            cwd_revision: CwdRevision::new(1),
+        }),
+    )
+}
+
+/// Gives the root editor's machine one event that ends the cursor hold, and returns the deadline
+/// that the pass over the lane left for the pump to wake at.
+///
+/// The event and the read are in one hold of the session. The pump takes the session for every
+/// pass it makes, so none of its passes can come between the pass that the event makes and the
+/// read: the value is the one that this pass wrote, whatever the pump does before or after.
+#[cfg(not(windows))]
+fn the_hold_ends_by(
+    runtime: &Arc<SessionRuntime>,
+    event: &kr_shell_integration::contract::events::BridgeEvent,
+) -> Option<u64> {
+    use kr_protocol::ids::RequestId;
+
+    let mut session = runtime.session();
+    let _ = session
+        .stimulate_fence(|driver| driver.bridge_event(RequestId::new(2), event))
+        .expect("a driver");
+    let published = session.published_reply_expiry();
+    runtime.flush_input();
+    published
 }
 
 /// KR-REQ-08.48: a takeover ends the keystrokes of the lease that was taken, and not the host's
@@ -3070,10 +3100,13 @@ async fn the_paste_ends_and_the_dropped_answer_was_never_written(
 /// The root editor is owed the reply to its cursor question, so the lane keeps the host's answer
 /// to the application's question behind that reply, and the answer does not age. A paste opens.
 /// The editor then leaves with no cursor report: the answer is free, with the deadline it had,
-/// and nothing can be written while the paste is open. After that nothing happens: no key, no
-/// output, no room and no other timer. The pass that ended the hold is the only one that can tell
-/// the pump when to look again, and the lane's clock moves only while the pump stands at its
-/// timer, so the drop is the pump's own wake at the deadline.
+/// and nothing can be written while the paste is open.
+///
+/// The pass that ends the hold publishes that deadline. The case reads it in the same hold of the
+/// session that the pass is made in, so no pass of the pump can come between. After that nothing
+/// happens: no key, no output, no room and no other timer. The lane's clock moves only while the
+/// pump stands at its timer, so the drop is the pump's own wake at the deadline, and the answer
+/// is never written.
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_answer_that_the_end_of_a_cursor_hold_frees_behind_an_open_paste_is_dropped_at_its_deadline()
@@ -3083,6 +3116,7 @@ async fn an_answer_that_the_end_of_a_cursor_hold_frees_behind_an_open_paste_is_d
     let (timer_ended, release_pump) = runtime.input().pause_the_pump_at_its_timer();
 
     the_editor_enters(&runtime, session_id);
+    let offered_at = kr_ipc::clock::SharedClock::boot_elapsed_ms(&clock);
     {
         let mut session = runtime.session();
         session.ingest_output(b"\x1b[?2004h");
@@ -3103,7 +3137,11 @@ async fn an_answer_that_the_end_of_a_cursor_hold_frees_behind_an_open_paste_is_d
     }
     // Before the deadline, with the paste open.
     clock.advance(Duration::from_millis(1_800));
-    the_editor_leaves(&runtime, session_id);
+    assert_eq!(
+        the_editor_leaves(&runtime, session_id),
+        Some(offered_at + 2_000),
+        "the pass that ends the hold publishes the deadline the answer had"
+    );
 
     tokio::time::timeout(Duration::from_secs(20), timer_ended)
         .await
@@ -3134,10 +3172,12 @@ async fn an_answer_that_the_end_of_a_cursor_hold_frees_behind_an_open_paste_is_d
 /// The share of the host's answers is full, and the writer holds all of them, before the root
 /// editor begins its read. The lane then keeps one more answer behind the editor's cursor report,
 /// and the answer does not age. The editor reads keys with no cursor report sent: the answer is
-/// free, with the deadline it had, and there is no room for it. After that nothing happens: no key, no
-/// output, no room and no other timer. The pass that ended the hold is the only one that can tell
-/// the pump when to look again, and the lane's clock moves only while the pump stands at its
-/// timer, so the drop is the pump's own wake at the deadline.
+/// free, with the deadline it had, and there is no room for it.
+///
+/// The pass that ends the hold publishes that deadline. The case reads it in the same hold of the
+/// session that the pass is made in, so no pass of the pump can come between. After that nothing
+/// happens: no key, no output, no room and no other timer. The lane's clock moves only while the
+/// pump stands at its timer, so the drop is the pump's own wake at the deadline.
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn an_answer_that_the_end_of_a_cursor_hold_frees_with_no_room_is_dropped_at_its_deadline() {
@@ -3158,6 +3198,7 @@ async fn an_answer_that_the_end_of_a_cursor_hold_frees_with_no_room_is_dropped_a
     // The lane's rate limit is per second: the answer after those is a second later.
     clock.advance(Duration::from_secs(1));
     the_editor_enters(&runtime, session_id);
+    let offered_at = kr_ipc::clock::SharedClock::boot_elapsed_ms(&clock);
     {
         let mut session = runtime.session();
         // Offered at one second, so its deadline is at three, once it ages.
@@ -3169,7 +3210,11 @@ async fn an_answer_that_the_end_of_a_cursor_hold_frees_with_no_room_is_dropped_a
     }
     // Before the deadline.
     clock.advance(Duration::from_millis(1_900));
-    the_editor_idles(&runtime, session_id);
+    assert_eq!(
+        the_editor_idles(&runtime, session_id),
+        Some(offered_at + 2_000),
+        "the pass that ends the hold publishes the deadline the answer had"
+    );
 
     tokio::time::timeout(Duration::from_secs(20), timer_ended)
         .await
