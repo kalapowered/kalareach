@@ -1121,7 +1121,11 @@ impl Host {
                 shell_packages: None,
                 terminal: Box::new(kr_controller::supervision::NoTerminal),
             };
-            kr_controller::testing::with_git_read_bound(
+            // Each thing a case gives the start wraps it in a future of its own, and a wrapper
+            // holds the future it wraps twice over, so the wrapped start is large in a debug
+            // build. Boxed, it is built once and then lives on the heap, off the stack of the
+            // test thread, instead of being held by every future that awaits the start.
+            Box::pin(kr_controller::testing::with_git_read_bound(
                 kr_controller::testing::HUNG_GIT_READ,
                 kr_controller::testing::with_account_origin(account_origin.clone(), async {
                     let started = async {
@@ -1178,7 +1182,7 @@ impl Host {
                         None => started.await,
                     }
                 }),
-            )
+            ))
         })
         .await
         .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
