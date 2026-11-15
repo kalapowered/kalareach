@@ -6490,6 +6490,10 @@ fn the_records_of_earlier_attempts_are_removed_only_after_they_were_put_out() {
     assert_eq!(attempts(&host).len(), 1, "the document was not written");
     assert!(stop_that_nobody_reads(&host, &["host", "stop"], "stderr"));
     assert_eq!(attempts(&host).len(), 1, "the record was not said");
+    // In text mode the record is said on standard error and the result is a line on standard
+    // output: where that line cannot be written, the command's result was not written either.
+    assert!(stop_that_nobody_reads(&host, &["host", "stop"], "stdout"));
+    assert_eq!(attempts(&host).len(), 1, "the result line was not written");
 
     let output = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
     let said = document(&output, "kr host stop");
