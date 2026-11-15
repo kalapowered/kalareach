@@ -578,6 +578,10 @@ impl RemoteConnection {
             Ok(proxy) => proxy,
             Err(error) => return Err(error.to_protocol_error()),
         };
+        // Whether the worker serves the lane is known once its link is, and what is refused for a
+        // worker without it is refused before the route is claimed.
+        let serves_lane = self.inputs.serves_lane(&proxy);
+        super::super::input::barrier::refuse_detach_without_attachment(serves_lane, mutation)?;
         if let Err(refusal) = self.claim_route(mutation, Some(session_id), own_claim) {
             return Err(refusal.into_error());
         }
@@ -652,7 +656,6 @@ impl RemoteConnection {
             answering,
             Method::InputRelease | Method::SessionDetach | Method::ShellLaunch
         );
-        let serves_lane = self.inputs.serves_lane(&proxy);
         // A worker without the lane writes no marker when its launch handling ends, so the client's
         // hold on later typing ends only with the stream the launch's barrier names. When the
         // launch's result stays unknown, that stream is ended below.
