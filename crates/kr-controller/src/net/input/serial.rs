@@ -221,9 +221,10 @@ async fn carry(
             // replaces it, the connection's release): nothing is written for the frame. The check
             // is made here, where the frame is entered, and the call that is entered below is
             // never dropped, since a call stopped part way through its write would close the link
-            // that carries the worker's other requests; a frame whose call is already at the
-            // link's writer is written whatever happens to the stream after. The end stands as it
-            // was decided, and the frame is left with no word of its own.
+            // that carries the worker's other requests. A frame whose call has been entered is
+            // written whatever happens to the stream after: the window starts at the entry, and
+            // not at the link's writer, which the call's own task reaches later. The end stands as
+            // it was decided, and the frame is left with no word of its own.
             return;
         }
         state.in_flight += 1;
