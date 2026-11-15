@@ -7024,6 +7024,68 @@ async fn a_created_session_is_kept_when_its_node_is_asked_to_stop_after_its_admi
     host.clients.abort();
 }
 
+/// A test that ends while its daemon has recorded a worker and not yet written the worker's
+/// descriptor still ends the worker. The descriptor is renamed within its directory, where nothing
+/// lists it, when the case ends, and renamed back once the teardown has read the directory and found
+/// the worker unnamed, as a daemon slow to write it would leave it; the teardown waits for it, asks
+/// the worker to close, and the worker ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_worker_whose_descriptor_is_written_after_the_teardown_began_is_still_closed() {
+    let host = working_host().await;
+    let mut control = client(&host).await;
+    host.issue(grant_id(100), &[ActionRight::SessionCreate]);
+    let mut document = definition(
+        workflow_id(100),
+        grant_id(100),
+        "a session",
+        create_session_node(&host, None),
+    );
+    document.deadlines = WorkflowDeadlines {
+        run_deadline_ms: U64::new(120_000),
+        action_wait_ms: U64::new(60_000),
+    };
+    install(&mut control, &host, &document).await;
+    enable(&mut control, &host, &document).await;
+    let _running = run_from_another_task(&host, &document, "evt-late");
+
+    let until_published = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    let environment = host._temp.environment();
+    let published = loop {
+        let sessions = all_sessions(&mut control).await;
+        let live = sessions.into_iter().find(|session| {
+            session.closure.0.is_none() && session.state == kr_protocol::session::SessionState::Live
+        });
+        if let Some(live) = live
+            && let Some(entry) = kr_ipc::descriptor::read_all(&environment)
+                .expect("the descriptors are readable")
+                .into_iter()
+                .find(|entry| {
+                    entry
+                        .descriptor
+                        .as_ref()
+                        .is_ok_and(|descriptor| descriptor.session_id == live.session_id)
+                })
+        {
+            break entry.path;
+        }
+        assert!(
+            std::time::Instant::now() < until_published,
+            "the session came into being with a descriptor"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    let held = published.with_extension("held");
+    std::fs::rename(&published, &held).expect("the descriptor is renamed out of the listing");
+    host.clients.abort();
+    std::thread::spawn(move || {
+        teardown::wait_until_a_worker_is_found_unnamed(
+            &environment,
+            std::time::Duration::from_secs(120),
+        );
+        let _ = std::fs::rename(&held, &published);
+    });
+}
+
 /// A daemon with real sessions whose configuration document names `suites` (a name, its command,
 /// and the output paths it declares), started before anything else is done.
 async fn working_host_with_suites(suites: &[(&str, &str, &[&str])]) -> Host {

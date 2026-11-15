@@ -64,6 +64,44 @@ const TOOL_BOUND: Duration = Duration::from_secs(10);
 /// of identity and the close itself, each within [`TOOL_BOUND`], and a margin.
 const ASKING_BOUND: Duration = Duration::from_secs(35);
 
+/// How long the teardown waits for a descriptor to name each worker of its tree that is still
+/// running. A daemon opens its link to a worker for up to two seconds before it writes the
+/// worker's descriptor, and the write waits for the disk twice, which a loaded machine stretches
+/// to seconds; this is five times the first and as long as one request to a worker is given.
+const DESCRIPTOR_BOUND: Duration = TOOL_BOUND;
+
+/// The descriptor directories of the environments whose teardown has read it and found a running
+/// worker of its tree that no descriptor named, with what wakes a case that waits for that.
+static UNNAMED_WORKERS: (Mutex<Vec<std::path::PathBuf>>, Condvar) =
+    (Mutex::new(Vec::new()), Condvar::new());
+
+/// Waits, for at most `within`, until the teardown of the tree that owns `environment` has read its
+/// descriptors and found a running worker that none of them names, and says whether it has. A case
+/// that holds a descriptor back and gives it later uses this to give it only once the teardown has
+/// looked, however late on a loaded machine that is.
+pub fn wait_until_a_worker_is_found_unnamed(
+    environment: &EnvironmentPaths,
+    within: Duration,
+) -> bool {
+    let directory = environment.descriptors_dir();
+    let deadline = Instant::now() + within;
+    let mut found = UNNAMED_WORKERS
+        .0
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    while !found.contains(&directory) {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+        found = UNNAMED_WORKERS
+            .1
+            .wait_timeout(found, left)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
+    }
+    true
+}
+
 /// A host tree whose daemon's workers are ended before the tree goes, however the test ended.
 ///
 /// It is the tree a test would otherwise hold, and reads as one. A tree in which something the
@@ -368,7 +406,7 @@ pub fn end_what_the_daemon_started(
                 "ending {what}, which this test started and did not close"
             ));
         }
-        asked = ask_to_close(environment);
+        asked = ask_to_close(environment, &started);
         wait_for_the_end(&mut started, closure);
     }
 
@@ -553,44 +591,75 @@ type Answers = Arc<Mutex<Vec<(ProcessStartIdentity, Outcome)>>>;
 /// Asks every running worker that published a descriptor in this environment to close its session,
 /// through its own endpoint, and says how each one answered.
 ///
+/// A daemon names a worker in its registry before it writes the worker's descriptor: it first opens
+/// its own link to the worker, which can wait seconds, and then writes the file, which waits for
+/// the disk twice. A test that ends in between has a worker that is running and recorded and that
+/// no descriptor names yet. So the descriptors are read again, for at most [`DESCRIPTOR_BOUND`],
+/// until a readable one names each of the `started` workers that is still running, and only then
+/// are the workers asked. A worker no descriptor names by then is not asked, and says so.
+///
 /// Each worker is first made to prove that it is the one its descriptor names, so a request reaches
 /// no process but that worker, which then ends itself: nothing here names a process by its number.
 /// The workers are asked together, on a runtime on a thread of its own because this runs inside a
 /// drop, and none of it is waited for longer than [`ASKING_BOUND`].
-fn ask_to_close(environment: &EnvironmentPaths) -> Asked {
-    let entries = match kr_ipc::descriptor::read_all(environment) {
-        Ok(entries) => entries,
-        Err(error) => {
-            return Asked {
-                not_asked: format!(
-                    "the descriptors of this environment could not be listed: {error}"
-                ),
-                ..Asked::default()
-            };
-        }
-    };
-    let mut unreadable = Vec::new();
-    let mut ended = 0_usize;
-    let mut workers = Vec::new();
-    for entry in entries {
-        match entry.descriptor {
-            Err(error) => unreadable.push(format!("{}: {error}", entry.path.display())),
-            Ok(descriptor) if running_or_unknown(&descriptor.process_start_identity) => {
-                workers.push(descriptor);
+fn ask_to_close(
+    environment: &EnvironmentPaths,
+    started: &[(ProcessStartIdentity, String)],
+) -> Asked {
+    let deadline = Instant::now() + DESCRIPTOR_BOUND;
+    let (workers, not_asked) = loop {
+        let entries = match kr_ipc::descriptor::read_all(environment) {
+            Ok(entries) => entries,
+            Err(error) => {
+                return Asked {
+                    not_asked: format!(
+                        "the descriptors of this environment could not be listed: {error}"
+                    ),
+                    ..Asked::default()
+                };
             }
-            Ok(_) => ended += 1,
+        };
+        let mut unreadable = Vec::new();
+        let mut ended = 0_usize;
+        let mut workers = Vec::new();
+        for entry in entries {
+            match entry.descriptor {
+                Err(error) => unreadable.push(format!("{}: {error}", entry.path.display())),
+                Ok(descriptor) if running_or_unknown(&descriptor.process_start_identity) => {
+                    workers.push(descriptor);
+                }
+                Ok(_) => ended += 1,
+            }
         }
-    }
-    let mut not_asked = format!(
-        "no running worker's readable descriptor names it; readable descriptors of workers that had ended: {ended}"
-    );
-    if !unreadable.is_empty() {
-        not_asked.push_str(&format!(
-            ", and {} could not be read ({})",
-            unreadable.len(),
-            unreadable.join("; ")
-        ));
-    }
+        let unnamed = started.iter().any(|(identity, _)| {
+            running_or_unknown(identity)
+                && !workers
+                    .iter()
+                    .any(|worker| worker.process_start_identity == *identity)
+        });
+        if unnamed {
+            UNNAMED_WORKERS
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(environment.descriptors_dir());
+            UNNAMED_WORKERS.1.notify_all();
+        }
+        if !unnamed || Instant::now() >= deadline {
+            let mut not_asked = format!(
+                "no readable descriptor of a running worker named it within {DESCRIPTOR_BOUND:?}; readable descriptors of workers that had ended: {ended}"
+            );
+            if !unreadable.is_empty() {
+                not_asked.push_str(&format!(
+                    ", and {} could not be read ({})",
+                    unreadable.len(),
+                    unreadable.join("; ")
+                ));
+            }
+            break (workers, not_asked);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
     if workers.is_empty() {
         return Asked {
             not_asked,
