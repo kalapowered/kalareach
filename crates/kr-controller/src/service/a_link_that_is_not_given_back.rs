@@ -1249,6 +1249,39 @@ async fn an_ask_whose_waits_left_too_little_time_for_its_first_exchange_sends_no
     silent.serving.abort();
 }
 
+/// KR-REQ-09.12: the first exchange of an ask has its own time limit end at or before the instant
+/// the caller's bound ends.
+///
+/// The ask is given seven seconds and nothing else ends it: the worker never answers, and no
+/// timeout stands around the ask. The exchange begins, with time for one, and is over when the
+/// seven seconds are, not after the ten an exchange has when no caller bounds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_exchange_of_an_ask_ends_by_the_deadline_it_was_given() {
+    let (silent, heard) = stalled().await;
+    let controller = Arc::clone(&silent.controller);
+    let session_id = silent.session_id;
+    let began = tokio::time::Instant::now();
+    let asked = controller
+        .ask_worker_revision(session_id, Some(began + Duration::from_secs(7)))
+        .await;
+    let lasted = began.elapsed();
+    assert_eq!(
+        heard.frames(),
+        1,
+        "the announcement went: time was left for it"
+    );
+    assert!(
+        lasted < Duration::from_secs(8),
+        "the ask ended {lasted:?} after it began, past the seven seconds it was given"
+    );
+    assert_eq!(
+        asked.unwrap_or(Asked::Failed),
+        Asked::Failed,
+        "the worker did not answer"
+    );
+    silent.serving.abort();
+}
+
 /// KR-REQ-09.12: a collection that waited for the worker's link while another operation held it
 /// gives the link back whole when too little time is left once it has it.
 ///
