@@ -386,18 +386,15 @@ impl Worker {
     ///
     /// # Panics
     ///
-    /// Panics when the closure is not recorded within a minute, so that a case does not go on to
-    /// remove the tree of a session that is still closing.
+    /// Panics when the closure is not recorded within [`super::LONG_WAIT`], so that a case does not
+    /// go on to remove the tree of a session that is still closing.
     pub async fn stop(self) {
         self.serving.abort();
         let (_, gate) = self._runtime.close(ClosureReason::CloseRequested);
         gate.release();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            self._runtime.wait_closed(),
-        )
-        .await
-        .expect("the worker's session closed");
+        tokio::time::timeout(super::LONG_WAIT, self._runtime.wait_closed())
+            .await
+            .expect("the worker's session closed");
     }
 
     /// The session's runtime, for a suite that stops the journal's next commit.
@@ -880,8 +877,9 @@ impl Worker {
     pub const BINDING: AgentBindingRevision = AgentBindingRevision::new(1);
 }
 
-/// How long a test waits for the daemon to reach a worker.
-const PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a test waits for the daemon to reach a worker, or for a change to finish in it: it
+/// fails a wait that never ends, and is not a measurement ([`super::LONG_WAIT`]).
+const PATIENCE: std::time::Duration = super::LONG_WAIT;
 
 /// A daemon on the network that has adopted workers in this process, and the keys of the
 /// environment's owner.

@@ -20,8 +20,9 @@ use kr_protocol::scalars::{Nullable, TimestampMs};
 use super::worker::Worker;
 use super::{Device, Host, RawDevice, pair_with, proposal};
 
-/// How long a test waits for the daemon to reach the worker.
-pub const PATIENCE: Duration = Duration::from_secs(60);
+/// How long a test waits for the daemon to reach the worker: it fails a wait that never ends, and
+/// is not a measurement ([`super::LONG_WAIT`]).
+pub const PATIENCE: Duration = super::LONG_WAIT;
 
 /// A daemon on the network with one adopted worker, and the keys of the environment's owner.
 pub struct Environment {

@@ -7,6 +7,11 @@ use iroh_relay::server::{
     CertConfig, QuicConfig, RelayConfig as RelayServerConfig, Server, ServerConfig, TlsConfig,
 };
 
+/// How long a stop waits for the server's sessions and port to end: it fails a wait that never ends,
+/// and is not a measurement. A stall of the machine of up to a minute freezes the work it waits for
+/// and leaves it unfinished, so a shorter wait would fail a case that has no fault.
+const LONG_WAIT: std::time::Duration = kr_controller::testing::ENVIRONMENT_HANDOVER_DEADLINE;
+
 /// What one run of the relay server lets in, and what it has let in so far.
 #[derive(Debug, Default)]
 struct Admissions {
@@ -173,7 +178,7 @@ impl LocalRelay {
         let port = self.port;
         let mut waiting_for = "the server to stop";
         let mut last_dial = None;
-        let stopped = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let stopped = tokio::time::timeout(LONG_WAIT, async {
             service.clients().shutdown().await;
             server.shutdown().await.expect("the relay stops");
             waiting_for = "every session the relay let in to end";

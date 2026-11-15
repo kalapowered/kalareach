@@ -38,6 +38,12 @@ use kr_pairing::direct::CandidateIdentity;
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::ProtocolError;
 use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope, SessionSelector};
+
+/// How long the support waits for work that correct code does at speed, before it takes the wait for
+/// hung. A test process or a machine that stalls for a minute freezes the work and the clock's
+/// reading of it alike, so a wait that is shorter than a stall ends a case that has no fault. The
+/// figure ends a case that a fault keeps and decides no assertion.
+pub const LONG_WAIT: Duration = kr_controller::testing::ENVIRONMENT_HANDOVER_DEADLINE;
 use kr_protocol::identity::BootIdentity;
 use kr_protocol::ids::{
     ActionId, BuildId, DeviceId, DeviceKeyRevision, EnvironmentId, GrantId, SessionEpoch, SessionId,
@@ -152,9 +158,9 @@ pub fn loopback() -> EndpointConfig {
 ///
 /// # Panics
 ///
-/// Panics when the address stays taken for ten seconds, or cannot be bound for another reason.
+/// Panics when the address stays taken for [`LONG_WAIT`], or cannot be bound for another reason.
 async fn until_the_address_is_free(address: std::net::SocketAddr) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + LONG_WAIT;
     loop {
         match std::net::UdpSocket::bind(address) {
             Ok(socket) => {
@@ -1982,7 +1988,7 @@ pub async fn dial_unread(
         .expect("an endpoint that dials");
     // The host admits a burst of new connections and returns a place at a fixed rate, so an
     // attempt it turned away for that is made again.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + LONG_WAIT;
     let connection = loop {
         match kr_transport::endpoint::connect(
             &endpoint,
