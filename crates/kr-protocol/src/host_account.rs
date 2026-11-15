@@ -186,8 +186,9 @@ pub enum AccountAttempt {
     PortBusy,
     /// Nothing came back in time.
     TimedOut,
-    /// The host's secret store failed, before the code was spent or after the service signed the
-    /// account in, so the host kept no grant.
+    /// The host kept no grant: its secret store failed, before the code was spent or after the
+    /// service signed the account in, or its authority for the sign-in ended while the person was
+    /// in the browser.
     NotKept,
     /// The service could not be reached to exchange the answer.
     Unreachable,
