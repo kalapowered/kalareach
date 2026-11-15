@@ -7,20 +7,30 @@
 # A row is the file, the function, the form of the start (the start function as written; a method
 # is written with a leading dot) and the callee (what the start runs: a function, or the first
 # call of an async block or a closure that does work), and stands for `count` starts that share all four.
-# `task` is the number (1 to 35) of the long-lived task of the daemon that the row belongs to, or `-`.
+# `task` is the number (1 to 36) of the long-lived task of the daemon that the row belongs to, or `-`.
+# Number 36 is the family of threads that a request starts and does not bound.
 #
-# Classes:
-#   supervised-later  a task that lives as long as the daemon, which a task supervisor must take
-#   request           ends with the request, connection, session or work that started it
-#   joined            its handle is awaited; a start awaited where it stands is always this class
-#   other_crate       a task of a linked crate; its note says whose program runs it
-#   test              compiled in only by a test build or the testing feature; every such start is this class
+# Classes, and what the case checks of each:
+#   supervised-later  a task that lives as long as the daemon, or as long as something that no request
+#                     bounds, which a task supervisor must take; its note says how long it lives (a
+#                     person's read)
+#   request           ends with the request, connection, session or work that started it; never a start
+#                     whose end the request does not bound (a person's read)
+#   joined            its handle is awaited. A start that is awaited where it stands must be this class,
+#                     and a row of this class whose start is not awaited where it stands has a marker
+#                     `join(function on name)` in its note, which the case checks against the source
+#   other_crate       a task of a linked crate; its note says whose program runs it (a person's read)
+#   test              compiled in only by a test build or the testing feature; every such start is
+#                     this class, and every row of this class has such a start
 #
 # A helper line, `helper | name | scope | note`, names a function that starts a task running one of
-# its own parameters: each call of that name in a file under scope is a start.
+# its own parameters of a closure or a future type: each call of that name in a file under scope is a
+# start, keyed by the argument at that parameter's place.
 #
 helper | blocking | crates/kr-controller/src/transfer.rs | hands the caller's closure to a blocking task and awaits its answer
-helper | start_service | crates/kr-controller/src/supervision.rs | launches a service process through the supervisor's own spawn method; listed because a scan cannot tell it from a task start
+helper | on_a_thread | crates/kr-worker/src/desktop/probe.rs | runs the caller's filesystem question on a thread and waits for it with a clock
+helper | read_within | crates/kr-controller/src/catalogue/mod.rs | runs the caller's read on a blocking task and waits for it no later than a deadline
+helper | serve_each | crates/kr-controller/src/ | serves each connection that a listener accepts on a task of its own, running the caller's closure for it
 helper | start_thread | crates/kr-describe/src/supervise.rs | starts a named thread for the caller's closure
 helper | detached | crates/kr-worker/src/ | starts a task for the caller's future and returns its handle
 
@@ -37,7 +47,7 @@ crates/kr-client/src/session.rs | Session::resume | tokio::spawn | read_loop | 1
 crates/kr-controller/src/account.rs | HostAccount::build | .spawn | async{.recover} | 1 | request | 35 | ends with the request, connection, session or work that started it
 crates/kr-controller/src/account.rs | HostAccount::sign_in | tokio::spawn | async{.attempt} | 1 | request | 35 | ends with the request, connection, session or work that started it
 crates/kr-controller/src/archive/fence.rs | ArchiveService::fence_owned | tokio::task::spawn_blocking | closure{read_record} | 1 | joined | - | awaited where it stands
-crates/kr-controller/src/archive/fence.rs | Group::empty | tokio::task::spawn_blocking | closure{read_group} | 1 | request | - | ends with the request, connection, session or work that started it
+crates/kr-controller/src/archive/fence.rs | Group::empty | tokio::task::spawn_blocking | closure{read_group} | 1 | joined | - | awaited where it stands, inside a macro
 crates/kr-controller/src/archive/fence.rs | Group::force | tokio::task::spawn_blocking | closure{crate::supervision::kill_unit} | 1 | request | - | ends with the request, connection, session or work that started it
 crates/kr-controller/src/archive/fence.rs | Group::holders | tokio::task::spawn_blocking | closure{read_group} | 1 | joined | - | awaited where it stands
 crates/kr-controller/src/attention.rs | AttentionModule::automation_records_waiting | tokio::task::spawn_blocking | closure{.automation_cursor} | 1 | joined | - | awaited where it stands
@@ -66,15 +76,18 @@ crates/kr-controller/src/backup/setup.rs | BackupSetup::record | tokio::task::sp
 crates/kr-controller/src/backup/setup.rs | BackupSetup::sign_in | tokio::spawn | async{.token} | 1 | request | - | ends with the request, connection, session or work that started it
 crates/kr-controller/src/backup/setup.rs | BackupSetup::status | tokio::task::spawn_blocking | closure{.setup} | 1 | joined | - | awaited where it stands
 crates/kr-controller/src/backup/setup.rs | BackupSetup::steps | tokio::task::spawn_blocking | closure{.setup} | 1 | joined | - | awaited where it stands
-crates/kr-controller/src/bin/kr-controller.rs | run | tokio::spawn | .serve_clients | 1 | joined | 1 | a server's end is the process's end; awaited in the select of the entry point
-crates/kr-controller/src/bin/kr-controller.rs | run | tokio::spawn | .serve_rendezvous | 1 | joined | 1 | a server's end is the process's end; awaited in the select of the entry point
-crates/kr-controller/src/bin/kr-controller.rs | run | tokio::spawn | kr_controller::transfer::serve_chunks | 1 | joined | 1 | a server's end is the process's end; awaited in the select of the entry point
+crates/kr-controller/src/bin/kr-controller.rs | run | tokio::spawn | .serve_clients | 1 | joined | 1 | a server's end is the process's end; the entry point's select waits on its handle: join(run on client_task)
+crates/kr-controller/src/bin/kr-controller.rs | run | tokio::spawn | .serve_rendezvous | 1 | joined | 1 | a server's end is the process's end; the entry point's select waits on its handle: join(run on rendezvous_task)
+crates/kr-controller/src/bin/kr-controller.rs | run | tokio::spawn | kr_controller::transfer::serve_chunks | 1 | joined | 1 | a server's end is the process's end; the entry point's select waits on its handle: join(run on chunk_task)
 crates/kr-controller/src/bridge/invoke.rs | Invocation::into_stream_within | tokio::spawn | read_stream | 1 | request | - | ends with the request, connection, session or work that started it
 crates/kr-controller/src/bridge/invoke.rs | drain | tokio::spawn | async{.read} | 1 | request | - | ends with the request, connection, session or work that started it
-crates/kr-controller/src/bridge/platform.rs | end_and_reap | spawn_thread | closure{.wait} | 1 | request | - | ends with the request, connection, session or work that started it
-crates/kr-controller/src/bridge/platform.rs | read_in_the_background | spawn_thread | closure{.read} | 1 | request | - | ends with the request, connection, session or work that started it
-crates/kr-controller/src/bridge/platform.rs | spawn_thread | .spawn | body | 1 | request | - | ends with the request, connection, session or work that started it
+crates/kr-controller/src/bridge/platform.rs | end_and_reap | spawn_thread | closure{.wait} | 1 | supervised-later | 36 | waits for a killed child after the five-second grace, with no bound of its own: it lives as long as the child takes to be collected
+crates/kr-controller/src/bridge/platform.rs | read_in_the_background | spawn_thread | closure{.read} | 1 | supervised-later | 36 | reader of one platform command's pipe; it ends at the end of the pipe, or at the next piece after the caller drops the receiver, but past the output limit it reads on without looking, so a descendant that holds the pipe keeps it as long as it likes
+crates/kr-controller/src/bridge/platform.rs | spawn_thread | .spawn | body | 1 | supervised-later | 36 | the thread helper of the platform reader and the reaper above: each thread it starts lives as its body does
+crates/kr-controller/src/catalogue/mod.rs | CatalogueModule::admission_revision_within | .read_within | closure{.admission_revision} | 1 | joined | - | awaited where it stands, for no longer than the read's deadline; a read still running then finishes by itself and its answer is dropped
+crates/kr-controller/src/catalogue/mod.rs | CatalogueModule::evidence_within | .read_within | closure{evidence::repositories} | 1 | joined | - | awaited where it stands, for no longer than the read's deadline; a read still running then finishes by itself and its answer is dropped
 crates/kr-controller/src/catalogue/mod.rs | CatalogueModule::follow_bridges | tokio::task::spawn_blocking | closure{reconcile_bridge} | 1 | joined | - | awaited where it stands
+crates/kr-controller/src/catalogue/mod.rs | CatalogueModule::installed_within | .read_within | closure{.admission_revision} | 1 | joined | - | awaited where it stands, for no longer than the read's deadline; a read still running then finishes by itself and its answer is dropped
 crates/kr-controller/src/catalogue/mod.rs | CatalogueModule::native_bridges_check | tokio::task::spawn_blocking | closure{.reports} | 1 | request | - | ends with the request, connection, session or work that started it
 crates/kr-controller/src/catalogue/mod.rs | CatalogueModule::read_within | tokio::task::spawn_blocking | closure{read} | 1 | request | - | ends with the request, connection, session or work that started it
 crates/kr-controller/src/catalogue/mod.rs | CatalogueModule::snapshot_within | tokio::task::spawn_blocking | closure{.admission_revision} | 1 | request | - | ends with the request, connection, session or work that started it
@@ -127,7 +140,7 @@ crates/kr-controller/src/net/mod.rs | NetworkHost::serve_connection | tokio::spa
 crates/kr-controller/src/net/mod.rs | NetworkHost::serve_connection | tokio::spawn | relay_loop | 1 | request | 35 | ends with the request, connection, session or work that started it
 crates/kr-controller/src/net/mod.rs | NetworkHost::withdraw_device | tokio::spawn | async{.release} | 1 | request | 35 | ends with the request, connection, session or work that started it
 crates/kr-controller/src/net/mod.rs | register | tokio::spawn | keep_the_record | 1 | supervised-later | 30 | clock record keeper
-crates/kr-controller/src/net/pairing.rs | PairingHost::invite | .spawn | serve_room | 1 | request | - | ends with the request, connection, session or work that started it
+crates/kr-controller/src/net/pairing.rs | PairingHost::invite | .spawn | serve_room | 1 | request | - | the room of one invitation; it ends with the invitation, at most one EXPIRY_RECHECK after it expires
 crates/kr-controller/src/net/proxy.rs | WorkerProxy::handshake | tokio::spawn | read_loop | 1 | request | - | ends with the request, connection, session or work that started it
 crates/kr-controller/src/net/rendezvous.rs | Watch::abort | tokio::task::spawn_blocking | closure{.room_abort} | 1 | joined | - | awaited where it stands
 crates/kr-controller/src/net/rendezvous.rs | Watch::offered | tokio::task::spawn_blocking | closure{.room_offer} | 1 | joined | - | awaited where it stands
@@ -174,7 +187,7 @@ crates/kr-controller/src/service/barrier.rs | Controller::fence_voice_revocation
 crates/kr-controller/src/service/barrier.rs | Controller::recover_what_workers_hold | tokio::spawn | async{while_held} | 1 | request | 5 | read-back at start: one pass by design, never started again
 crates/kr-controller/src/service/barrier.rs | Controller::start_debt_pass | tokio::spawn | debt_pass | 1 | supervised-later | 2 | debt pass; its panic ends the daemon, once
 crates/kr-controller/src/service/barrier.rs | Controller::start_debt_pass | tokio::spawn | evidence_pass | 1 | supervised-later | 4 | evidence pass; restarts, then stops
-crates/kr-controller/src/service/barrier.rs | debt_pass | tokio::spawn | async{while_held} | 1 | joined | 3 | telling task of the debt pass; awaited by the pass, which resumes its panic
+crates/kr-controller/src/service/barrier.rs | debt_pass | tokio::spawn | async{while_held} | 1 | joined | 3 | telling task of the debt pass; the pass waits for it in until_told, which drops its result, so a panic of the telling reads as told: join(until_told on handle)
 crates/kr-controller/src/service/capability_checks.rs | Controller::start_capability_checks | tokio::spawn | perform | 1 | request | - | ends with the request, connection, session or work that started it
 crates/kr-controller/src/service/close.rs | Controller::close_accepted | tokio::spawn | .watch_closure | 1 | request | 33 | closure watcher; bounded by the closure watch time-out
 crates/kr-controller/src/service/close.rs | Controller::crash_flight_soon | tokio::spawn | async{.crash_flight} | 1 | request | - | ends with the request, connection, session or work that started it
@@ -208,14 +221,15 @@ crates/kr-controller/src/service/inhibition.rs | Controller::demand | tokio::spa
 crates/kr-controller/src/service/inhibition.rs | Controller::review_power | tokio::spawn | async{tokio::time::sleep} | 1 | supervised-later | 29 | power review; its return at the stop review is a finish
 crates/kr-controller/src/service/inhibition.rs | Controller::review_power_soon | tokio::spawn | async{.power_state} | 1 | request | - | ends with the request, connection, session or work that started it
 crates/kr-controller/src/service/local.rs | Controller::perform_at | tokio::spawn | async{.wait} | 1 | request | 35 | ends with the request, connection, session or work that started it
+crates/kr-controller/src/service/local.rs | Controller::serve_clients | serve_each | closure{.client} | 1 | joined | - | awaited where it stands: the loop serves this listener until it ends; each connection's task is the row of serve_each
 crates/kr-controller/src/service/local.rs | serve_each | .spawn | task | 1 | request | 35 | ends with the request, connection, session or work that started it
 crates/kr-controller/src/service/local_access.rs | Controller::start_local_access_publisher | tokio::spawn | async{.tell_workers} | 1 | supervised-later | 6 | local access publisher
 crates/kr-controller/src/service/machine_group.rs | Controller::machine_perform | tokio::task::spawn_blocking | closure{.swap} | 1 | joined | - | awaited where it stands
 crates/kr-controller/src/service/machine_group.rs | Controller::machine_step | tokio::spawn | async{.machine_step_serially} | 1 | joined | - | awaited where it stands
 crates/kr-controller/src/service/machine_group.rs | Controller::settle_machine_record | tokio::task::spawn_blocking | closure{.settle_machine_record_blocking} | 1 | joined | - | awaited where it stands
 crates/kr-controller/src/service/organisation.rs | Controller::put_the_adapter_allowlist_by | tokio::spawn | async{.put_allowed_adapters} | 1 | request | - | ends with the request, connection, session or work that started it
-crates/kr-controller/src/service/plugin_runtime.rs | PluginRuntime::request | tokio::spawn | .attempt | 1 | joined | 34 | plugin runtime attempt and its opening task; joined by the request, a join error is a failed start
-crates/kr-controller/src/service/plugin_runtime.rs | PluginRuntime::request | tokio::spawn | block{Instant::now} | 1 | joined | 34 | plugin runtime attempt and its opening task; joined by the request, a join error is a failed start
+crates/kr-controller/src/service/plugin_runtime.rs | PluginRuntime::request | tokio::spawn | .attempt | 1 | joined | 34 | one start attempt of the plugin runtime, a task of its own so that a requester that stops waiting leaves it to finish; the watcher awaits it and a join error is a failed start: join(PluginRuntime::request on started)
+crates/kr-controller/src/service/plugin_runtime.rs | PluginRuntime::request | tokio::spawn | block{Instant::now} | 1 | request | 34 | watcher of one start attempt: its handle is dropped, nothing joins it, and it ends when the attempt it awaits ends, which START_DEADLINE bounds
 crates/kr-controller/src/service/reads.rs | Controller::archive_history_times | tokio::task::spawn_blocking | closure{.history_times} | 1 | joined | - | awaited where it stands
 crates/kr-controller/src/service/reads.rs | Controller::refuse_while_cleanup_is_owed | tokio::task::spawn_blocking | closure{.owes_cleanup} | 1 | joined | - | awaited where it stands
 crates/kr-controller/src/service/reads.rs | Controller::session_processes | tokio::task::spawn_blocking | closure{crate::processes::session_processes} | 1 | joined | - | awaited where it stands
@@ -225,6 +239,7 @@ crates/kr-controller/src/service/remote_revocation.rs | Controller::tell_the_own
 crates/kr-controller/src/service/remote_revocation.rs | Controller::wait_for_the_registry_to_take_a_write | tokio::task::spawn_blocking | closure{ask} | 1 | request | - | ends with the request, connection, session or work that started it
 crates/kr-controller/src/service/rendezvous.rs | Controller::admit_rendezvous | tokio::task::spawn_blocking | closure{.now} | 1 | joined | - | awaited where it stands
 crates/kr-controller/src/service/rendezvous.rs | Controller::admit_rendezvous | tokio::task::spawn_blocking | closure{qualified_package} | 1 | joined | - | awaited where it stands
+crates/kr-controller/src/service/rendezvous.rs | Controller::serve_rendezvous | super::serve_each | closure{.rendezvous} | 1 | joined | - | awaited where it stands: the loop serves this listener until it ends; each connection's task is the row of serve_each
 crates/kr-controller/src/service/rendezvous.rs | Controller::session_integrations | tokio::task::spawn_blocking | closure{crate::catalogue::integrations::fill} | 1 | request | - | ends with the request, connection, session or work that started it
 crates/kr-controller/src/service/revocation.rs | Controller::revoke_device_authority_proving | tokio::spawn | async{.end_calls_of_revoked_device} | 1 | request | 35 | ends with the request, connection, session or work that started it
 crates/kr-controller/src/service/start.rs | Controller::remove_closed_content | tokio::task::spawn_blocking | closure{.awaiting_removal} | 1 | joined | - | awaited where it stands
@@ -237,7 +252,7 @@ crates/kr-controller/src/service/start.rs | Controller::start_descriptions | tok
 crates/kr-controller/src/service/start.rs | Controller::start_device_watch | tokio::spawn | async{tokio::time::timeout} | 1 | supervised-later | 8 | device watch
 crates/kr-controller/src/service/start.rs | Controller::start_device_watch | tokio::task::spawn_blocking | closure{.recover_push_destinations} | 1 | joined | - | awaited where it stands
 crates/kr-controller/src/service/start.rs | Controller::start_passing | tokio::task::spawn_blocking | closure{.reconcile} | 1 | joined | - | awaited where it stands
-crates/kr-controller/src/service/start.rs | Controller::start_passing | tokio::task::spawn_blocking | closure{.remove_unclaimed_staging} | 1 | request | - | ends with the request, connection, session or work that started it
+crates/kr-controller/src/service/start.rs | Controller::start_passing | tokio::task::spawn_blocking | closure{.remove_unclaimed_staging} | 1 | joined | - | awaited where it stands, inside a macro
 crates/kr-controller/src/service/start.rs | Controller::start_passing | tokio::task::spawn_blocking | closure{Arc::new} | 1 | joined | - | awaited where it stands
 crates/kr-controller/src/service/start.rs | Controller::start_passing | tokio::task::spawn_blocking | closure{crate::backup::BackupService::open} | 1 | joined | - | awaited where it stands
 crates/kr-controller/src/service/start.rs | Controller::start_privacy_tick | tokio::spawn | async{privacy_pass} | 1 | supervised-later | 9 | privacy tick
@@ -273,13 +288,13 @@ crates/kr-controller/src/transfer.rs | TransferModule::write | blocking | closur
 crates/kr-controller/src/transfer.rs | blocking | tokio::task::spawn_blocking | work | 1 | request | - | ends with the request, connection, session or work that started it
 crates/kr-controller/src/transfer.rs | end_the_insertions_of_closed_sessions | tokio::task::spawn_blocking | closure{end_insertions_of_every_closure} | 1 | joined | - | awaited where it stands
 crates/kr-controller/src/transfer.rs | serve | tokio::spawn | async{sweep_forever} | 1 | supervised-later | 22 | transfer sweep
+crates/kr-controller/src/transfer.rs | serve_chunks | crate::service::serve_each | closure{.client} | 1 | joined | - | awaited where it stands: the loop serves this listener until it ends; each connection's task is the row of serve_each
 crates/kr-describe/src/resource.rs | platform::run_bounded | std::thread::spawn | closure{.read_to_end} | 1 | other_crate | - | linked crate: the description program runs it, or it is a bounded read
 crates/kr-describe/src/serve.rs | run | .spawn | closure{std::panic::catch_unwind} | 1 | other_crate | - | linked crate: the description program runs it, or it is a bounded read
 crates/kr-describe/src/serve.rs | run | .spawn | closure{watchdog} | 1 | other_crate | - | linked crate: the description program runs it, or it is a bounded read
 crates/kr-describe/src/serve.rs | say | .spawn | closure{.write_all} | 1 | other_crate | - | linked crate: the description program runs it, or it is a bounded read
-crates/kr-describe/src/supervise.rs | Driver::start | start_thread | READER_THREAD | 1 | other_crate | - | linked crate: the description program runs it, or it is a bounded read
-crates/kr-describe/src/supervise.rs | Driver::start | start_thread | WRITER_THREAD | 1 | other_crate | - | linked crate: the description program runs it, or it is a bounded read
-crates/kr-describe/src/supervise.rs | start_thread | .spawn | work | 1 | other_crate | - | linked crate: the description program runs it, or it is a bounded read
+crates/kr-describe/src/supervise.rs | Driver::start | start_thread | closure{.recv} | 2 | supervised-later | 26 | the reader and the writer of one description process's pipes; they run in the daemon, started by the description host's driver, and live as long as that process, across jobs
+crates/kr-describe/src/supervise.rs | start_thread | .spawn | work | 1 | supervised-later | 26 | the thread helper of the description process's reader and writer: each thread lives as long as that process
 crates/kr-describe/src/testing.rs | JobThreads::start | .spawn | closure{.wait} | 1 | test | - | compiled in only with the testing feature or a test module
 crates/kr-describe/src/testing.rs | Resident::keep | .spawn | closure{.chunks_mut} | 1 | test | - | compiled in only with the testing feature or a test module
 crates/kr-describe/src/testing.rs | stub_main | std::thread::spawn | closure{std::io::stderr} | 1 | test | - | compiled in only with the testing feature or a test module
@@ -288,13 +303,13 @@ crates/kr-plugin-catalogue/src/trust.rs | verify | tokio::task::spawn_blocking |
 crates/kr-plugin-service/src/client.rs | PluginClient::over | tokio::spawn | read_frames | 1 | request | - | bounded helper of a linked crate: ends with the work that started it
 crates/kr-plugin-service/src/client.rs | PluginClient::over | tokio::spawn | write_offered | 1 | request | - | bounded helper of a linked crate: ends with the work that started it
 crates/kr-plugin-service/src/launcher.rs | HostReservation::accept | tokio::task::spawn_blocking | closure{publish_in_turn} | 1 | request | - | bounded helper of a linked crate: ends with the work that started it
-crates/kr-plugin-service/src/launcher.rs | fence | tokio::spawn | async{} | 1 | other_crate | - | plugin host's own task: lives as long as the host runs, in the daemon's process
+crates/kr-plugin-service/src/launcher.rs | fence | tokio::spawn | async{} | 1 | other_crate | - | the plugin service's hold on one reservation's endpoint; it has no task number because its owner bounds it: it ends when the reservation's fence is dropped
 crates/kr-plugin-service/src/launcher.rs | retire_ended_hosts | tokio::task::spawn_blocking | closure{.retire} | 1 | joined | - | awaited where it stands
-crates/kr-plugin-service/src/launcher.rs | retire_when_ended | tokio::spawn | async{tokio::time::sleep} | 1 | other_crate | - | plugin host's own task: lives as long as the host runs, in the daemon's process
+crates/kr-plugin-service/src/launcher.rs | retire_when_ended | tokio::spawn | async{tokio::time::sleep} | 1 | other_crate | - | the plugin service's watch of one launched host; it has no task number: it lives as long as the host's process runs, then retires the job within RETIREMENT_WINDOW
 crates/kr-plugin-service/src/launcher.rs | retire_when_ended | tokio::task::spawn_blocking | closure{std::time::Instant::now} | 1 | joined | - | awaited where it stands
 crates/kr-project/src/git.rs | end_probe | std::thread::spawn | closure{.wait} | 1 | request | - | bounded helper of a linked crate: ends with the work that started it
 crates/kr-project/src/git.rs | read_up_to | std::thread::spawn | closure{.read} | 1 | request | - | bounded helper of a linked crate: ends with the work that started it
-crates/kr-shell-integration/src/host/terminal.rs | reap | .spawn | closure{.pop} | 1 | request | - | bounded helper of a linked crate: ends with the work that started it
+crates/kr-shell-integration/src/host/terminal.rs | reap | .spawn | closure{.pop} | 1 | supervised-later | 36 | one waiter for each terminal launcher that a request opened; it lives as long as the person leaves that window open
 crates/kr-shell-integration/src/host/terminal_profile/gsettings.rs | Gsettings::run | std::thread::spawn | closure{.read_to_end} | 1 | request | - | bounded helper of a linked crate: ends with the work that started it
 crates/kr-transport/src/listener.rs | ConnectionTasks::spawn | .spawn | task | 1 | request | 35 | transport: ends with its connection
 crates/kr-transport/src/listener.rs | Gate::wait_without_blocking | tokio::task::spawn_blocking | closure{.recv} | 1 | test | - | compiled in only with the testing feature or a test module
@@ -334,7 +349,7 @@ crates/kr-worker/src/broker/duplex.rs | Dispatch::request | detached | async{.de
 crates/kr-worker/src/broker/duplex.rs | Duplex::run_reverse | tokio::spawn | async{tokio::time::timeout} | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/broker/duplex.rs | Duplex::run_reverse | tokio::task::spawn_blocking | closure{.send} | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/broker/duplex.rs | detached | .spawn | work | 1 | other_crate | - | worker program: linked; the worker runs it
-crates/kr-worker/src/broker/probe.rs | run_within | std::thread::spawn | closure{.read_to_end} | 1 | other_crate | - | worker program: linked; the worker runs it
+crates/kr-worker/src/broker/probe.rs | run_within | std::thread::spawn | closure{.read_to_end} | 1 | request | - | reader of one launch probe's output; the daemon's catalogue calls run_within, which ends the process at its deadline, and that closes the pipe
 crates/kr-worker/src/broker/server.rs | Server::show | tokio::task::spawn_blocking | closure{crate::broker::image::verify_image} | 1 | joined | - | awaited where it stands
 crates/kr-worker/src/broker/server.rs | Server::spawn | tokio::spawn | async{.read} | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/broker/server.rs | Server::spawn | tokio::task::spawn_blocking | closure{crate::broker::image::read_identity} | 1 | joined | - | awaited where it stands
@@ -342,6 +357,7 @@ crates/kr-worker/src/broker/server.rs | Server::start | Self::spawn | spec | 1 |
 crates/kr-worker/src/broker/websocket.rs | TextLines::drop | .spawn | async{tokio::time::timeout_at} | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/daemon_link.rs | Drafts::ensure_reporter | .spawn | deliver | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/description_facts.rs | DescriptionFacts::read_directory | .spawn | closure{.run_reads} | 1 | other_crate | - | worker program: linked; the worker runs it
+crates/kr-worker/src/desktop/probe.rs | bounded_read | on_a_thread | closure{read_first_block} | 1 | other_crate | - | worker program: linked; the thread waits for a read that a stalled filesystem may never end, by design: the check stops waiting and the thread stays
 crates/kr-worker/src/desktop/probe.rs | on_a_thread | std::thread::spawn | closure{.send} | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/diagnostics.rs | Writer::offer | .spawn | closure{write_lines} | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/fence/bridge.rs | BridgeServer::serve | tokio::spawn | write_outbound | 1 | other_crate | - | worker program: linked; the worker runs it
@@ -387,3 +403,83 @@ crates/kr-worker/src/service/overtake.rs | Overtaking::open | tokio::spawn | run
 crates/kr-worker/src/session.rs | Session::detach | .detached | attachment_id | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/testing.rs | keep_one_shell_running | std::thread::spawn | closure{.read_line} | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/windows/conpty.rs | Slave::start | handle::spawn | expr | 1 | other_crate | - | worker program: linked; the worker runs it
+
+# The function paths of kr-worker and kr-describe that the daemon's own code names (a path in an
+# expression whose last segment is in lower case, a name that a `use` brought in read as its path, and
+# each glob import), one line each: `names | path`. A path that the code names and no line lists fails the
+# case, and so does a line whose path the code no longer names.
+names | kr_describe::context::ContextBinding::new
+names | kr_describe::context::CursorInterval::new
+names | kr_describe::context::ProjectText::new
+names | kr_describe::environment::ExecutionEnvironment::new
+names | kr_describe::environment::build_target
+names | kr_describe::metadata::Title::new
+names | kr_describe::metadata::deterministic_title
+names | kr_describe::processor::Features::running
+names | kr_describe::processor::name_parts
+names | kr_describe::profile::catalogue::Catalogue::builtin
+names | kr_describe::profile::catalogue::MetGates::default
+names | kr_describe::resource::ResourceSettings::default
+names | kr_describe::resource::platform::free_space
+names | kr_describe::resource::platform::power_of_supplies
+names | kr_describe::resource::platform::read_conditions
+names | kr_describe::service::DescriptionService::sharing
+names | kr_describe::service::Handles::default
+names | kr_describe::store::DescriptionStore::open
+names | kr_describe::summary::SummaryAsk::new
+names | kr_describe::summary::is_wanted
+names | kr_describe::supervise::Driver::new
+names | kr_describe::time::Reading::new
+names | kr_worker::action::adapter::PlatformTimeAdapter::new
+names | kr_worker::attention_source::page
+names | kr_worker::attention_source::texts
+names | kr_worker::broker::bridge::forwarder_application
+names | kr_worker::broker::commands::runnable
+names | kr_worker::broker::commands::starts_directly
+names | kr_worker::broker::probe::run_within
+names | kr_worker::broker::process::ManagedProcess::command_backends_failure
+names | kr_worker::config::Resolver::open
+names | kr_worker::config::document_path
+names | kr_worker::config::effective_value
+names | kr_worker::config::load
+names | kr_worker::config::lock
+names | kr_worker::desktop::capability::context_refuses
+names | kr_worker::desktop::capability::report
+names | kr_worker::desktop::capability::tools_of
+names | kr_worker::desktop::context
+names | kr_worker::desktop::probe::stale
+names | kr_worker::desktop::recorded_presence
+names | kr_worker::history::OutputHistory::read_spool
+names | kr_worker::history::retained_bytes_under
+names | kr_worker::history_filter::HistoryFilter::new
+names | kr_worker::history_filter::Provenance::over
+names | kr_worker::history_filter::SourceInterval::at
+names | kr_worker::history_filter::SourceInterval::new
+names | kr_worker::history_filter::ViewerScope::from_grant
+names | kr_worker::history_filter::ViewerScope::from_history
+names | kr_worker::history_filter::retained::member
+names | kr_worker::history_filter::retained::result_content
+names | kr_worker::history_filter::retained::shown_receipt
+names | kr_worker::history_filter::retained::shown_result
+names | kr_worker::history_filter::retained::with_member_nulled
+names | kr_worker::history_filter::retained::withheld_entirely
+names | kr_worker::history_filter::retained::without_member
+names | kr_worker::journal::Journal::open
+names | kr_worker::journal::Journal::open_existing
+names | kr_worker::journal::Journal::open_read_only
+names | kr_worker::journal::Journal::recorded_schema_version
+names | kr_worker::output_times::TimeIndex::new
+names | kr_worker::output_times::read
+names | kr_worker::output_times::remove_unfinished
+names | kr_worker::persistence::import::import_journal
+names | kr_worker::persistence::migration::plan
+names | kr_worker::privacy::Cancelled::default
+names | kr_worker::privacy::Completion::from_parts
+names | kr_worker::privacy::PrivacyGeneration::new
+names | kr_worker::privacy::PrivacyMode::reconcile
+names | kr_worker::privacy::PrivacyMode::restored
+names | kr_worker::privacy::Removed::default
+names | kr_worker::privacy::Unavailable::new
+names | kr_worker::pty::command_line
+names | kr_worker::session_group::identities
+names | kr_worker::session_group::service_of

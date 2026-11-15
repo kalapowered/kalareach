@@ -9,13 +9,26 @@
 //!   `spawn` under any receiver name, `thread::Builder`'s `spawn`, `Handle::spawn`); a method
 //!   `spawn` with no argument starts a child process and is not a start;
 //! * a call of a helper that the roster names, which is a function of this code that starts a
-//!   task for its caller;
+//!   task for its caller. A function is a helper when one of its parameters has a closure or a
+//!   future type (`impl FnOnce`, `impl Future`, a generic parameter bounded to one, a boxed one)
+//!   and a start that is not awaited where it stands runs it: the start's argument names that
+//!   parameter, or runs a local that was made from it (the local is the whole argument, is called
+//!   or is awaited). A helper's call is keyed by the argument at that parameter's place;
 //! * the same, inside the tokens of every macro (`matches!`, `select!`, a `macro_rules!` body),
 //!   which `syn` does not parse.
 //!
 //! Each start is keyed by its file, its function, its form (the name of the start function as
 //! written) and its callee (what the start runs), so that one start that replaces another in the
-//! same function changes the key.
+//! same function changes the key. A start is awaited where it stands when its call is followed by
+//! `.await`, in code or in a macro's tokens.
+//!
+//! The scan also keeps two lists for the roster's checks. The first is what is awaited and where:
+//! `name.await`, and every name inside a `select!` or a `join!`, by file and function, which is
+//! what a `joined` row's marker is checked against. The second is the function paths of watched
+//! crates that code outside them names: a path in an expression whose last segment is in lower
+//! case, with a name that a `use` brought in read as the path it stands for, and each glob import
+//! as the glob. A call through another function, and a method called on a value of one of those
+//! crates' types, are not seen.
 //!
 //! Items under `#[cfg(test)]` are left out: a module, a function, an `impl`, a statement. The
 //! modules of a crate are reached through its `mod` declarations from its root file, so a file that
@@ -95,6 +108,15 @@ pub struct Start {
     /// Whether the start is in code that a shipped build does not compile in (the `testing`
     /// feature).
     pub unshipped: bool,
+    /// What each argument of the start's call runs, in order: a helper's caller hands its work
+    /// over at the position of the helper's parameter.
+    pub arguments: Vec<String>,
+    /// The first parameter, by position, of the enclosing function that has a closure or a future
+    /// type and that the start uses, directly or through a local made from it.
+    pub parameter: Option<usize>,
+    /// The roster helper (its name and scope) that the start is a call of, until the callee is
+    /// read from the argument at the helper's position.
+    helper: Option<(String, String)>,
 }
 
 impl Start {
@@ -118,6 +140,11 @@ pub struct HelperShape {
     pub file: String,
     /// The function's name, as a caller writes it.
     pub name: String,
+    /// The place of the parameter that the start runs, not counting a receiver.
+    pub position: usize,
+    /// Whether the function takes `self`, which a call through a path hands over as its first
+    /// argument.
+    pub receiver: bool,
 }
 
 /// What a scan found.
@@ -129,6 +156,22 @@ pub struct Scan {
     pub helper_shapes: Vec<HelperShape>,
     /// The files read.
     pub files: BTreeSet<String>,
+    /// What is awaited where the handle of a start may be joined: a file, the function, and the
+    /// name of the handle (`name.await`, or a name inside a `select!` or `join!`).
+    pub awaits: BTreeSet<(String, String, String)>,
+    /// The function paths of the watched crates that code outside them names: a path in an
+    /// expression whose last segment is in lower case, with a name that a `use` brought in read as
+    /// the path it stands for, and each glob import.
+    pub named: BTreeSet<String>,
+}
+
+/// A linked crate whose paths the scan lists where other code names them.
+#[derive(Clone, Debug)]
+pub struct Watched {
+    /// The crate's name as a path is written: `kr_worker`.
+    pub ident: String,
+    /// Its folder, relative to the repository's root.
+    pub dir: PathBuf,
 }
 
 fn normalise(path: &Path) -> PathBuf {
@@ -293,15 +336,18 @@ pub fn root_files(
 
 /// Every start in the source reached from `roots`. `helpers` are the names of this code's own
 /// functions that start a task for their caller, each with the path (a file or a folder) under which
-/// its calls are looked for.
+/// its calls are looked for. `watched` are the crates whose paths are listed where other code names
+/// them.
 pub fn scan(
     files: &dyn Files,
     roots: &[PathBuf],
     helpers: &[(String, String)],
+    watched: &[Watched],
 ) -> Result<Scan, String> {
     let mut walker = Walker {
         files,
         helpers,
+        watched,
         file: PathBuf::new(),
         dir: PathBuf::new(),
         inline: 0,
@@ -309,6 +355,10 @@ pub fn scan(
         seen: BTreeSet::new(),
         awaited: BTreeSet::new(),
         unshipped: 0,
+        outside: false,
+        aliases: BTreeMap::new(),
+        frames: Vec::new(),
+        generics: Vec::new(),
         scan: Scan::default(),
         error: None,
     };
@@ -316,16 +366,37 @@ pub fn scan(
         let parent = root.parent().map(Path::to_path_buf).unwrap_or_default();
         walker.read_file(root.clone(), parent, "")?;
     }
-    match walker.error {
-        Some(error) => Err(error),
-        None => Ok(walker.scan),
+    if let Some(error) = walker.error {
+        return Err(error);
     }
+    let mut scan = walker.scan;
+    // A helper's caller hands its work over at the place of the helper's parameter.
+    for start in &mut scan.starts {
+        let Some((name, scope)) = start.helper.take() else {
+            continue;
+        };
+        let shape = scan
+            .helper_shapes
+            .iter()
+            .find(|shape| shape.name == name && shape.file.starts_with(&scope));
+        start.callee = shape
+            .and_then(|shape| {
+                let through_a_path = shape.receiver && !start.form.starts_with('.');
+                start
+                    .arguments
+                    .get(shape.position + usize::from(through_a_path))
+            })
+            .cloned()
+            .unwrap_or_else(|| "-".to_string());
+    }
+    Ok(scan)
 }
 
 struct Walker<'a> {
     files: &'a dyn Files,
     /// Each helper's name and the path that its calls are looked for under.
     helpers: &'a [(String, String)],
+    watched: &'a [Watched],
     /// The file being read, and the folder that the modules it declares are found in.
     file: PathBuf,
     dir: PathBuf,
@@ -337,6 +408,15 @@ struct Walker<'a> {
     awaited: BTreeSet<usize>,
     /// How many enclosing items a shipped build does not compile in.
     unshipped: usize,
+    /// Whether the file is outside every watched crate, so that its paths into one are listed.
+    outside: bool,
+    /// What each name a `use` of the file brings in stands for, as a path.
+    aliases: BTreeMap<String, Vec<String>>,
+    /// For each function being read, the parameters of a closure or future type and the locals
+    /// made from them.
+    frames: Vec<Frame>,
+    /// The generics of the enclosing `impl` and `trait` items.
+    generics: Vec<syn::Generics>,
     scan: Scan,
     error: Option<String>,
 }
@@ -357,14 +437,29 @@ impl Walker<'_> {
         if test_only(&parsed.attrs) {
             return Ok(());
         }
+        let outside = self
+            .watched
+            .iter()
+            .all(|watched| !file.starts_with(&watched.dir));
+        let mut uses = Uses::default();
+        uses.visit_file(&parsed);
         let saved = (
             std::mem::replace(&mut self.file, file),
             std::mem::replace(&mut self.dir, dir),
             std::mem::replace(&mut self.inline, 0),
             std::mem::take(&mut self.scope),
+            std::mem::replace(&mut self.outside, outside),
+            std::mem::replace(&mut self.aliases, uses.aliases),
         );
         self.visit_file(&parsed);
-        (self.file, self.dir, self.inline, self.scope) = saved;
+        (
+            self.file,
+            self.dir,
+            self.inline,
+            self.scope,
+            self.outside,
+            self.aliases,
+        ) = saved;
         Ok(())
     }
 
@@ -374,23 +469,45 @@ impl Walker<'_> {
         }
     }
 
-    fn push_start(&mut self, form: String, callee: String, at_once: bool) {
+    fn push_start(&mut self, start: NewStart) {
+        let parameter = self.parameter_used(&start.work);
         self.scan.starts.push(Start {
             file: slashed(&self.file),
             function: self.scope.join("::"),
-            form,
-            callee,
-            at_once,
+            form: start.form,
+            callee: start.callee,
+            at_once: start.at_once,
             unshipped: self.unshipped > 0,
+            arguments: start.arguments,
+            parameter,
+            helper: start.helper,
         });
     }
 
-    /// Whether a call of this name is a start. A name that begins with `spawn` is given an
-    /// argument; a helper of the roster is any call of its name.
-    fn is_start(&self, name: &str, arguments: usize) -> bool {
-        (name.starts_with("spawn") && arguments > 0)
-            || self.helpers.iter().any(|(helper, scope)| {
-                helper == name && slashed(&self.file).starts_with(scope.as_str())
+    /// The first parameter of the enclosing function, by position, that the tokens use: one that
+    /// has a closure or a future type, named anywhere in them, or a local made from one, run in
+    /// them (it is the whole of them, it is called, or it is awaited).
+    fn parameter_used(&self, tokens: &TokenStream) -> Option<usize> {
+        let frame = self.frames.last()?;
+        let named = bare_names(tokens.clone());
+        let run = running_names(tokens.clone());
+        let by_parameter = named.iter().filter_map(|name| frame.parameters.get(name));
+        let by_local = run.iter().filter_map(|name| frame.locals.get(name));
+        by_parameter.chain(by_local).min().copied()
+    }
+
+    /// What a call of this name is: a start by its name (`spawn` and the like, given an argument),
+    /// a call of a helper of the roster under its scope, or neither.
+    fn kind_of(&self, name: &str, arguments: usize) -> Kind {
+        if name.starts_with("spawn") && arguments > 0 {
+            return Kind::Spawn;
+        }
+        let file = slashed(&self.file);
+        self.helpers
+            .iter()
+            .find(|(helper, scope)| helper == name && file.starts_with(scope.as_str()))
+            .map_or(Kind::Not, |(helper, scope)| {
+                Kind::Helper(helper.clone(), scope.clone())
             })
     }
 
@@ -446,36 +563,148 @@ impl Walker<'_> {
     }
 
     fn start_in_call(&mut self, name: &str, form: String, arguments: Vec<&Expr>, at_once: bool) {
-        if !self.is_start(name, arguments.len()) {
+        let kind = self.kind_of(name, arguments.len());
+        if matches!(kind, Kind::Not) {
             return;
         }
-        let callee = arguments
-            .first()
-            .map_or_else(|| "-".to_string(), |first| callee_of(first));
-        self.push_start(form, callee, at_once);
+        let callees: Vec<String> = arguments
+            .iter()
+            .map(|argument| callee_of(argument))
+            .collect();
+        let tokens: Vec<TokenStream> = arguments
+            .iter()
+            .map(|argument| argument.to_token_stream())
+            .collect();
+        self.push_call(kind, form, callees, &tokens, at_once);
     }
 
-    fn scan_tokens(&mut self, stream: TokenStream) {
+    /// Records a call that is a start. What it runs is its first argument for a start by name; a
+    /// helper's call hands its work over at the helper's parameter, which is read once the whole
+    /// tree is, so every argument is kept.
+    fn push_call(
+        &mut self,
+        kind: Kind,
+        form: String,
+        callees: Vec<String>,
+        arguments: &[TokenStream],
+        at_once: bool,
+    ) {
+        let (callee, helper, work) = match kind {
+            Kind::Spawn => (
+                callees.first().cloned().unwrap_or_else(|| "-".to_string()),
+                None,
+                arguments.first().cloned().unwrap_or_default(),
+            ),
+            Kind::Helper(name, scope) => (
+                "-".to_string(),
+                Some((name, scope)),
+                arguments.iter().cloned().collect(),
+            ),
+            Kind::Not => return,
+        };
+        self.push_start(NewStart {
+            form,
+            callee,
+            at_once,
+            arguments: callees,
+            work,
+            helper,
+        });
+    }
+
+    fn scan_tokens(&mut self, stream: TokenStream, joins: bool) {
         let trees: Vec<TokenTree> = stream.into_iter().collect();
         for (index, tree) in trees.iter().enumerate() {
             match tree {
-                TokenTree::Group(group) => self.scan_tokens(group.stream()),
+                TokenTree::Group(group) => self.scan_tokens(group.stream(), joins),
                 TokenTree::Ident(ident) => {
                     let name = ident.to_string();
-                    let Some(group) = call_group(&trees, index + 1) else {
+                    if joins {
+                        self.awaits(&name);
+                    }
+                    if is_punct(trees.get(index + 1), '.')
+                        && matches!(trees.get(index + 2), Some(TokenTree::Ident(word)) if word == "await")
+                    {
+                        self.awaits(&name);
+                    }
+                    if !is_punct(
+                        index.checked_sub(1).and_then(|before| trees.get(before)),
+                        '.',
+                    ) {
+                        self.name_in_tokens(&trees, index);
+                    }
+                    let Some((at, group)) = call_group(&trees, index + 1) else {
                         continue;
                     };
-                    let first = first_argument(group.stream());
-                    let arguments = usize::from(!group.stream().is_empty());
-                    if !self.is_start(&name, arguments) {
+                    let argument_count = usize::from(!group.stream().is_empty());
+                    let kind = self.kind_of(&name, argument_count);
+                    if matches!(kind, Kind::Not) {
                         continue;
                     }
                     let form = written_form(&trees, index, &name);
-                    let callee = first.map_or_else(|| "-".to_string(), callee_of_tokens);
-                    self.push_start(form, callee, false);
+                    let arguments = arguments_of(group.stream());
+                    let callees: Vec<String> =
+                        arguments.iter().cloned().map(callee_of_tokens).collect();
+                    let at_once = is_punct(trees.get(at + 1), '.')
+                        && matches!(trees.get(at + 2), Some(TokenTree::Ident(word)) if word == "await");
+                    self.push_call(kind, form, callees, &arguments, at_once);
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Records a name as awaited in the function being read.
+    fn awaits(&mut self, name: &str) {
+        self.scan
+            .awaits
+            .insert((slashed(&self.file), self.scope.join("::"), name.to_string()));
+    }
+
+    /// A path written in macro tokens (`name`, `name::next`) that starts at `index`: listed when it
+    /// is one of a watched crate's.
+    fn name_in_tokens(&mut self, trees: &[TokenTree], index: usize) {
+        if !self.outside
+            || is_punct(
+                index.checked_sub(1).and_then(|before| trees.get(before)),
+                ':',
+            )
+        {
+            return;
+        }
+        let mut segments = Vec::new();
+        let mut at = index;
+        while let Some(TokenTree::Ident(segment)) = trees.get(at) {
+            segments.push(segment.to_string());
+            if is_punct(trees.get(at + 1), ':') && is_punct(trees.get(at + 2), ':') {
+                at += 3;
+            } else {
+                break;
+            }
+        }
+        self.name_path(&segments);
+    }
+
+    /// Lists a path, written as these segments, when it is a path of a watched crate, either by
+    /// its first segment or through a name that a `use` of the file brought in.
+    fn name_path(&mut self, segments: &[String]) {
+        if !self.outside {
+            return;
+        }
+        let Some(first) = segments.first() else {
+            return;
+        };
+        let full: Vec<String> = match self.aliases.get(first) {
+            Some(path) => path.iter().chain(&segments[1..]).cloned().collect(),
+            None => segments.to_vec(),
+        };
+        // A function's name is written in lower case; a type, a variant and a constant are not.
+        let function = full
+            .last()
+            .and_then(|last| last.chars().next())
+            .is_some_and(char::is_lowercase);
+        if function && self.watched.iter().any(|watched| watched.ident == full[0]) {
+            self.scan.named.insert(full.join("::"));
         }
     }
 
@@ -486,31 +715,298 @@ impl Walker<'_> {
         walk: impl FnOnce(&mut Self),
     ) {
         self.scope.push(name.clone());
+        let function = self.scope.join("::");
         let before = self.scan.starts.len();
+        self.frames.push(self.frame_of(signature));
         walk(self);
+        self.frames.pop();
         self.scope.pop();
-        let parameters = parameter_names(signature);
-        let runs_a_parameter = !name.starts_with("spawn")
-            && self.scan.starts[before..].iter().any(|start| {
-                !start.at_once
-                    && parameters.contains(&start.callee)
-                    && start
-                        .form
-                        .rsplit("::")
-                        .next()
-                        .is_some_and(|last| last.trim_start_matches('.').starts_with("spawn"))
-            });
-        if runs_a_parameter {
+        // A function that starts a task and does not await it, running one of its parameters of a
+        // closure or future type, leaves what runs to its caller. A name that begins with `spawn`
+        // is a start by its name and needs no line.
+        let position = self.scan.starts[before..]
+            .iter()
+            .filter(|start| start.function == function && !start.at_once)
+            .filter_map(|start| start.parameter)
+            .min();
+        if let Some(position) = position
+            && !name.starts_with("spawn")
+        {
             self.scan.helper_shapes.push(HelperShape {
                 file: slashed(&self.file),
                 name,
+                position,
+                receiver: signature
+                    .inputs
+                    .iter()
+                    .any(|input| matches!(input, syn::FnArg::Receiver(_))),
             });
+        }
+    }
+
+    /// The parameters of a signature that have a closure or a future type, by name, with their
+    /// places not counting a receiver.
+    fn frame_of(&self, signature: &syn::Signature) -> Frame {
+        let mut frame = Frame::default();
+        let typed = signature.inputs.iter().filter_map(|input| match input {
+            syn::FnArg::Typed(typed) => Some(typed),
+            syn::FnArg::Receiver(_) => None,
+        });
+        for (position, typed) in typed.enumerate() {
+            if let syn::Pat::Ident(ident) = &*typed.pat
+                && self.runs_work(&typed.ty, &signature.generics)
+            {
+                frame.parameters.insert(ident.ident.to_string(), position);
+            }
+        }
+        frame
+    }
+
+    /// Whether a type is one that a task can run: a closure, a future, or a generic parameter
+    /// bounded to one, however it is boxed, pinned or wrapped.
+    fn runs_work(&self, ty: &syn::Type, own: &syn::Generics) -> bool {
+        match ty {
+            syn::Type::ImplTrait(inner) => bounds_run_work(inner.bounds.iter()),
+            syn::Type::TraitObject(inner) => bounds_run_work(inner.bounds.iter()),
+            syn::Type::BareFn(_) => true,
+            syn::Type::Paren(inner) => self.runs_work(&inner.elem, own),
+            syn::Type::Group(inner) => self.runs_work(&inner.elem, own),
+            syn::Type::Reference(inner) => self.runs_work(&inner.elem, own),
+            syn::Type::Path(path) => {
+                if let Some(ident) = path.path.get_ident() {
+                    return std::iter::once(own)
+                        .chain(self.generics.iter())
+                        .any(|generics| generic_runs_work(generics, ident));
+                }
+                path.path.segments.iter().any(|segment| {
+                    matches!(
+                        segment.ident.to_string().as_str(),
+                        "BoxFuture" | "LocalBoxFuture"
+                    ) || match &segment.arguments {
+                        syn::PathArguments::AngleBracketed(arguments) => {
+                            arguments.args.iter().any(|argument| {
+                                matches!(argument, syn::GenericArgument::Type(inner)
+                                        if self.runs_work(inner, own))
+                            })
+                        }
+                        _ => false,
+                    }
+                })
+            }
+            _ => false,
         }
     }
 }
 
-/// The parenthesised group that follows a name at `index`, past a turbofish.
-fn call_group(trees: &[TokenTree], mut index: usize) -> Option<&proc_macro2::Group> {
+/// The traits whose values a task runs.
+const WORK_TRAITS: &[&str] = &["Fn", "FnMut", "FnOnce", "Future", "IntoFuture"];
+
+fn bounds_run_work<'a>(bounds: impl IntoIterator<Item = &'a syn::TypeParamBound>) -> bool {
+    bounds.into_iter().any(|bound| {
+        matches!(bound, syn::TypeParamBound::Trait(tr)
+        if tr.path.segments.last().is_some_and(|segment| {
+            WORK_TRAITS.contains(&segment.ident.to_string().as_str())
+        }))
+    })
+}
+
+/// Whether a generic parameter of these generics is bounded to a closure or a future, in its
+/// declaration or in the `where` clause.
+fn generic_runs_work(generics: &syn::Generics, ident: &syn::Ident) -> bool {
+    let declared = generics.params.iter().any(|parameter| {
+        matches!(parameter, syn::GenericParam::Type(declared)
+            if declared.ident == *ident && bounds_run_work(declared.bounds.iter()))
+    });
+    declared
+        || generics.where_clause.iter().any(|clause| {
+            clause.predicates.iter().any(|predicate| {
+                matches!(predicate, syn::WherePredicate::Type(bound)
+                    if matches!(&bound.bounded_ty, syn::Type::Path(path)
+                        if path.path.is_ident(ident))
+                        && bounds_run_work(bound.bounds.iter()))
+            })
+        })
+}
+
+/// What a call of a name is.
+enum Kind {
+    /// A start by its name: `spawn`, `spawn_blocking`.
+    Spawn,
+    /// A call of a helper of the roster, by its name and the scope its line gives.
+    Helper(String, String),
+    /// Neither.
+    Not,
+}
+
+/// A start that is about to be recorded.
+struct NewStart {
+    form: String,
+    callee: String,
+    at_once: bool,
+    arguments: Vec<String>,
+    /// The tokens of what the start runs.
+    work: TokenStream,
+    helper: Option<(String, String)>,
+}
+
+/// The parameters of a function that a task can run, and the locals made from them, by name, each
+/// with the first such parameter's place.
+#[derive(Default)]
+struct Frame {
+    parameters: BTreeMap<String, usize>,
+    locals: BTreeMap<String, usize>,
+}
+
+/// The names that a `use` declaration brings into a file, each as the path it stands for.
+#[derive(Default)]
+struct Uses {
+    aliases: BTreeMap<String, Vec<String>>,
+}
+
+impl<'ast> Visit<'ast> for Uses {
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        let mut found = Vec::new();
+        flatten_use(&item.tree, &mut Vec::new(), &mut found);
+        for (alias, path) in found {
+            if let Some(alias) = alias {
+                self.aliases.insert(alias, path);
+            }
+        }
+    }
+}
+
+/// Each name that a use tree brings in with the path it stands for, and each glob with no name.
+fn flatten_use(
+    tree: &syn::UseTree,
+    prefix: &mut Vec<String>,
+    found: &mut Vec<(Option<String>, Vec<String>)>,
+) {
+    match tree {
+        syn::UseTree::Path(path) => {
+            prefix.push(path.ident.to_string());
+            flatten_use(&path.tree, prefix, found);
+            prefix.pop();
+        }
+        syn::UseTree::Name(name) => {
+            let mut path = prefix.clone();
+            let ident = name.ident.to_string();
+            let alias = if ident == "self" {
+                prefix.last().cloned()
+            } else {
+                path.push(ident.clone());
+                Some(ident)
+            };
+            found.push((alias, path));
+        }
+        syn::UseTree::Rename(rename) => {
+            let mut path = prefix.clone();
+            if rename.ident != "self" {
+                path.push(rename.ident.to_string());
+            }
+            found.push((Some(rename.rename.to_string()), path));
+        }
+        syn::UseTree::Glob(_) => {
+            let mut path = prefix.clone();
+            path.push("*".to_string());
+            found.push((None, path));
+        }
+        syn::UseTree::Group(group) => {
+            for item in &group.items {
+                flatten_use(item, prefix, found);
+            }
+        }
+    }
+}
+
+/// The names in tokens that are not a method or a field: an identifier not after a `.`.
+fn bare_names(stream: TokenStream) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    collect_names(stream, &mut names);
+    names
+}
+
+fn collect_names(stream: TokenStream, names: &mut BTreeSet<String>) {
+    let mut after_a_dot = false;
+    for tree in stream {
+        match tree {
+            TokenTree::Ident(ident) => {
+                if !after_a_dot {
+                    names.insert(ident.to_string());
+                }
+                after_a_dot = false;
+            }
+            TokenTree::Group(group) => {
+                collect_names(group.stream(), names);
+                after_a_dot = false;
+            }
+            TokenTree::Punct(mark) => after_a_dot = mark.as_char() == '.',
+            TokenTree::Literal(_) => after_a_dot = false,
+        }
+    }
+}
+
+/// The names that tokens run: one that is the whole of them, one that is called (`name(..)`), and
+/// one that is awaited (`name.await`).
+fn running_names(stream: TokenStream) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let trees: Vec<TokenTree> = stream.into_iter().collect();
+    if let [TokenTree::Ident(only)] = trees.as_slice() {
+        names.insert(only.to_string());
+    }
+    collect_running(&trees, &mut names);
+    names
+}
+
+fn collect_running(trees: &[TokenTree], names: &mut BTreeSet<String>) {
+    for (index, tree) in trees.iter().enumerate() {
+        match tree {
+            TokenTree::Group(group) => {
+                let inner: Vec<TokenTree> = group.stream().into_iter().collect();
+                collect_running(&inner, names);
+            }
+            TokenTree::Ident(ident) => {
+                let after_a_dot_or_path = index > 0
+                    && (is_punct(trees.get(index - 1), '.') || is_punct(trees.get(index - 1), ':'));
+                if after_a_dot_or_path {
+                    continue;
+                }
+                let called = matches!(trees.get(index + 1),
+                    Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Parenthesis);
+                let awaited = is_punct(trees.get(index + 1), '.')
+                    && matches!(trees.get(index + 2), Some(TokenTree::Ident(word)) if word == "await");
+                if called || awaited {
+                    names.insert(ident.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The arguments of a call, as the tokens up to each comma outside any group.
+fn arguments_of(stream: TokenStream) -> Vec<TokenStream> {
+    let mut arguments = Vec::new();
+    let mut current = TokenStream::new();
+    let mut any = false;
+    for tree in stream {
+        if is_punct(Some(&tree), ',') {
+            if any {
+                arguments.push(std::mem::take(&mut current));
+            }
+            any = false;
+            continue;
+        }
+        any = true;
+        current.extend([tree]);
+    }
+    if any {
+        arguments.push(current);
+    }
+    arguments
+}
+
+/// The parenthesised group that follows a name at `index`, past a turbofish, and its place.
+fn call_group(trees: &[TokenTree], mut index: usize) -> Option<(usize, &proc_macro2::Group)> {
     if matches!(trees.get(index), Some(TokenTree::Punct(first)) if first.as_char() == ':')
         && matches!(trees.get(index + 1), Some(TokenTree::Punct(second)) if second.as_char() == ':')
         && matches!(trees.get(index + 2), Some(TokenTree::Punct(open)) if open.as_char() == '<')
@@ -535,7 +1031,9 @@ fn call_group(trees: &[TokenTree], mut index: usize) -> Option<&proc_macro2::Gro
         }
     }
     match trees.get(index) {
-        Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Parenthesis => Some(group),
+        Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Parenthesis => {
+            Some((index, group))
+        }
         _ => None,
     }
 }
@@ -563,20 +1061,6 @@ fn written_form(trees: &[TokenTree], index: usize, name: &str) -> String {
         at -= 3;
     }
     segments.join("::")
-}
-
-/// The tokens of a call's first argument: up to the first comma outside any group.
-fn first_argument(stream: TokenStream) -> Option<TokenStream> {
-    let mut first = TokenStream::new();
-    let mut any = false;
-    for tree in stream {
-        if is_punct(Some(&tree), ',') {
-            break;
-        }
-        any = true;
-        first.extend([tree]);
-    }
-    any.then_some(first)
 }
 
 fn callee_of_tokens(tokens: TokenStream) -> String {
@@ -752,21 +1236,6 @@ impl<'ast> Visit<'ast> for Calls {
     }
 }
 
-/// The names of a function's parameters.
-fn parameter_names(signature: &syn::Signature) -> Vec<String> {
-    signature
-        .inputs
-        .iter()
-        .filter_map(|input| match input {
-            syn::FnArg::Typed(typed) => match &*typed.pat {
-                syn::Pat::Ident(ident) => Some(ident.ident.to_string()),
-                _ => None,
-            },
-            syn::FnArg::Receiver(_) => None,
-        })
-        .collect()
-}
-
 /// Whether a `cfg` condition holds only where `leaf` holds: a leaf is true or false by itself,
 /// `all` holds where any part does, `any` where every part does, and `not` never.
 fn condition_holds_only_where(condition: &Meta, leaf: &dyn Fn(&Meta) -> bool) -> bool {
@@ -896,6 +1365,34 @@ fn expression_attributes(expression: &Expr) -> &[Attribute] {
     }
 }
 
+/// The name of the handle that an `.await` waits on: `handle`, `self.handle`, `&mut handle`.
+fn awaited_name(expression: &Expr) -> Option<String> {
+    match expression {
+        Expr::Path(path) => path.path.get_ident().map(ToString::to_string),
+        Expr::Field(field) => match &field.member {
+            syn::Member::Named(name) => Some(name.to_string()),
+            syn::Member::Unnamed(_) => None,
+        },
+        Expr::Reference(inner) => awaited_name(&inner.expr),
+        Expr::Paren(inner) => awaited_name(&inner.expr),
+        Expr::Unary(inner) => awaited_name(&inner.expr),
+        _ => None,
+    }
+}
+
+/// The names that a pattern binds.
+#[derive(Default)]
+struct Bindings {
+    names: Vec<String>,
+}
+
+impl<'ast> Visit<'ast> for Bindings {
+    fn visit_pat_ident(&mut self, ident: &'ast syn::PatIdent) {
+        self.names.push(ident.ident.to_string());
+        visit::visit_pat_ident(self, ident);
+    }
+}
+
 fn type_name(ty: &syn::Type) -> String {
     match ty {
         syn::Type::Path(path) => path
@@ -958,6 +1455,45 @@ impl<'ast> Visit<'ast> for Walker<'_> {
             return;
         }
         visit::visit_local(self, local);
+        // A local made from a parameter that a task can run stands for it from here on.
+        let Some(init) = &local.init else {
+            return;
+        };
+        let made_from = self.parameter_used(&init.expr.to_token_stream());
+        let mut bound = Bindings::default();
+        bound.visit_pat(&local.pat);
+        if let Some(frame) = self.frames.last_mut() {
+            for name in bound.names {
+                match made_from {
+                    Some(position) => frame.locals.insert(name, position),
+                    None => frame.locals.remove(&name),
+                };
+            }
+        }
+    }
+
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        if !self.outside {
+            return;
+        }
+        let mut found = Vec::new();
+        flatten_use(&item.tree, &mut Vec::new(), &mut found);
+        for (alias, path) in found {
+            if alias.is_none() && self.watched.iter().any(|watched| watched.ident == path[0]) {
+                self.scan.named.insert(path.join("::"));
+            }
+        }
+    }
+
+    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+        let segments: Vec<String> = path
+            .path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect();
+        self.name_path(&segments);
+        visit::visit_expr_path(self, path);
     }
 
     fn visit_arm(&mut self, arm: &'ast syn::Arm) {
@@ -1013,13 +1549,17 @@ impl<'ast> Visit<'ast> for Walker<'_> {
 
     fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
         self.scope.push(type_name(&item.self_ty));
+        self.generics.push(item.generics.clone());
         visit::visit_item_impl(self, item);
+        self.generics.pop();
         self.scope.pop();
     }
 
     fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
         self.scope.push(item.ident.to_string());
+        self.generics.push(item.generics.clone());
         visit::visit_item_trait(self, item);
+        self.generics.pop();
         self.scope.pop();
     }
 
@@ -1046,7 +1586,14 @@ impl<'ast> Visit<'ast> for Walker<'_> {
     }
 
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-        self.scan_tokens(mac.tokens.clone());
+        // What a `select!` or a `join!` waits on is awaited, though no `.await` is written.
+        let joins = mac.path.segments.last().is_some_and(|segment| {
+            matches!(
+                segment.ident.to_string().as_str(),
+                "select" | "select_biased" | "join" | "try_join"
+            )
+        });
+        self.scan_tokens(mac.tokens.clone(), joins);
     }
 
     fn visit_expr_await(&mut self, awaited: &'ast syn::ExprAwait) {
@@ -1061,7 +1608,11 @@ impl<'ast> Visit<'ast> for Walker<'_> {
             Expr::MethodCall(call) => {
                 self.awaited.insert(std::ptr::from_ref(call) as usize);
             }
-            _ => {}
+            other => {
+                if let Some(name) = awaited_name(other) {
+                    self.awaits(&name);
+                }
+            }
         }
         visit::visit_expr_await(self, awaited);
     }

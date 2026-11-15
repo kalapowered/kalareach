@@ -8,8 +8,13 @@
 //! A row stands for `count` starts that share the file, the function, the form and the callee.
 //! A line that begins with `helper` names a function of this code that starts a task running one
 //! of its own parameters, and has the columns `helper | name | scope | note`: each call of that
-//! name in a file under `scope` (a file or a folder) is a start. Blank lines and lines that begin
-//! with `#` are comments.
+//! name in a file under `scope` (a file or a folder) is a start, keyed by the argument at the
+//! parameter's place. A line that begins with `names` is a path of a watched crate that the daemon's
+//! code names, `names | path`. Blank lines and lines that begin with `#` are comments.
+//!
+//! A row of class `joined` whose start is not awaited where it stands carries a marker in its note,
+//! `join(function on name)`: the function of the same file that awaits the handle, and the name the
+//! handle has there. The comparison checks that the source still awaits that name in that function.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -67,6 +72,9 @@ pub struct Row {
     pub class: Class,
     pub task: Option<u32>,
     pub note: String,
+    /// Where the handle of the start is awaited, from the note's marker: a function of the same
+    /// file and the handle's name there.
+    pub join: Option<(String, String)>,
 }
 
 impl Row {
@@ -91,6 +99,8 @@ pub struct Helper {
 pub struct Roster {
     pub rows: Vec<Row>,
     pub helpers: Vec<Helper>,
+    /// The paths of the watched crates that the daemon's code names.
+    pub names: Vec<String>,
 }
 
 impl Roster {
@@ -111,6 +121,13 @@ pub fn parse(text: &str) -> Result<Roster, String> {
             continue;
         }
         let columns: Vec<&str> = line.split('|').map(str::trim).collect();
+        if columns[0] == "names" {
+            let [_, path] = columns[..] else {
+                return Err(format!("line {number}: a names line has two columns"));
+            };
+            roster.names.push(path.to_string());
+            continue;
+        }
         if columns[0] == "helper" {
             let [_, name, scope, _note] = columns[..] else {
                 return Err(format!("line {number}: a helper line has four columns"));
@@ -149,6 +166,7 @@ pub fn parse(text: &str) -> Result<Roster, String> {
                 "line {number}: a supervised-later row names its task number"
             ));
         }
+        let join = join_marker(note).map_err(|why| format!("line {number}: {why}"))?;
         roster.rows.push(Row {
             file: file.to_string(),
             function: function.to_string(),
@@ -158,7 +176,14 @@ pub fn parse(text: &str) -> Result<Roster, String> {
             class,
             task,
             note: note.to_string(),
+            join,
         });
+    }
+    let mut paths = BTreeSet::new();
+    for path in &roster.names {
+        if !paths.insert(path) {
+            return Err(format!("the path {path} is listed twice"));
+        }
     }
     let mut keys = BTreeSet::new();
     for row in &roster.rows {
@@ -170,6 +195,23 @@ pub fn parse(text: &str) -> Result<Roster, String> {
         }
     }
     Ok(roster)
+}
+
+/// The marker `join(function on name)` in a note: where the handle of a start is awaited.
+fn join_marker(note: &str) -> Result<Option<(String, String)>, String> {
+    let Some(at) = note.find("join(") else {
+        return Ok(None);
+    };
+    let inside = &note[at + "join(".len()..];
+    let Some(end) = inside.find(')') else {
+        return Err("a join marker is not closed".to_string());
+    };
+    match inside[..end].split_once(" on ") {
+        Some((function, name)) if !function.trim().is_empty() && !name.trim().is_empty() => {
+            Ok(Some((function.trim().to_string(), name.trim().to_string())))
+        }
+        _ => Err("a join marker is `join(function on name)`".to_string()),
+    }
 }
 
 /// A start as a line of the roster, for a person to complete and add.
@@ -237,6 +279,27 @@ pub fn disagreements(roster: &Roster, scan: &Scan) -> Vec<String> {
                 row.class.name()
             ));
         }
+        if row.class == Class::Joined && !start.all_at_once && !start.all_unshipped {
+            match &row.join {
+                None => problems.push(format!(
+                    "a row of class joined whose start is not awaited where it stands names where it is joined: add `join(<function> on <name>)` to its note: {describe}"
+                )),
+                Some((function, name)) => {
+                    let awaited = (key.0.clone(), function.clone(), name.clone());
+                    if !scan.awaits.contains(&awaited) {
+                        problems.push(format!(
+                            "the row says the handle is awaited as `{name}` in {function}, and the source does not await it there: {describe}"
+                        ));
+                    }
+                }
+            }
+        }
+        if row.class != Class::Joined && row.join.is_some() {
+            problems.push(format!(
+                "only a row of class joined has a join marker, and this row says {}: {describe}",
+                row.class.name()
+            ));
+        }
     }
     for (key, row) in &listed {
         if !found.contains_key(key) {
@@ -268,6 +331,21 @@ pub fn disagreements(roster: &Roster, scan: &Scan) -> Vec<String> {
             problems.push(format!(
                 "the helper `{}` is not a function under {} that starts a task running its own parameter",
                 helper.name, helper.scope
+            ));
+        }
+    }
+    let listed: BTreeSet<&String> = roster.names.iter().collect();
+    for path in &scan.named {
+        if !listed.contains(path) {
+            problems.push(format!(
+                "the daemon's code names {path} and the roster does not list it: add `names | {path}` once its starts have rows"
+            ));
+        }
+    }
+    for path in &roster.names {
+        if !scan.named.contains(path) {
+            problems.push(format!(
+                "the roster lists {path} and the daemon's code no longer names it"
             ));
         }
     }

@@ -8,9 +8,31 @@
 //!
 //! What this holds and what it does not. It holds the set of start sites, keyed by file, function,
 //! form and callee: a new start, a removed one, and one start that replaces another in the same
-//! function all change the list. It does not hold a lifetime: a helper that is given a longer life
-//! without a new start, and a start that only a dependency outside this repository makes, are not
-//! seen.
+//! function all change the list. A function that runs a closure or a future of its caller on a
+//! task is a helper: its line is listed, and each call of it is a start, keyed by what the caller
+//! hands over at the parameter's place. It does not hold a lifetime: a helper that is given a
+//! longer life without a new start, and a start that only a dependency outside this repository
+//! makes, are not seen.
+//!
+//! How each class of the roster is held:
+//!
+//! * `test` is held in both directions: a start that only a test build or the `testing` feature
+//!   compiles in has this class, and a row of this class has such a start.
+//! * `joined` is held in both directions: a start that is awaited where it stands has this class,
+//!   and a row of this class whose start is not awaited where it stands carries a
+//!   `join(function on name)` marker in its note, which the case checks against the source: that
+//!   function of the same file still awaits that name.
+//! * `request`, `supervised-later`, `other_crate`, the task numbers and the notes are held by a
+//!   person's read alone. The case holds that each start has a row, not what the row says of the
+//!   start's lifetime. A start whose end the request does not bound is not `request`; where the
+//!   code does not show the bound, the row takes the supervisor's class.
+//!
+//! The linked crates `kr-worker` and `kr-describe` keep a row for each start by name, and a list
+//! of the function paths of those two crates that the rest of the daemon's code names
+//! (`names` lines) is held in both directions: a path that the code names and the list lacks fails,
+//! and so does a listed path that the code no longer names. This does not see a call that goes
+//! through another function, which needs a call graph; a method called on a value of a type of
+//! those crates; or a function reached through a glob import, which is listed as the glob.
 //!
 //! The cases after the first run the scan over small trees of source text, so that each way the
 //! scan could miss a start is shown by a start that it must find.
@@ -31,12 +53,29 @@ fn repository() -> PathBuf {
 
 const DAEMON: &str = "crates/kr-controller";
 
-/// The scan of a tree, with the roster's helper lines.
-fn scan_of(files: &dyn Files, daemon: &str, roster: &Roster) -> Scan {
+/// The linked crates whose own starts have rows by name, and whose paths that the rest of the
+/// daemon's code names are listed.
+const WATCHED: &[&str] = &["kr-worker", "kr-describe"];
+
+/// The scan of a tree, with the roster's helper lines, listing the paths of the crates named.
+fn scan_watching(files: &dyn Files, daemon: &str, roster: &Roster, watched: &[&str]) -> Scan {
     let daemon = Path::new(daemon);
     let crates = scan::linked_crates(files, daemon).expect("the linked crates are found");
     let roots = scan::root_files(files, &crates, daemon).expect("the roots are found");
-    scan::scan(files, &roots, &roster.helper_scopes()).expect("the source is read")
+    let watched: Vec<scan::Watched> = crates
+        .iter()
+        .filter(|linked| watched.contains(&linked.name.as_str()))
+        .map(|linked| scan::Watched {
+            ident: linked.name.replace('-', "_"),
+            dir: linked.dir.clone(),
+        })
+        .collect();
+    scan::scan(files, &roots, &roster.helper_scopes(), &watched).expect("the source is read")
+}
+
+/// The scan of a tree, with the roster's helper lines.
+fn scan_of(files: &dyn Files, daemon: &str, roster: &Roster) -> Scan {
+    scan_watching(files, daemon, roster, &[])
 }
 
 fn real_roster() -> Roster {
@@ -49,7 +88,7 @@ fn real_roster() -> Roster {
 fn the_roster_names_every_start_of_the_daemon_process() {
     let roster = real_roster();
     let disk = scan::Disk(repository());
-    let found = scan_of(&disk, DAEMON, &roster);
+    let found = scan_watching(&disk, DAEMON, &roster, WATCHED);
     let problems = roster::disagreements(&roster, &found);
     assert!(
         problems.is_empty(),
@@ -67,8 +106,8 @@ fn the_roster_names_every_start_of_the_daemon_process() {
     ] {
         assert!(found.files.contains(file), "the scan did not read {file}");
     }
-    // Every long-lived task has a row.
-    for number in 1..=35 {
+    // Every long-lived task has a row, and so does the family of threads that no request bounds.
+    for number in 1..=36 {
         assert!(
             roster.rows.iter().any(|row| row.task == Some(number)),
             "the roster has no row for long-lived task {number}"
@@ -390,9 +429,19 @@ fn modules_are_found_through_their_declarations() {
     assert_eq!(found.len(), 4, "{found:?}");
 }
 
+/// The names of the helpers a scan found.
+fn helpers_of(tree: &Memory, roster: &Roster) -> Vec<String> {
+    scan_of(tree, "crates/daemon", roster)
+        .helper_shapes
+        .iter()
+        .map(|shape| format!("{}@{}", shape.name, shape.position))
+        .collect()
+}
+
 #[test]
 fn a_helper_that_runs_its_parameter_is_named_and_its_calls_are_starts() {
-    let source = "fn detach<F>(work: F) { tokio::spawn(work); }\nfn use_it() { detach(job()); }\n";
+    let source = "fn detach<F: std::future::Future>(work: F) { tokio::spawn(work); }\n\
+                  fn use_it() { detach(job()); }\n";
     let tree = daemon_with(source);
 
     // Without a helper line the helper is a problem of its own.
@@ -418,6 +467,108 @@ fn a_helper_that_runs_its_parameter_is_named_and_its_calls_are_starts() {
     assert!(
         problems.iter().any(|p| p.contains("`missing`")),
         "{problems:?}"
+    );
+}
+
+#[test]
+fn a_helper_is_seen_in_every_form_that_runs_its_parameter() {
+    // Each of these starts something other than the bare parameter: a block that awaits it, a
+    // closure that calls it, and a local that was made from it.
+    for (source, name) in [
+        (
+            "fn detach(work: impl std::future::Future<Output = ()> + Send + 'static) {\n\
+                 tokio::spawn(async move { work.await });\n\
+             }\n",
+            "detach",
+        ),
+        (
+            "fn on_a_thread(work: impl FnOnce() + Send + 'static) {\n\
+                 std::thread::spawn(move || work());\n\
+             }\n",
+            "on_a_thread",
+        ),
+        (
+            "fn each<S, T>(set: &mut Set, mut serve: S)\n\
+             where S: FnMut() -> Option<T>, T: std::future::Future<Output = ()> + Send + 'static {\n\
+                 let Some(task) = serve() else { return };\n\
+                 set.spawn(task);\n\
+             }\n",
+            "each",
+        ),
+        (
+            "fn later(work: Box<dyn FnOnce() + Send>) {\n\
+                 let task = work;\n\
+                 std::thread::spawn(task);\n\
+             }\n",
+            "later",
+        ),
+    ] {
+        let tree = daemon_with(source);
+        let problems = problems_of(&tree, &Roster::default());
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains(&format!("`{name}`")) && p.contains("no helper line")),
+            "{name}: {problems:?}"
+        );
+    }
+
+    // The twins start the same way and are not helpers: a parameter that is data, a local that is
+    // what a closure returned, and a start that is awaited where it stands.
+    for source in [
+        "fn notify(label: String) { tokio::spawn(async move { say(label).await }); }\n",
+        "fn watch(mut read: impl FnMut() -> Option<u8>) {\n\
+             let found = read();\n\
+             tokio::spawn(async move { use_it(found).await });\n\
+         }\n",
+        "async fn blocking(work: impl FnOnce() + Send + 'static) {\n\
+             tokio::task::spawn_blocking(work).await;\n\
+         }\n",
+        "fn launch(first: &Command, before: impl FnOnce()) { spawn_process(first, before); }\n",
+    ] {
+        let tree = daemon_with(source);
+        assert_eq!(
+            helpers_of(&tree, &Roster::default()),
+            Vec::<String>::new(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn a_helpers_call_is_keyed_by_the_argument_at_the_parameters_place() {
+    let source = "\
+        fn each<S, T>(listener: &Listener, mut serve: S)\n\
+        where S: FnMut() -> Option<T>, T: std::future::Future<Output = ()> + Send + 'static {\n\
+            let Some(task) = serve() else { return };\n\
+            set.spawn(task);\n\
+        }\n\
+        impl Pool {\n\
+            fn within<T>(&self, deadline: u64, read: impl FnOnce() -> T + Send + 'static) {\n\
+                std::thread::spawn(move || read());\n\
+            }\n\
+            fn first(&self) { self.within(10, || reading()); }\n\
+            fn second(pool: &Pool) { Pool::within(pool, 10, || other()); }\n\
+        }\n\
+        fn serve_all(listener: &Listener) { each(&listener, || client()); }\n";
+    let roster = roster_of(
+        "helper | each | crates/daemon/src/lib.rs | a case\n\
+         helper | within | crates/daemon/src/lib.rs | a case\n",
+    );
+    let found = starts_of(&daemon_with(source), &roster);
+    for expected in [
+        "each closure{client}",
+        ".within closure{reading}",
+        "Pool::within closure{other}",
+    ] {
+        assert!(
+            found.contains(&expected.to_string()),
+            "{expected} not in {found:?}"
+        );
+    }
+    assert_eq!(
+        helpers_of(&daemon_with(source), &roster),
+        ["each@1", "within@1"]
     );
 }
 
@@ -476,4 +627,221 @@ fn a_roster_line_that_is_not_a_row_is_refused() {
     );
     let twice = "f | g | tokio::spawn | h | 1 | request | - | n\nf | g | tokio::spawn | h | 1 | request | - | n\n";
     assert!(roster::parse(twice).is_err(), "two rows with one key");
+}
+
+const JOINED_ELSEWHERE: &str = "\
+    async fn serve() { let task = tokio::spawn(work()); drive(task).await; }\n\
+    async fn drive(task: Handle) { let _ = task.await; }\n";
+
+fn joined_row(class: &str, note: &str) -> Roster {
+    roster_of(&format!(
+        "crates/daemon/src/lib.rs | serve | tokio::spawn | work | 1 | {class} | - | {note}\n"
+    ))
+}
+
+#[test]
+fn a_join_that_is_removed_or_never_marked_fails() {
+    let tree = daemon_with(JOINED_ELSEWHERE);
+    let marked = joined_row("joined", "the handle is awaited: join(drive on task)");
+    assert_eq!(problems_of(&tree, &marked), Vec::<String>::new());
+
+    // The join is removed: the handle is dropped and the marker no longer holds.
+    let removed = daemon_with(
+        "async fn serve() { let task = tokio::spawn(work()); drive(task).await; }\n\
+         async fn drive(task: Handle) { drop(task); }\n",
+    );
+    let problems = problems_of(&removed, &marked);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].contains("does not await it there"),
+        "{problems:?}"
+    );
+
+    // A row of class joined whose start is not awaited where it stands, with no marker.
+    let problems = problems_of(&tree, &joined_row("joined", "awaited elsewhere"));
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].contains("names where it is joined"),
+        "{problems:?}"
+    );
+
+    // A marker that names another function, or another name, is not a join of this start.
+    for note in ["join(serve on task)", "join(drive on other)"] {
+        let problems = problems_of(&tree, &joined_row("joined", note));
+        assert_eq!(problems.len(), 1, "{note}: {problems:?}");
+    }
+
+    // A marker on a row that is not class joined is a mistake.
+    let problems = problems_of(&tree, &joined_row("request", "join(drive on task)"));
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("only a row of class joined has a join marker")),
+        "{problems:?}"
+    );
+
+    // What a `select!` waits on is a join as well, and so is a handle awaited inside a macro.
+    let selecting = daemon_with(
+        "async fn serve() {\n\
+             let task = tokio::spawn(work());\n\
+             tokio::select! { done = task => done, () = stop() => {} }\n\
+         }\n",
+    );
+    let marked = joined_row("joined", "the select waits on it: join(serve on task)");
+    assert_eq!(problems_of(&selecting, &marked), Vec::<String>::new());
+    let not_selected = daemon_with(
+        "async fn serve() {\n\
+             let task = tokio::spawn(work());\n\
+             tokio::select! { () = stop() => {} }\n\
+         }\n",
+    );
+    assert_eq!(problems_of(&not_selected, &marked).len(), 1);
+}
+
+#[test]
+fn a_start_awaited_inside_a_macro_is_joined() {
+    let tree = daemon_with(
+        "async fn serve() {\n\
+             let _ = matches!(tokio::task::spawn_blocking(move || work()).await, Ok(_));\n\
+         }\n",
+    );
+    let row = |class: &str| {
+        roster_of(&format!(
+            "crates/daemon/src/lib.rs | serve | tokio::task::spawn_blocking | closure{{work}} | 1 | {class} | - | a case\n"
+        ))
+    };
+    assert_eq!(problems_of(&tree, &row("joined")), Vec::<String>::new());
+    let problems = problems_of(&tree, &row("request"));
+    assert!(
+        problems.iter().any(|p| p.contains("class joined")),
+        "{problems:?}"
+    );
+}
+
+#[test]
+fn the_function_paths_of_a_watched_crate_that_the_code_names_are_listed_in_both_directions() {
+    let tree = Memory::of(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = []\n[workspace.dependencies]\nwatched-crate = { path = \"crates/watched\" }\n",
+        ),
+        (
+            "crates/daemon/Cargo.toml",
+            "[package]\nname = \"daemon\"\n[[bin]]\nname = \"daemon\"\npath = \"src/main.rs\"\n\
+             [dependencies]\nwatched-crate = { workspace = true }\n",
+        ),
+        ("crates/daemon/src/main.rs", "fn main() {}\n"),
+        (
+            "crates/daemon/src/lib.rs",
+            "use watched_crate::engine::{self, Pool};\n\
+             use watched_crate::prelude::*;\n\
+             fn serve() {\n\
+                 watched_crate::run();\n\
+                 engine::start();\n\
+                 let _ = Pool::new();\n\
+                 let _ = Pool::DEFAULT;\n\
+                 let _ = watched_crate::Kind::Fast;\n\
+                 let _ = matches!(x, Some(_) if watched_crate::probe(1));\n\
+             }\n\
+             #[cfg(test)]\nfn only_in_tests() { watched_crate::in_a_test(); }\n",
+        ),
+        (
+            "crates/watched/Cargo.toml",
+            "[package]\nname = \"watched-crate\"\n",
+        ),
+        (
+            "crates/watched/src/lib.rs",
+            "pub fn run() { tokio::spawn(carry()); }\n\
+             fn inside() { crate::run(); watched_crate::from_inside(); }\n",
+        ),
+    ]);
+    let listed = "\
+        crates/watched/src/lib.rs | run | tokio::spawn | carry | 1 | other_crate | - | a case\n\
+        names | watched_crate::engine::Pool::new\n\
+        names | watched_crate::engine::start\n\
+        names | watched_crate::prelude::*\n\
+        names | watched_crate::probe\n\
+        names | watched_crate::run\n";
+    let problems_with = |roster: &str| {
+        let roster = roster_of(roster);
+        let found = scan_watching(&tree, "crates/daemon", &roster, &["watched-crate"]);
+        roster::disagreements(&roster, &found)
+    };
+    assert_eq!(problems_with(listed), Vec::<String>::new());
+
+    // A path that the code names and the list lacks.
+    let without = listed.replace("names | watched_crate::probe\n", "");
+    let problems = problems_with(&without);
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].contains("watched_crate::probe"), "{problems:?}");
+
+    // A listed path that the code no longer names.
+    let problems = problems_with(&format!("{listed}names | watched_crate::gone\n"));
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].contains("no longer names"), "{problems:?}");
+}
+
+#[test]
+fn an_optional_dependency_and_a_library_path_are_read() {
+    let tree = Memory::of(&[
+        ("Cargo.toml", "[workspace]\nmembers = []\n"),
+        (
+            "crates/daemon/Cargo.toml",
+            "[package]\nname = \"daemon\"\n[[bin]]\nname = \"daemon\"\npath = \"src/main.rs\"\n\
+             [dependencies]\nextra = { path = \"../extra\", optional = true }\n\
+             moved = { path = \"../moved\" }\n",
+        ),
+        ("crates/daemon/src/main.rs", "fn main() {}\n"),
+        ("crates/daemon/src/lib.rs", "pub fn nothing() {}\n"),
+        ("crates/extra/Cargo.toml", "[package]\nname = \"extra\"\n"),
+        (
+            "crates/extra/src/lib.rs",
+            "pub fn run() { tokio::spawn(from_an_optional_dependency()); }\n",
+        ),
+        (
+            "crates/moved/Cargo.toml",
+            "[package]\nname = \"moved\"\n[lib]\npath = \"src/engine.rs\"\n",
+        ),
+        (
+            "crates/moved/src/engine.rs",
+            "pub fn run() { tokio::spawn(from_a_library_path()); }\n",
+        ),
+        (
+            "crates/moved/src/lib.rs",
+            "pub fn not_the_library() { tokio::spawn(never_read()); }\n",
+        ),
+    ]);
+    let found = starts_of(&tree, &Roster::default());
+    assert_eq!(
+        found,
+        [
+            "tokio::spawn from_an_optional_dependency",
+            "tokio::spawn from_a_library_path"
+        ],
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_start_under_cfg_any_is_skipped_only_when_every_part_is_a_test() {
+    let tree = daemon_with(
+        "#[cfg(any(test, unix))]\nfn some_builds() { tokio::spawn(on_unix_or_in_tests()); }\n\
+         #[cfg(any(test, feature = \"testing\"))]\nfn unshipped() { tokio::spawn(in_tests_or_testing()); }\n\
+         #[cfg(any(test, all(test, unix)))]\nfn only_tests() { tokio::spawn(only_in_tests()); }\n",
+    );
+    let found = scan_of(&tree, "crates/daemon", &Roster::default());
+    let read: Vec<(&str, bool)> = found
+        .starts
+        .iter()
+        .map(|start| (start.callee.as_str(), start.unshipped))
+        .collect();
+    // A shipped build on a platform that holds `unix` compiles the first in, the second only with
+    // the feature that no shipped build enables, and the third never.
+    assert_eq!(
+        read,
+        [
+            ("on_unix_or_in_tests", false),
+            ("in_tests_or_testing", true)
+        ]
+    );
 }
