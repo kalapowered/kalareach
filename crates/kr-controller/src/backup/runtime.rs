@@ -361,6 +361,9 @@ struct Shared {
     /// How many passes have begun. The pass numbered `n` is the one that began when this reached
     /// `n` and ended when `passes` did.
     begun: tokio::sync::watch::Sender<u64>,
+    /// Whether the carrier waits with nothing standing. For this host's own tests.
+    #[cfg(feature = "testing")]
+    settled: tokio::sync::watch::Sender<bool>,
 }
 
 impl Shared {
@@ -522,44 +525,82 @@ impl Shared {
 
     async fn wait(&self, wait: Wait, timer: &dyn Timer) {
         let signals = &self.signals;
-        match wait {
-            Wait::Signals => {
-                tokio::select! {
-                    () = signals.work.notified() => {}
-                    () = signals.fence.notified() => {}
-                    () = signals.person.notified() => {}
+        // Only a wait that takes all three signals can tell that none of them holds a permit.
+        #[cfg(feature = "testing")]
+        let takes_every_signal = matches!(wait, Wait::Signals | Wait::Timed { wakeable: true, .. });
+        let ended = async {
+            match wait {
+                Wait::Signals => {
+                    tokio::select! {
+                        () = signals.work.notified() => {}
+                        () = signals.fence.notified() => {}
+                        () = signals.person.notified() => {}
+                    }
+                }
+                Wait::Timed {
+                    duration,
+                    wakeable: true,
+                } => {
+                    tokio::select! {
+                        () = timer.sleep(duration) => {}
+                        () = signals.work.notified() => {}
+                        () = signals.fence.notified() => {}
+                        () = signals.person.notified() => {}
+                    }
+                }
+                Wait::Timed {
+                    duration,
+                    wakeable: false,
+                } => {
+                    tokio::select! {
+                        () = timer.sleep(duration) => {}
+                        () = signals.fence.notified() => {}
+                        () = signals.person.notified() => {}
+                    }
+                }
+                Wait::Owed { until, duration } => {
+                    tokio::select! {
+                        // What was asked for has passed, unless the service asked for more while
+                        // this waited.
+                        () = timer.sleep(duration) => self.quiet.passed(until),
+                        () = signals.fence.notified() => {}
+                    }
                 }
             }
-            Wait::Timed {
-                duration,
-                wakeable: true,
-            } => {
-                tokio::select! {
-                    () = timer.sleep(duration) => {}
-                    () = signals.work.notified() => {}
-                    () = signals.fence.notified() => {}
-                    () = signals.person.notified() => {}
-                }
+        };
+        #[cfg(feature = "testing")]
+        self.say_when_nothing_stands(takes_every_signal, ended)
+            .await;
+        #[cfg(not(feature = "testing"))]
+        ended.await;
+    }
+
+    /// Runs `ended`, the wait, and raises `settled` while it waits with nothing standing.
+    ///
+    /// A signal that holds a permit ends the wait the first time the wait is polled, and takes the
+    /// permit. So a wait that takes all three signals and is still pending after its first poll
+    /// found none of them holding a permit, and each now waits for the next. The carrier is then
+    /// between passes, so no pass is in hand either. A timer can still end such a wait without a
+    /// signal. The flag is lowered when the wait ends, before the pass it starts begins.
+    ///
+    /// It says what the carrier found when it last looked: a signal sent after that look ends the
+    /// state, and the flag follows when the carrier next runs.
+    #[cfg(feature = "testing")]
+    async fn say_when_nothing_stands(
+        &self,
+        takes_every_signal: bool,
+        ended: impl std::future::Future<Output = ()>,
+    ) {
+        let mut ended = std::pin::pin!(ended);
+        std::future::poll_fn(|context| {
+            let poll = ended.as_mut().poll(context);
+            if poll.is_pending() && takes_every_signal {
+                self.settled.send_replace(true);
             }
-            Wait::Timed {
-                duration,
-                wakeable: false,
-            } => {
-                tokio::select! {
-                    () = timer.sleep(duration) => {}
-                    () = signals.fence.notified() => {}
-                    () = signals.person.notified() => {}
-                }
-            }
-            Wait::Owed { until, duration } => {
-                tokio::select! {
-                    // What was asked for has passed, unless the service asked for more while this
-                    // waited.
-                    () = timer.sleep(duration) => self.quiet.passed(until),
-                    () = signals.fence.notified() => {}
-                }
-            }
-        }
+            poll
+        })
+        .await;
+        self.settled.send_replace(false);
     }
 
     /// One iteration: the ciphertext of finished generations is released first, whatever the
@@ -766,6 +807,8 @@ impl BackupRuntime {
             quiet: Arc::clone(&quiet),
             passes: tokio::sync::watch::channel(0).0,
             begun: tokio::sync::watch::channel(0).0,
+            #[cfg(feature = "testing")]
+            settled: tokio::sync::watch::channel(false).0,
         });
         let uploader = Uploader::new(
             Arc::clone(&backup),
@@ -855,6 +898,16 @@ impl BackupRuntime {
     #[must_use]
     pub fn passes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.shared.passes.subscribe()
+    }
+
+    /// Whether the carrier waits with nothing standing: no permit on any of its three signals and
+    /// no pass in hand. Only the next signal, or a timer, then starts a pass. It changes to `true`
+    /// when the carrier finds that, and back to `false` when its wait ends. For this host's own
+    /// tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn waits_with_nothing_standing(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.shared.settled.subscribe()
     }
 
     /// Tells the carrier to look again now.

@@ -9554,16 +9554,21 @@ async fn a_second_ask_sends_what_is_still_unanswered_when_no_pass_is_owed_it() {
     let (controller, endpoint, _serving) = start_daemon(&host, timer).await;
 
     // The restarted carrier has looked, and sent nothing it was not just asked for, and no pass is
-    // owed it when the second ask comes. A pass starts on one of three standing permits (work,
-    // fence, person), and each pass uses one up. A pass that begins after a call to `carry_now`
-    // ends after every pass that began before it. So one call for each permit leaves no pass in
-    // hand and no permit standing, whatever the start of the daemon left, and only the second
-    // ask's own wake can then start the pass that sends.
-    const PERMITS_THAT_START_A_PASS: usize = 3;
+    // owed it when the second ask comes: it waits with nothing standing, which is no permit on any
+    // of its three signals and no pass in hand. The restart leaves the fence's permit, and the
+    // carrier's first pass takes none, so that is not a state to count calls to: the carrier says
+    // when it has reached it. Nothing else signals it here, since its timer is held, privacy mode
+    // stops production before it signals the carrier, and no step is owed the fence. So only the
+    // second ask's own wake can start the pass that sends.
     let runtime = controller.backup_runtime().expect("a carrier");
-    for _ in 0..PERMITS_THAT_START_A_PASS {
-        within("a pass after the restart", runtime.carry_now()).await;
-    }
+    let mut settled = runtime.waits_with_nothing_standing();
+    within("the restarted carrier waits with nothing standing", async {
+        settled
+            .wait_for(|settled| *settled)
+            .await
+            .expect("the carrier runs");
+    })
+    .await;
     assert_eq!(served.web().requests_to(DELETE), sent);
     let confirmed = || {
         controller
