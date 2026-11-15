@@ -660,8 +660,9 @@ pub struct Controller {
     #[cfg(feature = "testing")]
     after_an_acknowledgement: ReadPause,
     /// Where this host's own tests stop a request for a page of a worker's fence evidence once it
-    /// holds the worker's link and has checked that time is left for it, before its time limit
-    /// starts, so that time can pass in between. Compiled away in every shipped build.
+    /// holds the worker's link and has taken the instant its time limit ends at, which is also the
+    /// check that time is left for it, before the exchange begins under that limit, so that time
+    /// can pass in between. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     before_a_pages_limit: ReadPause,
     /// How many pages of one worker's fence evidence this host's own tests let one announcement
@@ -1280,9 +1281,10 @@ impl Controller {
     }
 
     /// Stops the next request for a page of a worker's fence evidence once it holds the worker's
-    /// link and has checked that time is left for it, before its time limit starts, for this
-    /// host's own tests. Returns the end that says the request has arrived there, and the end that
-    /// lets it go. The stop fires once.
+    /// link and has taken the instant its time limit ends at, which is also the check that time is
+    /// left for it, before the exchange begins under that limit, for this host's own tests.
+    /// Returns the end that says the request has arrived there, and the end that lets it go. The
+    /// stop fires once.
     #[cfg(feature = "testing")]
     pub fn stop_before_a_pages_limit_for_tests(
         &self,

@@ -933,10 +933,11 @@ impl Controller {
                  confirmed ended. While the directory lists a pending worker, this host asks it \
                  again on its own. It asks at the pass that comes about five seconds after a \
                  refusal or an answer that names actions. After an ask that failed, or an \
-                 acknowledgement that names no actions, it asks at the first pass after a wait \
-                 of 10 seconds; that wait doubles for each further such ask, to 60 seconds at \
-                 most. It does not ask a worker while an earlier presentation of this host to it \
-                 is still under way. This check shows when every worker has acknowledged. The first \
+                 acknowledgement that says nothing about its fence, it asks at the first pass \
+                 after a wait of 10 seconds; that wait doubles for each further such ask, to 60 \
+                 seconds at most. It does not ask a worker while an earlier presentation of \
+                 this host to it is still under way. This check shows when every worker has \
+                 acknowledged. The first \
                  answer to the revocation is not rewritten then; repeating a revocation asks \
                  the workers that were pending in its answer again on the same terms and, once \
                  one has acknowledged, names the actions that won the dispatch race at it under \

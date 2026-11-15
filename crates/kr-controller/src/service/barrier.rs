@@ -578,9 +578,11 @@ const ASK_INTERVAL: std::time::Duration = DEBT_PASS_INTERVAL;
 /// asked at it.
 const PASS_JITTER: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// How long one ask of a pending worker may take in all: the exchange, bounded by
-/// [`super::net::ACKNOWLEDGEMENT_TIMEOUT`], and the collection of the names an acknowledgement
-/// leaves, which an ask that is cut leaves to the pass's own collection.
+/// How long one ask of a pending worker may take in all: the notices, each of which has
+/// [`super::net::ACKNOWLEDGEMENT_TIMEOUT`] from the moment it begins, or the time this bound has
+/// left when that is less, and the collection of the names an acknowledgement leaves, a page at a
+/// time. No exchange begins with less than [`WORKER_EXCHANGE`] left. An ask that is cut leaves the
+/// names to the pass's own collection.
 pub(super) const PASS_ASK_BOUND: std::time::Duration =
     super::net::ACKNOWLEDGEMENT_TIMEOUT.saturating_add(WORKER_EXCHANGE);
 
@@ -594,8 +596,10 @@ const ASK_INTERVAL_LONGEST: std::time::Duration = std::time::Duration::from_secs
 /// first pass that falls five seconds after the ask began. An ask that could not open a link or
 /// ran out costs a link attempt and the whole of its acknowledgement time: the wait before the next
 /// one, counted from its end, doubles from five seconds to a minute at most, and the ask is made
-/// at the first pass after it. An acknowledgement that names nothing of the worker's fence is paced
-/// the same way, though the link is good and nothing asks whether the worker has ended. Any other
+/// at the first pass after it. An ask that ran out before its first notice could begin, for want
+/// of time, is paced the same way but costs no link attempt: the link went back whole. An
+/// acknowledgement that says nothing about the worker's fence is paced the same way, though the
+/// link is good and nothing asks whether the worker has ended. Any other
 /// answer puts the wait back to five seconds. A worker whose earlier presentation is still waiting
 /// at its dispatch boundary is not asked at all. Only memory: the registry decides each pass who
 /// is pending.
