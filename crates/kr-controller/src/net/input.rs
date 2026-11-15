@@ -263,8 +263,9 @@ impl InputStreams {
     /// is called for a detach that took effect or may have, and for no other. The stream waits
     /// [`DETACH_NOTICE_WAIT`] for the worker's notice that the lease ended, if the view held it and
     /// none came yet, writes it to the device, and ends. Only the connection that asked is reached:
-    /// a worker detaches only attachments of the link that asks, so no other connection's stream
-    /// stands on an attachment this call can remove.
+    /// a worker detaches a named attachment only for the link that holds it, so no other
+    /// connection's stream stands on an attachment this call can remove. A request that names no
+    /// attachment is not told to this hook.
     pub(super) fn detached(&self, connection: ConnectionId, attachment: AttachmentId) {
         self.stages.detach_told();
         let streams: Vec<Arc<Live>> = self
@@ -1400,6 +1401,7 @@ async fn end_at_detach(flow: Arc<Flow>) {
     };
     let _ = tokio::time::timeout(DETACH_NOTICE_WAIT, wait).await;
     flow.end(End::Graceful);
+    flow.stages.detach_end_asked();
 }
 
 /// Writes what the device is told, in order. It never blocks the stream task or the lane, and a
