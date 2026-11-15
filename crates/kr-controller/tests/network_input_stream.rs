@@ -4233,11 +4233,12 @@ async fn a_request_that_does_not_decode_whole_is_refused_and_nothing_is_forwarde
         launch: Nullable::null(),
     };
     let target = rig.adopted.workers[0].target(rig.adopted.host.environment_id);
+    let first = ActionId::new(kr_ipc::new_uuid());
     let release = rig
         .device
         .mutate(
             Method::InputRelease,
-            ActionId::new(kr_ipc::new_uuid()),
+            first,
             target.clone(),
             &ReleaseWithATextReport {
                 session_id: rig.session,
@@ -4296,6 +4297,27 @@ async fn a_request_that_does_not_decode_whole_is_refused_and_nothing_is_forwarde
         rig.adopted.workers[0].attachments(),
         1,
         "nothing was applied: the attachment stands"
+    );
+    // The refusal claimed nothing: the release sent again under the same action, as it should have
+    // been, is a first request and goes through.
+    let again = rig
+        .device
+        .mutate(
+            Method::InputRelease,
+            first,
+            rig.adopted.workers[0].target(rig.adopted.host.environment_id),
+            &InputReleaseParams {
+                session_id: rig.session,
+                attachment_id: rig.attachment,
+                epoch: rig.epoch,
+                after_input: None,
+                fenced_report: false,
+            },
+        )
+        .await;
+    assert!(
+        again.is_ok(),
+        "the corrected release goes through: {again:?}"
     );
     rig.stop().await;
 }
