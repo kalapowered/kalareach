@@ -652,8 +652,8 @@ async fn a_session_goes_on_through_the_stop_sigterm_asks_for_and_the_next_daemon
     );
 }
 
-/// A stop asked on the local socket ends the real daemon after its answer has been written, by the
-/// ordinary way out: an exit code of zero, the line that says why, its sockets removed and its
+/// KR-REQ-02.03, KR-REQ-05.01: a stop asked on the local socket ends the real daemon after its
+/// answer has been written, by the ordinary way out: an exit code of zero, the line that says why, its sockets removed and its
 /// environment's lock free, and a session goes on through it as it does through a signal. A request
 /// for the launch alone, asked first, stops nothing and says how the daemon was started.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -603,8 +603,8 @@ async fn a_request_for_the_launch_alone_stops_nothing_and_says_how_the_daemon_wa
     assert!(!daemon.is_told_to_stop().await, "nothing was stopped");
 }
 
-/// A host that owes a fence can still be stopped, and the answer, told under the fence like any
-/// write's, is withheld as an unknown outcome while the daemon stops all the same; a request for the
+/// KR-REQ-09.09, 09.12 and 26.16: a host that owes a fence can still be stopped, and the answer,
+/// told under the fence like any write's, is withheld as an unknown outcome while the daemon stops all the same; a request for the
 /// launch alone is withheld the same way and stops nothing. The control: a method of the list the
 /// fence holds by name is still refused for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
