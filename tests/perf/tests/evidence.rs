@@ -12,24 +12,45 @@
 //! reads the directory through the real reader. The temporary folder ends in a slash, as macOS's
 //! does.
 //!
+//! A run that a time-out or a cancel ends keeps what its measurements had recorded: each record
+//! reaches the caller's directory as soon as its measurement ends, and the script's exit trap
+//! appends what is left. These checks end a run inside a measurement, by a signal that the trap runs
+//! on and by one that it does not, with a stand-in measurement that stops after it has recorded.
+//!
 //! Unix only: the script is a Unix shell script.
 
 #![cfg(unix)]
 
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output};
+use std::time::Duration;
 
 /// The variable that makes the stand-in measurement record its section.
 const CHILD: &str = "KR_STAND_IN_CHILD";
 
 /// The stand-in for `cargo`: every build and every suite succeeds at once, and each measurement
-/// runs this test program, which records a section.
+/// runs this test program, which records a section. Where `KR_STAND_IN_HOLD` names a folder, the
+/// measurement that `KR_STAND_IN_HOLD_AT` counts to stops after it has recorded, while the folder
+/// holds a file named `held` (which it makes) and for two minutes at most.
 const CARGO: &str = r#"#!/bin/sh
 case "$*" in
   build*) exit 0 ;;
   *--ignored*)
     echo "the measurement"
     "$KR_STAND_IN_READER" --exact the_stand_in_measurement --nocapture --test-threads=1 || exit 1
+    if [ -n "${KR_STAND_IN_HOLD:-}" ]; then
+      count=$(( $(cat "$KR_STAND_IN_HOLD/count" 2>/dev/null || echo 0) + 1 ))
+      echo "$count" > "$KR_STAND_IN_HOLD/count"
+      if [ "$count" = "$KR_STAND_IN_HOLD_AT" ]; then
+        : > "$KR_STAND_IN_HOLD/held"
+        waited=0
+        while [ -e "$KR_STAND_IN_HOLD/held" ] && [ "$waited" -lt 120 ]; do
+          sleep 1
+          waited=$((waited + 1))
+        done
+      fi
+    fi
     echo "test result: ok. 1 passed; 0 failed; 0 ignored"
     ;;
   *) echo "test result: ok. 3 passed; 0 failed; 0 ignored" ;;
@@ -56,9 +77,9 @@ fn repository() -> PathBuf {
         .expect("the repository")
 }
 
-/// Runs the script with the stand-in, `temporary` (with a slash at its end) as its temporary
-/// folder and `evidence` as the evidence directory, or none.
-fn performance(temporary: &Path, evidence: Option<&Path>) -> Output {
+/// The script with the stand-in, `temporary` (with a slash at its end) as its temporary folder and
+/// `evidence` as the evidence directory, or none.
+fn script(temporary: &Path, evidence: Option<&Path>) -> Command {
     let bin = temporary.join("bin");
     std::fs::create_dir_all(&bin).expect("a directory for the stand-in");
     kr_ipc::testing::place_script(&bin.join("cargo"), CARGO);
@@ -82,7 +103,74 @@ fn performance(temporary: &Path, evidence: Option<&Path>) -> Output {
     if let Some(evidence) = evidence {
         command.env("KR_TEST_ARTIFACTS_DIR", evidence);
     }
-    command.output().expect("the script runs")
+    command
+}
+
+/// Runs the script to its end.
+fn performance(temporary: &Path, evidence: Option<&Path>) -> Output {
+    script(temporary, evidence)
+        .output()
+        .expect("the script runs")
+}
+
+/// The script, started as the leader of a process group of its own, as a runner starts a step, with
+/// the measurement that is counted to `at` held after it has recorded.
+struct Held {
+    child: Child,
+    folder: PathBuf,
+}
+
+impl Held {
+    fn start(temporary: &Path, evidence: &Path, at: u32) -> Held {
+        let folder = temporary.join("hold");
+        std::fs::create_dir_all(&folder).expect("a folder for the stand-in's marks");
+        // To a file, so that nothing waits on a pipe that a process left behind still holds.
+        let log = std::fs::File::create(folder.join("log")).expect("a log");
+        let child = script(temporary, Some(evidence))
+            .env("KR_STAND_IN_HOLD", &folder)
+            .env("KR_STAND_IN_HOLD_AT", at.to_string())
+            .process_group(0)
+            .stdout(log.try_clone().expect("a second handle"))
+            .stderr(log)
+            .spawn()
+            .expect("the script starts");
+        Held { child, folder }
+    }
+
+    /// Waits until the held measurement has recorded and stopped, and says what the script printed
+    /// if it ends first or the wait runs out.
+    fn wait_until_held(&mut self) {
+        let printed = || std::fs::read_to_string(self.folder.join("log")).unwrap_or_default();
+        for _ in 0..600 {
+            if self.folder.join("held").exists() {
+                return;
+            }
+            if let Some(status) = self.child.try_wait().expect("polls the script") {
+                panic!(
+                    "the script ended ({status}) before the measurement was held:\n{}",
+                    printed()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "the measurement was not held within a minute:\n{}",
+            printed()
+        );
+    }
+
+    /// Ends the script and everything it started with `signal`, as a runner ends a step that has
+    /// timed out or been cancelled, and waits for the script to end.
+    fn end_by(mut self, signal: &str) {
+        let sent = Command::new("/bin/bash")
+            .args(["-c", r#"kill -s "$0" -- "-$1""#, signal])
+            .arg(self.child.id().to_string())
+            .status()
+            .expect("sends the signal");
+        assert!(sent.success(), "the signal {signal} was not sent");
+        let status = self.child.wait().expect("the script ends");
+        assert!(!status.success(), "the script ended well after {signal}");
+    }
 }
 
 fn sections(record: &Path) -> usize {
@@ -146,4 +234,39 @@ fn records_are_appended_to_a_directory_named_under_the_callers_temporary_folder(
     let text = std::fs::read_to_string(&record).expect("the record");
     assert!(text.starts_with("## an earlier section"), "{text}");
     assert_eq!(sections(&record), 4, "{text}");
+}
+
+/// A run that a time-out or a cancel cuts in the middle of a measurement keeps what that
+/// measurement had recorded: the exit trap appends it to the caller's directory.
+#[test]
+fn a_run_ended_by_a_signal_inside_a_measurement_keeps_what_the_measurement_recorded() {
+    let temporary = tempfile::tempdir().expect("a temporary folder");
+    let evidence = temporary.path().join("evidence");
+    std::fs::create_dir_all(&evidence).expect("the named directory");
+    let mut run = Held::start(temporary.path(), &evidence, 1);
+    run.wait_until_held();
+    run.end_by("TERM");
+    assert_eq!(
+        sections(&evidence.join("performance.md")),
+        1,
+        "the section that the first measurement recorded is in the caller's directory"
+    );
+}
+
+/// The record of a measurement that has ended stands in the caller's directory before the next
+/// measurement starts, so a run that is killed, which runs no trap, still has it.
+#[test]
+fn a_run_killed_inside_its_second_measurement_has_the_record_of_the_first() {
+    let temporary = tempfile::tempdir().expect("a temporary folder");
+    let evidence = temporary.path().join("evidence");
+    std::fs::create_dir_all(&evidence).expect("the named directory");
+    let mut run = Held::start(temporary.path(), &evidence, 2);
+    run.wait_until_held();
+    run.end_by("KILL");
+    assert_eq!(
+        sections(&evidence.join("performance.md")),
+        1,
+        "the section that the first measurement recorded is in the caller's directory, and the \
+         second measurement's, which was still in the run root, is not"
+    );
 }
