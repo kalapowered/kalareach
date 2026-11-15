@@ -5570,35 +5570,27 @@ async fn a_reconnect_opens_a_new_input_stream_and_replays_no_input() {
 
     // A client that replayed would send each command again exactly as it went, on a lane of this
     // connection for the old attachment, under the old connection's lease and the first sequence of
-    // it. Neither is carried on this connection. Only the host turning the frame away passes: its
-    // refusal, or its cut of the stream while the connection stands. A lane that does not open, or
-    // a frame that nothing answered within the bound, never put the old lease to a decision.
+    // it. Neither is carried on this connection, and the host turns it away in one of two ways,
+    // by the path that carries typing to the worker: on the worker's lane path the worker binds a
+    // lane only for an attachment that the connection's own link owns, so the host ends the stream
+    // before its first word; on the serial path the lane opens and the frame is turned away. Either
+    // passes, and the case prints which one answered. An open that ran out of time never put the
+    // old lease to a decision and fails the case. The history below holds on both paths: nothing
+    // the replay carried ran.
     for command in [MARKER_COMMAND, UNCERTAIN_COMMAND] {
-        let mut replayed = Typing::open(&session, environment_id, session_id, old_attachment)
-            .await
-            .unwrap_or_else(|why| {
-                panic!(
-                    "the lane for the old attachment did not open on the new connection, so the \
-                     replay of {command:?} was never put to a decision on the old lease: {why}"
-                )
-            });
-        let refused = replayed
-            .type_bytes(old.lease.epoch, command.as_bytes())
-            .await
-            .expect_err("the old connection's input stream is not carried across a reconnect");
-        println!("the replay of {command:?} was refused with: {refused}");
-        let decided = match &refused {
-            typing::NotTyped::Refused(error) => error.code != ErrorCode::OutcomeUnknown,
-            typing::NotTyped::LeaseEnded(_) => true,
-            // The host cut the stream while the connection stood, without accepting the frame: it
-            // does that for a worker's refusal that it cannot tell as one given before acceptance.
-            typing::NotTyped::Ended(kr_client::input::EndCause::Reset) => true,
-            _ => false,
-        };
-        assert!(
-            decided,
-            "the replay of {command:?} was not turned away on the old lease by the host: {refused}"
-        );
+        let turned_away = Typing::replay(
+            &session,
+            environment_id,
+            session_id,
+            old_attachment,
+            old.lease.epoch,
+            command.as_bytes(),
+        )
+        .await
+        .unwrap_or_else(|why| {
+            panic!("the replay of {command:?} was not turned away by the host: {why}")
+        });
+        println!("the replay of {command:?}: {turned_away}");
     }
 
     // A new attachment's lease is a new input stream, and it starts at sequence zero.
