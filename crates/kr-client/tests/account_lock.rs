@@ -363,6 +363,7 @@ async fn seed(directory: &Path, origin: &str) {
                 subject: "account-1".to_owned(),
             },
             "a-nonce",
+            || true,
         )
         .await
         .expect("a sign-in");

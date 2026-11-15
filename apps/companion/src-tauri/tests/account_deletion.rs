@@ -241,7 +241,7 @@ async fn rig_over(store: Arc<dyn SecretStore>, wire: Arc<Wire>) -> Rig {
         )
     }) {
         signed_in
-            .commit(issued("first"), "a-nonce")
+            .commit(issued("first"), "a-nonce", || true)
             .await
             .expect("the sign-in is kept");
     }

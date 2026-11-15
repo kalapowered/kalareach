@@ -651,7 +651,7 @@ impl HostAccount {
         let held = self.inner.held.as_ref().expect("a service to sign in at");
         let committed = held
             .signed_in
-            .commit(issued, "a-nonce")
+            .commit(issued, "a-nonce", || true)
             .await
             .expect("the grant is kept");
         assert_eq!(committed, Commit::Kept);
@@ -1358,21 +1358,19 @@ impl Inner {
                 };
                 // The sign-in waited for the person, up to the end of its time, and the authority
                 // it was started under can have ended in that wait: the fence this host owes and,
-                // on a host that is exclusively organisation-managed, the owner's lease. Where it
-                // no longer stands no grant is kept, and what the service issued is revoked, as a
-                // sign-out revokes it. The attempt holds the issue (the tokens the service gave
-                // for the spent code) and the account's gate here.
-                if lasting().is_err() {
-                    if let Err(error) = held.signed_in.revoke_unkept(refresh).await {
-                        eprintln!(
-                            "kr-controller: a sign-in's token was sent to the service, but the \
-                             store failed: {error}"
-                        );
-                    }
-                    return Outcome::AuthorityEnded;
-                }
-                match held.signed_in.keep(issued, grant.nonce()).await {
+                // on a host that is exclusively organisation-managed, the owner's lease. The grant
+                // is kept only where they still stand, asked under the account's hold immediately
+                // before it is written, because a token refresh in flight can keep that hold across
+                // its request to the service. Where they do not stand no grant is kept, and what
+                // the service issued is revoked, as a sign-out revokes it. The attempt holds the
+                // issue (the tokens the service gave for the spent code) and the account's gate.
+                match held
+                    .signed_in
+                    .keep(issued, grant.nonce(), || lasting().is_ok())
+                    .await
+                {
                     Ok(Commit::Kept) => {}
+                    Ok(Commit::Withheld) => return Outcome::AuthorityEnded,
                     Ok(Commit::Unsettled) => {
                         // The store reported a failure and then could not say which grant it
                         // held. No token was ended while the store may hold it, and the account
