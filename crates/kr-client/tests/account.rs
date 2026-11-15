@@ -2965,7 +2965,7 @@ async fn the_identity_read_after_a_sign_in_is_held_to_the_sign_ins_subject() {
         .expect("a sign-in");
     *stub.identity.lock().expect("the identity") = Some(Err(ErrorCode::UpstreamUnavailable));
     assert_eq!(
-        signed_in.complete_identity().await.expect("a read"),
+        signed_in.complete_identity(|| true).await.expect("a read"),
         IdentityRead::Unread
     );
     assert!(matches!(
@@ -2979,7 +2979,7 @@ async fn the_identity_read_after_a_sign_in_is_held_to_the_sign_ins_subject() {
         name: None,
     }));
     assert_eq!(
-        signed_in.complete_identity().await.expect("a read"),
+        signed_in.complete_identity(|| true).await.expect("a read"),
         IdentityRead::Read
     );
     assert!(matches!(
@@ -2993,7 +2993,7 @@ async fn the_identity_read_after_a_sign_in_is_held_to_the_sign_ins_subject() {
         name: None,
     }));
     assert_eq!(
-        signed_in.complete_identity().await.expect("a read"),
+        signed_in.complete_identity(|| true).await.expect("a read"),
         IdentityRead::Disagreed
     );
     assert_eq!(
@@ -3001,6 +3001,72 @@ async fn the_identity_read_after_a_sign_in_is_held_to_the_sign_ins_subject() {
         AccountStatus::SignedOut
     );
     assert_eq!(stub.revoked(), ["grant"]);
+}
+
+/// The address and name are written under the caller's standing, asked after the service has
+/// answered and the grant is read, immediately before the write: where the authority ended while the
+/// service took its time, nothing is written and the read is left as one that could not be made,
+/// the grant the sign-in kept stays. The control: where the standing holds, the same read keeps
+/// the address.
+#[tokio::test]
+async fn an_identity_read_whose_standing_ended_while_the_service_answered_writes_nothing() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::holding_identity());
+    *stub.identity.lock().expect("the identity") = Some(Ok(AccountIdentity {
+        subject: "account-1".to_owned(),
+        email: Some("sam@example.com".to_owned()),
+        name: Some("Sam".to_owned()),
+    }));
+    let store = Arc::new(MemoryStore::new());
+    let signed_in = account(&stub, &store);
+    signed_in
+        .commit(
+            issued_for("account-1", "grant-a", &["openid"]),
+            "a-nonce",
+            || true,
+        )
+        .await
+        .expect("the sign-in");
+
+    for standing_holds in [false, true] {
+        let standing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let reads_before = stub.identity_reads.load(Ordering::SeqCst);
+        let reading = {
+            let signed_in = Arc::clone(&signed_in);
+            let standing = Arc::clone(&standing);
+            tokio::spawn(async move {
+                signed_in
+                    .complete_identity(|| standing.load(Ordering::SeqCst))
+                    .await
+            })
+        };
+        while stub.identity_reads.load(Ordering::SeqCst) == reads_before {
+            tokio::task::yield_now().await;
+        }
+        standing.store(standing_holds, Ordering::SeqCst);
+        stub.identity_held
+            .as_ref()
+            .expect("a held read")
+            .add_permits(1);
+        let read = reading.await.expect("the read runs").expect("a read");
+        if standing_holds {
+            assert_eq!(read, IdentityRead::Read, "the control");
+            assert!(matches!(
+                signed_in.status().expect("a status"),
+                AccountStatus::SignedIn { email: Some(ref email), .. } if email == "sam@example.com"
+            ));
+        } else {
+            assert_eq!(read, IdentityRead::Unread);
+            assert!(
+                matches!(
+                    signed_in.status().expect("a status"),
+                    AccountStatus::SignedIn { email: None, .. }
+                ),
+                "the grant stays and no address was written"
+            );
+        }
+    }
 }
 
 /// An identity read that disagrees ends only the grant it was read for: a sign-in that replaced
@@ -3028,7 +3094,7 @@ async fn a_disagreeing_identity_ends_only_the_grant_it_was_read_for() {
 
     let reading = {
         let signed_in = Arc::clone(&signed_in);
-        tokio::spawn(async move { signed_in.complete_identity().await })
+        tokio::spawn(async move { signed_in.complete_identity(|| true).await })
     };
     while stub.identity_reads.load(Ordering::SeqCst) == 0 {
         tokio::task::yield_now().await;

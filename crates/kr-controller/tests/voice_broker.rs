@@ -1778,6 +1778,59 @@ async fn a_sign_out_that_meets_a_fence_before_it_removes_the_grant_removes_nothi
     host.stop().await;
 }
 
+/// KR-REQ-09.09: a sign-in is shown as waiting for the browser under the lock that shows it, and its
+/// admission is asked again under that lock, immediately before. A fence this host comes to owe
+/// after the sign-in's last early ask stops it: the sign-in is refused and the account is not shown
+/// as waiting. The control: with no fence the same sign-in waits for the browser.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_that_meets_a_fence_before_it_is_shown_as_waiting_is_not_shown_as_waiting() {
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+    for owed in [false, true] {
+        let broker = Broker::start().await;
+        let owner = DeviceKeys::generate().expect("owner keys");
+        let host =
+            net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+        listen_for_sign_ins(&host);
+        let account = host.controller().host_account();
+        let (arrived, go) = account.pause_before_it_is_shown_as_waiting();
+        let (answered, ()) = tokio::join!(
+            sign_in_as(&host, ActionId::new(kr_ipc::new_uuid())),
+            async {
+                tokio::time::timeout(WAIT, arrived)
+                    .await
+                    .expect("the sign-in reaches the place it is shown as waiting")
+                    .expect("the pause is armed");
+                host.controller().hold_fence(owed);
+                go.send(()).expect("the sign-in goes on");
+            }
+        );
+        host.controller().hold_fence(false);
+        if owed {
+            let refused = answered.expect_err("a sign-in under a fence this host owes is refused");
+            assert_eq!(
+                refused.code,
+                kr_protocol::error::ErrorCode::PermissionDenied,
+                "{refused:?}"
+            );
+            assert_eq!(
+                account_report(&host).await.state,
+                AccountState::SignedOut,
+                "the account is not shown as waiting"
+            );
+        } else {
+            answered.expect("the control starts");
+            assert!(
+                matches!(
+                    account_report(&host).await.state,
+                    AccountState::WaitingForBrowser { .. }
+                ),
+                "the control waits for the browser"
+            );
+        }
+        host.stop().await;
+    }
+}
+
 /// What a refusal says beside its own words when the request had already ended the sign-in that
 /// was waiting for the browser.
 const EARLIER_SIGN_IN_CANCELLED: &str = "The sign-in that was waiting for the browser was cancelled \

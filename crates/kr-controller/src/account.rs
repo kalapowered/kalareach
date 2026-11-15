@@ -307,6 +307,11 @@ struct Accounts {
     /// shipped build.
     #[cfg(feature = "testing")]
     before_it_asks_whether_it_stands: crate::service::ReadPause,
+    /// Where this host's own tests stop a sign-in after its last early ask and before it takes the
+    /// lock under which it is shown as waiting, so that the authority can change in between.
+    /// Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    before_it_is_shown_as_waiting: crate::service::ReadPause,
 }
 
 /// Whether the request that asked for a change of the account still stands: the check every
@@ -426,6 +431,8 @@ impl HostAccount {
             storage_origin: std::sync::OnceLock::new(),
             #[cfg(feature = "testing")]
             before_it_asks_whether_it_stands: crate::service::ReadPause::default(),
+            #[cfg(feature = "testing")]
+            before_it_is_shown_as_waiting: crate::service::ReadPause::default(),
         });
         Self::build(store, environment_id, service, refused, accounts, None)
     }
@@ -836,12 +843,26 @@ impl HostAccount {
         self.inner.accounts.before_it_asks_whether_it_stands.arm()
     }
 
+    /// Arms the pause the next sign-in stops at after its last early ask, before it takes the lock
+    /// under which it is shown as waiting. Returns the end that says the sign-in has arrived, and the
+    /// end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_it_is_shown_as_waiting(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.inner.accounts.before_it_is_shown_as_waiting.arm()
+    }
+
     /// Starts a sign-in: ends the one that is waiting, whichever account it is of, listens for the
     /// browser's answer and returns when the daemon is ready for it. The address the person opens is in
     /// [`Self::report`].
     ///
-    /// `stands` is asked before the waiting sign-in is ended and again before this one is shown as
-    /// waiting, because the waits between them can outlast the request's authority. A refusal after
+    /// `stands` is asked before the waiting sign-in is ended and again, under the lock this one is
+    /// shown as waiting under and immediately before it is shown, because the waits between them can
+    /// outlast the request's authority. A refusal after
     /// the waiting sign-in was ended says so (the words of `EARLIER_SIGN_IN_CANCELLED`).
     ///
     /// # Errors
@@ -899,6 +920,12 @@ impl HostAccount {
                 }
             };
             self.still_stands(stands).await?;
+            #[cfg(feature = "testing")]
+            self.inner
+                .accounts
+                .before_it_is_shown_as_waiting
+                .wait()
+                .await;
             let request = AuthorisationRequest::asking_at_origin(
                 &held.origin,
                 Client::Desktop,
@@ -911,11 +938,19 @@ impl HostAccount {
             let expires_at_ms = kr_ipc::now_ms()
                 .get()
                 .saturating_add(u64::try_from(WAIT.as_millis()).unwrap_or(u64::MAX));
-            self.inner.state.lock().expect("the sign-in state").phase = Phase::Waiting {
-                url,
-                address: listener.local_address().to_string(),
-                expires_at_ms,
-            };
+            let address = listener.local_address().to_string();
+            {
+                // Asked again under the lock the sign-in is shown as waiting under, immediately
+                // before it is shown: the earlier ask came before the lock, and the host's
+                // authority can end in the wait for it.
+                let mut state = self.inner.state.lock().expect("the sign-in state");
+                stands()?;
+                state.phase = Phase::Waiting {
+                    url,
+                    address,
+                    expires_at_ms,
+                };
+            }
             let (cancel, cancelled) = watch::channel(false);
             let inner = Arc::clone(&self.inner);
             let task = tokio::spawn(async move {
@@ -1415,7 +1450,9 @@ impl Inner {
                         return Outcome::Attempt(AccountAttempt::NotKept);
                     }
                 }
-                if let Ok(IdentityRead::Disagreed) = held.signed_in.complete_identity().await {
+                if let Ok(IdentityRead::Disagreed) =
+                    held.signed_in.complete_identity(|| lasting().is_ok()).await
+                {
                     return Outcome::Attempt(AccountAttempt::NotForThisAttempt);
                 }
                 Outcome::Attempt(AccountAttempt::SignedIn)
