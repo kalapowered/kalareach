@@ -37,6 +37,7 @@ use kr_protocol::root::{EditorBufferRevision, LaunchCommand, PromptGeneration, S
 use kr_protocol::scalars::{Bytes, Nullable, U64};
 use kr_protocol::session::Dimensions;
 use kr_transport::streams::DataStream;
+use kr_worker::input_domain::InputShared;
 
 use net_support::lane::ScriptedLane;
 use net_support::worker::{Adopted, Worker};
@@ -85,7 +86,11 @@ impl Rig {
 
     /// A rig whose lane begins with `frames` queue entries and `bytes` of credit.
     async fn start_with_credit(frames: u32, bytes: u64) -> Self {
-        let adopted = Adopted::start(1).await;
+        Self::start_on(Adopted::start(1).await, frames, bytes).await
+    }
+
+    /// A rig on `adopted`, whose lane begins with `frames` queue entries and `bytes` of credit.
+    async fn start_on(adopted: Adopted, frames: u32, bytes: u64) -> Self {
         let device = Device::create().await;
         let record = pair_with(
             &adopted.host,
@@ -3354,6 +3359,132 @@ impl Rig {
         rig.adopted.host.network().use_no_input_lane();
         rig
     }
+}
+
+impl Rig {
+    /// A rig whose typing the host carries on the real worker's own lane. The scripted lane that
+    /// the rig begins with stands idle: the host is not pointed at it, so it reads the worker's
+    /// answer to the hello and binds a lane on the worker when the worker states one.
+    async fn start_on_the_workers_lane() -> Self {
+        let rig = Self::start().await;
+        rig.adopted.host.network().use_no_input_lane();
+        rig
+    }
+
+    /// A rig whose real worker states no input lane: it leaves the capability out of its answer to
+    /// the hello, as a worker of an earlier release does, before any device connects.
+    async fn start_withholding_the_lane() -> Self {
+        let adopted = Adopted::start(1).await;
+        adopted.workers[0]
+            .service
+            .withhold_capability(kr_protocol::local::INPUT_LANE);
+        let rig = Self::start_on(adopted, 64, 512 * 1024).await;
+        rig.adopted.host.network().use_no_input_lane();
+        rig
+    }
+
+    /// The real worker's input domain, which a case reads the bound lanes and the terminal's
+    /// writes from.
+    fn worker_input(&self) -> Arc<InputShared> {
+        Arc::clone(self.adopted.workers[0].runtime().input())
+    }
+}
+
+/// Ends the device's side of the stream and waits until the host has dropped it, so that the host
+/// holds no record of it.
+async fn end_the_stream(rig: &Rig, stream: DataStream) {
+    let mut ended = rig.adopted.host.network().input_tasks_ended();
+    let (mut reader, writer) = stream.split();
+    drop(writer);
+    while let Some(_ack) = tokio::time::timeout(WAIT, reader.read_message::<InputAck>())
+        .await
+        .expect("the stream ends in time")
+        .expect("the stream is not reset")
+    {}
+    tokio::time::timeout(WAIT, ended.changed())
+        .await
+        .expect("the stream task ends")
+        .expect("the count stands");
+}
+
+/// What the worker's terminal took of a lease's typing, in the order it took it.
+fn typed_at_the_terminal(input: &InputShared) -> Vec<u8> {
+    input
+        .terminal_writes()
+        .into_iter()
+        .filter(|write| write.of_a_lease)
+        .flat_map(|write| write.bytes)
+        .collect()
+}
+
+/// A worker that states the input lane in its own answer to the hello is served on that lane: the
+/// host binds a lane on the worker, the typing reaches the worker's terminal in order, the
+/// acknowledgements come back through the host, and a release is sent the position it names and
+/// is asked for the count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_that_states_the_lane_is_served_on_its_lane() {
+    let rig = Rig::start_on_the_workers_lane().await;
+    let mut stream = rig.open().await;
+    for (sequence, key) in [b"a", b"b", b"c"].into_iter().enumerate() {
+        type_and_wait(&rig, &mut stream, sequence as u64, key).await;
+    }
+    let input = rig.worker_input();
+    let lanes = input.lock().lane_count();
+    assert_eq!(lanes, 1, "the host bound a lane on the worker");
+    until("the worker's terminal took the three keys", || {
+        typed_at_the_terminal(&input) == b"abc"
+    })
+    .await;
+    // The host has no record of a stream that has ended, so it judges no position and forwards the
+    // request whole: the position reaches the worker, which refuses what has not all arrived.
+    end_the_stream(&rig, stream).await;
+    let beyond = send_after(&rig, Dependent::Release, rig.epoch, 4).await;
+    assert!(!beyond.refused_here, "the host has nothing to judge by");
+    assert_eq!(
+        beyond.answer.expect_err("the worker refuses").code,
+        ErrorCode::DraftConflict
+    );
+    // The count is asked for: the answer to a release that is taken carries it.
+    let release = send_after(&rig, Dependent::Release, rig.epoch, 3).await;
+    let released: InputLeaseResult = release
+        .answer
+        .expect("the release is taken")
+        .to_typed()
+        .expect("a lease result");
+    assert_eq!(released.fenced_bytes, Some(U64::new(0)));
+    rig.stop().await;
+}
+
+/// A worker that does not state the input lane is served by the host one call at a time over its
+/// link: no lane is bound on the worker, the typing still reaches its terminal in order and is
+/// acknowledged, and what only a lane reads is taken out of a release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_that_does_not_state_the_lane_is_served_by_the_adapter() {
+    let rig = Rig::start_withholding_the_lane().await;
+    let mut stream = rig.open().await;
+    for (sequence, key) in [b"a", b"b", b"c"].into_iter().enumerate() {
+        type_and_wait(&rig, &mut stream, sequence as u64, key).await;
+    }
+    let input = rig.worker_input();
+    let lanes = input.lock().lane_count();
+    assert_eq!(lanes, 0, "no lane was bound on the worker");
+    until("the worker's terminal took the three keys", || {
+        typed_at_the_terminal(&input) == b"abc"
+    })
+    .await;
+    // The position is taken out, so the worker is never told it: the release that the lane's worker
+    // refuses for the typing that has not all arrived is taken.
+    end_the_stream(&rig, stream).await;
+    let beyond = send_after(&rig, Dependent::Release, rig.epoch, 4).await;
+    assert!(!beyond.refused_here, "the host has nothing to judge by");
+    // The count is not asked for either, so the release carries none.
+    let released: InputLeaseResult = beyond
+        .answer
+        .expect("the release is taken")
+        .to_typed()
+        .expect("a lease result");
+    assert_eq!(released.fenced_bytes, None);
+    rig.stop().await;
 }
 
 /// The calls a stand-in for the worker was given, in the order it was given them, and the most it

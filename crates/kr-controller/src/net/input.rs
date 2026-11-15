@@ -70,9 +70,6 @@ use stages::Tally;
 #[cfg(feature = "testing")]
 pub use stages::{InputStageCounts, InputStages, SerialAnswer};
 
-/// What a worker states when it serves typing on a lane of its own.
-pub(crate) const INPUT_LANE_CAPABILITY: &str = "input_lane";
-
 /// How many frames the device may have written and not had accepted.
 const CLIENT_WINDOW_FRAMES: u32 = 32;
 
@@ -275,7 +272,7 @@ impl InputStreams {
     }
 
     /// Whether the worker behind `proxy` serves typing on a lane of its own, which it says by
-    /// stating [`INPUT_LANE_CAPABILITY`]. This is the one choice between the lane and the serial
+    /// stating [`kr_protocol::local::INPUT_LANE`]. This is the one choice between the lane and the serial
     /// adapter ([`serial`]), and between giving a release, a detach or a launch the members that
     /// only such a worker reads and taking them out ([`barrier::params_for_worker`]). A worker is
     /// told apart by what it states and never by its level.
@@ -284,7 +281,7 @@ impl InputStreams {
         if self.scripted_lane().is_some() {
             return true;
         }
-        proxy.states(INPUT_LANE_CAPABILITY)
+        proxy.states(kr_protocol::local::INPUT_LANE)
     }
 
     fn live(&self) -> MutexGuard<'_, BTreeMap<Key, Arc<Live>>> {

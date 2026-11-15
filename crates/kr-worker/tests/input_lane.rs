@@ -3240,7 +3240,7 @@ async fn the_worker_states_the_input_lane() {
         link.acknowledgement()
             .capabilities
             .iter()
-            .any(|capability| capability.as_str() == "input.lane/1"),
+            .any(|capability| capability.as_str() == kr_protocol::local::INPUT_LANE),
         "the worker does not state the input lane"
     );
     rig.finish().await;
