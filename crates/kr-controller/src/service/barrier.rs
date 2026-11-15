@@ -1584,29 +1584,23 @@ impl Controller {
         }
     }
 
-    /// Whether the withdrawal `withdrew` proves still stands at this moment: the revision in force
-    /// is the one it set, so no later barrier has moved it, and no fence is owed. Both are read
-    /// under the registry's lock, which a restriction holds from the writing of its debt to the
-    /// publication of it, so a debt published while this waited for the lock is seen, and one
-    /// published after it is another request's. An unreadable registry counts as moved.
+    /// Whether the withdrawal `withdrew` proves still stands at this moment: no fence is owed and
+    /// the revision in force is the one it set, so no later barrier has moved it. Both are read
+    /// from memory, the flag first and the revision after it ([`super::footing::Footing::ask`]),
+    /// so a barrier that has retired its debts is seen to have raised the revision.
+    ///
+    /// The registry's lock is not taken: it did not order this read against the request's own
+    /// restriction, since a grant's revocation lets go of the registry before it publishes its
+    /// debts ([`Controller::revoke_grant`]), and what that publication adds is read through the
+    /// flag. The function is async so that its callers keep their form; it awaits nothing.
     ///
     /// # Errors
     ///
     /// Returns the fence's refusal while a fence is owed, and a refusal that the authority has
     /// withdrawn when a later barrier moved the revision.
     pub(crate) async fn withdrawal_stands(&self, withdrew: &HostWithdrawal) -> Result<()> {
-        let registry = self.registry.lock().await;
-        let in_force = registry.authority_revision();
-        self.check_fence()?;
-        if in_force.is_ok_and(|revision| revision == withdrew.revision) {
-            Ok(())
-        } else {
-            Err(ControllerError::PermissionDenied {
-                detail: "the authority this connection was admitted under has been withdrawn; \
-                         open a new connection"
-                    .to_owned(),
-            })
-        }
+        super::footing::Footing::untargeted(Arc::clone(&self.copies))
+            .stands(super::footing::Ask::own_withdrawal(withdrew.revision))
     }
 
     /// The published debts one barrier takes: the ones `first` names, then the rest while what they
