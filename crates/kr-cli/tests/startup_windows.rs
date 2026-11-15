@@ -1808,3 +1808,146 @@ fn clearing_the_start_leaves_a_worker_the_environments_task_started_running() {
         logon.as_str()
     );
 }
+
+/// A daemon of this test's own that answers the hello and `host.info` of one connection, closes it
+/// and ends, as a daemon whose stop has taken effect does. The pipe's instance for that connection
+/// outlives it for as long as the command holds its end.
+struct DaemonThatEnds {
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DaemonThatEnds {
+    fn serve(host: &Host) -> Self {
+        use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Response};
+        use kr_protocol::ids::{BuildId, ControllerGeneration};
+        use kr_protocol::method::Method;
+        use kr_protocol::scalars::CanonicalSet;
+
+        let environment = host.environment();
+        let environment_id = environment.environment_id();
+        let endpoint = environment.controller_endpoint().expect("an endpoint");
+        let build = "kr-controller/9.9.9";
+        let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+        let boot_epoch = kr_ipc::identity::boot_epoch(&boot).expect("a boot epoch");
+        let info = kr_protocol::hostinfo::HostInfoResult {
+            build_id: BuildId::new(build).expect("a build identifier"),
+            protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+            environment_id,
+            generation: ControllerGeneration::new(1),
+            boot_identity: boot.clone(),
+            started_at_ms: kr_protocol::scalars::TimestampMs::new(1_700_000_000_000),
+            live_sessions: kr_protocol::scalars::U64::new(0),
+            session_limit: kr_protocol::scalars::U64::new(8),
+            default_worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+            power: kr_protocol::desktop::SleepInhibitionState::off(
+                kr_protocol::desktop::InhibitionMechanism::None,
+                kr_protocol::desktop::PowerSource::Unknown,
+            ),
+            machine: None,
+            privacy: None,
+            default_shell_mode: None,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        // Bound before this returns, so that the endpoint exists when the test starts the command.
+        let listener = {
+            let _inside = runtime.enter();
+            kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint")
+        };
+        let thread = std::thread::spawn(move || {
+            runtime.block_on(async move {
+                let accepted =
+                    tokio::time::timeout(Duration::from_secs(60), listener.accept()).await;
+                let Ok(Ok((connection, peer))) = accepted else {
+                    return;
+                };
+                let (mut reader, mut writer) =
+                    kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+                let connection_id = kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid());
+                while let Ok(frame) = reader.read_message::<ControlFrame>().await {
+                    let (answer, last) = match frame {
+                        ControlFrame::Hello(_) => (
+                            ControlFrame::HelloAck(Box::new(kr_protocol::local::LocalHelloAck {
+                                selected_version: kr_protocol::hello::PROTOCOL_VERSION,
+                                role: kr_protocol::local::LocalRole::Controller,
+                                connection_id,
+                                environment_id,
+                                boot_identity: boot.clone(),
+                                peer: peer.to_wire(),
+                                action_window: kr_protocol::hello::ActionWindow {
+                                    action_window_id: kr_protocol::ids::ActionWindowId::new(
+                                        "test-daemon",
+                                    )
+                                    .expect("a window identifier"),
+                                    connection_id,
+                                    boot_epoch,
+                                    issued_at_ms: kr_protocol::scalars::TimestampMs::new(0),
+                                    valid_for_ms: kr_protocol::scalars::DurationMs::new(600_000),
+                                },
+                                capabilities: CanonicalSet::new(),
+                                max_receive: kr_protocol::hello::ReceiveLimits::default(),
+                                build: Some(kr_protocol::local::LocalBuild {
+                                    build_id: BuildId::new(build).expect("a build"),
+                                    protocol_version: kr_protocol::hello::PACKAGE_VERSION,
+                                }),
+                            })),
+                            false,
+                        ),
+                        ControlFrame::Request(request)
+                            if request.method.method() == Some(Method::HostInfo) =>
+                        {
+                            (
+                                ControlFrame::Response(Response {
+                                    request_id: request.request_id,
+                                    outcome: Outcome::Ok(
+                                        ParamsValue::from_typed(&info).expect("encodes"),
+                                    ),
+                                }),
+                                true,
+                            )
+                        }
+                        _ => continue,
+                    };
+                    if writer.write_message(&answer).await.is_err() || last {
+                        break;
+                    }
+                }
+                // The daemon ends: its end of the connection and its listener go with it.
+                drop(reader);
+                drop(writer);
+                drop(listener);
+            });
+        });
+        Self {
+            thread: Some(thread),
+        }
+    }
+
+    fn finish(mut self) {
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// KR-REQ-07.12 (a request that could not be made): a daemon that answers `host.info`, closes the
+/// connection and ends is seen to end by `kr host stop`, which lets go of its own end of the
+/// connection before it looks for the end. Where it kept the connection, the pipe's instance for
+/// it would stay for as long as the command held it, every new connection would meet a busy pipe,
+/// and the command could not see the daemon go.
+#[test]
+fn kr_host_stop_sees_a_daemon_end_that_closed_the_connection_the_command_held() {
+    let host = Host::create();
+    let daemon = DaemonThatEnds::serve(&host);
+    let output = host.kr(&["--json", "host", "stop"]);
+    daemon.finish();
+    let said = document(&output, "kr host stop");
+    assert!(
+        output.status.success(),
+        "{said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(said["stop"], "ended", "{said}");
+}
