@@ -2754,9 +2754,10 @@ impl DispatchHold {
 /// application asks next comes after the end of the paste and not inside it.
 ///
 /// The service ends the epoch of a dropped batch from a task of its own, and an epoch's end moves
-/// the fence, which also makes the writer end a paste. That task is held until the answer has
-/// been checked, so the end of the paste that the answer follows can only be the writer's own, at
-/// the drop. The epoch's end then comes, and the next acquire says that a paste was closed.
+/// the fence, which also makes the writer end a paste. That task is held from before the frames
+/// are sent until the answer has been checked, so the end of the paste that the answer follows
+/// can only be the writer's own, at the drop, whatever the order of threads. The epoch's end then
+/// comes, and the next acquire says that a paste was closed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_writer_ends_the_paste_it_abandons_part_way_before_a_reply_is_written() {
     const BODY: usize = 60_000;
@@ -2767,6 +2768,10 @@ async fn the_writer_ends_the_paste_it_abandons_part_way_before_a_reply_is_writte
     let epoch = rig.acquire(attachment).await;
     let mut lane = rig.lane(attachment).await;
 
+    // The boundary is held before the deadline is set and before either frame is sent, so that no
+    // order of threads lets the service end the epoch before it stands. The lane's input path
+    // does not pass the boundary.
+    let boundary = DispatchHold::take(&rig.service);
     let deadline = kr_ipc::clock::boot_elapsed_ms() + 5_000;
     let mut opening = b"\x1b[200~".to_vec();
     opening.extend_from_slice(&[b'q'; BODY]);
@@ -2775,7 +2780,6 @@ async fn the_writer_ends_the_paste_it_abandons_part_way_before_a_reply_is_writte
     // The frame that closes the paste is accepted too, and the writer will not write it.
     lane.send(b"\x1b[201~").await;
     lane.accepted().await;
-    let boundary = DispatchHold::take(&rig.service);
     until("the opening frame's authority ended", WAIT, || {
         kr_ipc::clock::boot_elapsed_ms() >= deadline
     })
