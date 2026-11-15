@@ -328,7 +328,7 @@ fn interrupted(progress: &Progress, stage: Stage, json: bool) -> Completion {
             shown!(
                 "The control daemon for environment {} was told to stop and may still be ending. \
                  kr host stop was interrupted before it saw the end. No session stops. Run kr host \
-                 stop to wait for it.",
+                 stop again to see.",
                 id
             ),
         ),
@@ -390,13 +390,16 @@ fn failed(error: CliError, result: &Facts, json: bool) -> Completion {
     Completion::Reported(error)
 }
 
-/// Reports a result that is a success.
-fn done(said: &Shown, result: &Facts, json: bool) -> Completion {
+/// Reports a result that is a success, and then removes the records of earlier attempts that the
+/// report has put out. This is the one place that removes them: a result that is not this command's
+/// own, seen and written, removes nothing.
+fn done(said: &Shown, result: &Facts, json: bool, earlier: &Earlier) -> Completion {
     if json {
         output::document(&result.document().with("ok", true));
     } else {
         output::say(said);
     }
+    earlier.remove_those_put_out(json);
     Completion::Done
 }
 
@@ -418,18 +421,17 @@ async fn stop(
     {
         return Ok(failed(error, &none, json));
     }
-    // What earlier attempts recorded and whose process has gone is said at the start, and removed
-    // once this command has seen its own result.
-    let earlier = Earlier::read(&environment.paths);
+    // What earlier attempts recorded and whose process has gone is said at the start (in the
+    // document under `--json`), and removed only by `done`, after the result that put it out has
+    // been written.
+    let mut earlier = Earlier::read(&environment.paths);
     let none = Facts::none(earlier.said(id));
     *progress
         .earlier
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = none.records.clone();
     if !json {
-        for said in &none.records {
-            report::say(said);
-        }
+        earlier.say(id);
     }
     let endpoint = environment.paths.controller_endpoint()?;
     match startup::reach(&endpoint, startup::ANSWER_BOUND, &[]).await {
@@ -467,6 +469,9 @@ async fn stop(
 /// What earlier attempts recorded whose process is no longer the one that recorded it.
 struct Earlier {
     records: Vec<attempt::Recorded>,
+    /// Whether the lines that say them were written on standard error at the start, which is where
+    /// they go without `--json`.
+    written: bool,
 }
 
 impl Earlier {
@@ -476,7 +481,17 @@ impl Earlier {
                 .into_iter()
                 .filter(|recorded| recorded.standing() != Standing::UnderWay)
                 .collect(),
+            written: false,
         }
+    }
+
+    /// Says each record on standard error, and keeps whether every line was written. A line that
+    /// standard error refused ends the saying: it refuses every later line too.
+    fn say(&mut self, id: EnvironmentId) {
+        self.written = self
+            .records
+            .iter()
+            .all(|recorded| report::shown_before_going_on(&record_said(recorded, id)));
     }
 
     fn said(&self, id: EnvironmentId) -> Vec<Shown> {
@@ -486,8 +501,18 @@ impl Earlier {
             .collect()
     }
 
-    /// Removes what was said, now that this command has ended with its own result seen.
-    fn remove(&self) {
+    /// Removes what was put out, now that this command's own result has been written. Under
+    /// `--json` the records are in that document; otherwise they were said at the start. A record
+    /// that was not put out stays for the next command to say.
+    fn remove_those_put_out(&self, json: bool) {
+        let put_out = if json {
+            output::unwritten_output().is_none()
+        } else {
+            self.written
+        };
+        if !put_out {
+            return;
+        }
         for recorded in &self.records {
             if recorded.standing() == Standing::Gone {
                 recorded.remove();
@@ -507,7 +532,7 @@ fn record_said(recorded: &attempt::Recorded, id: EnvironmentId) -> Shown {
     };
     if recorded.standing() == Standing::UnderWay {
         return shown!(
-            "A {} is under way for environment {} (process {}, since {}); wait for it.",
+            "A {} is under way for environment {} (process {}, last recorded at {}); wait for it.",
             command,
             id,
             process,
@@ -562,7 +587,6 @@ fn vacant(
     let id = environment.environment_id;
     match lock_held(&environment.paths) {
         Ok(false) => {
-            earlier.remove();
             let under_way: Vec<Shown> = attempt::recorded(&environment.paths)
                 .iter()
                 .filter(|recorded| recorded.standing() == Standing::UnderWay)
@@ -581,6 +605,7 @@ fn vacant(
                 ),
                 none,
                 json,
+                earlier,
             )
         }
         Ok(true) => holds_and_is_silent(environment, none, json),
@@ -621,19 +646,7 @@ fn silent(environment: &KnownEnvironment, none: &Facts, json: bool, bound: Durat
 /// A daemon holds the environment and does not answer, so it may be starting or stopping.
 fn holds_and_is_silent(environment: &KnownEnvironment, none: &Facts, json: bool) -> Completion {
     let id = environment.environment_id;
-    let ending = match named_daemon(&environment.paths) {
-        Some(pid) => shown!(
-            "If it stays like this, process {} is the daemon and {} {} ends it.",
-            pid,
-            handover::STOP_COMMAND,
-            pid
-        ),
-        None if cfg!(windows) => Shown::said(
-            "If it stays like this, end the kr-controller.exe process of this installation in \
-             Task Manager.",
-        ),
-        None => Shown::said("If it stays like this, end the process that holds the lock file."),
-    };
+    let ending = how_to_end_the_holder(&environment.paths);
     failed(
         CliError::Unfinished {
             code: ErrorCode::EnvironmentUnavailable,
@@ -647,6 +660,24 @@ fn holds_and_is_silent(environment: &KnownEnvironment, none: &Facts, json: bool)
         none,
         json,
     )
+}
+
+/// What a person does if the process that holds the environment stays: the process the lock file
+/// names where it is a process named kr-controller, and otherwise the way to find it.
+fn how_to_end_the_holder(environment: &EnvironmentPaths) -> Shown {
+    match named_daemon(environment) {
+        Some(pid) => shown!(
+            "If it stays like this, process {} is the daemon and {} {} ends it.",
+            pid,
+            handover::STOP_COMMAND,
+            pid
+        ),
+        None if cfg!(windows) => Shown::said(
+            "If it stays like this, end the kr-controller.exe process of this installation in \
+             Task Manager.",
+        ),
+        None => Shown::said("If it stays like this, end the process that holds the lock file."),
+    }
 }
 
 /// The process the lock file names, with its start identity, read now: the holder of the
@@ -678,7 +709,9 @@ fn named_daemon(environment: &EnvironmentPaths) -> Option<u64> {
 }
 
 /// Whether a daemon holds the environment's lock, which the kernel gives up only when its process
-/// has gone. A daemon that is starting holds the install lock, shared, and is waited for there.
+/// has gone. The look takes the lock for a moment, so a daemon that starts during it can find the
+/// lock taken and exit; only [`Installation::held`] in a store keeps a start out of that moment,
+/// by the install lock that a daemon's start holds.
 fn lock_held(environment: &EnvironmentPaths) -> std::result::Result<bool, Shown> {
     let lock = environment.singleton_lock();
     // An environment whose state directory is not there has never had a daemon.
@@ -794,9 +827,16 @@ async fn stop_the_daemon(
 ) -> Completion {
     let id = environment.environment_id;
     let none = Facts::none(earlier.said(id));
-    let info = match host_info(&mut client, &environment.paths).await {
-        Ok(info) => info,
-        Err(error) => return failed(error, &none, json),
+    // A daemon that answered the hello and does not answer this is a holder that is silent.
+    let info = match tokio::time::timeout(
+        startup::ANSWER_BOUND,
+        host_info(&mut client, &environment.paths),
+    )
+    .await
+    {
+        Ok(Ok(info)) => info,
+        Ok(Err(error)) => return failed(error, &none, json),
+        Err(_) => return silent(environment, &none, json, startup::ANSWER_BOUND),
     };
     // Who holds the environment, and which process that is, before anything is asked: a process
     // that has ended and not been collected is read as gone, and its number may be reused.
@@ -850,12 +890,14 @@ async fn stop_the_daemon(
     }
     drop(client);
 
-    let answered = pid;
     // The process that is waited for by its start identity is the one that answered: a lock file
-    // that names another says nothing about this daemon.
+    // that names another says nothing about this daemon. Where there is none, the wait is for the
+    // lock and the endpoint, and no text names a process.
     let old = holder
         .as_ref()
-        .filter(|holder| answered.is_none_or(|answered| answered == holder.pid.get()));
+        .filter(|holder| pid.is_none_or(|answered| answered == holder.pid.get()));
+    let named = old.map(|old| old.pid.get());
+    // For `--json`: the process the answer gave, and otherwise the one the lock file named.
     let pid = pid.or_else(|| holder.as_ref().map(|holder| holder.pid.get()));
     let ended = wait_for_the_end(host, &environment.paths, info.generation, old, END_BOUND).await;
     let result = |knows| Facts {
@@ -867,17 +909,16 @@ async fn stop_the_daemon(
     match ended {
         End::Gone => {
             progress.remove_marker();
-            earlier.remove();
             let cut = match unsettled {
                 Some(count) if count > 0 => shown!(
-                    " {} session creates were still under way after {} seconds and were cut; the \
-                     next daemon resolves them as it does after a crash.",
+                    " {} session creates were still under way after {} seconds, when the daemon \
+                     went on with its stop. Each of them finished or ended with the daemon.",
                     count,
                     STOP_SETTLE_MS / 1000
                 ),
                 _ => Shown::said(""),
             };
-            let process = pid.map_or_else(|| Shown::said(""), |pid| shown!(" (process {})", pid));
+            let process = named.map_or_else(|| Shown::said(""), |pid| shown!(" (process {})", pid));
             done(
                 &shown!(
                     "Stopped the control daemon for environment {}{}. No session was stopped: its \
@@ -889,43 +930,50 @@ async fn stop_the_daemon(
                 ),
                 &result(Knows::Ended),
                 json,
+                earlier,
             )
         }
         End::Successor(successor) => {
             progress.remove_marker();
-            earlier.remove();
-            let old = pid.map_or_else(
-                || Shown::said("the control daemon"),
-                |pid| shown!("process {}", pid),
+            let old = named.map_or_else(
+                || Shown::said("The control daemon"),
+                |pid| shown!("The control daemon (process {})", pid),
             );
             let now = successor.map_or_else(
-                || Shown::said("a control daemon"),
+                || Shown::said("another control daemon"),
                 |pid| shown!("process {}", pid),
             );
             done(
                 &shown!(
-                    "The control daemon of {} ended; {} now holds environment {}, so something \
-                     started it again.",
+                    "{} ended; {} now holds environment {}, so something started it again.",
                     old,
                     now,
                     id
                 ),
                 &result(Knows::Ended),
                 json,
+                earlier,
             )
         }
-        End::NotEnded => {
-            let what = match (knows, unknown) {
-                (Knows::MaybeAsked, Some(why)) => shown!(
-                    "did not show whether it took the stop ({}), and it has not ended",
-                    why
-                ),
-                _ => Shown::said("was told to stop and has not ended"),
+        End::NotEnded(why) => {
+            let message = match why {
+                Why::Held => still_held(&environment.paths, id),
+                Why::Unlooked(why) => unlooked(id, &why),
+                Why::Running => {
+                    let what = match (knows, unknown) {
+                        (Knows::MaybeAsked, Some(why)) => shown!(
+                            "did not show whether it took the stop ({}), and it has not ended",
+                            why
+                        ),
+                        _ => Shown::said("was told to stop and has not ended"),
+                    };
+                    not_ended(&environment.paths, id, &what, old)
+                }
             };
             failed(
                 CliError::Unfinished {
                     code: ErrorCode::EnvironmentUnavailable,
-                    message: not_ended(&environment.paths, id, &what, (answered, holder.as_ref())),
+                    message,
                 },
                 &result(knows),
                 json,
@@ -1010,19 +1058,18 @@ async fn refused(
     }
 }
 
-/// M4: the daemon was asked and has not ended after the wait.
+/// M4: the daemon was asked and has not ended after the wait. A process is named only while it is
+/// a process named kr-controller: `old`, the process that held the environment before the request
+/// where the daemon's answer, if it came, named it too, or the one the lock file names now.
 fn not_ended(
     environment: &EnvironmentPaths,
     id: EnvironmentId,
     what: &Shown,
-    (answered, holder): (Option<u64>, Option<&ProcessStartIdentity>),
+    old: Option<&ProcessStartIdentity>,
 ) -> Shown {
-    let ends_with = match answered
-        .or_else(|| {
-            holder
-                .filter(|holder| runs_the_daemon(holder))
-                .map(|holder| holder.pid.get())
-        })
+    let ends_with = match old
+        .filter(|holder| runs_the_daemon(holder))
+        .map(|holder| holder.pid.get())
         .or_else(|| named_daemon(environment))
     {
         Some(pid) => shown!(
@@ -1048,15 +1095,51 @@ fn not_ended(
     )
 }
 
+/// The environment after the daemon's process was seen to have gone, and still held when the wait
+/// ended: what is said is that the daemon ended, and that something holds the environment which the
+/// command cannot name as a control daemon.
+fn still_held(environment: &EnvironmentPaths, id: EnvironmentId) -> Shown {
+    shown!(
+        "The control daemon for environment {} ended, and something still holds the environment \
+         after {} seconds. Run kr host stop again in a moment. {}",
+        id,
+        END_BOUND.as_secs(),
+        how_to_end_the_holder(environment)
+    )
+}
+
+/// The environment's lock could not be looked at, so that nothing is known of whether the daemon
+/// has ended.
+fn unlooked(id: EnvironmentId, why: &Shown) -> Shown {
+    shown!(
+        "The control daemon for environment {} was told to stop, and whether it has ended could not \
+         be read after {} seconds: {}. Run kr host stop again in a moment.",
+        id,
+        END_BOUND.as_secs(),
+        *why
+    )
+}
+
+/// Why the daemon had not ended when the wait did.
+enum Why {
+    /// Its process runs, or nothing shows that it has gone: the daemon is told to stop and goes on.
+    Running,
+    /// Its process has gone and something holds the environment that nothing shows to be a daemon.
+    Held,
+    /// The lock could not be looked at.
+    Unlooked(Shown),
+}
+
 /// How the wait for the daemon's end came out.
 enum End {
-    /// The daemon's process has gone and the environment is free.
+    /// The daemon has ended and the environment is free: its process has gone where its identity
+    /// was known, and otherwise the lock is free and nothing answers at its endpoint.
     Gone,
-    /// The daemon has gone and another process holds the environment now; its number where the lock
-    /// file names it.
+    /// The daemon has ended and another daemon holds the environment or answers at its endpoint:
+    /// the number of the process the lock file names as a control daemon, where it names one.
     Successor(Option<u64>),
-    /// The daemon had not ended when the wait did.
-    NotEnded,
+    /// The daemon had not ended when the wait did, or it could not be seen whether it had.
+    NotEnded(Why),
 }
 
 /// Reads `host.info`, on a new connection once where the authority behind this one was withdrawn,
@@ -1085,8 +1168,15 @@ async fn host_info(
     }
 }
 
-/// Waits up to `bound` for the daemon that was asked to stop to end: its process gone by its start
-/// identity where it was read, and the environment's lock free or held by another process.
+/// Waits up to `bound` for the daemon that was asked to stop to end.
+///
+/// Where the daemon's process identity is known (`old`) it has ended only when that process has
+/// gone and the environment's lock is free; a lock that is held then is a successor only where the
+/// lock file names a live process named kr-controller that is not the old one, or a daemon of
+/// another generation answers. Anything else that holds the lock for a moment, another command's
+/// look among it, is waited through. Where no identity is known (always on Windows, where the
+/// holder cannot be read), the daemon has ended when the lock is free and nothing answers at its
+/// endpoint, and the command cannot name or wait for the process itself.
 ///
 /// Each look is bounded by what is left of the one deadline, and a look that cannot be made
 /// leaves the daemon as not ended.
@@ -1102,61 +1192,104 @@ async fn wait_for_the_end(
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         let held = installation.held(left).await;
-        let process_gone = old.and_then(|old| match identity::process_state(old) {
-            ProcessState::Ended => Some(true),
-            ProcessState::Running => Some(false),
-            ProcessState::Unknown { .. } => None,
-        });
-        match (held, process_gone) {
-            (Ok(false), Some(true) | None) => return End::Gone,
-            // The old process has gone and another holds the environment.
-            (Ok(true), Some(true)) => {
-                return End::Successor(
-                    SingletonLock::holder(&environment.singleton_lock())
-                        .ok()
-                        .flatten()
-                        .map(u64::from),
-                );
+        let unlooked = held.as_ref().err().cloned();
+        let process = old.map(identity::process_state);
+        let old_gone = matches!(process, Some(ProcessState::Ended));
+        let seen = match (held, process) {
+            (Ok(false), Some(ProcessState::Ended)) => Some(End::Gone),
+            (Ok(true), Some(ProcessState::Ended)) => {
+                successor_of(environment, generation, old, left)
+                    .await
+                    .map(End::Successor)
             }
-            // Where the old process is not known (no start identity could be read), a daemon of
-            // another generation that answers is the successor.
-            (Ok(true), None) if another_generation_answers(environment, generation).await => {
-                return End::Successor(
-                    SingletonLock::holder(&environment.singleton_lock())
-                        .ok()
-                        .flatten()
-                        .map(u64::from),
-                );
-            }
-            _ => {}
+            // The process runs, or the system did not say: the daemon has not ended.
+            (_, Some(ProcessState::Running | ProcessState::Unknown { .. })) => None,
+            (Ok(false), None) => match endpoint_look(environment, generation, left).await {
+                Endpoint::Nobody => Some(End::Gone),
+                Endpoint::Another => Some(End::Successor(named_daemon(environment))),
+                Endpoint::Same | Endpoint::Unclear => None,
+            },
+            (Ok(true), None) => successor_of(environment, generation, None, left)
+                .await
+                .map(End::Successor),
+            (Err(_), _) => None,
+        };
+        if let Some(seen) = seen {
+            return seen;
         }
         if tokio::time::Instant::now() >= deadline {
-            return End::NotEnded;
+            return End::NotEnded(match (unlooked, old_gone) {
+                (Some(why), _) if old.is_none() || old_gone => Why::Unlooked(why),
+                (None, true) => Why::Held,
+                _ => Why::Running,
+            });
         }
         tokio::time::sleep(LOOK_EVERY.min(left)).await;
     }
 }
 
-/// Whether a daemon that is not the one that was asked answers at the environment's endpoint.
-async fn another_generation_answers(
+/// Whether the environment is held by a daemon that is not the one that was asked, and the number
+/// of the process the lock file names as that daemon where it names one: a live process named
+/// kr-controller other than `old`, or a daemon of another generation that answers. Nothing else
+/// proves a successor.
+async fn successor_of(
     environment: &EnvironmentPaths,
     generation: ControllerGeneration,
-) -> bool {
-    let Ok(endpoint) = environment.controller_endpoint() else {
-        return false;
-    };
-    let Reached::Answered(listed) = startup::reach(&endpoint, LOOK_EVERY * 20, &[]).await else {
-        return false;
-    };
-    let Listed::Ours(mut client) = *listed else {
-        return true;
-    };
-    match client.request(Method::HostInfo, &()).await {
-        Ok(Ok(value)) => value
-            .to_typed::<HostInfoResult>()
-            .is_ok_and(|now| now.generation != generation),
-        _ => false,
+    old: Option<&ProcessStartIdentity>,
+    within: Duration,
+) -> Option<Option<u64>> {
+    let named =
+        named_daemon(environment).filter(|named| old.is_none_or(|old| *named != old.pid.get()));
+    if named.is_some() && old.is_some() {
+        return Some(named);
     }
+    (endpoint_look(environment, generation, within).await == Endpoint::Another)
+        .then(|| named_daemon(environment))
+}
+
+/// What answers at the environment's endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Endpoint {
+    /// Nothing listens there.
+    Nobody,
+    /// A daemon of the generation that was asked answers.
+    Same,
+    /// A daemon of another generation answers.
+    Another,
+    /// Something listens and does not answer, or the look could not be made.
+    Unclear,
+}
+
+/// Looks at the environment's endpoint, the connection, the hello and `host.info` together bounded
+/// by `within` and by one second, and treats a daemon that does not answer as unclear.
+async fn endpoint_look(
+    environment: &EnvironmentPaths,
+    generation: ControllerGeneration,
+    within: Duration,
+) -> Endpoint {
+    let Ok(endpoint) = environment.controller_endpoint() else {
+        return Endpoint::Unclear;
+    };
+    let within = within.min(LOOK_EVERY * 20);
+    tokio::time::timeout(within, async {
+        match startup::reach(&endpoint, within, &[]).await {
+            Reached::Refused(error) if startup::nothing_listening(&error) => Endpoint::Nobody,
+            Reached::Refused(_) | Reached::Silent => Endpoint::Unclear,
+            Reached::Answered(listed) => match *listed {
+                Listed::Other(_) => Endpoint::Another,
+                Listed::Ours(mut client) => match client.request(Method::HostInfo, &()).await {
+                    Ok(Ok(value)) => match value.to_typed::<HostInfoResult>() {
+                        Ok(now) if now.generation != generation => Endpoint::Another,
+                        Ok(_) => Endpoint::Same,
+                        Err(_) => Endpoint::Unclear,
+                    },
+                    _ => Endpoint::Unclear,
+                },
+            },
+        }
+    })
+    .await
+    .unwrap_or(Endpoint::Unclear)
 }
 
 /// How the environment's lock is looked at: under the store's install lock for a release of a
@@ -1253,7 +1386,7 @@ mod tests {
         .await
         .expect("the wait ends at its bound");
         assert!(
-            matches!(waited, End::NotEnded),
+            matches!(waited, End::NotEnded(Why::Running)),
             "a live holder is not an end"
         );
         drop(held);
@@ -1269,6 +1402,188 @@ mod tests {
         assert!(
             matches!(waited, End::Gone),
             "no holder and a process that has gone is the end"
+        );
+    }
+    /// The paths of a temporary host's environment, with the host's own.
+    fn paths_of(temp: &kr_ipc::testing::TempHost) -> (HostPaths, EnvironmentPaths) {
+        let environment = temp.environment();
+        let host = HostPaths::new(environment.runtime_root(), environment.state_root())
+            .expect("the roots of the environment");
+        (host, environment)
+    }
+
+    /// A lock that another command's look holds for a moment, with the old process gone, is waited
+    /// through to the end and is no successor; where nothing proves one, a lock that stays held
+    /// leaves the environment held, and says so, not that the daemon has not ended.
+    #[tokio::test]
+    async fn a_lock_that_another_look_holds_for_a_moment_is_waited_through() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (host, environment) = paths_of(&temp);
+        let generation = ControllerGeneration::new(1);
+        let ended = identity::ended_process_identity(std::process::id());
+        let held = SingletonLock::hold(&environment.singleton_lock(), environment.environment_id())
+            .expect("takes the lock");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        let waited = tokio::time::timeout(
+            Duration::from_secs(60),
+            wait_for_the_end(
+                &host,
+                &environment,
+                generation,
+                Some(&ended),
+                Duration::from_secs(30),
+            ),
+        )
+        .await
+        .expect("the wait ends");
+        release.join().expect("the look's hold ends");
+        assert!(
+            matches!(waited, End::Gone),
+            "a moment's hold is no successor"
+        );
+
+        let held = SingletonLock::hold(&environment.singleton_lock(), environment.environment_id())
+            .expect("takes the lock again");
+        let waited = wait_for_the_end(
+            &host,
+            &environment,
+            generation,
+            Some(&ended),
+            Duration::from_millis(300),
+        )
+        .await;
+        assert!(
+            matches!(waited, End::NotEnded(Why::Held)),
+            "a lock that stays held with nothing to show for it is not a successor"
+        );
+        drop(held);
+    }
+
+    /// With no process identity known, the daemon has ended when the lock is free and nothing
+    /// answers at its endpoint, and not before: a free lock and a listener, or a held lock and no
+    /// proof of a successor, are not an end.
+    #[tokio::test]
+    async fn with_no_process_identity_the_end_is_a_free_lock_and_an_endpoint_nobody_answers() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (host, environment) = paths_of(&temp);
+        let generation = ControllerGeneration::new(1);
+        let endpoint = environment.controller_endpoint().expect("an endpoint");
+        let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
+        let waited = wait_for_the_end(
+            &host,
+            &environment,
+            generation,
+            None,
+            Duration::from_millis(300),
+        )
+        .await;
+        assert!(
+            matches!(waited, End::NotEnded(Why::Running)),
+            "a free lock and a listener that does not answer is not an end"
+        );
+        drop(listener);
+
+        let held = SingletonLock::hold(&environment.singleton_lock(), environment.environment_id())
+            .expect("takes the lock");
+        let waited = wait_for_the_end(
+            &host,
+            &environment,
+            generation,
+            None,
+            Duration::from_millis(300),
+        )
+        .await;
+        assert!(
+            matches!(waited, End::NotEnded(Why::Running)),
+            "a held lock with nothing to show for a successor is not an end"
+        );
+        drop(held);
+
+        let waited = wait_for_the_end(
+            &host,
+            &environment,
+            generation,
+            None,
+            Duration::from_secs(30),
+        )
+        .await;
+        assert!(
+            matches!(waited, End::Gone),
+            "a free lock and nobody at the endpoint is the end"
+        );
+    }
+
+    /// The words of a daemon that was told and has not ended, and of an environment that is held after
+    /// the daemon's process has gone, name no process they cannot show and promise no wait.
+    #[test]
+    fn the_words_of_a_daemon_that_has_not_ended_name_no_process_and_promise_no_wait() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = temp.environment();
+        let id = environment.environment_id();
+        let what = Shown::said("was told to stop and has not ended");
+        let said = not_ended(&environment, id, &what, None).to_string();
+        assert!(
+            said.contains(
+                "was told to stop and has not ended after 30 seconds. It may be finishing a write."
+            ),
+            "{said}"
+        );
+        assert!(
+            said.contains("the next daemon recovers as it does after a crash."),
+            "{said}"
+        );
+        assert!(
+            !said.contains("kill -KILL") && !said.contains("taskkill"),
+            "{said}"
+        );
+        assert!(!said.contains("wait again"), "{said}");
+        let held = still_held(&environment, id).to_string();
+        assert!(
+            held.contains("ended, and something still holds the environment after 30 seconds"),
+            "{held}"
+        );
+        assert!(
+            held.contains("Run kr host stop again in a moment."),
+            "{held}"
+        );
+    }
+
+    /// The records of earlier attempts are removed only where they were put out: a record that was
+    /// not said stands.
+    #[test]
+    fn earlier_records_are_removed_only_where_they_were_put_out() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = temp.environment();
+        let directory = environment.state_dir().join(attempt::DIRECTORY);
+        kr_ipc::paths::create_private_directory(&directory).expect("the directory");
+        let record = attempt::Attempt {
+            command: attempt::Command::Stop,
+            phase: attempt::Phase::Told,
+            process: identity::ended_process_identity(std::process::id()),
+            at_ms: 1,
+            daemon: None,
+        };
+        kr_ipc::paths::write_owner_only_file(
+            &directory.join("an-earlier-attempt"),
+            &serde_json::to_vec(&record).expect("encodes"),
+        )
+        .expect("writes the record");
+        let mut earlier = Earlier::read(&environment);
+        assert_eq!(earlier.records.len(), 1);
+        earlier.remove_those_put_out(false);
+        assert_eq!(
+            attempt::recorded(&environment).len(),
+            1,
+            "not said, so it stands"
+        );
+        earlier.written = true;
+        earlier.remove_those_put_out(false);
+        assert!(
+            attempt::recorded(&environment).is_empty(),
+            "said, so it goes"
         );
     }
 }
