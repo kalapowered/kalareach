@@ -4805,6 +4805,36 @@ async fn a_new_stream_starts_from_what_a_worker_with_the_lane_accepted() {
     a_new_stream_starts_from_what_the_worker_accepted(false).await;
 }
 
+/// A launch whose result is unknown ends the stream its position was read from. The device opens a
+/// second stream for the attachment while the launch is out, which replaces the first; the end
+/// reaches the first, which is already reset, and the second goes on taking typing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_opened_while_a_launch_is_out_is_not_reset_when_the_launch_is_unknown() {
+    let (rig, mut older) = typed_serial(1).await;
+    let stages = rig.adopted.host.network().input_stages();
+    stages.script_dependent_answers(|_| SerialAnswer::Silent);
+    let (at_launch, go_launch) = stages.hold_before_a_dependent_answer();
+    let launch = send_after(&rig, Dependent::Launch, rig.epoch, 1);
+    let meanwhile = async {
+        arrived(at_launch).await;
+        let newer = rig.open().await;
+        let _ = go_launch.send(());
+        newer
+    };
+    let (unknown, mut newer) = tokio::join!(launch, meanwhile);
+    assert!(
+        matches!(&unknown.answer, Err(error) if error.code == ErrorCode::OutcomeUnknown),
+        "the launch's result is unknown: {:?}",
+        unknown.answer
+    );
+    assert!(
+        next_or_reset(&mut older).await.is_err(),
+        "the stream the launch followed was replaced and is reset"
+    );
+    type_and_wait(&rig, &mut newer, 1, b"k").await;
+    rig.stop().await;
+}
+
 /// What the worker accepted and refused of an attachment's typing outlives the stream that sent it,
 /// and is given up when the attachment is detached.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

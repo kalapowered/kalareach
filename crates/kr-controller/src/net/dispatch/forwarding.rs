@@ -16,6 +16,7 @@ use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_transport::window::AcceptedDeadline;
 
 use super::super::arrivals::{Arrival, Arrivals, Carried, request_of};
+use super::super::input::Reading;
 use super::super::proxy::{Forwarded, Vouched, WorkerProxy};
 use crate::error::{ControllerError, Result};
 use crate::given::Recorded;
@@ -207,20 +208,18 @@ pub(super) fn a_detach_may_have_acted(
     }
 }
 
-/// Whether a launch whose call to the worker ended as `carried_out` is told to the device as one
-/// whose outcome is unknown: the host's own call timed out or its link ended under it, or the
-/// worker said so. What the host does not know it does not say, and it does not know whether the
-/// launch will start.
-fn a_launch_is_unknown(
-    carried_out: &std::result::Result<Result<Forwarded>, tokio::task::JoinError>,
-) -> bool {
-    match carried_out {
-        Ok(Ok(answered)) => matches!(
-            &answered.response.outcome,
-            Outcome::Error(error) if error.code == ErrorCode::OutcomeUnknown
-        ),
-        Ok(Err(error)) => error.to_protocol_error().code == ErrorCode::OutcomeUnknown,
-        Err(_) => true,
+/// Whether `answer`, the word a device is given for a launch, says that its outcome is unknown: the
+/// worker said so, the host's own call timed out or its link ended under it, the effect's task
+/// failed, or the host will not show what the worker kept. What the host does not know it does not
+/// say, and it does not know whether the launch will start.
+fn a_launch_is_told_unknown(answer: &std::result::Result<ControlFrame, ProtocolError>) -> bool {
+    match answer {
+        Ok(ControlFrame::Response(Response {
+            outcome: Outcome::Error(error),
+            ..
+        }))
+        | Err(error) => error.code == ErrorCode::OutcomeUnknown,
+        Ok(_) => false,
     }
 }
 
@@ -567,13 +566,64 @@ impl RemoteConnection {
         // decides for itself, and this check only saves it a forward; for a worker that does not,
         // the members that carry the position are taken out below and this check is the only one.
         let barrier = super::super::input::barrier::barrier_of(mutation)?;
-        if let Some(barrier) = &barrier
-            && self
-                .inputs
-                .position_not_reached(self.connection_id(), barrier)
-        {
+        let read = barrier
+            .as_ref()
+            .map(|barrier| self.inputs.read_position(self.connection_id(), barrier));
+        if read.as_ref().is_some_and(Reading::not_reached) {
             return Err(super::super::input::barrier::not_reached());
         }
+        let answer = self
+            .forwarded_mutation(
+                mutation,
+                accepted,
+                validated,
+                grant_rights,
+                acting,
+                asked,
+                own_claim,
+                session_id,
+            )
+            .await;
+        // A client holds the typing that follows a launch until the launch's handling ends. A
+        // worker that serves a lane writes a marker when it does, so the lane's stream needs no
+        // end. A worker that serves none writes no marker, so the hold ends with the launch's
+        // definite answer or with the stream, and a launch whose outcome the device is told is
+        // unknown ends the stream that this request's position was read from, which a stream that
+        // opened since is not.
+        //
+        // The word is read from the answer this function returns, so the worker's own unknown
+        // answer, a call that timed out or whose link ended, a failed effect task, and a receipt
+        // that is not shown to the device all end the stream by one rule. Two paths tell a device
+        // an outcome is unknown for a launch outside it, and end nothing here: a copy of the action
+        // that this host refuses on its own account and words as a repeat's
+        // (`told_of_a_repeat`), and an answer read from a record before any dispatch. Each is for
+        // a copy of an action whose first call ran through this function and decided its own end,
+        // and a client holds typing behind a launch only on the connection that sent it, so a copy
+        // sent after that connection was lost finds nothing to release.
+        if let Some(read) = &read
+            && mutation.method.method() == Some(Method::ShellLaunch)
+            && a_launch_is_told_unknown(&answer)
+        {
+            read.end_when_serial();
+        }
+        answer
+    }
+
+    /// Forwards a mutation to the worker that owns its session, once its barrier has been judged:
+    /// the part of [`Self::proxied_mutation`] that claims the route, takes the authority's deadline
+    /// and carries the call out.
+    #[allow(clippy::too_many_arguments)]
+    async fn forwarded_mutation(
+        &self,
+        mutation: &MutationRequest,
+        accepted: AcceptedDeadline,
+        validated: AuthorityRevision,
+        grant_rights: CanonicalSet<ActionRight>,
+        acting: &Acting,
+        asked: &mut Option<Asked>,
+        own_claim: &OwnClaim,
+        session_id: SessionId,
+    ) -> std::result::Result<ControlFrame, ProtocolError> {
         let proxy = match self.proxy_for(session_id, acting).await {
             Ok(proxy) => proxy,
             Err(error) => return Err(error.to_protocol_error()),
@@ -653,13 +703,6 @@ impl RemoteConnection {
             Method::InputRelease | Method::SessionDetach | Method::ShellLaunch
         );
         let serves_lane = self.inputs.serves_lane(&proxy);
-        // A worker without the lane writes no marker when its launch handling ends, so the client's
-        // hold on later typing ends only with the stream the launch's barrier names. When the
-        // launch's result stays unknown, that stream is ended below.
-        let launching = barrier
-            .as_ref()
-            .filter(|_| answering == Method::ShellLaunch && !serves_lane)
-            .map(|barrier| barrier.attachment_id);
         if carries_lane_members {
             mutation.params = super::super::input::barrier::params_for_worker(
                 serves_lane,
@@ -695,7 +738,7 @@ impl RemoteConnection {
         let standing = self.feed_standing(&acting.grant);
         let effect = tokio::spawn(async move {
             if let Some(answered) = scripted {
-                return answered;
+                return answered.await;
             }
             proxy
                 .forward_mutation(
@@ -719,11 +762,6 @@ impl RemoteConnection {
             && a_detach_may_have_acted(&carried_out)
         {
             self.inputs.detached(self.connection_id(), attachment);
-        }
-        if let Some(attachment) = launching
-            && a_launch_is_unknown(&carried_out)
-        {
-            self.inputs.cut(self.connection_id(), attachment);
         }
         match carried_out {
             Ok(Ok(answered)) => {
@@ -1444,5 +1482,42 @@ const fn worker_capability(method: Method) -> Option<&'static str> {
     match method {
         Method::ShellLaunchSurface => Some(kr_protocol::local::SHELL_LAUNCH_SURFACE_READ),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod launch_words {
+    use kr_protocol::ids::RequestId;
+
+    use super::*;
+
+    /// A launch whose outcome the device is told is unknown ends the stream of a worker without the
+    /// lane, whichever way the word is made: the worker's own answer, a call that timed out or whose
+    /// link ended, and the receipt that the host will not show are all this one word, as a refusal
+    /// or as a frame. A definite word ends nothing. The receipt that is not shown cannot be made in
+    /// the suites that run a whole host, since withdrawing the authority that decides it also
+    /// releases the connection and so ends its streams, which would hide what this decides.
+    #[test]
+    fn a_launch_is_told_unknown_by_each_word_that_says_so_and_by_no_other() {
+        let said = |error| failure(RequestId::new(1), error);
+        for answer in [
+            Err(outcome_unknown()),
+            Err(outcome_not_shown()),
+            Ok(said(outcome_unknown())),
+            Ok(said(outcome_not_shown())),
+        ] {
+            assert!(a_launch_is_told_unknown(&answer), "{answer:?}");
+        }
+        for answer in [
+            Err(ProtocolError::new(ErrorCode::DraftConflict, "stale")),
+            Err(ProtocolError::new(ErrorCode::EditorBusy, "busy")),
+            Ok(said(ProtocolError::new(ErrorCode::EditorBusy, "busy"))),
+            Ok(ControlFrame::Response(Response {
+                request_id: RequestId::new(1),
+                outcome: Outcome::Ok(ParamsValue::empty()),
+            })),
+        ] {
+            assert!(!a_launch_is_told_unknown(&answer), "{answer:?}");
+        }
     }
 }
