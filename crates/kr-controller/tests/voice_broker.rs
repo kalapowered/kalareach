@@ -1392,7 +1392,7 @@ async fn an_open_call_holds_the_managed_account_and_not_the_storage_account() {
     let storage = host.controller().storage_account();
     storage.listen_on("127.0.0.1:0".parse().expect("an address"));
     storage
-        .sign_in(&|| Ok(()))
+        .sign_in(&|| Ok(()), std::sync::Arc::new(|| Ok(())))
         .await
         .expect("the storage account's sign-in is not held by the call");
 
@@ -1862,6 +1862,50 @@ async fn a_change_refused_after_it_ended_a_waiting_sign_in_says_so_and_says_it_a
             );
             host.stop().await;
         }
+    }
+}
+
+/// KR-REQ-09.09 and 17.54: a sign-in waits for the person for up to fifteen minutes, and keeps no
+/// grant when the authority it was started under no longer stands when the person completes it: the
+/// fence this host owes here, the owner's membership lease on a host that is exclusively
+/// organisation-managed. What the service issued for the spent code is revoked, the queue holds the
+/// revocation where the service cannot be reached, and the browser is told why. The control: with
+/// nothing owed the same sign-in is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_completed_after_its_authority_ended_keeps_no_grant_and_revokes_what_was_issued()
+{
+    for owed in [false, true] {
+        let broker = Broker::start().await;
+        let owner = DeviceKeys::generate().expect("owner keys");
+        let host =
+            net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+        listen_for_sign_ins(&host);
+        let (url, address) = start_sign_in(&host).await;
+        broker.expect_sign_in(&url);
+
+        host.controller().hold_fence(owed);
+        let page = browser_answers(&address, &url, "the-code").await;
+        host.controller().hold_fence(false);
+        let report = settled(&host).await;
+        if owed {
+            assert!(
+                page.contains("authority for this sign-in ended"),
+                "the browser is told why: {page}"
+            );
+            assert_eq!(report.state, AccountState::SignedOut, "no grant is kept");
+            assert_eq!(
+                broker.revoked(),
+                [broker.refresh(1)],
+                "what the service issued is revoked"
+            );
+        } else {
+            assert!(
+                matches!(report.state, AccountState::SignedIn { .. }),
+                "{report:?}"
+            );
+            assert!(broker.revoked().is_empty());
+        }
+        host.stop().await;
     }
 }
 

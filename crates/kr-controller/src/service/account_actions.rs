@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use kr_protocol::envelope::ParamsValue;
 use kr_protocol::host_account::{AccountSignInParams, AccountSignOutParams, AccountStatusParams};
+use kr_protocol::method::Method;
 use kr_protocol::service::GatewayOrigin;
 
 use crate::account::{HostAccount, Service};
@@ -221,6 +222,28 @@ impl Controller {
         })
     }
 
+    /// What a sign-in asks when the person completes it, long after the request that started it
+    /// has answered and its connection has ended: the fence this host owes, and the local owner's
+    /// membership lease for `method`, which on a host that is exclusively organisation-managed is
+    /// the authority the request was accepted under. The request's deadline and its connection are
+    /// not asked: that request has answered, and its connection ends with the command.
+    fn sign_in_lasting(self: &Arc<Self>, method: Method) -> crate::account::Lasting {
+        let controller = Arc::downgrade(self);
+        Arc::new(move || {
+            let controller =
+                controller
+                    .upgrade()
+                    .ok_or_else(|| ControllerError::PermissionDenied {
+                        detail: "this host is stopping".to_owned(),
+                    })?;
+            controller.check_fence()?;
+            controller
+                .local_hold(method)
+                .map(|_| ())
+                .map_err(ControllerError::from)
+        })
+    }
+
     /// Answers `account.storage_sign_in`: starts the sign-in at the storage service the person
     /// runs and says when the daemon stops waiting for the browser.
     ///
@@ -230,14 +253,17 @@ impl Controller {
     /// storage account, and otherwise why no sign-in can start, as
     /// [`crate::account::HostAccount::sign_in`] does.
     pub(super) async fn account_storage_sign_in(
-        &self,
+        self: &Arc<Self>,
         mutation: &kr_protocol::envelope::MutationRequest,
         carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
         let _: AccountSignInParams = parse(&mutation.params)?;
         let started = self
             .own_storage_account()?
-            .sign_in(&|| self.check_registration(&carried))
+            .sign_in(
+                &|| self.check_registration(&carried),
+                self.sign_in_lasting(Method::AccountStorageSignIn),
+            )
             .await?;
         ParamsValue::from_typed(&started)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
@@ -285,14 +311,17 @@ impl Controller {
     ///
     /// Returns why no sign-in can start, as [`crate::account::HostAccount::sign_in`] does.
     pub(super) async fn account_sign_in(
-        &self,
+        self: &Arc<Self>,
         mutation: &kr_protocol::envelope::MutationRequest,
         carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
         let _: AccountSignInParams = parse(&mutation.params)?;
         let started = self
             .account
-            .sign_in(&|| self.check_registration(&carried))
+            .sign_in(
+                &|| self.check_registration(&carried),
+                self.sign_in_lasting(Method::AccountSignIn),
+            )
             .await?;
         ParamsValue::from_typed(&started)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
