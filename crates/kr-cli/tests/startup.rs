@@ -6082,47 +6082,22 @@ fn a_process_named_kr_controller(host: &Standalone, folder: &str) -> Child {
     start_a_copy_that_holds_still(host.tree.root(), &directory.join("kr-controller"))
 }
 
-/// How long a start of a program this test has just written is tried again while the system says
-/// the file is busy.
-const BUSY_FILE_BOUND: Duration = Duration::from_secs(10);
-
 /// Places a copy of this test program at `copy` and starts it, holding still, with `working` as its
 /// working directory.
 ///
-/// A program that a case writes and then starts can meet "Text file busy": the system refuses to
-/// run a file that some process still holds open for writing, and a process that another thread of
-/// this test forks while the copy is being written inherits that descriptor until it has run its
-/// program. So the copy is written under another name, closed and renamed into place while the
-/// suite's spawning turn is held. The turn stops only the starts made through it: this program
-/// also starts processes without it, and a child of one of those that forks during the copy holds
-/// the write descriptor, which the rename does not take away. So a start that still meets the
-/// error is tried again, inside a short bound.
+/// The copy is written by a copier process, as the suite's other programs are: no thread of this
+/// test holds a descriptor that writes it, so no process this test starts can inherit one, and the
+/// system never refuses the start with "Text file busy" because of this test's own process.
 fn start_a_copy_that_holds_still(working: &Path, copy: &Path) -> Child {
-    let staging = copy.with_extension("new");
+    kr_ipc::testing::place_program(&std::env::current_exe().expect("this test"), copy);
     spawning(|| {
-        std::fs::copy(std::env::current_exe().expect("this test"), &staging).expect("copies it");
-        std::fs::rename(&staging, copy).expect("places it");
-    });
-    let deadline = Instant::now() + BUSY_FILE_BOUND;
-    loop {
-        let started = spawning(|| {
-            Command::new(copy)
-                .args(["--ignored", "--exact", HOLD_STILL, "--nocapture"])
-                .env("KR_HOLD_STILL_SECONDS", "600")
-                .current_dir(working)
-                .spawn()
-        });
-        match started {
-            Ok(child) => return child,
-            Err(error)
-                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
-                    && Instant::now() < deadline =>
-            {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(error) => panic!("starts: {error}"),
-        }
-    }
+        Command::new(copy)
+            .args(["--ignored", "--exact", HOLD_STILL, "--nocapture"])
+            .env("KR_HOLD_STILL_SECONDS", "600")
+            .current_dir(working)
+            .spawn()
+    })
+    .expect("starts")
 }
 
 /// A daemon that ends and is replaced before the command sees the end reads as ended, with the
