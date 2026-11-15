@@ -956,16 +956,21 @@ async fn stop_the_daemon(
             )
         }
         End::NotEnded(why) => {
+            // What the request came to: its failure where whether the daemon took it is not known.
+            let not_known = match (knows, unknown.as_ref()) {
+                (Knows::MaybeAsked, Some(failure)) => Some(failure),
+                _ => None,
+            };
             let message = match why {
                 Why::Held => still_held(&environment.paths, id),
-                Why::Unlooked(why) => unlooked(id, &why),
+                Why::Unlooked(why) => unlooked(id, not_known, &why),
                 Why::Running => {
-                    let what = match (knows, unknown) {
-                        (Knows::MaybeAsked, Some(why)) => shown!(
+                    let what = match not_known {
+                        Some(failure) => shown!(
                             "did not show whether it took the stop ({}), and it has not ended",
-                            why
+                            *failure
                         ),
-                        _ => Shown::said("was told to stop and has not ended"),
+                        None => Shown::said("was told to stop and has not ended"),
                     };
                     not_ended(&environment.paths, id, &what, old)
                 }
@@ -1109,15 +1114,27 @@ fn still_held(environment: &EnvironmentPaths, id: EnvironmentId) -> Shown {
 }
 
 /// The environment's lock could not be looked at, so that nothing is known of whether the daemon
-/// has ended.
-fn unlooked(id: EnvironmentId, why: &Shown) -> Shown {
-    shown!(
-        "The control daemon for environment {} was told to stop, and whether it has ended could not \
-         be read after {} seconds: {}. Run kr host stop again in a moment.",
-        id,
-        END_BOUND.as_secs(),
-        *why
-    )
+/// has ended. `not_known` is what the request's failure said where whether the daemon took the
+/// stop is not known; where it took it, the text says that it was told.
+fn unlooked(id: EnvironmentId, not_known: Option<&Shown>, why: &Shown) -> Shown {
+    match not_known {
+        None => shown!(
+            "The control daemon for environment {} was told to stop, and whether it has ended could \
+             not be read after {} seconds: {}. Run kr host stop again in a moment.",
+            id,
+            END_BOUND.as_secs(),
+            *why
+        ),
+        Some(failure) => shown!(
+            "The control daemon for environment {} did not show whether it took the stop ({}), and \
+             whether it has ended could not be read after {} seconds: {}. Run kr host stop again in \
+             a moment.",
+            id,
+            *failure,
+            END_BOUND.as_secs(),
+            *why
+        ),
+    }
 }
 
 /// Why the daemon had not ended when the wait did.
@@ -1585,5 +1602,26 @@ mod tests {
             attempt::recorded(&environment).is_empty(),
             "said, so it goes"
         );
+    }
+    /// The text for a lock that could not be looked at takes what the request came to: after a stop
+    /// that was taken it says that the daemon was told, and after a request whose taking is not
+    /// known it says that, with the request's failure, and never that the daemon was told.
+    #[test]
+    fn the_text_for_a_lock_that_could_not_be_looked_at_takes_the_requests_known_state() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let id = temp.environment().environment_id();
+        let why = Shown::said("the lock file could not be opened");
+        let told = unlooked(id, None, &why).to_string();
+        assert!(
+            told.contains("was told to stop, and whether it has ended could not be read after 30 seconds: the lock file could not be opened. Run kr host stop again in a moment."),
+            "{told}"
+        );
+        let failure = Shown::said("the connection was cut");
+        let unknown = unlooked(id, Some(&failure), &why).to_string();
+        assert!(
+            unknown.contains("did not show whether it took the stop (the connection was cut), and whether it has ended could not be read after 30 seconds: the lock file could not be opened. Run kr host stop again in a moment."),
+            "{unknown}"
+        );
+        assert!(!unknown.contains("was told to stop"), "{unknown}");
     }
 }
