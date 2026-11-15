@@ -18,7 +18,7 @@ use kr_client::services::admission::RelayAdmissionIssueBody;
 use kr_client::services::{
     AdmissionAnswer, AdmissionClock, AdmissionRequest, LeaseRequest, ManagedPairingAdmission,
     ManagedRelayLeaseService, PairingAdmissionService, PairingAdmissions, RelayDirection,
-    RelayLeaseService, ServiceFuture, ServiceSigner,
+    RelayLeaseService, ServiceFuture, ServiceHttp, ServiceHttpAnswer, ServiceSigner,
 };
 use kr_client::{ClientError as Error, Result};
 use kr_crypto::keys::AuthorisationKeyPair;
@@ -299,6 +299,182 @@ fn scripted_admissions(service: Arc<Scripted>, clock: &AdmissionClock) -> Pairin
         .expect("admissions")
         .on_clock(clock.clone())
         .waiting(Duration::from_millis(200))
+}
+
+/// A transport that answers every request with the one status and body it was given, byte for byte,
+/// and counts the requests: the service's answer as the client's own reader meets it.
+#[derive(Debug)]
+struct Exact {
+    status: u16,
+    body: String,
+    requests: AtomicUsize,
+}
+
+impl Exact {
+    fn new(status: u16, body: &str) -> Arc<Self> {
+        Arc::new(Self {
+            status,
+            body: body.to_owned(),
+            requests: AtomicUsize::new(0),
+        })
+    }
+
+    fn requests(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
+}
+
+impl ServiceHttp for Exact {
+    fn post_json<'a>(
+        &'a self,
+        _url: &'a str,
+        _body: &'a [u8],
+        _headers: &'a [(&'a str, &'a str)],
+    ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            Ok(ServiceHttpAnswer {
+                status: self.status,
+                body: self.body.as_bytes().to_vec(),
+            })
+        })
+    }
+}
+
+/// The answer the service gives for a relay it could not admit a pair through: its words, the paths
+/// that still work (none, when the cause is its own fault) and the wait it names when it names one.
+fn unavailable_body(message: &str, alternatives: &[&str], delay: Option<u64>) -> String {
+    let mut data = serde_json::json!({
+        "state": "unavailable",
+        "message": message,
+        "alternatives": alternatives,
+    });
+    if let Some(seconds) = delay {
+        data["retry_after_seconds"] = serde_json::json!(seconds);
+    }
+    serde_json::json!({ "ok": true, "data": data }).to_string()
+}
+
+/// The two paths that still work, as the service names them when a budget is short.
+const STILL_WORK: [&str; 2] = [
+    "A direct connection between the devices, which needs no managed relay.",
+    "A relay that the host's owner runs. The host must name it in its configuration and use no \
+     managed relay. A new invitation from that host then names it.",
+];
+
+/// When, in seconds after the first dial, the cache is dialled to in the timeline below.
+const PROBES: [u64; 13] = [0, 4, 6, 12, 21, 26, 61, 66, 130, 700, 3601, 3700, 90_000];
+
+/// What the cache did over `PROBES` when the service answered `body` to every request: at each
+/// dial, how many requests the service had been sent by then and whether a failed dial would be
+/// reported as the managed relay having no capacity.
+async fn timeline(body: &str) -> Vec<(u64, usize, bool)> {
+    let clock = AdmissionClock::default();
+    let http = Exact::new(200, body);
+    let origin = GatewayOrigin::new("https://reach.kala.to").expect("an origin");
+    let service = Arc::new(ManagedPairingAdmission::new(
+        origin.clone(),
+        Arc::clone(&http) as _,
+        Installation::new(),
+    ));
+    let admissions = PairingAdmissions::new(service, &origin)
+        .expect("admissions")
+        .on_clock(clock.clone());
+    let (host, relays) = (key(0x11), network(&[MANAGED]));
+    let mut seen = Vec::new();
+    let mut at = 0;
+    for probe in PROBES {
+        clock.advance(Duration::from_secs(probe - at));
+        at = probe;
+        admissions.before_dial(&relays, &host, key(0x22)).await;
+        seen.push((
+            probe,
+            http.requests(),
+            admissions.capacity_refused(&relays, &host),
+        ));
+    }
+    seen
+}
+
+/// KR-REQ-17.48: a service that cannot admit a pair for a reason of its own says so with the member
+/// that names the paths that still work present and empty, and the client's reader, which is the
+/// released one, holds it as it holds an answer that names them: the same answer kind, the same
+/// requests at the same moments, the same explanation of a failed dial, with a wait named and
+/// without. An answer that leaves the member out is still not one it reads.
+#[tokio::test]
+async fn kr_req_17_48_an_unavailable_answer_with_an_empty_list_is_held_as_one_with_entries() {
+    const FAULT: &str = "The managed relay service could not admit this pairing now.";
+    const SHORT: &str = "Managed capacity for new pairing invitations is not available now.";
+
+    for delay in [
+        None,
+        Some(0),
+        Some(5),
+        Some(3600),
+        Some(86_400),
+        Some(200_000),
+    ] {
+        let with_entries = unavailable_body(SHORT, &STILL_WORK, delay);
+        let with_none = unavailable_body(FAULT, &[], delay);
+
+        let (named, empty) = (timeline(&with_entries).await, timeline(&with_none).await);
+        println!("TIMELINE delay {delay:?} | entries {named:?} | empty {empty:?}");
+        assert_eq!(named, empty, "delay {delay:?}");
+        assert!(
+            named[0].2 && named[0].1 == 1,
+            "the first dial asks once and is explained as capacity: {named:?}"
+        );
+
+        let origin = GatewayOrigin::new("https://reach.kala.to").expect("an origin");
+        let read = |body: &str| {
+            ManagedPairingAdmission::new(
+                origin.clone(),
+                Exact::new(200, body) as _,
+                Installation::new(),
+            )
+        };
+        let (entries, none) = (
+            read(&with_entries).admit(&request(MANAGED)).await,
+            read(&with_none).admit(&request(MANAGED)).await,
+        );
+        assert_eq!(
+            entries.expect("an answer"),
+            AdmissionAnswer::Unavailable {
+                message: SHORT.to_owned(),
+                alternatives: STILL_WORK.map(str::to_owned).to_vec(),
+                retry_after_seconds: delay,
+            }
+        );
+        assert_eq!(
+            none.expect("an answer"),
+            AdmissionAnswer::Unavailable {
+                message: FAULT.to_owned(),
+                alternatives: Vec::new(),
+                retry_after_seconds: delay,
+            }
+        );
+    }
+
+    // The member is what the reader needs: an answer that leaves it out is not read, and the cache
+    // holds that as a failed request, which explains no dial.
+    let without = serde_json::json!({
+        "ok": true,
+        "data": {"state": "unavailable", "message": "The relay did not answer."},
+    })
+    .to_string();
+    let origin = GatewayOrigin::new("https://reach.kala.to").expect("an origin");
+    let unread =
+        ManagedPairingAdmission::new(origin, Exact::new(200, &without) as _, Installation::new())
+            .admit(&request(MANAGED))
+            .await;
+    assert!(unread.is_err(), "a missing member is read as an answer");
+    assert!(
+        !timeline(&without)
+            .await
+            .iter()
+            .any(|(_, _, refused)| *refused),
+        "an answer that cannot be read explained a dial"
+    );
 }
 
 /// KR-REQ-10.39, KR-REQ-10.54: an invitation that names a managed relay causes one request for it
