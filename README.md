@@ -138,6 +138,12 @@ pnpm -r generate:check
 pnpm -r test
 ```
 
+The check builds in its temporary directory, which is under `/tmp` unless `TMPDIR` names another
+place, so on Linux it usually builds there. When the build folder is under `/tmp`, the cases of
+the performance suite that run `scripts/performance.sh` as a caller does need a `/var/tmp` that
+exists, that the account can write, where programs can run, and that is not itself inside `/tmp`.
+They use no other folder and never skip.
+
 The cases that drive a managed shell package are left out of an ordinary test run, because they
 need the packages the setup built. This group runs them, then qualifies the packages against the
 startup customisations people run: `fetch-shell-stacks.sh` fetches the pinned customisations, a
