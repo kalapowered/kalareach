@@ -34,12 +34,18 @@
 # check read the value with each backslash as a slash). Any other spelling is refused, in words that
 # say which are taken: a device path (\\.\), a server with no share, three slashes at the start, a
 # path that depends on the current drive (\folder) or on a drive's current directory (C:folder).
-# Off Windows a backslash is a letter of a name.
+# Off Windows a value that holds a backslash is refused, in words that say that a backslash is not
+# taken in the folder's path on this platform, before any other read of it, and a temporary
+# variable that holds one is passed over as a root: PowerShell's own path commands read a
+# backslash as a separator there, so a folder whose name holds one cannot be kept as written by
+# every reader and by the scripts that use the path they return, and a value that the four readers
+# cannot read as one folder is refused by all four.
 #
 # Where the variable is not set, the run makes a directory of its own under the temporary folder
 # (readable by this account only) and says where it is on standard error. The temporary folder is
-# the one TMPDIR names, else /tmp, and on Windows, where TMPDIR is not set or is /tmp or /tmp/ (a
-# login shell's profile exports it so), the one TEMP names.
+# the one TMPDIR names, else /tmp (and /tmp where TMPDIR holds a backslash off Windows), and on
+# Windows, where TMPDIR is not set or is /tmp or /tmp/ (a login shell's profile exports it so), the
+# one TEMP names.
 #
 # The reader guards a test run against a mistake: for any value of the evidence variable, and any
 # temporary variable as a platform, a runner, one of our scripts or a developer's shell sets it,
@@ -141,6 +147,10 @@ _kr_artifacts_roots() {
   for _kr_candidate in "${_kr_named[@]}"; do
     # The name as it was given: the conversion below drops the line feeds at its end.
     case "$_kr_candidate" in *$'\n'*) continue ;; esac
+    # Off Windows a temporary variable that holds a backslash names no root.
+    if [ "$_kr_windows" != 1 ]; then
+      case "$_kr_candidate" in *\\*) continue ;; esac
+    fi
     if [ "$_kr_windows" = 1 ]; then
       # A temporary variable in a spelling this reader does not take names no root; the slashes at
       # its end are not part of the folder, so `/tmp/` is `/tmp`.
@@ -260,6 +270,14 @@ _kr_artifacts_confine() {
     _kr_artifacts_refuse "$1" "it is empty" ${2+"$2"}
     return 1
   fi
+  if ! _kr_artifacts_windows; then
+    case "$_kr_value" in
+      *\\*)
+        _kr_artifacts_refuse "$1" "it holds a backslash, and a backslash is not taken in the folder's path on this platform" ${2+"$2"}
+        return 1
+        ;;
+    esac
+  fi
   _kr_value="$(_kr_artifacts_posix "$_kr_value")" || _kr_status=$?
   if [ "$_kr_status" = 2 ]; then
     _kr_artifacts_refuse "$1" "it is a Windows path of a kind this reader does not take$(_kr_artifacts_takes)" ${2+"$2"}
@@ -337,12 +355,16 @@ _kr_artifacts_confine() {
 }
 
 # Makes a directory of this run's own under the temporary folder and prints its real path. The
-# temporary folder is TMPDIR, else /tmp, and on Windows, where TMPDIR is not set or is /tmp or /tmp/
-# (a login shell's profile exports it so), the folder TEMP names: /tmp there is a folder that TEMP may not
+# temporary folder is TMPDIR, else /tmp (and /tmp where TMPDIR holds a backslash, off Windows, which
+# passes it over as a root), and on Windows, where TMPDIR is not set or is /tmp or /tmp/ (a login
+# shell's profile exports it so), the folder TEMP names: /tmp there is a folder that TEMP may not
 # name, and it is no root then. The folder is checked before the directory is made in it, so that a
 # temporary folder that is no root is left as it was.
 _kr_artifacts_own() {
   local _kr_temporary="${TMPDIR:-/tmp}" _kr_made
+  if ! _kr_artifacts_windows; then
+    case "$_kr_temporary" in *\\*) _kr_temporary=/tmp ;; esac
+  fi
   if _kr_artifacts_windows && { [ -z "${TMPDIR:-}" ] || [ "$(_kr_artifacts_trim "$TMPDIR")" = /tmp ]; }; then
     _kr_temporary="$(_kr_artifacts_windows_temp)" || {
       if [ -z "${TEMP:-}" ]; then

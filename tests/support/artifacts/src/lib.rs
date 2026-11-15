@@ -21,9 +21,16 @@
 //! server with no share, three separators at the start, a path that depends on the current drive
 //! and one that depends on a drive's current directory.
 //!
+//! Off Windows a value that holds a backslash is refused, in words that say that a backslash is not
+//! taken in the folder's path on this platform, before any other read of it, and a temporary
+//! variable that holds one is passed over as a root: PowerShell's own path commands read a
+//! backslash as a separator on every platform, so a folder whose name holds one cannot be kept as
+//! written by every reader and by the scripts that use the path they return, and a value that the
+//! four readers cannot read as one folder is refused by all four.
+//!
 //! Where the variable is not set, the first read makes a directory of this run's own under the
-//! temporary folder, says where it is on standard error, and every later read of the same process
-//! returns the same directory.
+//! temporary folder (and under `/tmp` where that holds a backslash off Windows), says where it is
+//! on standard error, and every later read of the same process returns the same directory.
 //!
 //! The reader guards a test run against a mistake: for any value of the evidence variable, and any
 //! temporary variable as a platform, a runner, one of our scripts or a developer's shell sets it,
@@ -104,6 +111,9 @@ fn check(value: &Path, roots: &[PathBuf]) -> Result<PathBuf, String> {
     if value.as_os_str().is_empty() {
         return Err("it is empty".to_owned());
     }
+    if holds_backslash_off_windows(value) {
+        return Err(BACKSLASH_WHY.to_owned());
+    }
     if cfg!(windows) {
         match windows_spelling(&value.to_string_lossy()) {
             Spelling::Taken => {}
@@ -138,6 +148,16 @@ fn check(value: &Path, roots: &[PathBuf]) -> Result<PathBuf, String> {
     } else {
         Err("it is not inside a temporary root".to_owned())
     }
+}
+
+/// Why a path that holds a backslash is refused off Windows.
+const BACKSLASH_WHY: &str =
+    "it holds a backslash, and a backslash is not taken in the folder's path on this platform";
+
+/// Whether `path` holds a backslash where a backslash is a letter of a name, which the readers do not
+/// read alike.
+fn holds_backslash_off_windows(path: &Path) -> bool {
+    !cfg!(windows) && path.to_string_lossy().contains('\\')
 }
 
 /// The spellings of an absolute path that this reader takes on Windows, for the words of a refusal.
@@ -256,13 +276,24 @@ fn refused_own(temporary: &Path, why: &str, roots: &[PathBuf]) -> Refused {
 fn own() -> &'static Path {
     static OWN: OnceLock<PathBuf> = OnceLock::new();
     OWN.get_or_init(|| {
-        let own = own_in(&std::env::temp_dir(), &roots());
+        let own = own_in(&temporary_folder(), &roots());
         eprintln!(
             "{VARIABLE} is not set: this run keeps its evidence in {}",
             own.display()
         );
         own
     })
+}
+
+/// The folder the run's own directory goes under: the system's temporary folder, and `/tmp` where
+/// that holds a backslash off Windows, which is passed over as a root.
+fn temporary_folder() -> PathBuf {
+    let named = std::env::temp_dir();
+    if holds_backslash_off_windows(&named) {
+        PathBuf::from("/tmp")
+    } else {
+        named
+    }
 }
 
 /// A directory of this run's own under `temporary`, which has to be inside one of `roots`. The
@@ -309,9 +340,11 @@ fn roots() -> Vec<PathBuf> {
     }
     named.extend(std::env::var_os("RUNNER_TEMP").map(PathBuf::from));
     let mut roots: Vec<PathBuf> = Vec::new();
-    // A temporary variable in a spelling this reader does not take names no root.
+    // A temporary variable in a spelling this reader does not take, or that holds a backslash off
+    // Windows, names no root.
     let taken = |root: &&PathBuf| {
         root.is_absolute()
+            && !holds_backslash_off_windows(root)
             && (!cfg!(windows) || windows_spelling(&root.to_string_lossy()) == Spelling::Taken)
     };
     for root in named.iter().filter(taken) {
