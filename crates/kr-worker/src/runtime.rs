@@ -16,7 +16,7 @@
 //! [`crate::lifecycle`] describes. What is left on a clock is named there, with what it costs.
 
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use kr_protocol::session::{ClosureReason, ClosureRecord, SessionState};
 use kr_shell_integration::host::package::PUBLISH_COMMAND;
@@ -670,6 +670,32 @@ pub(crate) fn lock_session(
     }
 }
 
+/// Takes the session, waiting for it no longer than `bound`. The tries are a fixed step apart,
+/// so a session that is free is taken at once and one that is not is looked at about every
+/// [`crate::published::TAKE_STEP`] until `bound` has passed.
+pub(crate) fn lock_session_within(
+    session: &Mutex<Session>,
+    bound: Duration,
+) -> std::sync::LockResult<Option<MutexGuard<'_, Session>>> {
+    #[cfg(debug_assertions)]
+    crate::input_domain::assert_not_held("a bounded wait for the session");
+    let until = Instant::now() + bound;
+    loop {
+        match session.try_lock() {
+            Ok(guard) => return Ok(Some(guard)),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                return Err(std::sync::PoisonError::new(Some(poisoned.into_inner())));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(None);
+        }
+        std::thread::sleep(left.min(crate::published::TAKE_STEP));
+    }
+}
+
 /// Where batches for the terminal's writer are handed over, and who is told they were.
 ///
 /// Whoever holds the input domain takes what it has queued and sends it here before letting the
@@ -744,6 +770,8 @@ pub struct SessionRuntime {
     session: Arc<Mutex<Session>>,
     /// What a keystroke touches, which is taken after the session and never before it.
     domain: Arc<crate::input_domain::InputShared>,
+    /// The session's summary as it was last published, outside the session's lock.
+    published: Arc<crate::published::PublishedSummary>,
     /// The machine's own continuous clock, shared with the writer and with whatever else in this
     /// process decides whether a forwarded deadline has passed. One reading of one clock answers
     /// the same question at both boundaries.
@@ -816,6 +844,7 @@ impl SessionRuntime {
         // after the lease it belongs to has ended, and the count of what that lease left behind
         // cannot be taken while a write of its own is part way through.
         let domain = session.input();
+        let published = session.published();
         let (
             gate,
             queued_input,
@@ -1187,6 +1216,7 @@ impl SessionRuntime {
             tasks: OwnedTasks::default(),
             session: Arc::clone(&session),
             domain: Arc::clone(&domain),
+            published: Arc::clone(&published),
             shared_clock: Arc::clone(&shared_clock),
             sink: sink.clone(),
             closed: Arc::clone(&closed),
@@ -1288,6 +1318,7 @@ impl SessionRuntime {
         // restarts the shell.
         let monitor_session = Arc::clone(&session);
         let monitor_domain = Arc::clone(&domain);
+        let monitor_published = Arc::clone(&published);
         let monitor_closed = Arc::clone(&closed);
         let monitor_sink = sink.clone();
         let monitor_fence = Arc::clone(&fence);
@@ -1308,6 +1339,7 @@ impl SessionRuntime {
                 tasks: OwnedTasks::default(),
                 session: Arc::clone(&monitor_session),
                 domain: Arc::clone(&monitor_domain),
+                published: monitor_published,
                 shared_clock: monitor_clock,
                 sink: monitor_sink.clone(),
                 closed: Arc::clone(&monitor_closed),
@@ -1572,6 +1604,25 @@ impl SessionRuntime {
     /// session state and the state can no longer be trusted.
     pub fn session(&self) -> MutexGuard<'_, Session> {
         lock_session(&self.session).expect("the session lock is not poisoned")
+    }
+
+    /// Locks the session for one operation, waiting for it no longer than `bound`.
+    ///
+    /// Returns `None` when something else still holds the session after `bound`, which is what a
+    /// call that waits for a disk does to it. The wait blocks its thread, so it is made where
+    /// [`off_the_executor`] is.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lock is poisoned, as [`Self::session`] does.
+    pub fn session_within(&self, bound: Duration) -> Option<MutexGuard<'_, Session>> {
+        lock_session_within(&self.session, bound).expect("the session lock is not poisoned")
+    }
+
+    /// Returns the session's summary as it was last published, which is read without the session.
+    #[must_use]
+    pub const fn published(&self) -> &Arc<crate::published::PublishedSummary> {
+        &self.published
     }
 
     /// Returns what a keystroke and the recogniser's timer touch.
