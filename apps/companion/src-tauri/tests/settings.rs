@@ -54,7 +54,7 @@ use kr_protocol::pairing::DevicePublicKeys;
 use kr_protocol::scalars::{AuthorisationKey, Nullable, Signature64, TimestampMs, Uuid};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner, installation_id};
 use kr_protocol::sync::SyncObjectKind;
-use kr_service_stand_in::{Moment, Served, serve};
+use kr_service_stand_in::{Moment, Served, serve, short_budget};
 use serde_json::{Value, json};
 use tauri::Manager as _;
 use tauri::test::{INVOKE_KEY, MockRuntime, mock_builder, mock_context, noop_assets};
@@ -2387,6 +2387,49 @@ async fn a_start_that_did_not_finish_goes_on_with_the_collection_it_began() {
         "the collection is the one the first start named"
     );
     assert_eq!(computer.elsewhere().colour().await, "dark");
+}
+
+/// KR-REQ-17.48: a person who turns settings sync on while the service's keyless budget is spent
+/// reads the service's own words, which settings sync reaches through the membership, and after
+/// them "Until then:" and each alternative the service named, as it wrote them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_17_48_a_spent_keyless_budget_at_turn_on_names_the_alternatives_after_the_services_words()
+ {
+    const NAMED: [&str; 2] = [
+        "A settings sync service that you run yourself.",
+        "A path this version has never heard of.",
+    ];
+    let computer = Computer::new().await;
+    let page = computer.start();
+    page.choose("dark");
+
+    // The budget stays spent for every request of the turn-on: the membership's first key record
+    // is turned back and asked about again, and the second refusal is the one that ends the step.
+    for nth in 1..=8 {
+        computer.served.web().fail(
+            SYNC_PATH,
+            nth,
+            short_budget(429, "RATE_LIMITED", 600, &NAMED),
+        );
+    }
+    let refused = page
+        .call("settings_sync_turn_on", json!({}))
+        .expect_err("the service turned the start back");
+    let told = refused["message"].as_str().expect("the command's words");
+    let words = "Managed capacity for new names is not available now.";
+    let list = format!("Until then: {} {}", NAMED[0], NAMED[1]);
+    assert!(told.contains(words), "{told}");
+    assert!(told.ends_with(&list), "the list ends the line: {told}");
+    assert_eq!(told.matches("Until then").count(), 1, "{told}");
+    assert!(
+        told.find(words) < told.find("Until then"),
+        "the service's own words come first: {told}"
+    );
+    assert_eq!(
+        page.view()["sync"]["problem"].as_str(),
+        Some(told),
+        "the page shows what the command said"
+    );
 }
 
 /* -------------------------------------------------------------------------- */
