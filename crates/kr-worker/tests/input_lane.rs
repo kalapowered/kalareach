@@ -352,7 +352,8 @@ impl Rig {
             environment_id,
             display_number: DisplayNumber::new(1),
             shell: kr_worker::testing::posix_script(&format!(
-                "stty raw -echo; printf '\\033[?2004hkr-ready.'; {wait}exec tee {}",
+                "stty raw -echo; printf '\\033[?2004hkr-ready.'; {wait}exec {} {}",
+                common::KEEPS_WHAT_IT_READS,
                 kr_worker::testing::shell_quoted(&received)
             )),
             shell_mode: if fenced {
