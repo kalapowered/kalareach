@@ -23,7 +23,9 @@
 //!   for an unreachable feed.
 //! * **Every [`FEED_POLL_INTERVAL_MS`] after that**, while the daemon runs. The interval is counted
 //!   on the daemon's continuous clock, which counts the time the machine sleeps, so after a wake
-//!   the next pass begins within five seconds, whether or not anybody reads the status.
+//!   the wait between two passes ends within five seconds, whether or not anybody reads the
+//!   status. A pass that has not finished holds the next one back: the next begins when that one
+//!   ends, and a pass lasts as long as the feed and the registry take over it.
 //! * **When an owner is revoked**, so the key it held stops being named as one that may remove the
 //!   feed.
 //! * **When the host finds an announcement in its mailbox** ([`crate::mailbox_reader`]), so a
@@ -101,7 +103,7 @@ pub const GATE_WAIT: Duration = Duration::from_secs(5);
 ///
 /// The timer a wait is made by does not count the time a machine sleeps on macOS and Linux, so the
 /// wait is also over when the continuous clock has passed its end. A machine that slept through a
-/// wait therefore asks again within this long of waking.
+/// wait therefore ends it within this long of waking.
 const CLOCK_LOOK: Duration = Duration::from_secs(5);
 
 /// The most pages of a feed one pass reads, so a feed that never stops saying there is more cannot
