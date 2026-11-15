@@ -1269,8 +1269,10 @@ async fn drive(shared: Arc<Shared>, timer: Arc<dyn Timer>) {
         // does not count the time the machine sleeps on macOS and Linux. A wait after a pass that
         // recorded a synchronisation begins at the instant it recorded, so that a sleep between
         // that record and this point counts; a wait after a pass that recorded none begins now.
-        let began = recorded.unwrap_or_else(|| controller.continuous_now());
-        let owed = shared.quiet.owed();
+        let at = controller.continuous_now();
+        let began = recorded.unwrap_or(at);
+        // A delay the service named is counted on the timer's clock as well, and is read at `at`.
+        let owed = shared.quiet.owed().map(|owed| (owed, at));
         drop(controller);
         if chained {
             // The feed holds more than a pass reads. Nothing waits for this pass, because it
@@ -1292,15 +1294,16 @@ async fn drive(shared: Arc<Shared>, timer: Arc<dyn Timer>) {
             Some(duration) => {
                 let looks =
                     Arc::clone(&shared.looks.lock().unwrap_or_else(PoisonError::into_inner));
-                let wait = Wait {
-                    began,
-                    duration,
-                    owed,
-                };
+                let wait = Wait { began, duration };
                 tokio::select! {
                     () = &mut woken => {}
                     () = timer.sleep(duration) => {}
                     () = until_the_continuous_clock_ends(&shared, looks.as_ref(), wait) => {}
+                }
+                // Whichever branch ended the wait, a delay that the continuous clock has counted
+                // is over: the loop's top does not wait out what the timer's clock still holds.
+                if let Some((owed, from)) = owed {
+                    end_a_delay_the_clock_counted(&shared, owed, from);
                 }
             }
             None => woken.await,
@@ -1315,18 +1318,12 @@ struct Wait {
     began: ContinuousInstant,
     /// How long it is.
     duration: Duration,
-    /// The delay the service named when it began, if one was owed: it is counted on the timer's
-    /// clock, which does not count the time the machine sleeps on macOS and Linux.
-    owed: Option<Owed>,
 }
 
 /// Ends when the daemon's continuous clock has passed the end of `wait`. It reads that clock every
 /// [`CLOCK_LOOK`], counting the time between two reads by `looks`, so that a wait the machine
 /// slept through ends within that long of the wake. It also ends when the daemon is gone, and the
 /// carrier then ends with it.
-///
-/// A delay the service named that the same clock has counted is over, and is ended with the wait:
-/// the carrier asks the feed again without waiting out what the timer's clock still holds of it.
 async fn until_the_continuous_clock_ends(shared: &Shared, looks: &dyn Timer, wait: Wait) {
     let Some(ends) = wait.began.checked_add(wait.duration) else {
         return std::future::pending().await;
@@ -1338,15 +1335,24 @@ async fn until_the_continuous_clock_ends(shared: &Shared, looks: &dyn Timer, wai
         };
         let now = controller.continuous_now();
         drop(controller);
-        if now < ends {
-            continue;
+        if now >= ends {
+            return;
         }
-        if let Some(owed) = wait.owed
-            && now.saturating_duration_since(wait.began) >= owed.left
-        {
-            shared.quiet.passed(owed.until);
-        }
+    }
+}
+
+/// Ends the delay the service named, `owed` as it stood at `from`, when the daemon's continuous
+/// clock has counted all of it since. A delay is counted on the timer's clock, which does not count
+/// the time a machine sleeps on macOS and Linux, so one the machine slept past would otherwise be
+/// waited out again after the wake. A delay the service named since is not ended.
+fn end_a_delay_the_clock_counted(shared: &Shared, owed: Owed, from: ContinuousInstant) {
+    let Some(controller) = shared.controller.get().and_then(Weak::upgrade) else {
         return;
+    };
+    let now = controller.continuous_now();
+    drop(controller);
+    if now.saturating_duration_since(from) >= owed.left {
+        shared.quiet.passed(owed.until);
     }
 }
 

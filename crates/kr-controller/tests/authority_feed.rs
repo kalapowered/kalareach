@@ -4689,6 +4689,61 @@ async fn a_carrier_that_slept_past_a_delay_the_feed_named_reads_the_feed_within_
     assert_eq!(check.status, DoctorStatus::Ok, "{check:?}");
 }
 
+/// KR-REQ-10.46: a wake that ends the carrier's wait before a look does leaves no part of a delay
+/// the feed named to be waited out again. The delay is counted on the timer's clock, which does not
+/// count the time a machine sleeps on macOS and Linux, and the continuous clock has counted all of
+/// it: the carrier asks the feed again at once, and not after what the timer's clock still holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wake_after_a_sleep_past_a_delay_the_feed_named_asks_the_feed_at_once() {
+    let (moved, clocks) = Moved::new();
+    let rig = Rig::start_on(clocks).await;
+    let looks = HeldTimer::held();
+    rig.runtime().count_looks_by(Arc::clone(&looks) as _);
+    rig.served.web().fail_with_member(
+        AUTHORITY,
+        "read",
+        1,
+        Moment::Refuse {
+            status: 503,
+            code: "SERVICE_UNAVAILABLE",
+            retry_after_seconds: Some(120),
+        },
+    );
+    rig.poll().await;
+    assert!(
+        rig.shown().await.list.feed_stale,
+        "the control: the pass could not read the feed"
+    );
+    // The carrier waits out the delay, and its look is held: nothing but a wake can end the wait.
+    let _held = a_look("the carrier looks at the clock", &looks).await;
+    let wakes = rig.runtime().wakes();
+    let reads = rig.arrivals("read");
+    let mut passes = rig.runtime().passes();
+    let seen = *passes.borrow_and_update();
+
+    // The machine slept past the delay, and a connection wakes the carrier before a look does.
+    moved.advance_continuous(Duration::from_secs(5 * 60));
+    rig.runtime().wake();
+    soon("the pass the wake owed", async {
+        while rig.arrivals("read") == reads || *passes.borrow_and_update() <= seen {
+            passes.changed().await.expect("the carrier is running");
+        }
+    })
+    .await;
+    assert_eq!(
+        rig.runtime().wakes(),
+        wakes + 1,
+        "the wake ended the wait, and no look did"
+    );
+    let shown = rig.shown().await;
+    assert!(
+        !shown.list.feed_stale,
+        "the pass read the feed, and the status is current after it"
+    );
+    let check = shown.check.expect("the doctor reports the feed");
+    assert_eq!(check.status, DoctorStatus::Ok, "{check:?}");
+}
+
 /// KR-REQ-10.46: a host that starts with its feed unreachable knows only the time an earlier run
 /// wrote down. Its age cannot be told, so the device list and the doctor read stale, and the
 /// doctor gives no number of seconds: a count taken from an earlier run's wall clock would say how
