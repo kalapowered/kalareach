@@ -24,7 +24,10 @@
 //!   [`AuthorityFeed::synchronisation_owed`] is the question a connection asks, and it stays true
 //!   until a synchronisation has actually happened.
 //! * **When the feed is unavailable, the status is stale and says so.** It is never reported as
-//!   up to date because nothing contradicted it.
+//!   up to date because nothing contradicted it: [`AuthorityFeed::status`] reads as stale when the
+//!   carrier said so, when the last synchronisation is older than [`STALE_AFTER`] (three polls) on
+//!   the daemon's continuous clock, and when that age cannot be told. Whatever ended the carrier,
+//!   a status that is read after the bound is stale.
 //! * **A feed that answered that this host was removed from it says so.** The status shows
 //!   the removal and the last synchronisation before it. What the grants that rest on the feed ask
 //!   is the host's policy, which the daemon sets from the same answer.
@@ -41,16 +44,25 @@
 //! web repository's.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use kr_protocol::ids::{AuthorityRevision, DeviceId, RevocationRequestId};
 use kr_protocol::pairing::{AuthorityRevisionRecord, RevocationRequest};
 use kr_protocol::scalars::{Nullable, TimestampMs};
 use kr_protocol::sharing::AuthorityFeedStatus;
+use kr_transport::clock::ContinuousInstant;
 
 use super::durable::{StoredFeed, StoredRevocation};
 
 /// How often a host polls the feed while it is online, in milliseconds.
 pub const FEED_POLL_INTERVAL_MS: u64 = 30_000;
+
+/// How many polls a host goes without a synchronisation before what it shows of the feed is stale.
+const POLLS_BEFORE_STALE: u64 = 3;
+
+/// How long a synchronisation keeps what the host shows of the feed current: three polls.
+pub const STALE_AFTER: Duration =
+    Duration::from_millis(FEED_POLL_INTERVAL_MS.saturating_mul(POLLS_BEFORE_STALE));
 
 /// One retained revocation record.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,6 +141,16 @@ pub enum FeedRefusal {
     AlreadyApplied,
 }
 
+/// What this host shows of the feed at one instant: the status, and how long before that instant it
+/// last synchronised where that can be told.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FeedReading {
+    /// The status, stale by the carrier's word or by the clock.
+    pub status: AuthorityFeedStatus,
+    /// The age of the last synchronisation of this run, or none where it cannot be told.
+    pub synchronised_ago: Option<Duration>,
+}
+
 /// This host's view of the remote authority feed.
 #[derive(Clone, Debug)]
 pub struct AuthorityFeed {
@@ -137,6 +159,12 @@ pub struct AuthorityFeed {
     records: BTreeMap<RevocationRequestId, RetainedRevocation>,
     enrolled: BTreeSet<DeviceId>,
     last_synchronised_at_ms: Option<u64>,
+    /// When the last synchronisation of this run happened, on the continuous clock. A wall clock
+    /// that is set back or forward cannot hide how long ago it was, and a host that has not
+    /// synchronised since it started has none.
+    synchronised_on: Option<ContinuousInstant>,
+    /// What the carrier last said: true after a failed pass, a removal, a replaced connection, or
+    /// before the first synchronisation. [`Self::status`] adds what the clock says.
     stale: bool,
     /// True until this host has synchronised on the connection it now holds.
     owes_synchronisation: bool,
@@ -170,6 +198,7 @@ impl AuthorityFeed {
             records: BTreeMap::new(),
             enrolled: BTreeSet::new(),
             last_synchronised_at_ms: None,
+            synchronised_on: None,
             stale: true,
             owes_synchronisation: true,
             removal: None,
@@ -377,10 +406,15 @@ impl AuthorityFeed {
         self.records.values().collect()
     }
 
-    /// Records a successful synchronisation with the feed.
-    pub const fn synchronised(&mut self, at_ms: u64) {
+    /// Records a successful synchronisation with the feed, at `at_ms` on the wall clock and `on`
+    /// the continuous clock.
+    ///
+    /// The wall time is what the host shows and writes down. The continuous instant is what the
+    /// status measures the synchronisation's age by.
+    pub const fn synchronised(&mut self, at_ms: u64, on: ContinuousInstant) {
         self.unwritten |= !matches!(self.last_synchronised_at_ms, Some(last) if last == at_ms);
         self.last_synchronised_at_ms = Some(at_ms);
+        self.synchronised_on = Some(on);
         self.stale = false;
         self.owes_synchronisation = false;
     }
@@ -452,19 +486,51 @@ impl AuthorityFeed {
         self.removal.is_some()
     }
 
-    /// What this host shows about the feed.
+    /// What this host shows about the feed at `now` on the continuous clock.
+    ///
+    /// Every reading of the status goes through here, so the status is stale when the carrier said
+    /// so, and also when the last synchronisation is older than [`STALE_AFTER`] or its age cannot
+    /// be told: the host has not synchronised in this run, or the instant it recorded is later than
+    /// `now`. Nothing has to notice that the carrier stopped for the status to say so.
     #[must_use]
-    pub fn status(&self) -> AuthorityFeedStatus {
+    pub fn status(&self, now: ContinuousInstant) -> AuthorityFeedStatus {
         AuthorityFeedStatus {
             accepted_revision: self.accepted,
             last_synchronised_at_ms: Nullable(self.last_synchronised_at_ms.map(TimestampMs::new)),
-            stale: self.stale,
+            stale: self.stale || !self.is_current_at(now),
             removed_at_ms: Nullable(
                 self.removal
                     .as_ref()
                     .map(|removal| TimestampMs::new(removal.at_ms)),
             ),
             unacknowledged_records: u32::try_from(self.retained().len()).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// How long before `now`, on the continuous clock, this host last synchronised in this run.
+    ///
+    /// None when its age cannot be told: it has not synchronised since it started, or the instant
+    /// it recorded is later than `now`. The verdict of [`Self::status`] and the age a person is
+    /// told are this one reading, so the two agree.
+    #[must_use]
+    pub fn synchronised_ago(&self, now: ContinuousInstant) -> Option<Duration> {
+        self.synchronised_on
+            .filter(|on| *on <= now)
+            .map(|on| now.saturating_duration_since(on))
+    }
+
+    /// Whether the last synchronisation of this run is no older than [`STALE_AFTER`] at `now`.
+    fn is_current_at(&self, now: ContinuousInstant) -> bool {
+        self.synchronised_ago(now)
+            .is_some_and(|ago| ago <= STALE_AFTER)
+    }
+
+    /// What this host shows about the feed at `now`, with the age the status was judged by.
+    #[must_use]
+    pub fn reading(&self, now: ContinuousInstant) -> FeedReading {
+        FeedReading {
+            status: self.status(now),
+            synchronised_ago: self.synchronised_ago(now),
         }
     }
 
@@ -537,6 +603,7 @@ impl AuthorityFeed {
                 .collect(),
             enrolled: stored.enrolled.iter().copied().collect(),
             last_synchronised_at_ms: stored.last_synchronised_at_ms.as_ref().map(|at| at.get()),
+            synchronised_on: None,
             stale: true,
             owes_synchronisation: true,
             removal: None,

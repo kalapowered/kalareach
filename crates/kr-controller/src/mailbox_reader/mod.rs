@@ -311,13 +311,7 @@ impl MailboxReader {
         };
         // The announcement is a hint beside the feed, so what a reader that cannot read costs the
         // host depends on whether the feed is still read.
-        let feed = if controller
-            .authority_feed()
-            .status()
-            .removed_at_ms
-            .0
-            .is_some()
-        {
+        let feed = if controller.authority_feed().is_removed() {
             "; the authority feed was removed, so no revocation reaches this host from it"
         } else {
             "; this host still reads its authority feed at the feed's own poll"

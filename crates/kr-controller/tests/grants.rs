@@ -3529,12 +3529,13 @@ fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowl
 
     // Reconnecting owes a synchronisation again, and an unreachable feed is stale rather than
     // silently current.
-    feed.synchronised(3_000);
+    let clock = ManualClock::new();
+    feed.synchronised(3_000, clock.now());
     assert!(!feed.synchronisation_owed());
-    assert!(!feed.status().stale);
+    assert!(!feed.status(clock.now()).stale);
     assert_eq!(feed.next_poll_due_ms(), Some(33_000));
     feed.unreachable();
-    assert!(feed.status().stale);
+    assert!(feed.status(clock.now()).stale);
     assert!(
         !feed.synchronisation_owed(),
         "an unreachable feed is not a reason to stop serving work this host is authorised for"
@@ -3567,7 +3568,80 @@ fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowl
         Some(Some(AuthorityRevision::new(4)))
     );
     assert!(restored.synchronisation_owed());
-    assert!(restored.status().stale);
+    assert!(restored.status(clock.now()).stale);
+}
+
+/// KR-REQ-10.46: the status is stale when the last synchronisation is older than three polls on the
+/// continuous clock, current up to and including the bound, and stale where its age cannot be told:
+/// the host has not synchronised since it started, or the instant it recorded is later than now.
+#[test]
+fn the_status_is_stale_past_three_polls_and_where_its_age_cannot_be_told() {
+    use kr_controller::grants::feed::STALE_AFTER;
+
+    let host = device_id(0xf0);
+    let clock = ManualClock::new();
+    let mut feed = AuthorityFeed::new(host, AuthorityRevision::new(3));
+    assert_eq!(
+        STALE_AFTER,
+        Duration::from_secs(90),
+        "three polls of thirty seconds"
+    );
+    assert!(
+        feed.status(clock.now()).stale && feed.synchronised_ago(clock.now()).is_none(),
+        "a host that has not synchronised has no age"
+    );
+
+    feed.synchronised(1_000, clock.now());
+    clock.advance(Duration::from_secs(90));
+    assert!(
+        !feed.status(clock.now()).stale,
+        "a synchronisation three polls old is not older than three polls"
+    );
+    assert_eq!(
+        feed.synchronised_ago(clock.now()),
+        Some(Duration::from_secs(90))
+    );
+    clock.advance(Duration::from_millis(1));
+    assert!(
+        feed.status(clock.now()).stale,
+        "a millisecond past the bound"
+    );
+
+    feed.synchronised(2_000, clock.now());
+    assert!(
+        !feed.status(clock.now()).stale,
+        "a synchronisation after the bound clears it"
+    );
+    assert_eq!(
+        feed.status(clock.now()).last_synchronised_at_ms,
+        Nullable::some(TimestampMs::new(2_000))
+    );
+
+    // An instant later than now is no age: a clock that reads earlier than the synchronisation
+    // did cannot say how long ago it was.
+    let earlier = ManualClock::new();
+    let reading = feed.reading(earlier.now());
+    assert!(reading.status.stale);
+    assert_eq!(reading.synchronised_ago, None);
+
+    // The carrier's word still stands inside the bound.
+    feed.unreachable();
+    assert!(feed.status(clock.now()).stale);
+    assert_eq!(
+        feed.synchronised_ago(clock.now()),
+        Some(Duration::ZERO),
+        "and the age is still the clock's"
+    );
+
+    // A host that restarted has no instant of this run, whatever time it wrote down.
+    let restored = AuthorityFeed::restore(&feed.snapshot(), None);
+    let reading = restored.reading(clock.now());
+    assert!(reading.status.stale);
+    assert_eq!(reading.synchronised_ago, None);
+    assert_eq!(
+        reading.status.last_synchronised_at_ms,
+        Nullable::some(TimestampMs::new(2_000))
+    );
 }
 
 /// A feed that answered that this host was removed from it says so, keeps the last
@@ -3578,7 +3652,8 @@ fn a_removal_the_feed_answered_is_shown_settles_what_was_owed_and_is_kept_apart(
     let host = device_id(0xf0);
     let mut feed = AuthorityFeed::new(host, AuthorityRevision::new(3));
     feed.enrol(host);
-    feed.synchronised(5_000);
+    let clock = ManualClock::new();
+    feed.synchronised(5_000, clock.now());
     let request = kr_protocol::pairing::RevocationRequest {
         request_id: RevocationRequestId::new(Uuid::from_bytes([9; 16])),
         issuer_device_id: device_id(0xb0),
@@ -3608,7 +3683,7 @@ fn a_removal_the_feed_answered_is_shown_settles_what_was_owed_and_is_kept_apart(
     assert!(!feed.is_removed());
 
     feed.removed_from("https://feed.example", 6_000);
-    let status = feed.status();
+    let status = feed.status(clock.now());
     assert_eq!(
         status.removed_at_ms,
         Nullable::some(TimestampMs::new(6_000))
@@ -3629,7 +3704,7 @@ fn a_removal_the_feed_answered_is_shown_settles_what_was_owed_and_is_kept_apart(
     // The first answer is the one recorded.
     feed.removed_from("https://feed.example", 9_000);
     assert_eq!(
-        feed.status().removed_at_ms,
+        feed.status(clock.now()).removed_at_ms,
         Nullable::some(TimestampMs::new(6_000))
     );
 
@@ -3641,7 +3716,7 @@ fn a_removal_the_feed_answered_is_shown_settles_what_was_owed_and_is_kept_apart(
     restored.restore_removal("https://feed.example", 6_000);
     assert!(restored.is_removed_from("https://feed.example"));
     assert_eq!(
-        restored.status().removed_at_ms,
+        restored.status(clock.now()).removed_at_ms,
         Nullable::some(TimestampMs::new(6_000))
     );
 }
@@ -3726,7 +3801,8 @@ fn a_feed_stored_before_removals_were_kept_reads_back() {
     assert!(!feed.is_removed());
     assert_eq!(feed.accepted_revision(), AuthorityRevision::new(7));
     assert_eq!(
-        feed.status().last_synchronised_at_ms,
+        feed.status(ManualClock::new().now())
+            .last_synchronised_at_ms,
         Nullable::some(TimestampMs::new(5_000))
     );
 }

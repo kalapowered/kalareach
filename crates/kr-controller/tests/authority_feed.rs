@@ -45,7 +45,9 @@ use kr_protocol::scalars::{
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 use kr_protocol::sharing::{DeviceListParams, DeviceListResult, OfflineValidityPolicy};
 use kr_service_stand_in::{Moment, Served, serve, short_budget};
-use net_support::{Device, Host, MovedWall, RawDevice, connect, pair_with, paired_dial, proposal};
+use net_support::{
+    Device, Host, Moved, MovedWall, RawDevice, connect, pair_with, paired_dial, proposal,
+};
 
 const AUTHORITY: &str = "/api/authority/sync";
 
@@ -4480,6 +4482,140 @@ async fn a_feed_that_cannot_be_reached_refuses_nothing_and_shows_stale_status() 
     assert!(shown.list.feed_stale, "what is shown of the feed is stale");
     let check = shown.check.expect("the doctor reports the feed");
     assert_eq!(check.status, DoctorStatus::Warning);
+}
+
+/// The seconds the doctor says the feed was last synchronised ago, where it says them.
+fn seconds_since_the_doctor_says_the_feed_was_read(
+    check: &kr_protocol::hostinfo::DoctorCheck,
+) -> Option<u64> {
+    let after = check.detail().split("it was last synchronised ").nth(1)?;
+    after.split_whitespace().next()?.parse().ok()
+}
+
+/// KR-REQ-10.46: a feed whose carrier has ended reads as stale once its last synchronisation is
+/// past three polls, in the device list and in the doctor, whatever ended the carrier: nothing has
+/// to notice that it ended. The doctor's seconds are the age that decided it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_feed_whose_carrier_ended_reads_stale_once_its_last_synchronisation_is_past_three_polls()
+{
+    let (moved, clocks) = Moved::new();
+    let rig = Rig::start_on(clocks).await;
+    let shown = rig.shown().await;
+    assert!(
+        !shown.list.feed_stale,
+        "the control: the feed was just read"
+    );
+    let check = shown.check.expect("the doctor reports the feed");
+    assert_eq!(check.status, DoctorStatus::Ok, "the control: {check:?}");
+
+    rig.runtime().crash();
+    moved.advance(Duration::from_secs(100));
+
+    let shown = rig.shown().await;
+    assert!(
+        shown.list.feed_stale,
+        "the device list says that what it shows of the feed is stale"
+    );
+    let check = shown.check.expect("the doctor reports the feed");
+    assert_eq!(check.status, DoctorStatus::Warning, "{check:?}");
+    let seconds = seconds_since_the_doctor_says_the_feed_was_read(&check)
+        .expect("the doctor says how long ago the feed was read");
+    assert!(
+        (100..200).contains(&seconds),
+        "the doctor's age is the clock's: {seconds}"
+    );
+}
+
+/// KR-REQ-10.46: the bound is three polls. A feed whose carrier waits out its poll is current two
+/// polls on and stale a poll and a second after that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_feed_is_current_two_polls_after_it_was_read_and_stale_past_the_third() {
+    let (moved, clocks) = Moved::new();
+    let rig = Rig::start_on(clocks).await;
+
+    moved.advance(Duration::from_secs(2 * 30));
+    let shown = rig.shown().await;
+    assert!(
+        !shown.list.feed_stale,
+        "two polls on, a poll short of the bound, the list shows it current"
+    );
+    let check = shown.check.expect("the doctor reports the feed");
+    assert_eq!(check.status, DoctorStatus::Ok, "{check:?}");
+
+    moved.advance(Duration::from_secs(30 + 1));
+    let shown = rig.shown().await;
+    assert!(
+        shown.list.feed_stale,
+        "past three polls, the list shows it stale"
+    );
+    let check = shown.check.expect("the doctor reports the feed");
+    assert_eq!(check.status, DoctorStatus::Warning, "{check:?}");
+}
+
+/// KR-REQ-10.46: a wall clock that is set back after a synchronisation does not make a dead feed
+/// read current, and does not make a feed that was just read read stale. The age is the continuous
+/// clock's, so a recorded time that is later than the wall clock's present changes neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wall_clock_set_back_after_a_synchronisation_does_not_hide_a_dead_feed() {
+    let (moved, clocks) = Moved::new();
+    let rig = Rig::start_on(clocks).await;
+    // The wall clock runs two hours ahead when the feed is read, and is then put right.
+    moved.advance_wall(Duration::from_secs(2 * 60 * 60));
+    rig.poll().await;
+    rig.runtime().crash();
+    moved.rewind_wall(Duration::from_secs(2 * 60 * 60));
+
+    let shown = rig.shown().await;
+    let recorded = shown
+        .list
+        .feed_synchronised_at_ms
+        .0
+        .expect("the host has synchronised the feed")
+        .get();
+    assert!(
+        recorded > kr_ipc::now_ms().get() + 60 * 60 * 1000,
+        "the control: the time recorded is later than the wall clock's present: {recorded}"
+    );
+    assert!(
+        !shown.list.feed_stale,
+        "the feed was read a moment ago, whatever the wall clock reads now"
+    );
+
+    moved.advance(Duration::from_secs(100));
+    let shown = rig.shown().await;
+    assert!(
+        shown.list.feed_stale,
+        "a dead feed is stale, with the wall clock still before the time recorded"
+    );
+    let check = shown.check.expect("the doctor reports the feed");
+    assert_eq!(check.status, DoctorStatus::Warning, "{check:?}");
+    assert!(
+        seconds_since_the_doctor_says_the_feed_was_read(&check)
+            .is_some_and(|seconds| seconds >= 100),
+        "the doctor's age is the continuous clock's: {check:?}"
+    );
+}
+
+/// KR-REQ-10.46: a carrier that is alive reads the feed at its next poll, and the status that the
+/// clock made stale is current again: no stale stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_carrier_that_reads_the_feed_again_clears_what_the_clock_said() {
+    let (moved, clocks) = Moved::new();
+    let rig = Rig::start_on(clocks).await;
+    moved.advance(Duration::from_secs(100));
+    assert!(
+        rig.shown().await.list.feed_stale,
+        "the control: its last synchronisation is past three polls"
+    );
+
+    rig.poll().await;
+    let shown = rig.shown().await;
+    assert!(
+        !shown.list.feed_stale,
+        "the poll found the feed and read it"
+    );
+    let check = shown.check.expect("the doctor reports the feed");
+    assert_eq!(check.status, DoctorStatus::Ok, "{check:?}");
 }
 
 /// The keys the feed may be told can remove the host are the owners the host is paired with now: an

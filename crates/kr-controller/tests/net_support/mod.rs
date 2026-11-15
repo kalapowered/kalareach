@@ -367,6 +367,17 @@ impl Moved {
         );
     }
 
+    /// Takes the wall clock `by` back, as a clock that was set wrong is put right, and leaves the
+    /// continuous clock where it is. It undoes what was added to the wall clock, no more.
+    pub fn rewind_wall(&self, by: Duration) {
+        let by = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
+        let _ = self.wall_ahead_ms.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |ahead| Some(ahead.saturating_sub(by)),
+        );
+    }
+
     /// Takes both clocks `by` forward.
     ///
     /// The wall clock goes first. A daemon that reads between the two steps anchors the new wall
