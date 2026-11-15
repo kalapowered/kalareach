@@ -1490,6 +1490,250 @@ async fn an_update_handover_step_whose_deadline_passes_before_it_runs_changes_no
     );
 }
 
+/// KR-REQ-09.09: an update handover step asks its admission under the gate's lock, immediately
+/// before the gate changes. A fence that this host comes to owe while the step waits for that lock
+/// stops it: the gate is as it was, nothing is closed, stopped or resumed. The control: with no
+/// fence owed, the same steps are taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_update_handover_step_that_waits_for_the_gates_lock_meets_a_fence_owed_in_the_wait() {
+    use kr_protocol::scalars::Uuid;
+    use kr_protocol::update::{
+        HandoverStep, HostUpdateHandoverParams, HostUpdateHandoverResult, ReleaseName,
+    };
+    for owed in [false, true] {
+        let (temp, controller, _clock) = daemon().await;
+        let (connection_id, actor_id) = admitted(&controller).await;
+        let captured = controller
+            .admitted_revision(connection_id)
+            .expect("the connection is registered");
+        let step = |step: HandoverStep, attempt: Option<Uuid>| {
+            let controller = Arc::clone(&controller);
+            let actor_id = actor_id.clone();
+            let mutation = mutation_of(
+                &temp,
+                Method::HostUpdateHandover,
+                ParamsValue::from_typed(&HostUpdateHandoverParams {
+                    step,
+                    target: ReleaseName::new("0.2.0+4254aa6e62e5").expect("a release"),
+                    attempt: attempt.map_or_else(Nullable::null, Nullable::some),
+                })
+                .expect("encodes"),
+            );
+            let accepted = accepted(&controller);
+            async move {
+                controller
+                    .write_method(
+                        &actor_id,
+                        &mutation,
+                        Method::HostUpdateHandover,
+                        connection_id,
+                        None,
+                        Some(accepted),
+                        Some(captured),
+                    )
+                    .await
+                    .into_answer_for_test()
+            }
+        };
+        // The step is stopped where it waits for the gate's lock, a fence is owed there, and it
+        // goes on.
+        let stopped_at_the_lock = |step: Box<
+            dyn std::future::Future<Output = ControlFrame> + Send,
+        >| {
+            let controller = Arc::clone(&controller);
+            async move {
+                let (arrived, go) = controller.pause_before_the_gate_lock();
+                let running = tokio::spawn(Box::into_pin(step));
+                tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30)))
+                    .await
+                    .expect("the wait ends")
+                    .expect("the step reaches the gate's lock");
+                controller.hold_fence(owed);
+                go.send(()).expect("the step goes on");
+                let answered = running.await.expect("the step finishes");
+                controller.hold_fence(false);
+                answered
+            }
+        };
+
+        // A prepare closes the gate.
+        let prepared = stopped_at_the_lock(Box::new(step(HandoverStep::Prepare, None))).await;
+        if owed {
+            refused_for_a_fence(refusal(&prepared).expect("a prepare in a fence is refused"));
+            assert!(
+                controller.handover.admit().is_ok(),
+                "the gate was not closed"
+            );
+            continue;
+        }
+        let ControlFrame::Response(kr_protocol::envelope::Response {
+            outcome: Outcome::Ok(prepared),
+            ..
+        }) = prepared
+        else {
+            panic!("the control prepares: {prepared:?}");
+        };
+        let attempt = prepared
+            .to_typed::<HostUpdateHandoverResult>()
+            .expect("decodes")
+            .attempt
+            .0
+            .expect("the prepare began an attempt");
+        assert!(
+            controller.handover.admit().is_err(),
+            "the control closes the gate"
+        );
+        let resumed =
+            stopped_at_the_lock(Box::new(step(HandoverStep::Resume, Some(attempt)))).await;
+        assert!(
+            refusal(&resumed).is_none(),
+            "the control resumes: {resumed:?}"
+        );
+        assert!(
+            controller.handover.admit().is_ok(),
+            "the control opens the gate"
+        );
+    }
+
+    // The same steps against a gate that is closed: a fence owed in the wait stops a resume and a
+    // stop, and the attempt stays as it was.
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let captured = controller
+        .admitted_revision(connection_id)
+        .expect("the connection is registered");
+    let step = |step: HandoverStep, attempt: Option<Uuid>| {
+        let controller = Arc::clone(&controller);
+        let actor_id = actor_id.clone();
+        let mutation = mutation_of(
+            &temp,
+            Method::HostUpdateHandover,
+            ParamsValue::from_typed(&HostUpdateHandoverParams {
+                step,
+                target: ReleaseName::new("0.2.0+4254aa6e62e5").expect("a release"),
+                attempt: attempt.map_or_else(Nullable::null, Nullable::some),
+            })
+            .expect("encodes"),
+        );
+        let accepted = accepted(&controller);
+        async move {
+            controller
+                .write_method(
+                    &actor_id,
+                    &mutation,
+                    Method::HostUpdateHandover,
+                    connection_id,
+                    None,
+                    Some(accepted),
+                    Some(captured),
+                )
+                .await
+                .into_answer_for_test()
+        }
+    };
+    let prepared = step(HandoverStep::Prepare, None).await;
+    let ControlFrame::Response(kr_protocol::envelope::Response {
+        outcome: Outcome::Ok(prepared),
+        ..
+    }) = prepared
+    else {
+        panic!("a prepare with nothing owed is taken: {prepared:?}");
+    };
+    let attempt = prepared
+        .to_typed::<HostUpdateHandoverResult>()
+        .expect("decodes")
+        .attempt
+        .0
+        .expect("the prepare began an attempt");
+    for which in [HandoverStep::Resume, HandoverStep::Stop] {
+        let (arrived, go) = controller.pause_before_the_gate_lock();
+        let running = tokio::spawn(step(which, Some(attempt)));
+        tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30)))
+            .await
+            .expect("the wait ends")
+            .expect("the step reaches the gate's lock");
+        controller.hold_fence(true);
+        go.send(()).expect("the step goes on");
+        let answered = running.await.expect("the step finishes");
+        controller.hold_fence(false);
+        refused_for_a_fence(refusal(&answered).expect("a step in a fence is refused"));
+        assert!(
+            controller.handover.admit().is_err(),
+            "the attempt was not ended: the gate is still closed"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), controller.handed_over())
+                .await
+                .is_err(),
+            "nothing was stopped"
+        );
+    }
+}
+
+/// KR-REQ-09.09: the checks a service asks (the registration check and the admission check inside
+/// a transaction) compare the admission's deadline after the last lock that they take. The last
+/// reading of the fence takes the fence's lock, and a deadline that passes while that lock is
+/// waited for is read afterwards: the check refuses as expired. The control: where the deadline
+/// stands after the wait, the checks pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_check_that_waits_for_the_fences_lock_meets_a_deadline_that_passes_in_the_wait() {
+    use crate::error::ControllerError;
+    for registration_check in [true, false] {
+        for passes in [false, true] {
+            let (_temp, controller, clock) = daemon().await;
+            let (connection_id, _actor_id) = admitted(&controller).await;
+            let admission = crate::authority::AdmittedMutation {
+                connection_id,
+                admitted_revision: controller
+                    .admitted_revision(connection_id)
+                    .expect("the connection is registered"),
+                deadline: controller.clock.now().checked_add(STANDING),
+            };
+            let (arrived, go) = controller.pause_before_the_last_fence_read();
+            let registry = if registration_check {
+                None
+            } else {
+                Some(controller.registry.lock().await)
+            };
+            let releasing = {
+                let clock = clock.clone();
+                tokio::spawn(async move {
+                    // Every earlier reading has passed, and the check is about to take the
+                    // fence's lock.
+                    tokio::task::spawn_blocking(move || {
+                        arrived.recv_timeout(Duration::from_secs(30))
+                    })
+                    .await
+                    .expect("the wait ends")
+                    .expect("the check reaches its last reading of the fence");
+                    if passes {
+                        clock.advance(STANDING + Duration::from_secs(1));
+                    }
+                    go.send(()).expect("the check goes on");
+                })
+            };
+            let checked = tokio::task::block_in_place(|| match &registry {
+                None => controller.check_registration(&admission),
+                Some(registry) => controller.check_admission(registry, &admission),
+            });
+            releasing.await.expect("the release ends");
+            assert_eq!(
+                matches!(checked, Err(ControllerError::WindowExpired { .. })),
+                passes,
+                "{} with a deadline that passed in the wait: {passes}: {checked:?}",
+                if registration_check {
+                    "the registration check"
+                } else {
+                    "the admission check"
+                }
+            );
+            if !passes {
+                assert!(checked.is_ok(), "the control: {checked:?}");
+            }
+        }
+    }
+}
+
 /// An enrolment of an environment, for the record this host keeps of them.
 fn enrolment_of(byte: u8) -> kr_protocol::identity::EnvironmentEnrolment {
     use kr_protocol::identity::{EnvironmentAccess, EnvironmentEnrolment};

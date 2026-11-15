@@ -1390,6 +1390,10 @@ pub(super) struct Handover {
     settled: tokio::sync::Notify,
     /// Whether this daemon has been told to stop.
     stopping: tokio::sync::watch::Sender<bool>,
+    /// Where this host's own tests stop a handover step just before it takes the gate's lock, so
+    /// that authority can change in that wait. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub(super) before_the_gate_lock: super::ThreadPause,
 }
 
 /// The gate itself.
@@ -1429,6 +1433,8 @@ impl Default for Handover {
             gate: std::sync::Mutex::default(),
             settled: tokio::sync::Notify::new(),
             stopping: tokio::sync::watch::channel(false).0,
+            #[cfg(feature = "testing")]
+            before_the_gate_lock: super::ThreadPause::default(),
         }
     }
 }
@@ -1453,6 +1459,14 @@ impl Handover {
         self.gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The gate's lock, taken by a step that changes it: the one place a test stops such a step
+    /// before the lock, so that authority can change in that wait.
+    fn lock_for_a_step(&self) -> std::sync::MutexGuard<'_, Gate> {
+        #[cfg(feature = "testing")]
+        self.before_the_gate_lock.wait();
+        self.lock()
     }
 
     /// Admits one create, counted until the returned value is dropped, or refuses it while the
@@ -1486,20 +1500,32 @@ impl Handover {
     /// Begins an attempt: closes the gate for `hold` under a new identity, naming the release the
     /// host is being updated to, and returns the identity. An attempt already open is over.
     ///
+    /// `still` is the step's admission, asked under the gate's lock immediately before the gate
+    /// changes: the lock can be waited for, and what the step was admitted under can have ended in
+    /// that wait. Where it refuses, the gate is as it was.
+    ///
     /// # Errors
     ///
-    /// `ENVIRONMENT_UNAVAILABLE` once this daemon has been told to stop.
-    pub(super) fn close(&self, target: &ReleaseName, hold: std::time::Duration) -> Result<Uuid> {
-        let mut gate = self.lock();
+    /// `ENVIRONMENT_UNAVAILABLE` once this daemon has been told to stop, and what `still` refuses
+    /// with.
+    pub(super) fn close(
+        &self,
+        target: &ReleaseName,
+        hold: std::time::Duration,
+        still: impl FnOnce() -> Result<()>,
+    ) -> Result<Uuid> {
+        let mut gate = self.lock_for_a_step();
         if *self.stopping.borrow() {
             return Err(stopping());
         }
         let attempt = kr_ipc::new_uuid();
-        gate.closed = Some(Closed {
+        let closed = Closed {
             attempt,
             target: target.clone(),
             until: std::time::Instant::now() + hold,
-        });
+        };
+        still()?;
+        gate.closed = Some(closed);
         Ok(attempt)
     }
 
@@ -1527,18 +1553,26 @@ impl Handover {
     /// is not going ahead. Returns the attempt it ended, none when the one named is already over
     /// or none was open.
     ///
+    /// `still` is the step's admission, asked under the gate's lock immediately before the gate
+    /// opens, as [`Self::close`] asks it.
+    ///
     /// # Errors
     ///
     /// `ENVIRONMENT_UNAVAILABLE` once this daemon has been told to stop: it is going, and the
-    /// environment is served again by the daemon that starts after it.
-    pub(super) fn resume(&self, attempt: Option<Uuid>) -> Result<Option<Uuid>> {
-        let mut gate = self.lock();
+    /// environment is served again by the daemon that starts after it. What `still` refuses with.
+    pub(super) fn resume(
+        &self,
+        attempt: Option<Uuid>,
+        still: impl FnOnce() -> Result<()>,
+    ) -> Result<Option<Uuid>> {
+        let mut gate = self.lock_for_a_step();
         if *self.stopping.borrow() {
             return Err(stopping());
         }
         match &gate.closed {
             Some(closed) if attempt.is_none_or(|named| named == closed.attempt) => {
                 let ended = closed.attempt;
+                still()?;
                 gate.closed = None;
                 Ok(Some(ended))
             }
@@ -1566,23 +1600,31 @@ impl Handover {
     /// Tells this daemon to stop, under the attempt it was prepared for, while that attempt is
     /// the gate's and its hold has not lapsed. Asked again for the same attempt, it stops still.
     ///
+    /// `still` is the step's admission, asked under the gate's lock immediately before the daemon
+    /// is told to stop, as [`Self::close`] asks it.
+    ///
     /// # Errors
     ///
     /// `INVALID_ARGUMENT` when no attempt is named, and `RESOURCE_UNAVAILABLE` when the attempt
     /// is not the one the gate is closed for: this daemon was not prepared, the preparation
     /// lapsed and it may have started sessions since, or another attempt began or this one
-    /// ended.
-    pub(super) fn stop(&self, attempt: Option<Uuid>) -> Result<Uuid> {
+    /// ended. What `still` refuses with.
+    pub(super) fn stop(
+        &self,
+        attempt: Option<Uuid>,
+        still: impl FnOnce() -> Result<()>,
+    ) -> Result<Uuid> {
         let Some(attempt) = attempt else {
             return Err(ControllerError::InvalidArgument(
                 "a stop names the attempt that prepare answered".to_owned(),
             ));
         };
-        let gate = self.lock();
+        let gate = self.lock_for_a_step();
         match &gate.closed {
             Some(closed)
                 if closed.attempt == attempt && std::time::Instant::now() < closed.until =>
             {
+                still()?;
                 self.stopping.send_replace(true);
                 Ok(attempt)
             }
@@ -1611,11 +1653,11 @@ impl Controller {
     /// step for an attempt that is over changes nothing, so an updater that lost an answer asks
     /// again rather than guessing.
     ///
-    /// The admission the request carries is asked again immediately before the step's effect: the
-    /// request was admitted at the door, and what comes between that and here (the task that
-    /// carries it out, the claim of its action) can outlast its deadline, its registration or the
-    /// owner's lease. Where it no longer stands, the gate is not closed and nothing is stopped or
-    /// resumed.
+    /// The admission the request carries is asked again immediately before the step's effect, and
+    /// under the gate's lock: the request was admitted at the door, and what comes between that and
+    /// here (the task that carries it out, the claim of its action, the wait for the gate's lock)
+    /// can outlast its deadline, its registration or the owner's lease. Where it no longer
+    /// stands, the gate is not closed and nothing is stopped or resumed.
     ///
     /// # Errors
     ///
@@ -1640,12 +1682,16 @@ impl Controller {
             (HandoverStep::Prepare, Err(error)) => return Err(error),
             (_, Err(_)) => StartedLike::default(),
         };
+        // An early refusal, before anything waits or changes; the step asks again under the gate's
+        // lock, immediately before the gate changes.
         self.check_registration(carried)?;
+        let still = || self.check_registration(carried);
         let attempt = match params.step {
             HandoverStep::Prepare => {
                 let attempt = self.handover.close(
                     &params.target,
                     std::time::Duration::from_millis(HANDOVER_HOLD_MS),
+                    still,
                 )?;
                 let unsettled = self
                     .handover
@@ -1677,8 +1723,8 @@ impl Controller {
                 }
                 Some(attempt)
             }
-            HandoverStep::Stop => Some(self.handover.stop(params.attempt.0)?),
-            HandoverStep::Resume => self.handover.resume(params.attempt.0)?,
+            HandoverStep::Stop => Some(self.handover.stop(params.attempt.0, still)?),
+            HandoverStep::Resume => self.handover.resume(params.attempt.0, still)?,
         };
         encode(&self.started_as(started, attempt))
     }

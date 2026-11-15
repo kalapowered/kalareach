@@ -338,16 +338,22 @@ impl Controller {
             Method::OwnerConfirmationRequest => {
                 let params: OwnerConfirmationRequestParams = decode(&mutation.params)?;
                 if !caller.may_confirm(&params.subject) {
-                    return Err(if caller.confirms_the_clock_only {
-                        crate::grants::continuity_lost()
-                    } else {
-                        ControllerError::PermissionDenied {
-                            detail: "a device that no membership lease serves confirms only the \
-                                     clock and the end of exclusive management"
-                                .to_owned(),
-                        }
-                    });
+                    return Err(caller.refusal_to_confirm());
                 }
+                // The caller's scope is read again where the admission is asked, inside the
+                // transaction that records the request: the lease the door found can end in the
+                // waits before it, and the refusal is the door's own.
+                let admission: Admission = {
+                    let caller = caller.clone();
+                    let subject = params.subject.clone();
+                    Arc::new(move || {
+                        let now = caller.decided_now();
+                        if !now.may_confirm(&subject) {
+                            return Err(now.refusal_to_confirm());
+                        }
+                        admission()
+                    })
+                };
                 if matches!(params.subject, ConfirmationSubject::EstablishClock) {
                     let owner = Arc::clone(&self.owner);
                     let on_the_network = self.network_guard().is_some();

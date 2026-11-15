@@ -330,10 +330,16 @@ impl Controller {
             return false;
         };
         let record_stands = || from_a_record.is_none_or(|record| record.stands(self));
-        let lease_holds = || leased.is_none_or(|method| self.local_hold(method).is_ok());
         // The lease is asked first: its reading waits for the policy lock, which a policy commit
-        // holds across its storage writes, and the record's fence is read after that wait.
-        let permitted = || lease_holds() && record_stands();
+        // holds across its storage writes, and the record's fence is read after that wait. The
+        // record's check takes locks of its own, so the lease's end that the reading returned is
+        // compared with the clock again after them, with no lock of its own.
+        let permitted = || {
+            let Some(end) = leased.map_or(Some(None), |method| self.local_hold(method).ok()) else {
+                return false;
+            };
+            record_stands() && self.lease_is_live_until(end).is_ok()
+        };
         let mut begun = false;
         loop {
             let attempt = if begun {
@@ -429,6 +435,24 @@ impl Controller {
         &self,
     ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
         self.before_the_shares_lock.arm()
+    }
+
+    /// Arms the pause the next admission check stops at before its last reading of the fence. Returns
+    /// the end that says the check has arrived, and the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_the_last_fence_read(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.before_the_last_fence_read.arm()
+    }
+
+    /// Arms the pause the next handover step stops at before it takes the gate's lock. Returns the
+    /// end that says the step has arrived, and the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_the_gate_lock(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.handover.before_the_gate_lock.arm()
     }
 
     /// Arms the pause the next answer the local door tells stops at as it begins to tell it, so

@@ -51,7 +51,9 @@ fn target() -> ReleaseName {
 
 /// Begins an attempt on `handover` that holds for `hold`.
 fn begin(handover: &Handover, hold: Duration) -> Uuid {
-    handover.close(&target(), hold).expect("an attempt begins")
+    handover
+        .close(&target(), hold, || Ok(()))
+        .expect("an attempt begins")
 }
 
 /// A create passes an open gate, is refused by a closed one with the release the host is being
@@ -67,13 +69,16 @@ fn a_create_passes_an_open_gate_and_is_refused_by_a_closed_one() {
         refused.to_string().contains("0.2.0+4254aa6e62e5"),
         "{refused}"
     );
-    assert_eq!(handover.resume(None).expect("resumes"), Some(attempt));
+    assert_eq!(
+        handover.resume(None, || Ok(())).expect("resumes"),
+        Some(attempt)
+    );
     drop(handover.admit().expect("the gate is open again"));
 
     // A hold that lapses opens the gate by itself, and then nothing stops the daemon.
     let lapsed = begin(&handover, Duration::ZERO);
     drop(handover.admit().expect("a lapsed gate is open"));
-    assert!(handover.stop(Some(lapsed)).is_err());
+    assert!(handover.stop(Some(lapsed), || Ok(())).is_err());
 }
 
 /// A handover waits for the creates under way, and says how many did not settle in time.
@@ -102,7 +107,9 @@ async fn a_handover_waits_for_the_creates_under_way() {
 async fn only_a_prepared_daemon_is_told_to_stop() {
     let handover = Arc::new(Handover::default());
     assert!(
-        handover.stop(Some(Uuid::from_bytes([1; 16]))).is_err(),
+        handover
+            .stop(Some(Uuid::from_bytes([1; 16])), || Ok(()))
+            .is_err(),
         "an open gate is never stopped"
     );
     let waiting = {
@@ -111,12 +118,15 @@ async fn only_a_prepared_daemon_is_told_to_stop() {
     };
     let attempt = begin(&handover, Duration::from_secs(300));
     assert_eq!(
-        handover.stop(None).err().map(|error| error.code()),
+        handover
+            .stop(None, || Ok(()))
+            .err()
+            .map(|error| error.code()),
         Some(ErrorCode::InvalidArgument),
         "a stop names its attempt"
     );
     handover
-        .stop(Some(attempt))
+        .stop(Some(attempt), || Ok(()))
         .expect("a prepared daemon stops");
     tokio::time::timeout(LIVENESS_DEADLINE, waiting)
         .await
@@ -132,18 +142,18 @@ fn a_stopping_daemon_does_not_resume_and_a_resumed_one_does_not_stop() {
     let stopped = Handover::default();
     let attempt = begin(&stopped, Duration::from_secs(300));
     stopped
-        .stop(Some(attempt))
+        .stop(Some(attempt), || Ok(()))
         .expect("a prepared daemon stops");
     // Asked again for the same attempt, it stops still: an updater that lost the answer asks again.
     stopped
-        .stop(Some(attempt))
+        .stop(Some(attempt), || Ok(()))
         .expect("the same stop is repeated");
     let refused = stopped
-        .resume(None)
+        .resume(None, || Ok(()))
         .expect_err("a stopping daemon does not resume");
     assert_eq!(refused.code(), ErrorCode::EnvironmentUnavailable);
     let refused = stopped
-        .close(&target(), Duration::from_secs(300))
+        .close(&target(), Duration::from_secs(300), || Ok(()))
         .expect_err("a stopping daemon does not prepare");
     assert_eq!(refused.code(), ErrorCode::EnvironmentUnavailable);
 
@@ -151,10 +161,10 @@ fn a_stopping_daemon_does_not_resume_and_a_resumed_one_does_not_stop() {
     let resumed = Handover::default();
     let attempt = begin(&resumed, Duration::from_secs(300));
     resumed
-        .resume(Some(attempt))
+        .resume(Some(attempt), || Ok(()))
         .expect("a prepared daemon resumes");
     assert!(
-        resumed.stop(Some(attempt)).is_err(),
+        resumed.stop(Some(attempt), || Ok(())).is_err(),
         "a resumed daemon is not stopped"
     );
     drop(resumed.admit().expect("its gate is open"));
@@ -167,11 +177,14 @@ fn a_late_stop_of_an_attempt_that_is_over_ends_nothing() {
     let handover = Handover::default();
     let first = begin(&handover, Duration::from_secs(300));
     // The update gave up, and the next one, of the same release, began.
-    assert_eq!(handover.resume(None).expect("resumes"), Some(first));
+    assert_eq!(
+        handover.resume(None, || Ok(())).expect("resumes"),
+        Some(first)
+    );
     let second = begin(&handover, Duration::from_secs(300));
     assert_ne!(first, second, "each attempt has an identity of its own");
     let refused = handover
-        .stop(Some(first))
+        .stop(Some(first), || Ok(()))
         .expect_err("the first attempt is over");
     assert_eq!(refused.code(), ErrorCode::ResourceUnavailable);
     assert!(
@@ -179,20 +192,30 @@ fn a_late_stop_of_an_attempt_that_is_over_ends_nothing() {
         "the second attempt's gate stays closed"
     );
     // A resume of the first attempt, sent late as well, does not end the second.
-    assert_eq!(handover.resume(Some(first)).expect("changes nothing"), None);
+    assert_eq!(
+        handover
+            .resume(Some(first), || Ok(()))
+            .expect("changes nothing"),
+        None
+    );
     assert!(
         handover.admit().is_err(),
         "the second attempt's gate is still closed"
     );
     // Beginning another supersedes an attempt that never ended, too.
     let third = begin(&handover, Duration::from_secs(300));
-    assert!(handover.stop(Some(second)).is_err(), "the second is over");
-    handover.stop(Some(third)).expect("the open attempt stops");
+    assert!(
+        handover.stop(Some(second), || Ok(())).is_err(),
+        "the second is over"
+    );
+    handover
+        .stop(Some(third), || Ok(()))
+        .expect("the open attempt stops");
 
     // The control: an attempt whose hold has lapsed is over as well.
     let lapsed = Handover::default();
     let attempt = begin(&lapsed, Duration::ZERO);
-    assert!(lapsed.stop(Some(attempt)).is_err());
+    assert!(lapsed.stop(Some(attempt), || Ok(())).is_err());
 }
 
 /// A daemon answers a `prepare` as prepared only while its attempt is the gate's: an attempt that
@@ -202,7 +225,7 @@ fn an_attempt_is_current_only_until_it_is_over() {
     let handover = Handover::default();
     let first = begin(&handover, Duration::from_secs(300));
     assert!(handover.is_current(first));
-    handover.resume(Some(first)).expect("resumes");
+    handover.resume(Some(first), || Ok(())).expect("resumes");
     assert!(!handover.is_current(first), "a resumed attempt is over");
     let second = begin(&handover, Duration::from_secs(300));
     let third = begin(&handover, Duration::from_secs(300));
@@ -266,7 +289,11 @@ async fn a_prepare_whose_attempt_ended_while_it_settled_is_refused() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(
-        controller.handover.resume(None).expect("resumes").is_some(),
+        controller
+            .handover
+            .resume(None, || Ok(()))
+            .expect("resumes")
+            .is_some(),
         "the attempt was open"
     );
     drop(under_way);

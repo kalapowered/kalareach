@@ -114,8 +114,28 @@ impl Controller {
             return Err(refusal);
         }
         // The feed's check took the connection's shares lock, and a fence that was published while
-        // it waited is read here, after that lock, as the last reading of the check.
-        self.check_fence()
+        // it waited is read here, after that lock, as the last reading of the check. The fence's
+        // own lock can be waited for too, so the deadline is compared once more after it.
+        #[cfg(feature = "testing")]
+        self.before_the_last_fence_read.wait();
+        self.check_fence()?;
+        self.check_deadline(admission)
+    }
+
+    /// Refuses a mutation whose accepted deadline has passed on this daemon's clock, read now.
+    ///
+    /// Asked last by [`Self::check_admission`] and [`Self::check_registration_in`], after the
+    /// locks that they take, so the deadline cannot pass in the wait for one of them.
+    fn check_deadline(&self, admission: &crate::authority::AdmittedMutation) -> Result<()> {
+        if admission
+            .deadline
+            .is_some_and(|deadline| self.clock.now() >= deadline)
+        {
+            return Err(ControllerError::WindowExpired {
+                detail: crate::authority::AdmissionLapse::Expired.to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// The refusal the authority feed puts on remote grants, as an error, when one stands and
@@ -820,17 +840,14 @@ impl Controller {
         {
             return Err(refused);
         }
-        if admission
-            .deadline
-            .is_some_and(|deadline| self.clock.now() >= deadline)
-        {
-            return Err(ControllerError::WindowExpired {
-                detail: crate::authority::AdmissionLapse::Expired.to_string(),
-            });
-        }
+        self.check_deadline(admission)?;
         // The feed's check took the connection's shares lock, and a fence that was published while
-        // it waited is read here, after that lock, as the last reading of the check.
-        self.check_fence()
+        // it waited is read here, after that lock, as the last reading of the check. The fence's
+        // own lock can be waited for too, so the deadline is compared once more after it.
+        #[cfg(feature = "testing")]
+        self.before_the_last_fence_read.wait();
+        self.check_fence()?;
+        self.check_deadline(admission)
     }
 
     /// Returns the authority revision a connection was admitted under.
