@@ -1537,7 +1537,7 @@ async fn an_update_left_after_its_switch_names_a_daemon_that_answers_as_the_rele
         message.contains(&format!(
             "(process {pid}) answers as kr-controller/{}",
             one.name()
-        )) && message.contains(&format!("kill {pid}")),
+        )) && message.contains(&format!("kill -KILL {pid}")),
         "the daemon is named, with what it answers as and how to stop it: {said}"
     );
     assert_eq!(host.record()["update"]["state"], "switched");
@@ -2619,7 +2619,7 @@ fn stop_command(pid: u32) -> String {
     if cfg!(windows) {
         format!("taskkill /F /PID {pid}")
     } else {
-        format!("kill {pid}")
+        format!("kill -KILL {pid}")
     }
 }
 

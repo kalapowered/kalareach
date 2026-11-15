@@ -339,13 +339,16 @@ pub async fn writers_lock(
     }
 }
 
-/// The command that ends a process on this platform, for a message that tells a person how to stop
-/// a daemon that does not answer; the process identifier follows it.
+/// The command that ends a process by force on this platform, for a message that tells a person
+/// how to stop a daemon that does not answer; the process identifier follows it.
+///
+/// Forced on every platform. A daemon asked to stop with SIGTERM begins a graceful end and goes on
+/// until a write in progress has finished, so a plain `kill` no longer ends one that is stuck in
+/// it. On Windows a daemon has no window to ask to close, and `taskkill` without `/F` refuses it.
 const STOP_COMMAND: &str = if cfg!(windows) {
-    // Forced: a daemon has no window to ask to close, and `taskkill` without `/F` refuses it.
     "taskkill /F /PID"
 } else {
-    "kill"
+    "kill -KILL"
 };
 
 /// The refusal `error`, a wait for the store's install lock that ran out, with the process that holds

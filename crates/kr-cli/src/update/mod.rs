@@ -3284,7 +3284,7 @@ mod tests {
             another.contains("process 4242")
                 && another.contains("answers as kr-controller/0.1.0+aaaaaaaaaaaa")
                 && another.contains("not as a daemon of 0.2.0+bbbbbbbbbbbb")
-                && another.contains("kill 4242"),
+                && another.contains("kill -KILL 4242"),
             "{another}"
         );
         let unnamed_another = said(Some((None, Some(&before))));
@@ -3295,7 +3295,7 @@ mod tests {
         );
         let silent = said(Some((Some(4242), None)));
         assert!(
-            silent.contains("does not answer") && silent.contains("kill 4242"),
+            silent.contains("does not answer") && silent.contains("kill -KILL 4242"),
             "{silent}"
         );
         let unnamed = said(Some((None, None)));
