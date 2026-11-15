@@ -25,10 +25,20 @@ case $action in
       valid "$name"
       sudo -n ip netns add "$name"
       sudo -n ip -n "$name" link set lo up
-      links=$(sudo -n ip -n "$name" -o link show | wc -l)
-      [ "$links" -eq 1 ] || { echo "make-netns: $name holds $links interfaces, not one" >&2; exit 1; }
-      sudo -n ip -n "$name" -o addr show dev lo | grep -q 'inet 127.0.0.1/8' || { echo "make-netns: $name: no 127.0.0.1" >&2; exit 1; }
-      sudo -n ip -n "$name" -o -6 addr show dev lo | grep -q 'inet6 ::1/128' || { echo "make-netns: $name: no ::1" >&2; exit 1; }
+      links=$(sudo -n ip -n "$name" -o link show) || { echo "make-netns: $name: cannot list the interfaces" >&2; exit 1; }
+      case $links in
+        '' | *$'\n'*) echo "make-netns: $name holds $(printf '%s' "$links" | grep -c '^') interfaces, not one" >&2; exit 1 ;;
+      esac
+      addrs4=$(sudo -n ip -n "$name" -o addr show dev lo) || { echo "make-netns: $name: cannot list the addresses" >&2; exit 1; }
+      case $addrs4 in
+        *'inet 127.0.0.1/8'*) ;;
+        *) echo "make-netns: $name: no 127.0.0.1" >&2; exit 1 ;;
+      esac
+      addrs6=$(sudo -n ip -n "$name" -o -6 addr show dev lo) || { echo "make-netns: $name: cannot list the addresses" >&2; exit 1; }
+      case $addrs6 in
+        *'inet6 ::1/128'*) ;;
+        *) echo "make-netns: $name: no ::1" >&2; exit 1 ;;
+      esac
       echo "make-netns: $name inode=$(sudo -n stat -L -c %i "/run/netns/$name")"
     done
     ;;

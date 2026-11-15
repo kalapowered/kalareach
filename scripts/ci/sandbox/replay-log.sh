@@ -17,8 +17,9 @@ for ((i = 0; i < ${#args[@]}; i += 2)); do
   esac
 done
 
-# The token is made after the unit ended. 24 random bytes, hexadecimal.
-token=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+# The token is made after the unit ended. 24 random bytes, hexadecimal, read by one command.
+hex=$(od -An -N24 -tx1 /dev/urandom) || { echo "replay-log: no token" >&2; exit 1; }
+token=${hex//[[:space:]]/}
 [ "${#token}" -eq 48 ] || { echo "replay-log: no token" >&2; exit 1; }
 
 printf '::stop-commands::%s\n' "$token"

@@ -6,7 +6,8 @@
 # still there after 30 seconds. A unit that has already ended is not an error.
 set -u
 
-here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+dir=$(dirname "${BASH_SOURCE[0]}") || { echo "stop-unit: cannot find its own folder" >&2; exit 2; }
+here=$(cd "$dir" && pwd) || { echo "stop-unit: cannot find its own folder" >&2; exit 2; }
 name='' logdir='' prefix=''
 while [ "$#" -gt 0 ]; do
   case $1 in
@@ -20,22 +21,44 @@ case $name in '' | [!A-Za-z0-9]* | *[!A-Za-z0-9._-]*) echo "stop-unit: bad --nam
 [ -d "$logdir" ] || { echo "stop-unit: --log-dir is not a folder" >&2; exit 2; }
 [ -n "$prefix" ] || prefix=$name
 
-sudo -n systemctl stop "$name.service" 2>/dev/null || true
+# A stop of a unit that is not loaded fails too, so the stop's status says nothing about the
+# unit: the questions below do. A question that cannot be asked is not the answer "gone": the
+# script then ends with 1 (asked=0).
+sudo -n systemctl stop "$name.service" 2>/dev/null
 gone=0
-for _ in $(seq 1 30); do
-  if ! sudo -n systemctl cat "$name.service" >/dev/null 2>&1; then gone=1; break; fi
-  state=$(sudo -n systemctl show -p ActiveState --value "$name.service" 2>/dev/null)
-  if [ "$state" = inactive ] || [ "$state" = failed ]; then gone=1; break; fi
+asked=1
+tries=0
+while [ "$tries" -lt 30 ]; do
+  tries=$((tries + 1))
+  if props=$(sudo -n systemctl show -p LoadState -p ActiveState "$name.service" 2>/dev/null); then
+    case $props in
+      *LoadState=not-found* | *ActiveState=inactive* | *ActiveState=failed*) gone=1; break ;;
+    esac
+  else
+    asked=0
+    break
+  fi
   sleep 1
 done
 # After the stop no process of the unit's group remains: its group folder is gone or empty.
 cg="/sys/fs/cgroup/system.slice/$name.service"
-if [ -d "$cg" ] && [ -n "$(cat "$cg/cgroup.procs" 2>/dev/null)" ]; then gone=0; fi
+if [ -e "$cg/cgroup.procs" ]; then
+  if procs=$(cat "$cg/cgroup.procs" 2>/dev/null); then
+    [ -z "$procs" ] || gone=0
+  elif [ -e "$cg/cgroup.procs" ]; then
+    gone=0
+    asked=0
+  fi
+fi
 
 "$here/replay-log.sh" "$logdir/$name.systemd" "$prefix.systemd" "$logdir/$name.log" "$prefix"
 if [ "$gone" -eq 1 ]; then
   echo "stop-unit: $name ended"
   exit 0
+fi
+if [ "$asked" -eq 0 ]; then
+  echo "stop-unit: cannot ask about $name" >&2
+  exit 1
 fi
 echo "stop-unit: $name is still there after 30 seconds" >&2
 exit 1
