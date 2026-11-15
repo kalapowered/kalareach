@@ -887,6 +887,11 @@ async fn stop_the_daemon(
             // effect: its end is looked for once, within the one deadline. A daemon that stays is
             // the unmade request's failure.
             progress.remove_marker();
+            // The connection is let go before the look, as before the wait of a request that was
+            // asked: where the platform keeps a pipe instance for as long as a handle to it is
+            // open, a daemon that has gone stays visible at its endpoint to a command that holds
+            // its end.
+            drop(client);
             let named = holder.as_ref().map(|holder| holder.pid.get());
             if let Some(ended) = ended_before_the_request(
                 host,
