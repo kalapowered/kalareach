@@ -5187,6 +5187,9 @@ async fn a_device_that_is_refused_free_capacity_is_told_so_when_it_cannot_pair()
         .expect("the attempt ran")
         .expect_err("a relay that takes no session carries nothing");
     assert_eq!(failure.kind, FailureKind::RelayCapacity);
+    // The failure holds the paths the service named, as it wrote them, and no wait it did not name.
+    assert_eq!(told_paths(&failure), STAND_IN_PATHS);
+    assert_eq!(failure.retry_after_seconds, None);
 }
 
 /// KR-REQ-10.54: a device that pairs by code and is refused free capacity is told that the managed
@@ -5467,4 +5470,49 @@ async fn a_whole_pairing_through_a_relay_fits_in_the_admission_ceiling() {
         kr_service_stand_in::ADMISSION_BYTES
     );
     println!("== a whole pairing carried {carried} bytes through the relay");
+}
+
+/// The paths the service stand-in names when it cannot admit, as it writes them.
+const STAND_IN_PATHS: [&str; 2] = [
+    "A direct connection between the devices, which needs no managed relay.",
+    "A self-hosted relay configured in the service settings.",
+];
+
+/// The paths a failure carries, as words.
+fn told_paths(failure: &kr_client::pairing::failure::PairingFailure) -> Vec<String> {
+    failure
+        .alternatives
+        .as_given()
+        .iter()
+        .map(|path| path.as_str().to_owned())
+        .collect()
+}
+
+/// KR-REQ-17.48: a device whose dial the managed service could not admit and told to wait is handed
+/// the wait it named and the paths it named, so that what a person reads says when to try again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_that_is_refused_free_capacity_is_handed_the_wait_the_service_named() {
+    use kr_client::pairing::failure::FailureKind;
+
+    let relays = Relays::spawn().await;
+    let rig = Rig::start_over(false, 8 * 1024 * 1024, relays.host(), None).await;
+    rig.until_homed_on(&relays.configured.url).await;
+    rig.served.web().carry_relay(
+        relays.configured.url.as_str(),
+        kr_service_stand_in::AdmissionBehaviour::Unavailable {
+            retry_after_seconds: Some(90),
+        },
+    );
+    relays.configured.refuse_sessions(true);
+    let (_, text) = rig.direct_invitation().await;
+    let device = NewDevice::start(&rig, relays.roots(), true);
+    let (attempt, _) = device.redeem(&text);
+    let failure = tokio::time::timeout(Duration::from_secs(120), attempt)
+        .await
+        .expect("the attempt ends")
+        .expect("the attempt ran")
+        .expect_err("a relay that takes no session carries nothing");
+    assert_eq!(failure.kind, FailureKind::RelayCapacity);
+    assert_eq!(failure.retry_after_seconds, Some(90));
+    assert_eq!(told_paths(&failure), STAND_IN_PATHS);
 }
