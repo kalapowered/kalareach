@@ -380,8 +380,13 @@ fn write_batch(
 /// application is then still inside the paste, and the host's next answer would land in it. The
 /// terminator is the writer's own correction and is never fenced, and nothing is written when the
 /// application is not inside a paste of this epoch.
+///
+/// The latch is cleared, so the epoch's end writes no second terminator, and `ended` is marked
+/// first, so that the end of the epoch finds that a paste was closed whether it reads the latch
+/// before or after this: it reads the latch and then the mark.
 fn end_the_open_paste_of(
     open: &std::sync::atomic::AtomicU64,
+    ended: &std::sync::atomic::AtomicU64,
     epoch: u64,
     writer: &mut impl std::io::Write,
     room: Option<&crate::pty::InputWaiter>,
@@ -389,15 +394,14 @@ fn end_the_open_paste_of(
 ) -> bool {
     use std::sync::atomic::Ordering;
 
-    let inside = open
-        .compare_exchange(
-            epoch.saturating_add(1),
-            0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        )
-        .is_ok();
-    !inside || insist(writer, crate::input::PASTE_END, room, gate)
+    let ours = epoch.saturating_add(1);
+    // Only the writer sets the latch, so what it reads here is still so when it clears it.
+    if open.load(Ordering::Acquire) != ours {
+        return true;
+    }
+    ended.store(ours, Ordering::Release);
+    open.store(0, Ordering::Release);
+    insist(writer, crate::input::PASTE_END, room, gate)
 }
 
 /// Writes a few bytes the application must have into a terminal that answers rather than waits.
@@ -876,6 +880,7 @@ impl SessionRuntime {
         let writer_hold = Arc::clone(&domain.lock().writer().writer_hold);
         #[cfg(feature = "testing")]
         let drop_hold = Arc::clone(&domain.lock().writer().drop_hold);
+        let paste_ended_at_a_drop = Arc::clone(&domain.lock().writer().paste_ended_at_a_drop);
         #[cfg(feature = "testing")]
         let writer: Box<dyn std::io::Write + Send> = Box::new(RecordingWriter {
             inner: writer,
@@ -1145,6 +1150,7 @@ impl SessionRuntime {
                     // before anything else is written.
                     if !end_the_open_paste_of(
                         &writer_paste_open,
+                        &paste_ended_at_a_drop,
                         lease_epoch,
                         &mut writer,
                         input_waiter.as_ref(),
@@ -1252,6 +1258,7 @@ impl SessionRuntime {
                         // ended here, behind the delivered part and before anything else.
                         if !end_the_open_paste_of(
                             &writer_paste_open,
+                            &paste_ended_at_a_drop,
                             lease_epoch,
                             &mut writer,
                             input_waiter.as_ref(),
