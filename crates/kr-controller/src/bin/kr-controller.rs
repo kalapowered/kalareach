@@ -315,8 +315,8 @@ async fn run(
         controller.generation()
     );
 
-    // Taken once the start has completed and before anything is served, so that a daemon that
-    // answers a request has it. A signal that arrives during the start ends the process at once,
+    // Taken once the start has completed and before the local endpoints are served, so that a
+    // daemon that answers a request has it. A signal that arrives during the start ends the process at once,
     // as it always has; the next start recovers what that cut short.
     let stopped = stop_signal()?;
 
