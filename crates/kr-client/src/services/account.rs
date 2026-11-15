@@ -2044,6 +2044,11 @@ pub enum Commit {
     /// [`SignedInAccount::revoke_unkept`] could neither queue nor send is held in memory the same
     /// way, and lost the same way.
     Unsettled,
+    /// The caller's standing, asked under the account's hold immediately before the grant was
+    /// written, did not hold: nothing was written, queued or sent. The tokens the grant came with
+    /// are the caller's to end ([`SignedInAccount::revoke_unkept`]); [`SignedInAccount::keep`] ends
+    /// them.
+    Withheld,
 }
 
 /// The account signed in on this device: the grant in secure storage, one lock over every change
@@ -2469,6 +2474,12 @@ impl SignedInAccount {
 
     /// Keeps a sign-in's tokens, replacing any grant this device held, whose revocation is queued.
     ///
+    /// `stands` says whether the caller's authority for the sign-in still holds. It is asked under
+    /// the account's hold, immediately before the grant is written: the hold can be kept by a token
+    /// refresh across its request to the service, so whatever the caller checked before calling
+    /// has had that wait to go stale, and this answer is the last one before the change. Where it
+    /// says no, nothing is written, queued or sent, and the outcome is [`Commit::Withheld`].
+    ///
     /// An error means the new grant is known not to be held: the token it came with is the
     /// caller's to end ([`Self::revoke_unkept`]). A token is never ended while the store may hold
     /// it, so the case in which the store cannot say is its own outcome, [`Commit::Unsettled`],
@@ -2483,9 +2494,17 @@ impl SignedInAccount {
     /// of the grant the store holds, and the next recovery removes a held grant whose own
     /// revocation is queued, so the grant that was replaced is not ended while it is still held. A
     /// write that fails after the grant is in place and is then seen to be there counts as kept.
-    pub async fn commit(&self, issued: IssuedGrant, nonce: &str) -> Result<Commit> {
+    pub async fn commit(
+        &self,
+        issued: IssuedGrant,
+        nonce: &str,
+        stands: impl FnOnce() -> bool,
+    ) -> Result<Commit> {
         let replaced = {
             let _held = self.hold().await?;
+            if !stands() {
+                return Ok(Commit::Withheld);
+            }
             let grant =
                 StoredGrant::new(&self.issuer, issued, self.client, nonce, (self.clock_ms)())?;
             let replaced = self.read_grant()?;
@@ -2572,13 +2591,28 @@ impl SignedInAccount {
     /// replacing sign-in, which removes a held grant whose revocation is queued; until then a grant
     /// the store returns is presented as it was found.
     ///
+    /// `stands` is asked as [`Self::commit`] asks it. Where it says no, nothing is kept and the
+    /// tokens are ended at the service, queued before they are sent ([`Self::revoke_unkept`]), and
+    /// the outcome is [`Commit::Withheld`].
+    ///
     /// # Errors
     ///
     /// Returns the error of the commit.
-    pub async fn keep(&self, issued: IssuedGrant, nonce: &str) -> Result<Commit> {
+    pub async fn keep(
+        &self,
+        issued: IssuedGrant,
+        nonce: &str,
+        stands: impl FnOnce() -> bool,
+    ) -> Result<Commit> {
         let refresh = issued.refresh_token.clone();
-        match self.commit(issued, nonce).await {
+        match self.commit(issued, nonce, stands).await {
             Ok(Commit::Kept) => Ok(Commit::Kept),
+            Ok(Commit::Withheld) => {
+                // The caller's standing did not hold where the grant would have been written, so
+                // the tokens are ended at the service, queued first.
+                let _ = self.revoke_unkept(refresh).await;
+                Ok(Commit::Withheld)
+            }
             Ok(Commit::Unsettled) => {
                 let _ = self.recover().await;
                 // What the store and the queue hold now, read together: a grant the queue still
@@ -3332,7 +3366,7 @@ mod tests {
             Client::Desktop,
         );
         account
-            .commit(issued, grant.nonce())
+            .commit(issued, grant.nonce(), || true)
             .await
             .expect("the grant is kept");
 
@@ -3508,7 +3542,7 @@ mod tests {
             client,
         );
         account
-            .commit(issued, grant.nonce())
+            .commit(issued, grant.nonce(), || true)
             .await
             .expect("the grant is kept");
         account

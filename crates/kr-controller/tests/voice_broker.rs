@@ -120,6 +120,22 @@ struct Hold {
     path: String,
     reached: Arc<tokio::sync::Notify>,
     released: tokio::sync::watch::Receiver<bool>,
+    /// What the hold keeps back, and from which requests.
+    kind: HoldKind,
+    /// Whether a request has been given to a hold that keeps back one request only.
+    taken: std::sync::atomic::AtomicBool,
+}
+
+/// What a request the stand-in holds is kept back from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HoldKind {
+    /// Every request for the path waits before the service decides what to say.
+    EveryRequest,
+    /// The next request for the path alone waits before the service decides what to say.
+    NextRequest,
+    /// The next request for the path alone is decided as it arrives, and its answer waits: as a
+    /// service that has answered and whose answer is still on its way.
+    NextAnswer,
 }
 
 /// The suite's end of a held request: when it has arrived, and the way to let it go.
@@ -222,12 +238,30 @@ impl Broker {
     /// Holds the next request for `path` unanswered, after it has been checked, until the returned
     /// handle lets it go.
     fn hold(&self, path: &str) -> Held {
+        self.hold_as(path, HoldKind::EveryRequest)
+    }
+
+    /// Holds the next request for `path` and no other, unanswered and undecided, until the
+    /// returned handle lets it go. A request for `path` that comes after it is not held by it.
+    fn hold_the_next(&self, path: &str) -> Held {
+        self.hold_as(path, HoldKind::NextRequest)
+    }
+
+    /// Holds the answer to the next request for `path` and no other: the service has decided it
+    /// as the request arrived, and the answer is sent when the returned handle lets it go.
+    fn hold_the_answer_to_the_next(&self, path: &str) -> Held {
+        self.hold_as(path, HoldKind::NextAnswer)
+    }
+
+    fn hold_as(&self, path: &str, kind: HoldKind) -> Held {
         let reached = Arc::new(tokio::sync::Notify::new());
         let (release, released) = tokio::sync::watch::channel(false);
         self.shared.holds.lock().expect("the holds").push(Hold {
             path: path.to_owned(),
             reached: Arc::clone(&reached),
             released,
+            kind,
+            taken: std::sync::atomic::AtomicBool::new(false),
         });
         Held { reached, release }
     }
@@ -417,14 +451,28 @@ async fn answer(mut stream: TcpStream, shared: &Shared) {
         .lock()
         .expect("the holds")
         .iter()
-        .find(|hold| hold.path == path)
-        .map(|hold| (Arc::clone(&hold.reached), hold.released.clone()));
-    if let Some((reached, mut released)) = held {
+        .find(|hold| {
+            hold.path == path
+                && (hold.kind == HoldKind::EveryRequest
+                    || !hold.taken.swap(true, std::sync::atomic::Ordering::SeqCst))
+        })
+        .map(|hold| (Arc::clone(&hold.reached), hold.released.clone(), hold.kind));
+    let mut decided = None;
+    if let Some((reached, mut released, kind)) = held {
+        if kind == HoldKind::NextAnswer && path.starts_with("/auth/") {
+            decided = Some(account_answer(
+                shared,
+                &path,
+                authorization.as_deref(),
+                &body,
+            ));
+        }
         reached.notify_one();
         let _ = released.wait_for(|released| *released).await;
     }
     if path.starts_with("/auth/") {
-        let (status, answer) = account_answer(shared, &path, authorization.as_deref(), &body);
+        let (status, answer) = decided
+            .unwrap_or_else(|| account_answer(shared, &path, authorization.as_deref(), &body));
         let _ = stream
             .write_all(&response(
                 status,
@@ -1993,6 +2041,95 @@ async fn a_sign_out_that_waits_for_a_token_refresh_and_meets_a_fence_removes_not
     assert_eq!(account_report(&host).await.state, AccountState::SignedOut);
     assert_eq!(broker.revoked().len(), 1, "{:?}", broker.revoked());
     host.stop().await;
+}
+
+/// KR-REQ-09.09 and 17.54: a token refresh keeps the account's lock across its request to the
+/// service, and a sign-in that has exchanged its code waits for it where the grant would be kept.
+/// A fence this host comes to owe in that wait stops the sign-in there: the grant is not replaced
+/// and what the service issued for the code is revoked. The control: with no fence the same
+/// sign-in replaces the grant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_that_waits_for_a_token_refresh_and_meets_a_fence_keeps_no_grant() {
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+    for owed in [false, true] {
+        let broker = Broker::start().await;
+        let owner = DeviceKeys::generate().expect("owner keys");
+        let host =
+            net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+        listen_for_sign_ins(&host);
+        // Tokens that last 20 seconds are always inside the margin the host replaces them in, so
+        // every request for one is a refresh.
+        sign_in_with(&host, broker.issue_grant(20)).await;
+        let account = Arc::clone(host.controller().host_account());
+        let mark = account
+            .mark_at(&broker.origin)
+            .expect("the host is signed in");
+        let (url, address) = start_sign_in(&host).await;
+        broker.expect_sign_in(&url);
+
+        // The service holds the exchange of the code before it decides it, and then the answer to
+        // a refresh that starts while the exchange waits: that answer is decided as the refresh
+        // arrives and is still on its way when the exchange has been answered.
+        let exchange = broker.hold_the_next("/auth/oauth2/token");
+        let refresh = broker.hold_the_answer_to_the_next("/auth/oauth2/token");
+        let browser =
+            tokio::spawn(async move { browser_answers(&address, &url, "the-code").await });
+        tokio::time::timeout(WAIT, exchange.reached())
+            .await
+            .expect("the exchange reaches the service");
+        let refreshing = {
+            let tokens = account.tokens_fixed_to(&broker.origin, mark);
+            tokio::spawn(async move { tokens.token("voice").await.map(|_| ()) })
+        };
+        tokio::time::timeout(WAIT, refresh.reached())
+            .await
+            .expect("the refresh reaches the service");
+
+        // The exchange is answered and the sign-in begins its change, then waits for the lock the
+        // refresh keeps. The fence is owed after that wait began and before the refresh lets go.
+        exchange.release();
+        tokio::time::timeout(WAIT, async {
+            while !account.is_being_changed() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the sign-in begins its change");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        host.controller().hold_fence(owed);
+        refresh.release();
+        let page = browser.await.expect("the browser's answer ends");
+        host.controller().hold_fence(false);
+        refreshing
+            .await
+            .expect("the refresh task ends")
+            .expect("the refresh finishes");
+
+        let report = settled(&host).await;
+        assert!(
+            matches!(report.state, AccountState::SignedIn { .. }),
+            "the host stays signed in: {report:?}"
+        );
+        if owed {
+            assert!(
+                page.contains("authority for this sign-in ended"),
+                "the browser is told why: {page}"
+            );
+            assert_eq!(
+                broker.revoked(),
+                [broker.refresh(3)],
+                "what the service issued for the code is revoked and the grant held stays"
+            );
+        } else {
+            assert!(!page.contains("authority for this sign-in ended"), "{page}");
+            assert_eq!(
+                broker.revoked(),
+                [broker.refresh(2)],
+                "the sign-in replaced the grant, whose own token is revoked"
+            );
+        }
+        host.stop().await;
+    }
 }
 
 /// KR-REQ-09.09: a sign-in asks the admission it carries again before it ends the sign-in that
