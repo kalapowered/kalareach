@@ -342,6 +342,17 @@ mod with_seams {
         pub(in crate::service::net) fn records_fell(&self, count: usize) {
             self.records.fall_by(count);
         }
+
+        /// A stream's state is gone: the frames it still held and the records it still kept are
+        /// not the host's any more.
+        pub(in crate::service::net) fn stream_torn_down(
+            &self,
+            holds: &std::collections::BTreeMap<u64, usize>,
+            records: usize,
+        ) {
+            self.host_holds.fall_by(holds.values().sum());
+            self.records.fall_by(records);
+        }
     }
 }
 
@@ -402,5 +413,12 @@ mod without_seams {
         pub(in crate::service::net) fn record_made(&self) {}
 
         pub(in crate::service::net) fn records_fell(&self, _count: usize) {}
+
+        pub(in crate::service::net) fn stream_torn_down(
+            &self,
+            _holds: &std::collections::BTreeMap<u64, usize>,
+            _records: usize,
+        ) {
+        }
     }
 }

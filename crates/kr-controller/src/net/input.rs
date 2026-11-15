@@ -465,6 +465,15 @@ struct State {
     stages: Arc<InputStages>,
 }
 
+impl Drop for State {
+    fn drop(&mut self) {
+        // A stream torn down with frames held or a refusal on record gives them back, so the
+        // stages count the streams that stand.
+        self.stages
+            .stream_torn_down(&self.holds, self.refused.len());
+    }
+}
+
 impl State {
     /// Queues what the device is to be told, and cuts the stream when more is owed than
     /// [`MAX_UNREAD_ACKS`]. The caller wakes the tasks that wait on the state.
