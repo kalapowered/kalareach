@@ -26,6 +26,7 @@ worker directly for what a session owns.
 | `kr host terminal` | — | Show the terminal applications this host has, and which one a new window opens in |
 | `kr host terminal-profile` | — | Show, add or take out the optional `KalaReach` profile in one terminal application, so each window or tab opened through it is a session of its own |
 | `kr host startup` | — | Show or choose how `kr new` starts this environment's control daemon when none is running |
+| `kr host stop` | — | Ask this installation's control daemon to stop, wait until it has ended, and say what that left |
 | `kr host network` | — | Show which network and services this host selects, join the service that publishes a description of itself, or leave it |
 | `kr host descriptions` | — | Show what session descriptions offer on this host, turn them on or off, and fetch the model's files |
 | `kr host import-journals` | — | Bring this environment's journals that are older than this build migrates forward, once, while its daemon is stopped |
@@ -2489,6 +2490,60 @@ the task apart from the choice: whose it is, whether it is the one this installa
 where a start can use it (the login session the command runs in), its last result, which is one for
 all of its runs, and that the daemon it starts ends when you sign out. `kr doctor` reports the same
 as its `startup-task` check.
+
+## `kr host stop`
+
+```sh
+kr host stop           # ask this installation's control daemon to stop, and wait for it to end
+kr host stop --json    # the same, as a document
+```
+
+The command asks the control daemon of this installation's own environment to stop, and waits until
+the daemon's process has ended and the environment's lock is free. It stops no session. A session's
+worker keeps running, a local attach keeps working, and the next daemon finds the sessions again;
+paired devices' connections close, and commands that need a daemon fail until one runs. The daemon
+closes its gate to new sessions, waits up to ten seconds for the session creates that are under
+way, and goes on whether they settled or not. A create that was cut is resolved by the next daemon
+as after a crash, and the command says how many were cut. The daemon is told to stop only once
+its answer has been written, so the command has the answer; a daemon that ends for another cause
+gives none.
+
+The command refuses where `KR_SESSION` or `KR_ATTACHMENT` is set, and where a live session's worker
+says the process is its own; it asks every worker at once. This stops an accident and is no
+boundary: code that runs as your account can end the daemon with the platform's own tools. A worker
+that does not answer lets the command go on, because a host that needs its daemon stopped may hold
+one. Run the command in a terminal window that was not opened through the KalaReach profile, or an
+SSH login. The refusal exits 8 and says that nothing was stopped.
+
+A line on standard error, printed once the request has left and not under `--json`, says what the
+daemon waits for. An interrupt after that does not cancel the stop: the command says what may be
+so and exits 1, and a hangup is ignored. Run it again to see or to wait. Before the request is
+written an interrupt ends the command with nothing asked.
+
+Before it asks, the command writes a small record of its attempt in the environment's state
+directory, and removes it once it has seen its own result. A command that was killed leaves it. Every
+message that says no control daemon runs gives the record's last phase and its time, as a record and
+not as a claim of what happened after it, and says that an attempt is under way only while a live
+process has the start identity the record names. A control daemon that has bound its endpoints
+removes every record that does not name it as the daemon to stop. The command removes the records
+of earlier attempts whose process is gone once it has said them and ended with its own result.
+
+The command ends with one of these results, which `--json` keeps apart as `stop`: `ended` (the
+daemon was seen to end), `told` (the daemon took the stop and had not ended after 30 seconds, exit
+1), `maybe_asked` (the request left and neither its answer nor the daemon's end was seen, and the
+daemon had not ended after 30 seconds, exit 1) and `not_asked` (nothing was asked). A missing or
+cut answer is an unknown outcome and never "not stopped": the command looks at the lock and the
+process. A daemon that holds the environment and does not answer is named with its process, where
+the lock file names one that runs this installation's daemon, and `kill -KILL` with the process
+number ends it; the next daemon recovers as it does after a crash. Where no control daemon runs, the
+command says so and exits 0. A daemon of another build that takes no stop request is not stopped;
+the command says that and how to switch this host to another release.
+
+`kr host stop --json` returns `{"ok": true, "stop": "ended", "pid": 4242, "unsettled": 0}`; `pid`
+and `unsettled` are null where the answer that carries them did not arrive, and a failure carries
+`ok` false, the failure's code, message and exit code beside the same members. `records` lists, as
+sentences, what earlier attempts recorded that the command said and then removed, where there were
+any.
 
 ## `kr host power`
 

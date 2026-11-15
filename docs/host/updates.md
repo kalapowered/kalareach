@@ -394,7 +394,7 @@ stop was requested on its local socket, and no more: code that runs as the host'
 the daemon with the platform's own tools, and this request adds no power to it. A request that
 carries a process bridge's origin is refused with `PERMISSION_DENIED`. The daemon keeps no record of
 the request, and serves it while the host owes a fence and while the local owner's membership lease
-has lapsed. The `kr` command line of this build does not send this request.
+has lapsed. `kr host stop` sends this request.
 
 A stop closes the daemon's gate to new sessions and waits up to 10 seconds for the creates it has
 already started, then goes on whether they settled or not. It never refuses for a create that does
