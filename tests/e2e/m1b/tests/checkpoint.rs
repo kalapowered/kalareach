@@ -807,14 +807,12 @@ fn a_device_uses_an_agent_in_a_managed_shell_and_reattaches_to_the_screen_kr_att
     let acquired = runtime
         .block_on(view.acquire(&remote))
         .unwrap_or_else(|why| panic!("{why}"));
-    let written = runtime
+    // The host accepted the line the device typed. The lane's answer carries no count of what the
+    // worker took, so what shows the line reached the agent is the agent's screen, which is waited
+    // for next.
+    let _ = runtime
         .block_on(view.type_text(&remote, "go on\r"))
         .unwrap_or_else(|why| panic!("{why}"));
-    assert_eq!(
-        written.bytes,
-        "go on\r".len(),
-        "the host accepted the whole line the device typed, and the agent's screen shows it next"
-    );
     let _ = runtime
         .block_on(view.wait_for(&remote, WENT_ON, LIVENESS))
         .unwrap_or_else(|why| panic!("{why}"));

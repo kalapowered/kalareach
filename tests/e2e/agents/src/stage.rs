@@ -1479,14 +1479,15 @@ impl Keyboard {
     }
 
     /// Types `text` under the lease on the attachment's input lane, and requires the host to accept
-    /// it: with every byte taken by the terminal or held as the start of a bracketed-paste
-    /// delimiter, as a lone Escape is while the terminal takes pastes (the worker forwards such a
-    /// prefix once its short deadline passes), which is what the host's acceptance of the frame
-    /// says.
+    /// it. The lane's answer carries no count of what the worker took, so the [`Writing`] it
+    /// returns holds the length of what this keyboard sent, not a count from the worker: a case
+    /// that needs to know the bytes arrived reads the screen.
+    ///
+    /// [`Writing`]: kr_client::input::Writing
     ///
     /// # Errors
     ///
-    /// Returns the host's refusal, what ended the lane, or an acceptance that is not of these bytes.
+    /// Returns the host's refusal or what ended the lane.
     pub fn type_text(
         &mut self,
         remote: &Remote,
@@ -1517,16 +1518,6 @@ impl Keyboard {
         let written = runtime
             .block_on(typing.type_bytes(self.epoch, text.as_bytes()))
             .map_err(refusal)?;
-        if written.bytes != text.len() {
-            return Err(InputRefusal {
-                code: None,
-                detail: format!(
-                    "input of {} bytes was accepted as a frame of {} bytes",
-                    text.len(),
-                    written.bytes
-                ),
-            });
-        }
         self.next += 1;
         Ok(written)
     }
