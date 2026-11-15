@@ -213,6 +213,25 @@ async fn stalled() -> (Silent, Arc<Heard>) {
     (silent, heard)
 }
 
+/// Stops the daemon's evidence pass before its next pass does anything, waits until it has stopped
+/// there, and returns the end that lets it go. The pass stays stopped for as long as that end is
+/// kept, so a case keeps it until its last assertion.
+///
+/// The pass is the daemon's own, and it runs by itself every few seconds: it asks the workers that
+/// owe names for them, and asks the workers that have not acknowledged the revision in force. A
+/// frame that it sends to a case's worker is counted as one of the case's, or takes a gate meant
+/// for the case's own ask. Holding a round stops only the pass's collection of names; its asks of
+/// pending workers go on. So a case whose worker owes names or is pending stops the whole pass,
+/// before it makes the worker one or the other.
+async fn without_an_evidence_pass(controller: &Controller) -> tokio::sync::oneshot::Sender<()> {
+    let (arrived, release) = controller.stop_before_an_evidence_pass_for_tests();
+    tokio::time::timeout(WAIT, arrived)
+        .await
+        .expect("a pass of the daemon began")
+        .expect("the pass says that it has arrived");
+    release
+}
+
 /// Waits until `done` holds, and fails the test after [`WAIT`].
 async fn until(what: &str, mut done: impl FnMut() -> bool) {
     let deadline = tokio::time::Instant::now() + WAIT;
@@ -344,6 +363,7 @@ async fn an_announcement_dropped_part_way_gives_up_its_link() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_request_for_evidence_dropped_part_way_gives_up_its_link() {
     let (silent, heard) = stalled().await;
+    let _pass = without_an_evidence_pass(&silent.controller).await;
     let controller = Arc::clone(&silent.controller);
     let session_id = silent.session_id;
     let revision = controller.leases.authority_revision();
@@ -1444,6 +1464,7 @@ async fn a_collection_whose_wait_for_the_link_left_too_little_time_gives_the_lin
 async fn a_collection_with_too_little_time_left_does_not_wait_for_the_link_for_each_older_revision()
 {
     let (silent, heard) = stalled().await;
+    let _pass = without_an_evidence_pass(&silent.controller).await;
     let controller = Arc::clone(&silent.controller);
     let session_id = silent.session_id;
     let (binding, newer, _older) =
@@ -1505,6 +1526,7 @@ async fn a_collection_with_too_little_time_left_does_not_wait_for_the_link_for_e
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_give_back_before_an_older_revisions_first_exchange_leaves_the_worker_owing_its_names() {
     let (silent, heard) = stalled().await;
+    let _pass = without_an_evidence_pass(&silent.controller).await;
     let controller = Arc::clone(&silent.controller);
     let session_id = silent.session_id;
     let (binding, newer, older) =
@@ -1551,6 +1573,7 @@ async fn a_give_back_before_an_older_revisions_first_exchange_leaves_the_worker_
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_ask_whose_wait_runs_past_its_bound_ends_at_it_with_no_link_out() {
     let (silent, heard) = stalled().await;
+    let _pass = without_an_evidence_pass(&silent.controller).await;
     let controller = Arc::clone(&silent.controller);
     let session_id = silent.session_id;
     let revision = controller.leases.authority_revision();
@@ -1641,9 +1664,18 @@ async fn the_first_exchange_of_an_ask_starts_its_limit_once_the_ask_has_the_link
 /// Raises two barriers for changes that reach more grants than one notice names, while the
 /// worker is not in the directory, so that a daemon that has recorded nothing of the worker tells
 /// it three revisions in at least two notices. Then lists the worker again.
-async fn after_barriers_that_need_several_notices(silent: &Silent) {
+///
+/// The barriers leave the worker pending, and the daemon's evidence pass asks a pending worker for
+/// its acknowledgement by itself, as the case's own ask does. A held round does not stop those
+/// asks, so the pass is stopped as a whole before the barriers are raised. Returns the end that
+/// lets it go, which the case keeps until its last assertion: a frame of the pass would be counted
+/// as the ask's second notice, or take the gate that holds the worker's first answer.
+async fn after_barriers_that_need_several_notices(
+    silent: &Silent,
+) -> tokio::sync::oneshot::Sender<()> {
     let controller = &silent.controller;
     let session_id = silent.session_id;
+    let pass = without_an_evidence_pass(controller).await;
     controller.directory.lock().await.remove(session_id);
     let bound = u32::try_from(kr_protocol::worker::MAX_REVISION_REACH_NAMES).expect("fits");
     let mut newest = AuthorityRevision::new(0);
@@ -1686,6 +1718,7 @@ async fn after_barriers_that_need_several_notices(silent: &Silent) {
         .lock()
         .await
         .insert(silent.worker.clone(), None);
+    pass
 }
 
 /// One ask of fifteen seconds, whose first notice begins after another operation has held the
@@ -1776,7 +1809,7 @@ async fn the_second_notice_was_not_sent(silent: &Silent, heard: &Heard, asked: A
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_second_notice_that_would_begin_with_too_little_time_is_not_sent() {
     let (silent, heard) = answered().await;
-    after_barriers_that_need_several_notices(&silent).await;
+    let _pass = after_barriers_that_need_several_notices(&silent).await;
     let asked = a_telling_that_waits_for_the_registry_between_its_notices(
         &silent,
         &heard,
@@ -1797,7 +1830,7 @@ async fn a_second_notice_that_would_begin_with_too_little_time_is_not_sent() {
 async fn a_wait_for_the_registry_between_two_notices_that_runs_past_the_deadline_gives_the_link_back()
  {
     let (silent, heard) = answered().await;
-    after_barriers_that_need_several_notices(&silent).await;
+    let _pass = after_barriers_that_need_several_notices(&silent).await;
     let asked = a_telling_that_waits_for_the_registry_between_its_notices(
         &silent,
         &heard,
@@ -1818,6 +1851,7 @@ async fn a_wait_for_the_registry_between_two_notices_that_runs_past_the_deadline
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_page_whose_limit_starts_late_still_ends_by_the_deadline() {
     let (silent, heard) = stalled().await;
+    let _pass = without_an_evidence_pass(&silent.controller).await;
     let controller = Arc::clone(&silent.controller);
     let session_id = silent.session_id;
     let revision = controller.leases.authority_revision();
