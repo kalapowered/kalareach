@@ -1147,6 +1147,8 @@ impl Controller {
                 if !retries.by_the_pass {
                     self.record_announcement(session_id, &notice);
                 }
+                #[cfg(feature = "testing")]
+                self.before_a_pages_limit.wait().await;
                 match tokio::time::timeout(WORKER_EXCHANGE, link.client().announce_revision(notice))
                     .await
                 {

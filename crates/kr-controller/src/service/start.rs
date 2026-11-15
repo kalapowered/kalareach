@@ -1233,6 +1233,8 @@ impl Controller {
             #[cfg(feature = "testing")]
             after_an_acknowledgement: ReadPause::default(),
             #[cfg(feature = "testing")]
+            before_a_pages_limit: ReadPause::default(),
+            #[cfg(feature = "testing")]
             evidence_pages_limit: std::sync::atomic::AtomicUsize::new(usize::MAX),
             #[cfg(feature = "testing")]
             read_back: std::sync::Mutex::new(None),
