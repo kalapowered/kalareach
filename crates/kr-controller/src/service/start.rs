@@ -1438,6 +1438,9 @@ impl Controller {
                 kr_ipc::install::measured_environment(),
             )),
             finalising: Mutex::new(()),
+            known_closures: std::sync::Mutex::new(BTreeMap::new()),
+            #[cfg(feature = "testing")]
+            registry_write_stall: super::close::RegistryWriteStall::default(),
             removing_closed: Arc::new(Mutex::new(())),
             crash_flights: std::sync::Mutex::new(std::collections::HashMap::new()),
             left_by_an_earlier_boot: std::sync::Mutex::new(std::collections::BTreeSet::new()),

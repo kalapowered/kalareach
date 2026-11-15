@@ -1208,8 +1208,7 @@ impl RemoteConnection {
             else {
                 return Err(RouteRefusal::Conflict(unreadable_retained_answer()));
             };
-            let _ = self
-                .controller
+            self.controller
                 .settle_close_answer(session_id, &answer)
                 .await;
             let converted = ParamsValue::from_typed(&answer).map_err(|error| {

@@ -1328,6 +1328,17 @@ impl Host {
         self.controller.pause_after_a_frame_is_answered()
     }
 
+    /// Stops the next write that records a closure in the daemon's registry, and returns the end
+    /// that says the write has arrived and the end that lets it go.
+    pub fn stall_the_next_closure_write(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.controller.stall_the_next_closure_write()
+    }
+
     /// Connects one local client on the daemon's own socket.
     pub async fn client(&self) -> LocalClient {
         LocalClient::connect(&self.endpoint, LocalClientKind::Cli, build())
