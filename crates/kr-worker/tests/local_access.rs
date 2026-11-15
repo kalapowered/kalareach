@@ -840,6 +840,19 @@ async fn input_waiting_for_the_session_when_the_host_restricts_its_owner_is_not_
     world.close();
 }
 
+/// Waits until the input room holds nothing: the writer has met every write it was handed.
+async fn until_the_room_is_whole(runtime: &SessionRuntime) {
+    let room = runtime.input().lock().input_room();
+    let whole = kr_worker::input_room::Cost::default();
+    tokio::time::timeout(LIVENESS_DEADLINE, async {
+        while room.held() != whole {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the room holds {:?} and not {whole:?}", room.held()));
+}
+
 /// KR-REQ-17.54: bytes accepted under a lease whose end passes in UTC while they wait for the
 /// terminal are not written after it.
 ///
@@ -882,7 +895,7 @@ async fn bytes_queued_under_a_lease_whose_utc_end_passes_while_they_wait_are_nev
             .expect("the keys");
         (attachment, held.lease.epoch.get())
     };
-    let queue = |sequence: u64, bytes: &[u8], ends_at: u64| {
+    let queue = |epoch: u64, sequence: u64, bytes: &[u8], ends_at: u64| {
         let mut session = world.runtime.session();
         session
             .write_input_until(
@@ -900,7 +913,7 @@ async fn bytes_queued_under_a_lease_whose_utc_end_passes_while_they_wait_are_nev
         world.runtime.flush_input();
     };
 
-    queue(0, b"kr-inside", world.machine.utc_ms() + LEASE_MS);
+    queue(epoch, 0, b"kr-inside", world.machine.utc_ms() + LEASE_MS);
     produced(&world.runtime, b"kr-inside").await;
 
     // Accepted while the lease stood, handed to the writer after its UTC end had passed.
@@ -925,9 +938,25 @@ async fn bytes_queued_under_a_lease_whose_utc_end_passes_while_they_wait_are_nev
             .advance(Duration::from_millis(LEASE_MS + 1));
         world.runtime.flush_input();
     }
-    // The writer is serial: once the batch behind it has arrived, the one in front of it has
-    // either arrived or was never written.
-    queue(2, b"kr-after", world.machine.utc_ms() + FAR_MS);
+    // The writer gives each entry back as it is done with it, whether it wrote the batch or not,
+    // so the room's return says that it has met the batch. What follows a dropped batch in its
+    // epoch is not written either, so the sentinel is the next epoch's batch: the writer is
+    // serial, and once that batch has arrived the one in front of it has either arrived or was
+    // never written.
+    until_the_room_is_whole(&world.runtime).await;
+    let next = world
+        .runtime
+        .session()
+        .acquire_input(
+            attachment,
+            kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid()),
+            None,
+        )
+        .expect("the keys again")
+        .lease
+        .epoch
+        .get();
+    queue(next, 0, b"kr-after", world.machine.utc_ms() + FAR_MS);
     produced(&world.runtime, b"kr-after").await;
     let seen = retained(&world.runtime);
     assert!(
