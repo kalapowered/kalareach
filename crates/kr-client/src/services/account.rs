@@ -2413,6 +2413,18 @@ impl SignedInAccount {
     /// Adds a revocation to the list, dropping entries whose grants have ended by themselves and,
     /// past the limit, the oldest.
     fn queue(&self, grant_id: &str, refresh_token: RefreshToken) -> Result<()> {
+        let entries = self.queued(grant_id, refresh_token)?;
+        self.write_pending(&entries)
+    }
+
+    /// The list as it stands in the store with a revocation added, not yet written: the read half
+    /// of [`Self::queue`], for a caller that asks whether it may go on between the read and the
+    /// write.
+    fn queued(
+        &self,
+        grant_id: &str,
+        refresh_token: RefreshToken,
+    ) -> Result<Vec<PendingRevocation>> {
         let now = (self.clock_ms)();
         let mut entries = self.read_pending()?;
         entries.retain(|entry| now.saturating_sub(entry.queued_at_ms) < PENDING_LIFETIME_MS);
@@ -2430,7 +2442,7 @@ impl SignedInAccount {
         while entries.len() > PENDING_LIMIT {
             entries.remove(0);
         }
-        self.write_pending(&entries)
+        Ok(entries)
     }
 
     /// Whether this process holds `refresh_token` in memory for the next send.
@@ -2491,10 +2503,16 @@ impl SignedInAccount {
     /// Keeps a sign-in's tokens, replacing any grant this device held, whose revocation is queued.
     ///
     /// `stands` says whether the caller's authority for the sign-in still holds. It is asked under
-    /// the account's hold, immediately before the grant is written: the hold can be kept by a token
-    /// refresh across its request to the service, so whatever the caller checked before calling
-    /// has had that wait to go stale, and this answer is the last one before the change. Where it
-    /// says no, nothing is written, queued or sent, and the outcome is [`Commit::Withheld`].
+    /// the account's hold, and asked twice. The first ask comes before the store is read: the hold
+    /// can be kept by a token refresh across its request to the service, so whatever the caller
+    /// checked before calling has had that wait to go stale. Where it says no, nothing is written,
+    /// queued or sent, and the outcome is [`Commit::Withheld`]. The second ask comes immediately
+    /// before the grant is written, after the reads and the queue's write that the store takes,
+    /// and is the last one before the change. Where it says no, the queue is put back as it was
+    /// found, nothing of the new grant is written or sent, the grant that was held stays, and the
+    /// outcome is [`Commit::Withheld`] too. Where the queue cannot be put back, the outcome is
+    /// the one a grant that cannot be written has: the error, with the grant that was held
+    /// removed by the next recovery.
     ///
     /// An error means the new grant is known not to be held: the token it came with is the
     /// caller's to end ([`Self::revoke_unkept`]). A token is never ended while the store may hold
@@ -2514,7 +2532,7 @@ impl SignedInAccount {
         &self,
         issued: IssuedGrant,
         nonce: &str,
-        stands: impl FnOnce() -> bool,
+        stands: impl Fn() -> bool,
     ) -> Result<Commit> {
         let replaced = {
             let _held = self.hold().await?;
@@ -2530,23 +2548,34 @@ impl SignedInAccount {
                 Some(_) => Some(self.read_pending()?),
                 None => None,
             };
-            let put_back = |kept: &Option<StoredGrant>| {
+            let put_back = |kept: &Option<StoredGrant>| -> Result<()> {
                 // Only where the store is known to hold the grant this one replaced.
                 if let (Some(old), Some(kept), Some(before)) = (&replaced, kept, &before)
                     && kept.grant_id == old.grant_id
                 {
-                    // If this fails too, the old grant and its own queued revocation are both
-                    // there, which a send does not send and the next recovery settles.
-                    let _ = self.write_pending(before);
+                    return self.write_pending(before);
                 }
+                Ok(())
             };
             if let Some(old) = &replaced
                 && let Err(error) = self.queue(&old.grant_id, old.refresh_token.clone())
             {
                 // The grant write never started, so the old grant is the one held: a queue write
-                // can fail at its last step, after its contents are in place.
-                put_back(&replaced);
+                // can fail at its last step, after its contents are in place. If the queue cannot
+                // be put back either, the old grant and its own queued revocation are both there,
+                // which a send does not send and the next recovery settles; the error is the one
+                // the caller is given either way.
+                let _ = put_back(&replaced);
                 return Err(error);
+            }
+            // The last ask, after every read and the queue's write, with only the grant's write
+            // after it. The grant that was held stays, and its revocation is not owed. If the queue
+            // cannot be put back, the old grant and its own queued revocation are both there, which
+            // the next recovery settles by removing the grant: the outcome is the failed put-back,
+            // as it is the failed write of a grant.
+            if !stands() {
+                put_back(&replaced)?;
+                return Ok(Commit::Withheld);
             }
             if let Err(error) = self.write_grant(&grant) {
                 // A write can fail at its last step, after the grant is in place. What the store
@@ -2554,7 +2583,9 @@ impl SignedInAccount {
                 match self.read_grant() {
                     Ok(Some(held)) if held.grant_id == grant.grant_id => {}
                     Ok(kept) => {
-                        put_back(&kept);
+                        // As above, the old grant and its own queued revocation are both there if
+                        // the queue cannot be put back, and the error is the write's.
+                        let _ = put_back(&kept);
                         return Err(error);
                     }
                     // The store cannot say what it holds, so the new grant may be the one held and
@@ -2619,7 +2650,7 @@ impl SignedInAccount {
         &self,
         issued: IssuedGrant,
         nonce: &str,
-        stands: impl FnOnce() -> bool,
+        stands: impl Fn() -> bool,
     ) -> Result<Commit> {
         let refresh = issued.refresh_token.clone();
         match self.commit(issued, nonce, stands).await {
@@ -2722,11 +2753,12 @@ impl SignedInAccount {
     /// Signs this device out: the grant is removed at once and its revocation queued, then every
     /// queued revocation is sent.
     ///
-    /// `stands` is asked under the account's hold, immediately before the revocation is queued and
-    /// the grant is deleted. The hold can be kept by a token refresh across its request to the
-    /// service, so whatever the caller checked before calling has had that wait to go stale; the
-    /// answer given here is the last one before the change. Where it refuses, nothing is removed,
-    /// queued or sent, and the refusal is returned.
+    /// `stands` is asked under the account's hold, after the grant and the queue of revocations
+    /// are read and immediately before the revocation is queued and the grant is deleted. The hold
+    /// can be kept by a token refresh across its request to the service, and the store's reads
+    /// take their own time, so whatever the caller checked before calling has had those waits to
+    /// go stale; the answer given here is the last one before the change. Where it refuses,
+    /// nothing is removed, queued or sent, and the refusal is returned.
     ///
     /// # Errors
     ///
@@ -2740,8 +2772,8 @@ impl SignedInAccount {
     }
 
     /// Removes the grant, or only the grant `only` names while it is still the one here, queues
-    /// its revocation, then sends every queued revocation. `stands` is asked under the hold, before
-    /// anything changes.
+    /// its revocation, then sends every queued revocation. `stands` is asked under the hold, after
+    /// the grant and the queue are read and immediately before anything is written.
     async fn remove_grant<E>(
         &self,
         only: Option<&str>,
@@ -2749,19 +2781,23 @@ impl SignedInAccount {
     ) -> Result<std::result::Result<SignOut, E>> {
         let was_signed_in = {
             let _held = self.hold().await?;
+            let removed = self
+                .read_grant()?
+                .filter(|grant| only.is_none_or(|id| id == grant.grant_id));
+            let queued = match &removed {
+                Some(grant) => Some(self.queued(&grant.grant_id, grant.refresh_token.clone())?),
+                None => None,
+            };
             if let Err(refusal) = stands() {
                 return Ok(Err(refusal));
             }
-            match self.read_grant()? {
-                Some(grant) if only.is_none_or(|id| id == grant.grant_id) => {
-                    self.queue(&grant.grant_id, grant.refresh_token.clone())?;
-                    self.delete_grant()?;
-                    self.ended.store(false, Ordering::SeqCst);
-                    self.publish();
-                    true
-                }
-                Some(_) | None => false,
+            if let Some(entries) = &queued {
+                self.write_pending(entries)?;
+                self.delete_grant()?;
+                self.ended.store(false, Ordering::SeqCst);
+                self.publish();
             }
+            queued.is_some()
         };
         let remaining = self.send_pending().await?;
         Ok(Ok(SignOut {
