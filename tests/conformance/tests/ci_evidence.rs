@@ -1414,12 +1414,13 @@ const LIST: &[Listed] = &[
         ],
     ),
     // Runs the performance script with a stand-in measurement, with the variable set to a folder
-    // under its temporary folder, or removed.
+    // under its temporary folder, or removed; the stand-in for a process that records late reads it.
     lines(
         "tests/perf/tests/evidence.rs",
         &[
             (r#".env_remove("KR_TEST_ARTIFACTS_DIR");"#, 1),
             (r#"command.env("KR_TEST_ARTIFACTS_DIR", evidence);"#, 1),
+            (r#"evidence="$KR_TEST_ARTIFACTS_DIR""#, 1),
         ],
     ),
     // Runs the performance script with the evidence variable removed: its temporary folder is the

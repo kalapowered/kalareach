@@ -56,7 +56,8 @@ case "$*" in
     case "$*" in
       *idle_resources_for_twenty_sessions*)
         if [ -n "${KR_STAND_IN_LATE:-}" ]; then
-          sh -c 'while [ -e "$1/performance.md" ]; do sleep 0.1; done; printf "## a stand-in measurement\n\n" >> "$1/performance.md"' late "$KR_TEST_ARTIFACTS_DIR" > /dev/null 2>&1 &
+          evidence="$KR_TEST_ARTIFACTS_DIR"
+          sh -c 'while [ -e "$1/performance.md" ]; do sleep 0.1; done; printf "## a stand-in measurement\n\n" >> "$1/performance.md"' late "$evidence" > /dev/null 2>&1 &
         fi
         ;;
     esac
