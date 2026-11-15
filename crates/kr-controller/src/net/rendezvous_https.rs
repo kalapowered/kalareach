@@ -28,7 +28,13 @@
 //!    deadline) is the service being unavailable.
 //! 3. The service's own envelope decides next. `NOT_CONFIGURED`, `NOT_FOUND` and
 //!    `METHOD_NOT_ALLOWED` say the origin serves no rendezvous there: a configuration error.
-//!    `RATE_LIMITED` and every other code are the service being unavailable.
+//!    `RATE_LIMITED` and every other code are the service being unavailable, and the failure says
+//!    the code only when it has the shape of a code of the service's contract. A 429
+//!    `RATE_LIMITED` or a 503 `SERVICE_UNAVAILABLE` whose error also carries words and a list of
+//!    paths that still work with at least one entry says a budget is short: it is
+//!    [`PairingError::RendezvousCapacity`], which reports under the same code and tells a person
+//!    the service's words, the wait when the answer names one, and the list. What decides whether
+//!    an answer is sent again is read from the envelope as before, and does not read the list.
 //! 4. An answer without the envelope: a redirect, 404 and 405 say the same as those codes, and
 //!    anything else, such as a 429 or a 5xx page from something in front of the service, is the
 //!    service being unavailable.
@@ -62,6 +68,7 @@ use kr_client::error::ClientError;
 use kr_client::pairing::room::{RoomConnector, RoomError, RoomRole, RoomSocket};
 use kr_client::services::http::{HttpDeadlines, HttpService, ResponseLimits};
 use kr_client::services::relay::{ServiceHttp, ServiceHttpAnswer};
+use kr_client::services::{Alternatives, told_capacity};
 use kr_crypto::secret::SymmetricKey;
 use kr_pairing::PairingError;
 use kr_protocol::error::{ErrorCode, ProtocolError};
@@ -557,6 +564,7 @@ fn send_again_after(answer: &ServiceHttpAnswer) -> Option<Duration> {
         Envelope::Refused {
             code,
             retry_after_seconds: Some(seconds),
+            ..
         } if answer.status == 503 && code == "SERVICE_UNAVAILABLE" => {
             Some(Duration::from_secs(seconds))
         }
@@ -583,10 +591,13 @@ fn failed(error: &ClientError) -> PairingError {
 enum Envelope {
     /// `{"ok": true, "data": ...}`.
     Answered(serde_json::Value),
-    /// `{"ok": false, "error": {"code": ...}}`, with the seconds to wait when it names them.
+    /// `{"ok": false, "error": {"code": ...}}`, with the seconds to wait when it names them, and
+    /// the words and the paths that still work when it names those.
     Refused {
         code: String,
         retry_after_seconds: Option<u64>,
+        message: Option<String>,
+        alternatives: Alternatives,
     },
 }
 
@@ -606,6 +617,11 @@ fn envelope(body: &[u8]) -> Option<Envelope> {
                 retry_after_seconds: error
                     .get("retryAfterSeconds")
                     .and_then(serde_json::Value::as_u64),
+                message: error
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                alternatives: Alternatives::from_member(error.get("alternatives").cloned()),
             })
         }
         _ => None,
@@ -616,13 +632,19 @@ fn envelope(body: &[u8]) -> Option<Envelope> {
 fn read_answer<T: Answer>(address: &str, answer: &ServiceHttpAnswer) -> kr_pairing::Result<T> {
     let status = answer.status;
     match envelope(&answer.body) {
-        Some(Envelope::Refused { code, .. }) => Err(match code.as_str() {
+        Some(Envelope::Refused {
+            code,
+            retry_after_seconds,
+            message,
+            alternatives,
+        }) => Err(match code.as_str() {
             "NOT_CONFIGURED" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" => configuration(format!(
                 "{address} answered {code}: that origin serves no rendezvous"
             )),
-            _ => PairingError::RendezvousUnavailable {
-                reason: format!("{address} answered {code}"),
-            },
+            _ => short_budget(status, &code, retry_after_seconds, message, &alternatives)
+                .unwrap_or_else(|| PairingError::RendezvousUnavailable {
+                    reason: format!("{address} answered {}", said_code(&code)),
+                }),
         }),
         Some(Envelope::Answered(data)) if (200..300).contains(&status) => {
             serde_json::from_value::<T>(data)
@@ -649,6 +671,45 @@ fn read_answer<T: Answer>(address: &str, answer: &ServiceHttpAnswer) -> kr_pairi
             },
         }),
     }
+}
+
+/// How a code the service sent is said in a failure's reason: as it is when it has the shape of
+/// every code of the service's contract, capitals, digits and underscores in at most 64
+/// characters, and as "an unnamed code" otherwise.
+///
+/// A failure's text holds this build's own words, the address that is configured and a code of
+/// that shape, and nothing else of the answer. What a service puts where a code goes is its own
+/// words, and a text that carries them is not one that only this build wrote.
+fn said_code(code: &str) -> &str {
+    let shaped = !code.is_empty()
+        && code.len() <= 64
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_');
+    if shaped { code } else { "an unnamed code" }
+}
+
+/// The failure for an answer that says a budget is short: a rate limit or a service that takes no
+/// new invitations now, that names the paths that still work. Nothing else is one: a status or a
+/// code the service does not answer a short budget with, a list with no entry, a list that is not
+/// texts and an answer with no words are the service being unavailable, as they always were.
+fn short_budget(
+    status: u16,
+    code: &str,
+    retry_after_seconds: Option<u64>,
+    message: Option<String>,
+    alternatives: &Alternatives,
+) -> Option<PairingError> {
+    matches!(
+        (status, code),
+        (429, "RATE_LIMITED") | (503, "SERVICE_UNAVAILABLE")
+    )
+    .then_some(())?;
+    let told = told_capacity(&message?, retry_after_seconds, alternatives)?;
+    Some(PairingError::RendezvousCapacity {
+        told,
+        retry_after_seconds,
+    })
 }
 
 fn configuration(reason: impl std::fmt::Display) -> PairingError {
@@ -1330,12 +1391,14 @@ mod tests {
 
     /// The service's refusal of a request: its code, its words, the wait it names and, when it has
     /// one, the list of paths that still work, inside the error as every other member is.
-    fn refusal(code: &str, message: &str, delay: u64, list: &[&str]) -> String {
+    fn refusal(code: &str, message: &str, delay: Option<u64>, list: &[&str]) -> String {
         let mut error = serde_json::json!({
             "code": code,
             "message": message,
-            "retryAfterSeconds": delay,
         });
+        if let Some(seconds) = delay {
+            error["retryAfterSeconds"] = serde_json::json!(seconds);
+        }
         if !list.is_empty() {
             error["alternatives"] = serde_json::json!(list);
         }
@@ -1400,11 +1463,12 @@ mod tests {
 
     /// KR-REQ-17.48: a reservation that a budget refused is answered with the service's new words
     /// and, when the budget was short, a list of the paths that still work inside the error. The
-    /// host's reader, which is the released one, reads each such body as it reads the same body with
-    /// the words that were sent before: the same failure and text, the same wait owed, the same
-    /// requests, whether the status is 429 or 503 and whether the wait is a second or a day.
+    /// host does with each such body what it does with the same body with the words that were
+    /// sent before: the same failure code, the same wait owed, the same requests, whether the
+    /// status is 429 or 503 and whether the wait is a second or a day. A body with no list reads
+    /// as it always did, text included.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn kr_req_17_48_a_reservation_refused_with_the_new_words_and_a_list_is_read_as_with_the_old()
+    async fn kr_req_17_48_a_reservation_refused_with_the_new_words_and_a_list_is_sent_again_as_with_the_old()
      {
         const BUSY: &str = "SERVICE_UNAVAILABLE";
         const LIMITED: &str = "RATE_LIMITED";
@@ -1504,8 +1568,8 @@ mod tests {
         ];
 
         for row in rows {
-            let new = refusal(row.code, row.message, row.delay, row.list);
-            let old = refusal(row.code, "The words sent before.", row.delay, &[]);
+            let new = refusal(row.code, row.message, Some(row.delay), row.list);
+            let old = refusal(row.code, "The words sent before.", Some(row.delay), &[]);
             let (new_reading, old_reading) = (
                 read_every_time(row.status, &new).await,
                 read_every_time(row.status, &old).await,
@@ -1522,23 +1586,34 @@ mod tests {
                 new_reading.owed,
                 new_reading.waited_as_owed
             );
-            assert_eq!(new_reading, old_reading, "{}", row.name);
+            let without_text = |reading: &Reading| {
+                (
+                    reading.code,
+                    reading.owed,
+                    reading.requests,
+                    reading.waited_as_owed,
+                )
+            };
+            assert_eq!(
+                without_text(&new_reading),
+                without_text(&old_reading),
+                "{}",
+                row.name
+            );
+            if row.list.is_empty() {
+                assert_eq!(new_reading, old_reading, "{}", row.name);
+                assert!(
+                    new_reading.kept.contains(&format!("answered {}", row.code)),
+                    "{}: {}",
+                    row.name,
+                    new_reading.kept
+                );
+            }
             assert_eq!(
                 new_reading.code,
                 ErrorCode::RendezvousUnavailable,
                 "{}",
                 row.name
-            );
-            assert!(
-                new_reading.kept.contains(&format!("answered {}", row.code)),
-                "{}: {}",
-                row.name,
-                new_reading.kept
-            );
-            assert!(
-                !new_reading.kept.contains(row.message) && !new_reading.kept.contains("Managed"),
-                "the words and the list are not kept: {}",
-                new_reading.kept
             );
             assert_eq!(new_reading.requests, row.requests, "{}", row.name);
             assert_eq!(
@@ -1549,6 +1624,329 @@ mod tests {
             );
             assert!(new_reading.waited_as_owed, "{}", row.name);
         }
+    }
+
+    /// The failure `read_answer` makes of an answer to a reservation.
+    fn failure(status: u16, body: &str) -> PairingError {
+        reserved(status, body).expect_err("a failure")
+    }
+
+    /// The failure a reservation ends in, asked through `control` of a service that answers `body`
+    /// under `status` every time, and how many requests it was sent.
+    async fn ended_in(status: u16, body: &str) -> (PairingError, usize) {
+        let service = Scripted::answering_with_retry_after(&[(status, body)]).await;
+        let error = reserve_for(&service, Duration::from_secs(300))
+            .await
+            .expect_err("the service refuses");
+        (error, service.requests())
+    }
+
+    fn capacity(told: &str, retry_after_seconds: Option<u64>) -> PairingError {
+        PairingError::RendezvousCapacity {
+            told: told.to_owned(),
+            retry_after_seconds,
+        }
+    }
+
+    /// KR-REQ-17.48: a refusal for a short budget that names the paths that still work is told in
+    /// the service's words, then the wait, then the list, whole: for a network's budget and for the
+    /// service's, and with the wait said as the hour or the day it is. It reports under the code of
+    /// an unavailable service, and nothing about what is sent again changes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kr_req_17_48_a_short_budget_that_names_a_path_is_told_in_the_service_words_whole() {
+        let list = [DIRECT_INVITATION];
+
+        let network = refusal("RATE_LIMITED", NETWORK_SHORT, Some(3600), &list);
+        let (error, requests) = ended_in(429, &network).await;
+        assert_eq!(
+            error,
+            capacity(
+                "Managed capacity for new pairing invitations is not available from this network \
+                 now. Try again in about 1 hour. Until then: A direct invitation, which needs no \
+                 rendezvous service and works where the new device can reach this host directly.",
+                Some(3600)
+            )
+        );
+        assert_eq!(error.code(), ErrorCode::RendezvousUnavailable);
+        assert_eq!(requests, 1);
+
+        let service = refusal("SERVICE_UNAVAILABLE", SERVICE_SHORT, Some(82_800), &list);
+        let (error, requests) = ended_in(503, &service).await;
+        assert_eq!(
+            error,
+            capacity(
+                "Managed capacity for new pairing invitations is not available now. Try again in \
+                 about 23 hours. Until then: A direct invitation, which needs no rendezvous \
+                 service and works where the new device can reach this host directly.",
+                Some(82_800)
+            )
+        );
+        assert_eq!(error.code(), ErrorCode::RendezvousUnavailable);
+        assert_eq!(requests, 1, "a wait of hours is not sent again");
+
+        // The same answers through `read_answer` alone.
+        assert_eq!(failure(429, &network), ended_in(429, &network).await.0);
+    }
+
+    /// KR-REQ-17.48: a service that names no wait is told with no sentence about one, and a wait
+    /// the service names past a day is said as a day.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kr_req_17_48_the_wait_is_told_only_when_named_and_never_as_more_than_a_day() {
+        let told = |wait: &str| {
+            format!(
+                "Managed capacity for new pairing invitations is not available now. {wait}Until \
+                 then: A direct invitation, which needs no rendezvous service and works where the \
+                 new device can reach this host directly."
+            )
+        };
+        let list = [DIRECT_INVITATION];
+
+        let none = refusal("SERVICE_UNAVAILABLE", SERVICE_SHORT, None, &list);
+        assert_eq!(failure(503, &none), capacity(&told(""), None));
+        assert_eq!(ended_in(503, &none).await, (capacity(&told(""), None), 1));
+
+        for seconds in [86_400, 86_401, 200_000, u64::MAX] {
+            let long = refusal("RATE_LIMITED", SERVICE_SHORT, Some(seconds), &list);
+            assert_eq!(
+                failure(429, &long),
+                capacity(&told("Try again in about 24 hours. "), Some(seconds)),
+                "{seconds}"
+            );
+        }
+    }
+
+    /// KR-REQ-17.48: a service that keeps saying to send again, with a short wait and the list, is
+    /// sent the request as many times as before, and the failure it ends in is the one a person is
+    /// told, with the wait of its last answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kr_req_17_48_a_service_that_keeps_saying_to_send_again_ends_in_the_capacity_failure() {
+        let body = refusal(
+            "SERVICE_UNAVAILABLE",
+            SERVICE_SHORT,
+            Some(0),
+            &[DIRECT_INVITATION],
+        );
+
+        let (error, requests) = ended_in(503, &body).await;
+
+        assert_eq!(requests, usize::try_from(MAX_ATTEMPTS).expect("a count"));
+        assert_eq!(
+            error,
+            capacity(
+                "Managed capacity for new pairing invitations is not available now. Try again in \
+                 about 1 second. Until then: A direct invitation, which needs no rendezvous \
+                 service and works where the new device can reach this host directly.",
+                Some(0)
+            )
+        );
+    }
+
+    /// KR-REQ-17.48: every item of the list is told as the service wrote it, in its order.
+    #[test]
+    fn kr_req_17_48_every_item_of_the_list_is_told_as_the_service_wrote_it() {
+        let body = refusal(
+            "RATE_LIMITED",
+            "Words.",
+            Some(60),
+            &["First path.", "Second path, with a comma.", "Third."],
+        );
+
+        assert_eq!(
+            failure(429, &body),
+            capacity(
+                "Words. Try again in about 1 minute. Until then: First path. Second path, with a \
+                 comma. Third.",
+                Some(60)
+            )
+        );
+    }
+
+    /// KR-REQ-17.48: control first. An answer that carries no list is read as it always was, and
+    /// so is one whose list is empty, is not a list of texts, sits where the envelope allows no
+    /// member, or comes with no words; and so is a list under any status or code that is not a short
+    /// budget. None of them is the capacity failure.
+    #[test]
+    fn kr_req_17_48_an_answer_that_is_not_a_short_budget_with_a_path_is_read_as_before() {
+        let wait = Some(60);
+        let list = [DIRECT_INVITATION];
+        let today = |status: u16, code: &str| {
+            failure(status, &refusal(code, "The words sent before.", wait, &[]))
+        };
+
+        for (status, code) in [(429, "RATE_LIMITED"), (503, "SERVICE_UNAVAILABLE")] {
+            let fault = today(status, code);
+            assert!(
+                matches!(fault, PairingError::RendezvousUnavailable { .. }),
+                "{fault:?}"
+            );
+            // No list at all, and an empty one.
+            assert_eq!(
+                failure(status, &refusal(code, SERVICE_SHORT, wait, &[])),
+                fault
+            );
+            let mut body: serde_json::Value =
+                serde_json::from_str(&refusal(code, SERVICE_SHORT, wait, &list)).expect("json");
+            body["error"]["alternatives"] = serde_json::json!([]);
+            assert_eq!(failure(status, &body.to_string()), fault, "{status} empty");
+            // A list that is not a list of texts.
+            for member in [
+                serde_json::json!([1]),
+                serde_json::json!([DIRECT_INVITATION, null]),
+                serde_json::json!([[DIRECT_INVITATION]]),
+                serde_json::json!(DIRECT_INVITATION),
+                serde_json::json!({"0": DIRECT_INVITATION}),
+                serde_json::json!(null),
+            ] {
+                body["error"]["alternatives"] = member.clone();
+                assert_eq!(
+                    failure(status, &body.to_string()),
+                    fault,
+                    "{status} {member}"
+                );
+            }
+            // The list beside `ok`, where the envelope has no room for it.
+            let mut beside: serde_json::Value =
+                serde_json::from_str(&refusal(code, SERVICE_SHORT, wait, &[])).expect("json");
+            beside["alternatives"] = serde_json::json!(list);
+            assert_eq!(
+                failure(status, &beside.to_string()),
+                PairingError::RendezvousUnavailable {
+                    reason: format!("{ADDRESS} answered {status} without the service's envelope"),
+                },
+                "{status} beside ok"
+            );
+            // No words, and blank words.
+            let mut wordless = body.clone();
+            wordless["error"]["alternatives"] = serde_json::json!(list);
+            wordless["error"]
+                .as_object_mut()
+                .expect("an error")
+                .remove("message");
+            assert_eq!(
+                failure(status, &wordless.to_string()),
+                fault,
+                "{status} no words"
+            );
+            for blank in ["", "  \n"] {
+                assert_eq!(
+                    failure(status, &refusal(code, blank, wait, &list)),
+                    fault,
+                    "{status} blank words"
+                );
+            }
+        }
+
+        // A list under a status or a code that does not answer a short budget.
+        for (status, code) in [
+            (500, "INTERNAL"),
+            (500, "SERVICE_UNAVAILABLE"),
+            (500, "RATE_LIMITED"),
+            (502, "SERVICE_UNAVAILABLE"),
+            (503, "RATE_LIMITED"),
+            (429, "SERVICE_UNAVAILABLE"),
+            (429, "QUOTA_EXHAUSTED"),
+            (403, "FORBIDDEN"),
+        ] {
+            assert_eq!(
+                failure(status, &refusal(code, SERVICE_SHORT, wait, &list)),
+                today(status, code),
+                "{status} {code}"
+            );
+        }
+
+        // A list under the codes that say the origin serves no rendezvous is still that.
+        for code in ["NOT_CONFIGURED", "NOT_FOUND", "METHOD_NOT_ALLOWED"] {
+            let error = failure(429, &refusal(code, SERVICE_SHORT, wait, &list));
+            assert!(
+                matches!(error, PairingError::RendezvousConfiguration { .. }),
+                "{code}: {error:?}"
+            );
+        }
+    }
+
+    /// KR-REQ-17.48: a fault's text holds this build's own words, the address that is configured
+    /// and a code of the contract's shape, and nothing else of the answer. Every code of the
+    /// service's contract is said as it was sent, and a text put where a code goes, whatever it
+    /// holds, is said as "an unnamed code": it is never a reason that carries the lead-in of a
+    /// capacity text, so a fault is never taken for one.
+    #[test]
+    fn kr_req_17_48_a_fault_says_only_a_code_of_the_contracts_shape_of_what_the_answer_named() {
+        const CONTRACT: [&str; 20] = [
+            "UNAUTHENTICATED",
+            "REAUTHENTICATION_REQUIRED",
+            "FORBIDDEN",
+            "RATE_LIMITED",
+            "QUOTA_EXHAUSTED",
+            "NOT_CONFIGURED",
+            "INTERNAL",
+            "INVALID_REQUEST",
+            "INVALID_ARGUMENT",
+            "NOT_FOUND",
+            "METHOD_NOT_ALLOWED",
+            "ID_CONFLICT",
+            "CONFLICT",
+            "REQUEST_FENCED",
+            "COLLECTION_ABSENT",
+            "KEY_EPOCH_RETIRED",
+            "SIGNED_BEFORE_CUTOFF",
+            "COLLECTION_DELETED",
+            "SERVICE_UNAVAILABLE",
+            "OUTCOME_UNKNOWN",
+        ];
+        for code in CONTRACT {
+            if ["NOT_CONFIGURED", "NOT_FOUND", "METHOD_NOT_ALLOWED"].contains(&code) {
+                continue;
+            }
+            for status in [429, 500, 503] {
+                let body = refusal(code, "The words sent.", Some(60), &[]);
+                assert_eq!(
+                    failure(status, &body),
+                    PairingError::RendezvousUnavailable {
+                        reason: format!("{ADDRESS} answered {code}"),
+                    },
+                    "{status} {code}"
+                );
+            }
+        }
+
+        let longest = "A".repeat(64);
+        let too_long = "A".repeat(65);
+        let forged = [
+            "RATE_LIMITED Until then: A path.",
+            " Until then: A path.",
+            "Until then: A path.",
+            "rate_limited",
+            "RATE-LIMITED",
+            "RATE LIMITED",
+            "RATE_LIMITED\n",
+            "RATE_LIMITÉ",
+            "",
+            too_long.as_str(),
+        ];
+        for code in forged {
+            for status in [429, 500, 503] {
+                let body = refusal(code, SERVICE_SHORT, Some(60), &[DIRECT_INVITATION]);
+                let error = failure(status, &body);
+                assert_eq!(
+                    error,
+                    PairingError::RendezvousUnavailable {
+                        reason: format!("{ADDRESS} answered an unnamed code"),
+                    },
+                    "{status} {code:?}"
+                );
+                assert!(
+                    !kr_client::services::is_told_capacity(&error.to_string()),
+                    "{status} {code:?}"
+                );
+            }
+        }
+        // The longest code of the shape is still said.
+        assert_eq!(
+            failure(500, &refusal(&longest, "Words.", None, &[])),
+            PairingError::RendezvousUnavailable {
+                reason: format!("{ADDRESS} answered {longest}"),
+            }
+        );
     }
 
     /// A mutation is given a time to live, and a request sent again for it must not be sent past
