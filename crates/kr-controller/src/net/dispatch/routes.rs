@@ -1903,13 +1903,7 @@ impl RemoteConnection {
             DeviceWrite::Worker => {
                 return self
                     .proxied_mutation(
-                        mutation,
-                        accepted,
-                        validated,
-                        rights,
-                        &decided.acting,
-                        asked,
-                        own_claim,
+                        mutation, accepted, validated, rights, &decided, asked, own_claim,
                     )
                     .await;
             }
