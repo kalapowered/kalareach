@@ -3146,8 +3146,7 @@ async fn typed(accepted: u64) -> (Rig, DataStream) {
 /// How many frames of its epoch the real worker's lease has accepted.
 fn workers_count(rig: &Rig) -> u64 {
     let input = rig.worker_input();
-    let count = input.lock().lease().next_sequence.get();
-    count
+    input.lock().lease().next_sequence.get()
 }
 
 /// Whether the real worker's lease is held by the rig's attachment.
