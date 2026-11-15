@@ -250,8 +250,8 @@ pub const REMOVAL_PATIENCE: std::time::Duration = std::time::Duration::from_secs
 const LINE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// What the drop of a [`PrivateTempDir`] knows of the line that it said, as two facts that the
-/// drop itself sets: a stall of the dropping thread or of the process, of any length and at any
-/// point, changes neither.
+/// drop itself sets: a stall of the dropping thread or of the process that does not keep the
+/// receive past `LINE_WAIT` changes neither.
 ///
 /// `wait` is the length of the wait that the drop gave the writer's word: the time that its
 /// receive was given, set from the same value, whether or not a word came. It is nothing when no
@@ -1151,13 +1151,22 @@ mod tests {
     /// it prints anything, and ends with `WAIT_TOO_SHORT` when the wait was shorter than the hold
     /// and with `WRITE_NOT_DONE` when the word does not say that the write returned without an
     /// error. The case fails on either status, whatever the standard error holds, and passes only
-    /// when both facts hold. A stall of the process or of the dropping thread, of any length and
-    /// at any point, changes neither fact; the case rests only on the time that the writer takes,
-    /// which the wait of `LINE_WAIT` bounds. The line alone cannot decide the case, because a
-    /// process that is stopped for long enough after a drop that did not wait finds the line
-    /// written all the same. The hold makes a drop that waits really wait; it decides nothing. The
-    /// process says on its standard output what the drop took and the two facts, which a failure
-    /// shows.
+    /// when both facts hold. A stall of the process or of the dropping thread that does not keep
+    /// the receive past `LINE_WAIT` changes neither fact; the case rests only on the time that the
+    /// writer takes, which the wait of `LINE_WAIT` bounds. The line alone cannot decide the case,
+    /// because a process that is stopped for long enough after a drop that did not wait finds the
+    /// line written all the same. The hold makes a drop that waits really wait; it decides
+    /// nothing. The process says on its standard output what the drop took and the two facts,
+    /// which a failure shows.
+    ///
+    /// One kind of run is outside what this case can tell. When the writer's word is already in the
+    /// channel at the receive's last check (the dropping thread was stopped until the writer had
+    /// written, or a short receive woke after the word came), a wait of `LINE_WAIT`, a wait shorter
+    /// than the hold and a wait of no length do the same: the receive returns the word at once and
+    /// the line is written. A change of the receive's own argument that leaves the recorded wait as
+    /// it is passes the case in such a run, and fails it in every run in which the word is not yet
+    /// there. A change that shortens the recorded wait to less than `STANDARD_ERROR_HELD` fails the
+    /// case in every run, with `WAIT_TOO_SHORT`.
     #[cfg(unix)]
     #[test]
     fn a_process_that_ends_after_a_refused_removal_has_said_so() {
