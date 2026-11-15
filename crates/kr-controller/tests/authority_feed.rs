@@ -4618,6 +4618,43 @@ async fn a_carrier_that_reads_the_feed_again_clears_what_the_clock_said() {
     assert_eq!(check.status, DoctorStatus::Ok, "{check:?}");
 }
 
+/// KR-REQ-10.46: a host that starts with its feed unreachable knows only the time an earlier run
+/// wrote down. Its age cannot be told, so the device list and the doctor read stale, and the
+/// doctor gives no number of seconds: a count taken from an earlier run's wall clock would say how
+/// long ago, and not how long since this daemon last read the feed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restored_feed_whose_age_cannot_be_told_reads_stale_and_gives_no_seconds() {
+    let rig = Rig::start().await;
+    assert!(
+        !rig.shown().await.list.feed_stale,
+        "the control: the feed was just read"
+    );
+
+    let rig = rig.restarted(true, |_| {}).await;
+    let shown = rig.shown().await;
+    assert!(
+        shown.list.feed_synchronised_at_ms.0.is_some(),
+        "the control: an earlier run's time is shown"
+    );
+    assert!(
+        shown.list.feed_stale,
+        "the age of the last synchronisation cannot be told"
+    );
+    let check = shown.check.expect("the doctor reports the feed");
+    assert_eq!(check.status, DoctorStatus::Warning, "{check:?}");
+    assert_eq!(
+        seconds_since_the_doctor_says_the_feed_was_read(&check),
+        None,
+        "no number of seconds is given: {check:?}"
+    );
+    assert!(
+        check
+            .detail()
+            .contains("it has not been synchronised since this daemon started"),
+        "{check:?}"
+    );
+}
+
 /// The keys the feed may be told can remove the host are the owners the host is paired with now: an
 /// owner paired before the host first asked is named, a revoked owner stops being named, and a
 /// delegation the feed turns back is sent again by the next pass instead of being left to a person.
