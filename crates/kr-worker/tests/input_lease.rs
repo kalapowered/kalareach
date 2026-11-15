@@ -2712,8 +2712,9 @@ async fn an_answer_that_waits_for_room_is_dropped_at_its_deadline_with_nothing_e
 ///
 /// The lane drops an answer at a reading later than its deadline, and the pump's timer runs on
 /// another clock, which on some platforms is ahead of the lane's by a step of up to about sixteen
-/// milliseconds. Here the lane's clock stands at the deadline itself when the pump's timer ends.
-/// The clock then moves on, and that is all that happens: nothing notifies the pump.
+/// milliseconds. Here the lane's clock stands at the deadline itself when the pump's timer ends,
+/// and again when it ends a second time. The clock then moves on, and that is all that happens:
+/// nothing notifies the pump.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_answer_is_dropped_when_the_lanes_clock_passes_its_deadline_after_the_timer_found_it_there()
  {
@@ -2749,9 +2750,23 @@ async fn an_answer_is_dropped_when_the_lanes_clock_passes_its_deadline_after_the
             "at the deadline itself an answer has not lapsed"
         );
     }
+    // The pump has not given the deadline up: it waits for it again, and its timer ends a second
+    // time with the lane's clock still at the deadline.
+    let (timer_ended_again, release_again) = runtime.input().pause_the_pump_at_its_timer();
     drop(release_pump);
+    tokio::time::timeout(Duration::from_secs(20), timer_ended_again)
+        .await
+        .expect("the pump waits for the deadline again, and its timer ends a second time")
+        .expect("the pump's stop fires");
+    assert_eq!(
+        runtime.session().engine().replies_expired(),
+        0,
+        "at the deadline itself an answer has still not lapsed"
+    );
 
+    // Nothing notifies the pump from here on: the lane's clock moves, and that is all.
     clock.advance(Duration::from_millis(1));
+    drop(release_again);
     tokio::time::timeout(Duration::from_secs(10), async {
         while runtime.session().engine().replies_expired() == 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
