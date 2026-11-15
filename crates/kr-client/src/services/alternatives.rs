@@ -243,8 +243,9 @@ impl Offered {
 /// this.
 const LONGEST_SAID_SECONDS: u64 = 24 * 60 * 60;
 
-/// How long a wait of `seconds` is said to be, in the one unit that fits it, rounded up so that a
-/// person is never told to try again before the service said to.
+/// How long a wait of `seconds` is said to be, in the one unit that fits it, rounded up so that,
+/// up to the cap, a person is never told to try again before the service said to. A wait above the
+/// cap is said as a day.
 fn about(seconds: u64) -> Shown {
     let seconds = seconds.clamp(1, LONGEST_SAID_SECONDS);
     let minutes = seconds.div_ceil(60);
