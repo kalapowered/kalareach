@@ -4970,3 +4970,133 @@ async fn a_frame_of_a_refused_epoch_below_the_refusal_changes_no_count() {
     a_second_refusal_changes_no_count_of_the_epoch_before_it(SecondRefusal::TheSameEpochBelow)
         .await;
 }
+
+// The wait of a stream's admission, and of each frame's decision, for the registry. The registry is
+// held, so the wait cannot finish by itself: it ends when its stream does, whether the host ends
+// the stream or the device resets it, and nothing is forwarded.
+
+/// How the stream that waits for the registry ends.
+#[derive(Clone, Copy, Debug)]
+enum EndedBy {
+    /// The device's control stream ends while its connection stands, and the connection's input
+    /// streams end with it.
+    TheHost,
+    /// The device resets the input stream.
+    TheDevice,
+}
+
+/// A frame whose decision waits for the registry, with the stream ended by `by`: the stream's task
+/// ends while the registry is still held, and the worker was given no frame after the first.
+async fn a_frame_that_waits_for_the_registry_is_let_go_when_its_stream_ends(
+    serial: bool,
+    by: EndedBy,
+) {
+    let rig = if serial {
+        Rig::start_serial().await
+    } else {
+        Rig::start().await
+    };
+    let calls = serial.then(|| script_calls(&rig, None, |_| took()));
+    let stages = rig.adopted.host.network().input_stages();
+    let mut stream = rig.open().await;
+    type_and_wait(&rig, &mut stream, 0, b"a").await;
+    let mut ended = rig.adopted.host.network().input_tasks_ended();
+    let registry = rig.adopted.host.controller().hold_the_registry().await;
+    stream
+        .write_message(&rig.frame(1, b"b"))
+        .await
+        .expect("the frame is written");
+    until("the frame was read", || stages.counts().read == 2).await;
+    match by {
+        EndedBy::TheHost => rig.device.finish_control().await,
+        EndedBy::TheDevice => stream.reset(),
+    }
+    tokio::time::timeout(WAIT, ended.changed())
+        .await
+        .expect("the stream's task ended in time, with the registry held")
+        .expect("the count stands");
+    drop(registry);
+    match calls {
+        Some(calls) => assert_eq!(
+            calls.sequences(),
+            vec![0],
+            "{by:?}: the worker was given the frame that waited"
+        ),
+        None => assert_eq!(
+            rig.lane.frames().len(),
+            1,
+            "{by:?}: the lane was given the frame that waited"
+        ),
+    }
+    rig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_waiting_for_the_registry_is_let_go_when_the_host_ends_the_stream_of_a_worker_without_the_lane()
+ {
+    a_frame_that_waits_for_the_registry_is_let_go_when_its_stream_ends(true, EndedBy::TheHost)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_waiting_for_the_registry_is_let_go_when_the_device_resets_the_stream_of_a_worker_without_the_lane()
+ {
+    a_frame_that_waits_for_the_registry_is_let_go_when_its_stream_ends(true, EndedBy::TheDevice)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_waiting_for_the_registry_is_let_go_when_the_host_ends_the_stream_of_a_worker_with_the_lane()
+ {
+    a_frame_that_waits_for_the_registry_is_let_go_when_its_stream_ends(false, EndedBy::TheHost)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_waiting_for_the_registry_is_let_go_when_the_device_resets_the_stream_of_a_worker_with_the_lane()
+ {
+    a_frame_that_waits_for_the_registry_is_let_go_when_its_stream_ends(false, EndedBy::TheDevice)
+        .await;
+}
+
+/// A stream whose admission waits for the registry, with the stream ended by `by`: the stream's
+/// task ends while the registry is still held, and the stream is given no lane.
+async fn a_stream_that_waits_for_the_registry_at_its_admission_is_let_go_when_it_ends(by: EndedBy) {
+    let rig = Rig::start().await;
+    let mut started = rig.adopted.host.network().input_tasks_started();
+    let mut ended = rig.adopted.host.network().input_tasks_ended();
+    let registry = rig.adopted.host.controller().hold_the_registry().await;
+    let stream = rig.device.open_stream(rig.header_for(rig.attachment)).await;
+    tokio::time::timeout(WAIT, started.changed())
+        .await
+        .expect("the host began to serve the stream in time")
+        .expect("the count stands");
+    match by {
+        EndedBy::TheHost => rig.device.finish_control().await,
+        EndedBy::TheDevice => stream.reset(),
+    }
+    tokio::time::timeout(WAIT, ended.changed())
+        .await
+        .expect("the stream's task ended in time, with the registry held")
+        .expect("the count stands");
+    drop(registry);
+    assert!(
+        rig.lane.binds().is_empty(),
+        "{by:?}: the stream was given no lane"
+    );
+    rig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_waiting_for_the_registry_at_its_admission_is_let_go_when_the_host_ends_it() {
+    a_stream_that_waits_for_the_registry_at_its_admission_is_let_go_when_it_ends(EndedBy::TheHost)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_waiting_for_the_registry_at_its_admission_is_let_go_when_the_device_resets_it() {
+    a_stream_that_waits_for_the_registry_at_its_admission_is_let_go_when_it_ends(
+        EndedBy::TheDevice,
+    )
+    .await;
+}

@@ -34,6 +34,7 @@
 //! one of these states; its finish is heard once the frames it wrote have been read.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -264,6 +265,9 @@ pub(super) struct InputStreams {
     /// Where a suite has this host connect its input lanes, instead of the worker's own endpoint.
     #[cfg(feature = "testing")]
     lane_endpoint: Mutex<Option<kr_ipc::paths::Endpoint>>,
+    /// How many stream tasks have started.
+    #[cfg(feature = "testing")]
+    tasks_started: watch::Sender<u64>,
     /// How many stream tasks have ended, however they ended.
     #[cfg(feature = "testing")]
     tasks_ended: watch::Sender<u64>,
@@ -277,6 +281,8 @@ impl Default for InputStreams {
             stages: Arc::default(),
             #[cfg(feature = "testing")]
             lane_endpoint: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            tasks_started: watch::channel(0).0,
             #[cfg(feature = "testing")]
             tasks_ended: watch::channel(0).0,
         }
@@ -482,6 +488,10 @@ impl InputStreams {
             .unwrap_or_else(PoisonError::into_inner) = None;
     }
 
+    pub(super) fn tasks_started(&self) -> watch::Receiver<u64> {
+        self.tasks_started.subscribe()
+    }
+
     pub(super) fn tasks_ended(&self) -> watch::Receiver<u64> {
         self.tasks_ended.subscribe()
     }
@@ -498,9 +508,17 @@ impl InputStreams {
     }
 }
 
-/// Counts the end of a stream task, however the task ended, for a suite to wait for.
+/// Counts the start of a stream task, and its end however the task ended, for a suite to wait for.
 #[cfg(feature = "testing")]
 struct TaskEnd<'a>(&'a InputStreams);
+
+#[cfg(feature = "testing")]
+impl<'a> TaskEnd<'a> {
+    fn begin(streams: &'a InputStreams) -> Self {
+        streams.tasks_started.send_modify(|started| *started += 1);
+        Self(streams)
+    }
+}
 
 #[cfg(feature = "testing")]
 impl Drop for TaskEnd<'_> {
@@ -1049,10 +1067,21 @@ fn refusal(detail: &'static str) -> ProtocolError {
 /// Serves one terminal-input stream until it ends.
 pub(super) async fn serve(door: Arc<DataDoor>, mut reader: DataReader, writer: DataWriter) {
     #[cfg(feature = "testing")]
-    let _ended = TaskEnd(&door.host.input);
+    let _ended = TaskEnd::begin(&door.host.input);
     let handle = reader.handle();
     let header = reader.header().clone();
-    let Some(admitted) = admit(&door, &header, &handle).await else {
+    let admitted = {
+        // No frame is read while the stream is admitted: the pending read takes nothing from the
+        // stream and hears the device's reset, and the stream's revocation is heard beside it.
+        let (_no_room, mut no_room_rx) = watch::channel(false);
+        let mut reset = Box::pin(reader.read_message_when::<InputFrame>(&mut no_room_rx));
+        tokio::select! {
+            admitted = admit(&door, &header, &handle) => admitted,
+            _ = &mut reset => None,
+            () = handle.revoked() => None,
+        }
+    };
+    let Some(admitted) = admitted else {
         handle.revoke();
         return;
     };
@@ -1306,6 +1335,10 @@ async fn run(
     let mut next = Box::pin(reader.read_message_when::<InputFrame>(&mut room_rx));
     // Frames read and not yet routed, at most [`READ_AHEAD_FRAMES`].
     let mut held: VecDeque<Held> = VecDeque::new();
+    // The decision of the frame that was routed to go on, which waits for the registry. It is
+    // waited for in the select below with the stream's other events, so the stream's end and the
+    // device's reset are heard while it waits, and one frame is decided at a time, in order.
+    let mut deciding: Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>>> = None;
     let mut reading = true;
     let mut finished = false;
     loop {
@@ -1316,12 +1349,16 @@ async fn run(
         if flow.ended().is_some() || handle.is_revoked() {
             break;
         }
-        if let Some(front) = held.front() {
+        if deciding.is_none()
+            && let Some(front) = held.front()
+        {
             let claim = input_claim(front.frame.bytes.len());
             match flow.route(front.frame.epoch, claim) {
                 Routed::Forward(deadline) => {
                     if let Some(Held { frame, .. }) = held.pop_front() {
-                        forward(door, flow, queue, session, attachment, frame, deadline).await;
+                        deciding = Some(Box::pin(forward(
+                            door, flow, queue, session, attachment, frame, deadline,
+                        )));
                     }
                     continue;
                 }
@@ -1341,7 +1378,7 @@ async fn run(
         } else if !finished && reading {
             flow.stages.read_is_full();
         }
-        if finished && held.is_empty() && flow.drained() {
+        if finished && held.is_empty() && deciding.is_none() && flow.drained() {
             // The device is done and what it wrote is answered: the stream finishes.
             flow.end(End::Graceful);
             break;
@@ -1352,6 +1389,14 @@ async fn run(
         room.send_replace(may_read);
         tokio::select! {
             _ = version.changed() => {}
+            () = async {
+                match deciding.as_mut() {
+                    Some(deciding) => deciding.await,
+                    None => std::future::pending().await,
+                }
+            }, if deciding.is_some() => {
+                deciding = None;
+            }
             read = &mut next, if reading => {
                 match read {
                     Ok(Some(frame)) => {

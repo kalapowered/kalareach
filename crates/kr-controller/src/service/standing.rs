@@ -761,4 +761,13 @@ impl Controller {
         self.check_fence()?;
         Ok(effect())
     }
+
+    /// Holds this daemon's registry until the returned guard is dropped, for a suite that checks
+    /// what a wait for the registry does when the stream it serves ends.
+    #[cfg(feature = "testing")]
+    pub async fn hold_the_registry(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, crate::registry::Registry> {
+        self.registry.lock().await
+    }
 }
