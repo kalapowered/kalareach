@@ -3594,10 +3594,10 @@ impl Session {
         let waiting = self.engine.replies_pending() && input.lane_gate().allows_write();
         input.set_replies_waiting(waiting);
         // An answer that waits is also dropped at its deadline when no room comes back and nothing
-        // else happens, so the pump is told when that deadline is, and looks again then.
-        let expiry = waiting
-            .then(|| self.engine.next_reply_expiry_ms())
-            .flatten();
+        // else happens, and a closed gate does not stop it from ageing, so the pump is told when
+        // the first deadline of what the drain left is, whatever the gate allows, and looks again
+        // when the lane's clock has passed it.
+        let expiry = self.engine.next_reply_expiry_ms();
         let expiry_changed = input.set_reply_expiry(expiry);
         drop(input);
         if expiry_changed {
@@ -3611,8 +3611,10 @@ impl Session {
         }
     }
 
-    /// Returns how many answers the writer has dropped, because the response lane's deadline for
-    /// each passed while it waited for a terminal that would not take it.
+    /// Returns how many answers did not reach the application after they left the response lane:
+    /// each was past its lane deadline before the writer had written any of it, or the writer had
+    /// ended, or was ending, and left it unwritten. An answer dropped inside the lane, past its
+    /// deadline, is in the lane's record and not here.
     #[must_use]
     pub fn replies_dropped(&self) -> u64 {
         self.input.lock().replies_dropped()
@@ -4079,6 +4081,13 @@ impl Session {
     #[must_use]
     pub fn activity(&self) -> Arc<crate::lifecycle::Activity> {
         Arc::clone(&self.activity)
+    }
+
+    /// Returns the clock the response lane's deadlines are measured on, which the pump reads to
+    /// know when an answer's deadline has passed.
+    #[must_use]
+    pub(crate) fn lane_clock(&self) -> Arc<dyn kr_ipc::clock::SharedClock> {
+        self.engine.clock()
     }
 
     /// Returns how long the supervision lets this session go between observations while nothing
