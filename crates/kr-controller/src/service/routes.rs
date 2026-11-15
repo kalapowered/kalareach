@@ -456,6 +456,8 @@ impl Controller {
                 // Pairing and owner confirmation are the network module's, and a local caller
                 // reaches them as the host's own account: the issuing owner of what it invites.
                 let caller = self.local_caller(actor_id);
+                #[cfg(feature = "testing")]
+                self.after_the_pairing_caller.wait().await;
                 let deadline = accepted.map(|accepted| accepted.deadline);
                 let admission = self.pairing_admission(connection_id, admitted, deadline);
                 let guard = self.pairing_guard(connection_id, admitted, deadline);
