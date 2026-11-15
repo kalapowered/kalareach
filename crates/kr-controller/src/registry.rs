@@ -553,6 +553,51 @@ impl Registry {
         Ok(true)
     }
 
+    /// Writes the registry at `path`, as one state of it, into a new file at `copy`, which has no
+    /// log or journal beside it.
+    ///
+    /// The registry is opened for writing with the locks SQLite takes, never as an immutable file,
+    /// which ignores a log, and `VACUUM INTO` copies it inside one read transaction: the copy holds
+    /// what the file and its write-ahead log held together at the moment that transaction began,
+    /// whatever else writes meanwhile, and a log that holds writes its file has not taken in is
+    /// read, not copied beside it. Copying the file and then its log would give one state only if
+    /// nothing wrote between the two copies. The copy is made in the rollback-journal mode and is
+    /// brought to write-ahead mode by whatever opens it for writing, as any registry is. The
+    /// registry is changed no further than [`Registry::take_in_its_log`] changes it: closing the
+    /// connection takes into the file a log a daemon left, and removes the log.
+    ///
+    /// The caller holds the environment's singleton lock, so no daemon starts to write meanwhile,
+    /// and `copy` must not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the registry cannot be opened or read,
+    /// when `copy` cannot be written or its name cannot be given to the database as text, and when
+    /// the copy does not fit where it is made.
+    pub fn copy_as_one_state(
+        path: impl AsRef<std::path::Path>,
+        copy: impl AsRef<std::path::Path>,
+    ) -> Result<()> {
+        let copy = copy.as_ref();
+        let Some(named) = copy.to_str() else {
+            return Err(ControllerError::RegistryUnavailable {
+                detail: "the name of the copy is not text".to_owned(),
+            });
+        };
+        // Without the flag that creates a file: a registry removed meanwhile is not made again.
+        let connection = open_connection(
+            path.as_ref(),
+            Some(
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ),
+        )?;
+        connection
+            .execute("VACUUM INTO ?1", [named])
+            .map_err(ControllerError::registry)?;
+        Ok(())
+    }
+
     /// Brings a registry that is behind this build's schema forward, as a daemon's start would,
     /// and says what it did; `None` when there was nothing to bring. The file's other writers open
     /// it first, as they do at a daemon's start, and the registry's own tables go through its chain
@@ -5135,5 +5180,158 @@ mod tests {
         let refused =
             Registry::open_to_read(&link, environment()).expect_err("the reader refuses a link");
         assert!(refused.to_string().contains("link"), "{refused}");
+    }
+
+    /// A copy of a registry whose newest rows stand in its write-ahead log alone holds them, is one
+    /// file with nothing beside it, and leaves the registry as it was.
+    #[test]
+    fn a_copy_holds_what_the_log_holds_and_stands_alone() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        drop(opened(&path, kernel));
+        // A writer that is still open and never checkpoints: what it commits stands in the log.
+        let writer = Connection::open(&path).expect("opens");
+        writer
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("no checkpoint");
+        writer
+            .execute_batch(
+                "CREATE TABLE marker (n INTEGER NOT NULL);
+                 INSERT INTO marker VALUES (1), (2), (3);",
+            )
+            .expect("writes");
+        let mut log = path.as_os_str().to_owned();
+        log.push("-wal");
+        assert!(
+            std::fs::metadata(&log).expect("the log").len() > 0,
+            "the rows are in the log"
+        );
+        let file_before = std::fs::read(&path).expect("reads the file");
+        let copies = tempfile::tempdir().expect("a directory");
+        let copy = copies.path().join("registry.sqlite");
+        Registry::copy_as_one_state(&path, &copy).expect("copied");
+        let rows: i64 =
+            Connection::open_with_flags(&copy, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("the copy opens")
+                .query_row("SELECT COUNT(*) FROM marker", [], |row| row.get(0))
+                .expect("reads the copy");
+        assert_eq!(rows, 3, "the copy holds the rows the log held");
+        let names: Vec<_> = std::fs::read_dir(copies.path())
+            .expect("lists")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("registry.sqlite")]);
+        assert_eq!(
+            std::fs::read(&path).expect("reads the file"),
+            file_before,
+            "the registry's file is as it was"
+        );
+        drop(writer);
+    }
+
+    /// Whatever another connection commits and checkpoints while a copy is made, the copy is one
+    /// state of the registry: both of the two tables a commit changes together agree, the file is
+    /// whole, and it is no older than what had been committed when the copy was asked for.
+    #[test]
+    fn a_copy_is_one_state_of_a_registry_that_another_connection_writes_and_checkpoints() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        drop(opened(&path, kernel));
+        let committed = Arc::new(AtomicI64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = std::thread::spawn({
+            let (path, committed, stop) = (path.clone(), Arc::clone(&committed), Arc::clone(&stop));
+            move || {
+                let connection = Connection::open(&path).expect("opens");
+                connection
+                    .pragma_update(None, "synchronous", "OFF")
+                    .expect("no sync");
+                connection
+                    .execute_batch(
+                        "CREATE TABLE first (n INTEGER NOT NULL);
+                         CREATE TABLE second (n INTEGER NOT NULL);
+                         INSERT INTO first VALUES (0);
+                         INSERT INTO second VALUES (0);",
+                    )
+                    .expect("tables");
+                let mut n = 0;
+                while !stop.load(Ordering::Acquire) {
+                    n += 1;
+                    connection
+                        .execute_batch(&format!(
+                            "BEGIN; UPDATE first SET n = {n}; UPDATE second SET n = {n}; COMMIT;"
+                        ))
+                        .expect("commits");
+                    committed.store(n, Ordering::Release);
+                    if n % 3 == 0 {
+                        let _ =
+                            connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+                    }
+                }
+            }
+        });
+        while committed.load(Ordering::Acquire) == 0 {
+            assert!(!writer.is_finished(), "the writer ended");
+            std::thread::yield_now();
+        }
+        let copies = tempfile::tempdir().expect("a directory");
+        for round in 0..40 {
+            let before = committed.load(Ordering::Acquire);
+            let copy = copies.path().join(format!("registry-{round}.sqlite"));
+            Registry::copy_as_one_state(&path, &copy).expect("copied");
+            let connection =
+                Connection::open_with_flags(&copy, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .expect("the copy opens");
+            let (first, second): (i64, i64) = connection
+                .query_row(
+                    "SELECT (SELECT n FROM first), (SELECT n FROM second)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("reads the copy");
+            assert_eq!(first, second, "round {round}: two tables of two states");
+            assert!(
+                first >= before,
+                "round {round}: {first} is older than {before}"
+            );
+            let whole: String = connection
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .expect("checks the copy");
+            assert_eq!(whole, "ok", "round {round}");
+        }
+        stop.store(true, Ordering::Release);
+        writer.join().expect("the writer ended");
+    }
+
+    /// A copy that cannot be written is refused, and the registry is as it was.
+    #[test]
+    fn a_copy_that_cannot_be_written_is_refused_and_the_registry_is_as_it_was() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        drop(opened(&path, kernel));
+        let before = std::fs::read(&path).expect("reads the file");
+        let refused = Registry::copy_as_one_state(&path, directory.path().join("none/copy.sqlite"))
+            .expect_err("no directory to hold the copy");
+        assert!(
+            matches!(refused, ControllerError::RegistryUnavailable { .. }),
+            "{refused}"
+        );
+        assert_eq!(std::fs::read(&path).expect("reads the file"), before);
+        let gone = Registry::copy_as_one_state(
+            directory.path().join("gone.sqlite3"),
+            directory.path().join("copy.sqlite"),
+        )
+        .expect_err("no registry to copy");
+        assert!(
+            matches!(gone, ControllerError::RegistryUnavailable { .. }),
+            "{gone}"
+        );
+        assert!(
+            !directory.path().join("gone.sqlite3").exists(),
+            "a registry that is not there is not made"
+        );
     }
 }

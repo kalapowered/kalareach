@@ -310,9 +310,10 @@ pub async fn classify(environment: &Environment, target: &ReleaseManifest) -> Re
 /// the stores that runs before this takes into the file what a daemon that ended by a signal left in
 /// its log, as an update's does.) The copy is what the registry would be if a daemon of this release
 /// had started in the environment, and holds the same records, so a worker the registry names that no
-/// daemon of this release has met is classed all the same. The copy is made in the temporary
-/// directory and goes when this returns; a registry too large for that directory refuses the
-/// rollback, naming the environment.
+/// daemon of this release has met is classed all the same. The copy is made by the database
+/// itself, as one state of the registry and its log together, in the temporary directory, and goes
+/// when this returns; a registry too large for that directory refuses the rollback, naming the
+/// environment.
 ///
 /// # Errors
 ///
@@ -344,7 +345,7 @@ fn unreadable(environment: &Environment, error: &kr_controller::ControllerError)
     ))
 }
 
-/// A private copy of an environment's registry, with the log or journal beside it, which goes when
+/// A private copy of an environment's registry, as one file with nothing beside it, which goes when
 /// the copy does.
 struct ApartRegistry {
     directory: std::path::PathBuf,
@@ -357,20 +358,21 @@ impl Drop for ApartRegistry {
 }
 
 impl ApartRegistry {
-    /// Copies the registry at `original`; `None` where it is not a regular file.
+    /// Copies the registry at `original`, as one state of it that the database takes inside one read
+    /// transaction; `None` where it is not a regular file.
     fn of(environment: &Environment, original: &std::path::Path) -> Result<Option<Self>> {
-        let failed = |what: &'static str, error: &std::io::Error| {
+        let failed = |what: &'static str, error: Shown| {
             CliError::Other(shown!(
                 "environment {}'s registry could not be copied to be read: {} {}",
                 environment.environment_id,
                 what,
-                Shown::io(error)
+                error
             ))
         };
         match std::fs::symlink_metadata(original) {
             Ok(metadata) if metadata.is_file() => {}
             Ok(_) => return Ok(None),
-            Err(error) => return Err(failed("it could not be looked at:", &error)),
+            Err(error) => return Err(failed("it could not be looked at:", Shown::io(&error))),
         }
         let directory = std::env::temp_dir().join(format!("kr-registry-{}", kr_ipc::new_uuid()));
         let copy = Self { directory };
@@ -382,33 +384,12 @@ impl ApartRegistry {
                 Shown::ipc(&error)
             ))
         })?;
-        std::fs::copy(original, copy.database())
-            .map_err(|error| failed("the file could not be copied:", &error))?;
-        for suffix in ["-wal", "-journal"] {
-            let mut beside = original.as_os_str().to_owned();
-            beside.push(suffix);
-            let beside = std::path::PathBuf::from(beside);
-            match std::fs::symlink_metadata(&beside) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Ok(metadata) if metadata.is_file() => {
-                    let mut named = copy.database().as_os_str().to_owned();
-                    named.push(suffix);
-                    std::fs::copy(&beside, &named).map_err(|error| {
-                        failed("what is beside it could not be copied:", &error)
-                    })?;
-                }
-                Ok(_) => {
-                    return Err(CliError::Other(shown!(
-                        "environment {}'s registry has beside it something that is not a regular file, {}",
-                        environment.environment_id,
-                        Shown::root(&beside)
-                    )));
-                }
-                Err(error) => {
-                    return Err(failed("what is beside it could not be looked at:", &error));
-                }
-            }
-        }
+        Registry::copy_as_one_state(original, copy.database()).map_err(|error| {
+            failed(
+                "the file could not be copied:",
+                Shown::protocol(&error.to_protocol_error()),
+            )
+        })?;
         Ok(Some(copy))
     }
 
@@ -663,5 +644,85 @@ mod tests {
                 "{untrusted} is not an environment that is gone"
             );
         }
+    }
+
+    /// What a rollback classes a registry from is one file with nothing beside it, which holds what
+    /// the registry's write-ahead log holds and goes with the holder of the copy.
+    #[test]
+    fn the_private_copy_of_a_registry_is_one_file_that_goes_with_its_holder() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = Environment {
+            environment_id: temp.environment_id(),
+            paths: temp.environment(),
+            host: temp.paths().clone(),
+        };
+        let original = environment.paths.registry_database();
+        drop(Registry::open(&original, environment.environment_id).expect("a registry"));
+        // A writer that is still open and never checkpoints: its rows stand in the log alone.
+        let writer = rusqlite::Connection::open(&original).expect("opens");
+        writer
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("no checkpoint");
+        writer
+            .execute_batch(
+                "CREATE TABLE marker (n INTEGER NOT NULL); INSERT INTO marker VALUES (1), (2);",
+            )
+            .expect("writes");
+        let copy = ApartRegistry::of(&environment, &original)
+            .ok()
+            .flatten()
+            .expect("a copy of a regular file");
+        let held = copy.directory.clone();
+        let names: Vec<_> = std::fs::read_dir(&held)
+            .expect("lists the copy's directory")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![std::ffi::OsString::from("registry.sqlite")],
+            "the copy is one file"
+        );
+        let rows: i64 = rusqlite::Connection::open_with_flags(
+            copy.database(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("the copy opens")
+        .query_row("SELECT COUNT(*) FROM marker", [], |row| row.get(0))
+        .expect("reads the copy");
+        assert_eq!(rows, 2, "it holds what the log held");
+        drop(copy);
+        assert!(!held.exists(), "the copy goes with its holder");
+        drop(writer);
+    }
+
+    /// A registry that cannot be copied refuses the rollback, naming the environment, in the words
+    /// of a copy that failed.
+    #[test]
+    fn a_registry_that_cannot_be_copied_is_refused_naming_its_environment() {
+        use kr_client::shown::Said as _;
+
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = Environment {
+            environment_id: temp.environment_id(),
+            paths: temp.environment(),
+            host: temp.paths().clone(),
+        };
+        let original = environment.paths.registry_database();
+        std::fs::write(&original, vec![b'x'; 8192]).expect("a file that is no database");
+        let Err(refused) = ApartRegistry::of(&environment, &original) else {
+            panic!("a file that is no database is copied");
+        };
+        let said = refused.said();
+        assert!(
+            said.as_str()
+                .contains(&environment.environment_id.to_string()),
+            "{}",
+            said.as_str()
+        );
+        assert!(
+            said.as_str().contains("could not be copied to be read"),
+            "{}",
+            said.as_str()
+        );
     }
 }
