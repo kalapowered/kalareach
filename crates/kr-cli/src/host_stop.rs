@@ -47,10 +47,10 @@ use crate::update::handover;
 
 /// How long the answer to the request is waited for: the daemon settles the creates under way for
 /// [`STOP_SETTLE_MS`] before it answers, and its answer is written within a few seconds.
-const ANSWER_BOUND: Duration = Duration::from_millis(STOP_SETTLE_MS + 5_000);
+pub(crate) const ANSWER_BOUND: Duration = Duration::from_millis(STOP_SETTLE_MS + 5_000);
 
 /// How long the end of the daemon is waited for once it was told to stop.
-const END_BOUND: Duration = handover::DAEMON_STOP;
+pub(crate) const END_BOUND: Duration = handover::DAEMON_STOP;
 
 /// How often the end of the daemon is looked for.
 const LOOK_EVERY: Duration = Duration::from_millis(50);
@@ -58,9 +58,12 @@ const LOOK_EVERY: Duration = Duration::from_millis(50);
 /// What a refusal says of the sessions meanwhile, for a command that stops the daemon.
 const SESSIONS_GO_ON: &str = "Sessions and local attachments go on while no daemon runs.";
 
+/// What a refusal says of the sessions meanwhile, for a command that stops the daemon and starts one.
+const SESSIONS_GO_ON_THROUGH: &str = "Sessions and local attachments go on through a restart.";
+
 /// What this command knows of whether the daemon was asked, for `--json`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Knows {
+pub(crate) enum Knows {
     /// The daemon was seen to end.
     Ended,
     /// The daemon took the stop, and was not seen to end.
@@ -74,7 +77,7 @@ enum Knows {
 }
 
 impl Knows {
-    const fn word(self) -> &'static str {
+    pub(crate) const fn word(self) -> &'static str {
         match self {
             Self::Ended => "ended",
             Self::Told => "told",
@@ -87,7 +90,7 @@ impl Knows {
 
 /// Where the command has come to, which says what an interrupt may say.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Stage {
+pub(crate) enum Stage {
     /// The request has not been written.
     BeforeAsking = 0,
     /// The request has been written or is being written; the answer or the end is not seen.
@@ -96,33 +99,39 @@ enum Stage {
     Told = 2,
     /// The daemon refused the request, and nothing was stopped.
     Refused = 3,
+    /// The daemon's end was seen and no start has been asked for: only a restart enters it.
+    Ended = 4,
+    /// A start has been asked for: only a restart enters it.
+    Starting = 5,
 }
 
 /// What the command's interrupt handling and its work share.
-struct Progress {
-    stage: AtomicU8,
+pub(crate) struct Progress {
+    pub(crate) stage: AtomicU8,
     /// The command's own record, from the moment it is written.
-    marker: Mutex<Option<Marker>>,
-    environment_id: EnvironmentId,
+    pub(crate) marker: Mutex<Option<Marker>>,
+    pub(crate) environment_id: EnvironmentId,
     /// What the command said at its start of the attempts earlier commands recorded.
-    earlier: Mutex<Vec<Shown>>,
+    pub(crate) earlier: Mutex<Vec<Shown>>,
 }
 
 impl Progress {
-    fn enter(&self, stage: Stage) {
+    pub(crate) fn enter(&self, stage: Stage) {
         self.stage.store(stage as u8, Ordering::SeqCst);
     }
 
-    fn stage(&self) -> Stage {
+    pub(crate) fn stage(&self) -> Stage {
         match self.stage.load(Ordering::SeqCst) {
             0 => Stage::BeforeAsking,
             1 => Stage::Asked,
             2 => Stage::Told,
-            _ => Stage::Refused,
+            3 => Stage::Refused,
+            4 => Stage::Ended,
+            _ => Stage::Starting,
         }
     }
 
-    fn with_marker<T>(&self, then: impl FnOnce(&mut Marker) -> T) -> Option<T> {
+    pub(crate) fn with_marker<T>(&self, then: impl FnOnce(&mut Marker) -> T) -> Option<T> {
         let mut held = self
             .marker
             .lock()
@@ -130,14 +139,14 @@ impl Progress {
         held.as_mut().map(then)
     }
 
-    fn said_earlier(&self) -> Vec<Shown> {
+    pub(crate) fn said_earlier(&self) -> Vec<Shown> {
         self.earlier
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
-    fn remove_marker(&self) {
+    pub(crate) fn remove_marker(&self) {
         let taken = self
             .marker
             .lock()
@@ -242,7 +251,50 @@ impl Interrupts {
     }
 }
 
-/// Runs `kr host stop`.
+/// Which of the two commands that end the control daemon is running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Which {
+    /// `kr host stop`.
+    Stop,
+    /// `kr host restart`.
+    Restart,
+}
+
+impl Which {
+    /// The command as a person types it.
+    pub(crate) const fn command(self) -> &'static str {
+        match self {
+            Self::Stop => "kr host stop",
+            Self::Restart => "kr host restart",
+        }
+    }
+
+    /// What a refusal of the guard says of the sessions meanwhile.
+    const fn sessions(self) -> &'static str {
+        match self {
+            Self::Stop => SESSIONS_GO_ON,
+            Self::Restart => SESSIONS_GO_ON_THROUGH,
+        }
+    }
+
+    /// What a text says where the command ended before it asked the daemon for anything.
+    const fn nothing_asked(self) -> &'static str {
+        match self {
+            Self::Stop => "No stop was requested.",
+            Self::Restart => "No stop was requested and no start was made.",
+        }
+    }
+
+    /// What a text that ends a restart without a start says last.
+    const fn no_start(self) -> &'static str {
+        match self {
+            Self::Stop => "",
+            Self::Restart => " This command requested no start.",
+        }
+    }
+}
+
+/// Runs one of the two commands.
 ///
 /// The handlers stand from the first line: an interrupt before the request is written ends the
 /// command with nothing asked and its record removed; after it, a hangup is ignored, and any other
@@ -252,7 +304,7 @@ impl Interrupts {
 ///
 /// Returns the failures that are not the command's own result: this installation's environment
 /// cannot be found.
-pub async fn run(paths: &HostPaths, json: bool) -> Result<Completion> {
+pub(crate) async fn run_command(which: Which, paths: &HostPaths, json: bool) -> Result<Completion> {
     let mut interrupts = Interrupts::catch();
     let environment = installation(paths)?;
     let progress = Progress {
@@ -261,7 +313,14 @@ pub async fn run(paths: &HostPaths, json: bool) -> Result<Completion> {
         environment_id: environment.environment_id,
         earlier: Mutex::new(Vec::new()),
     };
-    let work = stop(paths, &environment, json, &progress);
+    let work = async {
+        match which {
+            Which::Stop => stop(paths, &environment, json, &progress).await,
+            Which::Restart => {
+                crate::host_restart::restart(paths, &environment, json, &progress).await
+            }
+        }
+    };
     tokio::pin!(work);
     loop {
         tokio::select! {
@@ -273,14 +332,27 @@ pub async fn run(paths: &HostPaths, json: bool) -> Result<Completion> {
                 if interrupt == Interrupt::Hangup && stage != Stage::BeforeAsking {
                     continue;
                 }
-                return Ok(interrupted(&progress, stage, json));
+                return Ok(match which {
+                    Which::Stop => interrupted(&progress, stage, json),
+                    Which::Restart => crate::host_restart::interrupted(&progress, stage, json),
+                });
             }
         }
     }
 }
 
+/// Runs `kr host stop`.
+///
+/// # Errors
+///
+/// Returns the failures that are not the command's own result: this installation's environment
+/// cannot be found.
+pub async fn run(paths: &HostPaths, json: bool) -> Result<Completion> {
+    run_command(Which::Stop, paths, json).await
+}
+
 /// This installation's own environment, whether or not a daemon has ever run there.
-fn installation(paths: &HostPaths) -> Result<KnownEnvironment> {
+pub(crate) fn installation(paths: &HostPaths) -> Result<KnownEnvironment> {
     let environment_id = paths.open_environment_id()?;
     Ok(KnownEnvironment {
         environment_id,
@@ -323,7 +395,8 @@ fn interrupted(progress: &Progress, stage: Stage, json: bool) -> Completion {
                 ),
             )
         }
-        Stage::Told => (
+        // Only a restart is ever past the end of the daemon it stopped.
+        Stage::Told | Stage::Ended | Stage::Starting => (
             Knows::Told,
             shown!(
                 "The control daemon for environment {} was told to stop and may still be ending. \
@@ -348,17 +421,17 @@ fn interrupted(progress: &Progress, stage: Stage, json: bool) -> Completion {
 
 /// The facts a result carries in `--json`.
 #[derive(Clone)]
-struct Facts {
-    knows: Knows,
-    pid: Option<u64>,
-    unsettled: Option<u64>,
+pub(crate) struct Facts {
+    pub(crate) knows: Knows,
+    pub(crate) pid: Option<u64>,
+    pub(crate) unsettled: Option<u64>,
     /// What earlier attempts recorded, which this command said at its start.
-    records: Vec<Shown>,
+    pub(crate) records: Vec<Shown>,
 }
 
 impl Facts {
     /// Nothing asked, and nothing known of a process.
-    fn none(records: Vec<Shown>) -> Self {
+    pub(crate) fn none(records: Vec<Shown>) -> Self {
         Self {
             knows: Knows::NotAsked,
             pid: None,
@@ -367,7 +440,7 @@ impl Facts {
         }
     }
 
-    fn document(&self) -> Document {
+    pub(crate) fn document(&self) -> Document {
         let document = Document::new()
             .with("stop", self.knows.word())
             .with("pid", self.pid)
@@ -381,7 +454,7 @@ impl Facts {
 }
 
 /// Reports a result that is a failure, in the form the caller asked for, and ends the command.
-fn failed(error: CliError, result: &Facts, json: bool) -> Completion {
+pub(crate) fn failed(error: CliError, result: &Facts, json: bool) -> Completion {
     if json {
         output::document(&report::with_failure(result.document(), &error));
     } else {
@@ -393,7 +466,7 @@ fn failed(error: CliError, result: &Facts, json: bool) -> Completion {
 /// Reports a result that is a success, and then removes the records of earlier attempts that the
 /// report has put out. This is the one place that removes them: a result that is not this command's
 /// own, seen and written, removes nothing.
-fn done(said: &Shown, result: &Facts, json: bool, earlier: &Earlier) -> Completion {
+pub(crate) fn done(said: &Shown, result: &Facts, json: bool, earlier: &Earlier) -> Completion {
     if json {
         output::document(&result.document().with("ok", true));
     } else {
@@ -403,27 +476,33 @@ fn done(said: &Shown, result: &Facts, json: bool, earlier: &Earlier) -> Completi
     Completion::Done
 }
 
-/// The command, from the guard to the daemon's end.
-async fn stop(
-    host: &HostPaths,
+/// What both commands have done once they begin: the guard has passed, and what earlier attempts
+/// recorded has been said. A record is removed only by [`done`], once the result that put it out
+/// has been written.
+pub(crate) struct Begun {
+    pub(crate) earlier: Earlier,
+    /// The facts of a result that asked nothing: the earlier records, said in `--json`.
+    pub(crate) none: Facts,
+}
+
+/// The guard, then the records of earlier attempts, which are said at the start (in the document
+/// under `--json`).
+pub(crate) async fn begin(
+    which: Which,
     environment: &KnownEnvironment,
     json: bool,
     progress: &Progress,
-) -> Result<Completion> {
+) -> std::result::Result<Begun, Completion> {
     let id = environment.environment_id;
-    let none = Facts::none(Vec::new());
     if let Err(error) = crate::bind::require_outside_to_end_a_daemon(
         &crate::build_id(),
-        "kr host stop",
-        SESSIONS_GO_ON,
+        which.command(),
+        which.sessions(),
     )
     .await
     {
-        return Ok(failed(error, &none, json));
+        return Err(failed(error, &Facts::none(Vec::new()), json));
     }
-    // What earlier attempts recorded and whose process has gone is said at the start (in the
-    // document under `--json`), and removed only by `done`, after the result that put it out has
-    // been written.
     let mut earlier = Earlier::read(&environment.paths);
     let none = Facts::none(earlier.said(id));
     *progress
@@ -433,41 +512,169 @@ async fn stop(
     if !json {
         earlier.say(id);
     }
-    let endpoint = environment.paths.controller_endpoint()?;
+    Ok(Begun { earlier, none })
+}
+
+/// A control daemon that answered the look, with what was read before anything was asked of it.
+pub(crate) struct Daemon {
+    pub(crate) client: LocalClient,
+    /// What it said of itself.
+    pub(crate) info: HostInfoResult,
+    /// The process that held the environment, with its start identity, read before anything is
+    /// asked: a process that has ended and not been collected is read as gone, and its number may
+    /// be reused.
+    pub(crate) holder: Option<ProcessStartIdentity>,
+}
+
+/// What the look at the environment found.
+pub(crate) enum Looked {
+    /// A control daemon of this command's public major answers.
+    Daemon(Box<Daemon>),
+    /// Nothing listens, and no daemon holds the environment.
+    NoDaemon,
+    /// The look ended the command with this result.
+    Ended(Completion),
+}
+
+/// The look both commands make before they ask for anything: whether a daemon answers, what it says
+/// of itself, and who holds the environment. A daemon that holds the environment and does not answer,
+/// one of another public major and a look that cannot be made end the command here.
+pub(crate) async fn look(
+    which: Which,
+    environment: &KnownEnvironment,
+    json: bool,
+    begun: &Begun,
+) -> Looked {
+    let id = environment.environment_id;
+    let none = &begun.none;
+    let endpoint = match environment.paths.controller_endpoint() {
+        Ok(endpoint) => endpoint,
+        Err(error) => return Looked::Ended(failed(error.into(), none, json)),
+    };
     match startup::reach(&endpoint, startup::ANSWER_BOUND, &[]).await {
         Reached::Answered(listed) => {
             let Listed::Ours(client) = *listed else {
-                return Ok(failed(
+                return Looked::Ended(failed(
                     CliError::Other(shown!(
                         "the control daemon for environment {} states another public major than \
-                         this command does. No stop was requested.",
-                        id
+                         this command does. {}",
+                        id,
+                        which.nothing_asked()
                     )),
-                    &none,
+                    none,
                     json,
                 ));
             };
-            Ok(stop_the_daemon(host, environment, *client, json, progress, &earlier).await)
+            let mut client = *client;
+            // A daemon that answered the hello and does not answer this is a holder that is silent.
+            let info = match tokio::time::timeout(
+                startup::ANSWER_BOUND,
+                host_info(&mut client, &environment.paths),
+            )
+            .await
+            {
+                Ok(Ok(info)) => info,
+                Ok(Err(error)) => return Looked::Ended(failed(error, none, json)),
+                Err(_) => {
+                    return Looked::Ended(silent(
+                        which,
+                        environment,
+                        none,
+                        json,
+                        startup::ANSWER_BOUND,
+                    ));
+                }
+            };
+            let holder = lock_holder(&environment.paths);
+            Looked::Daemon(Box::new(Daemon {
+                client,
+                info,
+                holder,
+            }))
         }
-        Reached::Silent => Ok(silent(environment, &none, json, startup::ANSWER_BOUND)),
+        Reached::Silent => Looked::Ended(silent(
+            which,
+            environment,
+            none,
+            json,
+            startup::ANSWER_BOUND,
+        )),
         Reached::Refused(error) if startup::nothing_listening(&error) => {
-            Ok(vacant(environment, &none, json, &earlier))
+            match lock_held(&environment.paths) {
+                Ok(false) => Looked::NoDaemon,
+                Ok(true) => Looked::Ended(holds_and_is_silent(which, environment, none, json)),
+                Err(error) => Looked::Ended(failed(
+                    CliError::Other(shown!(
+                        "whether a control daemon holds environment {} could not be read: {}. {}",
+                        id,
+                        error,
+                        which.nothing_asked()
+                    )),
+                    none,
+                    json,
+                )),
+            }
         }
-        Reached::Refused(error) => Ok(failed(
+        Reached::Refused(error) => Looked::Ended(failed(
             CliError::HostUnavailable(shown!(
-                "the control daemon for environment {} could not be reached: {}. No stop was \
-                 requested.",
+                "the control daemon for environment {} could not be reached: {}. {}",
                 id,
-                Shown::ipc(&error)
+                Shown::ipc(&error),
+                which.nothing_asked()
             )),
-            &none,
+            none,
             json,
         )),
     }
 }
 
+/// What a message that no daemon runs adds where an attempt is under way: a space and each such
+/// record's words, and nothing where there is none.
+pub(crate) fn under_way_said(environment: &KnownEnvironment) -> Shown {
+    let id = environment.environment_id;
+    let under_way: Vec<Shown> = attempt::recorded(&environment.paths)
+        .iter()
+        .filter(|recorded| recorded.standing() == Standing::UnderWay)
+        .map(|recorded| record_said(recorded, id))
+        .collect();
+    if under_way.is_empty() {
+        Shown::said("")
+    } else {
+        shown!(" {}", Shown::joined(under_way, " "))
+    }
+}
+
+/// The command, from the guard to the daemon's end.
+async fn stop(
+    host: &HostPaths,
+    environment: &KnownEnvironment,
+    json: bool,
+    progress: &Progress,
+) -> Result<Completion> {
+    let begun = match begin(Which::Stop, environment, json, progress).await {
+        Ok(begun) => begun,
+        Err(ended) => return Ok(ended),
+    };
+    Ok(match look(Which::Stop, environment, json, &begun).await {
+        Looked::Daemon(daemon) => {
+            stop_the_daemon(host, environment, *daemon, json, progress, &begun).await
+        }
+        Looked::NoDaemon => done(
+            &shown!(
+                "No control daemon runs for environment {}. Nothing was stopped.{}",
+                environment.environment_id,
+                under_way_said(environment)
+            ),
+            &begun.none,
+            json,
+            &begun.earlier,
+        ),
+        Looked::Ended(ended) => ended,
+    })
+}
+
 /// What earlier attempts recorded whose process is no longer the one that recorded it.
-struct Earlier {
+pub(crate) struct Earlier {
     records: Vec<attempt::Recorded>,
     /// Whether the lines that say them were written on standard error at the start, which is where
     /// they go without `--json`.
@@ -475,7 +682,7 @@ struct Earlier {
 }
 
 impl Earlier {
-    fn read(environment: &EnvironmentPaths) -> Self {
+    pub(crate) fn read(environment: &EnvironmentPaths) -> Self {
         Self {
             records: attempt::recorded(environment)
                 .into_iter()
@@ -487,14 +694,14 @@ impl Earlier {
 
     /// Says each record on standard error, and keeps whether every line was written. A line that
     /// standard error refused ends the saying: it refuses every later line too.
-    fn say(&mut self, id: EnvironmentId) {
+    pub(crate) fn say(&mut self, id: EnvironmentId) {
         self.written = self
             .records
             .iter()
             .all(|recorded| report::shown_before_going_on(&record_said(recorded, id)));
     }
 
-    fn said(&self, id: EnvironmentId) -> Vec<Shown> {
+    pub(crate) fn said(&self, id: EnvironmentId) -> Vec<Shown> {
         self.records
             .iter()
             .map(|recorded| record_said(recorded, id))
@@ -504,7 +711,7 @@ impl Earlier {
     /// Removes what was put out, now that this command's own result has been written. Under
     /// `--json` the records are in that document; otherwise they were said at the start. A record
     /// that was not put out stays for the next command to say.
-    fn remove_those_put_out(&self, json: bool) {
+    pub(crate) fn remove_those_put_out(&self, json: bool) {
         // The result is the document or the result line on standard output, and under text the
         // lines at the start went to standard error as well: none of them may have been refused.
         let put_out = output::unwritten_output().is_none() && (json || self.written);
@@ -574,65 +781,26 @@ pub fn records_said(environment: &EnvironmentPaths) -> Shown {
     }
 }
 
-/// Nothing listens at the endpoint: no daemon runs, or one holds the environment and has not begun
-/// to listen or has stopped listening.
-fn vacant(
+/// Something accepted the connection and did not answer within `bound`.
+fn silent(
+    which: Which,
     environment: &KnownEnvironment,
     none: &Facts,
     json: bool,
-    earlier: &Earlier,
+    bound: Duration,
 ) -> Completion {
-    let id = environment.environment_id;
     match lock_held(&environment.paths) {
-        Ok(false) => {
-            let under_way: Vec<Shown> = attempt::recorded(&environment.paths)
-                .iter()
-                .filter(|recorded| recorded.standing() == Standing::UnderWay)
-                .map(|recorded| record_said(recorded, id))
-                .collect();
-            let tail = if under_way.is_empty() {
-                Shown::said("")
-            } else {
-                shown!(" {}", Shown::joined(under_way, " "))
-            };
-            done(
-                &shown!(
-                    "No control daemon runs for environment {}. Nothing was stopped.{}",
-                    id,
-                    tail
-                ),
-                none,
-                json,
-                earlier,
-            )
-        }
-        Ok(true) => holds_and_is_silent(environment, none, json),
-        Err(error) => failed(
-            CliError::Other(shown!(
-                "whether a control daemon holds environment {} could not be read: {}. No stop \
-                 was requested.",
-                id,
-                error
-            )),
-            none,
-            json,
-        ),
-    }
-}
-
-/// Something accepted the connection and did not answer within `bound`.
-fn silent(environment: &KnownEnvironment, none: &Facts, json: bool, bound: Duration) -> Completion {
-    match lock_held(&environment.paths) {
-        Ok(true) => holds_and_is_silent(environment, none, json),
+        Ok(true) => holds_and_is_silent(which, environment, none, json),
         _ => failed(
             CliError::Unfinished {
                 code: ErrorCode::EnvironmentUnavailable,
                 message: shown!(
                     "the control daemon listening for environment {} accepted the connection and \
-                     did not answer within {} seconds. No stop was requested. Run kr host stop \
-                     again in a moment.",
+                     did not answer within {} seconds. {} Run {} again in a moment.",
                     environment.environment_id,
-                    bound.as_secs()
+                    bound.as_secs(),
+                    which.nothing_asked(),
+                    which.command()
                 ),
             },
             none,
@@ -642,7 +810,12 @@ fn silent(environment: &KnownEnvironment, none: &Facts, json: bool, bound: Durat
 }
 
 /// A daemon holds the environment and does not answer, so it may be starting or stopping.
-fn holds_and_is_silent(environment: &KnownEnvironment, none: &Facts, json: bool) -> Completion {
+fn holds_and_is_silent(
+    which: Which,
+    environment: &KnownEnvironment,
+    none: &Facts,
+    json: bool,
+) -> Completion {
     let id = environment.environment_id;
     let ending = how_to_end_the_holder(&environment.paths);
     failed(
@@ -650,9 +823,14 @@ fn holds_and_is_silent(environment: &KnownEnvironment, none: &Facts, json: bool)
             code: ErrorCode::EnvironmentUnavailable,
             message: shown!(
                 "A control daemon holds environment {} and does not answer, so it may be starting \
-                 or stopping. No stop was requested. Run kr host stop again in a moment. {}",
+                 or stopping. No stop was requested. Run {} again in a moment. {}{}",
                 id,
-                ending
+                which.command(),
+                ending,
+                match which {
+                    Which::Stop => "",
+                    Which::Restart => " This command requested no stop and no start.",
+                }
             ),
         },
         none,
@@ -681,7 +859,7 @@ fn how_to_end_the_holder(environment: &EnvironmentPaths) -> Shown {
 /// The process the lock file names, with its start identity, read now: the holder of the
 /// environment's lock, which a daemon writes when it takes it. A lock file that cannot be read, a
 /// process that has gone and one whose identity cannot be read name none.
-fn lock_holder(environment: &EnvironmentPaths) -> Option<ProcessStartIdentity> {
+pub(crate) fn lock_holder(environment: &EnvironmentPaths) -> Option<ProcessStartIdentity> {
     let pid = SingletonLock::holder(&environment.singleton_lock())
         .ok()
         .flatten()?;
@@ -700,7 +878,7 @@ fn runs_the_daemon(holder: &ProcessStartIdentity) -> bool {
 
 /// The process a message may name as the daemon: the lock file's holder, where it runs this
 /// installation's daemon. Anything else is not named.
-fn named_daemon(environment: &EnvironmentPaths) -> Option<u64> {
+pub(crate) fn named_daemon(environment: &EnvironmentPaths) -> Option<u64> {
     lock_holder(environment)
         .filter(runs_the_daemon)
         .map(|holder| holder.pid.get())
@@ -724,7 +902,7 @@ fn lock_held(environment: &EnvironmentPaths) -> std::result::Result<bool, Shown>
 }
 
 /// What the request came to.
-enum Asked {
+pub(crate) enum Asked {
     /// The daemon took the stop and answered.
     Taken(HostStopResult),
     /// The outcome is not known: no answer came, it was cut, or the daemon's word does not say
@@ -742,18 +920,19 @@ enum Asked {
 /// The answer is read from the connection, and anything but a whole answer to this request is an
 /// unknown outcome: a daemon that ends for another cause gets no answer, and the daemon stops when
 /// its write of the answer has completed, failed or reached its bound, so an answer can be cut.
-async fn ask(
+pub(crate) async fn ask(
     client: &mut LocalClient,
     environment_id: EnvironmentId,
     json: bool,
     progress: &Progress,
+    launch_only: bool,
 ) -> Asked {
     let composed = client
         .compose(
             Method::HostStop,
             ActionId::new(kr_ipc::new_uuid()),
             ActionTarget::environment(environment_id),
-            &HostStopParams { launch_only: false },
+            &HostStopParams { launch_only },
         )
         .await;
     let mutation = match composed {
@@ -765,8 +944,11 @@ async fn ask(
             };
         }
     };
-    // Set before the request is written: an interrupt from here on may find it taken.
-    progress.enter(Stage::Asked);
+    // Set before the request is written: an interrupt from here on may find it taken. A request for
+    // the launch alone stops nothing and enters no stage.
+    if !launch_only {
+        progress.enter(Stage::Asked);
+    }
     let request_id = mutation.request_id;
     if let Err(error) = client
         .send(&ControlFrame::Mutation(Box::new(mutation)))
@@ -774,7 +956,7 @@ async fn ask(
     {
         return Asked::Unknown(Shown::ipc(&error));
     }
-    if !json {
+    if !json && !launch_only {
         report::say(&shown!(
             "Asked the control daemon for environment {} to stop. It waits up to {} seconds for \
              session creates under way, and an interrupt does not cancel the stop.",
@@ -826,27 +1008,20 @@ async fn ask(
 async fn stop_the_daemon(
     host: &HostPaths,
     environment: &KnownEnvironment,
-    mut client: LocalClient,
+    daemon: Daemon,
     json: bool,
     progress: &Progress,
-    earlier: &Earlier,
+    begun: &Begun,
 ) -> Completion {
+    let which = Which::Stop;
     let id = environment.environment_id;
-    let none = Facts::none(earlier.said(id));
-    // A daemon that answered the hello and does not answer this is a holder that is silent.
-    let info = match tokio::time::timeout(
-        startup::ANSWER_BOUND,
-        host_info(&mut client, &environment.paths),
-    )
-    .await
-    {
-        Ok(Ok(info)) => info,
-        Ok(Err(error)) => return failed(error, &none, json),
-        Err(_) => return silent(environment, &none, json, startup::ANSWER_BOUND),
-    };
-    // Who holds the environment, and which process that is, before anything is asked: a process
-    // that has ended and not been collected is read as gone, and its number may be reused.
-    let holder = lock_holder(&environment.paths);
+    let none = begun.none.clone();
+    let earlier = &begun.earlier;
+    let Daemon {
+        mut client,
+        info,
+        holder,
+    } = daemon;
     let marker = match Marker::begin(&environment.paths, attempt::Command::Stop, holder.clone()) {
         Ok(marker) => marker,
         Err(error) => {
@@ -865,7 +1040,7 @@ async fn stop_the_daemon(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(marker);
 
-    let (knows, pid, unsettled, unknown) = match ask(&mut client, id, json, progress).await {
+    let (knows, pid, unsettled, unknown) = match ask(&mut client, id, json, progress, false).await {
         Asked::Taken(result) => {
             progress.enter(Stage::Told);
             (
@@ -968,7 +1143,8 @@ async fn stop_the_daemon(
                 &shown!(
                     "Stopped the control daemon for environment {}{}. No session was stopped: its \
                      workers keep running, a local attach keeps working, and the next daemon finds \
-                     the sessions again. Paired devices' connections close until a daemon runs.{}",
+                     the sessions again. Paired devices' connections close until a daemon runs.{} Run \
+                     kr host restart to start one where a start is chosen.",
                     id,
                     process,
                     cut
@@ -994,8 +1170,8 @@ async fn stop_the_daemon(
                 _ => None,
             };
             let message = match why {
-                Why::Held => still_held(&environment.paths, id),
-                Why::Unlooked(why) => unlooked(id, not_known, &why),
+                Why::Held => still_held(which, &environment.paths, id),
+                Why::Unlooked(why) => unlooked(which, id, not_known, &why),
                 Why::Running => {
                     let what = match not_known {
                         Some(failure) => shown!(
@@ -1004,7 +1180,7 @@ async fn stop_the_daemon(
                         ),
                         None => Shown::said("was told to stop and has not ended"),
                     };
-                    not_ended(&environment.paths, id, &what, old)
+                    not_ended(which, &environment.paths, id, &what, old)
                 }
             };
             failed(
@@ -1189,7 +1365,8 @@ async fn refused(
 /// M4: the daemon was asked and has not ended after the wait. A process is named only while it is
 /// a process named kr-controller: `old`, the process that held the environment before the request
 /// where the daemon's answer, if it came, named it too, or the one the lock file names now.
-fn not_ended(
+pub(crate) fn not_ended(
+    which: Which,
     environment: &EnvironmentPaths,
     id: EnvironmentId,
     what: &Shown,
@@ -1214,12 +1391,19 @@ fn not_ended(
              does after a crash.",
         ),
     };
+    let then = match which {
+        Which::Stop => "",
+        Which::Restart => " Run kr host restart again once the old one has ended.",
+    };
     shown!(
-        "The control daemon for environment {} {} after {} seconds. It may be finishing a write. {}",
+        "The control daemon for environment {} {} after {} seconds. It may be finishing a write. \
+         {}{}{}",
         id,
         *what,
         END_BOUND.as_secs(),
-        ends_with
+        ends_with,
+        then,
+        which.no_start()
     )
 }
 
@@ -1227,43 +1411,54 @@ fn not_ended(
 /// ended: what is said is that the process has gone and that something holds the environment which
 /// is not shown to be a control daemon. It does not say that the daemon ended: the daemon ended only
 /// where the lock is free or another control daemon holds it.
-fn still_held(environment: &EnvironmentPaths, id: EnvironmentId) -> Shown {
+pub(crate) fn still_held(which: Which, environment: &EnvironmentPaths, id: EnvironmentId) -> Shown {
     shown!(
         "The process of the control daemon for environment {} has gone, and something that is not \
-         shown to be a control daemon still holds the environment after {} seconds. Run kr host \
-         stop again in a moment. {}",
+         shown to be a control daemon still holds the environment after {} seconds. Run {} again \
+         in a moment. {}{}",
         id,
         END_BOUND.as_secs(),
-        how_to_end_the_holder(environment)
+        which.command(),
+        how_to_end_the_holder(environment),
+        which.no_start()
     )
 }
 
 /// The environment's lock could not be looked at, so that nothing is known of whether the daemon
 /// has ended. `not_known` is what the request's failure said where whether the daemon took the
 /// stop is not known; where it took it, the text says that it was told.
-fn unlooked(id: EnvironmentId, not_known: Option<&Shown>, why: &Shown) -> Shown {
+pub(crate) fn unlooked(
+    which: Which,
+    id: EnvironmentId,
+    not_known: Option<&Shown>,
+    why: &Shown,
+) -> Shown {
     match not_known {
         None => shown!(
             "The control daemon for environment {} was told to stop, and whether it has ended could \
-             not be read after {} seconds: {}. Run kr host stop again in a moment.",
+             not be read after {} seconds: {}. Run {} again in a moment.{}",
             id,
             END_BOUND.as_secs(),
-            *why
+            *why,
+            which.command(),
+            which.no_start()
         ),
         Some(failure) => shown!(
             "The control daemon for environment {} did not show whether it took the stop ({}), and \
-             whether it has ended could not be read after {} seconds: {}. Run kr host stop again in \
-             a moment.",
+             whether it has ended could not be read after {} seconds: {}. Run {} again in a \
+             moment.{}",
             id,
             *failure,
             END_BOUND.as_secs(),
-            *why
+            *why,
+            which.command(),
+            which.no_start()
         ),
     }
 }
 
 /// Why the daemon had not ended when the wait did.
-enum Why {
+pub(crate) enum Why {
     /// Its process runs, or nothing shows that it has gone: the daemon is told to stop and goes on.
     Running,
     /// Its process has gone and something holds the environment that nothing shows to be a daemon.
@@ -1273,7 +1468,7 @@ enum Why {
 }
 
 /// How the wait for the daemon's end came out.
-enum End {
+pub(crate) enum End {
     /// The daemon has ended and the environment is free: its process has gone where its identity
     /// was known, and otherwise the lock is free and nothing answers at its endpoint.
     Gone,
@@ -1286,7 +1481,7 @@ enum End {
 
 /// Reads `host.info`, on a new connection once where the authority behind this one was withdrawn,
 /// which a read of the host's configuration can do to every connection.
-async fn host_info(
+pub(crate) async fn host_info(
     client: &mut LocalClient,
     environment: &EnvironmentPaths,
 ) -> Result<HostInfoResult> {
@@ -1322,7 +1517,7 @@ async fn host_info(
 ///
 /// Each look is bounded by what is left of the one deadline, and a look that cannot be made
 /// leaves the daemon as not ended.
-async fn wait_for_the_end(
+pub(crate) async fn wait_for_the_end(
     host: &HostPaths,
     environment: &EnvironmentPaths,
     generation: ControllerGeneration,
@@ -1682,7 +1877,7 @@ mod tests {
         let environment = temp.environment();
         let id = environment.environment_id();
         let what = Shown::said("was told to stop and has not ended");
-        let said = not_ended(&environment, id, &what, None).to_string();
+        let said = not_ended(Which::Stop, &environment, id, &what, None).to_string();
         assert!(
             said.contains(
                 "was told to stop and has not ended after 30 seconds. It may be finishing a write."
@@ -1698,7 +1893,7 @@ mod tests {
             "{said}"
         );
         assert!(!said.contains("wait again"), "{said}");
-        let held = still_held(&environment, id).to_string();
+        let held = still_held(Which::Stop, &environment, id).to_string();
         assert!(
             held.contains(
                 "has gone, and something that is not shown to be a control daemon still holds the environment after 30 seconds"
@@ -1755,13 +1950,13 @@ mod tests {
         let temp = kr_ipc::testing::TempHost::create();
         let id = temp.environment().environment_id();
         let why = Shown::said("the lock file could not be opened");
-        let told = unlooked(id, None, &why).to_string();
+        let told = unlooked(Which::Stop, id, None, &why).to_string();
         assert!(
             told.contains("was told to stop, and whether it has ended could not be read after 30 seconds: the lock file could not be opened. Run kr host stop again in a moment."),
             "{told}"
         );
         let failure = Shown::said("the connection was cut");
-        let unknown = unlooked(id, Some(&failure), &why).to_string();
+        let unknown = unlooked(Which::Stop, id, Some(&failure), &why).to_string();
         assert!(
             unknown.contains("did not show whether it took the stop (the connection was cut), and whether it has ended could not be read after 30 seconds: the lock file could not be opened. Run kr host stop again in a moment."),
             "{unknown}"
