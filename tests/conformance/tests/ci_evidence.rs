@@ -1430,6 +1430,15 @@ const LIST: &[Listed] = &[
             1,
         )],
     ),
+    // Starts a case of the calling program as a caller does that names an evidence directory under
+    // its own temporary folder.
+    lines(
+        "tests/perf/tests/support/mod.rs",
+        &[(
+            r#".env("KR_TEST_ARTIFACTS_DIR", physical.join("evidence"))"#,
+            1,
+        )],
+    ),
     // Reader: the one reader of the variable for Rust.
     reader("tests/support/artifacts/src/lib.rs"),
 ];

@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
+mod support;
+
 /// The stand-in for `cargo`: every build and every suite succeeds at once and prints what the
 /// script looks for. When `KR_PERF_PLANT` names a file, the first measurement also starts a process
 /// that names the run's root by its physical path and writes that process's identifier there. The
@@ -137,5 +139,14 @@ fn a_run_that_leaves_nothing_behind_passes_the_check() {
         output.status.success() && printed.contains("no process this run started is still running"),
         "a run that started nothing that survives passes the check:\n{printed}\n{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A caller that names an evidence directory under its own temporary folder does not hand it to the
+/// script, whose temporary folder is a link of the case's own.
+#[test]
+fn an_evidence_directory_that_the_caller_named_is_not_handed_to_the_script() {
+    support::run_as_a_caller_with_an_evidence_folder(
+        "a_run_that_leaves_nothing_behind_passes_the_check",
     );
 }
