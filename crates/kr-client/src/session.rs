@@ -609,6 +609,13 @@ pub(crate) struct LocalInput {
 }
 
 impl LocalInput {
+    /// Whether a frame can still be written on the connection, read at once as a call's admission
+    /// reads it. A connection that has lost its writing side stands, and the session's record has
+    /// no end until the read loop reaches the peer's end.
+    pub(crate) fn can_send(&self) -> bool {
+        self.transport.can_send()
+    }
+
     /// Writes one ordered batch of raw input and waits for the host's answer.
     ///
     /// # Errors
