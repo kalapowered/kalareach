@@ -20,10 +20,12 @@ use kr_ipc::framed::split;
 use kr_ipc::verify::WorkerIdentity;
 use kr_protocol::envelope::ControlFrame;
 use kr_protocol::frame::StreamKind;
-use kr_protocol::ids::{ConnectionId, SessionId};
+use kr_protocol::ids::{AuthorityRevision, ConnectionId, SessionId};
 use kr_protocol::scalars::U64;
+use kr_transport::lease::WorkerBinding;
 
 use super::a_close_a_worker_never_answers::{self as world, Silent};
+use super::barrier::Asked;
 use crate::service::Controller;
 
 /// How long a test waits for something it waits for by condition, and fails after. Nothing is
@@ -1154,5 +1156,251 @@ async fn the_path_an_announcement_bound_before_a_link_was_taken_is_given_up_with
             .acknowledge(session_id, next, revision, None)
     );
     assert!(leases(controller, session_id));
+    silent.serving.abort();
+}
+
+/// The evidence of a worker's fence that names nothing and says `remaining` more names are to come.
+fn evidence(remaining: u64) -> kr_protocol::action::FenceEvidence {
+    kr_protocol::action::FenceEvidence {
+        rejected_actions: Vec::new(),
+        possibly_executed: Vec::new(),
+        remaining: U64::new(remaining),
+        omitted: U64::ZERO,
+    }
+}
+
+/// A worker whose last result reads revisions it has not been asked about, as the daemon holds it
+/// after this sequence: the announcements of the `older` revisions were refused for the moment and
+/// the worker fenced them by itself, and the announcement of revision 5 was acknowledged with
+/// evidence that was whole. The result of 5 reads the older ones, of which the daemon has no
+/// report. Returns the worker's binding, the revision acknowledged and the older ones.
+fn after_refusals_and_a_whole_acknowledgement(
+    controller: &Controller,
+    session_id: SessionId,
+    older: &[u64],
+) -> (WorkerBinding, AuthorityRevision, Vec<AuthorityRevision>) {
+    let binding = controller.leases.binding(session_id);
+    let held = AuthorityRevision::new(2);
+    let older: Vec<AuthorityRevision> = older.iter().copied().map(AuthorityRevision::new).collect();
+    let newer = AuthorityRevision::new(5);
+    for revision in &older {
+        controller.leases.announced(session_id, held, &[*revision]);
+    }
+    controller.leases.announced(session_id, held, &[newer]);
+    assert!(
+        controller
+            .leases
+            .acknowledge_announced(session_id, binding, newer, Some(evidence(0))),
+        "the acknowledgement of the newer revision is accepted"
+    );
+    assert_eq!(
+        controller.leases.unasked_before(session_id, newer),
+        older,
+        "the result of the newer revision reads the ones the worker was not asked about"
+    );
+    (binding, newer, older)
+}
+
+/// KR-REQ-09.12: the waits before an ask's first exchange count against the ask's bound, and an
+/// exchange that would get less than one exchange's time does not begin.
+///
+/// Another operation holds the registry, which the ask reads before anything goes to the worker,
+/// for six of the ask's eight seconds. The announcement would begin with two seconds left, inside
+/// the five an exchange may take, and a bound that cut it would drop the link with the
+/// announcement on the wire: a link that goes out of its holder's hand stops the renewal of the
+/// lease of a worker that has acknowledged before. So nothing is sent, and the link, opened for
+/// it, goes back whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ask_whose_waits_left_too_little_time_for_its_first_exchange_sends_nothing() {
+    let (silent, heard) = stalled().await;
+    let controller = Arc::clone(&silent.controller);
+    let session_id = silent.session_id;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let registry = controller.registry.lock().await;
+    let (asked, ()) = tokio::join!(
+        tokio::time::timeout_at(
+            deadline,
+            controller.ask_worker_revision(session_id, Some(deadline)),
+        ),
+        async {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            drop(registry);
+        },
+    );
+    let asked = asked.expect("the ask ended by itself, before its bound could cut anything");
+    assert_eq!(
+        asked.unwrap_or(Asked::Failed),
+        Asked::Failed,
+        "an ask that could not begin its exchange has run out"
+    );
+    assert_eq!(heard.frames(), 0, "nothing was sent to the worker");
+    assert!(
+        !controller.leases.is_fenced(session_id),
+        "the renewal of the worker's lease was not stopped"
+    );
+    assert!(leases(&controller, session_id));
+    assert!(
+        slot_holds_a_link(&controller, session_id).await,
+        "the link went back whole"
+    );
+    assert_eq!(heard.connections(), 1);
+    silent.serving.abort();
+}
+
+/// KR-REQ-09.12: a collection that waited for the worker's link while another operation held it
+/// gives the link back whole when too little time is left once it has it.
+///
+/// The other holder keeps the link until two seconds before the ask's end, inside the five the wait
+/// may take, and then lets it go. The check that gives the link back comes after the wait, so it
+/// sees the time that the wait took: no page goes, the link is in its slot, the worker's lease goes
+/// on renewing, and the names that were not asked for stay owed to the pass that collects them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_collection_whose_wait_for_the_link_left_too_little_time_gives_the_link_back_whole() {
+    let (silent, heard) = stalled().await;
+    let controller = Arc::clone(&silent.controller);
+    let session_id = silent.session_id;
+    let revision = controller.leases.authority_revision();
+    let binding = controller.leases.binding(session_id);
+    assert!(
+        controller
+            .leases
+            .acknowledge(session_id, binding, revision, Some(evidence(3)))
+    );
+    let mut elsewhere = controller
+        .worker_client(&silent.worker)
+        .await
+        .expect("another operation takes the worker's link");
+    let until = tokio::time::Instant::now() + Duration::from_secs(6);
+    tokio::join!(
+        controller.collect_owed_evidence(session_id, binding, revision, Some(until)),
+        async {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            elsewhere.give_back();
+            drop(elsewhere);
+        },
+    );
+    assert_eq!(heard.frames(), 0, "no page went to the worker");
+    assert!(
+        !controller.leases.is_fenced(session_id),
+        "the renewal of the worker's lease was not stopped"
+    );
+    assert!(leases(&controller, session_id));
+    assert!(
+        slot_holds_a_link(&controller, session_id).await,
+        "the link is back in its slot"
+    );
+    assert_eq!(
+        controller.leases.owing_names(),
+        vec![session_id],
+        "the names that were not asked for stay owed"
+    );
+    silent.serving.abort();
+}
+
+/// KR-REQ-09.12: a collection with too little time left does not wait for the link once for each
+/// older revision it would ask about.
+///
+/// Another operation holds the link throughout. Two older revisions that the results read and the
+/// worker was not asked about, and then two whose pages are still owed, would each wait five
+/// seconds for it; with two seconds of the ask left, each returns at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_collection_with_too_little_time_left_does_not_wait_for_the_link_for_each_older_revision()
+{
+    let (silent, heard) = stalled().await;
+    let controller = Arc::clone(&silent.controller);
+    let session_id = silent.session_id;
+    let (binding, newer, _older) =
+        after_refusals_and_a_whole_acknowledgement(&controller, session_id, &[3, 4]);
+    let elsewhere = controller
+        .worker_client(&silent.worker)
+        .await
+        .expect("another operation takes the worker's link");
+
+    let began = tokio::time::Instant::now();
+    controller
+        .collect_owed_evidence(
+            session_id,
+            binding,
+            newer,
+            Some(began + Duration::from_secs(2)),
+        )
+        .await;
+    assert!(
+        began.elapsed() < Duration::from_secs(3),
+        "the revisions the worker was not asked about waited {:?} for the link",
+        began.elapsed()
+    );
+
+    for revision in [3, 4] {
+        assert!(controller.leases.acknowledge(
+            session_id,
+            binding,
+            AuthorityRevision::new(revision),
+            Some(evidence(2)),
+        ));
+    }
+    let began = tokio::time::Instant::now();
+    controller
+        .collect_owed_evidence(
+            session_id,
+            binding,
+            newer,
+            Some(began + Duration::from_secs(2)),
+        )
+        .await;
+    assert!(
+        began.elapsed() < Duration::from_secs(3),
+        "the revisions whose pages are owed waited {:?} for the link",
+        began.elapsed()
+    );
+    assert_eq!(heard.frames(), 0, "nothing went to the worker");
+    drop(elsewhere);
+    silent.serving.abort();
+}
+
+/// KR-REQ-09.12: a collection that gave the link back before the first exchange of an older
+/// revision leaves the worker owing names, so that a later pass asks for them.
+///
+/// The worker refused revision 4 for the moment and fenced it by itself, so the daemon holds no
+/// report of it; revision 5 was then acknowledged with evidence that was whole, and its result
+/// reads 4. The ask's time ran out before 4's first exchange. The worker owes names no report
+/// says it owes, so the set the pass collects must hold it, or nothing asks again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_give_back_before_an_older_revisions_first_exchange_leaves_the_worker_owing_its_names() {
+    let (silent, heard) = stalled().await;
+    let controller = Arc::clone(&silent.controller);
+    let session_id = silent.session_id;
+    let (binding, newer, older) =
+        after_refusals_and_a_whole_acknowledgement(&controller, session_id, &[4]);
+    assert!(
+        controller.leases.owing_names().contains(&session_id),
+        "the worker owes names before the collection: its result reads revisions with no report"
+    );
+
+    controller
+        .collect_owed_evidence(
+            session_id,
+            binding,
+            newer,
+            Some(tokio::time::Instant::now() + Duration::from_secs(2)),
+        )
+        .await;
+    assert_eq!(heard.frames(), 0, "the collection gave the link back");
+    assert_eq!(
+        controller.leases.owing_names(),
+        vec![session_id],
+        "the collection left the worker owing the names of {older:?}"
+    );
+
+    // The pass that collects the names owed asks with no bound of its own, and asks for the first
+    // page of the older revisions.
+    controller
+        .collect_owed_evidence(session_id, binding, newer, None)
+        .await;
+    assert_eq!(
+        heard.frames(),
+        1,
+        "the pass asked the worker for the older revision"
+    );
     silent.serving.abort();
 }
