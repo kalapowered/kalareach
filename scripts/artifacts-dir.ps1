@@ -29,10 +29,15 @@
 # with folders and links as tools make them, it returns a folder inside the roots or refuses, and
 # it refuses nothing that the run set right. It is no boundary against a process of the same
 # account, which can write wherever the run can and can change a link or a folder while the reader
-# reads. It does not close a case that somebody arranges: a name with a line feed beside a link at
-# the shortened name, a link whose target climbs through another link, or a server named with no
-# share. On Windows the comparison ignores letter case, so a folder made case-sensitive, and a
-# letter that the disk and the reader do not fold alike, are not told apart.
+# reads. It does not close a case that somebody arranges: a link whose target climbs through
+# another link, which this reader settles by the target's text, or a server named with no share.
+# On Windows the comparison ignores letter case, so a folder made case-sensitive, and a letter that
+# the disk and the reader do not fold alike, are not told apart.
+#
+# On Windows this reader takes the temporary folder from TMP first and then TEMP, as the platform's
+# own call does, and so does the Rust reader; the TypeScript reader takes TEMP first and the shell
+# reader takes TEMP. Where TMP and TEMP differ, only a value under the runner's folder satisfies
+# all four readers.
 
 $ErrorActionPreference = 'Stop'
 $variable = 'KR_TEST_ARTIFACTS_DIR'
@@ -113,7 +118,7 @@ function Stop-Refused {
     param([string] $Value, [string] $Why, $Folder)
     $roots = (Get-TemporaryRoots) -join ', '
     if ($null -ne $Folder) {
-        throw "kr-artifacts: no directory of this run's own can be made for its evidence: the temporary folder '$Folder' is refused: $Why. It has to be an absolute path to a folder inside one of this platform's temporary roots ($roots). Point TMPDIR (on Windows, TEMP or TMP) at such a folder, or set $variable to a folder under one of the roots."
+        throw "kr-artifacts: no directory of this run's own can be made for its evidence: the temporary folder '$Folder' is refused: $Why. It has to be an absolute path to a folder inside one of this platform's temporary roots ($roots). Point TMPDIR (on Windows, TMP) at such a folder, or set $variable to a folder under one of the roots."
     }
     throw "kr-artifacts: the evidence directory '$Value' ($variable) is refused: $Why. It has to be an absolute path inside one of this platform's temporary roots ($roots). Set it to a folder under one of them, or leave it unset and the run makes a directory of its own."
 }

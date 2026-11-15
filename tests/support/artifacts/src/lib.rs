@@ -23,10 +23,14 @@
 //! with folders and links as tools make them, it returns a folder inside the roots or refuses, and
 //! it refuses nothing that the run set right. It is no boundary against a process of the same
 //! account, which can write wherever the run can and can change a link or a folder while the reader
-//! reads. It does not close a case that somebody arranges: a name with a line feed beside a link at
-//! the shortened name, a link whose target climbs through another link, or a server named with no
-//! share. On Windows the system resolves both paths before they are compared and the reader folds
-//! no letter itself, so a folder made case-sensitive is told apart.
+//! reads, or between the two checks of a run's own directory. The system resolves both paths before
+//! they are compared and the reader folds no letter itself, so on Windows a folder made
+//! case-sensitive is told apart.
+//!
+//! On Windows `std::env::temp_dir` takes the temporary folder from `TMP` first and then `TEMP`, and
+//! so does the PowerShell reader; the TypeScript reader takes `TEMP` first and the shell reader
+//! takes `TEMP`. Where `TMP` and `TEMP` differ, only a value under the runner's folder satisfies
+//! all four readers.
 
 use std::collections::hash_map::RandomState;
 use std::ffi::OsStr;
@@ -138,7 +142,7 @@ fn refused_own(temporary: &Path, why: &str, roots: &[PathBuf]) -> Refused {
     Refused(format!(
         "no directory of this run's own can be made for its evidence: the temporary folder `{}` is \
          refused: {why}. It has to be an absolute path to a folder inside one of this platform's \
-         temporary roots ({roots}). Point TMPDIR (on Windows, TEMP or TMP) at such a folder, or set \
+         temporary roots ({roots}). Point TMPDIR (on Windows, TMP) at such a folder, or set \
          KR_TEST_ARTIFACTS_DIR to a folder under one of the roots.",
         temporary.display()
     ))
