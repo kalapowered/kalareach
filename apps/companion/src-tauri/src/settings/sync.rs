@@ -1863,4 +1863,59 @@ mod tests {
         assert_eq!(one.floor, 3);
         assert_eq!(one.seen.as_ref().map(|seen| seen.epoch), Some(3));
     }
+
+    /// A refusal as a service words it when it has no managed capacity for new settings sync data.
+    fn refused(alternatives: &[&str]) -> SyncError {
+        SyncError::Client(Box::new(kr_client::ClientError::Refused {
+            error: kr_protocol::error::ProtocolError::new(
+                ErrorCode::ServiceCapacity,
+                "Managed capacity for new settings sync data is not available now.",
+            ),
+            retry_after_seconds: Some(600),
+            action: kr_client::retry::UserAction::Wait,
+            service_code: Some("SERVICE_UNAVAILABLE"),
+            alternatives: kr_client::services::Alternatives::for_test(alternatives),
+        }))
+    }
+
+    /// KR-REQ-17.48: a refusal that names no alternatives reads as it always did.
+    #[test]
+    fn kr_req_17_48_a_sync_refusal_that_names_no_alternatives_reads_as_today() {
+        let error = refused(&[]);
+        let today = error.to_string();
+        assert!(
+            today.contains("Managed capacity for new settings sync data is not available now."),
+            "the control holds the service's message: {today}"
+        );
+        let told = sync_failure(error);
+        assert_eq!(told.message, today);
+        assert!(!told.message.contains("Until then"));
+    }
+
+    /// KR-REQ-17.48: a refusal that names alternatives says the service's own words first, as the
+    /// service wrote them, and then "Until then:" and every alternative as given, with no delay
+    /// of its own: this page shows none.
+    #[test]
+    fn kr_req_17_48_a_sync_refusal_that_names_alternatives_says_them_after_the_services_words() {
+        let alternatives = [
+            "A settings sync service that you run yourself.",
+            "A path this build does not know.",
+        ];
+        let error = refused(&alternatives);
+        let words = error.to_string();
+        let told = sync_failure(error);
+        assert_eq!(
+            told.message,
+            format!(
+                "{words} Until then: {} {}",
+                alternatives[0], alternatives[1]
+            ),
+            "the service's words, then each alternative as given, nothing between"
+        );
+        let after = &told.message[words.len()..];
+        assert!(
+            !after.contains("retry") && !after.contains("seconds") && !after.contains("600"),
+            "the sentence added names no delay: {after}"
+        );
+    }
 }
