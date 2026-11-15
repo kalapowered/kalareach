@@ -82,7 +82,9 @@ const CLIENT_WINDOW_BYTES: u64 = 512 * 1024;
 /// before every write to the socket and does not write a frame past its deadline (it cuts the
 /// stream instead), and the reader cuts the stream when the oldest frame that the worker has not
 /// answered passes its deadline. The end is a cut in both, and the device is told nothing of the
-/// frame: its outcome stays uncertain. Both read the host's own clock.
+/// frame: its outcome stays uncertain. Both read the host's own clock. The writer's time limit
+/// ends only the writer's own wait for room in the socket; the reader's timer ends that wait too,
+/// by cutting the stream, so neither limit is the only thing that ends it.
 const FRAME_DEADLINE: Duration = CALL_TIMEOUT;
 
 /// How many frames the host keeps read and not yet routed: the one that waits for the worker's

@@ -759,10 +759,12 @@ async fn a_worker_that_does_not_answer_is_cut_at_the_frames_deadline() {
 }
 
 /// A frame keeps the deadline it was given when it was passed on: waiting for the lane's writer does
-/// not renew it. The lane's reader cuts the stream at the deadline of the oldest frame the worker
-/// has not answered, so a frame that the writer is held at past its deadline is cut by the reader
-/// and never reaches the worker. The deadline is shortened for the case, and the hold lasts longer
-/// than it.
+/// not renew it. A frame that the writer is held at past its deadline is cut and never reaches the
+/// worker. Each end of the lane cuts at that deadline on its own, and this case holds what they
+/// share, not the reader's half: with the reader's timer removed it still passes, because the
+/// writer asks again before it writes and cuts the stream when it is let go. The reader's half, a
+/// worker that does not answer, is held by the case of that name. The deadline is shortened for
+/// the case, and the hold lasts longer than it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_frame_that_waits_for_the_writer_past_its_deadline_is_cut_and_not_written() {
     let rig = Rig::start().await;
@@ -780,6 +782,9 @@ async fn a_frame_that_waits_for_the_writer_past_its_deadline_is_cut_and_not_writ
     let ended = loop {
         match next_or_reset(&mut stream).await {
             Ok(Some(InputAck::Accepted { .. })) => panic!("a frame past its deadline was accepted"),
+            Ok(Some(InputAck::Refused { .. })) => {
+                panic!("a frame past its deadline was refused, and its end is a cut")
+            }
             Ok(Some(_)) => {}
             other => break other,
         }
@@ -829,11 +834,69 @@ async fn a_frame_past_its_deadline_when_the_writer_goes_on_is_cut_and_never_writ
     let ended = loop {
         match next_or_reset(&mut stream).await {
             Ok(Some(InputAck::Accepted { .. })) => panic!("a frame past its deadline was accepted"),
+            Ok(Some(InputAck::Refused { .. })) => {
+                panic!("a frame past its deadline was refused, and its end is a cut")
+            }
             Ok(Some(_)) => {}
             other => break other,
         }
     };
     assert!(ended.is_err(), "the stream is reset: {ended:?}");
+    drop(go_answer);
+    rig.stop().await;
+}
+
+/// The writer's two checks before a write are made in an order: the frame's deadline, then the
+/// authority feed. A frame that is past its deadline and whose authority is withdrawn, with nothing
+/// sent, ends as a cut with no refusal: the deadline check cuts first, so the device reads a reset
+/// and is told nothing of the frame, where the feed check would refuse it and finish the stream
+/// cleanly. The reader is held where it cannot cut, the release that a withdrawal starts is held so
+/// that it does not revoke the stream, and the sleep only lets the frame's deadline pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_past_its_deadline_and_withdrawn_is_cut_and_not_refused() {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    let stages = rig.adopted.host.network().input_stages();
+    let (at_answer, go_answer) = stages.hold_before_a_lane_answer();
+    rig.lane.send_credit(rig.epoch.get(), 1, 1);
+    arrived(at_answer).await;
+
+    stages.set_frame_deadline(Duration::from_millis(20));
+    let (at_release, go_release) = stages.hold_before_a_release();
+    let (at_write, go_write) = stages.hold_before_a_lane_write();
+    stream
+        .write_message(&rig.frame(0, b"a"))
+        .await
+        .expect("the frame is written");
+    arrived(at_write).await;
+    rig.adopted
+        .host
+        .controller()
+        .raise_the_unverified_withdrawal_refusal()
+        .await;
+    arrived(at_release).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let _ = go_write.send(());
+
+    let ended = loop {
+        match next_or_reset(&mut stream).await {
+            Ok(Some(InputAck::Refused { .. })) => {
+                panic!("a frame past its deadline and withdrawn was refused, and its end is a cut")
+            }
+            Ok(Some(InputAck::Accepted { .. })) => panic!("a frame past its deadline was accepted"),
+            Ok(Some(_)) => {}
+            other => break other,
+        }
+    };
+    assert!(
+        ended.is_err(),
+        "the stream is reset, not finished: {ended:?}"
+    );
+    assert!(
+        rig.lane.frames().is_empty(),
+        "the worker was never given the frame"
+    );
+    drop(go_release);
     drop(go_answer);
     rig.stop().await;
 }
@@ -1566,7 +1629,10 @@ async fn a_detach_that_finds_the_stream_cut_leaves_it_a_reset() {
 /// A frame that waits in the lane writer's queue behind a frame that the worker then refuses is
 /// discarded by the writer, which leaves nothing in flight. The stream task, which waits for the
 /// stream to drain because the device has finished, is woken to see it. The writer is held at the
-/// queued frame until the stream task is waiting.
+/// queued frame until the stream task is waiting. What the host holds is read at the stream's
+/// graceful end, with the acknowledgement writer held there, before the device reads the end: the
+/// teardown of the stream's state gives held frames back too, so a read after it would not show
+/// that the discard let its frame go.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_frame_the_writer_discards_wakes_the_wait_for_the_stream_to_drain() {
     let rig = Rig::start().await;
@@ -1607,7 +1673,15 @@ async fn a_frame_the_writer_discards_wakes_the_wait_for_the_stream_to_drain() {
         .await
         .expect("the stream task waits for the frame in flight")
         .expect("the count stands");
+    let (at_look, go_look) = stages.hold_after_a_graceful_look();
     let _ = go_second.send(());
+    arrived(at_look).await;
+    assert_eq!(
+        stages.counts().host_holds,
+        0,
+        "the discarded frame is let go with the others"
+    );
+    let _ = go_look.send(());
 
     while let Some(ack) = tokio::time::timeout(WAIT, reader.read_message::<InputAck>())
         .await
@@ -1623,11 +1697,6 @@ async fn a_frame_the_writer_discards_wakes_the_wait_for_the_stream_to_drain() {
         rig.lane.frames().len(),
         1,
         "the discarded frame never reached the lane"
-    );
-    assert_eq!(
-        stages.counts().host_holds,
-        0,
-        "the discarded frame is let go with the others"
     );
     rig.stop().await;
 }
