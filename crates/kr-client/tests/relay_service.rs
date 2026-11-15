@@ -382,6 +382,134 @@ async fn an_exhausted_allowance_is_an_answer_with_the_grace_left() {
     assert!(answer.granted().is_none());
 }
 
+/// KR-REQ-17.48: the answer that says managed relay capacity is unavailable for a request that
+/// names no lease carries every member this reader knows, and is read as unavailable with no lease
+/// and the delay the service stated. Nothing in it is a lease, so nothing is granted.
+#[tokio::test]
+async fn kr_req_17_48_a_capacity_answer_with_every_member_the_reader_knows_is_unavailable_with_no_lease()
+ {
+    for delay in [Some(1_800_u64), Some(86_400), None] {
+        let mut data = serde_json::json!({
+            "state": "unavailable",
+            "payer": "installation:44444444-4444-4444-4444-444444444444",
+            "message": "No relay is on offer for new clients right now.",
+            "alternatives": [
+                "A path of the first kind.",
+                "A path of the second kind."
+            ],
+            "allowance": {
+                "allowance": "0",
+                "used": "0",
+                "reserved": "0",
+                "period": null,
+                "exhausted": false
+            },
+            "warnings": [],
+            "grace": null
+        });
+        if let Some(seconds) = delay {
+            data["retry_after_seconds"] = seconds.into();
+        }
+        let http = Recorder::new(&serde_json::json!({ "ok": true, "data": data }).to_string());
+        let service = ManagedRelayLeaseService::new(
+            origin(),
+            http.clone(),
+            Installation::new(ServiceRequestSigner::Installation),
+        );
+
+        let answer = service.issue(&issue_request()).await.expect("an answer");
+
+        let refusal = match &answer {
+            RelayLeaseAnswer::Unavailable(refusal) => refusal.clone(),
+            other => panic!("an unavailable answer, not {other:?}"),
+        };
+        assert_eq!(refusal.retry_after_seconds, delay);
+        assert_eq!(refusal.alternatives.len(), 2);
+        assert!(refusal.warnings.is_empty());
+        assert!(answer.grace().is_none());
+        assert!(answer.granted().is_none(), "no lease is in it");
+    }
+}
+
+/// KR-REQ-17.48: a refusal of a lease request whose error object carries a list of alternatives
+/// beside its code, its message and its delay is read as the same code, the same action and the
+/// same delay as one that does not, for a rate limit and for a service that cannot answer.
+#[tokio::test]
+async fn kr_req_17_48_a_lease_refusal_that_names_alternatives_is_read_as_one_that_does_not() {
+    for (status, code, delay, expected, action) in [
+        (
+            429,
+            "RATE_LIMITED",
+            3_600_u64,
+            ErrorCode::RateLimited,
+            UserAction::Wait,
+        ),
+        (
+            429,
+            "RATE_LIMITED",
+            86_400,
+            ErrorCode::RateLimited,
+            UserAction::Wait,
+        ),
+        (
+            503,
+            "SERVICE_UNAVAILABLE",
+            1_800,
+            ErrorCode::UpstreamUnavailable,
+            UserAction::Wait,
+        ),
+        (
+            503,
+            "SERVICE_UNAVAILABLE",
+            60,
+            ErrorCode::UpstreamUnavailable,
+            UserAction::Wait,
+        ),
+    ] {
+        let mut readings = Vec::new();
+        for alternatives in [None, Some(["A path of the first kind.", "A second path."])] {
+            let mut error = serde_json::json!({
+                "code": code,
+                "message": "Refused.",
+                "retryAfterSeconds": delay
+            });
+            if let Some(alternatives) = alternatives {
+                error["alternatives"] = serde_json::json!(alternatives);
+            }
+            let http = Recorder::new(&granted_answer());
+            http.answer_with(
+                status,
+                &serde_json::json!({ "ok": false, "error": error }).to_string(),
+            );
+            let service = ManagedRelayLeaseService::new(
+                origin(),
+                http.clone(),
+                Installation::new(ServiceRequestSigner::Host),
+            );
+
+            let error = service
+                .issue(&issue_request())
+                .await
+                .expect_err("a refusal");
+
+            assert_eq!(error.code(), expected, "{status} {code}");
+            assert_eq!(error.user_action(), action, "{status} {code}");
+            assert!(
+                matches!(
+                    error,
+                    ClientError::Refused {
+                        retry_after_seconds: Some(seconds),
+                        ..
+                    } if seconds == delay
+                ),
+                "{status} {code}: the delay the service stated"
+            );
+            readings.push((error.code(), error.user_action(), error.service_code()));
+        }
+        assert_eq!(readings[0], readings[1], "{status} {code}");
+    }
+}
+
 /// KR-REQ-04.19: a lease answer that names one member twice is not an answer this client reads.
 /// One reader would send traffic to the first relay and another to the second, and a lease may
 /// have been issued whichever it was, so it is an unknown outcome and nothing retries it.

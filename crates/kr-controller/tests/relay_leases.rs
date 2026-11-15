@@ -2421,6 +2421,78 @@ async fn a_service_that_has_no_room_for_a_lease_says_so_and_is_asked_again_later
     assert_eq!(rig.check().await.status, DoctorStatus::Ok);
 }
 
+/// The answer that says managed relay capacity is unavailable for a request that names no lease, with
+/// every member the host's reader knows and the delay the service asks for. The stand-in gives it
+/// for as long as the test runs.
+fn capacity_answer(retry_after_seconds: u64) -> &'static str {
+    Box::leak(
+        serde_json::json!({
+            "ok": true,
+            "data": {
+                "state": "unavailable",
+                "payer": "installation:55555555-5555-5555-5555-555555555555",
+                "message": "No relay is on offer for new clients right now.",
+                "alternatives": ["A path of the first kind.", "A path of the second kind."],
+                "allowance": {
+                    "allowance": "0",
+                    "used": "0",
+                    "reserved": "0",
+                    "period": null,
+                    "exhausted": false
+                },
+                "warnings": [],
+                "grace": null,
+                "retry_after_seconds": retry_after_seconds
+            }
+        })
+        .to_string()
+        .into_boxed_str(),
+    )
+}
+
+/// KR-REQ-17.48: a pair that holds no lease is answered that managed relay capacity is unavailable.
+/// The host holds nothing, so its record keeps the pair's row with no lease, and it asks once, not
+/// again until the delay the service stated has passed, an hour at most.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_17_48_a_capacity_answer_for_a_pair_with_no_lease_leaves_its_row_and_waits_the_delay()
+ {
+    for (stated, owed) in [(1_800_u64, 1_800_u64), (86_400, 3_600)] {
+        let rig = Rig::start_signed_in(false).await;
+        let owner = rig.owner_device();
+        rig.pass().await;
+        rig.served.web().fail(
+            ISSUE,
+            1,
+            Moment::Answer {
+                status: 200,
+                body: capacity_answer(stated),
+            },
+        );
+        let _sign_in = rig.signs_in_again(true).await;
+        rig.pass().await;
+
+        assert_eq!(
+            rig.lease_in_the_record(&owner),
+            Some(None),
+            "the row stays and names no lease"
+        );
+        assert!(rig.live_lease_for(&owner).is_none());
+        assert_eq!(rig.requests(ISSUE), 1, "asked once");
+        assert_eq!(
+            rig.timer.asked_for().into_iter().max(),
+            Some(Duration::from_secs(owed)),
+            "the longest wait is the delay the service stated, an hour at most"
+        );
+        let shown = rig.check().await;
+        assert_eq!(shown.status, DoctorStatus::Warning);
+        assert!(
+            shown.detail().contains("could not issue a lease"),
+            "{}",
+            shown.detail()
+        );
+    }
+}
+
 /// KR-REQ-17.51: a pairing or a revocation wakes the keeper, and what the service asked the host to
 /// wait for is still waited for. Devices paired while the allowance is spent are not asked for
 /// until the standing interval has passed, and are given their leases then.

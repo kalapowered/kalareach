@@ -121,6 +121,14 @@ pub enum Moment {
         /// The seconds the refusal asks the caller to wait, when it asks.
         retry_after_seconds: Option<u64>,
     },
+    /// The service answers with exactly this status and body, without acting on the request: an
+    /// answer written out in full, as the service's own code would have written it.
+    Answer {
+        /// The HTTP status.
+        status: u16,
+        /// The body, as the service wrote it.
+        body: &'static str,
+    },
     /// The service refuses the request as stated, without acting on it, and its words repeat the
     /// request it was sent, as a service's error text can.
     Echo {
@@ -1186,6 +1194,12 @@ impl ServiceWeb {
                     refusal_after(status, code, REFUSED_FOR_NOW, retry_after_seconds),
                 );
             }
+            Some(Moment::Answer { status, body }) => {
+                return Handled::Answer(ServiceHttpAnswer {
+                    status,
+                    body: body.as_bytes().to_vec(),
+                });
+            }
             Some(Moment::Echo { status, code }) => {
                 return Handled::Answer(refusal(
                     status,
@@ -1587,6 +1601,33 @@ pub(crate) fn answered(data: serde_json::Value) -> ServiceHttpAnswer {
         status: 200,
         body: serde_json::to_vec(&serde_json::json!({ "ok": true, "data": data }))
             .expect("an answer"),
+    }
+}
+
+/// The fault of a service that has no managed capacity for a new name: the refusal `status` and
+/// `code` carry, with the delay it asks for and the alternatives it names inside the error object,
+/// as the service writes it. It names none when `alternatives` is empty, which is how a service
+/// refuses for a fault that is not a short budget.
+#[must_use]
+pub fn short_budget(
+    status: u16,
+    code: &'static str,
+    retry_after_seconds: u64,
+    alternatives: &[&str],
+) -> Moment {
+    let mut error = serde_json::json!({
+        "code": code,
+        "message": "Managed capacity for new names is not available now.",
+        "retryAfterSeconds": retry_after_seconds,
+    });
+    if !alternatives.is_empty() {
+        error["alternatives"] = serde_json::json!(alternatives);
+    }
+    let body = serde_json::json!({ "ok": false, "error": error }).to_string();
+    // The answer lives as long as the test that scripts it.
+    Moment::Answer {
+        status,
+        body: Box::leak(body.into_boxed_str()),
     }
 }
 
