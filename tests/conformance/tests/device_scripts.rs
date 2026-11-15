@@ -994,25 +994,54 @@ fn a_device_on_any_scripts_own_serial_that_is_not_kalareachs_is_left_alone() {
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
-/// The console port an emulator was started with, as the record of its call has it.
-fn port_of(call: &str) -> Option<&str> {
-    let mut words = call.split_whitespace();
-    if words.next() != Some("emulator") {
-        return None;
-    }
-    words.skip_while(|word| *word != "-port").nth(1)
+/// The calls of a record that start an emulator, each with its place in the record and the console
+/// port it was given, or `None` when it was given none: such an emulator takes a port the script did
+/// not choose, so the serial the script then waits on is not its own.
+fn emulator_starts(calls: &[String]) -> Vec<(usize, Option<&str>)> {
+    calls
+        .iter()
+        .enumerate()
+        .filter_map(|(at, call)| {
+            let mut words = call.split_whitespace();
+            if words.next() != Some("emulator") {
+                return None;
+            }
+            let words: Vec<&str> = words.collect();
+            // The emulator takes a device as `-avd <name>` or as `@<name>`.
+            if !words.contains(&"-avd") && !words.iter().any(|word| word.starts_with('@')) {
+                return None;
+            }
+            let port = words
+                .iter()
+                .position(|word| *word == "-port")
+                .and_then(|port| words.get(port + 1).copied());
+            Some((at, port))
+        })
+        .collect()
 }
+
+/// The scripts that start no emulator while a device stands: each refuses when an emulator is listed
+/// as running, so none of them starts one beside it or waits for a boot.
+const STARTS_NONE_BESIDE_A_STANDING_DEVICE: [&str; 4] = [
+    "scripts/e2e-voice-device.sh",
+    "apps/companion/e2e/android-stores.sh",
+    "apps/companion/e2e/standing-emulator.sh",
+    "apps/companion/e2e/system-text-size-android.sh",
+];
 
 /// An emulator that already stands on another port does not answer the boot wait of the one a script
 /// starts. The debug bridge says that a boot is complete for a serial only when an emulator stands on
-/// that serial or has been started on it, so a script that waits for the boot of its own emulator is
-/// answered after that emulator was started, and not by the device that was up before it.
+/// that serial or has been started on it, and for no serial, or for the standing device's, from the
+/// first. So for each script that starts an emulator on a port of its own, the boot wait that is
+/// answered is the one for that port's serial, after the emulator was started on it, and no other
+/// wait is answered: a script that waits with no serial, or on the standing device's, or that starts
+/// its emulator on no port of its own, goes on at the answer of a device that is not its own. The
+/// scripts that start none beside a standing device are named, and the case fails when that set
+/// changes; none of them is answered a boot wait.
 #[test]
 fn an_emulator_already_up_on_another_port_does_not_answer_for_the_one_a_script_starts() {
     let mut problems = Vec::new();
-    let mut answered_after_start = 0;
-    // The scripts that start no emulator beside a device that is up, and so ask no boot of one.
-    let mut unread = Vec::new();
+    let mut starts_none = Vec::new();
     for path in OWN_SERIAL {
         let script = SCRIPTS
             .iter()
@@ -1030,38 +1059,78 @@ fn an_emulator_already_up_on_another_port_does_not_answer_for_the_one_a_script_s
                 ..Setup::default()
             },
         );
-        let Some((started, port)) = run
+        // Each boot wait the debug bridge answered, with its place in the record and the serial the
+        // wait named, which is empty when it named none.
+        let answers: Vec<(usize, &str)> = run
             .calls
             .iter()
             .enumerate()
-            .find_map(|(at, call)| port_of(call).map(|port| (at, port)))
-        else {
-            unread.push(path);
-            continue;
-        };
-        if port == "5554" {
-            problems.push(format!(
-                "{path}: it starts its emulator on the standing one's port"
-            ));
-            continue;
+            .filter_map(|(at, call)| {
+                call.strip_prefix("boot-answer")
+                    .map(|serial| (at, serial.trim()))
+            })
+            .collect();
+        let starts = emulator_starts(&run.calls);
+        let mut wrong = Vec::new();
+        if starts.is_empty() {
+            starts_none.push(path);
+            if !answers.is_empty() {
+                wrong.push(format!(
+                    "it started no emulator, and was answered {answers:?}"
+                ));
+            }
         }
-        let own = format!("boot-answer emulator-{port}");
-        match run.calls.iter().position(|call| *call == own) {
-            Some(answered) if answered < started => problems.push(format!(
-                "{path}: the boot of emulator-{port} was answered before an emulator was started on it:\n{}",
+        let mut own = Vec::new();
+        for (at, port) in &starts {
+            match port {
+                Some(port) if *port != "5554" => own.push((*at, format!("emulator-{port}"))),
+                _ => wrong.push(format!(
+                    "it started an emulator on {}",
+                    port.map_or("no port of its own".to_owned(), |port| format!(
+                        "port {port}, where a device stands"
+                    ))
+                )),
+            }
+        }
+        for (started, serial) in &own {
+            if !answers
+                .iter()
+                .any(|(at, answered)| at > started && answered == serial)
+            {
+                wrong.push(format!(
+                    "no boot wait of {serial} was answered after its emulator was started"
+                ));
+            }
+        }
+        for (at, answered) in &answers {
+            if !own
+                .iter()
+                .any(|(started, serial)| started < at && serial == answered)
+            {
+                wrong.push(format!(
+                    "a boot wait of {answered:?} was answered, and it is not the wait of an emulator the \
+                     script had started"
+                ));
+            }
+        }
+        if !wrong.is_empty() {
+            problems.push(format!(
+                "{path}: {}\n{}",
+                wrong.join("; "),
                 run.calls.join("\n")
-            )),
-            Some(_) => answered_after_start += 1,
-            None => {}
+            ));
         }
     }
+    let mut expected = STARTS_NONE_BESIDE_A_STANDING_DEVICE.to_vec();
+    starts_none.sort_unstable();
+    expected.sort_unstable();
+    if starts_none != expected {
+        problems.push(format!(
+            "the scripts that start no emulator beside a standing device are {starts_none:?}, and \
+             the case names {expected:?}"
+        ));
+    }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
-    assert!(
-        answered_after_start >= OWN_SERIAL.len() / 2,
-        "only {answered_after_start} of {} scripts waited for the boot of an emulator of their own; \
-         those that started none: {unread:?}",
-        OWN_SERIAL.len()
-    );
 }
 
 /// The driver moves the emulator's camera through its controller's port of the loopback interface, so
@@ -1191,20 +1260,40 @@ fn shell_scripts(directory: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
-/// Every script of the repository's `scripts` folder, a library among them, parses under the system's
-/// bash. On a Mac that is bash 3.2, whose parser reads the text of a here-document inside a command
-/// substitution for quotes, so a script it cannot parse ends where it fails and a caller that does not
-/// stop on an error goes on without the rest of it.
+/// Every tracked `.sh` file of the repository, the libraries and the scripts outside the `scripts`
+/// folder among them, parses under the system's bash. On a Mac that is bash 3.2, whose parser reads
+/// the text of a here-document inside a command substitution for quotes, so a script it cannot parse
+/// ends where it fails and a caller that does not stop on an error goes on without the rest of it.
+/// Only a Mac can fail this case for that fault: the bash of Linux parses the same text, so a pass on
+/// Linux shows nothing about it.
 #[test]
 fn every_script_parses_under_the_systems_bash() {
-    let mut scripts = Vec::new();
-    shell_scripts(&repository().join("scripts"), &mut scripts);
+    let listed = Command::new("git")
+        .arg("-C")
+        .arg(repository())
+        .args(["ls-files", "-z", "--", "*.sh"])
+        .output()
+        .expect("git starts");
     assert!(
-        scripts
-            .iter()
-            .any(|script| script.ends_with("lib/voice-call-lock-screen.sh")),
-        "the libraries are among the scripts read"
+        listed.status.success(),
+        "git lists the tracked scripts: {}",
+        String::from_utf8_lossy(&listed.stderr)
     );
+    let scripts: Vec<PathBuf> = listed
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| repository().join(String::from_utf8_lossy(name).as_ref()))
+        .collect();
+    for read in [
+        "scripts/lib/voice-call-lock-screen.sh",
+        "apps/companion/e2e/standing-emulator.sh",
+    ] {
+        assert!(
+            scripts.iter().any(|script| script.ends_with(read)),
+            "{read} is among the scripts read"
+        );
+    }
     let mut problems = Vec::new();
     for script in &scripts {
         let output = Command::new("/bin/bash")
