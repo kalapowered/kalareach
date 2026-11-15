@@ -34,7 +34,7 @@ pub enum Alternative {
     OwnSettingsSyncService,
     /// A backup storage service that the person runs.
     OwnBackupStorageService,
-    /// A direct connection between the devices, which needs no managed relay.
+    /// A connection between the devices that goes through no managed relay.
     DirectConnection,
     /// A relay the person runs.
     OwnRelay,
