@@ -24,8 +24,8 @@
 //! * **Every [`FEED_POLL_INTERVAL_MS`] after that**, while the daemon runs. The interval is counted
 //!   on the daemon's continuous clock, which counts the time the machine sleeps, so after a wake
 //!   the wait between two passes ends within five seconds, whether or not anybody reads the
-//!   status. A pass that has not finished holds the next one back: the next begins when that one
-//!   ends, and a pass lasts as long as the feed and the registry take over it.
+//!   status. A pass that has not finished holds the next one back: the wait before the next begins
+//!   when that one ends, and a pass lasts as long as the feed and the registry take over it.
 //! * **When an owner is revoked**, so the key it held stops being named as one that may remove the
 //!   feed.
 //! * **When the host finds an announcement in its mailbox** ([`crate::mailbox_reader`]), so a
