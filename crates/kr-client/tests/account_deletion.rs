@@ -355,7 +355,7 @@ async fn rig_over(store: Arc<dyn SecretStore>) -> Rig {
         .with_clock(clock_ms),
     );
     account
-        .commit(issued("account-1", "first"), "a-nonce")
+        .commit(issued("account-1", "first"), "a-nonce", || true)
         .await
         .expect("a sign-in is kept");
     let wire = Arc::new(Wire::default());
@@ -935,7 +935,7 @@ async fn a_different_account_signed_in_meanwhile_is_not_ended_and_does_not_borro
     // Another account signs in; its confirmation looks at the first account's receipt once, and
     // makes a receipt of its own.
     rig.account
-        .commit(issued("account-2", "second"), "another-nonce")
+        .commit(issued("account-2", "second"), "another-nonce", || true)
         .await
         .expect("a sign-in");
     rig.wire.then([
@@ -958,7 +958,7 @@ async fn a_different_account_signed_in_meanwhile_is_not_ended_and_does_not_borro
     rig.wire.then([recorded("preview")]);
     rig.deletion.preview().await.expect("a preview");
     rig.account
-        .commit(issued("account-2", "second"), "another-nonce")
+        .commit(issued("account-2", "second"), "another-nonce", || true)
         .await
         .expect("a sign-in");
     let before = rig.wire.seen().len();
@@ -1232,7 +1232,7 @@ async fn an_ending_that_failed_is_finished_after_a_restart_and_only_for_its_own_
 
     // A different account that signs in afterwards is left alone by every later settle.
     account
-        .commit(issued("account-2", "second"), "n")
+        .commit(issued("account-2", "second"), "n", || true)
         .await
         .expect("a sign-in");
     restarted.settle_grant().await.expect("settled");
@@ -1435,7 +1435,7 @@ async fn a_closed_deletion_is_shown_to_the_page_that_follows_it_and_to_no_page_t
         DeletionProgress::None
     );
     rig.account
-        .commit(issued("account-2", "second"), "n")
+        .commit(issued("account-2", "second"), "n", || true)
         .await
         .expect("another account signs in");
     rig.wire.then([recorded("status_open")]);
@@ -1499,7 +1499,7 @@ async fn an_unresolved_deletion_is_shown_to_its_own_account_and_to_no_other() {
 
     // Another account does not, and cannot give up on it.
     rig.account
-        .commit(issued("account-2", "second"), "n")
+        .commit(issued("account-2", "second"), "n", || true)
         .await
         .expect("another account signs in");
     rig.wire.then([recorded("status_unknown")]);
@@ -1533,7 +1533,7 @@ async fn a_dead_sign_in_is_not_told_the_closure_of_another_accounts_deletion() {
             .await
             .expect("an answer");
         rig.account
-            .commit(issued("account-2", "second"), "another-nonce")
+            .commit(issued("account-2", "second"), "another-nonce", || true)
             .await
             .expect("a sign-in");
         rig.wire.then([recorded("preview")]);
@@ -1566,7 +1566,7 @@ async fn a_closure_learned_for_one_account_never_ends_or_edits_another_accounts(
         Ok(DeletionOutcome::Unsettled)
     );
     rig.account
-        .commit(issued("account-2", "second"), "another-nonce")
+        .commit(issued("account-2", "second"), "another-nonce", || true)
         .await
         .expect("a sign-in");
     rig.wire.then([recorded("status_open")]);
@@ -1897,7 +1897,7 @@ async fn a_new_deletion_looks_after_an_old_closed_one_as_far_as_it_goes_and_then
     // Another account signs in on the device and deletes in its turn. The old record is asked
     // about and its steps are tried once more, and it is replaced whether or not they finish.
     rig.account
-        .commit(issued("account-2", "second"), "n")
+        .commit(issued("account-2", "second"), "n", || true)
         .await
         .expect("a sign-in");
     rig.wire.then([
@@ -1927,7 +1927,7 @@ async fn a_closure_does_not_let_go_of_the_note_that_another_accounts_sign_in_end
         .expect("closed");
     // Another account signs in, and its sign-in ends by itself.
     rig.account
-        .commit(issued("account-2", "second"), "n")
+        .commit(issued("account-2", "second"), "n", || true)
         .await
         .expect("a sign-in");
     *rig.service.ends.lock().expect("ends") = true;
@@ -2012,7 +2012,7 @@ async fn a_confirmation_sends_the_receipt_of_the_account_it_began_for_whoever_th
     // A second account confirms: it first asks about the first account's receipt, and that look is
     // held while another process signs in a third account and this page previews it.
     rig.account
-        .commit(issued("account-2", "second"), "n")
+        .commit(issued("account-2", "second"), "n", || true)
         .await
         .expect("a sign-in");
     rig.wire.then([recorded("preview")]);
@@ -2027,7 +2027,7 @@ async fn a_confirmation_sends_the_receipt_of_the_account_it_began_for_whoever_th
     let meanwhile = async {
         entered.notified().await;
         rig.account
-            .commit(issued("account-3", "third"), "m")
+            .commit(issued("account-3", "third"), "m", || true)
             .await
             .expect("a sign-in");
         rig.deletion.preview().await.expect("a preview");

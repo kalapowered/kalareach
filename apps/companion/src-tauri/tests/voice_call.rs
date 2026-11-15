@@ -481,7 +481,7 @@ async fn scene_replacing(
     ));
     if let Some(grant) = signed_in {
         tokens
-            .keep(grant, "a-nonce")
+            .keep(grant, "a-nonce", || true)
             .await
             .expect("the phone signs in");
     }

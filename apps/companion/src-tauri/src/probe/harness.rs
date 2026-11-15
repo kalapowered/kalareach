@@ -253,7 +253,7 @@ async fn signed_in(origin: &str, token: &str) -> Result<Arc<Account>, String> {
         Client::Mobile,
     ));
     tokens
-        .keep(service.grant(), "harness")
+        .keep(service.grant(), "harness", || true)
         .await
         .map_err(|error| error.to_string())?;
     let origin =

@@ -441,11 +441,18 @@ impl Account {
             Ok(Exchanged::Issued(issued)) => {
                 // The tokens are kept, or ended at the service when the store is known not to hold
                 // them; a store that cannot say is settled, never revoked while it may hold them.
-                match self.signed_in.keep(issued, grant.nonce()).await {
+                // The companion signs in its own account, which no host's deadline, lease or fence
+                // governs, so the check that the keep asks under the account's hold always stands.
+                match self.signed_in.keep(issued, grant.nonce(), || true).await {
                     Ok(Commit::Kept) => match self.signed_in.complete_identity().await {
                         Ok(IdentityRead::Disagreed) => Some(Outcome::NotForThisSignIn),
                         _ => None,
                     },
+                    Ok(Commit::Withheld) => {
+                        // The check always stands, so the keep never withholds here; were it to,
+                        // nothing was kept and the tokens were ended.
+                        Some(Outcome::NotKept)
+                    }
                     Ok(Commit::Unsettled) => {
                         tracing::warn!(
                             "the store could not say whether a sign-in was kept, so it was settled \
