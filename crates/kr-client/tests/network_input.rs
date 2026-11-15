@@ -230,19 +230,32 @@ impl Script {
     /// Waits until what the host saw satisfies `condition`: a condition of the host's state, never
     /// of a time.
     async fn until(&self, what: &str, condition: impl Fn(&Seen) -> bool) {
-        tokio::time::timeout(LIVENESS, async {
-            loop {
-                let changed = self.changed.notified();
-                tokio::pin!(changed);
-                changed.as_mut().enable();
-                if self.seen(&condition) {
-                    return;
-                }
-                changed.await;
+        tokio::time::timeout(LIVENESS, self.reached(&condition))
+            .await
+            .unwrap_or_else(|_| panic!("the host never saw {what}"));
+    }
+
+    /// As [`Script::until`], for what the case needs within a few seconds of the step that makes it
+    /// happen: a lane that does not do it fails the case here, by this assertion, and not by the
+    /// liveness limit.
+    async fn until_soon(&self, what: &str, condition: impl Fn(&Seen) -> bool) {
+        let reached = tokio::time::timeout(Duration::from_secs(5), self.reached(&condition)).await;
+        assert!(
+            reached.is_ok(),
+            "five seconds after the step, the host had still not seen {what}"
+        );
+    }
+
+    async fn reached(&self, condition: &impl Fn(&Seen) -> bool) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.seen(condition) {
+                return;
             }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("the host never saw {what}"));
+            changed.await;
+        }
     }
 
     fn frames(&self) -> Vec<SeenFrame> {
@@ -1774,7 +1787,7 @@ async fn a_write_that_finds_no_room_in_the_send_queue_waits_for_room() {
         .expect("the lane waits for room: it has not ended");
     drop(room);
     rig.script
-        .until("the four frames", |seen| seen.frames.len() >= 4)
+        .until_soon("the four frames", |seen| seen.frames.len() >= 4)
         .await;
     for (number, frame) in rig.script.frames().iter().enumerate() {
         assert_eq!(
@@ -1827,7 +1840,7 @@ async fn an_epoch_ends_while_the_writer_waits_for_room(how: EndsBy) {
         }
     }
     rig.script
-        .until("a frame", |seen| !seen.frames.is_empty())
+        .until_soon("a frame", |seen| !seen.frames.is_empty())
         .await;
     assert_eq!(
         rig.script.frames(),
@@ -2555,9 +2568,12 @@ async fn a_stream_lost_with_the_connection_waits_for_the_sessions_record_of_the_
             )),
         ))
         .expect("the control stream's writer");
-    let event = rig
-        .event_where(|event| matches!(event, InputEvent::Ended { .. }))
-        .await;
+    let event = loop {
+        let event = rig.event_soon().await;
+        if matches!(event, InputEvent::Ended { .. }) {
+            break event;
+        }
+    };
     let InputEvent::Ended {
         cause: EndCause::Connection {
             refusal: Some(refusal),
@@ -2627,6 +2643,155 @@ async fn the_paste_capacity_is_admitted_whole_when_every_cut_loses_the_most() {
     rig.lane
         .try_send_paste(&paste)
         .expect("the capacity is admitted whole");
+}
+
+/// The byte half of the bound counts the unanswered bytes of an older epoch once: frames of the most
+/// key bytes reach the 256 KiB long before they reach the frame count.
+#[tokio::test]
+async fn the_byte_bound_counts_the_unanswered_bytes_of_an_older_epoch_once() {
+    let mut rig = floor_rig().await;
+    rig.lane.begin_epoch(epoch(5)).expect("an epoch");
+    rig.lane.try_send(&[b'x'; FLOOR_FRAME]).expect("admitted");
+    rig.script
+        .until("the frame", |seen| !seen.frames.is_empty())
+        .await;
+    rig.lane.begin_epoch(epoch(6)).expect("a new epoch");
+    for _ in 0..255 {
+        rig.lane
+            .try_send(&[b'x'; FLOOR_FRAME])
+            .expect("admitted within the bound");
+    }
+    assert_eq!(
+        rig.lane.try_send(b"x"),
+        Err(InputRefusal::Full),
+        "one frame of epoch 5 still stands in the bound's bytes"
+    );
+    rig.script.accept(5, 0);
+    rig.settled().await;
+    rig.lane
+        .try_send(b"x")
+        .expect("admitted once the older frame was answered");
+}
+
+/// An older epoch's late answer lifts the charge of that epoch's frames and of no other epoch's:
+/// the frame that the newer epoch wrote still stands in the host's window, so the newer epoch's
+/// third frame waits.
+async fn an_older_epochs_answer_leaves_the_newer_epochs_charge(answer: impl FnOnce(&Script)) {
+    let mut rig = rig(2).await;
+    rig.lane.begin_epoch(epoch(5)).expect("an epoch");
+    rig.lane.try_send(&key(0)).expect("admitted");
+    rig.script
+        .until("the frame", |seen| !seen.frames.is_empty())
+        .await;
+    rig.lane.begin_epoch(epoch(6)).expect("a new epoch");
+    rig.lane
+        .try_send(&key(100))
+        .expect("admitted under epoch 6");
+    rig.script
+        .until("the new epoch's frame", |seen| seen.frames.len() >= 2)
+        .await;
+    rig.lane.try_send(&key(101)).expect("admitted");
+    rig.settled().await;
+    assert_eq!(
+        rig.script.frames().len(),
+        2,
+        "both epochs' frames fill the window of two"
+    );
+    answer(&rig.script);
+    rig.script
+        .until_soon("the second frame of epoch 6", |seen| seen.frames.len() >= 3)
+        .await;
+    rig.lane.try_send(&key(102)).expect("admitted");
+    rig.settled().await;
+    assert_eq!(
+        rig.script.frames().len(),
+        3,
+        "the newer epoch's charge stands, so its third frame waits"
+    );
+}
+
+#[tokio::test]
+async fn an_older_epochs_late_acceptance_leaves_the_newer_epochs_charge() {
+    an_older_epochs_answer_leaves_the_newer_epochs_charge(|script| script.accept(5, 0)).await;
+}
+
+#[tokio::test]
+async fn an_older_epochs_late_refusal_leaves_the_newer_epochs_charge() {
+    an_older_epochs_answer_leaves_the_newer_epochs_charge(|script| {
+        script.refuse(5, 0, None, ErrorCode::LeaseLost);
+    })
+    .await;
+}
+
+/// Unread acceptances join only when nothing came between them: a marker of the host's between two
+/// acceptances of one epoch stays between them, in the order it came.
+#[tokio::test]
+async fn an_acceptance_does_not_join_across_another_event() {
+    let mut rig = rig(8).await;
+    rig.lane.begin_epoch(epoch(5)).expect("an epoch");
+    rig.lane.try_send(&key(0)).expect("admitted");
+    rig.lane.try_send(&key(1)).expect("admitted");
+    rig.script
+        .until("both frames", |seen| seen.frames.len() >= 2)
+        .await;
+    rig.script.accept(5, 0);
+    rig.script.marker(7);
+    rig.script.accept(5, 1);
+    let told = rig.settled().await;
+    assert_eq!(told.len(), 3, "{told:?}");
+    assert!(
+        matches!(&told[0], InputEvent::Accepted { through, frames: 1, .. } if *through == sequence(0)),
+        "{told:?}"
+    );
+    assert!(
+        matches!(&told[1], InputEvent::LaunchReserved { launch: 7, .. }),
+        "{told:?}"
+    );
+    assert!(
+        matches!(&told[2], InputEvent::Accepted { through, frames: 1, .. } if *through == sequence(1)),
+        "{told:?}"
+    );
+}
+
+/// Unread acceptances of two epochs do not join: each stays an event of its own epoch.
+#[tokio::test]
+async fn an_acceptance_does_not_join_across_epochs() {
+    let mut rig = rig(8).await;
+    rig.lane.begin_epoch(epoch(5)).expect("an epoch");
+    rig.lane.try_send(&key(0)).expect("admitted");
+    rig.script
+        .until("the frame", |seen| !seen.frames.is_empty())
+        .await;
+    rig.script.accept(5, 0);
+    // The lane has applied it, and the case has read no event.
+    within(async {
+        while rig.sets().accepted != count(1, 5) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    rig.lane.begin_epoch(epoch(6)).expect("a new epoch");
+    rig.lane
+        .try_send(&key(100))
+        .expect("admitted under epoch 6");
+    rig.script
+        .until("the new epoch's frame", |seen| seen.frames.len() >= 2)
+        .await;
+    rig.script.accept(6, 0);
+    let told = rig.settled().await;
+    let accepted: Vec<&InputEvent> = told
+        .iter()
+        .filter(|event| matches!(event, InputEvent::Accepted { .. }))
+        .collect();
+    assert_eq!(accepted.len(), 2, "{told:?}");
+    assert!(
+        matches!(accepted[0], InputEvent::Accepted { epoch: e, frames: 1, .. } if *e == epoch(5)),
+        "{told:?}"
+    );
+    assert!(
+        matches!(accepted[1], InputEvent::Accepted { epoch: e, frames: 1, .. } if *e == epoch(6)),
+        "{told:?}"
+    );
 }
 
 /// What a hold's end counts and what nothing releases afterwards, four ways, each with the two
@@ -3533,6 +3698,28 @@ mod local {
             ),
             "{ended:?}"
         );
+        session.close();
+    }
+
+    /// A key that the host has not answered holds every request behind it, and the lane queues 64 of
+    /// them: the 65th is refused as full, and nothing queued is lost.
+    #[tokio::test]
+    async fn the_lane_queues_64_requests_behind_an_unanswered_key_and_refuses_the_65th() {
+        let (socket, session, lane, _events) = local_lane(false).await;
+        lane.begin_epoch(epoch(5)).expect("an epoch");
+        lane.try_send(&key(0)).expect("admitted");
+        socket.next_write().await;
+        let mut queued = Vec::new();
+        for number in 1..=64 {
+            queued.push(queue_request(&lane, &session, number).await);
+        }
+        assert_eq!(
+            lane.after_keys(|_| async { Err(ClientError::ConnectionEnded) })
+                .err(),
+            Some(InputRefusal::Full),
+            "the 65th request behind one unanswered key is refused"
+        );
+        drop(queued);
         session.close();
     }
 
