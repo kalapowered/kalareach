@@ -1133,8 +1133,9 @@ fn a_second_root_that_differs_in_letter_case_alone_is_a_root_where_the_disk_tell
     }
 }
 
-/// Off Windows a backslash is a letter of a name: a value that holds `\..\` names a folder under
-/// the root, and every reader takes it as one.
+/// Off Windows a backslash is a letter of a name for the shell reader: a value that holds `\..\`
+/// names a folder under the root. PowerShell's own path commands read a backslash as a separator on
+/// every platform, so its reader refuses the `..` behind one, as it would on Windows.
 #[cfg(unix)]
 #[test]
 fn a_backslash_in_a_value_is_a_letter_of_a_name_off_windows() {
@@ -1143,15 +1144,24 @@ fn a_backslash_in_a_value_is_a_letter_of_a_name_off_windows() {
         let name = r"a\..\..\kr-letters";
         let value = real(temporary.path()).join(name);
         let reading = reader.read(Some(value.as_os_str()), None);
-        assert!(
-            reading.succeeded,
-            "{reader:?} refused {value:?}: {reading:?}"
-        );
-        let directory = reading.directory.as_deref().expect("a directory");
-        assert!(
-            same(directory, &real(temporary.path()).join(name)),
-            "{reader:?}: {directory:?}"
-        );
+        if reader.is_shell() {
+            assert!(
+                reading.succeeded,
+                "{reader:?} refused {value:?}: {reading:?}"
+            );
+            let directory = reading.directory.as_deref().expect("a directory");
+            assert!(
+                same(directory, &real(temporary.path()).join(name)),
+                "{reader:?}: {directory:?}"
+            );
+        } else {
+            assert_refused(
+                reader,
+                &reading,
+                "a step up behind a backslash",
+                "steps up a directory",
+            );
+        }
     }
 }
 
@@ -1902,12 +1912,14 @@ mod windows_paths {
         }
     }
 
-    /// A refusal that finds no root says so in both readers, and shows no empty list.
+    /// A refusal that finds no root says so in the shell reader, and shows no empty list. (`pwsh`
+    /// makes the folder that `TEMP` names when it starts, so no environment leaves PowerShell with no
+    /// root; the Rust and TypeScript readers' words are cased with an empty list of roots.)
     #[test]
     fn a_refusal_with_no_roots_says_that_there_are_none() {
         let nowhere = std::env::temp_dir().join("kr-no-such-temporary-folder");
         assert!(!nowhere.exists());
-        for reader in readers() {
+        for reader in readers().into_iter().filter(|reader| reader.is_shell()) {
             let named = [
                 ("TMP", nowhere.as_os_str()),
                 ("TEMP", nowhere.as_os_str()),
