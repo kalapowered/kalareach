@@ -3848,6 +3848,22 @@ async fn a_prefix_made_only_of_the_newer_bytes_keeps_the_newer_deadline() {
         "a prefix made of the second write's bytes is admitted by the second write's \
          authority, though the first write's has run out: {seen:?}"
     );
+    // The escape of the writer's own paste terminator is the same byte, so that text alone does not
+    // tell a held byte that was written from one that was dropped. The next write of the epoch does:
+    // an epoch that dropped a batch writes nothing more.
+    {
+        let mut session = runtime.session();
+        session
+            .write_input(id, epoch, 2, b"z", Some(late), Instant::now())
+            .expect("accepted");
+        runtime.flush_input();
+    }
+    retained_within(
+        &runtime,
+        b"kr-ready.\x1b[200~\x1bz",
+        Duration::from_secs(10),
+    )
+    .await;
 }
 
 /// KR-REQ-08.64, in part.
