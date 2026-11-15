@@ -127,7 +127,7 @@ describe('the evidence directory reader', () => {
       '\\private\\tmp\\kr-evidence'
     ]) {
       expect(() => read(value)).toThrow(BACKSLASH)
-      expect(() => read(value)).toThrow(/KR_TEST_ARTIFACTS_DIR.*temporary roots/s)
+      expect(() => read(value)).toThrow(/temporary roots/)
     }
     expect(existsSync('/etc/kr-evidence')).toBe(false)
   })

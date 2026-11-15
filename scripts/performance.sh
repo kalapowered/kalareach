@@ -129,8 +129,42 @@ echo
 # put their runtime directories, state directories and copied binaries there, so a process whose
 # command line names that root is one of ours and nothing else is. That is what makes the check
 # below an answer about this run rather than about whatever else the machine happens to be doing.
+#
+# The suites read the evidence directory through their own reader, which accepts a folder inside
+# THEIR temporary folder, and that is now the run root. So the directory that the caller named (or,
+# where none is named, one that this run makes under its own temporary folder and says where it is)
+# is read here, before the temporary folder moves; the suites record under the run root; and what
+# they recorded is appended to the files of the directory that the caller named, on every way this
+# script ends and before the run root goes.
+# shellcheck source=scripts/lib/artifacts-dir.sh
+. "$root/scripts/lib/artifacts-dir.sh"
+kr_artifacts_dir
+evidence="$kr_artifacts"
 run_root="$(mktemp -d "${TMPDIR:-/tmp}/kalareach-run.XXXXXX")"
 export TMPDIR="$run_root"
+run_evidence="$run_root/evidence"
+export KR_TEST_ARTIFACTS_DIR="$run_evidence"
+
+# Appends each record file that the suites made under the run root to the file of the same name in
+# the directory that the caller named, and removes it from the run root, so that a second call
+# keeps nothing twice. The suites write flat files of Markdown.
+keep_evidence() {
+  local file
+  [ -d "$run_evidence" ] || return 0
+  if ! mkdir -p "$evidence"; then
+    echo "performance: the records of this run could not be kept in $evidence" >&2
+    return 1
+  fi
+  for file in "$run_evidence"/*; do
+    [ -f "$file" ] || continue
+    if ! cat "$file" >> "$evidence/${file##*/}"; then
+      echo "performance: the record $file could not be kept in $evidence" >&2
+      return 1
+    fi
+    rm -f "$file"
+  done
+}
+trap keep_evidence EXIT
 
 survivors() {
   # By the root's own name, which mktemp made unique to this run, rather than by its whole path.
@@ -151,6 +185,7 @@ check_no_survivors() {
     left="$(survivors)"
     if [ -z "$left" ]; then
       echo "no process this run started is still running"
+      keep_evidence || return 1
       rm -rf "$run_root"
       return 0
     fi
