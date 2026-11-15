@@ -353,7 +353,8 @@ fn stop_signal() -> std::io::Result<impl Future<Output = ()>> {
     })
 }
 
-/// A daemon on Windows is stopped by the request that stops it, so there is no signal to wait for.
+/// Windows has no SIGTERM and no service manager that sends one, so a daemon there waits for no
+/// stop signal.
 #[cfg(not(unix))]
 fn stop_signal() -> std::io::Result<impl Future<Output = ()>> {
     Ok(std::future::pending())
