@@ -6074,9 +6074,11 @@ const BUSY_FILE_BOUND: Duration = Duration::from_secs(10);
 /// A program that a case writes and then starts can meet "Text file busy": the system refuses to
 /// run a file that some process still holds open for writing, and a process that another thread of
 /// this test forks while the copy is being written inherits that descriptor until it has run its
-/// program. So the copy is written under another name, closed and renamed into place, all while no
-/// other thread starts a process, and a start that still meets the error is tried again, inside a
-/// short bound.
+/// program. So the copy is written under another name, closed and renamed into place while the
+/// suite's spawning turn is held. The turn stops only the starts made through it: this program
+/// also starts processes without it, and a child of one of those that forks during the copy holds
+/// the write descriptor, which the rename does not take away. So a start that still meets the
+/// error is tried again, inside a short bound.
 fn start_a_copy_that_holds_still(working: &Path, copy: &Path) -> Child {
     let staging = copy.with_extension("new");
     spawning(|| {
