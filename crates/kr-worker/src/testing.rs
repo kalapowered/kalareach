@@ -715,7 +715,7 @@ pub fn signal_next_lock_wait(
 }
 
 /// Settles batches that a test took out of a session's queue with
-/// [`Session::take_pending_input`], as the terminal's writer settles batches it has written whole.
+/// [`take_pending_input`], as the terminal's writer settles batches it has written whole.
 ///
 /// This is test support for a harness that plays the terminal's writer. A session with no writer
 /// to take its queue leaves everything taken charged to the room: the entry and its bytes, the
