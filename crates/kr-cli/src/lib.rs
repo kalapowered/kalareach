@@ -70,6 +70,7 @@ pub mod error;
 pub mod export;
 pub mod helper;
 pub mod hold;
+pub mod host_restart;
 pub mod host_stop;
 pub mod import;
 pub mod machine;
