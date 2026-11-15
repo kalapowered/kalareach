@@ -955,11 +955,11 @@ mod tests {
         }));
     }
 
-    /// How long the thread of [`hold_the_standard_error`] holds the lock. It is not what decides
-    /// the case: the drop's own word does. The hold is for the drop that waits and the wait of no
-    /// length. A drop that waits has to wait for the lock, since its writer cannot write before
-    /// it is free; and with the lock held, a wait of no length cannot find the line already
-    /// written, which a free lock could let a fast writer do before the wait begins.
+    /// How long the thread of [`hold_the_standard_error`] holds the lock. It makes a drop that
+    /// waits really wait: its writer cannot write before the lock is free. It decides nothing. A
+    /// dropping thread that is stopped for longer than this finds the lock free, and a wait of no
+    /// length finds the writer's word already sent; the record of the wait that the drop gave
+    /// ([`LineRecord`]) is what rejects that, and the length that the record must have is this one.
     #[cfg(unix)]
     const STANDARD_ERROR_HELD: Duration = Duration::from_millis(300);
 
@@ -1139,21 +1139,25 @@ mod tests {
         );
     }
 
-    /// The drop of a directory that is refused waits for its line to be written, and says that it
-    /// has: a process that ends right after it still has said so on its standard error.
+    /// The drop of a directory that is refused waits for the writer of its line, and a process that
+    /// ends right after it has said so on its standard error.
     ///
     /// The case runs itself again as a process of its own, and reads how it ended and its standard
     /// error. In that process one more thread takes the standard error's lock before the drop,
     /// says that it has it, holds it for `STANDARD_ERROR_HELD` and lets go. The drop gives its
-    /// line to a writer thread and waits for the writer's word that the line is written, and
-    /// records whether the wait ended with that word ([`LineRecord`]). The
-    /// process reads the record right after the drop, before it prints anything, and ends with
-    /// `WAIT_TOO_SHORT` or `WRITE_NOT_DONE` as its status when the drop had no word; the case fails on that status
-    /// whatever the standard error holds. The line alone cannot decide it, because a process
-    /// that is stopped for long enough after a drop that did not wait finds the line written all
-    /// the same. The hold is what lets a drop that waits really wait, and keeps a wait of no
-    /// length from finding a finished write. The process says on its standard output how long the
-    /// drop took, which a failure shows.
+    /// line to a writer thread, waits for the writer's word, and records two facts
+    /// ([`LineRecord`]): the length of the wait that it gave, and whether the word said that the
+    /// write returned without an error. The process reads the record right after the drop, before
+    /// it prints anything, and ends with `WAIT_TOO_SHORT` when the wait was shorter than the hold
+    /// and with `WRITE_NOT_DONE` when the word does not say that the write returned without an
+    /// error. The case fails on either status, whatever the standard error holds, and passes only
+    /// when both facts hold. A stall of the process or of the dropping thread, of any length and
+    /// at any point, changes neither fact; the case rests only on the time that the writer takes,
+    /// which the wait of `LINE_WAIT` bounds. The line alone cannot decide the case, because a
+    /// process that is stopped for long enough after a drop that did not wait finds the line
+    /// written all the same. The hold makes a drop that waits really wait; it decides nothing. The
+    /// process says on its standard output what the drop took and the two facts, which a failure
+    /// shows.
     #[cfg(unix)]
     #[test]
     fn a_process_that_ends_after_a_refused_removal_has_said_so() {
