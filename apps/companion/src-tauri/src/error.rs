@@ -122,11 +122,19 @@ impl std::fmt::Display for CommandError {
 impl std::error::Error for CommandError {}
 
 impl From<kr_client::ClientError> for CommandError {
+    /// A service with no managed capacity for what it was asked names what still works. Every line
+    /// that carries the service's own words carries those alternatives after them: "Until then:"
+    /// and each one as the service wrote it, and no delay of their own.
     fn from(error: kr_client::ClientError) -> Self {
         let code = error.code();
+        let mut message = error.to_string();
+        if let Some(told) = error.alternatives().until_then() {
+            message.push(' ');
+            message.push_str(told.as_str());
+        }
         Self {
             code,
-            message: error.to_string(),
+            message,
             user_action: error.user_action().as_str().into(),
             retry: code.retry_category(),
         }
@@ -189,6 +197,45 @@ mod tests {
             assert_eq!(sent["retry"], word, "{code:?}");
             assert_eq!(CommandError::new(code, "said").retry, category, "{code:?}");
         }
+    }
+
+    /// KR-REQ-17.48: a refusal of a service that names alternatives is told with the service's own
+    /// words and then "Until then:" and each alternative as the service wrote it, wherever it is
+    /// converted, once. A refusal that names none is told as it always was.
+    #[test]
+    fn kr_req_17_48_a_refusal_that_names_alternatives_is_told_with_them_after_the_services_words() {
+        use kr_client::ClientError;
+        use kr_client::services::Alternatives;
+
+        let refusal = |alternatives: &[&str]| ClientError::Refused {
+            error: kr_protocol::error::ProtocolError::new(
+                ErrorCode::ServiceCapacity,
+                "There is no room for new feeds right now.",
+            ),
+            retry_after_seconds: Some(600),
+            action: kr_client::retry::UserAction::Wait,
+            service_code: Some("SERVICE_UNAVAILABLE"),
+            alternatives: Alternatives::for_test(alternatives),
+        };
+        let words = refusal(&[]).to_string();
+        let alone = CommandError::from(refusal(&[]));
+        assert_eq!(alone.message, words);
+        assert!(!alone.message.contains("Until then"));
+
+        let named = CommandError::from(refusal(&[
+            "A feed service that you run yourself.",
+            "A path this version has never heard of.",
+        ]));
+        assert_eq!(
+            named.message,
+            format!(
+                "{words} Until then: A feed service that you run yourself. A path this version has never heard of."
+            ),
+            "the service's words, then each alternative as given, nothing between"
+        );
+        assert_eq!(named.code, alone.code);
+        assert_eq!(named.user_action, alone.user_action);
+        assert_eq!(named.retry, alone.retry);
     }
 
     /// The scripted hosts the page is tested against give every code the retry category the

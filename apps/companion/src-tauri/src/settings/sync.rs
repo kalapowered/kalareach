@@ -1686,18 +1686,15 @@ fn installation_id_of(device: &Device) -> String {
 
 /// What a sync failure is to the person.
 pub(super) fn sync_failure(error: SyncError) -> CommandError {
-    // A service with no managed capacity for new settings sync data says what still works, and
-    // the person is told it after the service's own words. No delay is told: this page shows none.
-    let mut message = error.to_string();
-    if let Some(told) = error.alternatives().until_then() {
-        message.push(' ');
-        message.push_str(told.as_str());
-    }
-    CommandError {
-        code: error.code(),
-        user_action: error.user_action().as_str().into(),
-        message,
-        retry: error.code().retry_category(),
+    match error {
+        // A failure of the service is told as every refusal of a service is.
+        SyncError::Client(error) => CommandError::from(*error),
+        error => CommandError {
+            code: error.code(),
+            user_action: error.user_action().as_str().into(),
+            message: error.to_string(),
+            retry: error.code().retry_category(),
+        },
     }
 }
 

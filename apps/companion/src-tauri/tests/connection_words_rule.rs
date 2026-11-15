@@ -430,13 +430,6 @@ const EXCEPTIONS: [Exception; 67] = [
         reason: "ends the host's own words with a full stop before this computer's words follow; it chooses no words from them",
     },
     Exception {
-        file: "revocation.rs",
-        function: "told_the_alternatives",
-        needle: WORDS,
-        lines: 1,
-        reason: "ends the service's own words with a full stop before the alternatives it named follow; it chooses no words from them and reads no connection's refusal",
-    },
-    Exception {
         file: "settings/connected.rs",
         function: "holds",
         needle: MATCHED,
