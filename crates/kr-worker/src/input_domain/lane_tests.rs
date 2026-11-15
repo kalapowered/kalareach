@@ -815,3 +815,57 @@ fn the_end_of_a_hold_gives_the_window_back_what_a_drop_outside_a_hold_returned()
         "the host was not told of the credit: {told:?}"
     );
 }
+
+/// The delimiter prefix the recogniser holds is the lease holder's. The removal of an attachment
+/// that does not hold the lease takes none of it; the removal of the holder takes all of it, into
+/// the share the removal carries, and leaves the recogniser with no prefix.
+#[test]
+fn a_removal_takes_the_held_prefix_only_for_the_attachment_that_holds_the_lease() {
+    let mut rig = Rig::new();
+    let mut holder = View::new();
+    let other = View::new();
+    rig.take(&mut holder);
+    let _ = rig.input.set_bracketed_paste(true);
+    let accepted = rig
+        .write(&mut holder, None, b"\x1b")
+        .expect("the key is accepted");
+    assert_eq!(
+        accepted.accepted.held_prefix_bytes, 1,
+        "the Escape is held as the start of a frame"
+    );
+    let shares_of_removing = |rig: &mut Rig, attachment: AttachmentId| -> Vec<u64> {
+        let applied = rig.input.apply_effects(Effects {
+            steps: vec![Step::RemoveAttachment {
+                attachment,
+                discarded: 0,
+            }],
+            ..Effects::default()
+        });
+        applied
+            .owed
+            .iter()
+            .map(|step| match step {
+                Step::RemoveAttachment { discarded, .. } => *discarded,
+                other => panic!("not a removal: {other:?}"),
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        shares_of_removing(&mut rig, other.attachment),
+        [0],
+        "the removal of an attachment that holds nothing takes the holder's prefix"
+    );
+    assert_eq!(
+        shares_of_removing(&mut rig, holder.attachment),
+        [1],
+        "the removal of the holder leaves the prefix out of its share"
+    );
+    assert!(
+        rig.input
+            .close_framing_for_takeover()
+            .discarded_prefix
+            .is_empty(),
+        "the recogniser holds a prefix after the holder's removal took it"
+    );
+}
