@@ -227,7 +227,7 @@ impl Controller {
     /// membership lease for `method`, which on a host that is exclusively organisation-managed is
     /// the authority the request was accepted under. The request's deadline and its connection are
     /// not asked: that request has answered, and its connection ends with the command.
-    fn sign_in_lasting(self: &Arc<Self>, method: Method) -> crate::account::Lasting {
+    pub(super) fn sign_in_lasting(self: &Arc<Self>, method: Method) -> crate::account::Lasting {
         let controller = Arc::downgrade(self);
         Arc::new(move || {
             let controller =
@@ -237,12 +237,18 @@ impl Controller {
                         detail: "this host is stopping".to_owned(),
                     })?;
             // The lease is read first: reading it waits for the policy lock, which a policy commit
-            // holds across its storage writes, and the fence is read after that wait.
-            controller
+            // holds across its storage writes, and the fence is read after that wait. Reading the
+            // fence takes its own lock, so the lease's end is compared with the clock again after
+            // it, with no lock of its own.
+            let end = controller
                 .local_hold(method)
-                .map(|_| ())
                 .map_err(ControllerError::from)?;
-            controller.check_fence()
+            #[cfg(feature = "testing")]
+            controller.before_the_last_fence_read.wait();
+            controller.check_fence()?;
+            controller
+                .lease_is_live_until(end)
+                .map_err(ControllerError::from)
         })
     }
 

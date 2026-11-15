@@ -42,6 +42,13 @@ async fn connected(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .set_exclusively_managed(exclusive);
+    let (writer, reader) = local_connection(&temp).await;
+    (temp, controller, writer, reader)
+}
+
+/// A local connection to the daemon of `temp`: the writer the daemon answers on and the reader its
+/// caller reads from.
+async fn local_connection(temp: &kr_ipc::testing::TempHost) -> (FrameWriter, FrameReader) {
     let endpoint = temp
         .environment()
         .controller_endpoint()
@@ -52,7 +59,62 @@ async fn connected(
     let caller = dialled.await.expect("the task ends").expect("connects");
     let (_, writer) = split(connection, StreamKind::Control);
     let (reader, _) = split(caller, StreamKind::Control);
-    (temp, controller, writer, reader)
+    (writer, reader)
+}
+
+/// A daemon on clocks the test moves by hand, exclusively organisation-managed, whose local owner
+/// holds a membership lease that is live for its fifteen minutes, and a local connection to it.
+/// Returns the continuous clock too, which the test moves past the lease's end.
+async fn connected_under_a_lease() -> (
+    kr_ipc::testing::TempHost,
+    Arc<Controller>,
+    kr_transport::clock::ManualClock,
+    FrameWriter,
+    FrameReader,
+) {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (continuous, wall, clocks) = crate::service::net::tests::manual_clocks();
+    let controller = crate::service::net::tests::daemon_on_clocks_to_move(&temp, clocks).await;
+    let now = wall.load(std::sync::atomic::Ordering::SeqCst);
+    let organisation =
+        crate::grants::organisation::testing::TestOrganisation::new(0x31, now - 60 * 60 * 1000);
+    let reading = crate::service::net::devices::ObservedUtc {
+        now: kr_protocol::scalars::TimestampMs::new(now),
+        behind_ms: 0,
+    };
+    controller
+        .update_policy(|policy| {
+            let verified = policy
+                .verify_enrolment(&organisation.authority(now), Some(&reading))
+                .expect("the chain verifies");
+            let revision = policy.authority_revision();
+            policy.enrol(verified, revision).expect("the host enrols");
+            policy.set_exclusively_managed(true);
+        })
+        .expect("the enrolment is written down");
+    let key = kr_crypto::keys::AuthorisationKeyPair::generate().expect("a device key");
+    let account = kr_protocol::ids::AccountId::new("ada").expect("an account");
+    let lease = organisation.lease(
+        &account,
+        *key.public(),
+        now,
+        &[kr_protocol::rights::ActionRight::SessionView],
+    );
+    controller
+        .update_policy(|policy| {
+            policy.install_lease(crate::grants::organisation::LeasePresentation {
+                lease: &lease,
+                device_id: controller.local_owner_device(),
+                proven_key: key.public(),
+                reading: Some(reading),
+                now: controller.clock.now(),
+                generation: controller.generation(),
+            })
+        })
+        .expect("the lease is written down")
+        .expect("the lease installs and binds the owner's device");
+    let (writer, reader) = local_connection(&temp).await;
+    (temp, controller, continuous, writer, reader)
 }
 
 /// The answer the effect produced: a result.
@@ -395,5 +457,109 @@ async fn a_conflict_the_local_door_told_is_written_as_the_checks_refusal_when_a_
         } else {
             assert_eq!(read, conflict, "the control");
         }
+    }
+}
+
+/// KR-REQ-17.54: a reply read from a record is written under a lease that is live when the write is
+/// let go, not only when its reading began. The record's own check takes locks after the lease is
+/// read, and a lease that ends in that wait stops the reply before the transport takes it: the
+/// stored answer is never written, and the caller is told the outcome is unknown. The control: where
+/// the lease still stands after the wait, the whole answer is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reply_read_from_a_record_is_not_written_when_the_lease_ends_while_the_record_is_checked()
+{
+    use kr_protocol::ids::{ActorId, ConnectionId};
+
+    for ends in [false, true] {
+        let (_temp, controller, continuous, mut writer, mut reader) =
+            connected_under_a_lease().await;
+        let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+        let revision = controller.policy().authority_revision();
+        controller.admitted_write().insert(
+            connection_id,
+            crate::service::AdmittedConnection::new(
+                ActorId::new("owner").expect("a principal"),
+                revision,
+            ),
+        );
+        let (arrived, go) = controller.pause_before_the_last_fence_read();
+        let writing = {
+            let controller = Arc::clone(&controller);
+            tokio::spawn(async move {
+                let stood = controller
+                    .write_answer(
+                        &mut writer,
+                        StreamKind::Control,
+                        &result(),
+                        Some(Method::PrivacySet),
+                        REQUEST,
+                        Some(crate::given::local_door::FromARecord::for_a_case(
+                            connection_id,
+                            revision,
+                        )),
+                    )
+                    .await;
+                drop(writer);
+                stood
+            })
+        };
+        // The lease was read live, and the record's check is at its last lock.
+        tokio::task::spawn_blocking(move || {
+            arrived.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await
+        .expect("the wait ends")
+        .expect("the record's check is reached");
+        if ends {
+            continuous.advance(std::time::Duration::from_secs(16 * 60));
+        }
+        go.send(()).expect("the check goes on");
+        let read = tokio::time::timeout(std::time::Duration::from_secs(30), reader.read_message())
+            .await
+            .expect("the daemon wrote or ended the connection");
+        writing.await.expect("the write ends");
+        if ends {
+            let Ok(ControlFrame::Response(response)) = read else {
+                panic!("the caller is told the outcome is unknown: {read:?}");
+            };
+            let Outcome::Error(told) = response.outcome else {
+                panic!("the stored answer reached the caller after the lease ended");
+            };
+            assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+        } else {
+            assert_eq!(read.expect("the answer reads"), result(), "the control");
+        }
+    }
+}
+
+/// KR-REQ-17.54: the ask that stands behind a sign-in reads the owner's lease first and the fence
+/// this host owes after it, and reading the fence takes its lock, so the lease's end that the first
+/// reading returned is compared with the clock again after it. A lease that ends in that wait
+/// stops the sign-in: nothing is kept. The control: where the lease still stands after the wait,
+/// the ask passes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_ask_whose_lease_ends_while_the_fence_is_read_is_refused() {
+    for ends in [false, true] {
+        let (_temp, controller, continuous, _writer, _reader) = connected_under_a_lease().await;
+        let lasting = controller.sign_in_lasting(Method::AccountSignIn);
+        let (arrived, go) = controller.pause_before_the_last_fence_read();
+        let asking = tokio::task::spawn_blocking(move || lasting());
+        // The lease was read live, and the ask is about to read the fence.
+        tokio::task::spawn_blocking(move || {
+            arrived.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await
+        .expect("the wait ends")
+        .expect("the ask reaches its reading of the fence");
+        if ends {
+            continuous.advance(std::time::Duration::from_secs(16 * 60));
+        }
+        go.send(()).expect("the ask goes on");
+        let asked = asking.await.expect("the ask ends");
+        assert_eq!(
+            asked.is_err(),
+            ends,
+            "a lease that ended in the wait: {ends}: {asked:?}"
+        );
     }
 }

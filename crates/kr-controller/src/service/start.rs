@@ -1233,6 +1233,8 @@ impl Controller {
             #[cfg(feature = "testing")]
             before_the_shares_lock: ThreadPause::default(),
             #[cfg(feature = "testing")]
+            before_the_last_fence_read: ThreadPause::default(),
+            #[cfg(feature = "testing")]
             replies_written: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "testing")]
             replies_made: std::sync::Mutex::new(Vec::new()),
