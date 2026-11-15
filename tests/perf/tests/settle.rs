@@ -18,6 +18,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod support;
+
 /// Prints the load as macOS does: `{ one five fifteen }`. The one-minute figure is the reading the
 /// run is at, which is the line of the readings file that the number of waits so far points at, and
 /// the last line from there on.
@@ -183,4 +185,13 @@ fn a_bound_that_is_not_a_load_is_refused_before_anything_runs() {
         assert_eq!(run.status, Some(2), "{bound:?}: {}", run.printed);
         assert_eq!(run.calls, 0, "{bound:?}: nothing was built or measured");
     }
+}
+
+/// A caller that names an evidence directory under its own temporary folder does not hand it to the
+/// script, whose temporary folder is one of the case's own.
+#[test]
+fn an_evidence_directory_that_the_caller_named_is_not_handed_to_the_script() {
+    support::run_as_a_caller_with_an_evidence_folder(
+        "a_run_that_names_no_bound_measures_at_whatever_load_the_machine_has",
+    );
 }
