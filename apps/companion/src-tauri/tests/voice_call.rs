@@ -2263,7 +2263,12 @@ async fn signing_out_during_a_call_ends_it() {
         .state_where("a running call", |state| state["running"] == true)
         .await;
 
-    scene.tokens.sign_out().await.expect("the phone signs out");
+    scene
+        .tokens
+        .sign_out(|| Ok::<(), std::convert::Infallible>(()))
+        .await
+        .expect("the phone signs out")
+        .expect("a check that always stands");
 
     let ended = scene
         .state_where("the end", |state| {
