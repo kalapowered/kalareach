@@ -79,9 +79,28 @@ impl EvidenceBudget {
 /// instant a caller that bounds the whole of its work must be done by. Without a bound there is
 /// always time.
 pub(super) fn has_time_for_an_exchange(until: Option<tokio::time::Instant>) -> bool {
-    until.is_none_or(|until| {
-        until.saturating_duration_since(tokio::time::Instant::now()) >= WORKER_EXCHANGE
-    })
+    exchange_ends_by(until, WORKER_EXCHANGE).is_some()
+}
+
+/// The instant an exchange that begins now must be over by, as an absolute time that is taken once
+/// and serves both the check that time is left and the timer: `length` from now, or `until` when
+/// that comes first. `None` when `until` leaves less than one exchange's time
+/// ([`WORKER_EXCHANGE`]), so the exchange does not begin. Without a bound the exchange has
+/// `length`.
+///
+/// A timer that read the clock again after the check would end later than the instant the check
+/// was made for, by however long the task took to get there, and a caller's bound that cut the
+/// exchange then would drop its link with the request on the wire.
+pub(super) fn exchange_ends_by(
+    until: Option<tokio::time::Instant>,
+    length: std::time::Duration,
+) -> Option<tokio::time::Instant> {
+    let now = tokio::time::Instant::now();
+    match until {
+        Some(until) if until.saturating_duration_since(now) < WORKER_EXCHANGE => None,
+        Some(until) => Some((now + length).min(until)),
+        None => Some(now + length),
+    }
 }
 
 /// How many more times an announcement may ask again for a page a worker refused for now, and how
@@ -480,6 +499,33 @@ async fn debt_pass(
     }
 }
 
+/// What bounds each notice of a telling ([`Controller::tell_revisions`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NoticeLimit {
+    /// Nothing of its own: the limit the caller holds on the whole telling applies.
+    Caller,
+    /// Each notice may take this long from the moment it begins.
+    Each(std::time::Duration),
+    /// The caller bounds the whole of an ask, which is over at this instant. A notice begins only
+    /// when a whole exchange's time is left before it, and its own limit, an instant that is taken
+    /// as it begins ([`exchange_ends_by`]), ends by it at the latest.
+    Before(tokio::time::Instant),
+}
+
+impl NoticeLimit {
+    /// Where a notice that begins now ends by: `None` when it must not begin, and `Some(None)` when
+    /// it has no limit of its own.
+    fn begin(self) -> Option<Option<tokio::time::Instant>> {
+        match self {
+            Self::Caller => Some(None),
+            Self::Each(length) => Some(Some(tokio::time::Instant::now() + length)),
+            Self::Before(until) => {
+                exchange_ends_by(Some(until), super::net::ACKNOWLEDGEMENT_TIMEOUT).map(Some)
+            }
+        }
+    }
+}
+
 /// What came of telling a worker the revisions it has not fenced.
 pub(crate) enum Told {
     /// The worker acknowledged the last of them.
@@ -845,7 +891,7 @@ impl Controller {
                                         .get(&session_id)
                                         .copied()
                                         .unwrap_or_else(|| AuthorityRevision::new(0)),
-                                    Some(WORKER_EXCHANGE),
+                                    NoticeLimit::Each(WORKER_EXCHANGE),
                                 )
                                 .await;
                             // An exchange that failed or ran out leaves a client whose stream
@@ -1100,8 +1146,15 @@ impl Controller {
     /// Tells a worker the revisions it has not fenced, over the link the caller holds, oldest
     /// first, and answers the acknowledgement of the last, which is the one the barrier waits on.
     /// It answers [`Told::Refused`] when the worker said that its dispatch boundary is held for
-    /// the moment, and [`Told::Failed`] when an exchange failed or ran out, `bound` after it began
-    /// when one is given.
+    /// the moment, and [`Told::Failed`] when an exchange failed or ran out, or when a notice could
+    /// not begin for want of time (`limit`).
+    ///
+    /// Under [`NoticeLimit::Before`], a deadline, a notice begins only when a whole exchange's time is
+    /// left before it, and ends by it: that is asked as each begins, the first and each after the
+    /// wait for the registry that follows an earlier acknowledgement, which the deadline ends too.
+    /// Where a notice cannot begin, nothing more is sent and the link goes back whole, here, since
+    /// what was sent before was answered to its end. The answer is [`Told::Failed`], and the caller
+    /// does not put the link back again.
     ///
     /// Each is a revision of its own, acknowledged as one ([`Self::note_earlier_acknowledgement`]).
     /// All are recorded as announced before any is sent, and with them what the result of each reads
@@ -1115,40 +1168,63 @@ impl Controller {
         link: &mut super::workers::WorkerLink,
         revision: AuthorityRevision,
         held: AuthorityRevision,
-        bound: Option<std::time::Duration>,
+        limit: NoticeLimit,
     ) -> Told {
-        let mut notices = self.revision_notices(revision, held, 0);
+        let notices = self.revision_notices(revision, held, 0);
         let told: Vec<AuthorityRevision> = notices.iter().map(|notice| notice.revision).collect();
+        // A telling that cannot begin records nothing as announced: no fence has run for what was
+        // never sent.
+        let Some(mut ends_by) = limit.begin() else {
+            link.give_back();
+            return Told::Failed;
+        };
         self.leases.announced(session_id, held, &told);
-        let last = notices.pop().expect("an announcement is made");
-        for notice in notices {
+        let mut notices = notices.into_iter();
+        let mut notice = notices.next().expect("an announcement is made");
+        loop {
             #[cfg(feature = "testing")]
             self.record_announcement(session_id, &notice);
-            let ack = match Self::exchange(bound, link.client().announce_revision(notice)).await {
+            let answer = Self::exchange(ends_by, link.client().announce_revision(notice)).await;
+            let Some(next) = notices.next() else {
+                return match answer {
+                    Answer::Given(ack) => Told::Acknowledged(ack),
+                    Answer::Refused => Told::Refused,
+                    Answer::Failed => Told::Failed,
+                };
+            };
+            let ack = match answer {
                 Answer::Given(ack) => ack,
                 Answer::Refused => return Told::Refused,
                 Answer::Failed => return Told::Failed,
             };
-            self.note_earlier_acknowledgement(session_id, binding, ack)
-                .await;
-        }
-        #[cfg(feature = "testing")]
-        self.record_announcement(session_id, &last);
-        match Self::exchange(bound, link.client().announce_revision(last)).await {
-            Answer::Given(ack) => Told::Acknowledged(ack),
-            Answer::Refused => Told::Refused,
-            Answer::Failed => Told::Failed,
+            let noted = self.note_earlier_acknowledgement(session_id, binding, ack);
+            match limit {
+                NoticeLimit::Before(until) => {
+                    if tokio::time::timeout_at(until, noted).await.is_err() {
+                        link.give_back();
+                        return Told::Failed;
+                    }
+                }
+                NoticeLimit::Caller | NoticeLimit::Each(_) => noted.await,
+            }
+            // The wait for the registry took time too, so whether the next notice can begin is
+            // asked after it.
+            let Some(next_ends_by) = limit.begin() else {
+                link.give_back();
+                return Told::Failed;
+            };
+            (notice, ends_by) = (next, next_ends_by);
         }
     }
 
     /// The answer of one exchange with a worker, or what became of it when it gave none: refused
-    /// for the moment, or failed or took longer than `bound`.
+    /// for the moment, or failed or still waiting at `ends_by`.
     async fn exchange<T>(
-        bound: Option<std::time::Duration>,
+        ends_by: Option<tokio::time::Instant>,
         exchange: impl std::future::Future<Output = std::result::Result<T, kr_ipc::IpcError>>,
     ) -> Answer<T> {
-        let answered = match bound {
-            Some(bound) => match tokio::time::timeout(bound, exchange).await {
+        let answered = match ends_by {
+            Some(ends_by) => match tokio::time::timeout_at(ends_by, exchange).await {
                 Ok(answered) => answered,
                 Err(_) => return Answer::Failed,
             },
@@ -1215,18 +1291,20 @@ impl Controller {
                 // An exchange that the bound of the whole ask cut would be dropped with the page on
                 // the wire, and the link with it, which stops the renewal of the lease of a worker
                 // that has acknowledged. Nothing has been sent yet, so the link goes back whole
-                // and the pass that collects names asks for what is left.
-                if !has_time_for_an_exchange(budget.until) {
+                // and the pass that collects names asks for what is left. The instant the page
+                // is over by is taken here, once, for the check and for the timer: a timer that
+                // started later would end later than the bound the check was made against.
+                let Some(ends_by) = exchange_ends_by(budget.until, WORKER_EXCHANGE) else {
                     link.give_back();
                     return;
-                }
+                };
                 #[cfg(feature = "testing")]
                 if !retries.by_the_pass {
                     self.record_announcement(session_id, &notice);
                 }
                 #[cfg(feature = "testing")]
                 self.before_a_pages_limit.wait().await;
-                match tokio::time::timeout(WORKER_EXCHANGE, link.client().announce_revision(notice))
+                match tokio::time::timeout_at(ends_by, link.client().announce_revision(notice))
                     .await
                 {
                     Ok(Ok(ack)) => {
