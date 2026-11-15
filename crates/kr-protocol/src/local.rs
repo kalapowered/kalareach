@@ -281,6 +281,14 @@ pub const AGENT_INSTANCES_READ: &str = "agent.instances/1";
 /// refuses a method it does not serve, which reads as a missing right.
 pub const SHELL_LAUNCH_SURFACE_READ: &str = "shell.launch.surface/1";
 
+/// The capability a worker states when it serves the input lane: the window and its credit, the
+/// position checks of a release, a detach and a launch, the count of what an end discarded, and
+/// the launch marker.
+///
+/// A control daemon and a client send a lane request, a position or a count member only to a
+/// worker that states this, because a worker of an earlier release refuses what it does not know.
+pub const INPUT_LANE: &str = "input.lane/1";
+
 /// The kind of grant a forwarded `session.attach` was decided under, which decides how much of the
 /// session's screen the attachment is drawn.
 ///
