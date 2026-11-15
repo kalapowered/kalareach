@@ -2270,11 +2270,13 @@ async fn local_writer(
             }
             // The send queue is done: the lane is complete, as a network lane is when the host has
             // read its stream to the end. A connection that ended under the last send is not
-            // complete. The session records that end before it says that the send stopped, so it
-            // is read here, ahead of the finished end, and the lane ends with the connection's
-            // cause.
+            // complete, and neither is one that stands with no writing side left, since the last
+            // request may have met that loss at its bound and been told as not sent. The session's
+            // record has the first and the transport the second, so both are read here, ahead of
+            // the finished end, and the lane ends with the connection's cause. The wait for the
+            // session's record stays, so that the host's refusal is read before the end is told.
             Next::Done => {
-                if shared.connection.state().0 {
+                if shared.connection.state().0 || !local.can_send() {
                     shared.end_by_failure(true).await;
                 } else {
                     shared.end(EndCause::Finished);
