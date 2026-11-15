@@ -3012,9 +3012,11 @@ async fn a_reply_comes_after_the_end_of_a_paste_whose_closing_batch_the_writer_d
         clock.advance(Duration::from_millis(1_500));
         runtime.flush_input();
     }
+    // What the session retains is the question itself, which the case fed in, and then what the
+    // application echoed: the end of the paste, and the answer behind it.
     let seen = retained_within(&runtime, STATUS_ANSWER, LIVENESS_DEADLINE).await;
     assert!(
-        contains(&seen, b"\x1b[200~kr-pasted\x1b[201~\x1b[0n"),
+        contains(&seen, b"\x1b[200~kr-pasted\x1b[5n\x1b[201~\x1b[0n"),
         "the answer came inside a paste that was left open: {:?}",
         String::from_utf8_lossy(&seen)
     );
