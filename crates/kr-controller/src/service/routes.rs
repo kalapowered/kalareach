@@ -22,11 +22,13 @@ use super::{Controller, encode, error_reply, net, parse, respond};
 /// The local write methods this daemon performs itself that take no admission into a service:
 /// the environment record, the update handover, the setting up of backups, the person's deletion of
 /// a copy privacy mode lists, the person's confirmation of a policy the host found restored and the
-/// host's own sign-in and sign-out. The deletion asks the registration again in the write that
-/// records it, the setting up of backups asks it, with the deadline, before each request that
-/// changes the storage service and in the transaction that records the setup, and the confirmation
-/// asks the registration and the deadline again where it removes the record of the wait, under that
-/// record's lock; the others change nothing the revision or the deadline decides.
+/// host's own sign-in and sign-out. Each asks the registration and the deadline again where its
+/// effect lands, after the waits that come first: the environment record in each write of it, the
+/// update handover immediately before it closes the gate, stops or resumes, the setting up of
+/// backups before each request that changes the storage service and in the transaction that records
+/// the setup, the deletion in the write that records it, the confirmation where it removes the
+/// record of the wait under that record's lock, and the sign-in and the sign-out before each change
+/// of the account.
 ///
 /// The fence check and the registration check run for each of them before it does anything. A
 /// method that takes an admission asks both inside the service that performs it, so this list is
@@ -937,7 +939,7 @@ impl Controller {
                 }
                 framed(
                     self.claimed_action(actor_id, mutation, connection_id, admitted, async {
-                        Given::fresh(self.update_handover(mutation).await)
+                        Given::fresh(self.update_handover(mutation, &carried).await)
                     })
                     .await,
                 )

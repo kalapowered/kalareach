@@ -1714,14 +1714,25 @@ impl Controller {
     /// step for an attempt that is over changes nothing, so an updater that lost an answer asks
     /// again rather than guessing.
     ///
+    /// The admission the request carries is asked again immediately before the step's effect: the
+    /// request was admitted at the door, and what comes between that and here (the task that
+    /// carries it out, the claim of its action) can outlast its deadline, its registration or the
+    /// owner's lease. Where it no longer stands, the gate is not closed and nothing is stopped or
+    /// resumed.
+    ///
     /// # Errors
     ///
+    /// `PERMISSION_DENIED` or `WINDOW_EXPIRED` when the admission no longer stands;
     /// `RESOURCE_UNAVAILABLE` when the creates under way do not settle within
     /// [`HANDOVER_SETTLE_MS`] (the attempt ends and the gate opens again), or when `stop` names an
     /// attempt that is not the gate's; `INVALID_ARGUMENT` when `stop` names none, and when a
     /// `prepare` finds that this daemon cannot say how it was started (nothing has changed then);
     /// `ENVIRONMENT_UNAVAILABLE` when `prepare` or `resume` comes after a `stop`.
-    pub(super) async fn update_handover(&self, mutation: &MutationRequest) -> Result<ParamsValue> {
+    pub(super) async fn update_handover(
+        &self,
+        mutation: &MutationRequest,
+        carried: &crate::authority::AdmittedMutation,
+    ) -> Result<ParamsValue> {
         let params: HostUpdateHandoverParams = parse(&mutation.params)?;
         // How this daemon was started is what the update starts a daemon of the new release like,
         // so a prepare that cannot say is refused before it changes the gate. A stop or a resume
@@ -1732,6 +1743,7 @@ impl Controller {
             (HandoverStep::Prepare, Err(error)) => return Err(error),
             (_, Err(_)) => StartedLike::default(),
         };
+        self.check_registration(carried)?;
         let attempt = match params.step {
             HandoverStep::Prepare => {
                 let attempt = self.handover.close(

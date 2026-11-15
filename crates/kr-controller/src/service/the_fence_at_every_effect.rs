@@ -1393,6 +1393,103 @@ async fn the_methods_that_take_no_admission_are_refused_while_a_fence_is_owed() 
     }
 }
 
+/// KR-REQ-09.09 and 17.54: an update handover step whose deadline passes after the envelope was
+/// checked and before the step runs closes nothing, stops nothing and resumes nothing: it is
+/// refused as expired. The control: the same steps under a deadline that stands are taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_update_handover_step_whose_deadline_passes_before_it_runs_changes_nothing() {
+    use kr_protocol::scalars::Uuid;
+    use kr_protocol::update::{
+        HandoverStep, HostUpdateHandoverParams, HostUpdateHandoverResult, ReleaseName,
+    };
+    let (temp, controller, clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let captured = controller
+        .admitted_revision(connection_id)
+        .expect("the connection is registered");
+    let step = |step: HandoverStep, attempt: Option<Uuid>, accepted: AcceptedDeadline| {
+        let controller = Arc::clone(&controller);
+        let actor_id = actor_id.clone();
+        let mutation = mutation_of(
+            &temp,
+            Method::HostUpdateHandover,
+            ParamsValue::from_typed(&HostUpdateHandoverParams {
+                step,
+                target: ReleaseName::new("0.2.0+4254aa6e62e5").expect("a release"),
+                attempt: attempt.map_or_else(Nullable::null, Nullable::some),
+            })
+            .expect("encodes"),
+        );
+        async move {
+            controller
+                .write_method(
+                    &actor_id,
+                    &mutation,
+                    Method::HostUpdateHandover,
+                    connection_id,
+                    None,
+                    Some(accepted),
+                    Some(captured),
+                )
+                .await
+                .into_answer_for_test()
+        }
+    };
+    let expired = |answered: &ControlFrame| {
+        let error = refusal(answered).expect("a step whose deadline passed is refused");
+        assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+        assert!(
+            error
+                .message
+                .contains(&crate::authority::AdmissionLapse::Expired.to_string()),
+            "refused for the deadline: {error:?}"
+        );
+    };
+
+    // The deadline the envelope check accepted, which the clock then passes.
+    let accepted_at_the_door = accepted(&controller);
+    let prepared = step(HandoverStep::Prepare, None, accepted_at_the_door).await;
+    let ControlFrame::Response(kr_protocol::envelope::Response {
+        outcome: Outcome::Ok(prepared),
+        ..
+    }) = prepared
+    else {
+        panic!("a prepare under a deadline that stands is taken: {prepared:?}");
+    };
+    let attempt = prepared
+        .to_typed::<HostUpdateHandoverResult>()
+        .expect("decodes")
+        .attempt
+        .0
+        .expect("the prepare began an attempt");
+    assert!(controller.handover.admit().is_err(), "the gate is closed");
+    clock.advance(STANDING + Duration::from_secs(1));
+
+    expired(&step(HandoverStep::Stop, Some(attempt), accepted_at_the_door).await);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), controller.handed_over())
+            .await
+            .is_err(),
+        "nothing was stopped"
+    );
+    expired(&step(HandoverStep::Resume, Some(attempt), accepted_at_the_door).await);
+    assert!(
+        controller.handover.admit().is_err(),
+        "the attempt was not ended: the gate is still closed"
+    );
+    let resumed = step(HandoverStep::Resume, Some(attempt), accepted(&controller)).await;
+    assert!(refusal(&resumed).is_none(), "{resumed:?}");
+    assert!(
+        controller.handover.admit().is_ok(),
+        "a deadline that stands resumes it"
+    );
+    expired(&step(HandoverStep::Prepare, None, accepted_at_the_door).await);
+    assert!(
+        controller.handover.admit().is_ok(),
+        "a prepare past its deadline did not close the gate"
+    );
+}
+
 /// An enrolment of an environment, for the record this host keeps of them.
 fn enrolment_of(byte: u8) -> kr_protocol::identity::EnvironmentEnrolment {
     use kr_protocol::identity::{EnvironmentAccess, EnvironmentEnrolment};
