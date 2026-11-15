@@ -956,6 +956,99 @@ async fn a_reused_identifier_is_shown_to_a_device_that_may_not_read_the_record()
     world.serving.abort();
 }
 
+/// KR-REQ-09.09: a reused identifier found in the door's own stores passes the kept answer's check
+/// and is then written under the standing that check asked, as every answer read from a record is:
+/// a fence this host comes to owe after the check stops it before it is written, and the device is
+/// told the refusal of the check that failed, which is true because the request had no effect of
+/// its own, and not an unknown outcome. A fence owed when the stores are read gives the same word.
+/// The control: with no fence owed the device is told the conflict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reused_identifier_found_in_the_doors_stores_is_not_written_while_a_fence_is_owed() {
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    for (byte, owed_at_the_stores, owed) in
+        [(85, false, false), (86, false, true), (87, true, false)]
+    {
+        let (connection, recording) = paired_connection(controller, byte, EVERY_RIGHT);
+        let mut mutation = mutation_of(
+            &world,
+            &connection,
+            Method::SessionRename,
+            93,
+            ParamsValue::empty(),
+        );
+        mutation.target = ActionTarget {
+            environment_id: world.environment_id,
+            session_id: Nullable::some(world.session_id),
+            session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+            application_instance_id: Nullable::null(),
+            agent_binding_revision: Nullable::null(),
+        };
+        let entry = connection
+            .admit(mutation.method.as_str(), mutation.method_version)
+            .expect("the method is in the registry");
+        let decided = connection
+            .ask_mutation(&mutation, entry)
+            .expect("the rename is decided");
+        let validated = connection
+            .admitted_at()
+            .await
+            .expect("the registration stands");
+        let recorded = ControlFrame::Response(Response {
+            request_id: mutation.request_id,
+            outcome: Outcome::Error(ProtocolError::new(
+                ErrorCode::IdConflict,
+                "the identifier was used with another request",
+            )),
+        });
+        let mut asked = None;
+        controller.hold_fence(owed_at_the_stores);
+        let found = connection
+            .kept_answer(
+                Recorded::read(recorded.clone()),
+                Method::SessionRename,
+                &mutation,
+                validated,
+                &decided,
+                &mut asked,
+            )
+            .await;
+        if owed_at_the_stores {
+            controller.hold_fence(false);
+            let told = found.expect_err("the stores are read while a fence is owed");
+            assert_eq!(
+                told.code,
+                ErrorCode::PermissionDenied,
+                "the refusal of the check that failed, not an unknown outcome: {told:?}"
+            );
+            continue;
+        }
+        let frame = found.expect("no fence is owed when the stores are read");
+        controller.hold_fence(owed);
+        assert!(
+            connection
+                .write_answer(connection.output(), Answered { frame, asked })
+                .await,
+            "the connection stands"
+        );
+        controller.hold_fence(false);
+        let frames = recording.frames();
+        let [ControlFrame::Response(Response { outcome, .. })] = frames.as_slice() else {
+            panic!("one answer was written: {frames:?}");
+        };
+        let Outcome::Error(told) = outcome else {
+            panic!("a refusal was written: {frames:?}");
+        };
+        let expected = if owed {
+            ErrorCode::PermissionDenied
+        } else {
+            ErrorCode::IdConflict
+        };
+        assert_eq!(told.code, expected, "a fence owed: {owed}: {told:?}");
+    }
+    world.serving.abort();
+}
+
 /// KR-REQ-09.09: an answer kept from an earlier submission of an action, whoever found it, is a
 /// read of what that submission produced and is shown under the right to read that. A device that
 /// holds the right over the session its action names is given the answer; one that does not is

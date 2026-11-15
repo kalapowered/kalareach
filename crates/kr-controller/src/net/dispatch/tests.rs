@@ -502,7 +502,7 @@ fn paired(
 /// right, every environment and session, the whole retained history and the live screen, and a
 /// live voice grant beside it. What such a device is answered is the routing's decision rather
 /// than its grant's.
-fn paired_with_every_right(
+pub(super) fn paired_with_every_right(
     controller: &crate::service::Controller,
     byte: u8,
 ) -> crate::service::net::devices::DeviceRecord {
@@ -2892,7 +2892,7 @@ async fn a_devices_close_is_kept_by_the_daemon_whatever_the_device_may_read() {
 }
 
 /// A device's mutation of `method` to the scripted session, with params `params`.
-fn device_mutation(
+pub(super) fn device_mutation(
     world: &crate::service::a_close_a_worker_never_answers::Silent,
     connection: &super::RemoteConnection,
     method: Method,
@@ -7729,7 +7729,8 @@ async fn a_reused_identifier_is_refused_as_one_though_a_copy_of_the_request_is_q
 
 /// KR-REQ-09.09: a reused identifier is read from the route record, and goes back only under the
 /// check every answer read from a record goes under, asked with it in hand: a device whose host
-/// owes a fence is told the outcome is not shown, and not the conflict. The record is found when a
+/// owes a fence is told the refusal of that check, which says nothing of the record, and not the
+/// conflict. The record is found when a
 /// retained answer is looked up (the route names a session, or none) and, where a copy of the
 /// request claims the route after that lookup found none, when the claim is made. The control: with
 /// no fence owed the device is told the conflict.
@@ -7809,8 +7810,10 @@ async fn a_reused_identifier_found_in_the_route_record_is_not_shown_while_a_fenc
             }
             .expect("the request is answered");
             let error = error_of(told.frame());
+            // The request has no effect of its own, so the device is told the refusal of the check
+            // that failed, which is the fence's, and not an unknown outcome.
             let expected = if owed {
-                ErrorCode::OutcomeUnknown
+                ErrorCode::PermissionDenied
             } else {
                 ErrorCode::IdConflict
             };

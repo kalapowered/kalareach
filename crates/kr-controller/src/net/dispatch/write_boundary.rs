@@ -1727,6 +1727,124 @@ async fn a_kept_answer_that_waits_for_the_stream_is_not_written_when_a_fence_is_
     }
 }
 
+/// KR-REQ-09.09: a reused identifier read from the route record passes the kept answer's check,
+/// then waits for the stream, and is asked the standing that check asked again where its bytes are
+/// handed to the transport. A fence this host comes to owe in that wait stops it: the conflict does
+/// not go out, and the device is told the refusal of the check that failed, which is true because
+/// the request had no effect of its own. The control: with no fence the conflict is written. The
+/// record is found when a retained answer is looked up (the route names a session, or none) and,
+/// where a copy of the request claims the route after that lookup found none, at the claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reused_identifier_that_waits_for_the_stream_is_not_written_when_a_fence_is_owed_in_the_wait()
+ {
+    use kr_protocol::envelope::{Outcome, ParamsValue, Response};
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::ids::RequestId;
+    use kr_protocol::method::Method;
+    use kr_protocol::session::SessionCloseParams;
+
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    for (routed_to_a_session, claimed_meanwhile) in [(true, false), (false, false), (true, true)] {
+        for owed in [false, true] {
+            let script = Scripted::new();
+            let world = scripted::scripted(&script).await;
+            let controller = &world.controller;
+            let stream = HeldStream::new(false);
+            let connection = super::RemoteConnection::for_test_writing_to(
+                controller,
+                super::tests::paired_with_every_right(controller, 93),
+                Box::new(Arc::clone(&stream)),
+            );
+            let held = super::tests::device_mutation(
+                &world,
+                &connection,
+                Method::AgentPromptSubmit,
+                107,
+                ParamsValue::empty(),
+            );
+            let claim_the_held_route = || async {
+                connection
+                    .claim_route(
+                        &held,
+                        routed_to_a_session.then_some(world.session_id),
+                        connection
+                            .admitted_at()
+                            .await
+                            .expect("the registration stands"),
+                        &super::forwarding::OwnClaim::none(),
+                    )
+                    .is_ok()
+            };
+            let mut reused = held.clone();
+            reused.request_id = RequestId::new(108);
+            reused.params = ParamsValue::from_typed(&SessionCloseParams {
+                session_id: world.session_id,
+            })
+            .expect("encodes");
+
+            let answered = if claimed_meanwhile {
+                // The request finds no route and is stopped before its effect; a copy claims the
+                // route under the same identifier meanwhile.
+                let (arrived, go) = controller.before_the_effect.arm();
+                let (answered, ()) = tokio::join!(
+                    connection.answer_now(ControlFrame::Mutation(Box::new(reused))),
+                    async {
+                        tokio::time::timeout(std::time::Duration::from_secs(30), arrived)
+                            .await
+                            .expect("the request reaches the place it is stopped at")
+                            .expect("the pause is armed");
+                        assert!(
+                            claim_the_held_route().await,
+                            "a copy claims the route of the identifier"
+                        );
+                        go.send(()).expect("the request goes on");
+                    }
+                );
+                answered
+            } else {
+                assert!(
+                    claim_the_held_route().await,
+                    "the route holds the first request"
+                );
+                connection
+                    .answer_now(ControlFrame::Mutation(Box::new(reused)))
+                    .await
+            }
+            .expect("the request is answered");
+            let (stood, ()) = tokio::join!(
+                connection.write_answer(connection.output(), answered),
+                async {
+                    // The write waits for the stream's writer, which the peer has not freed.
+                    stream.waited(1).await;
+                    controller.hold_fence(owed);
+                    stream.writer.add_permits(2);
+                }
+            );
+            controller.hold_fence(false);
+            assert!(stood, "the connection stands");
+            let frames = stream.frames();
+            let [ControlFrame::Response(Response { outcome, .. })] = frames.as_slice() else {
+                panic!("one answer was written: {frames:?}");
+            };
+            let Outcome::Error(told) = outcome else {
+                panic!("a refusal was written: {frames:?}");
+            };
+            let expected = if owed {
+                ErrorCode::PermissionDenied
+            } else {
+                ErrorCode::IdConflict
+            };
+            assert_eq!(
+                told.code, expected,
+                "a route to a session: {routed_to_a_session}, claimed meanwhile: \
+                 {claimed_meanwhile}, a fence owed: {owed}: {told:?}"
+            );
+            world.serving.abort();
+        }
+    }
+}
+
 /// KR-REQ-24.15: an answer decided before the feed removed this host is not written when the
 /// connection's grant rests on the feed, as it is not for the other two refusals: the removal moves
 /// no revision, so a decision taken before it names nothing that has changed. The device is written

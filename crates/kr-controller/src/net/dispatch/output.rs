@@ -283,6 +283,12 @@ pub(super) enum Answers {
     /// read of the receipt it is. It goes only while the standing it was checked under holds: the
     /// registration at the revision the request was admitted under, and no fence owed.
     Kept(AuthorityRevision),
+    /// A refusal that says another request spent the identifier of this one, read from the route's
+    /// record, from the door's own stores or from a service. It names no result and had no effect of
+    /// its own, but it is read from a record, so it goes only while the standing it was checked
+    /// under holds, as a kept answer does; where that fails the device is told the refusal of the
+    /// check that failed.
+    Conflict(AuthorityRevision),
 }
 
 impl Answers {
@@ -298,7 +304,7 @@ impl Answers {
         match self {
             Self::Action => super::after_the_outcome(answer, refusal),
             Self::Kept(_) => super::outcome_not_shown(),
-            Self::Read | Self::Nothing => refusal,
+            Self::Read | Self::Nothing | Self::Conflict(_) => refusal,
         }
     }
 }
@@ -594,10 +600,13 @@ impl RemoteOutput {
         // the turn is taken, for the one frame every attempt below writes.
         let shown = super::super::device_errors::frame_for_a_device(frame);
         let refusal;
-        // What a kept answer stands on, asked with the other bounds. It is not asked of a refusal
-        // written in the answer's place: that frame carries nothing the record held.
+        // What a kept answer, or a conflict read from a record, stands on, asked with the other
+        // bounds. It is not asked of a refusal written in the answer's place: that frame carries
+        // nothing the record held.
         let mut kept_standing = match answers {
-            Answers::Kept(admitted_revision) => Some(admitted_revision),
+            Answers::Kept(admitted_revision) | Answers::Conflict(admitted_revision) => {
+                Some(admitted_revision)
+            }
             Answers::Nothing | Answers::Read | Answers::Action => None,
         };
         let frame: &ControlFrame = match &shown {
@@ -742,9 +751,9 @@ impl RemoteOutput {
         }
     }
 
-    /// Whether the standing an answer kept from an earlier submission was checked under still
-    /// holds: the fence this host owes and the registration at the revision the request was
-    /// admitted under, asked as the kept answer's own check asks them. Any other answer stands.
+    /// Whether the standing an answer read from a record was checked under still holds: the fence
+    /// this host owes and the registration at the revision the request was admitted under, asked
+    /// as the kept answer's own check asks them. Any other answer stands.
     ///
     /// Asked inside the poll that hands bytes to the stream, so the last ask before the transport
     /// takes a byte is made after every wait of the write: the turn, the stream's room and the
