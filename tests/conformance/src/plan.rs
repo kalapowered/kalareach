@@ -2166,7 +2166,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         ],
         runs: Runs::Supplied {
             file: "scripts/performance.sh",
-            line: "if ! output=\"$(CARGO_BUILD_JOBS=\"${CARGO_BUILD_JOBS:-4}\" cargo test --release -p kr-worker \"$target_flag\" \"$target\" -- --ignored --exact --nocapture \"$name\" 2>&1)\"; then",
+            line: "output=\"$(CARGO_BUILD_JOBS=\"${CARGO_BUILD_JOBS:-4}\" cargo test --release -p kr-worker \"$target_flag\" \"$target\" -- --ignored --exact --nocapture \"$name\" 2>&1)\" || status=$?",
             names_with: &["measurement_in --test performance"],
         },
     },
@@ -2184,7 +2184,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Supplied {
             file: "scripts/performance.sh",
-            line: "if ! output=\"$(CARGO_BUILD_JOBS=\"${CARGO_BUILD_JOBS:-4}\" cargo test --release -p kr-worker \"$target_flag\" \"$target\" -- --ignored --exact --nocapture \"$name\" 2>&1)\"; then",
+            line: "output=\"$(CARGO_BUILD_JOBS=\"${CARGO_BUILD_JOBS:-4}\" cargo test --release -p kr-worker \"$target_flag\" \"$target\" -- --ignored --exact --nocapture \"$name\" 2>&1)\" || status=$?",
             names_with: &["measurement_in --bench input_latency"],
         },
     },
