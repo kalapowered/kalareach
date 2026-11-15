@@ -895,7 +895,7 @@ fn a_name_that_a_select_handler_or_branch_binds_is_not_the_handle() {
     // A local of the handle's name that a branch's pattern or its handler binds is not the handle:
     // awaiting it joins nothing, whatever else the handler does with the handle.
     for branches in [
-        // The review's probe: the handler drops the handle and awaits a local of its name.
+        // The handler drops the handle and awaits a local of its name.
         "result = tokio::signal::ctrl_c() => { drop(task); let task = async { result }; task.await?; }, () = other() => {}",
         "Some(task) = jobs() => { task.await; }, () = other() => {}",
         "() = stop() => { let task = jobs(); task.await; }",
