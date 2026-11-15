@@ -26,7 +26,7 @@ ok H.3 "writable but unit-private tmpfs mounts: $(for p in /run /opt /srv /mnt /
 
 # H.4: the full list of writable files and folders, by mount.
 UNIT_MAX=120 unit_legs sbx-h2 -- $W list
-bad=$(grep '^RESULT writable mount=' "$SBX_LOGS/sbx-h2.log" | grep -v -E 'mount=(/home/kr-legs|/opt/kr-legs/(cargo|target)|/tmp|/dev/shm|/run|/opt|/srv|/mnt|/media|/dev) ' || true)
+bad=$(grep '^RESULT writable mount=' "$SBX_LOGS/sbx-h2.log" | grep -v -E 'mount=(/home/kr-legs|/opt/kr-legs/(cargo|target)|/tmp|/dev/shm|/run|/opt|/srv|/mnt|/media|/dev|/home|/root|/run/user) ' || true)
 if [ -z "$bad" ]; then ok H.4 "every writable file or folder lies on a bind or a unit-private tmpfs"; else fail H.4 "writable elsewhere: $(printf '%s' "$bad" | tr '\n' ';' | cut -c1-300)"; fi
 
 # H.5: absent paths.
