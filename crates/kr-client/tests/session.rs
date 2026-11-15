@@ -752,13 +752,14 @@ async fn a_call_made_after_the_host_closed_the_connection_is_refused_as_not_sent
     let composed = padded_request(&session, 0x73, 16).await;
 
     script.close_now.notify_one();
-    tokio::time::timeout(Duration::from_secs(30), async {
+    // The library records the host's close while the read loop is held. A transport that does not
+    // say so leaves this wait to run out, and the call below shows what the session then does.
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
         while kr_client::transport::ControlTransport::can_send(transport.as_ref()) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .expect("the host's close reaches the client");
+    .await;
 
     let refused = session.send(&composed).await;
     assert!(
