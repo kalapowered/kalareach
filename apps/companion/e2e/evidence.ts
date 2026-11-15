@@ -26,10 +26,12 @@
  * with folders and links as tools make them, it returns a folder inside the roots or refuses, and
  * it refuses nothing that the run set right. It is no boundary against a process of the same
  * account, which can write wherever the run can and can change a link or a folder while the reader
- * reads. It does not close a case that somebody arranges: a name with a line feed beside a link at
- * the shortened name, a link whose target climbs through another link, or a server named with no
- * share. On Windows the comparison ignores letter case, so a folder made case-sensitive, and a
+ * reads. On Windows the comparison ignores letter case, so a folder made case-sensitive, and a
  * letter that the disk and the reader do not fold alike, are not told apart.
+ *
+ * On Windows `os.tmpdir()` takes the temporary folder from `TEMP` first and then `TMP`, and the
+ * shell reader takes it from `TEMP`; the Rust reader and the PowerShell reader take `TMP` first.
+ * Where `TMP` and `TEMP` differ, only a value under the runner's folder satisfies all four readers.
  *
  * Declared against `node:process` for the same reason `served.ts` is: the browser tests are
  * type-checked with the interface's own settings, which carry no Node types.
@@ -105,8 +107,8 @@ function refusedOwn(temporary: string, why: string): Error {
   return new Error(
     `no directory of this run's own can be made for its evidence: the temporary folder ` +
       `'${temporary}' is refused: ${why}. It has to be an absolute path to a folder inside one of ` +
-      `this platform's temporary roots (${roots().join(', ')}). Point TMPDIR (on Windows, TEMP or ` +
-      `TMP) at such a folder, or set ${VARIABLE} to a folder under one of the roots.`
+      `this platform's temporary roots (${roots().join(', ')}). Point TMPDIR (on Windows, TEMP) ` +
+      `at such a folder, or set ${VARIABLE} to a folder under one of the roots.`
   )
 }
 
