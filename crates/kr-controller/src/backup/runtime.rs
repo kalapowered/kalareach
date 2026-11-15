@@ -569,38 +569,44 @@ impl Shared {
             }
         };
         #[cfg(feature = "testing")]
-        self.say_when_nothing_stands(takes_every_signal, ended)
-            .await;
+        Self::say_when_nothing_stands(&self.settled, takes_every_signal, ended).await;
         #[cfg(not(feature = "testing"))]
         ended.await;
     }
 
     /// Runs `ended`, the wait, and raises `settled` while it waits with nothing standing.
     ///
-    /// A signal that holds a permit ends the wait the first time the wait is polled, and takes the
-    /// permit. So a wait that takes all three signals and is still pending after its first poll
-    /// found none of them holding a permit, and each now waits for the next. The carrier is then
-    /// between passes, so no pass is in hand either. A timer can still end such a wait without a
-    /// signal. The flag is lowered when the wait ends, before the pass it starts begins.
+    /// A signal that holds a permit ends the wait the first time the wait asks it, and takes the
+    /// permit. So a wait that takes all three signals, and is still pending after a poll that asked
+    /// each of them, found none of them holding a permit, and each now waits for the next. The
+    /// carrier is then between passes, so no pass is in hand either.
     ///
-    /// It says what the carrier found when it last looked: a signal sent after that look ends the
-    /// state, and the flag follows when the carrier next runs.
+    /// A poll that begins with the task's budget spent is not such a poll: the `select!` returns
+    /// `Pending` before it asks any signal, and a permit stays where it is until the poll that
+    /// follows. A poll that begins with budget asks every signal, and a branch that is not ready
+    /// gives back the unit it took.
+    ///
+    /// A timer can still end such a wait without a signal. The flag is lowered when the wait ends,
+    /// before the pass it starts begins. It says what the carrier found when it last asked: a
+    /// signal sent after that ends the state, and the flag follows when the carrier next runs.
     #[cfg(feature = "testing")]
     async fn say_when_nothing_stands(
-        &self,
+        settled: &tokio::sync::watch::Sender<bool>,
         takes_every_signal: bool,
         ended: impl std::future::Future<Output = ()>,
     ) {
         let mut ended = std::pin::pin!(ended);
         std::future::poll_fn(|context| {
+            // Read before the poll, because the `select!` in `ended` reads the same budget first.
+            let asks_every_signal = tokio::task::coop::has_budget_remaining();
             let poll = ended.as_mut().poll(context);
-            if poll.is_pending() && takes_every_signal {
-                self.settled.send_replace(true);
+            if poll.is_pending() && takes_every_signal && asks_every_signal {
+                settled.send_replace(true);
             }
             poll
         })
         .await;
-        self.settled.send_replace(false);
+        settled.send_replace(false);
     }
 
     /// One iteration: the ciphertext of finished generations is released first, whatever the
@@ -900,10 +906,10 @@ impl BackupRuntime {
         self.shared.passes.subscribe()
     }
 
-    /// Whether the carrier waits with nothing standing: no permit on any of its three signals and
-    /// no pass in hand. Only the next signal, or a timer, then starts a pass. It changes to `true`
-    /// when the carrier finds that, and back to `false` when its wait ends. For this host's own
-    /// tests.
+    /// Whether the carrier waits with nothing standing: it asked each of its three signals, none
+    /// held a permit, and no pass is in hand. Only the next signal, or a timer, then starts a pass.
+    /// It changes to `true` when the carrier finds that, and back to `false` when its wait ends. It
+    /// stays `true` if the carrier is ended during such a wait. For this host's own tests.
     #[cfg(feature = "testing")]
     #[must_use]
     pub fn waits_with_nothing_standing(&self) -> tokio::sync::watch::Receiver<bool> {
@@ -1207,5 +1213,101 @@ const fn remedy_for(hold: Hold) -> &'static str {
             "Tell the service's operator that backup storage is not configured."
         }
         _ => "This host asks again by itself. Check that the service is reachable.",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::poll_fn;
+    use std::pin::pin;
+    use std::task::{Context, Poll};
+
+    use tokio::sync::{Notify, watch};
+    use tokio::task::coop;
+
+    use super::Shared;
+
+    /// The wait of a carrier with nothing owed: the first of its three signals ends it.
+    async fn the_three_signals(work: &Notify, fence: &Notify, person: &Notify) {
+        tokio::select! {
+            () = work.notified() => {}
+            () = fence.notified() => {}
+            () = person.notified() => {}
+        }
+    }
+
+    /// Takes every unit of the task's budget for the rest of this poll, as the I/O of a task does,
+    /// through the runtime's own budget call, and says how many units it took.
+    fn spend_the_budget(context: &mut Context<'_>) -> u32 {
+        let mut units = 0;
+        while units < 1_000 && coop::has_budget_remaining() {
+            let Poll::Ready(unit) = coop::poll_proceed(context) else {
+                break;
+            };
+            unit.made_progress();
+            units += 1;
+        }
+        units
+    }
+
+    #[tokio::test]
+    async fn the_signal_is_raised_by_a_poll_that_asked_each_signal_and_not_by_the_budget() {
+        let settled = watch::channel(false).0;
+        let (work, fence, person) = (Notify::new(), Notify::new(), Notify::new());
+
+        // A permit is stored and the task has no budget left when the wait begins: the runtime
+        // returns `Pending` before it asks a signal, and the signal has to stay down until the
+        // permit is taken.
+        fence.notify_one();
+        let mut wait = pin!(Shared::say_when_nothing_stands(
+            &settled,
+            true,
+            the_three_signals(&work, &fence, &person)
+        ));
+        let mut spent = None;
+        poll_fn(|context| {
+            if spent.is_none() {
+                spent = Some(spend_the_budget(context));
+                assert!(!coop::has_budget_remaining(), "the budget is spent");
+            }
+            let poll = wait.as_mut().poll(context);
+            if poll.is_pending() {
+                assert!(
+                    !*settled.borrow(),
+                    "the wait went pending on a spent budget with a permit stored, and the signal \
+                     says that nothing stands"
+                );
+            }
+            poll
+        })
+        .await;
+        assert!(
+            spent.is_some_and(|units| units > 0),
+            "the case spent budget"
+        );
+        assert!(!*settled.borrow(), "the wait ended and lowered the signal");
+
+        // The poll that follows has its budget, asks each signal, and finds none with a permit.
+        assert!(coop::has_budget_remaining(), "a new poll has its budget");
+        let mut wait = pin!(Shared::say_when_nothing_stands(
+            &settled,
+            true,
+            the_three_signals(&work, &fence, &person)
+        ));
+        poll_fn(|context| {
+            assert!(wait.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(
+            *settled.borrow(),
+            "every signal was asked and none held a permit"
+        );
+        person.notify_one();
+        wait.await;
+        assert!(
+            !*settled.borrow(),
+            "the signal ended the wait and lowered it"
+        );
     }
 }
