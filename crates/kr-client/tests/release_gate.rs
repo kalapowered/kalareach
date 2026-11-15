@@ -197,6 +197,7 @@ fn is_the_route_error(error: &Error) -> bool {
             retry_after_seconds: None,
             action: UserAction::Update,
             service_code: None,
+            ..
         } if error.code == ErrorCode::UnsupportedCapability
     )
 }

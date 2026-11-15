@@ -1059,6 +1059,7 @@ fn data_of(answer: &ServiceHttpAnswer, method: &str) -> Result<serde_json::Value
         retry_after_seconds: refusal.retry_after_seconds,
         action,
         service_code: super::signed::named_code(&refusal.code),
+        alternatives: super::alternatives::Alternatives::none(),
     })
 }
 

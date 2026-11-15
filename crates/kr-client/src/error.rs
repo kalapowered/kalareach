@@ -4,6 +4,7 @@ use kr_protocol::error::{ErrorCode, ProtocolError, RetryCategory};
 use kr_protocol::method::{Method, MethodVersion};
 
 use crate::retry::{Decision, Failure, RequestClass, UserAction};
+use crate::services::alternatives::Alternatives;
 use crate::shown::{Said, Shown};
 
 /// A client failure.
@@ -49,6 +50,10 @@ pub enum ClientError {
         /// A caller whose decision turns on which refusal it was reads it here: two service codes
         /// can share one protocol code and one action.
         service_code: Option<&'static str>,
+        /// The alternatives the service named beside a refusal for a short budget: the paths that
+        /// still work. They change what a person is told and nothing a caller does, so no
+        /// decision reads them.
+        alternatives: Alternatives,
     },
     /// A value could not be encoded or decoded as KR-CBOR-1.
     ///
@@ -189,6 +194,19 @@ impl ClientError {
             _ => None,
         }
     }
+
+    /// The alternatives a managed service named when it refused for a short budget. Empty for
+    /// every other failure, and for every refusal that named none, which is a fault.
+    #[must_use]
+    pub fn alternatives(&self) -> &Alternatives {
+        match self {
+            Self::Refused { alternatives, .. } => alternatives,
+            _ => Self::NO_ALTERNATIVES,
+        }
+    }
+
+    /// What a failure that is not a refusal names.
+    pub(crate) const NO_ALTERNATIVES: &'static Alternatives = &Alternatives::none();
 
     /// Returns what the retry policy makes of this failure for a request of `class`.
     ///

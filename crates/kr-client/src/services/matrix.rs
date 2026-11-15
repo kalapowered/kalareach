@@ -643,6 +643,7 @@ impl RouteError {
             retry_after_seconds: None,
             action: UserAction::Update,
             service_code: None,
+            alternatives: super::alternatives::Alternatives::none(),
         }
     }
 }

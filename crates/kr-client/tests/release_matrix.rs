@@ -404,6 +404,7 @@ mod the_choice {
                 retry_after_seconds,
                 action,
                 service_code,
+                ..
             } => {
                 assert_eq!(error.code, ErrorCode::UnsupportedCapability);
                 assert_eq!(retry_after_seconds, None);

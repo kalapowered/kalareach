@@ -244,6 +244,7 @@ fn sign_in_again(refusal: kr_protocol::error::ProtocolError) -> ClientError {
         retry_after_seconds: None,
         action: UserAction::SignIn,
         service_code: None,
+        alternatives: super::alternatives::Alternatives::none(),
     }
 }
 

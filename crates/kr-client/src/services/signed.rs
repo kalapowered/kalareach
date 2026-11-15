@@ -83,6 +83,7 @@ use kr_protocol::service::{
 use serde::{Deserialize, Serialize};
 
 use super::account::AccountTokenSource;
+use super::alternatives::Alternatives;
 use super::json::Unreadable;
 use super::relay::{ServiceHttp, ServiceHttpAnswer, ServiceSigner};
 use crate::error::{ClientError, Result};
@@ -697,6 +698,9 @@ pub(crate) struct Refusal {
     code: Option<&'static str>,
     message: ServiceMessage,
     retry_after_seconds: Option<u64>,
+    /// The alternatives the service named beside a refusal for a short budget, which change what a
+    /// person is told and nothing a caller does.
+    alternatives: Alternatives,
     /// The whole answer the refusal arrived in, which [`Self::members`] reads again.
     answer: Vec<u8>,
 }
@@ -759,6 +763,7 @@ impl Refusal {
             retry_after_seconds: self.retry_after_seconds,
             action,
             service_code: self.code,
+            alternatives: self.alternatives,
         }
     }
 }
@@ -827,6 +832,10 @@ fn answer_of(answer: &ServiceHttpAnswer, repeat: Repeat) -> Result<Answer> {
         /// The service names this in camel case, as its whole envelope does.
         #[serde(default, rename = "retryAfterSeconds")]
         retry_after_seconds: Option<u64>,
+        /// What a service adds when a budget was short. Read as a list of texts when it is one and
+        /// left out when it is anything else, so that no shape of it makes a refusal unreadable.
+        #[serde(default)]
+        alternatives: Option<serde_json::Value>,
     }
 
     let envelope = super::json::read::<Envelope>(&answer.body).map_err(|fault| {
@@ -862,6 +871,7 @@ fn answer_of(answer: &ServiceHttpAnswer, repeat: Repeat) -> Result<Answer> {
         code: named_code(&named.code),
         message: ServiceMessage::from_refusal(named.message),
         retry_after_seconds: named.retry_after_seconds,
+        alternatives: named_alternatives(named.alternatives),
         answer: answer.body.clone(),
     }))
 }
@@ -930,6 +940,23 @@ const SERVICE_CODES: [&str; 20] = [
     "SERVICE_UNAVAILABLE",
     "OUTCOME_UNKNOWN",
 ];
+
+/// The alternatives a refusal named, when it named a list of texts. A member of any other shape is
+/// read as none: what a service adds to tell a person more is never a reason to refuse to read
+/// what it decided.
+fn named_alternatives(member: Option<serde_json::Value>) -> Alternatives {
+    let Some(serde_json::Value::Array(items)) = member else {
+        return Alternatives::none();
+    };
+    let mut texts = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            serde_json::Value::String(text) => texts.push(text),
+            _ => return Alternatives::none(),
+        }
+    }
+    Alternatives::named(texts)
+}
 
 /// The code the contract names that `text` spells, as this client's own constant.
 pub(super) fn named_code(text: &str) -> Option<&'static str> {
@@ -2147,6 +2174,155 @@ mod tests {
                 serde_json::json!({ "status": { "request_id": identity } }),
             ),
         ]
+    }
+
+    /// A refusal as a service words one when a budget is short: the usual members, and a list of
+    /// alternatives inside the error object when it names any.
+    fn refusal_naming(
+        status: u16,
+        code: &str,
+        retry_after_seconds: u64,
+        alternatives: &[&str],
+    ) -> ServiceHttpAnswer {
+        let mut error = serde_json::json!({
+            "code": code,
+            "message": "Refused.",
+            "retryAfterSeconds": retry_after_seconds,
+        });
+        if !alternatives.is_empty() {
+            error["alternatives"] = serde_json::json!(alternatives);
+        }
+        ServiceHttpAnswer {
+            status,
+            body: serde_json::to_vec(&serde_json::json!({ "ok": false, "error": error }))
+                .expect("a refusal"),
+        }
+    }
+
+    /// What a caller acts on in a refusal: its code, its action, the service's own code and the
+    /// delay it named.
+    fn acted_on(error: &ClientError) -> (ErrorCode, UserAction, Option<&'static str>, Option<u64>) {
+        let ClientError::Refused {
+            retry_after_seconds,
+            ..
+        } = error
+        else {
+            panic!("a refusal, not {error:?}");
+        };
+        (
+            error.code(),
+            error.user_action(),
+            error.service_code(),
+            *retry_after_seconds,
+        )
+    }
+
+    /// KR-REQ-17.48: a refusal for a short budget names alternatives inside its error object, beside
+    /// its code, its message and its delay. It is read as the same code, the same action and the
+    /// same delay as the refusal that names none, for a rate limit and for a service that cannot
+    /// answer, and a request goes as many times as it does without them: once, or once more after
+    /// a short delay when it is safe to repeat. What a caller does turns on the code and the delay
+    /// alone.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_17_48_a_refusal_that_names_alternatives_is_read_as_one_that_does_not() {
+        let mut requests = safe_requests();
+        requests.push((
+            Method::AuthoritySync,
+            serde_json::json!({ "publish": { "request": {} } }),
+        ));
+        requests.push((
+            Method::SyncCompareExchange,
+            serde_json::json!({ "exchange": { "request_id": null } }),
+        ));
+        for (status, code, expected, once_more_after_short_delays) in [
+            (429, "RATE_LIMITED", ErrorCode::RateLimited, false),
+            (503, "SERVICE_UNAVAILABLE", ErrorCode::ServiceCapacity, true),
+        ] {
+            for delay in [2_u64, 60, 3_600, 86_400] {
+                for (method, body) in &requests {
+                    let mut readings = Vec::new();
+                    for alternatives in [
+                        &[][..],
+                        &["A path of its own.", "A second path of its own."][..],
+                    ] {
+                        let script =
+                            Script::answering([refusal_naming(status, code, delay, alternatives)]);
+                        let refused = match asked(&script, *method, body.clone(), None).await {
+                            Ok(Answer::Refused(refusal)) => refusal,
+                            other => panic!("{status} {code} {method:?} {body}: {other:?}"),
+                        };
+                        let error = refused.into_error();
+                        let named: Vec<String> = error
+                            .alternatives()
+                            .as_given()
+                            .iter()
+                            .map(|one| one.as_str().to_owned())
+                            .collect();
+                        assert_eq!(named, alternatives, "{status} {code}: what it names");
+                        readings.push((acted_on(&error), script.requests()));
+                    }
+                    let case = format!("{status} {code} after {delay} {method:?} {body}");
+                    assert_eq!(readings[0], readings[1], "{case}");
+                    let ((read, action, service_code, named), sent) = readings[0];
+                    assert_eq!(read, expected, "{case}");
+                    assert_eq!(action, UserAction::Wait, "{case}");
+                    assert_eq!(service_code, Some(code), "{case}");
+                    assert_eq!(named, Some(delay), "{case}");
+                    let safe = Repeat::of(*method, body) == Repeat::Safe;
+                    let again = once_more_after_short_delays && safe && delay <= 10;
+                    assert_eq!(sent, if again { 2 } else { 1 }, "{case}: sent");
+                }
+            }
+        }
+    }
+
+    /// KR-REQ-17.48: a list of alternatives that is not a list of texts is no reason to refuse to
+    /// read what the service decided. The refusal is read as one that names none: the same code,
+    /// action and delay, and nothing to show.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_17_48_an_alternatives_member_of_another_shape_names_none() {
+        for member in [
+            serde_json::json!("A path of its own."),
+            serde_json::json!({ "first": "A path of its own." }),
+            serde_json::json!(["A path of its own.", 7]),
+            serde_json::json!(7),
+            serde_json::Value::Null,
+        ] {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": "SERVICE_UNAVAILABLE",
+                    "message": "Refused.",
+                    "retryAfterSeconds": 600,
+                    "alternatives": member
+                }
+            }))
+            .expect("a refusal");
+            let script = Script::answering([ServiceHttpAnswer { status: 503, body }]);
+            let refused = match asked(
+                &script,
+                Method::AuthoritySync,
+                serde_json::json!({ "publish": { "request": {} } }),
+                None,
+            )
+            .await
+            {
+                Ok(Answer::Refused(refusal)) => refusal,
+                other => panic!("{member}: {other:?}"),
+            };
+            let error = refused.into_error();
+            assert!(error.alternatives().is_empty(), "{member}");
+            assert_eq!(
+                acted_on(&error),
+                (
+                    ErrorCode::ServiceCapacity,
+                    UserAction::Wait,
+                    Some("SERVICE_UNAVAILABLE"),
+                    Some(600)
+                ),
+                "{member}"
+            );
+        }
     }
 
     /// KR-REQ-23.57: a request that is safe to repeat, answered that the service did not finish
