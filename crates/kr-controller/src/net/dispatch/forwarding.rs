@@ -795,10 +795,13 @@ impl RemoteConnection {
         // reservation its token holds, whichever way the first attempt ended, and the session that
         // reservation holds is its subject.
         let reserved = if method == Method::SessionCreate {
-            match network_door::kept(
-                crate::service::net::AtTheNetworkDoor::here(),
-                self.reserved_session(mutation).await,
-            ) {
+            let looked_up = self.reserved_session(mutation).await;
+            // The lookup waited for the registry, and a fence this host came to owe, or a
+            // registration withdrawn or replaced, in that wait stops the answer all the same.
+            if self.admitted_to_answer(validated).is_err() {
+                return Err(outcome_not_shown());
+            }
+            match network_door::kept(crate::service::net::AtTheNetworkDoor::here(), looked_up) {
                 Ok(reserved) => reserved,
                 Err(()) => return Err(outcome_not_shown()),
             }
@@ -892,6 +895,11 @@ impl RemoteConnection {
         let Ok(digest) = kr_protocol::digest::mutation_digest(mutation, &actor_id) else {
             return Recorded::read(Err(()));
         };
+        #[cfg(test)]
+        self.controller
+            .before_a_reservation_is_looked_up
+            .wait()
+            .await;
         let registry = self.controller.registry.lock().await;
         Recorded::read(
             match registry.reservation_for_token(&actor_id, mutation.action_id.get()) {

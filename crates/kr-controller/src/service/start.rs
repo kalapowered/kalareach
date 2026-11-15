@@ -1289,6 +1289,8 @@ impl Controller {
             #[cfg(test)]
             before_the_effect: ReadPause::default(),
             #[cfg(test)]
+            before_a_reservation_is_looked_up: ReadPause::default(),
+            #[cfg(test)]
             before_a_voice_change_claims: ReadPause::default(),
             #[cfg(test)]
             place_lookup_panics: std::sync::atomic::AtomicBool::new(false),

@@ -390,6 +390,103 @@ async fn a_deduplicated_create_is_told_as_a_kept_answer() {
     }
 }
 
+/// KR-REQ-09.09: a create answered from the reservation another copy made asks the check every
+/// answer read from a record goes under again once its lookup of the reservation is over, because
+/// the lookup waits for the registry. A fence this host comes to owe in that wait stops the answer:
+/// the device is told the outcome is unknown. The control: with no fence the same create is given
+/// the answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deduplicated_create_is_not_shown_when_a_fence_lands_while_its_reservation_is_looked_up()
+{
+    for owed in [false, true] {
+        let world = fake::fake_worker(None).await;
+        let controller = &world.controller;
+        let (connection, _) = paired_connection(controller, 87, EVERY_RIGHT);
+        let create =
+            crate::service::a_create_that_launches_nothing::create_params(world.environment_id);
+        let mutation = mutation_of(
+            &world,
+            &connection,
+            Method::SessionCreate,
+            92,
+            ParamsValue::from_typed(&create).expect("encodes"),
+        );
+
+        let (arrived, go) = controller.before_the_effect.arm();
+        let (answered, ()) = tokio::join!(
+            connection.answer_now(ControlFrame::Mutation(Box::new(mutation.clone()))),
+            async {
+                tokio::time::timeout(WAIT_BOUND, arrived)
+                    .await
+                    .expect("the copy reaches the place it is stopped at")
+                    .expect("the pause is armed");
+                let actor = connection.device.principal();
+                let digest =
+                    kr_protocol::digest::mutation_digest(&mutation, &actor).expect("a digest");
+                let intent = kr_cbor::to_canonical_vec(&create).expect("encodes");
+                let reserved = {
+                    let mut registry = controller.registry.lock().await;
+                    let admitted = registry
+                        .reserve(
+                            &actor,
+                            mutation.action_id.get(),
+                            digest,
+                            &intent,
+                            kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get()),
+                        )
+                        .expect("the other copy's reservation");
+                    registry
+                        .set_phase(
+                            admitted.reservation.reservation_id,
+                            crate::registry::LaunchPhase::Closed,
+                        )
+                        .expect("the session has closed");
+                    admitted.reservation
+                };
+                controller
+                    .retire(
+                        &crate::service::a_read_that_meets_a_worker_on_its_way_out::closure_of(
+                            reserved.session_id,
+                        ),
+                    )
+                    .await
+                    .expect("the closure is recorded");
+                let (looking, go_looking) = controller.before_a_reservation_is_looked_up.arm();
+                go.send(()).expect("the copy goes on");
+                tokio::time::timeout(WAIT_BOUND, looking)
+                    .await
+                    .expect("the answer's check passed and the lookup is about to wait")
+                    .expect("the pause is armed");
+                // The registry is held while the fence lands, so the lookup does wait for it.
+                let registry = controller.registry.lock().await;
+                controller.hold_fence(owed);
+                go_looking.send(()).expect("the lookup goes on");
+                drop(registry);
+            }
+        );
+        let answered = answered.expect("the copy is answered");
+        if owed {
+            let told = refusal_of(&answered);
+            assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+        } else {
+            let ControlFrame::Response(Response {
+                outcome: Outcome::Ok(value),
+                ..
+            }) = answered.frame()
+            else {
+                panic!(
+                    "the create was answered from the record: {:?}",
+                    answered.frame()
+                );
+            };
+            let created: kr_protocol::session::SessionCreateResult =
+                value.to_typed().expect("a create result");
+            assert!(created.deduplicated, "an answer read from the record");
+        }
+        world.serving.abort();
+    }
+}
+
 /// KR-REQ-09.09: a create the daemon answers from a reservation whose first attempt failed is an
 /// answer read from a record, as one made from a session that was launched is. The copy is stopped
 /// before its effect, and meanwhile another copy has reserved the session and failed to launch it.
