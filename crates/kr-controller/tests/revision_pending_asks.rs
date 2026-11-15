@@ -1191,17 +1191,72 @@ async fn a_repeat_of_a_revocation_says_so_when_the_worker_no_longer_holds_the_na
     drop(workers);
 }
 
-/// KR-REQ-09.12: a whole ask is over by its bound, however long the names step after an
-/// acknowledgement takes.
+/// KR-REQ-09.12, KR-REQ-10.45: a repeat of a revocation gives the ask of a pending worker the bound
+/// and the deadline the pass's asks have, so its ask does not end with a page on the wire and the
+/// worker's lease goes on renewing.
+///
+/// The repeat comes straight after the first answer, which lists the worker as pending. The worker
+/// acknowledges at once and its names come a page at a time, each page after the first taking four
+/// seconds. The fourth would begin with three of the ask's fifteen seconds left, inside the page's
+/// own five: an ask that ends with that page on the wire is dropped with the link out, which stops
+/// the renewal of the lease of a worker that has acknowledged. The repeat's ask returns what it has
+/// before that page begins, and the repeat is answered with the lease as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_repeat_of_a_revocation_whose_ask_has_more_pages_than_its_time_leaves_the_renewal_going()
+{
+    let Adopted {
+        host,
+        owner,
+        workers,
+    } = Adopted::start(1).await;
+    let worker = &workers[0];
+    let session_id = worker.session_id;
+    let (mut client, mutation) = a_revocation_to_repeat(&host, &owner, worker, 6).await;
+    worker.limit_evidence_page_for_tests(1);
+    worker
+        .service
+        .delay_evidence_continuations_for_tests(Duration::from_secs(4));
+    worker
+        .service
+        .hold_the_boundary_for_one_announcement_after(0);
+    let (_, first) = the_answer_to(&mut client, &mutation, session_id).await;
+    assert!(
+        !first.state.holds(),
+        "the first answer carries the worker as pending: {first:?}"
+    );
+
+    let began = tokio::time::Instant::now();
+    let (_, repeated) = the_answer_to(&mut client, &mutation, session_id).await;
+    let lasted = began.elapsed();
+    assert!(
+        !host.controller().renewal_stopped_for_tests(session_id),
+        "the worker acknowledged, and its renewal stopped when the repeat's ask ended"
+    );
+    assert!(
+        lasted < Duration::from_secs(14),
+        "the repeat was answered {lasted:?} after it was made, which is its bound and not a return \
+         with what it had"
+    );
+    assert!(
+        repeated.state.holds() || repeated.rejected_actions_total.get() > 0,
+        "the repeat carries the worker's answer: {repeated:?}"
+    );
+    drop(client);
+    host.stop().await;
+    drop(workers);
+}
+
+/// KR-REQ-09.12: an ask with more pages of names than its time holds is over within its bound,
+/// however long the names step after an acknowledgement would take.
 ///
 /// The worker acknowledges at once, and every page of names after the first takes four seconds,
 /// inside the page's own bound, so the pages that follow could take as long as there are pages. The
 /// ask is over by fifteen seconds, and the pass, which settles the fence when its asks have ended,
 /// settles it then. The ask ends by returning before a page that does not fit in what is left of
-/// its time, which the next case reads; the bound itself is the backstop for the waits that no
-/// page's exchange covers.
+/// its time, which the next case reads. The bound itself, for the waits that no page's exchange
+/// covers, has its case with the daemon's other link cases.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_whole_ask_ends_at_its_bound_though_the_pages_after_the_acknowledgement_go_on() {
+async fn an_ask_with_more_pages_of_names_than_its_time_holds_is_over_within_its_bound() {
     let Adopted {
         host,
         owner: _,
