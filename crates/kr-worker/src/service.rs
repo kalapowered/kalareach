@@ -87,12 +87,6 @@ use boundary::DispatchBoundary;
 pub use boundary::DispatchGuard;
 use standing::{Limited, Mode, ShownAtAdmission, Sweep};
 
-/// The capability this worker states when it serves the input lane: the window and its credit, the
-/// position checks of a release, a detach and a launch, the count of what an end discarded, and
-/// the launch marker. A control daemon sends a lane request, a position or a count member only to
-/// a worker that states this, because a worker built before them refuses what it does not know.
-pub const INPUT_LANE_CAPABILITY: &str = "input.lane/1";
-
 /// How often the worker replaces a live connection's action window.
 ///
 /// Half the window's validity, which is the schedule the transport uses: an attached terminal that
@@ -5434,7 +5428,7 @@ impl WorkerService {
                     kr_protocol::local::LOCAL_ACCESS,
                     kr_protocol::local::AGENT_INSTANCES_READ,
                     kr_protocol::local::SHELL_LAUNCH_SURFACE_READ,
-                    INPUT_LANE_CAPABILITY,
+                    kr_protocol::local::INPUT_LANE,
                 ]
                 .into_iter()
                 .filter_map(|capability| kr_protocol::ids::CapabilityId::new(capability).ok()),
