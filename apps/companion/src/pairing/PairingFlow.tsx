@@ -43,12 +43,14 @@ import {
   clockTime,
   codeComplete,
   codeProblem,
+  failureAlternatives,
   failureSentence,
   failureWords,
   minutesLeft,
   readingFrom,
   timeLeft,
   triesTheCodeAgain,
+  UNTIL_THEN,
   type AttemptMode,
   type NextAction,
   type Reading
@@ -85,7 +87,7 @@ function spends(view: PairingView): boolean {
     state.state === 'paired' ||
     (state.state === 'ended' &&
       !triesTheCodeAgain(
-        failureWords(state.failure.kind, state.service ?? view.origin.host, state.mode).action
+        failureWords(state.failure, state.service ?? view.origin.host, state.mode).action
       ))
   )
 }
@@ -446,7 +448,7 @@ export function PairingFlow({
             </div>
             {pasteFailure !== null ? (
               <p className="small danger-text" role="alert" data-testid="paste-failure">
-                {sayingAddresses(failureWords(pasteFailure, service, 'code', failedFrom).sentence, [service])}
+                {sayingAddresses(failureWords({ kind: pasteFailure }, service, 'code', failedFrom).sentence, [service])}
               </p>
             ) : null}
             {pasteFailure === 'camera_denied' ? (
@@ -664,7 +666,8 @@ export function PairingFlow({
 
 /**
  * How an attempt ended, in the words for how it was made and the service it went through, with
- * the one thing the person can do next.
+ * the one thing the person can do next. A failure that names paths that still work lists them
+ * after "Until then:", each as text exactly as the service wrote it.
  */
 function Ended({
   failure,
@@ -681,7 +684,8 @@ function Ended({
   readonly heading: RefObject<HTMLHeadingElement | null>
   readonly onAction: (action: NextAction) => void
 }): ReactNode {
-  const { action } = failureWords(failure.kind, service, mode, reading)
+  const { action } = failureWords(failure, service, mode, reading)
+  const alternatives = failureAlternatives(failure)
   return (
     <section aria-labelledby="pairing-ended" className="pairing-section">
       <h1 id="pairing-ended" ref={heading} tabIndex={-1}>
@@ -690,6 +694,16 @@ function Ended({
       <p role="alert" data-testid="failure-sentence">
         {sayingAddresses(failureSentence(failure, service, mode, reading), [service])}
       </p>
+      {alternatives.length > 0 ? (
+        <div className="pairing-alternatives" data-testid="failure-alternatives">
+          <p id="pairing-until-then">{UNTIL_THEN}</p>
+          <ul aria-labelledby="pairing-until-then">
+            {alternatives.map((path, at) => (
+              <li key={at}>{path}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
       <div className="row">
         <Button data-wraps
           tone="primary"

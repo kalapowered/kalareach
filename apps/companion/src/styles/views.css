@@ -1476,6 +1476,30 @@
 }
 
 /*
+ * The paths a failure names, as the service wrote them: one to a line, each breaking where it must
+ * when it is longer than the column. The indent is in rem so that it grows with the text instead of
+ * taking a larger share of a narrow column at the largest size.
+ */
+.pairing-alternatives {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-2);
+}
+
+.pairing-alternatives ul {
+  padding-inline-start: 1.25rem;
+}
+
+.pairing-alternatives li {
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.pairing-alternatives li + li {
+  margin-block-start: var(--gap-2);
+}
+
+/*
  * The scanner's one control, above the code field: as wide as the column, so a thumb finds it
  * without aiming, and as tall as every control is.
  */

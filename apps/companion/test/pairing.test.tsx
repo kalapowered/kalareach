@@ -35,8 +35,17 @@ function attempt(controls: FakeHostControls, state: AttemptState): void {
 const IN_FIVE_MINUTES = Date.now() + 5 * 60_000
 
 /** A code attempt through the configured service that ended as `kind`. */
-function ended(kind: FailureKind, tries_left: number | null): AttemptState {
-  return { state: 'ended', failure: { kind, tries_left }, mode: 'code', service: null }
+function ended(
+  kind: FailureKind,
+  tries_left: number | null,
+  retry_after_seconds?: number
+): AttemptState {
+  return {
+    state: 'ended',
+    failure: { kind, tries_left, ...(retry_after_seconds === undefined ? {} : { retry_after_seconds }) },
+    mode: 'code',
+    service: null
+  }
 }
 
 describe('pairing with a host', () => {
@@ -169,11 +178,11 @@ describe('pairing with a host', () => {
       attempt(controls, ended(kind, 3))
       const sentence = await screen.findByTestId('failure-sentence')
       expect(shown(sentence)).toBe(
-        `${failureWords(kind, 'reach.kala.to').sentence} 3 tries left on this device.`
+        `${failureWords({ kind }, 'reach.kala.to').sentence} 3 tries left on this device.`
       )
       // The alert says the service as words, wherever its sentence names it.
       expect(readAloud(sentence)).toBe(
-        `${failureWords(kind, 'reach dot kala dot to').sentence} 3 tries left on this device.`
+        `${failureWords({ kind }, 'reach dot kala dot to').sentence} 3 tries left on this device.`
       )
     }
     attempt(controls, ended('declined', null))
@@ -234,7 +243,7 @@ describe('pairing with a host', () => {
     const { controls } = start()
     await screen.findByLabelText('Pairing code')
 
-    attempt(controls, ended('relay_capacity', null))
+    attempt(controls, ended('relay_capacity', null, 20))
     const code = (await screen.findByTestId('failure-sentence')).textContent ?? ''
     expect(code).toMatch(/managed relay/)
     expect(code).not.toMatch(/could not be reached/)
@@ -242,7 +251,7 @@ describe('pairing with a host', () => {
 
     attempt(controls, {
       state: 'ended',
-      failure: { kind: 'relay_capacity', tries_left: null },
+      failure: { kind: 'relay_capacity', tries_left: null, retry_after_seconds: 20 },
       mode: 'direct',
       service: null
     })
