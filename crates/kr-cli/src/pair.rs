@@ -2087,4 +2087,42 @@ mod tests {
         )));
         assert!(matches!(other, CliError::Refused(_)));
     }
+
+    /// KR-REQ-17.48: whatever text the composing makes for a refusal of the reservation, the
+    /// command says that text whole, so a person never reads the wait the text names and then the
+    /// command's own line to wait. A list with no entry that has text composes no text, and the
+    /// answer is the fault's, as it was.
+    #[test]
+    fn kr_req_17_48_every_capacity_text_the_composing_makes_is_the_whole_output_of_the_command() {
+        const WORDS: &str = "Managed capacity for new pairing invitations is not available now.";
+        let mut told_at_all = 0;
+        for list in [
+            serde_json::json!([""]),
+            serde_json::json!(["  "]),
+            serde_json::json!(["", " \t"]),
+            serde_json::json!(["Path."]),
+            serde_json::json!(["", "Path."]),
+            serde_json::json!(["Path.", ""]),
+        ] {
+            let alternatives = kr_client::services::Alternatives::from_member(Some(list.clone()));
+            for wait in [Some(3600), None, Some(0), Some(200_000)] {
+                let Some(told) = kr_client::services::told_capacity(WORDS, wait, &alternatives)
+                else {
+                    continue;
+                };
+                told_at_all += 1;
+                let error = capacity_in_its_own_words(the_daemons_refusal(
+                    kr_pairing::PairingError::RendezvousCapacity {
+                        told: told.clone(),
+                        retry_after_seconds: wait,
+                    },
+                ));
+                assert_eq!(output_of(&error), told, "{list} {wait:?}");
+            }
+        }
+        assert_eq!(
+            told_at_all, 12,
+            "the three lists with an entry that has text"
+        );
+    }
 }
