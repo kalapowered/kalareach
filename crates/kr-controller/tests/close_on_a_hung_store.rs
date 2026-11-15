@@ -62,6 +62,17 @@ struct Rig {
     closure: std::sync::mpsc::Receiver<Instant>,
 }
 
+impl Drop for Rig {
+    /// Stops the shell this fixture started, however the case ended: a close that was lost leaves
+    /// a shell that only a force ends.
+    fn drop(&mut self) {
+        let runtime = Arc::clone(self.adopted.workers[0].runtime());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = runtime.session().force_close();
+        }));
+    }
+}
+
 impl Rig {
     async fn start() -> Self {
         let marks = tempfile::tempdir().expect("a directory on the internal disk");
@@ -379,7 +390,6 @@ async fn a_close_at_the_daemon_with_nothing_standing_still_stops_within_its_time
     let started = Instant::now();
     let first = close_at_the_daemon(&rig).await;
     the_stop_is_watched("control", &rig, started, &first, WINDOW, None).await;
-    rig.adopted.host.stop().await;
 }
 
 /// `kr close` while the worker's dispatch marker stands still: the daemon's seven seconds, what
