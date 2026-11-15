@@ -1917,7 +1917,10 @@ mod windows_paths {
     /// root; the Rust and TypeScript readers' words are cased with an empty list of roots.)
     #[test]
     fn a_refusal_with_no_roots_says_that_there_are_none() {
-        let nowhere = std::env::temp_dir().join("kr-no-such-temporary-folder");
+        let nowhere = std::env::temp_dir().join(format!(
+            "kr-no-such-temporary-folder-{}",
+            std::process::id()
+        ));
         assert!(!nowhere.exists());
         for reader in readers().into_iter().filter(|reader| reader.is_shell()) {
             let named = [
