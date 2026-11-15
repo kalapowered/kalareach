@@ -545,9 +545,10 @@ impl RemoteConnection {
         // A release, a detach or a launch may follow typing that its sender wrote on its input
         // stream. When this host's own record of that stream shows the typing has not all been
         // accepted, the request is refused here: nothing is forwarded, claimed or applied, so
-        // nothing a later request reads has changed. The check is advisory: where the host has no
-        // record, or the barrier is of another epoch than the stream's lease, the request goes on
-        // and the worker decides.
+        // nothing a later request reads has changed. Where the host has no record, or the worker's
+        // lease has moved past the barrier's epoch, the request goes on. A worker that serves a lane
+        // decides for itself, and this check only saves it a forward; for a worker that does not,
+        // the members that carry the position are taken out below and this check is the only one.
         if let Some(barrier) = super::super::input::barrier::barrier_of(mutation)
             && self
                 .inputs
