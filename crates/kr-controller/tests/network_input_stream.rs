@@ -2,9 +2,12 @@
 //!
 //! A paired device opens a stream that carries typing and nothing else, and the host forwards each
 //! frame to the session's worker over a lane of its own, within the credit the worker gives. The
-//! device is real, on its authorised connection; the worker's lane is scripted
-//! ([`net_support::lane::ScriptedLane`]), so every stage between the two is held where a case wants
-//! it. What each case asserts is what reaches the lane and what the device is told.
+//! device is real, on its authorised connection, and so is the worker behind it. Most cases point
+//! the host at a scripted lane ([`net_support::lane::ScriptedLane`]), so every stage between the
+//! two is held where a case wants it. Cases that run on the worker's own lane carry the typing on
+//! the lane that the real worker serves, and cases of a worker without the lane use a real worker
+//! that states none, which the host serves one call at a time. What each case asserts is what
+//! reaches the lane and what the device is told.
 
 #![cfg(unix)]
 
