@@ -1133,12 +1133,14 @@ fn not_ended(
 }
 
 /// The environment after the daemon's process was seen to have gone, and still held when the wait
-/// ended: what is said is that the daemon ended, and that something holds the environment which the
-/// command cannot name as a control daemon.
+/// ended: what is said is that the process has gone and that something holds the environment which
+/// is not shown to be a control daemon. It does not say that the daemon ended: the daemon ended only
+/// where the lock is free or another control daemon holds it.
 fn still_held(environment: &EnvironmentPaths, id: EnvironmentId) -> Shown {
     shown!(
-        "The control daemon for environment {} ended, and something still holds the environment \
-         after {} seconds. Run kr host stop again in a moment. {}",
+        "The process of the control daemon for environment {} has gone, and something that is not \
+         shown to be a control daemon still holds the environment after {} seconds. Run kr host \
+         stop again in a moment. {}",
         id,
         END_BOUND.as_secs(),
         how_to_end_the_holder(environment)
@@ -1607,9 +1609,12 @@ mod tests {
         assert!(!said.contains("wait again"), "{said}");
         let held = still_held(&environment, id).to_string();
         assert!(
-            held.contains("ended, and something still holds the environment after 30 seconds"),
+            held.contains(
+                "has gone, and something that is not shown to be a control daemon still holds the environment after 30 seconds"
+            ),
             "{held}"
         );
+        assert!(!held.contains("ended"), "{held}");
         assert!(
             held.contains("Run kr host stop again in a moment."),
             "{held}"
