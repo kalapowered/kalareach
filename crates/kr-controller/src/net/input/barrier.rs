@@ -170,3 +170,103 @@ pub(in crate::service::net) fn params_for_worker(
         None => Ok(params.clone()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use kr_protocol::ids::{AttachmentId, InputLeaseEpoch, SessionId};
+    use kr_protocol::root::{EditorBufferRevision, LaunchCommand};
+    use kr_protocol::scalars::{Nullable, U64, Uuid};
+
+    use super::*;
+
+    fn barrier() -> InputBarrier {
+        InputBarrier {
+            attachment_id: AttachmentId::new(Uuid::from_bytes([2; 16])),
+            epoch: InputLeaseEpoch::new(3),
+            count: U64::new(1),
+            launch: Nullable::null(),
+        }
+    }
+
+    /// The parameters of a release that carry a valid barrier and a report request of the wrong type.
+    #[derive(serde::Serialize)]
+    struct ReleaseWithATextReport {
+        session_id: SessionId,
+        attachment_id: AttachmentId,
+        epoch: InputLeaseEpoch,
+        after_input: InputBarrier,
+        fenced_report: &'static str,
+    }
+
+    /// The parameters of a detach that carry a valid barrier and a report request of the wrong type.
+    #[derive(serde::Serialize)]
+    struct DetachWithATextReport {
+        attachment_id: Nullable<AttachmentId>,
+        after_input: InputBarrier,
+        fenced_report: &'static str,
+    }
+
+    /// The parameters of a launch that carry a valid barrier and an expected generation of the wrong
+    /// type.
+    #[derive(serde::Serialize)]
+    struct LaunchWithATextGeneration {
+        session_id: SessionId,
+        command: LaunchCommand,
+        expected_prompt_generation: &'static str,
+        expected_buffer_revision: EditorBufferRevision,
+        after_input: InputBarrier,
+    }
+
+    /// The parameters are read whole before the members a worker without the lane does not know are
+    /// taken out: a request that carries a valid barrier and a member of the wrong type is refused as
+    /// an argument, and the barrier is not lost with the member that is wrong. The request's own
+    /// decoding at the door reads them first, so the strip's guard is only reached by a call of this
+    /// function that is not made after that gate, which is what this case makes.
+    #[test]
+    fn parameters_that_do_not_decode_are_refused_before_a_member_is_taken_out() {
+        let session_id = SessionId::new(Uuid::from_bytes([1; 16]));
+        let attachment_id = AttachmentId::new(Uuid::from_bytes([2; 16]));
+        let request = [
+            (
+                Method::InputRelease,
+                ParamsValue::from_typed(&ReleaseWithATextReport {
+                    session_id,
+                    attachment_id,
+                    epoch: InputLeaseEpoch::new(3),
+                    after_input: barrier(),
+                    fenced_report: "yes",
+                }),
+            ),
+            (
+                Method::SessionDetach,
+                ParamsValue::from_typed(&DetachWithATextReport {
+                    attachment_id: Nullable::some(attachment_id),
+                    after_input: barrier(),
+                    fenced_report: "yes",
+                }),
+            ),
+            (
+                Method::ShellLaunch,
+                ParamsValue::from_typed(&LaunchWithATextGeneration {
+                    session_id,
+                    command: LaunchCommand::Arguments(vec!["true".to_owned()]),
+                    expected_prompt_generation: "zero",
+                    expected_buffer_revision: EditorBufferRevision(U64::new(0)),
+                    after_input: barrier(),
+                }),
+            ),
+        ];
+        for (method, params) in request {
+            let params = params.expect("parameters");
+            for serves_lane in [false, true] {
+                let refused = params_for_worker(serves_lane, method, &params)
+                    .expect_err("parameters that do not decode are refused");
+                assert_eq!(
+                    refused.code,
+                    ErrorCode::InvalidArgument,
+                    "{method:?}, a worker that serves a lane: {serves_lane}"
+                );
+            }
+        }
+    }
+}
