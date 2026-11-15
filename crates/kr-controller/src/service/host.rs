@@ -392,16 +392,18 @@ impl Controller {
     /// Only a refresh reaches the platform, and only when the request asked it to start the
     /// environment it selected. Enrolling and forgetting change the record and nothing else.
     ///
-    /// None of the three takes a deadline to change the record: it changes nothing a window
-    /// decides. A refresh's start is the one effect that does, and is asked with it. Each asks
-    /// the check every service asks, on the registration `carried` names, again after it has the
-    /// record's lock and before the effect it guards, because waiting for that lock can outlast a
-    /// fence this host owes or the registration the change was admitted under. Enrolling and
-    /// forgetting write the record while the registration is held standing; a refresh runs a
-    /// platform command that can take seconds, so it is asked before the command, again before the
-    /// command starts the environment, again where the observation is recorded, which after a
-    /// start is an outcome this host does not know, and once more before it opens a bridge, after
-    /// which a refusal is not a refusal of the refresh that has run.
+    /// Every write of the record is held to the deadline the change was accepted under, as it is
+    /// to the registration it was admitted under: a window decides what lands, and the owner's
+    /// own lease on a host that is exclusively organisation-managed is what bounds that deadline.
+    /// Each asks the check every service asks, on the admission `carried` names, again after it
+    /// has the record's lock and before the effect it guards, because waiting for that lock can
+    /// outlast a fence this host owes, the registration the change was admitted under, or the
+    /// deadline. Enrolling and forgetting write the record while the registration is held
+    /// standing; a refresh runs a platform command that can take seconds, so it is asked before
+    /// the command, again before the command starts the environment, again where the observation
+    /// is recorded, which after a start is an outcome this host does not know, and once more
+    /// before it opens a bridge, after which a refusal is not a refusal of the refresh that has
+    /// run.
     pub(super) async fn environment_record(
         self: &Arc<Self>,
         actor: &kr_protocol::actor::ActorEnvelope,
@@ -420,6 +422,20 @@ impl Controller {
         }
     }
 
+    /// Arms the pause the next environment change stops at once it holds this host's record of its
+    /// environments and before it asks the admission again, so that a fence, a revocation or the end
+    /// of a lease can land where the change has nothing left to wait for. Returns the end that says
+    /// the change has arrived, and the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_after_the_environment_record_is_taken(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.after_the_environment_record_is_taken.arm()
+    }
+
     async fn environment_change(
         self: &Arc<Self>,
         actor: &kr_protocol::actor::ActorEnvelope,
@@ -435,13 +451,6 @@ impl Controller {
 
         let state_dir = self.paths.state_dir().to_path_buf();
         let now_ms = wall_clock_ms();
-        // A refresh's start is an effect on another environment that a passed deadline stops; the
-        // changes to the record decide nothing by a window.
-        let accepted = carried;
-        let carried = crate::authority::AdmittedMutation {
-            deadline: None,
-            ..carried
-        };
         let controller = Arc::clone(self);
         match method {
             Method::EnvironmentEnrol => {
@@ -553,7 +562,7 @@ impl Controller {
                             params.environment_id,
                             params.start,
                             platform.as_ref(),
-                            &|| asking.check_registration(&accepted),
+                            &|| asking.check_registration(&carried),
                         )?;
                         let started = observed.started();
                         asking
