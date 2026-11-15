@@ -2498,52 +2498,29 @@ kr host stop           # ask this installation's control daemon to stop, and wai
 kr host stop --json    # the same, as a document
 ```
 
-The command asks the control daemon of this installation's own environment to stop, and waits until
-the daemon's process has ended and the environment's lock is free. It stops no session. A session's
-worker keeps running, a local attach keeps working, and the next daemon finds the sessions again;
-paired devices' connections close, and commands that need a daemon fail until one runs. The daemon
-closes its gate to new sessions, waits up to ten seconds for the session creates that are under
-way, and goes on whether they settled or not. A create that was cut is resolved by the next daemon
-as after a crash, and the command says how many were cut. The daemon is told to stop only once
-its answer has been written, so the command has the answer; a daemon that ends for another cause
-gives none.
+The command asks the control daemon of this installation's own environment to stop, and then waits up to 30 seconds for it to end. It stops no session: a session's worker keeps running, a local attach keeps working, and the next daemon finds the sessions again. Paired devices' connections close, and commands that need a daemon fail until one runs.
 
-The command refuses where `KR_SESSION` or `KR_ATTACHMENT` is set, and where a live session's worker
-says the process is its own; it asks every worker at once. This stops an accident and is no
-boundary: code that runs as your account can end the daemon with the platform's own tools. A worker
-that does not answer lets the command go on, because a host that needs its daemon stopped may hold
-one. Run the command in a terminal window that was not opened through the KalaReach profile, or an
-SSH login. The refusal exits 8 and says that nothing was stopped.
+The daemon closes its gate to new sessions, waits up to ten seconds for the session creates that are under way, and goes on with its stop whether they settled or not. It stops when its answer has been written, has failed to write or has reached its write bound, so the answer can be missing. A daemon that ends for another cause gives none. A daemon that cannot show its result to the caller, because the caller's registration lapsed or a fence is owed, answers with an unknown-outcome error in its place. On Windows an answer of more than about 4.5 KiB can be cut. A missing, cut or unknown answer is an unknown outcome and never "not stopped": the command waits for the daemon as for one that took the stop.
 
-A line on standard error, printed once the request has left and not under `--json`, says what the
-daemon waits for. An interrupt after that does not cancel the stop: the command says what may be
-so and exits 1, and a hangup is ignored. Run it again to see or to wait. Before the request is
-written an interrupt ends the command with nothing asked.
+The count of creates that were still under way after those ten seconds is known only where the answer arrived. Where the daemon is then seen to end, the command gives the count. Each of those creates finished or ended with the daemon, and the next daemon resolves one that ended as after a crash.
 
-Before it asks, the command writes a small record of its attempt in the environment's state
-directory, and removes it once it has seen its own result. A command that was killed leaves it. Every
-message that says no control daemon runs gives the record's last phase and its time, as a record and
-not as a claim of what happened after it, and says that an attempt is under way only while a live
-process has the start identity the record names. A control daemon that has bound its endpoints
-removes every record that does not name it as the daemon to stop. The command removes the records
-of earlier attempts whose process is gone once it has said them and ended with its own result.
+The command refuses where `KR_SESSION` or `KR_ATTACHMENT` is set, and where a live session's worker says the process is inside its session; it asks every worker at once. This stops an accident and is no boundary: code that runs as your account can end the daemon with the platform's own tools. A worker that does not answer lets the command go on, because a host whose daemon has to be stopped may hold a worker that does not answer. Run the command in a terminal window that was not opened through the KalaReach profile, or in an SSH login. The refusal exits 8 and says that nothing was stopped.
 
-The command ends with one of these results, which `--json` keeps apart as `stop`: `ended` (the
-daemon was seen to end), `told` (the daemon took the stop and had not ended after 30 seconds, exit
-1), `maybe_asked` (the request left and neither its answer nor the daemon's end was seen, and the
-daemon had not ended after 30 seconds, exit 1) and `not_asked` (nothing was asked). A missing or
-cut answer is an unknown outcome and never "not stopped": the command looks at the lock and the
-process. A daemon that holds the environment and does not answer is named with its process, where
-the lock file names one that runs this installation's daemon, and `kill -KILL` with the process
-number ends it; the next daemon recovers as it does after a crash. Where no control daemon runs, the
-command says so and exits 0. A daemon of another build that takes no stop request is not stopped;
-the command says that and how to switch this host to another release.
+Once the request has left, the command writes a line on standard error, not under `--json`, that says what the daemon waits for. An interrupt after that does not cancel the stop: the command says what may be so and exits 1, and a hangup is ignored. The interrupt's result is `maybe_asked` while no answer has come, `told` after the daemon's answer and `refused` after a refusal. Where the daemon was told, the words end with the advice to run `kr host stop` again to see. Before the request is written, an interrupt ends the command with nothing asked and no record of its own.
 
-`kr host stop --json` returns `{"ok": true, "stop": "ended", "pid": 4242, "unsettled": 0}`; `pid`
-and `unsettled` are null where the answer that carries them did not arrive, and a failure carries
-`ok` false, the failure's code, message and exit code beside the same members. `records` lists, as
-sentences, what earlier attempts recorded that the command said and then removed, where there were
-any.
+Before it asks, the command writes a small record of its attempt: one file, named by a new identifier, in the `host-attempts` folder of the environment's state directory. It removes its record when it has seen the daemon end, when the daemon refused the request, and when an interrupt comes before the request is written. It leaves the record where the daemon was told and had not ended after 30 seconds, where an interrupt comes after the request has left, and where the command is killed.
+
+Every message that says no control daemon runs gives each record's last phase and its time, as a record and not as a claim of what happened after it. An attempt is under way only while a live process has the start identity that the record names. A control daemon that has bound its endpoints removes the records that do not name it as the daemon to stop, among the first 64 entries of the folder, and leaves the rest.
+
+The command removes the records of earlier attempts whose process is gone only after its own result has been written and has put them out: in the `records` member of the document under `--json`, and otherwise in the lines it wrote at its start. A command that ends with an interrupt, a refusal, a daemon that had not ended or a failure removes none of them.
+
+The command ends with one of these results, which `--json` keeps apart as `stop`: `ended` (the daemon was seen to end), `told` (the daemon took the stop and had not ended after 30 seconds, exit 1), `maybe_asked` (the request left, neither its answer nor the daemon's end was seen, and the daemon had not ended after 30 seconds, exit 1), `refused` (the request left and the daemon refused it) and `not_asked` (no request left).
+
+"Ended" means, where the command read the process that held the environment before it asked and the daemon's answer, if it arrived, named the same process, that this process has gone and the environment's lock is free. Where it did not (always on Windows, or where the lock file cannot be read), it means that the lock is free and nothing answers at the daemon's endpoint. The text then names no process, and the command cannot name or wait for the process itself. A lock that another command's look holds for a moment is waited through. Where the old process was read, a lock file that names a live process named `kr-controller` other than the old one shows that something started the daemon again; in every case a daemon of another generation that answers shows it. The command says so and exits 0. Where the old process has gone and something that is not shown to be a daemon still holds the environment after 30 seconds, the command says that and exits 1; where the lock cannot be looked at, it says that instead.
+
+A message names a process only where it is a process named `kr-controller`: the one the command waited for, or the one the lock file names. `kill -KILL` with that number ends it, and the next daemon recovers as it does after a crash. On Windows the messages name no process and point to the Task Manager. Where no control daemon runs, the command says so and exits 0. A daemon that accepts the connection and does not answer within 10 seconds is a holder that does not answer: the command asks for no stop and exits 1. A daemon of another build that takes no stop request is not stopped; the command says that and how to switch this host to another release.
+
+`kr host stop --json` returns `{"ok": true, "stop": "ended", "pid": 4242, "unsettled": 0}`. In a result that follows the wait for the end, `pid` is the process in the daemon's answer, or, where no answer arrived, the process the lock file named before the request, where that process could be read; `unsettled` is the answer's count, and is null where the answer did not arrive. In every other result both are null. A failure carries `ok` false, the failure's code, message and exit code beside the same members. `records` lists, as sentences, what earlier attempts recorded that the command said, where there were any.
 
 ## `kr host power`
 
