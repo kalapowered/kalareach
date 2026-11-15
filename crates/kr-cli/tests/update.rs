@@ -5391,8 +5391,14 @@ async fn a_rollback_whose_temporary_directory_cannot_take_the_copy_is_refused_an
         "kr host rollback: {said} {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // The rollback classes each environment in turn, and the first of the host's two that it comes
+    // to is the one it names.
     let message = said["message"].as_str().unwrap_or_default();
-    assert!(message.contains(&idle.environment_id()), "{said}");
+    assert!(
+        message.contains(&idle.environment_id())
+            || message.contains(&host.tree.environment_id().to_string()),
+        "{said}"
+    );
     assert!(message.contains("could not be copied to be read"), "{said}");
     assert_eq!(idle.version(), 6, "the registry was not brought forward");
     assert_eq!(idle.records(), before, "and what it records is as it was");
