@@ -445,6 +445,80 @@ fn the_reply_budget_holds_for_the_cursor_reports_that_go_first() {
     assert_eq!(engine.lane().pending(), 2, "the rest is still waiting");
 }
 
+/// KR-REQ-08.49: an answer that has waited past its deadline is dropped, and recorded, wherever it
+/// stands in the lane and whatever room the caller has, so the first deadline the lane reports is
+/// always one that the next drain acts on.
+///
+/// A cursor report's hold can put a later deadline in front of an earlier one. An ordinary answer
+/// is kept behind the hold from the start; two cursor reports arrive after it; the first report is
+/// taken, which ends the hold and gives the kept answer back the time it waited behind it. The
+/// answer, with the later deadline, now stands in front of the second report. A caller that has no
+/// room takes nothing, and each answer must still go at its own deadline.
+#[test]
+fn an_answer_in_front_of_an_earlier_deadline_does_not_keep_that_deadline_from_ending() {
+    let mut engine = engine();
+    let deadline = LaneLimits::DEFAULT.reply_deadline_ms;
+    let budget = |replies| DrainBudget {
+        bytes: 1 << 20,
+        replies,
+    };
+
+    engine.feed(b"\x1b[c", 0);
+    assert!(
+        engine
+            .lane_mut()
+            .drain_within(owed(), budget(0), 0)
+            .is_empty()
+    );
+    engine.feed(b"\x1b[6n\x1b[6n", 100);
+    assert!(
+        engine
+            .lane_mut()
+            .drain_within(owed(), budget(0), 100)
+            .is_empty()
+    );
+    let one = engine.lane_mut().drain_within(owed(), budget(1), 500);
+    assert_eq!(one.len(), 1, "the first cursor report is taken");
+    assert!(is_a_cursor_report(one[0].bytes()));
+    assert_eq!(engine.lane().pending(), 2);
+    assert_eq!(
+        engine.lane().next_expiry_ms(),
+        Some(100 + deadline),
+        "the second report goes first, though the answer stands in front of it"
+    );
+
+    // No room from here on: the caller takes nothing.
+    let at_the_report = 100 + deadline;
+    let none = engine
+        .lane_mut()
+        .drain_within(LaneGate::default(), budget(0), at_the_report);
+    assert!(none.is_empty());
+    assert_eq!(engine.lane().pending(), 2, "nothing lapses at its deadline");
+    let none = engine
+        .lane_mut()
+        .drain_within(LaneGate::default(), budget(0), at_the_report + 1);
+    assert!(none.is_empty());
+    assert_eq!(engine.lane().degradation().expired, 1);
+    assert_eq!(
+        engine.lane().pending(),
+        1,
+        "the report is dropped, in place"
+    );
+    assert_eq!(
+        engine.lane().next_expiry_ms(),
+        Some(500 + deadline),
+        "the answer has the time it waited behind the hold added"
+    );
+
+    let none = engine
+        .lane_mut()
+        .drain_within(LaneGate::default(), budget(0), 500 + deadline + 1);
+    assert!(none.is_empty());
+    assert_eq!(engine.lane().degradation().expired, 2);
+    assert_eq!(engine.lane().pending(), 0);
+    assert_eq!(engine.lane().next_expiry_ms(), None);
+}
+
 /// KR-REQ-08.48: a reply never lands inside an unfinished paste or a half-delivered human input
 /// frame, unless the backend is qualified to take it inside a paste.
 #[test]

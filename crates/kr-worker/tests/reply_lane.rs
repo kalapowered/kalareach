@@ -238,16 +238,60 @@ async fn a_reply_that_waited_under_two_seconds_is_written_when_the_paste_ends() 
 }
 
 /// KR-REQ-08.48, KR-REQ-08.49, section 9: a reply that waited more than two seconds of continuous
-/// time is dropped, not written into a conversation that has moved on. The wall clock does not
-/// move in this test, and the session's decision follows the clock it was given.
+/// time is dropped, not written into a conversation that has moved on, and it is dropped at its
+/// deadline, with its record, while the paste behind which it waits is still open.
+///
+/// The paste stays open, the person types nothing and the application writes nothing: the reply's
+/// deadline passes and one pass of the pump follows. A closed gate decides what is written, not
+/// what ages. When the paste ends nothing is written and nothing is counted a second time. The
+/// wall clock does not move in this test, and the session's decision follows the clock it was
+/// given.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_reply_that_waited_over_two_seconds_is_dropped_when_the_paste_ends() {
+async fn a_reply_that_waited_over_two_seconds_behind_a_paste_is_dropped_at_its_deadline_and_not_written_when_the_paste_ends()
+ {
     let (clock, time) = manual();
     let mut fixture = Fixture::new(time);
-    let (at_the_question, after) =
-        fixture.asks_behind_a_paste(&clock, Duration::from_millis(2_100));
-    assert!(at_the_question.is_empty());
-    assert!(after.is_empty(), "the reply expired: {after:?}");
+    let _ = fixture.session.ingest_output(b"\x1b[?2004h");
+    fixture.type_bytes(PASTE_OPEN);
+    let _ = fixture.replies();
+    let _ = fixture.session.ingest_output(QUESTION);
+    assert!(
+        fixture.replies().is_empty(),
+        "the reply does not land inside the paste"
+    );
+    assert!(fixture.session.engine().replies_pending());
+    assert_eq!(fixture.session.engine().replies_expired(), 0);
+    let deadline = fixture
+        .session
+        .engine()
+        .next_reply_expiry_ms()
+        .expect("a reply that waits behind a closed gate has a deadline");
+
+    clock.advance(Duration::from_millis(2_100));
+    assert!(
+        deadline < 2_100,
+        "the clock now reads later than the deadline"
+    );
+    fixture.session.pump_replies();
+    assert_eq!(
+        fixture.session.engine().replies_expired(),
+        1,
+        "the reply is dropped and recorded, with the paste still open"
+    );
+    assert!(!fixture.session.engine().replies_pending());
+    assert!(fixture.replies().is_empty());
+
+    fixture.type_bytes(PASTE_CLOSE);
+    fixture.session.pump_replies();
+    assert!(
+        fixture.replies().is_empty(),
+        "nothing is written when the paste ends"
+    );
+    assert_eq!(
+        fixture.session.engine().replies_expired(),
+        1,
+        "and the drop is not counted again"
+    );
 }
 
 /// KR-REQ-08.49: the host's answers have a share of the queue's entries, and the answers past it
