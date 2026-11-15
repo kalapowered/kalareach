@@ -3067,6 +3067,10 @@ mod local {
         freed: tokio::sync::Notify,
         ended: tokio::sync::Notify,
         closed: AtomicBool,
+        /// The connection stands, and nothing can be written to it any more: the state of a
+        /// transport whose write failed because the peer has gone, until the read loop reads to
+        /// the peer's end.
+        write_side_lost: AtomicBool,
     }
 
     impl Socket {
@@ -3083,7 +3087,14 @@ mod local {
                 freed: tokio::sync::Notify::new(),
                 ended: tokio::sync::Notify::new(),
                 closed: AtomicBool::new(false),
+                write_side_lost: AtomicBool::new(false),
             })
+        }
+
+        /// From now on the double reports that it cannot send, and it stands: the session's record
+        /// of the connection does not change.
+        fn lose_the_write_side(&self) {
+            self.write_side_lost.store(true, Ordering::Release);
         }
 
         /// The next bounded send stops at `stall` until the case frees it or its time passes.
@@ -3277,6 +3288,9 @@ mod local {
         }
         fn is_closed(&self) -> bool {
             self.closed.load(Ordering::Acquire)
+        }
+        fn can_send(&self) -> bool {
+            !self.is_closed() && !self.write_side_lost.load(Ordering::Acquire)
         }
     }
 
@@ -3747,6 +3761,90 @@ mod local {
             ),
             "{ends:?}"
         );
+    }
+
+    /// What the lane does once its first call met a connection that stands but cannot send: it
+    /// waits for the connection's end, for the admission bound at most, and the bound passes.
+    async fn the_bound_on_the_connections_end_passes(deadlines: &Arc<ManualDeadlines>) {
+        let waiting = tokio::time::timeout(
+            Duration::from_secs(5),
+            deadlines.wait_armed(DeadlineKind::Admission),
+        )
+        .await;
+        assert!(
+            waiting.is_ok(),
+            "the lane did not wait for the connection's end after its call was refused"
+        );
+        deadlines.fire(DeadlineKind::Admission);
+    }
+
+    /// A last request that the session refuses because the connection stands but cannot send, with
+    /// the lane finished and no key behind it, was never sent: its caller is told that the
+    /// connection ended, and the lane ends once, with the connection's cause, and neither as
+    /// finished nor as stopped by a refusal of the request.
+    #[tokio::test(start_paused = true)]
+    async fn a_lane_whose_last_request_was_refused_for_a_lost_write_side_ends_with_its_cause() {
+        let deadlines = ManualDeadlines::new();
+        let (socket, session, lane, mut events) = local_lane_with(false, &deadlines).await;
+        socket.lose_the_write_side();
+        lane.begin_epoch(epoch(5)).expect("an epoch");
+        let request = queue_request(&lane, &session, 1).await;
+        lane.finish();
+        let told = told_by_the_bound(request).await;
+        assert!(
+            matches!(told, Err(ClientError::ConnectionEnded)),
+            "the request was not sent, and its caller is told that the connection ended: {told:?}"
+        );
+        the_bound_on_the_connections_end_passes(&deadlines).await;
+        let ends = ends_of(&mut events).await;
+        assert_eq!(
+            ends.len(),
+            1,
+            "the lane tells its end once and never as finished: {ends:?}"
+        );
+        assert!(
+            matches!(
+                ends[0],
+                InputEvent::Ended {
+                    cause: EndCause::Connection { refusal: None },
+                    ..
+                }
+            ),
+            "{ends:?}"
+        );
+        assert!(
+            socket.sent.lock().expect("sent").is_empty(),
+            "nothing of the request was written"
+        );
+    }
+
+    /// A key that the session refuses because the connection stands but cannot send was never
+    /// sent: nothing is written or accepted, and the lane ends once, with the connection's cause.
+    #[tokio::test(start_paused = true)]
+    async fn a_key_refused_for_a_lost_write_side_ends_the_lane_with_the_connections_cause() {
+        let deadlines = ManualDeadlines::new();
+        let (socket, session, lane, mut events) = local_lane_with(false, &deadlines).await;
+        socket.lose_the_write_side();
+        lane.begin_epoch(epoch(5)).expect("an epoch");
+        lane.try_send(&key(0)).expect("admitted");
+        the_bound_on_the_connections_end_passes(&deadlines).await;
+        let ends = ends_of(&mut events).await;
+        assert_eq!(ends.len(), 1, "the lane tells its end once: {ends:?}");
+        assert!(
+            matches!(
+                ends[0],
+                InputEvent::Ended {
+                    cause: EndCause::Connection { refusal: None },
+                    ..
+                }
+            ),
+            "{ends:?}"
+        );
+        assert!(
+            socket.sent.lock().expect("sent").is_empty(),
+            "the key was not written"
+        );
+        session.close();
     }
 
     /// A lane that ends while a request waits for the connection's turn does not have it sent when
