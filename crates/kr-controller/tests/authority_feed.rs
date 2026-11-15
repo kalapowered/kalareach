@@ -4819,13 +4819,16 @@ async fn a_machine_that_slept_after_a_pass_recorded_its_synchronisation_asks_the
         rig.shown().await.list.feed_stale,
         "the control: the sleep came after the record, so the record is five minutes old"
     );
+
+    // The first look after the sleep finds the end of the poll behind the clock, and a pass begins.
+    let release = a_look("the carrier looks at the clock", &looks).await;
+    // The counts are taken once the look is in hand: the carrier says that a pass ended before it
+    // counts the pass, and a count taken before the look could be the one from before that, which
+    // the pass that this look begins would then be measured against.
     let wakes = rig.runtime().wakes();
     let reads = rig.arrivals("read");
     let mut passes = rig.runtime().passes();
     let seen = *passes.borrow_and_update();
-
-    // The first look after the sleep finds the end of the poll behind the clock, and a pass begins.
-    let release = a_look("the carrier looks at the clock", &looks).await;
     release.notify_one();
     within("the pass the sleep owed", async {
         while rig.arrivals("read") == reads || *passes.borrow_and_update() <= seen {
