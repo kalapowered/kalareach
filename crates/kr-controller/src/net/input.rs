@@ -61,13 +61,14 @@ use super::dispatch::RemoteConnection;
 use super::proxy::CALL_TIMEOUT;
 
 pub(super) mod barrier;
+mod serial;
 mod stages;
 
 #[cfg(not(feature = "testing"))]
 use stages::InputStages;
 use stages::Tally;
 #[cfg(feature = "testing")]
-pub use stages::{InputStageCounts, InputStages};
+pub use stages::{InputStageCounts, InputStages, SerialAnswer};
 
 /// What a worker states when it serves typing on a lane of its own.
 pub(crate) const INPUT_LANE_CAPABILITY: &str = "input_lane";
@@ -120,16 +121,33 @@ fn client_window() -> InputWindow {
     }
 }
 
-/// What the host knows of one stream's lane, which a position check reads
+/// What the host knows of one stream, which a position check reads
 /// ([`InputStreams::position_not_reached`]).
 #[derive(Debug, Default)]
 struct Record {
-    /// The epoch of the lease this stream's attachment holds, as the worker last told the lane;
-    /// none while it holds none.
-    holding: Option<InputLeaseEpoch>,
+    lease: Lease,
     /// The highest sequence the worker accepted, with its epoch, recorded before the device is
     /// told.
     accepted: Option<(InputLeaseEpoch, u64)>,
+}
+
+/// What the host knows of the epoch of the lease the stream's attachment holds.
+#[derive(Debug)]
+enum Lease {
+    /// The worker's own lane tells it: the epoch of the lease the attachment holds now, as the
+    /// worker last said, or none while it holds none.
+    Told(Option<InputLeaseEpoch>),
+    /// A worker with no lane tells nothing of its lease, so the host reads it from the typing: the
+    /// device types in the epoch it holds, and an epoch the worker refused a frame of is over. The
+    /// epoch is the oldest that can still be judged: the newest epoch read from the device, or the
+    /// one after the newest that was refused, whichever is later; none before either happened.
+    Floor(Option<InputLeaseEpoch>),
+}
+
+impl Default for Lease {
+    fn default() -> Self {
+        Self::Told(None)
+    }
 }
 
 /// One live stream: how to end it, and what the worker has accepted on it.
@@ -162,7 +180,32 @@ impl Live {
 
     /// Records the epoch of the lease this stream's attachment holds now, or that it holds none.
     fn hold(&self, epoch: Option<InputLeaseEpoch>) {
-        self.lock().holding = epoch;
+        self.lock().lease = Lease::Told(epoch);
+    }
+
+    /// Records that the worker behind this stream tells nothing of its lease.
+    fn hear_nothing_of_the_lease(&self) {
+        self.lock().lease = Lease::Floor(None);
+    }
+
+    /// Records that the device types in `epoch`, which only a stream whose worker tells nothing of
+    /// its lease reads.
+    fn typing_in(&self, epoch: InputLeaseEpoch) {
+        self.raise_the_floor(epoch);
+    }
+
+    /// Records that the worker refused a frame of `epoch`: the epoch is over for the position
+    /// check of a stream whose worker tells nothing of its lease.
+    fn epoch_over(&self, epoch: InputLeaseEpoch) {
+        self.raise_the_floor(InputLeaseEpoch::new(epoch.get().saturating_add(1)));
+    }
+
+    fn raise_the_floor(&self, epoch: InputLeaseEpoch) {
+        if let Lease::Floor(floor) = &mut self.lock().lease
+            && floor.is_none_or(|floor| floor.get() < epoch.get())
+        {
+            *floor = Some(epoch);
+        }
     }
 
     /// The highest accepted sequence of `epoch`, when the epoch is the one the record holds.
@@ -174,12 +217,17 @@ impl Live {
     }
 
     /// Whether the worker has accepted fewer than `count` frames of `epoch`, when `epoch` is the
-    /// epoch of the lease this stream's attachment holds now. For any other epoch the answer is no:
-    /// it is not this lane's to judge, and the worker treats such a barrier as stale. No frame
-    /// accepted in the epoch is a count of none.
+    /// epoch of the lease this stream's attachment holds now, or, for a worker that tells nothing
+    /// of its lease, when it is not older than the epochs the host has read and refused. For any
+    /// other epoch the answer is no: it is not this stream's to judge, and the worker treats such a
+    /// barrier as stale. No frame accepted in the epoch is a count of none.
     fn short_of(&self, epoch: InputLeaseEpoch, count: u64) -> bool {
         let record = self.lock();
-        if record.holding != Some(epoch) {
+        let judged = match record.lease {
+            Lease::Told(held) => held == Some(epoch),
+            Lease::Floor(floor) => floor.is_none_or(|floor| epoch.get() >= floor.get()),
+        };
+        if !judged {
             return false;
         }
         let accepted = match record.accepted {
@@ -237,6 +285,27 @@ impl InputStreams {
     /// How many input streams one connection may hold.
     pub(super) const fn max_per_connection(&self) -> usize {
         self.max_per_connection
+    }
+
+    /// The answer a suite gives a release, a detach or a launch in place of the worker's.
+    pub(super) fn scripted_answer(
+        &self,
+        mutation: &kr_protocol::envelope::MutationRequest,
+    ) -> Option<super::proxy::Forwarded> {
+        self.stages.scripted_answer(mutation)
+    }
+
+    /// Whether the worker behind `proxy` serves typing on a lane of its own, which it says by
+    /// stating [`INPUT_LANE_CAPABILITY`]. This is the one choice between the lane and the serial
+    /// adapter ([`serial`]), and between giving a release, a detach or a launch the members that
+    /// only such a worker reads and taking them out ([`barrier::params_for_worker`]). A worker is
+    /// told apart by what it states and never by its level.
+    pub(super) fn serves_lane(&self, proxy: &super::proxy::WorkerProxy) -> bool {
+        #[cfg(feature = "testing")]
+        if self.scripted_lane().is_some() {
+            return true;
+        }
+        proxy.states(INPUT_LANE_CAPABILITY)
     }
 
     fn live(&self) -> MutexGuard<'_, BTreeMap<Key, Arc<Live>>> {
@@ -356,6 +425,13 @@ impl InputStreams {
             .lane_endpoint
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(endpoint);
+    }
+
+    pub(super) fn use_no_lane(&self) {
+        *self
+            .lane_endpoint
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
     }
 
     pub(super) fn tasks_ended(&self) -> watch::Receiver<u64> {
@@ -613,6 +689,7 @@ impl State {
             self.cutoff
                 .map_or(epoch.get(), |newest| newest.max(epoch.get())),
         );
+        live.epoch_over(epoch);
         let accepted_through = live.through(epoch).map(InputSequence::new);
         self.tell(InputAck::Refused {
             epoch,
@@ -625,22 +702,35 @@ impl State {
 }
 
 impl Flow {
+    /// The flow of a stream whose worker's lane answered `ready`, or, with no lane to the worker
+    /// (`ready` is none), the flow of the serial adapter: it has no window, since it passes each
+    /// frame on in turn and the worker decides it, and the worker tells it nothing of the lease.
     fn new(
         live: Arc<Live>,
         attachment: AttachmentId,
-        ready: &InputLaneReady,
+        ready: Option<&InputLaneReady>,
         stages: Arc<InputStages>,
     ) -> Arc<Self> {
-        let window = if ready.holder {
-            Window::Holder {
-                epoch: ready.epoch,
-                frames: u64::from(ready.frames),
-                bytes: ready.bytes.get(),
+        let window = match ready {
+            Some(ready) => {
+                live.hold(ready.holder.then_some(ready.epoch));
+                if ready.holder {
+                    Window::Holder {
+                        epoch: ready.epoch,
+                        frames: u64::from(ready.frames),
+                        bytes: ready.bytes.get(),
+                    }
+                } else {
+                    Window::None { known: ready.epoch }
+                }
             }
-        } else {
-            Window::None { known: ready.epoch }
+            None => {
+                live.hear_nothing_of_the_lease();
+                Window::None {
+                    known: InputLeaseEpoch::new(0),
+                }
+            }
         };
-        live.hold(ready.holder.then_some(ready.epoch));
         let mut acks = VecDeque::new();
         acks.push_back(InputAck::Ready {
             window: client_window(),
@@ -760,7 +850,11 @@ impl Flow {
     /// Takes a frame read from the device, and says whether the stream's order holds: a frame of an
     /// epoch lower than the newest one read cuts the stream, as a malformed frame does.
     fn take(&self, epoch: InputLeaseEpoch) -> bool {
-        self.lock().read(epoch)
+        let ordered = self.lock().read(epoch);
+        if ordered {
+            self.live.typing_in(epoch);
+        }
+        ordered
     }
 
     /// Takes back a frame that was entered as outstanding and was not written.
@@ -926,27 +1020,21 @@ pub(super) async fn serve(door: Arc<DataDoor>, mut reader: DataReader, writer: D
         session,
         attachment,
         standing,
-        ready,
-        lane_reader,
-        lane_writer,
+        carry,
     } = admitted;
     let flow = Flow::new(
         Arc::clone(&standing.live),
         attachment,
-        &ready,
+        match &carry {
+            Carry::Lane { ready, .. } => Some(ready),
+            Carry::Serial(_) => None,
+        },
         Arc::clone(&door.host.input.stages),
     );
     let (queue, queued) = mpsc::unbounded_channel();
     let mut tasks = JoinSet::new();
-    tasks.spawn(write_lane(
-        lane_writer,
-        queued,
-        Arc::clone(&flow),
-        Arc::clone(&door.remote),
-    ));
-    tasks.spawn(read_lane(lane_reader, Arc::clone(&flow)));
-    tasks.spawn(end_at_detach(Arc::clone(&flow)));
     let (acked, acks_flushed) = tokio::sync::oneshot::channel();
+    tasks.spawn(end_at_detach(Arc::clone(&flow)));
     tasks.spawn({
         let flow = Arc::clone(&flow);
         async move {
@@ -954,16 +1042,43 @@ pub(super) async fn serve(door: Arc<DataDoor>, mut reader: DataReader, writer: D
             let _ = acked.send(());
         }
     });
-    run(
-        &door,
-        &mut reader,
-        &flow,
-        &queue,
-        session,
-        attachment,
-        acks_flushed,
-    )
-    .await;
+    match carry {
+        Carry::Lane {
+            reader: lane_reader,
+            writer: lane_writer,
+            ..
+        } => {
+            tasks.spawn(write_lane(
+                lane_writer,
+                queued,
+                Arc::clone(&flow),
+                Arc::clone(&door.remote),
+            ));
+            tasks.spawn(read_lane(lane_reader, Arc::clone(&flow)));
+            run(
+                &door,
+                &mut reader,
+                &flow,
+                &queue,
+                session,
+                attachment,
+                acks_flushed,
+            )
+            .await;
+        }
+        Carry::Serial(proxy) => {
+            serial::run(
+                &door,
+                &mut reader,
+                &flow,
+                &proxy,
+                session,
+                attachment,
+                acks_flushed,
+            )
+            .await;
+        }
+    }
     // A graceful end was waited out inside `run`, with what the device is owed written. A stream
     // that was cut or revoked is reset now.
     if flow.ended() != Some(End::Graceful) {
@@ -972,20 +1087,31 @@ pub(super) async fn serve(door: Arc<DataDoor>, mut reader: DataReader, writer: D
     drop(standing);
 }
 
-/// What a stream is given once it is admitted and its lane is bound.
+/// What a stream is given once it is admitted: how its typing reaches the worker.
 struct Admitted {
     session: kr_protocol::ids::SessionId,
     attachment: AttachmentId,
     standing: Arc<Standing>,
-    ready: InputLaneReady,
-    lane_reader: LinkReader,
-    lane_writer: LinkWriter,
+    carry: Carry,
+}
+
+/// How a stream's typing reaches the worker.
+enum Carry {
+    /// On a lane of its own, which the worker states it serves and has bound.
+    Lane {
+        ready: InputLaneReady,
+        reader: LinkReader,
+        writer: LinkWriter,
+    },
+    /// Over the link that carries the worker's other requests, one call at a time
+    /// ([`serial`]), for a worker that does not state the lane.
+    Serial(Arc<super::proxy::WorkerProxy>),
 }
 
 /// Admits a stream, in the order of the plan: the environment, the route, the grant's decision for
 /// `input.write`, the registry (one stream for each attachment, and a bound for the connection),
-/// and the lane to the worker. Each step that refuses leaves the stream to be reset with nothing
-/// forwarded.
+/// and the lane to the worker, when the worker serves one. Each step that refuses leaves the
+/// stream to be reset with nothing forwarded.
 async fn admit(
     door: &Arc<DataDoor>,
     header: &StreamHeader,
@@ -1013,13 +1139,22 @@ async fn admit(
         .input
         .stand(door.remote.connection_id(), attachment, handle)
         .ok()?;
-    let lane = InputLane {
-        proxy_connection: proxy.connection_id(),
-        attachment_id: attachment,
-    };
-    let (lane_reader, lane_writer, ready) = tokio::select! {
-        opened = open_lane(door, &proxy, lane) => opened?,
-        () = &mut deadline => return None,
+    let carry = if door.host.input.serves_lane(&proxy) {
+        let lane = InputLane {
+            proxy_connection: proxy.connection_id(),
+            attachment_id: attachment,
+        };
+        let (reader, writer, ready) = tokio::select! {
+            opened = open_lane(door, &proxy, lane) => opened?,
+            () = &mut deadline => return None,
+        };
+        Carry::Lane {
+            ready,
+            reader,
+            writer,
+        }
+    } else {
+        Carry::Serial(proxy)
     };
     if handle.is_revoked() {
         return None;
@@ -1028,9 +1163,7 @@ async fn admit(
         session,
         attachment,
         standing,
-        ready,
-        lane_reader,
-        lane_writer,
+        carry,
     })
 }
 
@@ -1051,7 +1184,8 @@ async fn until_routed(
     }
 }
 
-/// Opens the lane and binds it: the worker answers with the epoch the lane starts in.
+/// Opens the lane of a worker that serves one and binds it: the worker answers with the epoch the
+/// lane starts in.
 async fn open_lane(
     door: &Arc<DataDoor>,
     proxy: &Arc<super::proxy::WorkerProxy>,
@@ -1070,9 +1204,6 @@ async fn open_lane(
             lane,
         )
         .await;
-    }
-    if !proxy.states(INPUT_LANE_CAPABILITY) {
-        return None;
     }
     let (reader, writer, _level) = door
         .remote
@@ -1221,6 +1352,30 @@ impl Drop for ReadLetGo<'_> {
     }
 }
 
+/// The `input.write` request that carries one frame to the worker.
+fn write_request(
+    request_id: RequestId,
+    session: kr_protocol::ids::SessionId,
+    attachment: AttachmentId,
+    frame: InputFrame,
+) -> Option<Request> {
+    let params = InputWriteParams {
+        session_id: session,
+        attachment_id: attachment,
+        epoch: frame.epoch,
+        sequence: frame.sequence,
+        input: InputContent::Bytes { bytes: frame.bytes },
+    };
+    let params = ParamsValue::from_typed(&params).ok()?;
+    let entry = Method::InputWrite.entry();
+    Some(Request {
+        request_id,
+        method: Method::InputWrite.into(),
+        method_version: entry.version,
+        params,
+    })
+}
+
 /// Decides one frame afresh, as a key is decided, and queues it for the lane's writer.
 async fn forward(
     door: &Arc<DataDoor>,
@@ -1241,23 +1396,9 @@ async fn forward(
         }
     };
     let request_id = flow.next_request_id();
-    let params = InputWriteParams {
-        session_id: session,
-        attachment_id: attachment,
-        epoch,
-        sequence: frame.sequence,
-        input: InputContent::Bytes { bytes: frame.bytes },
-    };
-    let Ok(params) = ParamsValue::from_typed(&params) else {
+    let Some(request) = write_request(request_id, session, attachment, frame) else {
         flow.refuse(epoch, sequence, refusal("this typing could not be encoded"));
         return;
-    };
-    let entry = Method::InputWrite.entry();
-    let request = Request {
-        request_id,
-        method: Method::InputWrite.into(),
-        method_version: entry.version,
-        params,
     };
     let frame = ControlFrame::ForwardedRead(Box::new(ForwardedRequest {
         request,
