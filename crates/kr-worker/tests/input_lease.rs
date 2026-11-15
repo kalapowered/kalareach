@@ -2577,10 +2577,6 @@ async fn room_given_back_between_the_pumps_reading_and_its_waiting_still_brings_
         runtime.flush_input();
         clock.advance(Duration::from_secs(1));
         session.ingest_output(STATUS_QUESTION);
-        session
-            .write_input(holder, epoch, 1, b"\x1b[201~", None, Instant::now())
-            .expect("the paste ends");
-        runtime.flush_input();
     }
     tokio::time::timeout(Duration::from_secs(20), writer_stopped)
         .await
@@ -2589,29 +2585,46 @@ async fn room_given_back_between_the_pumps_reading_and_its_waiting_still_brings_
     assert_eq!(
         room.held_replies(),
         256,
-        "the host's answers fill their share, and the 257th waits in the lane"
+        "the host's answers fill their share"
+    );
+    assert!(
+        runtime.session().engine().replies_pending(),
+        "the 257th waits in the lane, behind the open paste"
+    );
+    assert!(
+        !runtime.input().lock().replies_waiting(),
+        "and no pass of the pump has said that answers wait"
     );
 
-    // The pump's pass that the paste's end asks for, stopped after it has read no room.
+    // The paste ends. The pass of the pump that the write makes is stopped after it has read the
+    // room, which is full, and before it says that answers wait.
     let (pump_stopped, release_pump) = runtime.input().pump_hold().arm_blocking();
-    let pump = {
+    let ending = {
         let runtime = Arc::clone(&runtime);
-        tokio::task::spawn_blocking(move || runtime.session().pump_replies())
+        tokio::task::spawn_blocking(move || {
+            runtime
+                .session()
+                .write_input(holder, epoch, 1, b"\x1b[201~", None, Instant::now())
+                .expect("the paste ends");
+        })
     };
     tokio::time::timeout(Duration::from_secs(20), pump_stopped)
         .await
         .expect("the pump reads the room")
         .expect("the pump's stop fires");
     drop(release_writer);
+    // The writer writes every answer and the paste's opening, and gives back what each held. The
+    // paste's end waits in the domain's queue, which the stopped pass holds, so it is still held.
     tokio::time::timeout(Duration::from_secs(20), async {
-        while room.held() != kr_worker::input_room::Cost::default() || room.held_replies() != 0 {
+        while room.held_replies() != 0 || room.held().frames > 1 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .expect("the writer writes every batch it holds");
     drop(release_pump);
-    pump.await.expect("the pump's pass ends");
+    ending.await.expect("the paste's end is accepted");
+    runtime.flush_input();
 
     // The last answer is written once something has brought it out of the lane: the pump's own
     // pass cannot, because it read the room before the writer gave it back.
