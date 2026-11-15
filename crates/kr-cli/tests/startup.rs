@@ -5648,8 +5648,8 @@ enum OnStop {
     /// Takes no notice of `host.info`, the command's first request, until the test lets it go, so
     /// that the command is held before its request to stop has left.
     HoldTheLook,
-    /// Answers `host.info` and then closes the connection, so that the command cannot make its
-    /// request to stop.
+    /// Answers `host.info` and, in the same write, sends a frame that cannot be read, and then
+    /// closes the connection, so that the command cannot make its request to stop.
     CloseAfterTheLook,
 }
 
@@ -5856,7 +5856,20 @@ impl TestDaemon {
                             }
                             _ => continue,
                         };
-                        if writer.write_message(&answer).await.is_err() {
+                        let written = if then_close {
+                            // The answer and a frame that cannot be read, in ONE write: the
+                            // command meets the unreadable frame whenever it next reads, whatever
+                            // the order of what follows this write.
+                            let codec = kr_protocol::frame::FrameCodec::new(
+                                kr_protocol::frame::StreamKind::Control,
+                            );
+                            let mut bytes = codec.encode_message(&answer).expect("encodes");
+                            bytes.extend(codec.encode(&[0xff, 0xff]).expect("frames"));
+                            writer.write_frame(&bytes).await
+                        } else {
+                            writer.write_message(&answer).await
+                        };
+                        if written.is_err() {
                             break;
                         }
                         if then_end {
