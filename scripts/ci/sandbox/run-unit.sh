@@ -37,12 +37,13 @@ set -u
 set -C
 umask 077
 
-here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-
 die() {
   echo "run-unit: $*" >&2
   exit 2
 }
+
+dir=$(dirname "${BASH_SOURCE[0]}") || die "cannot find its own folder"
+here=$(cd "$dir" && pwd) || die "cannot find its own folder"
 
 name='' user='' group='' workdir='' logdir='' guard='' netns='' nspath='' nsinode=''
 hostnet=0 wait=1 dry=0 runtime_max='' type=exec exit_type='' prefix='' shm=tmpfs

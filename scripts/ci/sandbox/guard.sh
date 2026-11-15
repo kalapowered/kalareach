@@ -28,8 +28,9 @@ esac
 have=$(stat -L -c %i /proc/self/ns/net 2>/dev/null) || refuse "cannot read /proc/self/ns/net"
 [ "$have" = "$want" ] || refuse "network namespace inode $have is not the runner's $want"
 
-# The interfaces of this namespace (not sysfs: its view is the namespace it was mounted in).
-names=$(tail -n +3 /proc/self/net/dev | sed -e 's/^ *//' -e 's/:.*//')
+# The interfaces of this namespace (not sysfs: its view is the namespace it was mounted in). One
+# command reads the file and drops its two header lines and each line's counters.
+names=$(sed -e '1,2d' -e 's/^ *//' -e 's/:.*//' /proc/self/net/dev) || refuse "cannot read /proc/self/net/dev"
 [ "$names" = "lo" ] || refuse "the interfaces are not the loopback alone"
 
 # Both loopback addresses are present, which also shows that the loopback was brought up.
@@ -42,16 +43,17 @@ awk '
 ' /proc/self/net/fib_trie || refuse "no 127.0.0.1 on lo"
 
 # No route: the main table of IPv4 is only its header, and IPv6 has routes on lo alone.
-[ "$(wc -l < /proc/self/net/route)" -le 1 ] || refuse "an IPv4 route exists"
-if awk 'NF && $NF != "lo" { bad = 1 } END { exit bad ? 0 : 1 }' /proc/self/net/ipv6_route; then
-  refuse "an IPv6 route outside lo exists"
-fi
+route_lines=$(wc -l < /proc/self/net/route) || refuse "cannot read /proc/self/net/route"
+[ "$route_lines" -le 1 ] || refuse "an IPv4 route exists"
+bad_routes=$(awk 'NF && $NF != "lo" { n++ } END { print n + 0 }' /proc/self/net/ipv6_route) || refuse "cannot read /proc/self/net/ipv6_route"
+[ "$bad_routes" = "0" ] || refuse "an IPv6 route outside lo exists"
 
 status=$(cat /proc/self/status) || refuse "cannot read /proc/self/status"
-printf '%s\n' "$status" | grep -q '^NoNewPrivs:[[:space:]]*1$' || refuse "NoNewPrivs is not 1"
-printf '%s\n' "$status" | grep -q '^Seccomp:[[:space:]]*2$' || refuse "no seccomp filter"
-printf '%s\n' "$status" | grep -q '^CapEff:[[:space:]]*0*$' || refuse "a capability is effective"
-[ "$(id -u)" != "0" ] || refuse "the unit runs as root"
+grep -q '^NoNewPrivs:[[:space:]]*1$' <<<"$status" || refuse "NoNewPrivs is not 1"
+grep -q '^Seccomp:[[:space:]]*2$' <<<"$status" || refuse "no seccomp filter"
+grep -q '^CapEff:[[:space:]]*0*$' <<<"$status" || refuse "a capability is effective"
+uid=$(id -u) || refuse "cannot read the account's id"
+[ "$uid" != "0" ] || refuse "the unit runs as root"
 
 case $1 in
   /*) ;;
