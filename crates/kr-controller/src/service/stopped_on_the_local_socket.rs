@@ -28,7 +28,7 @@ use kr_protocol::update::{
 
 use crate::service::Controller;
 
-use super::host::Handover;
+use super::host::{Handover, StopCause};
 use super::the_fence_at_every_effect::{accepted, admitted, daemon, mutation_of, refusal};
 
 /// How long a wait for something that is going to happen is given. A bound on a hang: nothing is
@@ -407,7 +407,11 @@ fn a_gate_closed_for_a_stop_stays_closed_and_an_updates_steps_meet_the_stops_wor
         !handover.is_current(attempt),
         "the attempt that was open is over"
     );
-    handover.end(attempt);
+    assert_eq!(
+        handover.end(attempt),
+        Some(StopCause::Request),
+        "the end of an attempt leaves the gate closed and says why"
+    );
     assert!(
         handover.admit().is_err(),
         "the end of an attempt leaves the gate closed"
@@ -425,7 +429,7 @@ fn a_gate_closed_for_a_stop_stays_closed_and_an_updates_steps_meet_the_stops_wor
     let refused = update.admit().err().expect("the gate is closed");
     assert_eq!(refused.code(), ErrorCode::ResourceUnavailable);
     assert!(refused.to_string().contains("making way for release"));
-    update.end(attempt);
+    assert_eq!(update.end(attempt), None, "an update's gate opens");
     drop(update.admit().expect("the gate is open again"));
 }
 
@@ -481,6 +485,98 @@ async fn a_stop_that_meets_an_open_attempt_is_taken_and_the_updater_meets_the_st
             "{what}: {refused:?}"
         );
     }
+}
+
+/// A `prepare` that waits for its creates when a stop comes is answered in the stop's words: the
+/// stop ended its attempt and closed the gate for good, so neither "the attempt ended while it
+/// waited" nor "the gate is open again" is true of it. The control is the same `prepare` with no
+/// stop, which is answered as prepared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_prepare_that_waits_when_the_stop_comes_is_answered_in_the_stops_words() {
+    let daemon = serving().await;
+    let preparing = |daemon: &Serving| {
+        let endpoint = daemon.endpoint.clone();
+        let environment_id = daemon.environment_id();
+        let params = HostUpdateHandoverParams {
+            step: HandoverStep::Prepare,
+            target: target(),
+            attempt: Nullable(None),
+        };
+        tokio::spawn(async move {
+            let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+                .await
+                .expect("reaches the daemon");
+            client
+                .mutate(
+                    Method::HostUpdateHandover,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    kr_protocol::envelope::ActionTarget::environment(environment_id),
+                    &params,
+                )
+                .await
+                .expect("the call reaches the daemon")
+        })
+    };
+
+    // The control: nothing under way and no stop, and the daemon is prepared.
+    let prepared = tokio::time::timeout(LIVENESS, preparing(&daemon))
+        .await
+        .expect("the prepare answers")
+        .expect("the task ends");
+    assert!(prepared.is_ok(), "{prepared:?}");
+    let attempt = prepared
+        .expect("prepared")
+        .to_typed::<kr_protocol::update::HostUpdateHandoverResult>()
+        .expect("decodes")
+        .attempt
+        .0
+        .expect("the attempt");
+    daemon
+        .controller
+        .handover
+        .resume(Some(attempt))
+        .expect("the control attempt ends");
+
+    // A create is under way, so the prepare waits; the stop comes while it does.
+    let under_way = daemon
+        .controller
+        .handover
+        .admit()
+        .expect("a create is under way");
+    let preparing = preparing(&daemon);
+    daemon.until_the_gate_is_closed().await;
+    let asking = tokio::spawn(ask(daemon.endpoint.clone(), daemon.environment_id(), false));
+    let deadline = std::time::Instant::now() + LIVENESS;
+    while !daemon
+        .controller
+        .handover
+        .admit()
+        .err()
+        .is_some_and(|refused| refused.to_string().contains(ASKED_TO_STOP))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stop did not close the gate"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    drop(under_way);
+
+    let refused = tokio::time::timeout(LIVENESS, preparing)
+        .await
+        .expect("the prepare answers once the create has settled")
+        .expect("the task ends")
+        .expect_err("a prepare that a stop overtook is refused");
+    assert_eq!(refused.code, ErrorCode::EnvironmentUnavailable);
+    assert!(refused.message.contains(ASKED_TO_STOP), "{refused:?}");
+    assert!(!refused.message.contains("ended while"), "{refused:?}");
+    assert!(!refused.message.contains("open again"), "{refused:?}");
+    tokio::time::timeout(LIVENESS, asking)
+        .await
+        .expect("the stop answers")
+        .expect("the task ends")
+        .expect("the stop is taken");
+    daemon.told_to_stop().await;
 }
 
 /// The daemon is not told to stop until the answer to the stop has been written: the answer is

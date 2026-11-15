@@ -408,7 +408,10 @@ next daemon finds it again.
 
 While the gate is closed for a stop, a create is refused with `ENVIRONMENT_UNAVAILABLE`, and so is
 an update's `prepare`, `resume` and `stop`; an attempt that was open when the stop came is over. A
-second stop finds the gate closed for a stop, waits beside the first and is taken. The answer to any
+`prepare` that arrives after the stop is refused at once. One that was already waiting for its
+creates to settle when the stop came is refused in the stop's words when it ends, whether its
+creates settled or not, and the gate it closed does not open again: the stop holds it. A second stop
+finds the gate closed for a stop, waits beside the first and is taken. The answer to any
 other request, a request for the launch alone included, does not stop the daemon.
 
 With `launch_only` set, the request stops nothing, closes no gate and answers only how the daemon

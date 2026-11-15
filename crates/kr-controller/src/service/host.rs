@@ -1591,14 +1591,27 @@ impl Handover {
     }
 
     /// Ends `attempt` and opens the gate, if it is still the attempt the gate is closed for. A gate
-    /// closed for a stop requested on the local socket is no attempt and stays closed.
-    pub(super) fn end(&self, attempt: Uuid) {
+    /// closed for a stop requested on the local socket is no attempt and stays closed, and so does
+    /// one of a daemon that was told to stop: then it says why, and the caller must not say that
+    /// the gate is open again.
+    pub(super) fn end(&self, attempt: Uuid) -> Option<StopCause> {
         let mut gate = self.lock();
+        if let Some(cause) = self.stopping_for(&gate) {
+            return Some(cause);
+        }
         if gate.closed.as_ref().is_some_and(|closed| {
             closed.attempt == attempt && matches!(closed.reason, Reason::Update { .. })
         }) {
             gate.closed = None;
         }
+        None
+    }
+
+    /// Why this daemon would not take a step that begins an attempt or ends one, as
+    /// [`Handover::stopping_for`] says, for a caller that holds no lock.
+    pub(super) fn stopping_cause(&self) -> Option<StopCause> {
+        let gate = self.lock();
+        self.stopping_for(&gate)
     }
 
     /// Ends the attempt named, or the open one when none is named, and opens the gate: the update
@@ -1731,7 +1744,11 @@ impl Controller {
                     .settle(std::time::Duration::from_millis(HANDOVER_SETTLE_MS))
                     .await;
                 if unsettled > 0 {
-                    self.handover.end(attempt);
+                    // A stop that came while the creates settled has closed the gate for good, and
+                    // the gate is not open again for it: its words belong here, not these.
+                    if let Some(cause) = self.handover.end(attempt) {
+                        return Err(stopping(cause));
+                    }
                     return Err(ControllerError::Refused {
                         code: ErrorCode::ResourceUnavailable,
                         detail: format!(
@@ -1746,6 +1763,11 @@ impl Controller {
                 // An attempt that ended while the creates settled, resumed or superseded, is not
                 // one this daemon answers as prepared: nothing acts on an attempt that is over.
                 if !self.handover.is_current(attempt) {
+                    // A stop that came while the creates settled ended the attempt: it is the
+                    // stop that this daemon answers, which no new `prepare` changes.
+                    if let Some(cause) = self.handover.stopping_cause() {
+                        return Err(stopping(cause));
+                    }
                     return Err(ControllerError::Refused {
                         code: ErrorCode::ResourceUnavailable,
                         detail: "the attempt this control daemon was preparing under ended while \
@@ -1823,11 +1845,13 @@ impl Controller {
                     pid,
                     unsettled: U64::new(0),
                     launch: Nullable(launch),
-                })?,
+                }),
                 then_stops: false,
             });
         }
         self.handover.begin_stop();
+        // From here nothing returns early: the gate is closed for good, so every answer of this
+        // request, one that is an error included, carries the flag that stops the daemon.
         let unsettled = self
             .handover
             .settle(std::time::Duration::from_millis(STOP_SETTLE_MS))
@@ -1837,7 +1861,7 @@ impl Controller {
                 pid,
                 unsettled: U64::new(u64::try_from(unsettled).unwrap_or(u64::MAX)),
                 launch: Nullable(launch),
-            })?,
+            }),
             then_stops: true,
         })
     }
@@ -1927,10 +1951,12 @@ impl Controller {
 /// What `host.stop` came to: its answer, and whether the daemon stops once that answer has been
 /// written.
 pub(super) struct Stopped {
-    /// The answer: the daemon's process, the creates that did not settle and how it was started.
-    pub(super) answer: ParamsValue,
-    /// True for a stop whose wait for the creates has ended, and false for a request that asked
-    /// for the launch alone.
+    /// The answer: the daemon's process, the creates that did not settle and how it was started,
+    /// or the error that made it. A stop that has closed the gate stops the daemon whatever this
+    /// holds, so that a gate that is closed for good never stays with a daemon that serves.
+    pub(super) answer: Result<ParamsValue>,
+    /// True for a stop whose gate has closed, and false for a request that asked for the launch
+    /// alone.
     pub(super) then_stops: bool,
 }
 
