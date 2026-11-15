@@ -9,7 +9,7 @@
 
 import { describe, expect, it } from 'vitest'
 
-import { CLICK_AWAY, decide, keepsPress, type Click, type Layout, type PaneLink, type Press, type Rect } from '../src/markdown/link-target'
+import { CLICK_AWAY, decide, keepsPress, lookAt, type Click, type Decision, type Layout, type NamedLink, type PaneLink, type Press, type Rect } from '../src/markdown/link-target'
 
 /** Links are named by strings here: the decision only compares them. */
 type Id = string
@@ -185,5 +185,67 @@ describe('where the click lies against the press', () => {
   it('opens it for a click at the allowed distance from the press, and stands for a click farther', () => {
     expect(decide(press(), click({ point: { x: 60 + CLICK_AWAY, y: 125 } }), layoutOf(UPPER, LOWER))).toEqual(OPEN_UPPER)
     expect(decide(press(), click({ point: { x: 60 + CLICK_AWAY + 0.5, y: 125 } }), layoutOf(UPPER, LOWER))).toEqual(STAND)
+  })
+})
+
+/** The link a click names, as the handler measures it. */
+const NAMED: NamedLink<Id> = { id: 'lower', measurable: true }
+
+/** What `decide` says of a click at `names`, held to the layout of the two links. */
+function decision(names: Click['names'], over: Partial<Click> = {}, record: Press<Id> | null = press()): Decision<Id> {
+  return decide(record, click({ names, ...over }), layoutOf(UPPER, LOWER))
+}
+
+describe('the link that has the look at a click', () => {
+  it('is the link that the click names, for a touch and for a pen', () => {
+    expect(lookAt('touch', click({ names: 'link' }), NAMED, decision('link'))).toBe('lower')
+    expect(lookAt('pen', click({ names: 'link' }), NAMED, decision('link'))).toBe('lower')
+  })
+
+  it('is the link that the click names whatever the handler’s own tests of the click say: a detail of 2, a late click, a press that moved, no press at all', () => {
+    const two = click({ names: 'link', detail: 2 })
+    expect(decision('link', { detail: 2 })).toEqual(STAND)
+    expect(lookAt('touch', two, NAMED, decision('link', { detail: 2 }))).toBe('lower')
+    const late = click({ names: 'link', at: 1000 + 3200 })
+    expect(lookAt('touch', late, NAMED, decision('link', { at: 1000 + 3200 }))).toBe('lower')
+    const far = click({ names: 'link', point: { x: 60 + CLICK_AWAY + 40, y: 125 } })
+    expect(lookAt('touch', far, NAMED, decision('link', { point: far.point }))).toBe('lower')
+    expect(lookAt('touch', click({ names: 'link' }), NAMED, decision('link', {}, press({ moved: true })))).toBe('lower')
+    expect(lookAt('touch', click({ names: 'link' }), NAMED, decision('link', {}, null))).toBe('lower')
+  })
+
+  it('is the link that the handler opens from plain text, and none where the handler stands', () => {
+    expect(lookAt('touch', click(), null, decision('neither'))).toBe('upper')
+    expect(lookAt('pen', click(), null, decision('neither'))).toBe('upper')
+    expect(decision('neither', { at: 1000 + 3200 })).toEqual(STAND)
+    expect(lookAt('touch', click({ at: 1000 + 3200 }), null, decision('neither', { at: 1000 + 3200 }))).toBeNull()
+    expect(lookAt('touch', click({ detail: 2 }), null, decision('neither', { detail: 2 }))).toBeNull()
+    expect(lookAt('touch', click(), null, decision('neither', {}, press({ moved: true })))).toBeNull()
+    expect(lookAt('touch', click(), null, decision('neither', {}, null))).toBeNull()
+  })
+
+  it('is none for a click that names a control, which opens no link', () => {
+    expect(lookAt('touch', click({ names: 'control' }), null, decision('control'))).toBeNull()
+  })
+
+  it('is none where the last press was a mouse’s or where no press in the pane came before the click', () => {
+    expect(lookAt('mouse', click({ names: 'link' }), NAMED, decision('link'))).toBeNull()
+    expect(lookAt('mouse', click(), null, STAND)).toBeNull()
+    expect(lookAt(null, click({ names: 'link' }), NAMED, decision('link'))).toBeNull()
+    expect(lookAt('', click({ names: 'link' }), NAMED, decision('link'))).toBeNull()
+  })
+
+  it('is none for a click with a detail of 0, which nothing pressed, and for an untrusted click', () => {
+    expect(lookAt('touch', click({ names: 'link', detail: 0 }), NAMED, decision('link', { detail: 0 }))).toBeNull()
+    expect(lookAt('touch', click({ names: 'link', trusted: false }), NAMED, decision('link', { trusted: false }))).toBeNull()
+    expect(lookAt('touch', click({ trusted: false }), null, decision('neither', { trusted: false }))).toBeNull()
+  })
+
+  it('is none for a link that cannot be measured, as at the press', () => {
+    expect(lookAt('touch', click({ names: 'link' }), { id: 'lower', measurable: false }, decision('link'))).toBeNull()
+  })
+
+  it('is none for a click that names a link the handler has no name for', () => {
+    expect(lookAt('touch', click({ names: 'link' }), null, decision('link'))).toBeNull()
   })
 })

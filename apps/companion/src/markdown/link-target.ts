@@ -272,12 +272,12 @@ const STAND = { kind: 'stand' } as const
 
 /**
  * Whether a press of this pointer type can get an open from `decide`: a touch or a pen. A mouse's or a
- * trackpad's click on plain text opens nothing, as on a desktop, so a press of those lights nothing by
- * the rule either, and keeps no look by it. This one test is asked at the pointer down (which link the
- * press lights), at each move of a mouse's or a trackpad's press (its look follows the pointer, since only
- * the element can open), at each scroll or resize while a lit press lives (whether a release would still
- * open it) and at the click (`decide`). A press on a link's own element is kept besides by the element
- * lying under the point, for every pointer type.
+ * trackpad's click on plain text opens nothing, as on a desktop, so a press of those on plain text keeps
+ * no record by the rule. This one test is asked at the pointer down (whether a press on plain text keeps
+ * a record), at each move of a mouse's or a trackpad's press (its look follows the pointer, since only
+ * the element can open), at each scroll or resize while a press lives (whether a release would still
+ * open it), at the click (`decide`) and for the look at the click (`lookAt`). A press on a link's own
+ * element is kept besides by the element lying under the point, for every pointer type.
  */
 export function opensByRule(pointerType: string): boolean {
   return pointerType === 'touch' || pointerType === 'pen'
@@ -306,10 +306,9 @@ export function keepsPress<L>(press: Press<L>, layout: (at: Point) => Layout<L>)
  * pointer's up and within `CLICK_WITHIN` of it, and lies within `CLICK_AWAY` of the press, since the
  * engine reports the point of the same tap, rounded or moved toward a nearby link; and the
  * nearest-words rule, run again at the press's own point in the layout as it is now, names the same
- * element, opening the same destination, as it did at the press's start (`keepsPress`). For a touch or
- * a pen, the look at the press and the open at the click are therefore one function of one point. The
- * press is the record of the latest primary pointer down: a later press, or a pointer cancel, leaves
- * none.
+ * element, opening the same destination, as it did at the press's start (`keepsPress`). The press is the
+ * record of the latest primary pointer down: a later press, or a pointer cancel, leaves none. These
+ * tests guard only the open that this adds; the look that a click gets is `lookAt`'s.
  *
  * `layout` is read only when the other conditions hold, at the press's point.
  */
@@ -320,4 +319,37 @@ export function decide<L>(press: Press<L> | null, click: Click, layout: (at: Poi
   if (click.at < press.upAt || click.at - press.upAt > CLICK_WITHIN) return STAND
   if (Math.hypot(click.point.x - press.at.x, click.point.y - press.at.y) > CLICK_AWAY) return STAND
   return keepsPress(press, layout) ? { kind: 'open', link: press.start.link } : STAND
+}
+
+/** How long the pressed look stays after a click, or after a release that gets no click, in milliseconds. */
+export const LOOK_HOLD = 150
+
+/** The link that a click names, and whether the handler can measure it (`false`: a box above it keeps its view from being read). */
+export interface NamedLink<L> {
+  readonly id: L
+  readonly measurable: boolean
+}
+
+/**
+ * The link that gets the pressed look at a click, or null when none does. The look at a click is what a
+ * person sees of the link that opens, so it names that link and no other:
+ *
+ * - none for a click that no touch or pen made: `kind` is the pointer type of the last primary press in
+ *   the pane, and a mouse's look follows its pointer and goes at its release;
+ * - none for an untrusted click and for one with a detail of 0 (a keyboard's or an assistive
+ *   activation's): nothing pressed the link;
+ * - the link the click names, whatever `decide` says of the click (its detail, a move, the time since the
+ *   release, the distance), because the link's own element opens on every click; none where that link
+ *   cannot be measured, as at the press;
+ * - none for a click that names a control, which opens no link;
+ * - for a click on plain text, the link that `decide` opens, and none where it stands.
+ *
+ * The caller sets the look to exactly this link, so a link that was lit and is not the result goes out.
+ */
+export function lookAt<L>(kind: string | null, click: Pick<Click, 'trusted' | 'detail' | 'names'>, named: NamedLink<L> | null, decision: Decision<L>): L | null {
+  if (kind === null || !opensByRule(kind)) return null
+  if (!click.trusted || click.detail === 0) return null
+  if (click.names === 'link') return named !== null && named.measurable ? named.id : null
+  if (click.names === 'control') return null
+  return decision.kind === 'open' ? decision.link : null
 }
