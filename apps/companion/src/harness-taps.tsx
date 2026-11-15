@@ -10,8 +10,10 @@
  * focus is. It is started by the strip, which also fills the first session with the messages the taps
  * need. The harness bundle is built only for tests, so none of this ships.
  *
- * The record listens on the document, in the capture phase, as the pane's own tap handling does, so
- * that it adds nothing the platform counts as a click listener on the page's content.
+ * The record listens on the document, as the pane's own tap handling does, so that it adds nothing the
+ * platform counts as a click listener on the page's content: in the capture phase, except for the
+ * pointer down and the click, which are read in the bubble phase so that the look they log is the one
+ * that the pane's handling and the page's own listeners have left.
  */
 
 import { useEffect, type ReactNode } from 'react'
@@ -150,23 +152,26 @@ export function TapRecord({ controls }: { readonly controls: FakeHostControls })
       order += 1
       const pointer = event as PointerEvent
       // The event's class, and the pointer's number and type where the event has them: `-` where it has not.
-      // At a pointer down, the link that the page's press handling lit by then (`-` for none): this runs in
-      // the bubble phase, after the handler's own listener on the document has run.
-      const lit = event.type === 'pointerdown' ? nameOf(document.querySelector<HTMLElement>('.md-link[data-pressed]')?.title ?? '') || '-' : '-'
+      // At a pointer down and at a click, the link that the page's press handling lit by then (`-` for none):
+      // these run in the bubble phase, after the handler's own listener on the document and the page's own
+      // have run.
+      const lit = event.type === 'pointerdown' || event.type === 'click' ? nameOf(document.querySelector<HTMLElement>('.md-link[data-pressed]')?.title ?? '') || '-' : '-'
       seen.push(
         `E ${String(order)} ${event.type} ${describe(event.target)} ${event.isTrusted ? '1' : '0'} ${String(at.detail ?? 0)} ${round(at.clientX ?? 0)} ${round(at.clientY ?? 0)} ${event.constructor.name} ${typeof pointer.pointerId === 'number' ? String(pointer.pointerId) : '-'} ${pointer.pointerType || '-'} lit=${lit}`
       )
       if (seen.length > KEPT) seen.shift()
       show()
     }
-    const types = ['pointerup', 'pointercancel', 'click', 'focusin'] as const
+    const types = ['pointerup', 'pointercancel', 'focusin'] as const
     for (const type of types) document.addEventListener(type, note, true)
     document.addEventListener('pointerdown', note)
+    document.addEventListener('click', note)
     const timer = window.setInterval(show, 400)
     show()
     return () => {
       for (const type of types) document.removeEventListener(type, note, true)
       document.removeEventListener('pointerdown', note)
+      document.removeEventListener('click', note)
       window.clearInterval(timer)
     }
   }, [controls])
