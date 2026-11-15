@@ -92,7 +92,7 @@ pub(in crate::service::net) fn barrier_of(
 /// barrier names the line's own attachment, which a worker that states the lane takes. No sender of
 /// this build sends the shape: a client names its own attachment, and the command line's detach by
 /// capability carries no barrier. A worker that states the lane is sent the request whole and
-/// refuses it itself.
+/// decides it itself.
 ///
 /// # Errors
 ///
