@@ -224,6 +224,7 @@ async fn a_registration_replaced_while_a_retry_waits_stops_its_retained_answer()
         let revision = registry
             .authority_revision()
             .expect("the revision in force");
+        controller.copies.raise_revision(revision);
         let mut registrations = controller.admitted_write();
         for connection in registrations.values_mut() {
             connection.admitted_revision = revision;
@@ -265,6 +266,7 @@ pub(super) async fn another_devices_revocation_lands(controller: &Controller) {
     let revision = registry
         .authority_revision()
         .expect("the revision in force");
+    controller.copies.raise_revision(revision);
     let mut registrations = controller.admitted_write();
     for connection in registrations.values_mut() {
         connection.admitted_revision = revision;
@@ -3133,6 +3135,7 @@ async fn an_installation_recorded_before_a_late_attempts_lookup_is_not_given_bac
         let revision = registry
             .authority_revision()
             .expect("the revision in force");
+        controller.copies.raise_revision(revision);
         for connection in controller.admitted_write().values_mut() {
             connection.admitted_revision = revision;
         }

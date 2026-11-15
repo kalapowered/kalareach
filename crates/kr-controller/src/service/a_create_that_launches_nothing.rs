@@ -966,6 +966,7 @@ async fn a_create_admitted_before_a_revision_is_refused_though_its_connection_st
         let revision = registry
             .authority_revision()
             .expect("the revision in force");
+        controller.copies.raise_revision(revision);
         let mut admitted = controller.admitted_write();
         for connection in admitted.values_mut() {
             connection.admitted_revision = revision;
@@ -2707,6 +2708,7 @@ async fn the_admission_a_service_checks_again_answers_both_revocations() {
         let revision = registry
             .authority_revision()
             .expect("the revision in force");
+        controller.copies.raise_revision(revision);
         let mut admitted = controller.admitted_write();
         for connection in admitted.values_mut() {
             connection.admitted_revision = revision;
@@ -3420,6 +3422,7 @@ async fn an_installation_admitted_before_a_revocation_is_refused_at_its_marker()
         let revision = registry
             .authority_revision()
             .expect("the revision in force");
+        controller.copies.raise_revision(revision);
         let mut registrations = controller.admitted_write();
         for connection in registrations.values_mut() {
             connection.admitted_revision = revision;

@@ -1145,6 +1145,14 @@ impl Controller {
         // What a read of the changes since a visit is answered with, when it asks for a summary,
         // is the descriptions module's to keep.
         attention.attach_descriptions(Arc::clone(&descriptions));
+        // The authority revision in memory starts from the revision the registry holds, which is
+        // the revision the barrier below is built at.
+        let copies = Arc::new(super::footing::Copies::new(
+            authority_revision,
+            Arc::clone(&clock),
+            wall.clone(),
+            Arc::clone(&utc_floor),
+        ));
         let controller = Arc::new_cyclic(|me| Self {
             me: me.clone(),
             registry: Mutex::new(registry),
@@ -1188,6 +1196,7 @@ impl Controller {
             storage_account,
             rights_ceiling,
             debts: Arc::new(std::sync::Mutex::new(Debts::default())),
+            copies,
             debt_pass: Arc::new(tokio::sync::Notify::new()),
             device_watch: Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "testing")]
@@ -1529,6 +1538,7 @@ impl Controller {
                     },
                 );
             }
+            controller.copies.note_debts(!debts.published.is_empty());
         }
         if let Err(error) = controller.raise_owed_barrier().await {
             eprintln!(
