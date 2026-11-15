@@ -3818,6 +3818,50 @@ mod local {
         );
     }
 
+    /// A last request that was admitted while the connection could send, and that waits for the
+    /// connection's turn while another caller loses the writing side, meets the lost side at its
+    /// bound. Its caller is told that it was not sent, and the lane, finished with no key behind
+    /// it, ends once with the connection's cause and not as finished: the connection stands, so
+    /// the session has recorded no end, but nothing more can be written to it.
+    #[tokio::test(start_paused = true)]
+    async fn a_lane_whose_last_request_waited_for_the_turn_while_the_write_side_was_lost_ends_with_its_cause()
+     {
+        let deadlines = ManualDeadlines::new();
+        let (socket, session, lane, mut events) = local_lane_with(false, &deadlines).await;
+        socket.stall(Stall::Turn);
+        lane.begin_epoch(epoch(5)).expect("an epoch");
+        let request = queue_request(&lane, &session, 1).await;
+        lane.finish();
+        socket.stalled_send().await;
+        socket.lose_the_write_side();
+        let told = told_by_the_bound(request).await;
+        assert!(
+            matches!(told, Err(ClientError::Withheld)),
+            "the request's bound passed with nothing sent: {told:?}"
+        );
+        the_bound_on_the_connections_end_passes(&deadlines).await;
+        let ends = ends_of(&mut events).await;
+        assert_eq!(
+            ends.len(),
+            1,
+            "the lane tells its end once and never as finished: {ends:?}"
+        );
+        assert!(
+            matches!(
+                ends[0],
+                InputEvent::Ended {
+                    cause: EndCause::Connection { refusal: None },
+                    ..
+                }
+            ),
+            "{ends:?}"
+        );
+        assert!(
+            socket.sent.lock().expect("sent").is_empty(),
+            "nothing of the request was written"
+        );
+    }
+
     /// A key that the session refuses because the connection stands but cannot send was never
     /// sent: nothing is written or accepted, and the lane ends once, with the connection's cause.
     #[tokio::test(start_paused = true)]
