@@ -1518,15 +1518,16 @@ mod windows_paths {
         ];
         let reading = Reader::Shell.read_with(None, None, &named);
         assert!(reading.succeeded, "{reading:?}");
+        // Git Bash may write the directory as `/tmp/…`, so it is looked for by its own name in the
+        // share's folder.
         let directory = reading.directory.clone().expect("a directory");
-        assert!(directory.is_dir(), "{}", directory.display());
+        let made = by_windows.join(directory.file_name().expect("a name"));
         assert!(
-            same(directory.parent().expect("a parent"), &by_windows)
-                || same(directory.parent().expect("a parent"), &ordinary),
+            made.is_dir(),
             "the directory is made in the share's folder: {}",
             directory.display()
         );
-        std::fs::remove_dir(&directory).expect("removes the directory the run made");
+        std::fs::remove_dir(&made).expect("removes the directory the run made");
     }
 
     /// The reader takes the extended-length spelling of a value and of a root (`\\?\C:\…`, and
