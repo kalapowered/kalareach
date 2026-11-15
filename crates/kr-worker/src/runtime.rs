@@ -372,6 +372,34 @@ fn write_batch(
     (delivered, Delivery::Complete)
 }
 
+/// Ends the paste the application is inside when it was a batch of `epoch` that opened it, and
+/// returns whether the writer can go on.
+///
+/// The writer calls it at an epoch's first drop. The response lane reads the stream the session
+/// accepted, which can say that a paste is closed while the batch that closed it was dropped; the
+/// application is then still inside the paste, and the host's next answer would land in it. The
+/// terminator is the writer's own correction and is never fenced, and nothing is written when the
+/// application is not inside a paste of this epoch.
+fn end_the_open_paste_of(
+    open: &std::sync::atomic::AtomicU64,
+    epoch: u64,
+    writer: &mut impl std::io::Write,
+    room: Option<&crate::pty::InputWaiter>,
+    gate: &std::sync::Mutex<()>,
+) -> bool {
+    use std::sync::atomic::Ordering;
+
+    let inside = open
+        .compare_exchange(
+            epoch.saturating_add(1),
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok();
+    !inside || insist(writer, crate::input::PASTE_END, room, gate)
+}
+
 /// Writes a few bytes the application must have into a terminal that answers rather than waits.
 ///
 /// No fence applies to these: a paste terminator is the one thing that can end a paste nothing else
@@ -1108,6 +1136,18 @@ impl SessionRuntime {
                     // scope.
                     dropped_epoch = Some(lease_epoch);
                     let _ = epoch_expired.send(lease_epoch);
+                    // A paste an earlier batch of this epoch opened stays open at the application
+                    // while the batch that was to close it is not written, so it is ended here,
+                    // before anything else is written.
+                    if !end_the_open_paste_of(
+                        &writer_paste_open,
+                        lease_epoch,
+                        &mut writer,
+                        input_waiter.as_ref(),
+                        &writer_gate,
+                    ) {
+                        break;
+                    }
                     continue;
                 }
                 // Written in pieces, with the fence looked at before each one, so that a
@@ -1201,6 +1241,18 @@ impl SessionRuntime {
                     if epoch.is_some() && lease_epoch >= writer_fence.load(Ordering::Acquire) {
                         dropped_epoch = Some(lease_epoch);
                         let _ = epoch_expired.send(lease_epoch);
+                        // What reached the application is what it has, delimiters included: a
+                        // paste that the delivered part of this batch or an earlier one opened is
+                        // ended here, behind the delivered part and before anything else.
+                        if !end_the_open_paste_of(
+                            &writer_paste_open,
+                            lease_epoch,
+                            &mut writer,
+                            input_waiter.as_ref(),
+                            &writer_gate,
+                        ) {
+                            break;
+                        }
                     }
                 }
             }
