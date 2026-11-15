@@ -1875,6 +1875,8 @@ impl RemoteConnection {
                     },
                     own_claim,
                     on_stream.map_or(Arrival::Control, Arrival::Stream),
+                    &decided,
+                    asked,
                 )
                 .await
                 .map(|given| {
@@ -1959,6 +1961,8 @@ impl RemoteConnection {
                         },
                         own_claim,
                         Arrival::Settling,
+                        decided,
+                        asked,
                     )
                     .await
                     .map(|given| {

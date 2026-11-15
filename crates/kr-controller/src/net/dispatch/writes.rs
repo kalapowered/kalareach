@@ -10,10 +10,11 @@ use kr_protocol::ids::ActorId;
 use kr_protocol::method::Method;
 
 use super::super::chunks::ChunkAdmission;
+use super::decision::Asked;
 use super::forwarding::OwnClaim;
 use super::routes::Unserved;
 use super::{RemoteConnection, failure, outcome_unknown};
-use crate::given::{Given, network_door};
+use crate::given::Given;
 
 /// How this host answers one mutation a paired device may send: which service performs it, or the
 /// reason it is refused.
@@ -169,6 +170,11 @@ impl RemoteConnection {
     ///
     /// `arrival` says how the write reached the door: on the control stream, on a data stream that
     /// the service asks about again, or as an exact repeat that carries no usable window.
+    ///
+    /// What the stored subject says is the record's word, so it is told through the check every
+    /// answer read from a record goes through ([`Self::kept_refusal`]), under the revision the
+    /// request was admitted under, which is why `decided` and `asked` come with the write.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn transfer_write(
         &self,
         mutation: &MutationRequest,
@@ -177,19 +183,16 @@ impl RemoteConnection {
         carried: crate::authority::AdmittedMutation,
         own_claim: &OwnClaim,
         arrival: Arrival<'_>,
+        decided: &Asked,
+        asked: &mut Option<Asked>,
     ) -> std::result::Result<Given<ControlFrame>, ProtocolError> {
-        // What the stored subject says goes back as it is, which is the word this door gives it
-        // without a check.
         if let Some(refused) = self
             .controller
             .transfer
             .check_subject_of_record(&actor_id, mutation, method)
             .await?
         {
-            return Err(network_door::kept(
-                crate::service::net::AtTheNetworkDoor::here(),
-                refused,
-            ));
+            return Err(self.kept_refusal(refused, carried.admitted_revision, decided, asked));
         }
         if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
             return Err(refusal.into_error());
