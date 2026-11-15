@@ -236,6 +236,13 @@ pub struct Journal {
     /// shipped build.
     #[cfg(feature = "testing")]
     marker_stall: crate::testing::Stall,
+    /// Where this host's own tests stop the next dispatch marker between its read of the receipt
+    /// and its first write.
+    #[cfg(feature = "testing")]
+    marker_read_stall: crate::testing::Stall,
+    /// Where this host's own tests stop the worker once the next dispatch marker has committed.
+    #[cfg(feature = "testing")]
+    after_marker_stall: crate::testing::Stall,
     /// Where this host's own tests stop a worker the moment after a settlement or a rejection has
     /// committed, which is where a crash leaves exactly what the commit holds. Compiled away in
     /// every shipped build.
@@ -387,6 +394,10 @@ impl Journal {
             attention_changes: std::sync::Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "testing")]
             marker_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            marker_read_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            after_marker_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             settlement_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
@@ -1914,13 +1925,33 @@ impl Journal {
         action_id: ActionId,
         now_ms: TimestampMs,
     ) -> Result<Receipt> {
-        self.advance(
+        self.mark_dispatching_while(actor_id, action_id, now_ms, || Ok(()))
+    }
+
+    /// Commits the dispatch marker before the external effect, once `still` agrees to it.
+    ///
+    /// `still` is asked after the receipt is read and immediately before the marker's first write,
+    /// where nothing but instructions stands between it and the write. What it refuses is
+    /// refused with nothing written, and its error is returned as it came.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Journal::mark_dispatching`] returns, and what `still` refuses with.
+    pub fn mark_dispatching_while(
+        &mut self,
+        actor_id: ActorId,
+        action_id: ActionId,
+        now_ms: TimestampMs,
+        still: impl FnOnce() -> Result<()>,
+    ) -> Result<Receipt> {
+        self.advance_while(
             actor_id,
             action_id,
             ReceiptState::Dispatching,
             None,
             None,
             now_ms,
+            still,
         )
     }
 
@@ -1956,6 +1987,22 @@ impl Journal {
         error: Option<ProtocolError>,
         now_ms: TimestampMs,
     ) -> Result<Receipt> {
+        self.advance_while(actor_id, action_id, state, reason, error, now_ms, || Ok(()))
+    }
+
+    /// Advances a receipt once `still` agrees to it, asked after the receipt is read and before
+    /// the first write.
+    #[allow(clippy::too_many_arguments)]
+    fn advance_while(
+        &mut self,
+        actor_id: ActorId,
+        action_id: ActionId,
+        state: ReceiptState,
+        reason: Option<RejectionReason>,
+        error: Option<ProtocolError>,
+        now_ms: TimestampMs,
+        still: impl FnOnce() -> Result<()>,
+    ) -> Result<Receipt> {
         self.advance_and_name(
             actor_id,
             action_id,
@@ -1966,6 +2013,7 @@ impl Journal {
                 now_ms,
             },
             None,
+            still,
         )
         .map(|(receipt, _)| receipt)
     }
@@ -1981,6 +2029,7 @@ impl Journal {
         action_id: ActionId,
         transition: Transition,
         fenced_for: Option<u64>,
+        still: impl FnOnce() -> Result<()>,
     ) -> Result<(Receipt, bool)> {
         let Transition {
             state,
@@ -1997,6 +2046,12 @@ impl Journal {
         })?;
         receipt.error = Nullable(error);
         receipt.updated_at_ms = now_ms;
+        #[cfg(feature = "testing")]
+        if state == ReceiptState::Dispatching {
+            self.marker_read_stall.stand();
+        }
+        // The last ask, after every read this step makes and before its first write.
+        still()?;
         let transaction = self
             .connection
             .transaction()
@@ -2032,6 +2087,10 @@ impl Journal {
             .commit()
             .map_err(|error| faulted(&self.health, error))?;
         self.health.note_durable_through(sequence);
+        #[cfg(feature = "testing")]
+        if state == ReceiptState::Dispatching {
+            self.after_marker_stall.stand();
+        }
         #[cfg(feature = "testing")]
         if CONTENT_WITHHELD_STATES.contains(&state) {
             self.settlement_stall.stand();
@@ -2117,6 +2176,7 @@ impl Journal {
                     now_ms,
                 },
                 Some(revision),
+                || Ok(()),
             ) {
                 Ok((_, named)) => {
                     fenced.rejected = fenced.rejected.saturating_add(u64::from(named));
@@ -3452,6 +3512,38 @@ impl Journal {
         self.marker_stall.arm_blocking()
     }
 
+    /// Stops the next dispatch marker between its read of the receipt and its first write, for
+    /// this host's own tests: the receipt is as it was and nothing of the marker is written.
+    ///
+    /// Returns the end that says the marker has arrived there, and the end that lets it go. The
+    /// stop fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_next_marker_before_its_write(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.marker_read_stall.arm()
+    }
+
+    /// Stops the worker once the next dispatch marker has committed, for this host's own tests:
+    /// the marker is on disk and nothing that follows it has run.
+    ///
+    /// Returns the end that says the commit has happened, and the end that lets the worker go. The
+    /// stop fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_after_next_marker(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.after_marker_stall.arm()
+    }
+
     /// Stops the worker once the next settlement or rejection has committed, for this host's own
     /// tests: the receipt is on disk as the commit left it, and nothing that would have followed
     /// the commit has run. A crash there leaves exactly this.
@@ -3616,6 +3708,10 @@ impl Journal {
             attention_changes: std::sync::Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "testing")]
             marker_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            marker_read_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            after_marker_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             settlement_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]

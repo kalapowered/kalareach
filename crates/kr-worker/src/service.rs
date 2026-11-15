@@ -6798,24 +6798,16 @@ impl WorkerService {
             // The remote dispatch lease, in the serial path and immediately before the deadline
             // and the marker: a lease that was valid when the action was queued proves nothing.
             .and_then(|()| self.check_dispatch_lease(caller, method))
-            .and_then(|()| {
-                // The deadline the host derived is the deadline it keeps, measured on the
-                // continuous clock so a wall clock that moves cannot extend it. This is also what
-                // makes a zero requested lifetime mean what it says.
-                if self.clock.now() >= deadline {
-                    Err(WorkerError::WindowExpired {
-                        detail: "the accepted deadline for this action has passed".to_owned(),
-                    })
-                } else {
-                    Ok(())
-                }
-            })
+            // The deadline the host derived is the deadline it keeps, measured on the continuous
+            // clock so a wall clock that moves cannot extend it. This is also what makes a zero
+            // requested lifetime mean what it says.
+            .and_then(|()| self.check_accepted_deadline(deadline))
             // And last, what the effect itself would have refused. Last, because that is where the
             // effect asked it: moving a refusal before the marker must not move it in front of a
             // precondition the caller stated or a deadline this host accepted. For a mutation the
             // broker owns, what comes back is the admission itself.
             .and_then(|()| self.decidable(&session, mutation, method, caller, preparation));
-        let prepared = match revalidated {
+        let mut prepared = match revalidated {
             Ok(prepared) => prepared,
             Err(error) => {
                 if let Some(journal) = session.journal_mut() {
@@ -6852,6 +6844,13 @@ impl WorkerService {
                 return Err(error);
             }
         };
+        // The broker asks the deadline again where the operation's effect lands, so the admission
+        // carries it, and the clock it is measured on, from here.
+        if let Some(Prepared::Upstream(handoff)) = prepared.as_mut() {
+            handoff
+                .admitted
+                .hold_to_accepted_deadline(Arc::clone(&self.clock), deadline);
+        }
         // An action whose effect is prepared outside the boundary stops here, with its receipt
         // still `accepted` and no marker written. It comes back through `dispatch_prepared`.
         if let Some(Prepared::NeedsPreparation(asked)) = prepared {
@@ -6877,9 +6876,33 @@ impl WorkerService {
             // The dispatch marker is committed before the effect. A stop whose marker cannot be
             // written proceeds on the worker's current authority and reports volatile durability,
             // for the same reason its acceptance did; anything else is refused before it happens.
-            if let Err(error) =
-                journal.mark_dispatching(actor_id.clone(), mutation.action_id, kr_ipc::now_ms())
-            {
+            //
+            // The accepted deadline is asked again inside the marker's own step, after the
+            // receipt is read and before the first write: the checks above wait for locks, and
+            // the read is storage.
+            if let Err(error) = journal.mark_dispatching_while(
+                actor_id.clone(),
+                mutation.action_id,
+                kr_ipc::now_ms(),
+                || self.check_accepted_deadline(deadline),
+            ) {
+                if matches!(error, WorkerError::WindowExpired { .. }) {
+                    // The deadline ended before the marker was written, so nothing was. The stop's
+                    // permission to go on without a marker covers a marker that could not be
+                    // written, and this one was refused: it is the revalidation's own refusal,
+                    // recorded as that records it.
+                    let _ = journal.reject(
+                        actor_id,
+                        mutation.action_id,
+                        kr_protocol::receipt::RejectionReason::Expired,
+                        Some(error.to_protocol_error()),
+                        kr_ipc::now_ms(),
+                    );
+                    if let Some(prepared) = prepared {
+                        prepared.abandon();
+                    }
+                    return Err(error);
+                }
                 if !volatile_permitted {
                     // A marker that was not written leaves nothing executable behind it. The
                     // admission is abandoned here, so the operation it authorised cannot be
@@ -6895,13 +6918,20 @@ impl WorkerService {
 
         // From here the agent may be sent what was prepared: an offer the control daemon claimed is
         // reported as unknown, not as failed, if nothing says what became of it.
-        let mut prepared = prepared;
         if let Some(Prepared::Upstream(handoff)) = prepared.as_mut()
             && let Some(claim) = handoff.claim.as_mut()
         {
             claim.dispatched();
         }
-        let outcome = self.apply(&mut session, state, mutation, method, caller, prepared);
+        let outcome = self.apply(
+            &mut session,
+            state,
+            mutation,
+            method,
+            caller,
+            prepared,
+            deadline,
+        );
         // A launch that reached the reader has no outcome yet, so none is recorded: it is settled
         // when the reader answers, outside this boundary. An admitted upstream operation is the
         // same shape for the same reason: its effect is the admission, and its outcome is what the
@@ -6948,10 +6978,16 @@ impl WorkerService {
                 // Past the marker there is no rejection. Whether the effect happened cannot be
                 // established from here, so the outcome is recorded as unknown — except where the
                 // failure itself proves the effect did not happen, which a launch the machine
-                // refused before it reached the reader does.
+                // refused before it reached the reader does, and so does a refusal of the asks
+                // that stand at the entry of `apply`: they are made before any arm starts its
+                // effect, and nothing else in `apply` fails with these two.
                 let state = if matches!(error, WorkerError::LaunchRefused { code, .. }
                     if *code != ErrorCode::OutcomeUnknown)
-                {
+                    || matches!(
+                        error,
+                        WorkerError::WindowExpired { .. }
+                            | WorkerError::DispatchLeaseRefused { .. }
+                    ) {
                     kr_protocol::receipt::ReceiptState::Refused
                 } else {
                     kr_protocol::receipt::ReceiptState::Unknown
@@ -7266,6 +7302,41 @@ impl WorkerService {
             authority_revision: lease.authority_revision,
             deadline,
         }
+    }
+
+    /// Refuses an action whose accepted deadline has passed.
+    ///
+    /// The deadline is the one the host derived at admission, read on the continuous clock this
+    /// worker decides every deadline on.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::WindowExpired`] once the clock has reached the deadline.
+    fn check_accepted_deadline(&self, deadline: ContinuousInstant) -> Result<()> {
+        if self.clock.now() >= deadline {
+            Err(WorkerError::WindowExpired {
+                detail: crate::action::window::ACCEPTED_DEADLINE_PASSED.to_owned(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The two asks that stand at an effect: the dispatch lease and then the accepted deadline,
+    /// the clock last.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::check_dispatch_lease`] and [`Self::check_accepted_deadline`] refuse
+    /// with.
+    fn still_admitted(
+        &self,
+        caller: &Caller,
+        method: Method,
+        deadline: ContinuousInstant,
+    ) -> Result<()> {
+        self.check_dispatch_lease(caller, method)?;
+        self.check_accepted_deadline(deadline)
     }
 
     /// Refuses a paired device's dispatch that does not hold a live lease from the generation this
@@ -9765,6 +9836,12 @@ impl WorkerService {
     /// with the session locked throughout, so nothing the mutation was validated against can move
     /// underneath it. What cannot be done under the lock — writing input to the terminal, starting
     /// a termination sequence — is handed back to the caller as an after-effect.
+    ///
+    /// The marker does not exempt what follows it from the asks that stand at an effect: the
+    /// accepted deadline and the dispatch lease are asked here, before any arm starts its effect,
+    /// and an arm that waits for something before its effect asks them again after the wait. A
+    /// refusal here has started nothing, and is recorded as a refusal and not as an unknown outcome.
+    #[allow(clippy::too_many_arguments)]
     fn apply(
         &self,
         session: &mut Session,
@@ -9773,7 +9850,16 @@ impl WorkerService {
         method: Method,
         caller: &Caller,
         prepared: Option<Prepared>,
+        deadline: ContinuousInstant,
     ) -> Result<(ParamsValue, AfterEffect)> {
+        if let Err(refusal) = self.still_admitted(caller, method, deadline) {
+            // What was prepared for an operation that goes upstream is given up, so that nothing
+            // that still holds it can send it.
+            if let Some(prepared) = prepared {
+                prepared.abandon();
+            }
+            return Err(refusal);
+        }
         let params = &mutation.params;
         match method {
             Method::SessionAttach => {

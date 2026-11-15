@@ -761,3 +761,225 @@ async fn a_local_forwarded_action_and_a_devices_stop_need_no_lease() {
         .await
         .expect("the closure finishes");
 }
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-09.16: the accepted deadline and the lease are asked again where an effect lands
+// ---------------------------------------------------------------------------------------------
+
+/// Where a dispatch stands while the worker's clock moves.
+#[derive(Clone, Copy, Debug)]
+enum Stands {
+    /// In the dispatch marker's step, between its read of the receipt and its first write.
+    BeforeTheMarkerWrite,
+    /// After the marker is committed, before the effect: the stop is inside the boundary.
+    AfterTheMarker,
+}
+
+/// Which caller sends the `session.attach`.
+#[derive(Clone, Copy, Debug)]
+enum Caller {
+    /// A local caller, which holds no lease and is held to the accepted deadline alone.
+    Local,
+    /// A paired device whose lease ends `lease_ms` after the dispatch reaches the worker.
+    Device { lease_ms: u64 },
+}
+
+/// What a `session.attach` comes to when the worker's clock moves by `moved` while the dispatch
+/// stands at `stands`.
+async fn attach_while_the_clock_moves(
+    caller: Caller,
+    stands: Stands,
+    moved: Duration,
+) -> (Host, MutationRequest, Outcome, Vec<BoundLink>) {
+    let clock = ManualClock::new();
+    let host = host_on(Some(Arc::new(clock.clone()))).await;
+    let mut authority = link(&host, 1, None).await;
+    let mutation = attach(&host);
+    let (reached, release) = {
+        let mut session = host.service.runtime().session();
+        let journal = session.journal_mut().expect("this session keeps a journal");
+        match stands {
+            Stands::BeforeTheMarkerWrite => journal.stall_next_marker_before_its_write(),
+            Stands::AfterTheMarker => journal.stall_after_next_marker(),
+        }
+    };
+    // The daemon's authority connection stays open for the whole dispatch.
+    let (mut sender, authority) = match caller {
+        Caller::Local => (authority, None),
+        Caller::Device { .. } => {
+            announce(&mut authority, &host, 3).await;
+            (proxy(&host, 1).await, Some(authority))
+        }
+    };
+    let frame = match caller {
+        Caller::Local => forwarded(&mutation, ActorIngress::LocalIpc, 1, 0, None),
+        Caller::Device { lease_ms } => for_a_device(&mutation, 1, 3, Some(lease(1, 3, lease_ms))),
+    };
+    let answering = tokio::spawn(async move {
+        let outcome = answer_to(&mut sender, frame).await;
+        (sender, outcome)
+    });
+    tokio::time::timeout(WAIT, reached)
+        .await
+        .expect("the dispatch reaches the stop in time")
+        .expect("the stop is armed");
+    clock.advance(moved);
+    release.send(()).expect("the dispatch is waiting to go on");
+    let (sender, outcome) = answering.await.expect("the dispatch ends");
+    // The links stay open while the case looks at the session: a device's attachments go with its
+    // link.
+    let links = std::iter::once(sender).chain(authority).collect();
+    (host, mutation, outcome, links)
+}
+
+/// The receipt of an action of `actor_id`.
+fn receipt_for(
+    host: &Host,
+    actor_id: ActorId,
+    mutation: &MutationRequest,
+) -> kr_protocol::receipt::Receipt {
+    let mut session = host.service.runtime().session();
+    session
+        .journal_mut()
+        .expect("a journal")
+        .read(actor_id, mutation.action_id)
+        .expect("reads")
+        .expect("the action has a receipt")
+}
+
+fn local_actor() -> ActorId {
+    ActorId::new("local:501").expect("a principal")
+}
+
+/// How many attachments the session holds: the effect of a `session.attach`, counted.
+fn attachments(host: &Host) -> usize {
+    host.service.runtime().session().attachments().len()
+}
+
+/// Whether the journal holds a dispatch marker's event for the action.
+fn marker_event_written(host: &Host, actor_id: ActorId, mutation: &MutationRequest) -> bool {
+    receipt_for(host, actor_id, mutation)
+        .state
+        .has_dispatch_marker()
+}
+
+/// KR-REQ-09.16: the accepted deadline is asked inside the marker's own step, after the receipt is
+/// read and before the marker's first write. A deadline that passes in that step leaves the receipt
+/// as it was and rejects the action as expired: no marker, and no attachment made. The control, the
+/// same step with the clock where it was, writes the marker and attaches once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_accepted_deadline_that_passes_in_the_markers_step_leaves_no_marker_and_no_effect() {
+    let (host, mutation, outcome, _links) = attach_while_the_clock_moves(
+        Caller::Local,
+        Stands::BeforeTheMarkerWrite,
+        Duration::from_secs(121),
+    )
+    .await;
+    let Outcome::Error(error) = &outcome else {
+        panic!("a deadline that passed before the marker's write did not refuse: {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+    let receipt = receipt_for(&host, local_actor(), &mutation);
+    assert_eq!(receipt.state, ReceiptState::Rejected, "{receipt:?}");
+    assert_eq!(receipt.reason.as_ref(), Some(&RejectionReason::Expired));
+    assert!(
+        !marker_event_written(&host, local_actor(), &mutation),
+        "the marker was written after the deadline passed"
+    );
+    assert_eq!(attachments(&host), 0, "the effect was made");
+
+    let (host, mutation, outcome, _links) = attach_while_the_clock_moves(
+        Caller::Local,
+        Stands::BeforeTheMarkerWrite,
+        Duration::from_secs(1),
+    )
+    .await;
+    assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
+    assert_eq!(
+        receipt_for(&host, local_actor(), &mutation).state,
+        ReceiptState::Applied
+    );
+    assert_eq!(attachments(&host), 1, "the control attaches once");
+}
+
+/// KR-REQ-09.16: the marker makes no exemption for what follows it. A deadline that passes after the
+/// marker is committed and before the effect leaves the effect unmade: the dispatch is refused at the
+/// entry of the worker's effect step, the marker stays as written, and the receipt says refused, which
+/// a repeat of the action is answered from. The control attaches once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_accepted_deadline_that_passes_after_the_marker_makes_no_effect() {
+    let (host, mutation, outcome, _links) = attach_while_the_clock_moves(
+        Caller::Local,
+        Stands::AfterTheMarker,
+        Duration::from_secs(121),
+    )
+    .await;
+    let Outcome::Error(error) = &outcome else {
+        panic!("a deadline that passed after the marker did not refuse: {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+    assert!(marker_event_written(&host, local_actor(), &mutation));
+    assert_eq!(
+        receipt_for(&host, local_actor(), &mutation).state,
+        ReceiptState::Refused,
+        "the refusal is known to have done nothing, so it is recorded as one"
+    );
+    assert_eq!(attachments(&host), 0, "the effect was made");
+    // The same action asked again is answered from what was recorded: it is not told that its
+    // outcome is unknown, and nothing is made.
+    let mut daemon = link(&host, 1, None).await;
+    let again = answer_to(
+        &mut daemon,
+        forwarded(&mutation, ActorIngress::LocalIpc, 1, 0, None),
+    )
+    .await;
+    if let Outcome::Error(error) = &again {
+        assert_ne!(error.code, ErrorCode::OutcomeUnknown, "{error:?}");
+    }
+    assert_eq!(
+        receipt_for(&host, local_actor(), &mutation).state,
+        ReceiptState::Refused
+    );
+    assert_eq!(attachments(&host), 0, "a repeat made the effect");
+
+    let (host, _mutation, outcome, _links) = attach_while_the_clock_moves(
+        Caller::Local,
+        Stands::AfterTheMarker,
+        Duration::from_secs(1),
+    )
+    .await;
+    assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
+    assert_eq!(attachments(&host), 1, "the control attaches once");
+}
+
+/// KR-REQ-09.16: the dispatch lease is asked again at the entry of the worker's effect step. A lease
+/// that ends after the marker is committed and before the effect leaves the effect unmade, whatever
+/// the accepted deadline still allows. The control, a lease that still stands, attaches once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_lease_that_ends_after_the_marker_makes_no_effect() {
+    let (host, mutation, outcome, _links) = attach_while_the_clock_moves(
+        Caller::Device { lease_ms: 2_000 },
+        Stands::AfterTheMarker,
+        Duration::from_secs(3),
+    )
+    .await;
+    let Outcome::Error(error) = &outcome else {
+        panic!("a lease that ended after the marker did not refuse: {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+    assert!(marker_event_written(&host, actor(), &mutation));
+    assert_eq!(
+        receipt_for(&host, actor(), &mutation).state,
+        ReceiptState::Refused
+    );
+    assert_eq!(attachments(&host), 0, "the effect was made");
+
+    let (host, mutation, outcome, _links) = attach_while_the_clock_moves(
+        Caller::Device { lease_ms: 2_000 },
+        Stands::AfterTheMarker,
+        Duration::from_secs(1),
+    )
+    .await;
+    dispatched(&host, &mutation, &outcome);
+    assert_eq!(attachments(&host), 1, "the control attaches once");
+}
