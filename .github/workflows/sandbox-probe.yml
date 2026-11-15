@@ -1,0 +1,48 @@
+name: sandbox-probe
+
+# Probes how a hosted image runs commands as transient units of the system manager, each with
+# a file system view of its own and a network namespace that holds the loopback alone. A push
+# to the probe's branch is the only trigger; nothing here has a secret, an environment, a cache
+# or an artifact, and the log is the record.
+
+on:
+  push:
+    branches: ["task/T-CI-LEGS-5-probe"]
+
+permissions: {}
+
+jobs:
+  probe:
+    name: probe (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the scripts
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+
+      - name: Setup
+        id: setup
+        run: bash scripts/ci/sandbox-probe/setup.sh
+
+      - name: A, the image's facts
+        if: always() && steps.setup.outcome == 'success'
+        run: bash scripts/ci/sandbox-probe/a-facts.sh
+
+      - name: B, the properties
+        if: always() && steps.setup.outcome == 'success'
+        run: bash scripts/ci/sandbox-probe/b-properties.sh
+
+      - name: C, the namespace and the guard
+        if: always() && steps.setup.outcome == 'success'
+        run: bash scripts/ci/sandbox-probe/c-namespace.sh
+
+      - name: J, exit codes
+        if: always() && steps.setup.outcome == 'success'
+        run: bash scripts/ci/sandbox-probe/j-exit.sh
+
+      - name: Result
+        if: always() && steps.setup.outcome == 'success'
+        run: bash scripts/ci/sandbox-probe/summary.sh
