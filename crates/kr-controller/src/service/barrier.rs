@@ -768,13 +768,82 @@ async fn until_told(telling: &mut Option<tokio::task::JoinHandle<()>>) {
 /// it lets the daemon go, so the count is never above the references these tasks hold: a strong
 /// count that is no higher than it means nothing else holds the daemon.
 #[derive(Debug, Default)]
-pub(super) struct TaskHolds(std::sync::Mutex<usize>);
+pub(super) struct TaskHolds(std::sync::Mutex<usize>, #[cfg(test)] TaskWaits);
 
 impl TaskHolds {
     fn count(&self) -> std::sync::MutexGuard<'_, usize> {
+        #[cfg(test)]
+        match self.0.try_lock() {
+            Ok(guard) => return guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => return poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => self.1.says_it_waits(),
+        }
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Arms the record for `task`: `waits` is called once, when `task` asks for the count and finds
+    /// its guard held, just before it waits for it.
+    #[cfg(test)]
+    pub(super) fn say_when_it_waits(
+        &self,
+        task: tokio::task::Id,
+        waits: impl FnOnce() + Send + 'static,
+    ) {
+        *self
+            .1
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(WaitFor {
+            task,
+            waits: Box::new(waits),
+        });
+    }
+}
+
+/// What a test has armed to hear of a task that has to wait for the task count's guard: the task,
+/// and what to call when it does. A task that finds the guard free says nothing, so a case that
+/// holds the guard hears of the task that ought to wait there by an event, and of one that does not
+/// by the event that follows it, never by the lack of one.
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct TaskWaits(std::sync::Mutex<Option<WaitFor>>);
+
+/// The task a test listens for at the task count's guard, and what to call when it waits there.
+#[cfg(test)]
+struct WaitFor {
+    task: tokio::task::Id,
+    waits: Box<dyn FnOnce() + Send>,
+}
+
+#[cfg(test)]
+impl TaskWaits {
+    fn says_it_waits(&self) {
+        let waits = {
+            let mut armed = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if armed
+                .as_ref()
+                .is_some_and(|armed| tokio::task::try_id() == Some(armed.task))
+            {
+                armed.take()
+            } else {
+                None
+            }
+        };
+        if let Some(armed) = waits {
+            (armed.waits)();
+        }
+    }
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for TaskWaits {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TaskWaits")
     }
 }
 

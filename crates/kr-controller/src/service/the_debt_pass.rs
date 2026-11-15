@@ -208,11 +208,6 @@ async fn the_pass_leaves_a_change_its_own_debt() {
     drop(controller);
 }
 
-/// How long a case waits for a step that correct code does not let happen. A task that has to wait
-/// for the task count while a look holds it has nothing else to do, so this only has to outlast
-/// the scheduling of a task that is ready to run.
-const BLOCKED_FOR: Duration = Duration::from_secs(1);
-
 /// What a task that holds the daemon through `while_held` tells a case, in the order it happens.
 #[derive(Debug, PartialEq, Eq)]
 enum Step {
@@ -226,6 +221,8 @@ enum Step {
     Ended,
     /// The task stands between the two counts of a look, holding the task count.
     Looking,
+    /// The task asked for the task count and found it held, and waits for it.
+    WaitsAtTheCount,
 }
 
 /// A task that holds the daemon through `while_held` for work that lasts until it is told to
@@ -305,30 +302,39 @@ impl Holder {
             })
     }
 
-    /// The next step the task says, or `None` when it says none within `within`.
-    fn next_within(&self, within: Duration) -> Option<Step> {
-        self.steps.recv_timeout(within).ok()
+    /// Arms the record that the task finds the task count held and waits for it, which it says as
+    /// [`Step::WaitsAtTheCount`]. Armed for the task's next such wait, so a case arms it when the
+    /// guard is held by what the case stopped and the task is yet to ask.
+    fn hear_when_it_waits_at_the_count(&self, controller: &Controller) {
+        let says = self.says.clone();
+        controller
+            .task_holds
+            .say_when_it_waits(self.task.id(), move || {
+                let _ = says.send(Step::WaitsAtTheCount);
+            });
     }
 
     /// Waits for the task to say `step` as its next, and fails with `otherwise` when it says
-    /// something else or nothing.
+    /// something else or nothing within [`WAIT`].
     fn says(&self, step: Step, otherwise: &str) {
-        let said = self.next_within(WAIT);
+        let said = self.steps.recv_timeout(WAIT).ok();
         assert_eq!(said.as_ref(), Some(&step), "{otherwise}");
     }
 }
 
-/// The first task of a case, begun and stopped at its first look between the two counts: it holds
-/// the daemon, is counted, and holds the task count while the case goes on.
+/// The first task of a case, begun and stopped at a look between the two counts: it holds the
+/// daemon, is counted, and holds the task count while the case goes on.
 fn stopped_between_its_counts(
     daemon: &std::sync::Weak<Controller>,
     controller: &Controller,
 ) -> (Holder, std::sync::mpsc::SyncSender<()>) {
     let mut first = Holder::new(daemon);
-    let release = first.stop_at_its_next_look(controller);
     first.begin();
     first.says(Step::AboutToBegin, "the first task begins");
     first.says(Step::Began, "the first task's work begins");
+    // Armed once the task has begun: its first look is due at once and can come before its work
+    // starts, and a task is stopped at a look it has not reached yet, the next one at the latest.
+    let release = first.stop_at_its_next_look(controller);
     first.says(
         Step::Looking,
         "the first task looks and stands between its counts",
@@ -360,10 +366,11 @@ fn goes_on_from_its_look(
 /// two counts the look compares.
 ///
 /// The first task stands between its counts, holding the task count, and the second asks to begin.
-/// The second may not begin while the first stands there: it counts itself under the same lock. A
-/// look that does not keep the lock lets it begin at once, and the case would see that. Then the
-/// first goes on, and it does not let the daemon go, because the owner holds it, though the
-/// second holds it too. Both end once the owner lets the daemon go.
+/// The second may not begin while the first stands there: it counts itself under the same lock, and
+/// the case waits for the record that it waits for it. A look that does not keep the lock lets it
+/// begin at once, and the case fails on that, with no wait for a silence. Then the first goes on,
+/// and it does not let the daemon go, because the owner holds it, though the second holds it too.
+/// Both end once the owner lets the daemon go.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_task_that_begins_between_the_two_counts_does_not_make_another_let_the_daemon_go() {
     let temp = kr_ipc::testing::TempHost::create();
@@ -372,13 +379,13 @@ async fn a_task_that_begins_between_the_two_counts_does_not_make_another_let_the
     let (first, release) = stopped_between_its_counts(&daemon, &controller);
 
     let mut second = Holder::new(&daemon);
+    second.hear_when_it_waits_at_the_count(&controller);
     second.begin();
     second.says(Step::AboutToBegin, "the second task asks to begin");
-    assert_eq!(
-        second.next_within(BLOCKED_FOR),
-        None,
-        "the second task began while the first stood between its counts, so the first look no \
-         longer holds the task count there"
+    second.says(
+        Step::WaitsAtTheCount,
+        "the second task did not wait for the task count while the first stood between its \
+         counts, so the first look no longer holds the task count there",
     );
 
     goes_on_from_its_look(&controller, &first, &release);
@@ -396,7 +403,10 @@ async fn a_task_that_begins_between_the_two_counts_does_not_make_another_let_the
         Step::Ended,
         "the second task lets the daemon go once its owner has",
     );
-    assert_eq!(daemon.strong_count(), 0, "the daemon let go is gone");
+    until("the daemon let go being gone", async || {
+        daemon.strong_count() == 0
+    })
+    .await;
 }
 
 /// A task that looks at whether it is the daemon's last holder does not let the daemon go while
@@ -406,10 +416,11 @@ async fn a_task_that_begins_between_the_two_counts_does_not_make_another_let_the
 /// A task that ends takes itself out of the count first and lets go of the daemon after. The
 /// second task's work is over and it stands before leaving the count. Then the first task stands
 /// between its counts, holding the task count, with the second still in it, and the second is let
-/// go on. It may not leave the count while the first stands there. A look that does not keep the
-/// lock lets it leave both, and the case would see that: the first would read the task count with
-/// the second in it and the daemon's count without it. Then the first goes on, and it does not
-/// let the daemon go. Both end once the owner lets the daemon go.
+/// go on. It may not leave the count while the first stands there, and the case waits for the
+/// record that it waits for it. A look that does not keep the lock lets it leave both, and the case
+/// fails on that: the first would read the task count with the second in it and the daemon's count
+/// without it. Then the first goes on, and it does not let the daemon go. Both end once the owner
+/// lets the daemon go.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_task_that_ends_between_the_two_counts_does_not_make_another_let_the_daemon_go() {
     let temp = kr_ipc::testing::TempHost::create();
@@ -427,14 +438,14 @@ async fn a_task_that_ends_between_the_two_counts_does_not_make_another_let_the_d
     );
     let (first, release) = stopped_between_its_counts(&daemon, &controller);
 
+    second.hear_when_it_waits_at_the_count(&controller);
     leave
         .send(())
         .expect("the second task waits before it leaves the count");
-    assert_eq!(
-        second.next_within(BLOCKED_FOR),
-        None,
+    second.says(
+        Step::WaitsAtTheCount,
         "the second task left the count and let the daemon go while the first stood between its \
-         counts, so the first look no longer holds the task count there"
+         counts, so the first look no longer holds the task count there",
     );
 
     goes_on_from_its_look(&controller, &first, &release);
@@ -448,5 +459,8 @@ async fn a_task_that_ends_between_the_two_counts_does_not_make_another_let_the_d
         Step::Ended,
         "the first task lets the daemon go once its owner has",
     );
-    assert_eq!(daemon.strong_count(), 0, "the daemon let go is gone");
+    until("the daemon let go being gone", async || {
+        daemon.strong_count() == 0
+    })
+    .await;
 }
