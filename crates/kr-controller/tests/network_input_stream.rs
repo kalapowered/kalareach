@@ -3435,6 +3435,112 @@ async fn a_barrier_that_names_another_attachment_is_refused_for_a_worker_without
     a_barrier_that_names_another_attachment_is_refused(rig).await;
 }
 
+/// Sends a detach as a device does that holds the capability of a line: it names no attachment,
+/// presents `token`, and carries `after_input` when it is given.
+async fn detach_by_token(
+    rig: &Rig,
+    action: ActionId,
+    token: &str,
+    after_input: Option<InputBarrier>,
+) -> Result<ParamsValue, ProtocolError> {
+    rig.device
+        .mutate(
+            Method::SessionDetach,
+            action,
+            rig.adopted.workers[0].target(rig.adopted.host.environment_id),
+            &SessionDetachParams {
+                attachment_id: Nullable::null(),
+                line_token: Nullable::some(token.to_owned()),
+                after_input,
+                fenced_report: false,
+            },
+        )
+        .await
+}
+
+/// A barrier of the rig's attachment at count zero, which is reached whatever has been typed.
+fn barrier_at_zero(rig: &Rig) -> InputBarrier {
+    InputBarrier {
+        attachment_id: rig.attachment,
+        epoch: rig.epoch,
+        count: U64::new(0),
+        launch: Nullable::null(),
+    }
+}
+
+/// A detach that names no attachment is resolved by the worker, from the capability of a line, and
+/// only the worker can say whose typing its barrier must follow. The host takes the barrier out of
+/// what it forwards to a worker without the lane, so it cannot leave the judging to that worker:
+/// it refuses a detach that carries a barrier and names no attachment, as an argument. Nothing is
+/// forwarded, nothing is claimed and nothing is applied, so the attachment of the line stays
+/// attached, and the same action sent again as the command line's detach, which carries no
+/// barrier, is a first request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detach_that_names_no_attachment_and_follows_typing_is_refused_for_a_worker_without_the_lane()
+ {
+    let (rig, _stream) = typed_serial(3).await;
+    let sent = script_dependents(&rig, None);
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let refused = detach_by_token(
+        &rig,
+        action,
+        "a-line-capability",
+        Some(barrier_at_zero(&rig)),
+    )
+    .await
+    .expect_err("a detach of no named attachment follows typing");
+    assert_eq!(refused.code, ErrorCode::InvalidArgument);
+    assert_eq!(
+        refused.message,
+        kr_worker::input_domain::POSITION_NEEDS_ATTACHMENT
+    );
+    assert!(
+        forwarded(&sent).is_empty(),
+        "nothing was forwarded: {:?}",
+        forwarded(&sent)
+    );
+    assert_eq!(position_refusals(&rig), 0, "no position was judged");
+    assert_eq!(
+        rig.adopted.workers[0].attachments(),
+        1,
+        "nothing was applied: the attachment stands"
+    );
+    let again = detach_by_token(&rig, action, "a-line-capability", None).await;
+    assert!(
+        again.is_ok(),
+        "the refusal claimed no route: the detach with no position goes through: {again:?}"
+    );
+    assert_eq!(forwarded(&sent), vec![Method::SessionDetach]);
+    rig.stop().await;
+}
+
+/// The same request to a worker with the lane is sent to it whole, and the worker refuses it. The
+/// capability here names no line, so the worker's own answer is the one it gives to a capability
+/// that is not a live line's: the host's refusal is not what answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detach_that_names_no_attachment_and_follows_typing_is_refused_by_the_worker_with_the_lane()
+ {
+    let rig = Rig::start_on_the_workers_lane().await;
+    let _stream = rig.open().await;
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let refused = detach_by_token(
+        &rig,
+        action,
+        "a-line-capability",
+        Some(barrier_at_zero(&rig)),
+    )
+    .await
+    .expect_err("the worker has no such line");
+    assert_eq!(refused.code, ErrorCode::AmbiguousAttachment);
+    assert_eq!(position_refusals(&rig), 0, "the host judged no position");
+    assert_eq!(
+        rig.adopted.workers[0].attachments(),
+        1,
+        "nothing was applied: the attachment stands"
+    );
+    rig.stop().await;
+}
+
 /// The host has no record of a stream that never opened, and none of one that ended: the request is
 /// forwarded and the worker decides, by its own count of the typing. A position that the worker has
 /// not reached is refused by the worker with the words of the host's own refusal, and one that it

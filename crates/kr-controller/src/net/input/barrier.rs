@@ -32,9 +32,10 @@ fn read_whole<T: kr_protocol::wire::WireMessage>(params: &ParamsValue) -> Result
 /// it carries one.
 ///
 /// A release's or a detach's barrier names the request's own attachment: the request orders itself
-/// after its own typing. A launch's names the holder of the lease, which only the worker knows. A
-/// detach that names no attachment has no subject here, and the worker, which resolves it, judges
-/// the barrier against the attachment it finds.
+/// after its own typing. A detach that names no attachment has no subject here: a worker that
+/// states the lane resolves it and judges the barrier against the attachment it finds, and
+/// [`refuse_detach_without_attachment`] refuses it for any other worker. A launch's barrier names
+/// the holder of the lease, which only the worker knows.
 ///
 /// # Errors
 ///
@@ -69,6 +70,38 @@ pub(in crate::service::net) fn barrier_of(
         ));
     }
     Ok(barrier)
+}
+
+/// Refuses a detach that carries a barrier and names no attachment, when its worker does not state
+/// the input lane.
+///
+/// Such a detach is told by the capability of a line, which only the worker resolves, so the host
+/// cannot say whose typing the barrier must follow. The host takes the barrier out of what it
+/// forwards to a worker without the lane, and that worker would detach the line's attachment with
+/// no order at all. The host therefore refuses every such detach for that worker, also one whose
+/// barrier names the line's own attachment, which a worker that states the lane takes. No sender of
+/// this build sends the shape: a client names its own attachment, and the command line's detach by
+/// capability carries no barrier. A worker that states the lane is sent the request whole and
+/// refuses it itself.
+///
+/// # Errors
+///
+/// Refuses the request as an argument, with nothing forwarded, claimed or applied.
+pub(in crate::service::net) fn refuse_detach_without_attachment(
+    serves_lane: bool,
+    mutation: &MutationRequest,
+) -> Result<(), ProtocolError> {
+    if serves_lane || !matches!(mutation.method.method(), Some(Method::SessionDetach)) {
+        return Ok(());
+    }
+    let params = read_whole::<SessionDetachParams>(&mutation.params)?;
+    if params.after_input.is_some() && params.attachment_id.0.is_none() {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidArgument,
+            kr_worker::input_domain::POSITION_NEEDS_ATTACHMENT,
+        ));
+    }
+    Ok(())
 }
 
 /// What a request is told when the typing its barrier names has not all been accepted, or can no

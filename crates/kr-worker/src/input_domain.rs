@@ -90,6 +90,13 @@ pub const POSITION_NOT_REACHED: &str = "The typing before this request has not a
 pub const POSITION_NAMES_ANOTHER: &str =
     "The typing that this request follows belongs to another attachment.";
 
+/// What a detach that names no attachment and carries a position is refused with by the control
+/// daemon when its worker does not serve the input lane: only a worker resolves the capability of a
+/// line, so the daemon cannot say whose typing the position follows. A worker that serves the lane
+/// resolves the capability itself and does not say this.
+pub const POSITION_NEEDS_ATTACHMENT: &str =
+    "A detach that follows typing must name the attachment it detaches.";
+
 /// One entry in a session's queue for the pseudo-terminal.
 #[derive(Debug)]
 pub(crate) enum Queued {
