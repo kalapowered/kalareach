@@ -69,6 +69,10 @@ jobs:
         if: always() && steps.setup.outcome == 'success'
         run: bash scripts/ci/sandbox-probe/j-exit.sh
 
+      - name: L, the launcher's reads
+        if: always() && steps.setup.outcome == 'success'
+        run: bash scripts/ci/sandbox-probe/l-reads.sh
+
       - name: Result
         if: always() && steps.setup.outcome == 'success'
         run: bash scripts/ci/sandbox-probe/summary.sh
