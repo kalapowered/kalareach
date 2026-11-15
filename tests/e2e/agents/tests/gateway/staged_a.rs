@@ -270,7 +270,9 @@ const WHOLE_PATH_WATCH: Duration = Duration::from_secs(5);
 
 /// Whether `rows` show `text` whole: on one row, or across consecutive rows where the agent's
 /// composer wrapped it. The blanks and the box-drawing characters at the ends of each row are the
-/// composer's own and are left out.
+/// composer's own and are left out. Any other text that a composer puts at the end of a row that
+/// holds part of the path (a hint, a marker) breaks the join and fails the case with correct code:
+/// the rule has not been tried against a real composer.
 fn shows_whole(rows: &[String], text: &str) -> bool {
     const WRAPPED_ROWS: usize = 4;
     let bare: Vec<&str> = rows
