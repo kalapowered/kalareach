@@ -676,7 +676,11 @@ impl RemoteOutput {
                 },
                 None => None,
             };
-            let admitted = self.fence() && bounds_hold_now();
+            // The fence reads no lock, and the bounds read several (the connection table, the
+            // shares, the fence this host owes), which a withdrawal or a commit can hold. The bounds
+            // leave the grant's own expiry out, so the fence is read again after them: the last
+            // ask before the bytes are handed over.
+            let admitted = self.fence() && bounds_hold_now() && self.fence();
             if admitted {
                 begun.store(true, Ordering::Release);
                 attempt();
