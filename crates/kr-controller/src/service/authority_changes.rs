@@ -990,7 +990,7 @@ impl Controller {
     pub(super) async fn device_list(&self, params: &ParamsValue) -> Result<ParamsValue> {
         let params: kr_protocol::sharing::DeviceListParams = parse(params)?;
         let records = self.devices.devices()?;
-        let status = self.authority_feed().status();
+        let status = self.authority_feed_reading().status;
         // The revision in force is the registry's. The feed's accepted revision is what it has
         // seen and the policy's is what it was last told, and either can be behind the allocator
         // after a revocation this daemon took by another path.

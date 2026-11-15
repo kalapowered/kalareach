@@ -29,6 +29,8 @@ tokio.workspace = true
 [dev-dependencies]
 # The service the revision case is answered by, with the answers it is made to give.
 kr-service-stand-in = { path = "../../support/service-stand-in" }
+# The clock the host's record of the feed measures a synchronisation's age on.
+kr-transport.workspace = true
 
 [lints]
 workspace = true

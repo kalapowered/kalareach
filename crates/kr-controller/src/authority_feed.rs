@@ -75,7 +75,7 @@ use tokio::task::JoinHandle;
 
 use crate::error::{ControllerError, Result};
 use crate::grants::Refusal;
-use crate::grants::feed::{FEED_POLL_INTERVAL_MS, RetainedRevocation};
+use crate::grants::feed::{FEED_POLL_INTERVAL_MS, FeedReading, RetainedRevocation};
 use crate::grants::restored::Target;
 use crate::quiet::{Quiet, Timer};
 use crate::service::remote_revocation::{DrainWhy, Ground, Judged, Replay, StuckDrain, Unverified};
@@ -804,15 +804,24 @@ impl FeedRuntime {
     /// What `kr doctor` says of the feed.
     #[must_use]
     pub fn doctor_check(&self, controller: &Controller) -> DoctorCheck {
-        let status = controller.authority_feed().status();
+        let FeedReading {
+            status,
+            synchronised_ago,
+        } = controller.authority_feed_reading();
         let observed = self.shared.observed();
         let now = controller.wall_now_ms();
-        let synchronised = match status.last_synchronised_at_ms.0 {
-            Some(at) => Sentence::new()
+        // The seconds are the age the verdict was judged by. Where that age cannot be told, no
+        // number is given: a figure from an earlier run's wall clock would say how long ago, and
+        // not how long since this daemon last read the feed.
+        let synchronised = match (synchronised_ago, status.last_synchronised_at_ms.0) {
+            (Some(ago), _) => Sentence::new()
                 .stated("it was last synchronised ")
-                .number(now.saturating_sub(at.get()) / 1000)
+                .number(ago.as_secs())
                 .stated(" seconds ago"),
-            None => Sentence::new().stated("it has not been synchronised"),
+            (None, None) => Sentence::new().stated("it has not been synchronised"),
+            (None, Some(_)) => {
+                Sentence::new().stated("it has not been synchronised since this daemon started")
+            }
         };
         let reads =
             Sentence::new().stated("this host reads its remote revocations from an authority feed");
@@ -854,7 +863,10 @@ impl FeedRuntime {
                         .stated("; ")
                         .sentence(&synchronised)
                         .stated(", so what is shown of it may be stale"),
-                    Some("This host reads the feed by itself shortly."),
+                    Some(
+                        "This host should read the feed by itself shortly. If it is still stale \
+                         after a few minutes, start the daemon again.",
+                    ),
                 )
             } else {
                 (

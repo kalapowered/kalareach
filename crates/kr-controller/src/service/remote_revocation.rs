@@ -798,7 +798,9 @@ impl Controller {
         let now = self.wall_now_ms();
         {
             let mut feed = self.authority_feed();
-            feed.synchronised(now);
+            // The instant is read under the feed's guard, as a status's reading is, so that no
+            // reader's instant is earlier than the one recorded here.
+            feed.synchronised(now, self.clock.now());
             if let Err(error) = self.keep_feed(&mut feed) {
                 eprintln!(
                     "kr-controller: could not write the authority feed's record down: {error}"
@@ -818,6 +820,16 @@ impl Controller {
     /// Notes that the feed could not be reached or read through, so what is shown is stale.
     pub(crate) fn authority_feed_unreachable(&self) {
         self.authority_feed().unreachable();
+    }
+
+    /// What this host shows of the authority feed now: the device list and `kr doctor` read it
+    /// here, so what they show is stale when the last synchronisation is older than three polls,
+    /// whether or not the carrier is still running.
+    ///
+    /// The clock is read under the feed's guard, so a synchronisation that finishes first is never
+    /// later than the reading that follows it.
+    pub(crate) fn authority_feed_reading(&self) -> crate::grants::feed::FeedReading {
+        self.authority_feed().reading(self.clock.now())
     }
 
     /// Refuses the grants that rest on the authority feed, from this moment: an organisation's

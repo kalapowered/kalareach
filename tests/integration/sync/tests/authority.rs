@@ -45,6 +45,7 @@ use kr_sync_integration::{
     Deployment, FeedClient, RunKey, SilentService, authority_feed_left, following_the_retry,
     fresh_uuid, now_ms, proved,
 };
+use kr_transport::clock::{ContinuousClock as _, SystemContinuousClock};
 
 /// One run's feed: a host that owns it, and a remote owner that publishes to it.
 ///
@@ -789,7 +790,7 @@ async fn kr_req_10_46_a_revision_that_does_not_follow_the_accepted_one_is_reject
         let mut restarted = AuthorityFeed::restore(&held.snapshot(), None);
         assert_eq!(restarted.accepted_revision(), AuthorityRevision::new(6));
         assert!(restarted.synchronisation_owed());
-        assert!(restarted.status().stale);
+        assert!(restarted.status(SystemContinuousClock::new().now()).stale);
         assert_eq!(
             restarted.accept(&following),
             Err(FeedRefusal::OutOfOrder {
@@ -894,8 +895,9 @@ async fn kr_req_10_46_a_synchronisation_is_owed_from_the_connection_until_one_ha
         // A host that has just connected owes a synchronisation, before any remote access it might
         // affect.
         let mut held = feed.record();
+        let clock = SystemContinuousClock::new();
         assert!(held.synchronisation_owed());
-        assert!(held.status().stale);
+        assert!(held.status(clock.now()).stale);
 
         // A feed that answered nothing does not satisfy it. The service the leg calls holds its own
         // port and closes every connection it accepts, so the exchange ends at the socket.
@@ -929,9 +931,9 @@ async fn kr_req_10_46_a_synchronisation_is_owed_from_the_connection_until_one_ha
             .read(feed.address(), None, true)
             .await
             .expect("the host reads its feed");
-        held.synchronised(at);
+        held.synchronised(at, clock.now());
         assert!(!held.synchronisation_owed());
-        assert!(!held.status().stale);
+        assert!(!held.status(clock.now()).stale);
         assert_eq!(
             u64::from(state.summary.poll_interval_seconds) * 1000,
             held.next_poll_due_ms().expect("a poll is due") - at,
@@ -941,7 +943,7 @@ async fn kr_req_10_46_a_synchronisation_is_owed_from_the_connection_until_one_ha
         // And a connection that was replaced owes one again.
         held.reconnected();
         assert!(held.synchronisation_owed());
-        assert!(held.status().stale);
+        assert!(held.status(clock.now()).stale);
 
         "the record reports a synchronisation owed from the moment a connection is established, keeps reporting it after an attempt that was not answered, stops once a read succeeded, counts the next poll from the interval the feed states, and owes one again when the connection is replaced".to_owned()
     })
@@ -992,8 +994,9 @@ async fn kr_req_10_46_an_unreachable_feed_is_stale_and_still_shows_the_last_ackn
             .expect("the host acknowledges it");
         assert!(state.summary.acknowledged_at.as_ref().is_some());
         held.acknowledge(&published, feed.owner.device_id());
-        held.synchronised(now_ms());
-        let current = held.status();
+        let clock = SystemContinuousClock::new();
+        held.synchronised(now_ms(), clock.now());
+        let current = held.status(clock.now());
         assert!(!current.stale);
 
         // Then the feed cannot be reached. The status goes stale and stays stale; it is never
@@ -1008,7 +1011,7 @@ async fn kr_req_10_46_an_unreachable_feed_is_stale_and_still_shows_the_last_ackn
         assert_eq!(failure.code(), ErrorCode::OutcomeUnknown);
         held.unreachable();
 
-        let stale = held.status();
+        let stale = held.status(clock.now());
         assert!(stale.stale, "an unavailable feed shows stale status");
         assert_eq!(
             stale.last_synchronised_at_ms, current.last_synchronised_at_ms,
