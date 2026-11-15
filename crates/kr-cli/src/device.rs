@@ -66,7 +66,8 @@ async fn list(paths: &HostPaths, arguments: &DeviceListArguments, json: bool) ->
             "; the revocation feed was removed, so this host learns no revocation from it, and \
              the grants that rest on the feed are refused until the owner acts at the host"
         } else if listed.feed_stale {
-            "; the revocation feed is unreachable, so what is shown may be stale"
+            "; this host's reading of the revocation feed is not current, so what is shown may \
+             be stale"
         } else {
             ""
         }

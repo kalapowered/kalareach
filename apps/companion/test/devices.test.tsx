@@ -426,6 +426,24 @@ describe('revoking a device', () => {
     expect(screen.getByText(/Reached through its feed at reach\.kala\.to/)).toBeVisible()
   })
 
+  it('says of a host whose reading of its feed is not current that it is not, and says it of no other', async () => {
+    screenOf(
+      view([
+        host({ name: 'the-studio', host_feed_stale: true }),
+        host({
+          reference: 'barn',
+          name: 'the-barn',
+          host_feed_stale: false,
+          devices: [device('the-cow', { state: 'active' })]
+        })
+      ])
+    )
+    await rowOf('the-phone')
+    const said = screen.getAllByText(/reading of the revocation feed is not current/)
+    expect(said).toHaveLength(1)
+    expect(said[0]).toHaveTextContent('the-studio')
+  })
+
   it('shows a standing kept from an earlier read of the feed as that, with when it was read', async () => {
     screenOf(
       view([

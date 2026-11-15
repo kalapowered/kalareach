@@ -284,7 +284,7 @@ export function describeFeed(
     lines.push(`${host.name} last read its feed ${whenOf(host.host_synchronised_at_ms, now)}.`)
   }
   if (host.host_feed_stale) {
-    lines.push(`${host.name} says it could not reach its feed at its last check.`)
+    lines.push(`${host.name} says its reading of the revocation feed is not current.`)
   }
   return lines
 }
