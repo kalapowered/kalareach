@@ -3657,8 +3657,9 @@ fn daemon_is_the_authority(
 ///   counted together with the names the daemon's entry lacks, with no overflow, and a sentence says
 ///   that up to that many may not be named, because the two counts need not describe the same names
 ///   and nothing in either entry says which of one's missing names the other lists; no name is taken
-///   off the figure. What `given` said of the revisions the worker had not said what its fence named
-///   for stays unless the daemon's own entry shows that the worker has said some since.
+///   off the figure. A sentence of `given`'s on revisions the worker had not said what its fence
+///   named for, cannot say, or whose fences are not read stays too, unless the daemon's own entry
+///   has the very same sentence ([`crate::authority::kept_sentences_beside`]).
 ///
 /// The sentence that this daemon holds no names under the revision goes only when names of `given`
 /// go into the entry.
