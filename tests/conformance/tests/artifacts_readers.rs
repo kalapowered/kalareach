@@ -241,6 +241,7 @@ impl Reader {
                     "-c",
                     r#". "$1"
                     [ -z "${KR_READER_CALLER_OPTION:-}" ] || shopt -s "$KR_READER_CALLER_OPTION"
+                    [ -z "${KR_READER_TMPDIR:-}" ] || export TMPDIR="$KR_READER_TMPDIR"
                     printf 'slash_tmp=%s\n' "$(cygpath -w /tmp 2>/dev/null)"
                     kr_artifacts_dir
                     printf 'nocasematch=%s\n' "$(shopt -q nocasematch && echo on || echo off)"
@@ -1226,11 +1227,142 @@ fn a_temporary_variable_with_a_backslash_is_passed_over_as_a_root_off_windows() 
         assert!(reading.succeeded, "{reader:?}: {reading:?}");
         let directory = reading.directory.clone().expect("a directory");
         assert!(
-            same(directory.parent().expect("a parent"), &real(Path::new("/tmp"))),
+            same(
+                directory.parent().expect("a parent"),
+                &real(Path::new("/tmp"))
+            ),
             "{reader:?}: the run's own directory is made under /tmp: {}",
             directory.display()
         );
         std::fs::remove_dir(&directory).expect("removes the directory the run made");
+    }
+}
+
+/// Stands in for `uname` and `cygpath` so that the shell reader takes the branch that Git Bash runs,
+/// on a machine that has no Windows: `uname` says Git Bash, and `cygpath` maps `C:\x` to a folder
+/// under `$KR_FAKE_DRIVES/c` and back. The folder it returns is a stub's folder, so the case shows
+/// how the reader builds a path and not how Git Bash converts one (the cases on a Windows machine
+/// show that).
+#[cfg(unix)]
+fn windows_stub() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let stub = tempfile::tempdir().expect("a folder for the stubs");
+    let programs = [
+        ("uname", "#!/bin/sh\necho MINGW64_NT-10.0\n"),
+        (
+            "cygpath",
+            r#"#!/bin/bash
+mode=$1
+shift
+[ "$1" = -- ] && shift
+v=${1//\\//}
+case $mode in
+  -u) printf '%s/%s%s\n' "$KR_FAKE_DRIVES" "$(printf '%s' "${v:0:1}" | tr A-Z a-z)" "${v:2}" ;;
+  -w)
+    case $v in
+      "$KR_FAKE_DRIVES"/?/*)
+        rest=${v#"$KR_FAKE_DRIVES"/?}
+        d=${v#"$KR_FAKE_DRIVES"/}
+        printf '%s:%s\n' "$(printf '%s' "${d:0:1}" | tr a-z A-Z)" "${rest//\//\\}"
+        ;;
+      *) printf '%s\n' "$v" ;;
+    esac
+    ;;
+esac
+"#,
+        ),
+    ];
+    for (name, text) in programs {
+        let path = stub.path().join(name);
+        std::fs::write(&path, text).expect("writes a stub");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("runs");
+    }
+    stub
+}
+
+/// Every path that a reader builds is built from the form that its own classifier returns, never
+/// from the written value: the shell reader's own directory under a temporary folder written behind
+/// `\\?\` in backslashes (the folder that the roots accept) is made there, where adding a name to
+/// the written folder would put a slash behind the prefix and the reader would refuse its own path.
+/// Run under the stubbed Git Bash branch, by the first bash of the search path and by the system's.
+#[cfg(unix)]
+#[test]
+fn the_shell_readers_own_directory_is_made_under_the_folder_in_the_form_it_reads() {
+    let drives = tempfile::tempdir().expect("a folder for the drives");
+    let drives_real = real(drives.path());
+    let folder = drives_real.join("c").join("Users").join("kr").join("Temp");
+    std::fs::create_dir_all(&folder).expect("a temporary folder");
+    let stub = windows_stub();
+    let path = format!(
+        "{}:{}",
+        stub.path().display(),
+        std::env::var("PATH").expect("PATH")
+    );
+    for reader in [Reader::Shell, Reader::SystemShell] {
+        if matches!(reader, Reader::SystemShell) && system_shell().is_none() {
+            continue;
+        }
+        for written in [
+            r"C:\Users\kr\Temp",
+            r"C:/Users/kr/Temp/",
+            r"\\?\C:\Users\kr\Temp",
+            r"\\?\C:\Users\kr\Temp\",
+        ] {
+            let reading = reader.read_with(
+                None,
+                Some(Path::new(written)),
+                &[
+                    ("PATH", OsStr::new(&path)),
+                    ("KR_FAKE_DRIVES", drives_real.as_os_str()),
+                ],
+            );
+            assert!(
+                reading.succeeded,
+                "{reader:?} refused the run's own directory under {written}: {reading:?}"
+            );
+            let directory = reading.directory.clone().expect("a directory");
+            assert_eq!(
+                directory.parent(),
+                Some(folder.as_path()),
+                "{reader:?} under {written}: {directory:?}"
+            );
+            std::fs::remove_dir(&directory).expect("removes the directory the run made");
+        }
+    }
+}
+
+/// A drive's letter is an ASCII letter in every locale: bash 3.2 reads a range such as `A-Za-z` by
+/// collation under a UTF-8 locale and would take `é:\x` for a drive.
+#[cfg(unix)]
+#[test]
+fn a_drive_letter_is_an_ascii_letter_in_every_locale() {
+    let drives = tempfile::tempdir().expect("a folder for the drives");
+    let drives_real = real(drives.path());
+    let stub = windows_stub();
+    let path = format!(
+        "{}:{}",
+        stub.path().display(),
+        std::env::var("PATH").expect("PATH")
+    );
+    for reader in readers_and_system_shell()
+        .into_iter()
+        .filter(|reader| reader.is_shell())
+    {
+        let reading = reader.read_with(
+            Some(OsStr::new("\u{e9}:\\kr-evidence")),
+            None,
+            &[
+                ("PATH", OsStr::new(&path)),
+                ("KR_FAKE_DRIVES", drives_real.as_os_str()),
+                ("LC_ALL", OsStr::new("en_US.UTF-8")),
+            ],
+        );
+        assert_refused(
+            reader,
+            &reading,
+            "a value that begins with é:",
+            "not an absolute path",
+        );
     }
 }
 
@@ -2017,6 +2149,42 @@ mod windows_paths {
                 "{reader:?}: {}",
                 reading.words
             );
+        }
+    }
+
+    /// Every path that a reader builds is built from the form that its own classifier returns: the
+    /// run's own directory under a temporary folder written behind `\\?\` is made there, by the
+    /// shell reader (which reads the folder from `TMPDIR`, set inside Git Bash as a caller's shell
+    /// sets it) and by PowerShell (which reads `TMP`).
+    #[test]
+    fn the_runs_own_directory_is_made_under_a_temporary_folder_written_in_the_extended_form() {
+        let temporary = tempfile::tempdir().expect("a temporary folder");
+        let ordinary = real(temporary.path());
+        let extended = PathBuf::from(format!(r"\\?\{}", ordinary.display()));
+        for reader in readers() {
+            let named: Vec<(&str, &OsStr)> = if reader.is_shell() {
+                vec![
+                    ("KR_READER_TMPDIR", extended.as_os_str()),
+                    ("TEMP", ordinary.as_os_str()),
+                    ("TMP", ordinary.as_os_str()),
+                ]
+            } else {
+                vec![
+                    ("TMP", extended.as_os_str()),
+                    ("TEMP", extended.as_os_str()),
+                ]
+            };
+            let reading = reader.read_with(None, None, &named);
+            assert!(
+                reading.succeeded,
+                "{reader:?} refused its own directory under {extended:?}: {reading:?}"
+            );
+            let directory = reading.directory.clone().expect("a directory");
+            assert!(
+                same(directory.parent().expect("a parent"), &ordinary),
+                "{reader:?}: {directory:?}"
+            );
+            std::fs::remove_dir(&directory).expect("removes the directory the run made");
         }
     }
 }

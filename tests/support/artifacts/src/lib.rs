@@ -656,7 +656,10 @@ mod tests {
             assert!(!output.status.success(), "{value:?}: {output:?}");
             let words = String::from_utf8_lossy(&output.stderr);
             assert!(words.contains("not inside a temporary root"), "{words}");
-            assert!(!words.contains("a\\b"), "a root that holds a backslash: {words}");
+            assert!(
+                !words.contains("a\\b"),
+                "a root that holds a backslash: {words}"
+            );
         }
         let output = read_in_a_run_with(None, None, &named);
         assert!(output.status.success(), "{output:?}");
@@ -777,6 +780,12 @@ mod tests {
             confine_in(&extended, std::slice::from_ref(&real)).expect("inside"),
             real.join("evidence")
         );
+        // The run's own directory under a temporary folder written in the extended form is made
+        // there: it is named from the folder as a path, never from its written text.
+        let temporary = PathBuf::from(format!(r"\\?\{text}"));
+        let own = own_in(&temporary, std::slice::from_ref(&real));
+        assert_eq!(own.parent(), Some(real.as_path()));
+        std::fs::remove_dir(&own).expect("removes the run's own directory");
     }
 
     #[cfg(windows)]
