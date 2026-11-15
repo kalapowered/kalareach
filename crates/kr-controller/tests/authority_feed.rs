@@ -4505,6 +4505,20 @@ async fn soon<T>(what: &str, work: impl std::future::Future<Output = T>) -> T {
         .unwrap_or_else(|_| panic!("gave up waiting for {what}"))
 }
 
+/// The next look the carrier takes at the continuous clock, with the means to end it. The case
+/// counts the looks by a timer of its own, so a look is exactly as long as the carrier asked for:
+/// five seconds. A longer look asks the feed late after a wake, and a look of no length is a spin,
+/// so every look that a case takes is checked from above and from below.
+async fn a_look(what: &str, looks: &HeldTimer) -> Arc<tokio::sync::Notify> {
+    let (length, release) = soon(what, looks.next_wait()).await;
+    assert_eq!(
+        length,
+        Duration::from_secs(5),
+        "every look at the continuous clock is five seconds long"
+    );
+    release
+}
+
 /// KR-REQ-10.46: a machine that slept through the carrier's wait asks the feed again within five
 /// seconds of waking, with nothing to wake the carrier: the timer a wait is made by does not count
 /// the time a machine sleeps on macOS and Linux, so the wait is also over when the daemon's
@@ -4525,11 +4539,7 @@ async fn a_carrier_that_slept_through_its_wait_reads_the_feed_within_five_second
         !shown.list.feed_stale,
         "the control: the feed was just read, and the timer has most of its thirty seconds left"
     );
-    let (look, release) = soon("the carrier looks at the clock", looks.next_wait()).await;
-    assert!(
-        look <= Duration::from_secs(5),
-        "the carrier reads the clock at least every five seconds: {look:?}"
-    );
+    let release = a_look("the carrier looks at the clock", &looks).await;
     let wakes = rig.runtime().wakes();
     let reads = rig.arrivals("read");
     let mut passes = rig.runtime().passes();
@@ -4538,7 +4548,7 @@ async fn a_carrier_that_slept_through_its_wait_reads_the_feed_within_five_second
     // Twenty seconds on, a look finds the poll's end ahead, and asks nothing.
     moved.advance_continuous(Duration::from_secs(20));
     release.notify_one();
-    let (_, release) = soon("the carrier looks again", looks.next_wait()).await;
+    let release = a_look("the carrier looks again", &looks).await;
     assert_eq!(
         (rig.arrivals("read"), *passes.borrow()),
         (reads, seen),
@@ -4592,11 +4602,7 @@ async fn a_carrier_that_slept_past_a_delay_the_feed_named_reads_the_feed_within_
         rig.shown().await.list.feed_stale,
         "the control: the pass could not read the feed"
     );
-    let (look, release) = soon("the carrier looks at the clock", looks.next_wait()).await;
-    assert!(
-        look <= Duration::from_secs(5),
-        "the carrier reads the clock at least every five seconds: {look:?}"
-    );
+    let release = a_look("the carrier looks at the clock", &looks).await;
     let wakes = rig.runtime().wakes();
     let reads = rig.arrivals("read");
     let mut passes = rig.runtime().passes();
@@ -4605,7 +4611,7 @@ async fn a_carrier_that_slept_past_a_delay_the_feed_named_reads_the_feed_within_
     // A minute on, the delay is not over, and a look asks nothing.
     moved.advance_continuous(Duration::from_secs(60));
     release.notify_one();
-    let (_, release) = soon("the carrier looks again", looks.next_wait()).await;
+    let release = a_look("the carrier looks again", &looks).await;
     assert_eq!(
         (rig.arrivals("read"), *passes.borrow()),
         (reads, seen),
