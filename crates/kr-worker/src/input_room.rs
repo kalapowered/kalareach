@@ -327,9 +327,10 @@ impl InputRoom {
         self.replies_waiting.load(Ordering::SeqCst)
     }
 
-    /// Wakes the pump if answers wait in the lane, once room has come back. The fence pairs with
+    /// Wakes the pump if answers wait in the lane, once room has come back: a debt that is given
+    /// back, a promise that is returned, or the window of a lane that ends. The fence pairs with
     /// the one in [`Self::publish_waiting_replies`].
-    fn wake_pump_if_replies_wait(&self) {
+    pub(crate) fn wake_pump_if_replies_wait(&self) {
         fence(Ordering::SeqCst);
         if self.replies_waiting() {
             self.pump.notify_one();
@@ -503,6 +504,10 @@ impl Drop for ClaimGuard {
         // The counters are lower first and the request comes after, so a top-up that took the
         // request before this line reads them again when this one asks.
         self.room.topup.request();
+        // The promise is room for the answers that wait in the lane, and the writer drops the
+        // debt of a batch, and wakes the pump for it, before it drops the guard: that look read
+        // the room with the promise still counted, so the pump looks again.
+        self.room.wake_pump_if_replies_wait();
     }
 }
 

@@ -3009,6 +3009,109 @@ async fn room_given_back_after_the_pumps_pass_has_ended_brings_the_waiting_answe
     });
 }
 
+/// KR-REQ-08.48 and KR-REQ-08.49: the room that a lane's window gives back when the lane ends
+/// brings the waiting answer out of the response lane, though the writer gives nothing back and
+/// nothing else happens.
+///
+/// A person's writes fill half of the room and the writer holds them, so none of it returns. A lane
+/// binds, and its window keeps back what is left, so the room that the host's own answers may take
+/// is nothing and one answer waits in the lane. The pump has looked once and said that it waits.
+/// The lane's link then ends by itself. The writer stays held and the lane's clock stands still:
+/// only the end of the lane can bring the answer out.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_room_a_lane_gives_back_when_it_ends_brings_the_waiting_answer_out() {
+    let (_host, runtime, _clock, _session_id, holder, epoch) = silent_session().await;
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
+    let room = runtime.input().lock().input_room();
+    let (writer_stopped, release_writer) = runtime.input().writer_hold().arm();
+    {
+        let mut session = runtime.session();
+        for sequence in 0..16 {
+            session
+                .write_input(
+                    holder,
+                    epoch,
+                    sequence,
+                    &[b'x'; 32 * 1024],
+                    None,
+                    Instant::now(),
+                )
+                .expect("the room has space");
+            runtime.flush_input();
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(20), writer_stopped)
+        .await
+        .expect("the writer takes the first batch")
+        .expect("the writer's stop fires");
+    let lane = runtime
+        .input()
+        .lock()
+        .bind_lane(
+            holder,
+            kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid()),
+            || Ok(()),
+        )
+        .expect("the lane binds");
+    let ledger = runtime.input().lock().ledger();
+    assert_eq!(
+        ledger.free.bytes, 0,
+        "the window keeps back what the writes left: {ledger:?}"
+    );
+
+    // The answer's first wait, and the pump's pass that follows it, which is stopped after it has
+    // read the room and before it says that the answer waits.
+    let (pump_stopped, release_pump) = {
+        let mut session = runtime.session();
+        session.ingest_output(STATUS_QUESTION);
+        runtime.input().pump_hold().arm_blocking()
+    };
+    tokio::time::timeout(Duration::from_secs(20), pump_stopped)
+        .await
+        .expect("the pump's pass reads the room")
+        .expect("the pump's stop fires");
+    drop(release_pump);
+    // Taking the domain waits for that pass to end, so what follows is after the pass has read the
+    // room, and it has said that the answer waits.
+    assert!(
+        runtime.input().lock().replies_waiting(),
+        "the pump's pass says that the answer waits"
+    );
+    assert_eq!(room.held_replies(), 0, "no room was left for the answer");
+
+    runtime.input().lock().end_lane(lane.id);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while room.held_replies() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the answer waits in the lane after the lane ended: the room is {:?}",
+            runtime.input().lock().ledger()
+        )
+    });
+
+    // The writer goes on and writes the answer.
+    drop(release_writer);
+    let written = || -> usize {
+        runtime
+            .input()
+            .terminal_writes()
+            .iter()
+            .map(|write| count(&write.bytes, STATUS_ANSWER))
+            .sum()
+    };
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while written() < 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the writer writes the answer");
+}
+
 /// KR-REQ-08.48 and KR-REQ-08.49: an answer that waits behind an open paste is dropped at its own
 /// deadline, with its record, though the paste stays open and nothing else happens, and it is
 /// never written.

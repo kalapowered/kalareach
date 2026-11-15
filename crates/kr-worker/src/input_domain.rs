@@ -2161,6 +2161,10 @@ impl InputDomain {
         }
         if self.window.as_ref().is_some_and(|window| window.lane == id) {
             self.window = None;
+            // What the window kept back is room for the answers that wait in the lane, and the end
+            // of a lane is followed by no pass of the pump when the link ends by itself or the
+            // lane breaches its credit.
+            self.writer.room.wake_pump_if_replies_wait();
         }
     }
 
