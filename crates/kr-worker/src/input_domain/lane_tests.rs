@@ -832,3 +832,53 @@ fn the_answers_allowance_leaves_the_room_the_window_keeps_back() {
         "the allowance passes what is left of the room: {allowance:?} against {ledger:?}"
     );
 }
+
+/// Whether the pump was woken since the last call, which takes the wake.
+fn woken(pump: &tokio::sync::Notify) -> bool {
+    use std::future::Future;
+    let mut notified = std::pin::pin!(pump.notified());
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    notified.as_mut().poll(&mut context).is_ready()
+}
+
+/// The writer drops a batch's debt before the guard of its write, and the promise that the guard
+/// gives back is room too: the pump, which looks again when the debt is dropped and reads the room
+/// with the promise still counted, is woken again when the guard is dropped, if answers wait.
+#[test]
+fn a_promise_given_back_after_its_batch_wakes_the_pump_for_the_answers_that_wait() {
+    let mut rig = Rig::new();
+    let mut view = View::new();
+    rig.take(&mut view);
+    for _ in 0..31 {
+        rig.write(&mut view, None, &[b'x'; 32 * 1024])
+            .expect("the room has space");
+    }
+    // The writer holds every batch, and is done with the last one.
+    let mut with_the_writer = rig.input.take_pending();
+    let mut last = with_the_writer.pop().expect("the last batch");
+    assert!(last.guard.is_some(), "the last batch is a write's");
+    let pump = rig.input.input_room().pump();
+    rig.input.set_replies_waiting(true);
+    assert!(!woken(&pump), "nothing has woken the pump yet");
+    let before = rig.input.reply_allowance();
+
+    drop(last.debt.take());
+    assert!(woken(&pump), "the debt that is given back wakes the pump");
+    let with_the_promise = rig.input.reply_allowance();
+    assert!(
+        with_the_promise.bytes > before.bytes,
+        "the debt gave room back: {before:?} then {with_the_promise:?}"
+    );
+
+    drop(last);
+    let without_it = rig.input.reply_allowance();
+    assert!(
+        without_it.bytes > with_the_promise.bytes,
+        "the promise gave room back: {with_the_promise:?} then {without_it:?}"
+    );
+    assert!(
+        woken(&pump),
+        "the pump is not woken for the room that the promise gave back"
+    );
+    drop(with_the_writer);
+}
