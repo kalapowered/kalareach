@@ -34,8 +34,17 @@ fn read_whole<T: kr_protocol::wire::WireMessage>(params: &ParamsValue) -> Result
 /// A release's or a detach's barrier names the request's own attachment: the request orders itself
 /// after its own typing. A detach that names no attachment has no subject here: a worker that
 /// states the lane resolves it and judges the barrier against the attachment it finds, and
-/// [`refuse_detach_without_attachment`] refuses it for any other worker. A launch's barrier names
-/// the holder of the lease, which only the worker knows.
+/// [`refuse_detach_without_attachment`] refuses it for any other worker.
+///
+/// A launch's barrier names the holder of the lease, which only the worker knows. Limit for a
+/// worker that states no lane: the host is told nothing of that worker's lease, and a record of its
+/// own could differ from the worker's and refuse what the worker would take; it cannot refuse every
+/// launch barrier either, since a person would lose the typing held for the launch. So a launch's
+/// barrier is judged at the stream that it names, and the host takes it out before it forwards. A
+/// device that names another attachment of its own connection in a launch's barrier gets its launch
+/// ordered after that other attachment's typing, or not ordered at all, which is what a launch with
+/// no barrier gets. The effect is on the sender's own typing order alone. A worker that states the
+/// lane refuses the shape itself, before it acts.
 ///
 /// # Errors
 ///
@@ -55,6 +64,7 @@ pub(in crate::service::net) fn barrier_of(
             let params = read_whole::<SessionDetachParams>(&mutation.params)?;
             (params.after_input, params.attachment_id.0)
         }
+        // A launch has no subject here: see the limit above.
         Some(Method::ShellLaunch) => (
             read_whole::<ShellLaunchParams>(&mutation.params)?.after_input,
             None,
