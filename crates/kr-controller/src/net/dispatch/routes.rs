@@ -962,7 +962,7 @@ impl RemoteConnection {
                 // host named as the owner of what it produces. Without it, an identifier spent on
                 // a create would be free for a mutation on a worker, and section 9 makes
                 // `(verified actor, action)` one operation whoever ends up holding its receipt.
-                if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
+                if let Err(refusal) = self.claim_route(mutation, None, validated, own_claim) {
                     return Err(refusal.into_error());
                 }
                 let controller = Arc::clone(&self.controller);
@@ -1015,7 +1015,7 @@ impl RemoteConnection {
                 // A conflicting identifier refuses the close; storage that cannot record the
                 // route does not. Section 7 has an authorised stop go ahead when storage fails,
                 // and the worker reports what its own durability then was.
-                match self.claim_route(mutation, Some(session_id), own_claim) {
+                match self.claim_route(mutation, Some(session_id), validated, own_claim) {
                     Ok(()) | Err(RouteRefusal::Unavailable(_)) => {}
                     Err(RouteRefusal::Conflict(error)) => {
                         return Err(error);
@@ -1120,7 +1120,7 @@ impl RemoteConnection {
                 // A project mutation claims its action identity the way every other mutation
                 // does, with this host named as the owner of what it produces. Storage that
                 // cannot record the route refuses it: only section 7's stop goes on without one.
-                if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
+                if let Err(refusal) = self.claim_route(mutation, None, validated, own_claim) {
                     return Err(refusal.into_error());
                 }
                 let controller = Arc::clone(&self.controller);
@@ -1166,7 +1166,7 @@ impl RemoteConnection {
             // materialisation without the host path of its directory.
             DeviceWrite::Materialisation => {
                 self.check_materialisation(mutation).await?;
-                if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
+                if let Err(refusal) = self.claim_route(mutation, None, validated, own_claim) {
                     return Err(refusal.into_error());
                 }
                 let controller = Arc::clone(&self.controller);
@@ -1210,7 +1210,7 @@ impl RemoteConnection {
                     super::narrowing::Earlier::Nothing,
                 )
                 .await?;
-                if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
+                if let Err(refusal) = self.claim_route(mutation, None, validated, own_claim) {
                     return Err(refusal.into_error());
                 }
                 let controller = Arc::clone(&self.controller);
@@ -1257,7 +1257,7 @@ impl RemoteConnection {
                 // what a device that lost its connection has left to say the daemon owns the
                 // receipt. Storage that cannot record it refuses the mutation: only section 7's
                 // stop goes on without a route.
-                if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
+                if let Err(refusal) = self.claim_route(mutation, None, validated, own_claim) {
                     return Err(refusal.into_error());
                 }
                 let carried = crate::authority::AdmittedMutation {
@@ -1315,7 +1315,7 @@ impl RemoteConnection {
                 {
                     return Err(error.to_protocol_error());
                 }
-                if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
+                if let Err(refusal) = self.claim_route(mutation, None, validated, own_claim) {
                     return Err(refusal.into_error());
                 }
                 let controller = Arc::clone(&self.controller);
@@ -1368,7 +1368,7 @@ impl RemoteConnection {
                 // its own record of the answer, and this claim is what makes `(verified actor,
                 // action)` one key across every route: an identifier a voice mutation used is not
                 // free for a create or a close, and the other way round.
-                if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
+                if let Err(refusal) = self.claim_route(mutation, None, validated, own_claim) {
                     return Err(refusal.into_error());
                 }
                 // The admission travels with the change, as it does with a project or an
@@ -1408,7 +1408,7 @@ impl RemoteConnection {
             // what it came to under the claim before it is answered, so a retry is answered from
             // that record.
             DeviceWrite::Rename => {
-                if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
+                if let Err(refusal) = self.claim_route(mutation, None, validated, own_claim) {
                     return Err(refusal.into_error());
                 }
                 let controller = Arc::clone(&self.controller);
@@ -1499,7 +1499,7 @@ impl RemoteConnection {
             // committed with its answer and answered on a task that outlives this connection, so
             // a retry is answered from that record.
             DeviceWrite::Redemption => {
-                if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
+                if let Err(refusal) = self.claim_route(mutation, None, validated, own_claim) {
                     return Err(refusal.into_error());
                 }
                 let controller = Arc::clone(&self.controller);
@@ -1575,7 +1575,7 @@ impl RemoteConnection {
                         ));
                     }
                 }
-                if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
+                if let Err(refusal) = self.claim_route(mutation, None, validated, own_claim) {
                     return Err(refusal.into_error());
                 }
                 let controller = Arc::clone(&self.controller);
@@ -1615,7 +1615,7 @@ impl RemoteConnection {
             // step is claimed, written and its receipt kept on a task that outlives this
             // connection, so a retry is answered from that record.
             DeviceWrite::MachineGroup => {
-                if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
+                if let Err(refusal) = self.claim_route(mutation, None, validated, own_claim) {
                     return Err(refusal.into_error());
                 }
                 let controller = Arc::clone(&self.controller);
@@ -1648,7 +1648,7 @@ impl RemoteConnection {
             // connection that ends does not cut a presentation between its policy write and its
             // fence; the device that was not answered presents the same lease again.
             DeviceWrite::Membership => {
-                if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
+                if let Err(refusal) = self.claim_route(mutation, None, validated, own_claim) {
                     return Err(refusal.into_error());
                 }
                 if self.controller.clock.now() >= accepted.deadline {
@@ -1676,7 +1676,7 @@ impl RemoteConnection {
                 settled(request_id, self.controller.within_effect_wait(effect).await)
             }
             DeviceWrite::PreviewKey => {
-                if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
+                if let Err(refusal) = self.claim_route(mutation, None, validated, own_claim) {
                     return Err(refusal.into_error());
                 }
                 let actor_id = self.device.principal();
@@ -1730,7 +1730,7 @@ impl RemoteConnection {
             // after its window has closed. What reaches this arm is a first request or a copy of
             // one still running, which the claim in `push_register_action` answers.
             DeviceWrite::PushRegistration => {
-                if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
+                if let Err(refusal) = self.claim_route(mutation, None, validated, own_claim) {
                     return Err(refusal.into_error());
                 }
                 let actor_id = self.device.principal();
@@ -1761,7 +1761,7 @@ impl RemoteConnection {
             // transaction that writes the keys asks about it again and records the outcome beside
             // them, which is what a retry of this action is answered from.
             DeviceWrite::KeysComplete => {
-                if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
+                if let Err(refusal) = self.claim_route(mutation, None, validated, own_claim) {
                     return Err(refusal.into_error());
                 }
                 let carried = crate::authority::AdmittedMutation {
@@ -1785,7 +1785,7 @@ impl RemoteConnection {
             // that act under the grant it holds, so a workflow cannot give it rights its grant
             // does not carry.
             DeviceWrite::Automation => {
-                if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
+                if let Err(refusal) = self.claim_route(mutation, None, validated, own_claim) {
                     return Err(refusal.into_error());
                 }
                 let controller = Arc::clone(&self.controller);
@@ -1823,7 +1823,7 @@ impl RemoteConnection {
             DeviceWrite::Pairing => {
                 // A pairing mutation claims its action identity the way every other mutation does,
                 // with this host named as the owner of what it produces.
-                if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
+                if let Err(refusal) = self.claim_route(mutation, None, validated, own_claim) {
                     return Err(refusal.into_error());
                 }
                 if self.controller.clock.now() >= accepted.deadline {
