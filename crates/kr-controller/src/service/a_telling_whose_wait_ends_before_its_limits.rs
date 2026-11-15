@@ -6,7 +6,8 @@
 //! which of those timers the runtime sees first must decide nothing: the wait ends a whole
 //! exchange's time before the deadline, where no further notice can begin, and gives the link back
 //! there, with nothing on the wire. The write the wait is for may still finish after it, until the
-//! deadline, before the next caller has the link.
+//! deadline, before the next caller has the link. An answer that is read at or after that instant
+//! is decided by the clock before any timer is polled: the link goes back at once.
 //!
 //! The worker here answers a notice only when a test lets it, so a test holds the registry before
 //! the first answer arrives and learns what the daemon did from its own records: the slot, the lease
@@ -309,19 +310,17 @@ async fn a_limit_that_ends_near_the_deadline_finds_the_link_already_given_back()
     silent.serving.abort();
 }
 
-/// KR-REQ-09.12: the write that a wait for the registry is for finishes when the registry is let
-/// go after the wait ended, and leaves the row as the acknowledgement of the first notice.
+/// What an ask of [`ASK`] seconds leaves when the first of its notices is answered `answer_after`
+/// into it and the registry is held from before the answer until two seconds before the deadline.
+/// The worker has a row in the registry, so the write of its acknowledged revision has a row to go
+/// to. The ask answers `Failed`, since no further notice can begin; the row records the
+/// acknowledgement of the first notice, written with the slot held; and the link is back whole.
 ///
-/// The wait ends five seconds before the deadline, and the registry is let go three seconds later,
-/// two before the deadline. The link has gone back by then, and the write is made with the slot still
-/// held, so that the next caller of the link finds it recorded. The ask, which could send no more,
-/// answers `Failed`.
-///
-/// The worker has a row, so it is pending, and the daemon's own pass would ask it too, and send a
-/// notice of its own that the count of frames and the slot would take for this ask's. The pass's
-/// asks are held for the case.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_write_that_finishes_after_the_wait_ended_leaves_the_row_right() {
+/// The pass's asks are held: the worker is pending, so the daemon's own pass would ask it too, and
+/// send a notice of its own that the count of frames and the slot would take for this ask's.
+async fn the_row_is_right_when_the_registry_is_held_until_near_the_deadline(
+    answer_after: Duration,
+) {
     let (silent, heard) = answered().await;
     silent.controller.hold_the_pass_asks_for_tests(true);
     record_the_worker(&silent).await;
@@ -349,6 +348,7 @@ async fn a_write_that_finishes_after_the_wait_ended_leaves_the_row_right() {
             })
             .await;
             let held = controller.registry.lock().await;
+            tokio::time::sleep_until(until_when - ASK + answer_after).await;
             heard.answer.add_permits(1);
             tokio::time::sleep_until(until_when - Duration::from_secs(2)).await;
             drop(held);
@@ -370,4 +370,28 @@ async fn a_write_that_finishes_after_the_wait_ended_leaves_the_row_right() {
     );
     the_link_went_back_whole(&silent, &heard).await;
     silent.serving.abort();
+}
+
+/// KR-REQ-09.12: the write that a wait for the registry is for finishes when the registry is let
+/// go after the wait ended, and leaves the row as the acknowledgement of the first notice.
+///
+/// The wait ends five seconds before the deadline, and the registry is let go three seconds later,
+/// two before the deadline. The link has gone back by then, and the write is made with the slot still
+/// held, so that the next caller of the link finds it recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_that_finishes_after_the_wait_ended_leaves_the_row_right() {
+    the_row_is_right_when_the_registry_is_held_until_near_the_deadline(Duration::ZERO).await;
+}
+
+/// KR-REQ-09.12: an answer that is read after the last instant a notice could begin finds the
+/// link given back at once, and the write for it finishes as it does when the wait ends there.
+///
+/// The worker answers six seconds into the ask's ten, a second after the instant five seconds
+/// before the deadline, with the registry held: the clock says that no notice can begin before the
+/// write has been waited for at all. The link is given back, and the write is made, with the slot
+/// still held, when the registry is let go two seconds before the deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_read_after_the_last_instant_a_notice_could_begin_finds_the_link_given_back() {
+    the_row_is_right_when_the_registry_is_held_until_near_the_deadline(Duration::from_secs(6))
+        .await;
 }

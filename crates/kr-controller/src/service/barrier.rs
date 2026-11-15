@@ -1157,11 +1157,11 @@ impl Controller {
     /// left before it, and ends by it: that is asked as each begins, the first and each after the
     /// wait for the registry that follows an earlier acknowledgement. That wait ends a whole
     /// exchange's time before the deadline, the last instant a notice could begin after it, and
-    /// the link goes back there; the write it waits for may finish, with the slot still held,
-    /// until the deadline. Where a notice cannot
-    /// begin, nothing more is sent and the link goes back whole, here, since what was sent before
-    /// was answered to its end. The answer is [`Told::Failed`], and the caller does not put the
-    /// link back again.
+    /// the link goes back there, or at once when the answer is read at or after that instant; the
+    /// write it waits for may finish, with the slot still held, until the deadline. Where a notice
+    /// cannot begin, nothing more is sent and the link goes back whole, here, since what was sent
+    /// before was answered to its end. The answer is [`Told::Failed`], and the caller does not put
+    /// the link back again.
     ///
     /// Each is a revision of its own, acknowledged as one ([`Self::note_earlier_acknowledgement`]).
     /// All are recorded as announced before any is sent, and with them what the result of each reads
@@ -1210,15 +1210,19 @@ impl Controller {
                     // The telling's own limit and the bound of the ask end at `until` too. The
                     // link goes back here, a whole exchange's time before it, where no notice can
                     // begin any more: no frame is on the wire, and which of those timers the
-                    // runtime sees first decides nothing. The write of the row may still finish,
-                    // with the slot held, until `until`.
+                    // runtime sees first decides nothing. An answer that is read at or after
+                    // that instant is decided by the clock, before any timer is polled: a task
+                    // that has spent its budget on that read polls no timer of this wait, and
+                    // the bound of the ask, which is later, could drop the link first. The write
+                    // of the row may still finish, with the slot held, until `until`.
                     let mut noted = std::pin::pin!(noted);
                     let no_notice_after = until
                         .checked_sub(WORKER_EXCHANGE)
                         .unwrap_or_else(tokio::time::Instant::now);
-                    if tokio::time::timeout_at(no_notice_after, &mut noted)
-                        .await
-                        .is_err()
+                    if tokio::time::Instant::now() >= no_notice_after
+                        || tokio::time::timeout_at(no_notice_after, &mut noted)
+                            .await
+                            .is_err()
                     {
                         link.give_back();
                         let _ = tokio::time::timeout_at(until, &mut noted).await;
