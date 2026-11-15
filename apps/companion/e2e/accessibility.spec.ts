@@ -286,7 +286,6 @@ async function watchClicks(page: Page): Promise<void> {
 
 const clicksSeen = (page: Page): Promise<Clicked[]> =>
   page.evaluate(() => (window as unknown as { clicks: Clicked[] }).clicks.slice())
-const looksSeen = (page: Page): Promise<Look[]> => page.evaluate(() => (window as unknown as { looks: Look[] }).looks.slice())
 
 /** The clicks the browser made itself, seen before any handler: what the page was given. */
 const browsers = (clicks: readonly Clicked[]): Clicked[] => clicks.filter((click) => click.phase === 'capture' && click.trusted)
@@ -424,6 +423,67 @@ async function tapNow(page: Page, x: number, y: number): Promise<void> {
   await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
 }
 
+/** How many clicks, pointer-down looks and opened links the page has recorded: what a tap's records start after. */
+interface Mark {
+  readonly clicks: number
+  readonly looks: number
+  readonly opened: number
+}
+
+const marked = (page: Page): Promise<Mark> =>
+  page.evaluate(() => ({
+    clicks: (window as unknown as { clicks: Clicked[] }).clicks.length,
+    looks: (window as unknown as { looks: Look[] }).looks.length,
+    opened: window.krTestHost?.openedLinks.length ?? 0
+  }))
+
+/**
+ * What the page recorded after `mark`, once the browser's own click is in: the page waits for that click
+ * itself (a click is a trusted one at the window's capture phase, the same test as `browsers`), for at
+ * most `within` ms, and then for the end of that click's dispatch, in which the page's handler makes its
+ * own click and opens its link. The lists are cut in the page, so a tap moves only its own records
+ * however many taps went before it. `arrived` is false where no click came in time.
+ */
+const recordedSince = (page: Page, mark: Mark, within: number): Promise<{ arrived: boolean; clicks: Clicked[]; looks: Look[]; opened: string[] }> =>
+  page.evaluate(
+    async ({ after, limit }) => {
+      const records = window as unknown as { clicks: Clicked[]; looks: Look[] }
+      const browsersClick = (): boolean => records.clicks.slice(after.clicks).some((click) => click.phase === 'capture' && click.trusted)
+      let arrived = browsersClick()
+      if (!arrived) {
+        arrived = await new Promise<boolean>((resolve) => {
+          const listening = new AbortController()
+          const timer = window.setTimeout(() => {
+            listening.abort()
+            resolve(false)
+          }, limit)
+          // Added after the cases' own listener, so the click is in the list when this one runs.
+          window.addEventListener(
+            'click',
+            () => {
+              if (!browsersClick()) return
+              window.clearTimeout(timer)
+              listening.abort()
+              resolve(true)
+            },
+            { capture: true, signal: listening.signal }
+          )
+        })
+      }
+      // The window's capture phase comes first: the page's handler runs later in the same dispatch, which ends before the next task.
+      await new Promise<void>((resolve) => {
+        window.setTimeout(resolve, 0)
+      })
+      return {
+        arrived,
+        clicks: records.clicks.slice(after.clicks),
+        looks: records.looks.slice(after.looks),
+        opened: window.krTestHost?.openedLinks.slice(after.opened) ?? []
+      }
+    },
+    { after: mark, limit: within }
+  )
+
 /**
  * What one tap did: the clicks the page saw, the links the page opened, and the link lit at the press
  * (null for none), since the tap began. A tap that gets no click from the browser fails here: no point
@@ -435,13 +495,10 @@ async function tapAndRead(
   y: number,
   tapper: (page: Page, x: number, y: number) => Promise<void> = tap
 ): Promise<{ clicks: Clicked[]; opened: string[]; lit: (string | null)[]; presses: Look[] }> {
-  const clicksBefore = (await clicksSeen(page)).length
-  const openedBefore = (await openedLinks(page)).length
-  const looksBefore = (await looksSeen(page)).length
+  const mark = await marked(page)
   await tapper(page, x, y)
-  try {
-    await expect.poll(async () => browsers((await clicksSeen(page)).slice(clicksBefore)).length, `a click for a tap at ${String(Math.round(x))}, ${String(Math.round(y))}`).toBeGreaterThan(0)
-  } catch (error) {
+  const recorded = await recordedSince(page, mark, 5000)
+  if (!recorded.arrived) {
     // Say what the point is: the element there and the boxes around it.
     const where = await page.evaluate(
       ([px, py]) => {
@@ -455,12 +512,11 @@ async function tapAndRead(
       },
       [x, y]
     )
-    throw new Error(`${(error as Error).message}; ${where}`, { cause: error })
+    throw new Error(`a click for a tap at ${String(Math.round(x))}, ${String(Math.round(y))} did not come; ${where}`)
   }
-  const presses = (await looksSeen(page)).slice(looksBefore)
-  const clicks = (await clicksSeen(page)).slice(clicksBefore)
+  const { clicks, looks: presses, opened } = recorded
   noteAway(page, presses, clicks)
-  return { clicks, opened: (await openedLinks(page)).slice(openedBefore), lit: presses.map((look) => look.lit), presses }
+  return { clicks, opened, lit: presses.map((look) => look.lit), presses }
 }
 
 /**
