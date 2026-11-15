@@ -1133,6 +1133,28 @@ fn a_second_root_that_differs_in_letter_case_alone_is_a_root_where_the_disk_tell
     }
 }
 
+/// Off Windows a backslash is a letter of a name: a value that holds `\..\` names a folder under
+/// the root, and every reader takes it as one.
+#[cfg(unix)]
+#[test]
+fn a_backslash_in_a_value_is_a_letter_of_a_name_off_windows() {
+    for reader in readers_and_system_shell() {
+        let temporary = tempfile::tempdir().expect("a temporary folder");
+        let name = r"a\..\..\kr-letters";
+        let value = real(temporary.path()).join(name);
+        let reading = reader.read(Some(value.as_os_str()), None);
+        assert!(
+            reading.succeeded,
+            "{reader:?} refused {value:?}: {reading:?}"
+        );
+        let directory = reading.directory.as_deref().expect("a directory");
+        assert!(
+            same(directory, &real(temporary.path()).join(name)),
+            "{reader:?}: {directory:?}"
+        );
+    }
+}
+
 #[cfg(windows)]
 mod windows_paths {
     use super::*;
@@ -1265,6 +1287,7 @@ mod windows_paths {
         for (reader, tmpdir) in [
             (Reader::Shell, ""),
             (Reader::Shell, "/tmp"),
+            (Reader::Shell, "/tmp/"),
             (Reader::LoginShell, ""),
         ] {
             let named = [
@@ -1355,6 +1378,21 @@ mod windows_paths {
         assert!(
             same(directory, &real(here.path()).join("evidence")),
             "{directory:?}"
+        );
+        // A `TMPDIR` of `/tmp/` names the same folder as `/tmp`, which is no root here either.
+        let with_slash = [
+            ("TMP", there.path().as_os_str()),
+            ("TEMP", here.path().as_os_str()),
+            ("TMPDIR", OsStr::new("/tmp/")),
+        ];
+        let reading =
+            Reader::Shell.read_with(Some(OsStr::new("/tmp/kr-evidence")), None, &with_slash);
+        assert_own_slash_tmp(&reading, &real(there.path()));
+        assert_refused(
+            Reader::Shell,
+            &reading,
+            "a folder under /tmp when TMPDIR is /tmp/ and /tmp is not the reader's temporary folder",
+            OUTSIDE,
         );
     }
 
@@ -1499,32 +1537,41 @@ mod windows_paths {
         }
     }
 
-    /// With the temporary folder a share's folder and no variable set, the run's own directory is
-    /// made in that folder.
+    /// With `TMP` a local folder (which Git Bash makes its `/tmp` from) and `TEMP` a share's folder,
+    /// the reader's temporary folder is the share's, `TEMP` being the variable it reads: the run's
+    /// own directory is made there, and `/tmp` is a local folder that is no root.
     #[test]
-    fn a_run_whose_temporary_folder_is_a_shares_folder_gets_its_own_directory_there() {
+    fn a_run_whose_temp_is_a_shares_folder_and_tmp_a_local_folder_gets_its_own_directory_in_the_share()
+     {
         if shell().is_none() {
             return;
         }
-        let temporary = tempfile::tempdir().expect("a temporary folder");
-        let ordinary = real(temporary.path());
+        let there = tempfile::tempdir().expect("a folder that /tmp is");
+        let here = tempfile::tempdir().expect("the share's folder");
+        let ordinary = real(here.path());
         let Some((_, by_windows)) = shell_share(&ordinary) else {
             return;
         };
         let named = [
-            ("TMP", by_windows.as_os_str()),
+            ("TMP", there.path().as_os_str()),
             ("TEMP", by_windows.as_os_str()),
             ("TMPDIR", OsStr::new("")),
         ];
         let reading = Reader::Shell.read_with(None, None, &named);
+        // The case says something only where this Git Bash's /tmp is the local TMP folder.
+        assert_own_slash_tmp(&reading, &real(there.path()));
         assert!(reading.succeeded, "{reading:?}");
-        // Git Bash may write the directory as `/tmp/…`, so it is looked for by its own name in the
-        // share's folder.
         let directory = reading.directory.clone().expect("a directory");
-        let made = by_windows.join(directory.file_name().expect("a name"));
+        let name = directory.file_name().expect("a name");
+        let made = by_windows.join(name);
         assert!(
             made.is_dir(),
-            "the directory is made in the share's folder: {}",
+            "the directory stands in the share's folder: {}",
+            directory.display()
+        );
+        assert!(
+            !real(there.path()).join(name).exists(),
+            "and not in the folder that /tmp is: {}",
             directory.display()
         );
         std::fs::remove_dir(&made).expect("removes the directory the run made");
@@ -1597,5 +1644,295 @@ mod windows_paths {
             "a Windows path with a step up",
             "steps up a directory",
         );
+    }
+
+    const KIND: &str = "a kind this reader does not take";
+    const NOT_ABSOLUTE: &str = "not an absolute path";
+    /// A mark of the words that say which spellings a reader takes.
+    const TAKES: &str = "//server/share/folder";
+
+    /// `folder` (an ordinary drive path) as a platform may give it, each with the separator that
+    /// joins a name to it: backslashes, slashes, a slash only at the end, a slash only after the
+    /// drive, and the extended-length form.
+    fn drive_spellings(folder: &Path) -> Vec<(&'static str, String, char)> {
+        let back = folder.to_string_lossy().into_owned();
+        let slash = back.replace('\\', "/");
+        vec![
+            ("a drive path with backslashes", back.clone(), '\\'),
+            ("a drive path with slashes", slash, '/'),
+            (
+                "a drive path with a slash before the name",
+                back.clone(),
+                '/',
+            ),
+            (
+                "a drive path with a slash after the drive",
+                back.replacen('\\', "/", 1),
+                '\\',
+            ),
+            (
+                "an extended-length drive path",
+                format!(r"\\?\{back}"),
+                '\\',
+            ),
+        ]
+    }
+
+    /// `share` (`\\localhost\C$\…`) as a platform or a tool may give it.
+    fn share_spellings(share: &str) -> Vec<(&'static str, String, char)> {
+        vec![
+            ("a share with backslashes", share.to_owned(), '\\'),
+            ("a share with slashes", share.replace('\\', "/"), '/'),
+            (
+                "a share with slashes at its start only",
+                share.replacen(r"\\", "//", 1),
+                '\\',
+            ),
+            (
+                "a share with a slash after its server",
+                share.replacen(r"\\localhost\", r"\\localhost/", 1),
+                '\\',
+            ),
+            (
+                "an extended-length share",
+                format!(r"\\?\UNC\{}", &share[2..]),
+                '\\',
+            ),
+        ]
+    }
+
+    /// The class, for a drive path: every spelling of the temporary folder's drive path that a
+    /// platform, a runner or a tool gives is read as the same folder, as a value and as the
+    /// runner's folder, by both readers; the temporary folder is another one, so that only the
+    /// runner's root can admit the value.
+    #[test]
+    fn every_spelling_of_a_drive_path_is_read_as_the_same_folder_as_a_value_and_as_a_root() {
+        let runner = tempfile::tempdir().expect("a runner folder");
+        let other = tempfile::tempdir().expect("a temporary folder");
+        let ordinary = real(runner.path());
+        let expected = ordinary.join("evidence");
+        for reader in readers() {
+            for (what, folder, separator) in drive_spellings(&ordinary) {
+                let value = format!("{folder}{separator}evidence");
+                let reading = reader.read_with(
+                    Some(OsStr::new(&value)),
+                    Some(other.path()),
+                    &[("RUNNER_TEMP", OsStr::new(&folder))],
+                );
+                assert!(
+                    reading.succeeded,
+                    "{reader:?} refused {what} ({value}): {reading:?}"
+                );
+                let directory = reading.directory.as_deref().expect("a directory");
+                assert!(
+                    same(directory, &expected),
+                    "{reader:?}: {what} ({value}) came back as {directory:?}"
+                );
+            }
+        }
+    }
+
+    /// The class, for a share: the machine's own share of its drive, in every spelling.
+    #[test]
+    fn every_spelling_of_a_share_is_read_as_the_same_folder_as_a_value_and_as_a_root() {
+        let runner = tempfile::tempdir().expect("a runner folder");
+        let other = tempfile::tempdir().expect("a temporary folder");
+        let ordinary = real(runner.path());
+        let Some(unc) = by_unc(&ordinary) else {
+            return;
+        };
+        let share = unc.to_string_lossy().into_owned();
+        for reader in readers() {
+            for (what, folder, separator) in share_spellings(&share) {
+                let value = format!("{folder}{separator}evidence");
+                let reading = reader.read_with(
+                    Some(OsStr::new(&value)),
+                    Some(other.path()),
+                    &[("RUNNER_TEMP", OsStr::new(&folder))],
+                );
+                assert!(
+                    reading.succeeded,
+                    "{reader:?} refused {what} ({value}): {reading:?}"
+                );
+                let directory = reading.directory.as_deref().expect("a directory");
+                // The share's folder may come back by its share or by the drive it is on.
+                assert!(
+                    same(directory, &unc.join("evidence"))
+                        || same(directory, &ordinary.join("evidence")),
+                    "{reader:?}: {what} ({value}) came back as {directory:?}"
+                );
+            }
+        }
+    }
+
+    /// The class, for every other spelling: both readers refuse it in words that say which
+    /// spellings they take. A rooted path with no drive and a drive with no root are not absolute.
+    #[test]
+    fn every_other_windows_spelling_is_refused_in_words_that_say_which_spellings_are_taken() {
+        let temporary = tempfile::tempdir().expect("a temporary folder");
+        let ordinary = real(temporary.path());
+        let back = ordinary.to_string_lossy().into_owned();
+        let slash = back.replace('\\', "/");
+        let rows = [
+            ("a device path", format!(r"\\.\{back}\evidence"), KIND),
+            (
+                "an extended-length path with a slash behind the prefix",
+                format!(r"\\?\{back}\a/evidence"),
+                KIND,
+            ),
+            (
+                "an extended-length path written with slashes",
+                format!("//?/{slash}/evidence"),
+                KIND,
+            ),
+            (
+                "an extended-length volume path",
+                r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\evidence".to_owned(),
+                KIND,
+            ),
+            ("a server with no share", r"\\localhost".to_owned(), KIND),
+            (
+                "a server with a slash and no share",
+                "//localhost/".to_owned(),
+                KIND,
+            ),
+            (
+                "three separators at the start",
+                r"\\\localhost\C$\evidence".to_owned(),
+                KIND,
+            ),
+            (
+                "a path that depends on the current drive",
+                r"\Windows\kr-evidence".to_owned(),
+                NOT_ABSOLUTE,
+            ),
+            (
+                "a path that depends on a drive's current directory",
+                "C:kr-evidence".to_owned(),
+                NOT_ABSOLUTE,
+            ),
+            ("a relative path", r"kr-evidence\x".to_owned(), NOT_ABSOLUTE),
+        ];
+        for reader in readers() {
+            for (what, value, why) in &rows {
+                let reading = reader.read(Some(OsStr::new(value)), None);
+                assert_refused(reader, &reading, what, why);
+                assert!(
+                    reading.words.contains(TAKES),
+                    "{reader:?} refused {what} without saying which spellings it takes: {}",
+                    reading.words
+                );
+            }
+        }
+    }
+
+    /// Git Bash's own spelling is the shell reader's alone: `/tmp/x` is a rooted path with no
+    /// drive to the others, and Git Bash converts such a value for a program it starts.
+    #[test]
+    fn git_bashs_own_spelling_is_read_by_the_shell_reader_and_is_no_path_to_the_others() {
+        if shell().is_none() {
+            return;
+        }
+        let reading = Reader::Shell.read(Some(OsStr::new("/tmp/kr-gitbash-spelling")), None);
+        assert!(reading.succeeded, "{reading:?}");
+        if powershell().is_some() {
+            let reading = POWER.read(Some(OsStr::new("/tmp/kr-gitbash-spelling")), None);
+            assert_refused(POWER, &reading, "a Git Bash path", NOT_ABSOLUTE);
+        }
+    }
+
+    /// On Windows the shell reader reads each backslash of a value as a separator before its step-up
+    /// and its root checks: Git Bash settles a path that holds one by its text, and a `..` behind a
+    /// backslash climbs out of the folder (`/tmp/a\..\..\x` is `TEMP`'s parent's `x`).
+    #[test]
+    fn a_backslash_in_a_value_is_read_as_a_separator_before_the_step_up_check() {
+        if shell().is_none() {
+            return;
+        }
+        let temporary = tempfile::tempdir().expect("a temporary folder");
+        let ordinary = real(temporary.path());
+        let slash = ordinary.to_string_lossy().replace('\\', "/");
+        let git_bash = spelled_for(Reader::Shell, &ordinary);
+        let values = [
+            r"/tmp/a\..\..\kr-probe".to_owned(),
+            r"/tmp/a\..\kr-probe".to_owned(),
+            format!(r"{}/a\..\..\kr-probe", git_bash.display()),
+            format!(r"{slash}/a\..\..\kr-probe"),
+            format!(r"{}\a\..\..\kr-probe", ordinary.display()),
+        ];
+        for value in &values {
+            let reading = Reader::Shell.read(Some(OsStr::new(value)), None);
+            assert_refused(Reader::Shell, &reading, value, "steps up a directory");
+        }
+        if powershell().is_some() {
+            let value = format!(r"{}\a\..\..\kr-probe", ordinary.display());
+            let reading = POWER.read(Some(OsStr::new(&value)), None);
+            assert_refused(POWER, &reading, &value, "steps up a directory");
+        }
+    }
+
+    /// A value under a root with backslashes that stays inside is that folder, in the shell reader
+    /// and in the others.
+    #[test]
+    fn a_value_with_backslashes_that_stays_inside_a_root_is_read_as_that_folder() {
+        if shell().is_none() {
+            return;
+        }
+        let temporary = tempfile::tempdir().expect("a temporary folder");
+        let ordinary = real(temporary.path());
+        let expected = ordinary.join("a").join("b").join("evidence");
+        let git_bash = spelled_for(Reader::Shell, &ordinary);
+        let values = [
+            format!(r"{}/a\b\evidence", git_bash.display()),
+            format!(r"{}\a/b\evidence", ordinary.display()),
+        ];
+        for reader in readers() {
+            for value in &values {
+                if !reader.is_shell() && value.starts_with('/') {
+                    continue;
+                }
+                let reading = reader.read(Some(OsStr::new(value)), None);
+                assert!(reading.succeeded, "{reader:?} refused {value}: {reading:?}");
+                let directory = reading.directory.as_deref().expect("a directory");
+                assert!(
+                    same(directory, &expected),
+                    "{reader:?}: {value}: {directory:?}"
+                );
+            }
+        }
+    }
+
+    /// A refusal that finds no root says so in both readers, and shows no empty list.
+    #[test]
+    fn a_refusal_with_no_roots_says_that_there_are_none() {
+        let nowhere = std::env::temp_dir().join("kr-no-such-temporary-folder");
+        assert!(!nowhere.exists());
+        for reader in readers() {
+            let named = [
+                ("TMP", nowhere.as_os_str()),
+                ("TEMP", nowhere.as_os_str()),
+                ("TMPDIR", OsStr::new("")),
+            ];
+            let reading =
+                reader.read_with(Some(OsStr::new(r"C:\Windows\kr-evidence")), None, &named);
+            assert_refused(
+                reader,
+                &reading,
+                "a value with no root to be inside",
+                OUTSIDE,
+            );
+            assert!(
+                reading
+                    .words
+                    .contains("(none: no folder that a temporary variable names exists)"),
+                "{reader:?}: {}",
+                reading.words
+            );
+            assert!(
+                !reading.words.contains("()"),
+                "{reader:?}: {}",
+                reading.words
+            );
+        }
     }
 }

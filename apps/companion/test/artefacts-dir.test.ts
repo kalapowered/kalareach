@@ -16,7 +16,13 @@ import { join, relative } from 'node:path'
 import { chdir, cwd } from 'node:process'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { artefactsDirectory, fullyQualified, temporaryRoots } from '../e2e/evidence'
+import {
+  artefactsDirectory,
+  fullyQualified,
+  listed,
+  spellingOf,
+  temporaryRoots
+} from '../e2e/evidence'
 
 const VARIABLE = 'KR_TEST_ARTIFACTS_DIR'
 
@@ -173,12 +179,91 @@ describe('the evidence directory reader', () => {
     ['C:/x', true, true],
     ['\\\\server\\share\\x', true, true],
     ['\\\\?\\C:\\x', true, true],
-    ['//?/C:/x', true, true],
+    ['//?/C:/x', true, false],
     ['\\x', true, false],
     ['/x', true, false],
     ['C:x', true, false],
     ['x\\y', true, false]
   ])('says of %s on Windows=%s that it is fully qualified: %s', (path, onWindows, expected) => {
     expect(fullyQualified(path, onWindows)).toBe(expected)
+  })
+
+  // The table of spellings, the same in every reader: what each one is, whatever platform this runs on.
+  it.each([
+    ['C:\\Users\\x\\Temp\\evidence', 'taken'],
+    ['c:/Users/x/Temp/evidence', 'taken'],
+    ['C:\\Users/x\\Temp/evidence', 'taken'],
+    ['\\\\server\\share\\evidence', 'taken'],
+    ['//server/share/evidence', 'taken'],
+    ['\\\\server/share\\evidence', 'taken'],
+    ['//server\\share/evidence', 'taken'],
+    ['\\\\localhost\\C$\\Users\\x', 'taken'],
+    ['\\\\?\\C:\\Users\\x\\Temp\\evidence', 'taken'],
+    ['\\\\?\\c:\\Users\\x', 'taken'],
+    ['\\\\?\\UNC\\server\\share\\evidence', 'taken'],
+    ['\\\\?\\unc\\server\\share\\evidence', 'taken'],
+    ['C:\\', 'taken'],
+    ['\\\\?\\C:\\a/b', 'kind'],
+    ['\\\\?\\UNC\\server\\share/b', 'kind'],
+    ['\\\\?\\Volume{1234}\\x', 'kind'],
+    ['\\\\?\\C:', 'kind'],
+    ['\\\\?\\UNC\\server', 'kind'],
+    ['\\\\?\\', 'kind'],
+    ['\\\\.\\C:\\Users\\x', 'kind'],
+    ['\\\\.\\pipe\\x', 'kind'],
+    ['//?/C:/Users/x', 'kind'],
+    ['//./C:/Users/x', 'kind'],
+    ['\\\\.', 'kind'],
+    ['\\\\server', 'kind'],
+    ['//server', 'kind'],
+    ['//server/', 'kind'],
+    ['\\\\server\\', 'kind'],
+    ['\\\\server\\\\share', 'kind'],
+    ['///server/share/x', 'kind'],
+    ['\\\\\\server\\share\\x', 'kind'],
+    ['\\Windows\\Temp', 'not-absolute'],
+    ['C:Windows', 'not-absolute'],
+    ['C:', 'not-absolute'],
+    ['relative\\x', 'not-absolute'],
+    ['./x', 'not-absolute'],
+    ['/tmp/a\\b\\c', 'not-absolute'],
+    ['/c/Users/x/Temp', 'not-absolute'],
+    ['/', 'not-absolute']
+  ])('reads %s on Windows as %s', (path, expected) => {
+    expect(spellingOf(path, true)).toBe(expected)
+  })
+
+  it('reads a backslash off Windows as a letter of a name', () => {
+    expect(spellingOf('/tmp/a\\..\\b', false)).toBe('taken')
+    expect(spellingOf('C:\\x', false)).toBe('not-absolute')
+  })
+
+  it('says that there are no roots where there are none, and shows no empty list', () => {
+    expect(listed([])).toBe('none: no folder that a temporary variable names exists')
+    expect(listed(['/a', '/b'])).toBe('/a, /b')
+  })
+
+  it.skipIf(!windows)('refuses the spellings it does not take, and names those it takes', () => {
+    const root = folder(tmpdir())
+    const text = realpathSync.native(root)
+    const device = `\\\\.\\${text}\\evidence`
+    expect(() => read(device)).toThrow(/a kind this reader does not take.*\/\/server\/share\/folder/s)
+    expect(() => read('C:evidence')).toThrow(/not an absolute path \(on Windows this reader takes/)
+    expect(() => read(`${text}\\a\\..\\..\\kr-evidence`)).toThrow(/steps up a directory/)
+    expect(() => read(`${text}/a\\..\\kr-evidence`)).toThrow(/steps up a directory/)
+  })
+
+  it.skipIf(!windows)('reads every spelling that a platform gives as the same folder', () => {
+    const root = folder(tmpdir())
+    const text = realpathSync.native(root)
+    const expected = join(text, 'evidence')
+    for (const value of [
+      `${text}\\evidence`,
+      `${text.replaceAll('\\', '/')}/evidence`,
+      `${text}/evidence`,
+      `\\\\?\\${text}\\evidence`
+    ]) {
+      expect(read(value).toLowerCase()).toBe(expected.toLowerCase())
+    }
   })
 })
