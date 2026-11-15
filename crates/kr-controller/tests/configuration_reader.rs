@@ -1,7 +1,7 @@
 //! A daemon over a registry one schema version ahead of the one it writes, and over the
 //! configuration document that registry accepted at the next version.
 //!
-//! A later release writes registry version 16 and records the document it accepted at version 4 of
+//! A later release writes the next registry version and records the document it accepted at version 4 of
 //! the document. This build reads both as found when the document holds nothing it lacks. When the
 //! document holds a ceiling this build lacks, the daemon refuses to start: the copy decides the
 //! restrictions in force from the first request, and read as no copy it would lift the rights
@@ -99,6 +99,9 @@ fn write_the_document(temp: &kr_ipc::testing::TempHost, text: &str) {
         .expect("writes the document");
 }
 
+/// The schema version above the one this build writes, which it reads as found.
+const NEXT_REGISTRY_VERSION: i64 = kr_controller::registry::READS_THROUGH_SCHEMA_VERSION;
+
 /// What a later release leaves in the registry: its schema version, and the document it accepted.
 fn as_a_later_release_left_it(
     temp: &kr_ipc::testing::TempHost,
@@ -144,7 +147,7 @@ fn recorded(temp: &kr_ipc::testing::TempHost) -> (i64, Option<String>, i64) {
 async fn a_daemon_starts_over_the_next_registry_version_and_the_document_it_accepted() {
     let temp = a_stopped_environment().await;
     let golden = fixture("version-4.json");
-    as_a_later_release_left_it(&temp, 16, Some(&golden));
+    as_a_later_release_left_it(&temp, NEXT_REGISTRY_VERSION, Some(&golden));
     write_the_document(&temp, &golden);
     let before = recorded(&temp);
     Connection::open(temp.environment().registry_database())
@@ -191,7 +194,7 @@ async fn a_daemon_starts_over_the_next_registry_version_and_the_document_it_acce
     assert_eq!(as_this_build_reads_it.version, configuration::VERSION);
     let accepted = recorded(&temp);
     assert_eq!(
-        accepted.0, 16,
+        accepted.0, NEXT_REGISTRY_VERSION,
         "no acceptance writes the registry's version"
     );
     assert_eq!(acceptance_writes(), 1, "the question accepted the document");
@@ -238,7 +241,7 @@ async fn a_daemon_refuses_to_start_over_an_accepted_copy_it_cannot_read() {
     ));
 
     for (what, copy) in copies {
-        as_a_later_release_left_it(&temp, 16, Some(&copy));
+        as_a_later_release_left_it(&temp, NEXT_REGISTRY_VERSION, Some(&copy));
         write_the_document(&temp, &readable);
         let before = recorded(&temp);
         let refused = start(&temp)
@@ -262,11 +265,15 @@ async fn a_daemon_refuses_to_start_over_an_accepted_copy_it_cannot_read() {
     }
 
     // The control: with no copy there is nothing to read, and the daemon accepts the document.
-    as_a_later_release_left_it(&temp, 16, None);
+    as_a_later_release_left_it(&temp, NEXT_REGISTRY_VERSION, None);
     write_the_document(&temp, &readable);
     let controller = start(&temp)
         .await
         .expect("a registry with no copy of an accepted document starts");
     drop(controller);
-    assert_eq!(recorded(&temp).0, 16, "the version stays as it was found");
+    assert_eq!(
+        recorded(&temp).0,
+        NEXT_REGISTRY_VERSION,
+        "the version stays as it was found"
+    );
 }

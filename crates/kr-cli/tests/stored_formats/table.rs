@@ -704,6 +704,11 @@ pub fn table() -> Vec<Store> {
                     "crates/kr-controller/src/net/devices.rs",
                     &["KeyDeclaration"],
                 ),
+                // What the entries of a revocation's answer read, kept beside the answer.
+                Kept::Source(
+                    "crates/kr-controller/src/authority/reads.rs",
+                    &["Stored", "StoredWorker"],
+                ),
                 Kept::Words(
                     "methods a recorded pairing action names",
                     kr_controller::service::net::invitations::RECORDED_METHODS
