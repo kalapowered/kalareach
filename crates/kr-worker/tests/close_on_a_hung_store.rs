@@ -11,6 +11,12 @@
 //!
 //! A case passes when the stop happens within the times section 7 gives it: five seconds of grace
 //! and two of drain, with an answer inside the seven seconds the daemon's close allows in all.
+//!
+//! The cases of a read of a held session hold the session where a storage call would, and read it
+//! from another connection. The read answers within its bound and says the state the session is in:
+//! for a close that was admitted a moment before the summary the session published says so, the
+//! state comes from the input domain. Each of them has a control in which nothing holds the session
+//! and the read is the one that takes it.
 
 #![cfg(unix)]
 
@@ -31,8 +37,10 @@ use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
 use kr_protocol::scalars::Nullable;
 use kr_protocol::session::{
-    Dimensions, DisplayNumber, SessionCloseParams, SessionCloseResult, ShellMode,
+    Dimensions, DisplayNumber, SessionCloseParams, SessionCloseResult, SessionReadParams,
+    SessionReadResult, SessionState, ShellMode,
 };
+use kr_worker::published::TAKE_BOUND;
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
@@ -50,6 +58,16 @@ const WINDOW: Duration = Duration::from_secs(17);
 const AFTER_LET_GO: Duration = Duration::from_secs(25);
 /// How long a case waits for its work to reach its stall.
 const REACH: Duration = Duration::from_secs(20);
+/// What a loaded gate machine may add to a read's bound: the round trip on the local socket and the
+/// steps of the take, which the bound does not count. A read that took longer than the bound and
+/// this has waited for the session, whatever it was held by.
+const MARGIN: Duration = Duration::from_secs(2);
+/// How long a case allows a read of a held session: the take's bound and the margin. Each of those
+/// cases waits no longer, so that a read that waits for the session ends the case by an assertion
+/// and not by the runner's limit.
+const READ_BOUND: Duration = TAKE_BOUND.saturating_add(MARGIN);
+/// How long a case waits for a session that was asked to stop to record its closure.
+const CLOSURE_WAIT: Duration = Duration::from_secs(20);
 
 fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
@@ -107,13 +125,22 @@ impl Host {
 /// A session whose shell notes the request to stop and goes on, so the graceful request and the
 /// force that follows it are told apart.
 async fn host() -> Host {
+    host_of(false).await
+}
+
+/// A session whose shell ends when it is asked to stop, or one that notes the request and goes on.
+async fn host_of(ends_when_asked: bool) -> Host {
     let marks = tempfile::tempdir().expect("a directory on the internal disk");
-    let script = format!(
-        "trap 'echo TERM >> {asked}' TERM; trap 'echo HUP >> {asked}' HUP; \
-         trap 'echo INT >> {asked}' INT; touch {ready}; while true; do sleep 1; done",
-        asked = kr_worker::testing::shell_quoted(&marks.path().join("asked")),
-        ready = kr_worker::testing::shell_quoted(&marks.path().join("ready")),
-    );
+    let ready = kr_worker::testing::shell_quoted(&marks.path().join("ready"));
+    let script = if ends_when_asked {
+        format!("touch {ready}; while true; do sleep 1; done")
+    } else {
+        format!(
+            "trap 'echo TERM >> {asked}' TERM; trap 'echo HUP >> {asked}' HUP; \
+             trap 'echo INT >> {asked}' INT; touch {ready}; while true; do sleep 1; done",
+            asked = kr_worker::testing::shell_quoted(&marks.path().join("asked")),
+        )
+    };
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
@@ -696,4 +723,316 @@ async fn own_write_stands_still(stalled: Stalled, case: &str) {
         Some(standing),
     )
     .await;
+}
+
+/// What a read was answered, and after how long counted from its own send.
+type ReadAnswer = (Duration, SessionReadResult);
+
+/// Reads the session on `client`. The read is waited for no longer than [`READ_BOUND`], so a read
+/// that waits for the session fails the case by an assertion that names what was waited for.
+async fn read_within_its_bound(client: &mut LocalClient, host: &Host, what: &str) -> ReadAnswer {
+    let sent = Instant::now();
+    let outcome = tokio::time::timeout(
+        READ_BOUND,
+        client.request(
+            Method::SessionRead,
+            &SessionReadParams {
+                session_id: host.session_id,
+            },
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{what}: the read was not answered within {READ_BOUND:?}"));
+    let answered = sent.elapsed();
+    let result = match outcome {
+        Ok(Ok(value)) => value
+            .to_typed::<SessionReadResult>()
+            .unwrap_or_else(|error| panic!("{what}: the answer could not be read: {error}")),
+        Ok(Err(error)) => panic!("{what}: the read was refused: {error}"),
+        Err(error) => panic!("{what}: the read failed: {error}"),
+    };
+    eprintln!(
+        "RESULT {what}: read answered after {answered:.2?} as {:?}",
+        result.session.state
+    );
+    (answered, result)
+}
+
+/// Reads the receipt of `action_id` on `client`, waited for no longer than [`READ_BOUND`], and
+/// returns the host's answer, an error code when it refused.
+async fn receipt_within_its_bound(
+    client: &mut LocalClient,
+    action_id: ActionId,
+    what: &str,
+) -> (
+    Duration,
+    Result<kr_protocol::receipt::ActionReadResult, kr_protocol::error::ErrorCode>,
+) {
+    let sent = Instant::now();
+    let outcome = tokio::time::timeout(
+        READ_BOUND,
+        client.request(
+            Method::ActionRead,
+            &kr_protocol::receipt::ActionReadParams {
+                action_id,
+                session_id: None,
+            },
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{what}: the read was not answered within {READ_BOUND:?}"));
+    let answered = sent.elapsed();
+    let result = match outcome {
+        Ok(Ok(value)) => Ok(value
+            .to_typed()
+            .unwrap_or_else(|error| panic!("{what}: the answer could not be read: {error}"))),
+        Ok(Err(error)) => Err(error.code),
+        Err(error) => panic!("{what}: the read failed: {error}"),
+    };
+    eprintln!(
+        "RESULT {what}: receipt read answered after {answered:.2?}: {:?}",
+        result.as_ref().map(|_| ())
+    );
+    (answered, result)
+}
+
+/// The lifecycle state the input domain holds, which is what the session's admission of a close
+/// changes.
+fn domain_state(host: &Host) -> SessionState {
+    host.runtime.input().lock().state()
+}
+
+/// The read of a session that nothing holds is the one that takes it: the control of the cases
+/// below. It carries the session's content and its state, as it always did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_read_of_a_session_nothing_holds_takes_it_and_gives_its_content() {
+    let host = host().await;
+    host.runtime
+        .session()
+        .set_application(Some("an editor".to_owned()));
+    let mut reader = host.client().await;
+    let (answered, read) = read_within_its_bound(&mut reader, &host, "control read").await;
+    assert!(answered <= READ_BOUND, "answered after {answered:?}");
+    assert_eq!(read.session.state, SessionState::Live);
+    assert_eq!(read.session.application.as_deref(), Some("an editor"));
+    assert!(
+        read.launch_profile.0.is_some(),
+        "a read that takes the session gives the profile it was launched with"
+    );
+    assert!(
+        read.endpoint.0.is_some(),
+        "a running session names its endpoint"
+    );
+}
+
+/// A live session that the maintenance pass holds behind a storage call: the read answers within
+/// its bound, says that the session is live, and says what the session was when it published.
+///
+/// The three places that publish before a close are shown by what the answer carries: the launch by
+/// the root shell, which the record made when the session was made does not have, and the change of
+/// the application by its name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_read_of_a_live_session_that_is_held_answers_within_its_bound_and_says_live() {
+    let host = host().await;
+    host.runtime
+        .session()
+        .set_application(Some("an editor".to_owned()));
+    let (holder, mut reader) = (host.client().await, host.client().await);
+    let standing = stall(&host, Stalled::Prune, holder).await;
+    let (answered, read) = read_within_its_bound(&mut reader, &host, "held live").await;
+    let _ = standing.release.send(());
+    assert!(
+        answered <= READ_BOUND,
+        "the read of a held session was answered after {answered:?}, past {READ_BOUND:?}"
+    );
+    assert_eq!(read.session.state, SessionState::Live);
+    assert!(
+        read.session.root_process.0.is_some(),
+        "the session published its summary when it launched its shell"
+    );
+    assert_eq!(read.session.application.as_deref(), Some("an editor"));
+    assert_eq!(read.session.session_id, host.session_id);
+    assert!(
+        read.launch_profile.0.is_none() && read.last_command_block.0.is_none(),
+        "a read of a held session gives no content of the session"
+    );
+    assert!(
+        read.endpoint.0.is_some(),
+        "a live session names its endpoint"
+    );
+}
+
+/// A read that names another session is refused whether or not the session is held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_read_of_another_session_is_refused_while_the_session_is_held() {
+    let host = host().await;
+    let (holder, mut reader) = (host.client().await, host.client().await);
+    let standing = stall(&host, Stalled::Prune, holder).await;
+    let sent = Instant::now();
+    let outcome = tokio::time::timeout(
+        READ_BOUND,
+        reader.request(
+            Method::SessionRead,
+            &SessionReadParams {
+                session_id: SessionId::new(kr_ipc::new_uuid()),
+            },
+        ),
+    )
+    .await
+    .expect("the read of another session was answered within its bound");
+    let _ = standing.release.send(());
+    assert!(sent.elapsed() <= READ_BOUND);
+    assert!(
+        matches!(outcome, Ok(Err(_))),
+        "a read that names another session is refused: {outcome:?}"
+    );
+}
+
+/// A close that was admitted and whose later calls stand still, while the summary the session
+/// published says that it is live: the domain says that the session is closing, and so does the
+/// read. Without the state from the domain the read says live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_read_of_a_session_whose_close_is_underway_says_closing_from_the_domain() {
+    let host = host().await;
+    let (closer, mut reader) = (host.client().await, host.client().await);
+    let (arrived, release) = host.runtime.session().stall_next_close_tail_blocking();
+    let slot = send_close(&host, closer);
+    reached(arrived, "the close's tail").await;
+    // What the case stands on: the close was admitted, and the summary does not know it yet.
+    assert_eq!(domain_state(&host), SessionState::Closing);
+    assert_eq!(
+        host.runtime.published().latest().state,
+        SessionState::Live,
+        "the published summary precedes the close's admission"
+    );
+    let (answered, read) = read_within_its_bound(&mut reader, &host, "held closing").await;
+    let _ = release.send(());
+    assert!(
+        answered <= READ_BOUND,
+        "the read of a held session was answered after {answered:?}, past {READ_BOUND:?}"
+    );
+    assert_eq!(
+        read.session.state,
+        SessionState::Closing,
+        "the session is closing and the read says so"
+    );
+    assert!(
+        read.endpoint.0.is_some(),
+        "a closing session still names its endpoint"
+    );
+    // Once the close has gone on, the admission is published.
+    let began = Instant::now();
+    while look(&slot).is_none() {
+        assert!(
+            began.elapsed() < ANSWER_BOUND,
+            "the close was not answered within {ANSWER_BOUND:?} once it was let go"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        host.runtime.published().latest().state,
+        SessionState::Closing,
+        "the close's admission is published"
+    );
+}
+
+/// The control of the case above: nothing holds the session after the close was admitted, so the
+/// read takes it and gives what it always gave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_read_of_a_session_whose_close_is_underway_and_nothing_holds_takes_it() {
+    let host = host().await;
+    let (closer, mut reader) = (host.client().await, host.client().await);
+    let slot = send_close(&host, closer);
+    let began = Instant::now();
+    while look(&slot).is_none() {
+        assert!(
+            began.elapsed() < ANSWER_BOUND,
+            "the close was not answered within {ANSWER_BOUND:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (_, read) = read_within_its_bound(&mut reader, &host, "control closing").await;
+    assert_eq!(read.session.state, SessionState::Closing);
+    assert!(read.launch_profile.0.is_some());
+}
+
+/// A receipt is read from the journal under the session: while the session is held behind a storage
+/// call the read answers within its bound that the journal is not reachable, and the same read
+/// gives the receipt once the session is let go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_read_of_a_receipt_while_the_session_is_held_is_answered_within_its_bound() {
+    let host = host().await;
+    let (mut owner, holder, mut reader) = (
+        host.client().await,
+        host.client().await,
+        host.client().await,
+    );
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let attached = owner
+        .mutate(
+            Method::SessionAttach,
+            action_id,
+            host.target(),
+            &attach_params(host.session_id),
+        )
+        .await
+        .expect("the attach reached the worker");
+    assert!(attached.is_ok(), "the attach was accepted: {attached:?}");
+    let (_, control) = receipt_within_its_bound(&mut reader, action_id, "control receipt").await;
+    assert!(
+        control.is_ok(),
+        "a receipt is read when nothing holds the session"
+    );
+    let standing = stall(&host, Stalled::Prune, holder).await;
+    let (answered, held) = receipt_within_its_bound(&mut reader, action_id, "held receipt").await;
+    let _ = standing.release.send(());
+    assert!(
+        answered <= READ_BOUND,
+        "the receipt read was answered after {answered:?}, past {READ_BOUND:?}"
+    );
+    assert_eq!(
+        held.map(|_| ()),
+        Err(kr_protocol::error::ErrorCode::StorageUnavailable),
+        "a receipt that cannot be read now is said to be unreachable"
+    );
+    // The stall let go, the same read gives the receipt again.
+    let began = Instant::now();
+    loop {
+        let (_, again) = receipt_within_its_bound(&mut reader, action_id, "after the let-go").await;
+        if again.is_ok() {
+            break;
+        }
+        assert!(
+            began.elapsed() < AFTER_LET_GO,
+            "the receipt was not readable {AFTER_LET_GO:?} after the stall was let go"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A session that has recorded its closure publishes it: the summary says closed and carries the
+/// record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_closed_session_publishes_its_closure() {
+    let host = host_of(true).await;
+    let closure = watch_the_closure(&host.runtime);
+    let closer = host.client().await;
+    let _slot = send_close(&host, closer);
+    let began = Instant::now();
+    while closure.try_recv().is_err() {
+        assert!(
+            began.elapsed() < CLOSURE_WAIT,
+            "the closure was not recorded within {CLOSURE_WAIT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The closure is recorded under the session, which this takes after it.
+    drop(host.runtime.session());
+    let published = host.runtime.published().latest();
+    assert_eq!(published.state, SessionState::Closed);
+    assert!(
+        published.closure.0.is_some(),
+        "the published summary carries the closure record"
+    );
+    assert_eq!(domain_state(&host), SessionState::Closed);
 }
