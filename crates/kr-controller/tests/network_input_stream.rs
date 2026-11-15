@@ -5265,3 +5265,120 @@ async fn a_stream_opened_while_a_launch_is_out_is_not_reset_when_the_launch_is_u
     type_and_wait(&rig, &mut newer, 1, b"k").await;
     rig.stop().await;
 }
+
+// A second refusal on a stream that holds one, for a worker without the lane. The host's count of
+// the typing the worker accepted stops at the first refusal of an epoch, and no second refusal, in
+// the next epoch or in the same one, moves it.
+
+/// How a second refusal reaches a stream whose first refusal was for room, at sequence 1.
+#[derive(Clone, Copy, Debug)]
+enum SecondRefusal {
+    /// A frame of the next epoch, which the worker refuses because it still holds the older.
+    ANewerEpoch,
+    /// A frame of the same epoch above the refused sequence.
+    TheSameEpochAbove,
+    /// A frame of the same epoch below the refused sequence.
+    TheSameEpochBelow,
+}
+
+/// What a barrier of the epoch that was refused in is judged by: frame 0 was accepted and frame 1
+/// refused, so two frames are not reached and one is.
+async fn the_count_of_the_refused_epoch_stands(rig: &Rig, when: &str) {
+    let short = send_after(rig, Dependent::Release, rig.epoch, 2).await;
+    assert!(
+        short.refused_here,
+        "{when}: frame 1 was refused, so two frames are not reached: {:?}",
+        short.answer
+    );
+    let reached = send_after(rig, Dependent::Release, rig.epoch, 1).await;
+    assert!(
+        !reached.refused_here,
+        "{when}: frame 0 was accepted, so one frame is reached: {:?}",
+        reached.answer
+    );
+}
+
+/// The worker takes frame 0 of an epoch and refuses frame 1 for room. A device then sends the
+/// second refusal's frame, and a frame of the next epoch that the worker refuses, which is the
+/// point where everything before it has been dealt with, since a stream's frames are dealt with in
+/// order. The host tells the device one refusal for each epoch and gives the worker none of the
+/// frames of the refused epoch, and a barrier of that epoch is judged as it was before: two frames
+/// are not reached and one is.
+async fn a_second_refusal_changes_no_count_of_the_epoch_before_it(second: SecondRefusal) {
+    let rig = Rig::start_withholding_the_lane().await;
+    let held = rig.epoch;
+    let newer = InputLeaseEpoch::new(held.get() + 1);
+    let (calls, gate) = script_by_epoch(&rig, move |epoch, sequence| {
+        if epoch != held {
+            gives(ErrorCode::LeaseLost)
+        } else if sequence == 1 {
+            gives(ErrorCode::ResourceUnavailable)
+        } else {
+            took()
+        }
+    });
+    gate.add_permits(1);
+    let sent = script_dependents(&rig, None);
+    let mut stream = rig.open().await;
+    type_and_wait(&rig, &mut stream, 0, b"a").await;
+    stream
+        .write_message(&rig.frame(1, b"b"))
+        .await
+        .expect("the frame is written");
+    assert!(
+        matches!(
+            next(&mut stream).await,
+            Some(InputAck::Refused { epoch, .. }) if epoch == held
+        ),
+        "the first refusal is told"
+    );
+    the_count_of_the_refused_epoch_stands(&rig, "before the second refusal").await;
+
+    match second {
+        SecondRefusal::ANewerEpoch => {}
+        SecondRefusal::TheSameEpochAbove => stream
+            .write_message(&rig.frame(3, b"c"))
+            .await
+            .expect("the frame is written"),
+        SecondRefusal::TheSameEpochBelow => stream
+            .write_message(&rig.frame(0, b"c"))
+            .await
+            .expect("the frame is written"),
+    }
+    stream
+        .write_message(&frame_of(newer.get(), 0, b"d"))
+        .await
+        .expect("the frame is written");
+    match next(&mut stream).await {
+        Some(InputAck::Refused { epoch, .. }) if epoch == newer => {}
+        other => panic!(
+            "{second:?}: the next word was the refusal of the newer epoch, and the host said {other:?}"
+        ),
+    }
+    the_count_of_the_refused_epoch_stands(&rig, "after the second refusal").await;
+    assert_eq!(
+        calls.sequences(),
+        vec![0, 1, 0],
+        "{second:?}: the worker was given frame 0 and 1 of the epoch and frame 0 of the newer, and no frame of the refused epoch after"
+    );
+    assert_eq!(forwarded(&sent).len(), 2);
+    assert_eq!(position_refusals(&rig), 2);
+    rig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_in_a_newer_epoch_changes_no_count_of_the_epoch_before_it() {
+    a_second_refusal_changes_no_count_of_the_epoch_before_it(SecondRefusal::ANewerEpoch).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_of_a_refused_epoch_above_the_refusal_changes_no_count() {
+    a_second_refusal_changes_no_count_of_the_epoch_before_it(SecondRefusal::TheSameEpochAbove)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_of_a_refused_epoch_below_the_refusal_changes_no_count() {
+    a_second_refusal_changes_no_count_of_the_epoch_before_it(SecondRefusal::TheSameEpochBelow)
+        .await;
+}
