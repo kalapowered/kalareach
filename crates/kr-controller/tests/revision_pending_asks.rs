@@ -298,6 +298,146 @@ async fn an_answer_puts_the_interval_back_to_five_seconds() {
     drop(workers);
 }
 
+/// KR-REQ-09.12: a worker that acknowledges a revision and sends no names with it is asked again
+/// at an interval that doubles, and stays pending.
+///
+/// The acknowledgement is two statements, the revision installed and what the fence named, and the
+/// worker makes the first only. Nothing a new ask can do changes that, so the asks are paced as
+/// asks that failed are, ten seconds and then twenty after the one before, and not one for each
+/// pass for as long as the daemon runs. The worker is no more and no less pending than before, and
+/// no ask of this kind asks whether the worker has ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_acknowledgement_with_no_names_is_asked_again_at_a_doubling_interval() {
+    let Adopted {
+        host,
+        owner: _,
+        workers,
+    } = Adopted::start(1).await;
+    let worker = &workers[0];
+    let session_id = worker.session_id;
+    worker
+        .service
+        .hold_the_boundary_for_one_announcement_after(0);
+    let barrier = host
+        .controller()
+        .revoke_authority()
+        .await
+        .expect("the restriction is recorded");
+    assert!(!barrier.holds(), "the worker refused for the moment");
+    let revision = barrier.authority_revision;
+    worker.service.forget_evidence_for_tests(revision.get());
+    let reconciled = host.controller().reconciliations_for_tests(session_id);
+
+    until(DEBT_PASS_INTERVAL * 2 + SLACK, "the first ask", || {
+        !asks_of(host.controller(), session_id).is_empty()
+    })
+    .await;
+    // Six passes after the first ask: one ask at each of them, or the first and two more.
+    tokio::time::sleep_until(
+        asks_of(host.controller(), session_id)[0] + DEBT_PASS_INTERVAL * 6 + Duration::from_secs(2),
+    )
+    .await;
+    let asks = asks_of(host.controller(), session_id);
+    assert_eq!(
+        asks.len(),
+        3,
+        "asks at the pass, then ten seconds after the first and twenty after the second: {:?}",
+        asks.iter().map(|at| *at - asks[0]).collect::<Vec<_>>()
+    );
+    assert!(
+        asks[1] - asks[0] >= Duration::from_secs(10) - Duration::from_millis(500),
+        "the second ask came {:?} after the first",
+        asks[1] - asks[0]
+    );
+    assert!(
+        asks[2] - asks[1] >= Duration::from_secs(20) - Duration::from_millis(500),
+        "the third ask came {:?} after the second",
+        asks[2] - asks[1]
+    );
+    assert_eq!(
+        host.controller().revision_pending().await.expect("a read"),
+        vec![session_id],
+        "the worker has installed the revision and is still pending"
+    );
+    assert!(
+        !host
+            .controller()
+            .barrier_as_it_stands_for_tests()
+            .await
+            .expect("the barrier is read")
+            .holds(),
+        "the barrier counts it pending"
+    );
+    assert_eq!(
+        host.controller().reconciliations_for_tests(session_id),
+        reconciled,
+        "an acknowledgement is not a worker that may have ended"
+    );
+    host.stop().await;
+    drop(workers);
+}
+
+/// KR-REQ-09.12: an acknowledgement that carries the names, after one that did not, clears the
+/// pending state, and the asks end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_acknowledgement_with_the_names_after_one_without_clears_the_pending_state() {
+    let Adopted {
+        host,
+        owner: _,
+        workers,
+    } = Adopted::start(1).await;
+    let worker = &workers[0];
+    let session_id = worker.session_id;
+    worker
+        .service
+        .hold_the_boundary_for_one_announcement_after(0);
+    let barrier = host
+        .controller()
+        .revoke_authority()
+        .await
+        .expect("the restriction is recorded");
+    assert!(!barrier.holds(), "the worker refused for the moment");
+    let revision = barrier.authority_revision;
+    worker.service.forget_evidence_for_tests(revision.get());
+
+    until(DEBT_PASS_INTERVAL * 2 + SLACK, "the first ask", || {
+        !asks_of(host.controller(), session_id).is_empty()
+    })
+    .await;
+    // The first ask is over in a moment; it came to an acknowledgement with no names.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        host.controller().revision_pending().await.expect("a read"),
+        vec![session_id],
+        "no names, so the worker is pending"
+    );
+    worker.service.remember_evidence_for_tests(revision.get());
+
+    until_nobody_is_pending(
+        host.controller(),
+        Duration::from_secs(30),
+        "the ask that carried the names",
+    )
+    .await;
+    // The second ask came when the interval after the first allowed it, and nothing asks after it.
+    tokio::time::sleep(DEBT_PASS_INTERVAL * 3).await;
+    assert_eq!(
+        asks_of(host.controller(), session_id).len(),
+        2,
+        "the first ask and the one that was answered with the names"
+    );
+    assert!(
+        host.controller()
+            .fence_owed_for_tests()
+            .await
+            .expect("the registry is read")
+            .is_none(),
+        "the pass settled the fence once nobody was pending"
+    );
+    host.stop().await;
+    drop(workers);
+}
+
 /// KR-REQ-09.12: a worker whose ask is stuck does not hold up the ask of another pending worker.
 ///
 /// Both workers refused the restriction for the moment. The connection of the one the pass asks
@@ -1102,6 +1242,103 @@ async fn a_whole_ask_ends_at_its_bound_though_the_pages_after_the_acknowledgemen
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    host.stop().await;
+    drop(workers);
+}
+
+/// KR-REQ-09.12: an ask that has too little time left for another page of names gives the link back
+/// and ends, and the worker's lease goes on renewing.
+///
+/// The worker acknowledges and its names come a page at a time, each page after the first taking
+/// four seconds. The fourth of them would begin with three of the ask's fifteen seconds left,
+/// inside the page's own five, and an ask that ends with the page on the wire is dropped with the
+/// link out: a link that goes out of its holder's hand stops the renewal of the worker's lease,
+/// though the worker has acknowledged. The ask returns what it has before that page begins, and
+/// the pass collects the names that are left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_ask_with_too_little_time_for_another_page_leaves_the_renewal_of_the_worker_going() {
+    let Adopted {
+        host,
+        owner: _,
+        workers,
+    } = Adopted::start(1).await;
+    let worker = &workers[0];
+    let session_id = worker.session_id;
+    let device = ActorId::new("device:phone").expect("a principal");
+    worker.limit_evidence_page_for_tests(1);
+    worker.seed_undispatched_intents(&device, 6);
+    worker
+        .service
+        .delay_evidence_continuations_for_tests(Duration::from_secs(4));
+    worker
+        .service
+        .hold_the_boundary_for_one_announcement_after(0);
+    let barrier = host
+        .controller()
+        .revoke_authority()
+        .await
+        .expect("the restriction is recorded");
+    assert!(!barrier.holds(), "the worker refused for the moment");
+    assert!(
+        !host.controller().renewal_stopped_for_tests(session_id),
+        "a refusal that was read to its end leaves the renewal as it was"
+    );
+
+    until(DEBT_PASS_INTERVAL * 2 + SLACK, "an ask of the pass", || {
+        !asks_of(host.controller(), session_id).is_empty()
+    })
+    .await;
+    let began = asks_of(host.controller(), session_id)[0];
+    // The pass settles the fence once its asks have ended, so that is when this one has.
+    let by = began + Duration::from_secs(15) + SLACK;
+    while host
+        .controller()
+        .fence_owed_for_tests()
+        .await
+        .expect("the registry is read")
+        .is_some()
+    {
+        assert!(
+            tokio::time::Instant::now() < by,
+            "the ask had not ended {:?} after it began",
+            tokio::time::Instant::now() - began
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let lasted = tokio::time::Instant::now() - began;
+    assert!(
+        !host.controller().renewal_stopped_for_tests(session_id),
+        "the worker acknowledged, and its renewal stopped when the ask ended"
+    );
+    assert!(
+        lasted < Duration::from_secs(14),
+        "the ask ended {lasted:?} after it began, which is its bound and not a return with what \
+         it had"
+    );
+    assert_eq!(
+        host.controller().names_owed_for_tests(),
+        vec![session_id],
+        "the ask left names for the pass to collect"
+    );
+
+    until(
+        Duration::from_secs(60),
+        "the pass to collect the names that the ask left",
+        || host.controller().names_owed_for_tests().is_empty(),
+    )
+    .await;
+    assert!(
+        !host.controller().renewal_stopped_for_tests(session_id),
+        "the renewal is going when the names are all collected"
+    );
+    assert!(
+        host.controller()
+            .revision_pending()
+            .await
+            .expect("the registry is read")
+            .is_empty(),
+        "the worker stays acknowledged"
+    );
     host.stop().await;
     drop(workers);
 }
