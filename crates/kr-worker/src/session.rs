@@ -1027,6 +1027,17 @@ impl Session {
         Arc::clone(&self.input)
     }
 
+    /// Returns the deadline that the last pass over the lane left for the pump to wake at, read
+    /// from the field the pump reads, for this host's own tests.
+    ///
+    /// Read under the session's hold, it is the value of the pass that was made under the same
+    /// hold: no pump pass can come between.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn published_reply_expiry(&self) -> Option<u64> {
+        self.input.lock().writer().room.reply_expiry()
+    }
+
     /// Carries out the steps the root editor's machine asked for that need this session, with the
     /// input domain let go.
     ///
