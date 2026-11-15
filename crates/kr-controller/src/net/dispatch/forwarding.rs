@@ -160,7 +160,7 @@ fn unreadable_retained_answer() -> ProtocolError {
 /// this level. Key records have no counterpart at a retained level, which is a lack of the
 /// worker's and not of the write, so the code is the one that says a capability is missing and
 /// nothing reaches the worker.
-fn input_write_refusal(error: &CodecError) -> ProtocolError {
+pub(in crate::service::net) fn input_write_refusal(error: &CodecError) -> ProtocolError {
     match error {
         CodecError::NotInLevel { .. } => ProtocolError::new(
             ErrorCode::UnsupportedCapability,
@@ -628,7 +628,23 @@ impl RemoteConnection {
                     .and_then(|params| params.attachment_id.0)
             })
             .flatten();
-        let mutation = mutation.clone();
+        let mut mutation = mutation.clone();
+        let carries_lane_members = matches!(
+            answering,
+            Method::InputRelease | Method::SessionDetach | Method::ShellLaunch
+        );
+        if carries_lane_members {
+            mutation.params = super::super::input::barrier::params_for_worker(
+                self.inputs.serves_lane(&proxy),
+                answering,
+                &mutation.params,
+            );
+        }
+        let scripted = if carries_lane_members {
+            self.inputs.scripted_answer(&mutation)
+        } else {
+            None
+        };
         let request_id = mutation.request_id;
         // The grant's history scope travels with it too, so what the worker shows of its answer,
         // now and when the action is read again, is held to what this device's grant reaches.
@@ -651,6 +667,9 @@ impl RemoteConnection {
         // lift the refusal.
         let standing = self.feed_standing(&acting.grant);
         let effect = tokio::spawn(async move {
+            if let Some(answered) = scripted {
+                return Ok(answered);
+            }
             proxy
                 .forward_mutation(
                     &mutation,
