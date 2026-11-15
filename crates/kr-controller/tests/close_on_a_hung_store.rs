@@ -12,6 +12,12 @@
 //! A case passes when the stop happens within the times section 7 gives it: the answer inside the
 //! seven seconds the daemon's close allows, the shell asked to stop at once, forced after five
 //! seconds and the closure recorded two seconds after that.
+//!
+//! The daemon's own disk is the other place a close can stand: a close of a session whose worker
+//! has closed is answered with the closure, and the daemon's write of that closure to its registry
+//! must neither refuse the answer nor hold it. The cases after the stop's own cases close a session
+//! whose shell stops at once, wait for the worker's closure, and then repeat the close at the
+//! daemon while its registry write fails or stands.
 
 #![cfg(unix)]
 
@@ -25,7 +31,9 @@ use kr_protocol::ids::ActionId;
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::Nullable;
-use kr_protocol::session::{Dimensions, SessionCloseParams, SessionCloseResult};
+use kr_protocol::session::{
+    ClosureRecord, Dimensions, Durability, SessionCloseParams, SessionCloseResult, SessionState,
+};
 
 use net_support::worker::Adopted;
 use net_support::{Device, RawDevice, pair_with, proposal};
@@ -54,6 +62,15 @@ fn stubborn(marks: &std::path::Path) -> String {
     )
 }
 
+/// The shell a session runs when nothing is asked of its processes but that they end: it says it is
+/// ready and waits, and a request to stop ends it.
+fn obedient(marks: &std::path::Path) -> String {
+    format!(
+        "touch {ready}; exec sleep 3600",
+        ready = kr_worker::testing::shell_quoted(&marks.join("ready")),
+    )
+}
+
 /// A daemon with an adopted worker running the stubborn shell.
 struct Rig {
     adopted: Adopted,
@@ -75,8 +92,13 @@ impl Drop for Rig {
 
 impl Rig {
     async fn start() -> Self {
+        Self::start_with(stubborn).await
+    }
+
+    /// A rig whose shell is the one `shell` makes for the folder of its marks.
+    async fn start_with(shell: fn(&std::path::Path) -> String) -> Self {
         let marks = tempfile::tempdir().expect("a directory on the internal disk");
-        let adopted = Adopted::start_running(&stubborn(marks.path())).await;
+        let adopted = Adopted::start_running(&shell(marks.path())).await;
         let started = Instant::now();
         while !marks.path().join("ready").exists() {
             assert!(
@@ -160,8 +182,12 @@ fn look(slot: &Slot) -> Option<Answer> {
 
 /// Sends a close at the daemon's local socket, as `kr close` does.
 async fn close_at_the_daemon(rig: &Rig) -> Slot {
+    close_on(rig, rig.adopted.host.client().await).await
+}
+
+/// Sends a close on a client that is already connected to the daemon's local socket.
+async fn close_on(rig: &Rig, mut client: kr_ipc::client::LocalClient) -> Slot {
     let slot: Slot = Arc::new(std::sync::Mutex::new(None));
-    let mut client = rig.adopted.host.client().await;
     let (target, session_id) = (rig.target(), rig.worker().session_id);
     let answered = Arc::clone(&slot);
     let sent = Instant::now();
@@ -316,7 +342,7 @@ async fn the_stop_is_watched(
     let mut seen = Seen::default();
     let mut looked_at_the_daemon = false;
     let mut daemon_while_it_stood = String::new();
-    let mut step = |seen: &mut Seen| {
+    let step = |seen: &mut Seen| {
         let now = started.elapsed();
         if seen.first.is_none() {
             seen.first = look(first);
@@ -430,4 +456,240 @@ async fn a_close_from_a_paired_device_stops_the_session_while_a_marker_write_sta
         Some(release),
     )
     .await;
+}
+
+/// How long a case that has let a stall go waits for the write that stood in it to finish.
+const WRITE_FINISHES: Duration = Duration::from_secs(20);
+
+/// Waits for the answer to a close, for at most `bound`.
+async fn answer_within(slot: &Slot, bound: Duration) -> Option<Answer> {
+    let started = Instant::now();
+    while started.elapsed() < bound {
+        if let Some(answer) = look(slot) {
+            return Some(answer);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    look(slot)
+}
+
+/// Closes the session at the daemon and waits until its worker has recorded its own closure: the
+/// daemon has the worker's acceptance, and the closure is the worker's, not yet the daemon's.
+async fn closed_by_its_worker(rig: &Rig) {
+    let first = close_at_the_daemon(rig).await;
+    let accepted = answer_within(&first, ANSWER_BOUND).await;
+    assert!(
+        matches!(accepted, Some((_, Ok(_)))),
+        "the first close is accepted: {}",
+        answer_said(&accepted)
+    );
+    let started = Instant::now();
+    while rig.closure.try_recv().is_err() {
+        assert!(
+            started.elapsed() < REACH,
+            "the worker never recorded its closure"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// What is wrong with the answer to a repeat of a close, once the worker has closed the session:
+/// it is the closure, durable, and it came inside the time the daemon gives a close.
+fn shortfalls_of_a_repeat(answer: &Option<Answer>) -> Vec<String> {
+    let mut missed = Vec::new();
+    match answer {
+        None => missed.push(format!(
+            "the repeat was not answered within {ANSWER_BOUND:?}"
+        )),
+        Some((after, Err(error))) => missed.push(format!(
+            "the repeat was not accepted, after {after:.2?}: {error}"
+        )),
+        Some((after, Ok(result))) => {
+            if *after > ANSWER_BOUND {
+                missed.push(format!("the repeat was answered after {after:?}"));
+            }
+            if result.state != SessionState::Closed {
+                missed.push(format!("the repeat said {:?}, not closed", result.state));
+            }
+            if result.durability != Durability::Durable || result.closure.as_ref().is_none() {
+                missed.push(format!(
+                    "the repeat did not carry a durable closure: {:?}",
+                    result.durability
+                ));
+            }
+        }
+    }
+    missed
+}
+
+/// What the daemon's registry holds of the session's closure, read through a handle of its own.
+fn recorded_closure(rig: &Rig) -> Option<ClosureRecord> {
+    kr_controller::registry::Registry::open(
+        rig.adopted.host.registry_database(),
+        rig.adopted.host.environment_id,
+    )
+    .expect("the registry opens beside the daemon's own handle")
+    .closure(rig.worker().session_id)
+    .expect("the registry reads")
+}
+
+/// Waits for the daemon's registry to hold the session's closure, for at most `bound`.
+async fn recorded_within(rig: &Rig, bound: Duration) -> Option<ClosureRecord> {
+    let started = Instant::now();
+    loop {
+        if let Some(record) = recorded_closure(rig) {
+            return Some(record);
+        }
+        if started.elapsed() >= bound {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn recorded_durability(record: &Option<ClosureRecord>) -> Option<Durability> {
+    record.as_ref().map(|record| record.durability)
+}
+
+/// Waits for the write that the stall holds to arrive, for at most `bound`.
+async fn arrived_within(arrived: &std::sync::mpsc::Receiver<()>, bound: Duration) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < bound {
+        if arrived.try_recv().is_ok() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+/// Control: nothing refuses or holds the daemon's write. A repeat of a close, after the worker has
+/// closed the session, is answered with the closure and the daemon records it durably.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_repeated_close_is_answered_and_recorded_durably_when_the_registry_takes_it() {
+    let rig = Rig::start_with(obedient).await;
+    closed_by_its_worker(&rig).await;
+    let repeat = close_at_the_daemon(&rig).await;
+    let answer = answer_within(&repeat, ANSWER_BOUND).await;
+    let recorded = recorded_within(&rig, WRITE_FINISHES).await;
+    eprintln!(
+        "RESULT control: the repeat was answered {}; the registry holds a closure: {:?}",
+        answer_said(&answer),
+        recorded_durability(&recorded)
+    );
+    assert_eq!(shortfalls_of_a_repeat(&answer), Vec::<String>::new());
+    assert_eq!(recorded_durability(&recorded), Some(Durability::Durable));
+}
+
+/// The daemon's write of the closure fails: the registry refuses a closure. The repeat of the close
+/// is still answered with the closure the worker gave, and not with the write's error, and the
+/// daemon records the closure once the registry takes it, when the close is asked again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_repeated_close_is_answered_while_the_registry_refuses_the_closure() {
+    let rig = Rig::start_with(obedient).await;
+    closed_by_its_worker(&rig).await;
+    let registry = rusqlite::Connection::open(rig.adopted.host.registry_database())
+        .expect("the registry opens beside the daemon's own handle");
+    registry
+        .execute_batch(
+            "CREATE TRIGGER the_closure_is_not_kept BEFORE INSERT ON tombstones
+             BEGIN SELECT RAISE(ABORT, 'the registry keeps no closure'); END;",
+        )
+        .expect("the registry is made to refuse the write that records a closure");
+    let repeat = close_at_the_daemon(&rig).await;
+    let answer = answer_within(&repeat, ANSWER_BOUND).await;
+    let held_out = recorded_closure(&rig);
+    registry
+        .execute_batch("DROP TRIGGER the_closure_is_not_kept;")
+        .expect("the registry takes a closure again");
+    // Asked again, the daemon writes the closure it answered with.
+    let mut later = Vec::new();
+    let asked_again = Instant::now();
+    let recorded = loop {
+        if let Some(record) = recorded_closure(&rig) {
+            break Some(record);
+        }
+        if asked_again.elapsed() >= WRITE_FINISHES {
+            break None;
+        }
+        let again = close_at_the_daemon(&rig).await;
+        later.extend(shortfalls_of_a_repeat(
+            &answer_within(&again, ANSWER_BOUND).await,
+        ));
+    };
+    eprintln!(
+        "RESULT registry refuses: the repeat was answered {}; the registry held a closure \
+         meanwhile: {}; once it took the write it held: {:?}; later repeats fell short: {later:?}",
+        answer_said(&answer),
+        held_out.is_some(),
+        recorded_durability(&recorded)
+    );
+    assert_eq!(shortfalls_of_a_repeat(&answer), Vec::<String>::new());
+    assert!(
+        held_out.is_none(),
+        "the registry took the closure it refuses"
+    );
+    assert_eq!(later, Vec::<String>::new());
+    assert_eq!(recorded_durability(&recorded), Some(Durability::Durable));
+}
+
+/// The daemon's write of the closure stands: the disk does not answer. The repeat of the close is
+/// answered with the closure within the daemon's seven seconds, and the closure is recorded when the
+/// write goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_repeated_close_is_answered_while_the_registry_write_stands() {
+    let rig = Rig::start_with(obedient).await;
+    closed_by_its_worker(&rig).await;
+    let client = rig.adopted.host.client().await;
+    let (arrived, release) = rig.adopted.host.stall_the_next_closure_write();
+    let repeat = close_on(&rig, client).await;
+    let answer = answer_within(&repeat, ANSWER_BOUND).await;
+    let reached = arrived_within(&arrived, REACH).await;
+    let held_out = recorded_closure(&rig);
+    let _ = release.send(());
+    let recorded = recorded_within(&rig, WRITE_FINISHES).await;
+    eprintln!(
+        "RESULT registry write stands: the repeat was answered {}; the write reached its stall: \
+         {reached}; the registry held a closure meanwhile: {}; after the let-go it held: {:?}",
+        answer_said(&answer),
+        held_out.is_some(),
+        recorded_durability(&recorded)
+    );
+    assert_eq!(shortfalls_of_a_repeat(&answer), Vec::<String>::new());
+    assert!(reached, "the closure's write never reached the stall");
+    assert!(
+        held_out.is_none(),
+        "the registry took the closure before the let-go"
+    );
+    assert_eq!(recorded_durability(&recorded), Some(Durability::Durable));
+}
+
+/// A close on a client that was opened before the stall, while the write of the closure stands: it
+/// is answered from what the daemon knows of the closure, as the repeat that started the write was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_close_on_a_client_opened_before_the_stall_is_answered_while_the_registry_write_stands() {
+    let rig = Rig::start_with(obedient).await;
+    closed_by_its_worker(&rig).await;
+    let starts_the_write = rig.adopted.host.client().await;
+    let opened_before = rig.adopted.host.client().await;
+    let (arrived, release) = rig.adopted.host.stall_the_next_closure_write();
+    let first = close_on(&rig, starts_the_write).await;
+    let first_answer = answer_within(&first, ANSWER_BOUND).await;
+    let reached = arrived_within(&arrived, REACH).await;
+    let second = close_on(&rig, opened_before).await;
+    let second_answer = answer_within(&second, ANSWER_BOUND).await;
+    let _ = release.send(());
+    let recorded = recorded_within(&rig, WRITE_FINISHES).await;
+    eprintln!(
+        "RESULT client opened before the stall: the first repeat was answered {}; the write \
+         reached its stall: {reached}; the close on the earlier client was answered {}; after the \
+         let-go the registry held: {:?}",
+        answer_said(&first_answer),
+        answer_said(&second_answer),
+        recorded_durability(&recorded)
+    );
+    assert_eq!(shortfalls_of_a_repeat(&first_answer), Vec::<String>::new());
+    assert!(reached, "the closure's write never reached the stall");
+    assert_eq!(shortfalls_of_a_repeat(&second_answer), Vec::<String>::new());
+    assert_eq!(recorded_durability(&recorded), Some(Durability::Durable));
 }
