@@ -13,8 +13,9 @@
 
 use kr_protocol::error::ErrorCode;
 use kr_protocol::pairing::PairingConsumedReason;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 
+use crate::services::{Alternatives, RelayRefusal};
 use crate::shown::{Said, Shown};
 
 /// Which of the outcomes a person is told apart an attempt ended with.
@@ -54,6 +55,10 @@ pub enum FailureKind {
     /// The relay this device would reach the host through is the managed service's, and the service
     /// has no free capacity to admit this device through it now: not a failure of the host.
     RelayCapacity,
+    /// The relay this device would reach the host through is the managed service's, and the service
+    /// failed on its side when it was asked to admit this device through it: not a failure of the
+    /// host, and not a refusal for want of capacity.
+    RelayFault,
     /// The host did not match its invitation, so nothing was sent to it.
     HostMismatch,
     /// This device is already paired with the host the invitation is for.
@@ -96,6 +101,7 @@ impl Said for FailureKind {
             Self::AnotherDeviceWaiting => "AnotherDeviceWaiting",
             Self::HostUnreachable => "HostUnreachable",
             Self::RelayCapacity => "RelayCapacity",
+            Self::RelayFault => "RelayFault",
             Self::HostMismatch => "HostMismatch",
             Self::AlreadyPaired => "AlreadyPaired",
             Self::NotAnInvitation => "NotAnInvitation",
@@ -115,15 +121,40 @@ impl Said for FailureKind {
 /// `detail` says what happened in terms a log can keep. It is a [`Shown`], so it never holds a
 /// secret or anything a host, a service, a store or a payload wrote, and an interface shows the
 /// kind's own words rather than it.
+///
+/// A failure that the managed relay service's answer explains also carries what that answer named:
+/// the paths that still work, each as the service wrote it, and the seconds after which the same
+/// attempt could succeed. Both are absent from what an interface is sent when the answer named none.
+/// Nothing is made up for either: an interface shows each path as received or not at all, and says
+/// no wait the service did not name.
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct PairingFailure {
     /// Which outcome it was.
     pub kind: FailureKind,
     /// How many tries this device has left with the code, when the attempt was charged.
     pub tries_left: Option<u32>,
+    /// The paths that still work, as the managed relay service named them, when it named any.
+    #[serde(
+        skip_serializing_if = "Alternatives::is_empty",
+        serialize_with = "as_received"
+    )]
+    pub alternatives: Alternatives,
+    /// Seconds after which the same attempt could succeed, as the managed relay service named them,
+    /// when it named a delay.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_seconds: Option<u64>,
     /// What happened, for a log.
     #[serde(skip)]
     pub detail: Shown,
+}
+
+/// Writes each path as the service wrote it, and nothing else.
+fn as_received<S: Serializer>(
+    alternatives: &Alternatives,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    let items = alternatives.as_given();
+    serializer.collect_seq(items.iter().map(Shown::as_str))
 }
 
 impl PairingFailure {
@@ -133,7 +164,38 @@ impl PairingFailure {
         Self {
             kind,
             tries_left: None,
+            alternatives: Alternatives::none(),
+            retry_after_seconds: None,
             detail: detail.into(),
+        }
+    }
+
+    /// The failure of a dial that the managed relay service's standing answer held back. Capacity
+    /// keeps the paths and the delay the service named; a fault of the service keeps the delay and
+    /// no path, since a path is only ever a path the service named.
+    #[must_use]
+    pub fn of_relay(refusal: RelayRefusal) -> Self {
+        match refusal {
+            RelayRefusal::Capacity {
+                alternatives,
+                retry_after_seconds,
+            } => Self {
+                alternatives,
+                retry_after_seconds,
+                ..Self::new(
+                    FailureKind::RelayCapacity,
+                    "the managed relay has no free capacity to admit this device now",
+                )
+            },
+            RelayRefusal::Fault {
+                retry_after_seconds,
+            } => Self {
+                retry_after_seconds,
+                ..Self::new(
+                    FailureKind::RelayFault,
+                    "the managed relay service could not admit this device now",
+                )
+            },
         }
     }
 
@@ -261,6 +323,67 @@ mod tests {
         assert_eq!(
             format!("{failure:?}"),
             "PairingFailure(\"HostMismatch: the live peer was another endpoint\")"
+        );
+    }
+
+    /// KR-REQ-17.48: a failure that the managed relay service's answer explains carries the paths
+    /// the service named, each as it wrote it, and the wait it named, and says nothing it did not.
+    /// A fault of the service is its own kind, and carries no path.
+    #[test]
+    fn kr_req_17_48_a_failure_of_the_relay_service_carries_what_it_named() {
+        let named = || {
+            Alternatives::named(vec![
+                "A path that this build has never heard of.".to_owned(),
+                "Another path, in the service's words.".to_owned(),
+            ])
+        };
+        let sent = |refusal| serde_json::to_value(PairingFailure::of_relay(refusal)).expect("ok");
+
+        assert_eq!(
+            sent(RelayRefusal::Capacity {
+                alternatives: named(),
+                retry_after_seconds: Some(90),
+            }),
+            serde_json::json!({
+                "kind": "relay_capacity",
+                "tries_left": null,
+                "alternatives": [
+                    "A path that this build has never heard of.",
+                    "Another path, in the service's words."
+                ],
+                "retry_after_seconds": 90,
+            })
+        );
+        // No wait named, none said.
+        assert_eq!(
+            sent(RelayRefusal::Capacity {
+                alternatives: named(),
+                retry_after_seconds: None,
+            }),
+            serde_json::json!({
+                "kind": "relay_capacity",
+                "tries_left": null,
+                "alternatives": [
+                    "A path that this build has never heard of.",
+                    "Another path, in the service's words."
+                ],
+            })
+        );
+        assert_eq!(
+            sent(RelayRefusal::Fault {
+                retry_after_seconds: Some(30)
+            }),
+            serde_json::json!({
+                "kind": "relay_fault",
+                "tries_left": null,
+                "retry_after_seconds": 30,
+            })
+        );
+        assert_eq!(
+            sent(RelayRefusal::Fault {
+                retry_after_seconds: None
+            }),
+            serde_json::json!({"kind": "relay_fault", "tries_left": null})
         );
     }
 }

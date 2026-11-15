@@ -5236,12 +5236,12 @@ impl kr_client::pairing::link::HostLink for Counting {
         self.inner.dial(network, endpoint)
     }
 
-    fn relay_capacity_refused(
+    fn relay_refusal(
         &self,
         network: &kr_protocol::pairing::NetworkConfig,
         endpoint: &kr_protocol::scalars::EndpointKey,
-    ) -> bool {
-        self.inner.relay_capacity_refused(network, endpoint)
+    ) -> Option<kr_client::services::RelayRefusal> {
+        self.inner.relay_refusal(network, endpoint)
     }
 
     fn open_unpaired<'a>(

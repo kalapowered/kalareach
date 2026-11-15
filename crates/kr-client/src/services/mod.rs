@@ -159,7 +159,7 @@ pub use account::{
 };
 pub use admission::{
     AdmissionAnswer, AdmissionClock, AdmissionRequest, ManagedPairingAdmission,
-    PairingAdmissionService, PairingAdmissions,
+    PairingAdmissionService, PairingAdmissions, RelayRefusal,
 };
 pub use alternatives::{Alternative, Alternatives, Offered, is_told_capacity, told_capacity};
 pub use authority::{

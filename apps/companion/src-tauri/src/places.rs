@@ -424,8 +424,12 @@ impl HostLink for Budgeted {
         self.inner.would_refuse_visit(network, in_use)
     }
 
-    fn relay_capacity_refused(&self, network: &NetworkConfig, endpoint: &EndpointKey) -> bool {
-        self.inner.relay_capacity_refused(network, endpoint)
+    fn relay_refusal(
+        &self,
+        network: &NetworkConfig,
+        endpoint: &EndpointKey,
+    ) -> Option<kr_client::services::RelayRefusal> {
+        self.inner.relay_refusal(network, endpoint)
     }
 }
 

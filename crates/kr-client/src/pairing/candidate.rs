@@ -421,26 +421,26 @@ impl Pairing {
         self.candidate.paired_identity(host.device_id, revision)
     }
 
-    /// What a first dial that was lost means when the managed service had no free capacity to admit
-    /// this device through the relay the dial addresses, and none otherwise.
+    /// What a first dial that was lost means when the managed service's answer held it back, and
+    /// none otherwise: no free capacity to admit this device through the relay the dial addresses,
+    /// with what the service named, or a fault of the service.
     ///
     /// Only a dial that was lost is asked, and only about the dial itself: a failure after it, on
     /// the connection, is never a reason to blame the service. The route's own deadline ending a dial
     /// counts as lost, which is the usual way a relay that drops what an unadmitted device sends
     /// ends one.
-    pub(super) fn capacity_failure(
+    pub(super) fn relay_failure(
         &self,
         error: &LinkError,
         network: &NetworkConfig,
         host: &EndpointKey,
     ) -> Option<PairingFailure> {
-        (matches!(error, LinkError::Lost(_)) && self.link.relay_capacity_refused(network, host))
-            .then(|| {
-                PairingFailure::new(
-                    FailureKind::RelayCapacity,
-                    "the managed relay has no free capacity to admit this device now",
-                )
-            })
+        if !matches!(error, LinkError::Lost(_)) {
+            return None;
+        }
+        self.link
+            .relay_refusal(network, host)
+            .map(PairingFailure::of_relay)
     }
 
     /// Pairs by a short code through the room at `origin`.
@@ -677,7 +677,7 @@ impl Pairing {
         )
         .await
         .map_err(|error| {
-            match self.capacity_failure(&error, &bundle.network_config, &bundle.endpoint_id) {
+            match self.relay_failure(&error, &bundle.network_config, &bundle.endpoint_id) {
                 Some(failure) => failure.with_tries(tries),
                 None => link_failed(&error, tries),
             }
