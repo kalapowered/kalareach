@@ -732,7 +732,6 @@ enum Asked {
     Unknown(Shown),
     /// The daemon refused, and its word is that nothing was done.
     Refused(ProtocolError),
-    /// The request could not be made: nothing was sent.
     /// The request could not be made: nothing was sent. `closed` is whether the daemon closed the
     /// connection, which a daemon does when it goes.
     NotComposed { why: Shown, closed: bool },
