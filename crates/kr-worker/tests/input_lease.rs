@@ -2554,26 +2554,31 @@ async fn answers_held_behind_a_paste_are_all_written_when_it_ends_though_more_th
 /// of it and its saying that answers wait still brings the answer out of the lane.
 ///
 /// The share of the host's answers is full and the writer holds all of them; one more answer
-/// waits in the lane behind an open paste, and no pass of the pump has said that answers wait.
-/// The paste ends and the pump reads no room. Before the pump goes on, the writer writes every
-/// batch it holds, and each give-back finds nothing to wake. Nothing else happens afterwards: the
-/// application writes nothing and nobody types. The answer must reach the application all the
-/// same.
+/// waits in the lane behind the first bytes of a key sequence that a person has begun, and no pass
+/// of the pump has said that answers wait. The recogniser's timer forwards the held bytes at their
+/// deadline, which opens the gate and asks the pump to look: the first pass after the gate opens.
+/// That pass reads no room. Before it goes on, the writer writes every batch it holds, the
+/// forwarded bytes among them, and each give-back finds nothing to wake. Nothing else happens
+/// afterwards: the application writes nothing and nobody types. The answer must reach the
+/// application all the same.
 #[tokio::test(flavor = "multi_thread")]
 async fn room_given_back_between_the_pumps_reading_and_its_waiting_still_brings_the_answer_out() {
     let (_host, runtime, clock, _session_id, holder, epoch) = silent_session().await;
     let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
     let room = runtime.input().lock().input_room();
     let (writer_stopped, release_writer) = runtime.input().writer_hold().arm();
+    let (timer_arrived, release_timer) = runtime.pause_the_timer_at_its_deadline();
 
     {
         let mut session = runtime.session();
         session.ingest_output(b"\x1b[?2004h");
         session.ingest_output(&STATUS_QUESTION.repeat(256));
         runtime.flush_input();
+        // The first bytes of the sequence that opens a paste, and no more: the recogniser holds
+        // them, and an answer written now would land inside what the application reads as one key.
         session
-            .write_input(holder, epoch, 0, b"\x1b[200~pasted", None, Instant::now())
-            .expect("the paste opens");
+            .write_input(holder, epoch, 0, b"\x1b[20", None, Instant::now())
+            .expect("the first bytes of a key sequence are held");
         runtime.flush_input();
         clock.advance(Duration::from_secs(1));
         session.ingest_output(STATUS_QUESTION);
@@ -2582,6 +2587,10 @@ async fn room_given_back_between_the_pumps_reading_and_its_waiting_still_brings_
         .await
         .expect("the writer takes the first batch")
         .expect("the writer's stop fires");
+    tokio::time::timeout(Duration::from_secs(20), timer_arrived)
+        .await
+        .expect("the held bytes reach their deadline")
+        .expect("the timer's stop fires");
     assert_eq!(
         room.held_replies(),
         256,
@@ -2589,42 +2598,31 @@ async fn room_given_back_between_the_pumps_reading_and_its_waiting_still_brings_
     );
     assert!(
         runtime.session().engine().replies_pending(),
-        "the 257th waits in the lane, behind the open paste"
+        "the 257th waits in the lane, behind the held bytes"
     );
     assert!(
         !runtime.input().lock().replies_waiting(),
         "and no pass of the pump has said that answers wait"
     );
 
-    // The paste ends. The pass of the pump that the write makes is stopped after it has read the
-    // room, which is full, and before it says that answers wait.
+    // The timer forwards the held bytes and asks the pump to look. The pump's pass is stopped
+    // after it has read the room, which is full, and before it says that answers wait.
     let (pump_stopped, release_pump) = runtime.input().pump_hold().arm_blocking();
-    let ending = {
-        let runtime = Arc::clone(&runtime);
-        tokio::task::spawn_blocking(move || {
-            runtime
-                .session()
-                .write_input(holder, epoch, 1, b"\x1b[201~", None, Instant::now())
-                .expect("the paste ends");
-        })
-    };
+    release_timer.send(()).expect("the timer goes on");
     tokio::time::timeout(Duration::from_secs(20), pump_stopped)
         .await
         .expect("the pump reads the room")
         .expect("the pump's stop fires");
     drop(release_writer);
-    // The writer writes every answer and the paste's opening, and gives back what each held. The
-    // paste's end waits in the domain's queue, which the stopped pass holds, so it is still held.
+    // The writer writes every answer and the forwarded bytes, and gives back what each held.
     tokio::time::timeout(Duration::from_secs(20), async {
-        while room.held_replies() != 0 || room.held().frames > 1 {
+        while room.held() != kr_worker::input_room::Cost::default() || room.held_replies() != 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .expect("the writer writes every batch it holds");
     drop(release_pump);
-    ending.await.expect("the paste's end is accepted");
-    runtime.flush_input();
 
     // The last answer is written once something has brought it out of the lane: the pump's own
     // pass cannot, because it read the room before the writer gave it back.
