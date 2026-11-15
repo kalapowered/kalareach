@@ -97,6 +97,14 @@ pub struct InputShared {
     pump: Arc<tokio::sync::Notify>,
     /// What the worker holds for the terminal, which the pump reads without the domain's lock.
     room: Arc<InputRoom>,
+    /// Where the pump's timer says it has ended, and what lets the pump go on.
+    #[cfg(feature = "testing")]
+    pump_timer: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
 }
 
 impl InputShared {
@@ -106,6 +114,8 @@ impl InputShared {
             pump: domain.writer.room.pump(),
             room: Arc::clone(&domain.writer.room),
             domain: Mutex::new(domain),
+            #[cfg(feature = "testing")]
+            pump_timer: Mutex::default(),
         })
     }
 
@@ -187,33 +197,74 @@ impl InputShared {
         self.pump.notify_one();
     }
 
-    /// Waits until the pump is asked for, or until the first answer that waits in the lane lapses.
+    /// Stops the pump the next time its timer ends, for this host's own tests.
     ///
-    /// An answer that waits for room is dropped when the pump next drains the lane, and when no
-    /// room comes back and nothing else happens that is never, so the pump asks itself at the
-    /// answer's deadline. `tried` is the deadline it last woke at: one that a pass did not end is
-    /// not waited for again, which keeps a lane that cannot drop it from waking the pump over and
-    /// over.
-    pub(crate) async fn pump_asked(
+    /// Returns the end that says the timer has ended, which is before the pump reads the lane's
+    /// clock again, and the end that lets the pump go on. The stop fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn pause_the_pump_at_its_timer(
         &self,
-        clock: &dyn kr_ipc::clock::SharedClock,
-        tried: &mut Option<u64>,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
     ) {
-        let expiry = self
-            .room
-            .reply_expiry()
-            .filter(|at_ms| *tried != Some(*at_ms));
-        let Some(at_ms) = expiry else {
-            self.pump.notified().await;
-            return;
-        };
-        // One millisecond past it: a reply lapses when the reading is later than its deadline.
-        let wait = at_ms
-            .saturating_sub(clock.boot_elapsed_ms())
-            .saturating_add(1);
-        tokio::select! {
-            () = self.pump.notified() => {}
-            () = tokio::time::sleep(std::time::Duration::from_millis(wait)) => *tried = Some(at_ms),
+        let (arrived, watch) = tokio::sync::oneshot::channel();
+        let (release, go) = tokio::sync::oneshot::channel();
+        *self
+            .pump_timer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Waits at the stop the pump's timer takes when it ends, where one is armed.
+    #[cfg(feature = "testing")]
+    async fn at_pump_timer(&self) {
+        let armed = self
+            .pump_timer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.await;
+        }
+    }
+
+    /// Waits until the pump is asked for, or until the lane's clock has passed the deadline of the
+    /// first answer that waits in the lane.
+    ///
+    /// An answer that waits, whether for room or behind a closed gate, is dropped when the pump
+    /// next drains the lane, and when no room comes back and nothing else happens that is never,
+    /// so the pump asks itself once the lane's clock has passed the answer's deadline. The lane
+    /// drops an answer at a reading later than its deadline, and the timer here runs on another
+    /// clock, so a timer that ends is only a reason to read the lane's clock again: the wait goes
+    /// on, a step at a time, until that clock reads later than the deadline.
+    ///
+    /// Nothing here remembers a deadline it has woken for. A pass at a reading later than the
+    /// deadline removes every answer that has it, and the deadline the pass publishes afterwards
+    /// is later than that reading, so the same deadline is never asked for twice and a deadline
+    /// that stays published is always one the lane's clock has not yet passed.
+    pub(crate) async fn pump_asked(&self, lane_clock: &dyn kr_ipc::clock::SharedClock) {
+        loop {
+            let Some(at_ms) = self.room.reply_expiry() else {
+                self.pump.notified().await;
+                return;
+            };
+            let now_ms = lane_clock.boot_elapsed_ms();
+            if now_ms > at_ms {
+                return;
+            }
+            // The lane's clock reads the deadline or an earlier moment, and reads later than it
+            // one millisecond on at the soonest.
+            let wait = std::time::Duration::from_millis(at_ms - now_ms + 1);
+            tokio::select! {
+                () = self.pump.notified() => return,
+                () = tokio::time::sleep(wait) => {}
+            }
+            #[cfg(feature = "testing")]
+            self.at_pump_timer().await;
         }
     }
 }
@@ -371,7 +422,8 @@ pub(crate) struct WriterHandles {
     pub(crate) room: Arc<InputRoom>,
     /// The part of that which belongs to the current lease.
     pub(crate) queued_lease_bytes: Arc<crate::runtime::LeaseBytes>,
-    /// How many answers the writer has dropped because their lane deadline passed.
+    /// How many answers did not reach the application after they left the lane: past their lane
+    /// deadline before the writer wrote any of them, or left unwritten by a writer that ended.
     pub(crate) dropped_replies: Arc<AtomicU64>,
     /// How many bytes of the host's own answers are queued and neither written nor dropped.
     pub(crate) unwritten_replies: Arc<AtomicUsize>,
@@ -703,8 +755,8 @@ impl InputDomain {
         self.lease.epoch()
     }
 
-    /// Returns how many answers the writer has dropped, because the response lane's deadline for
-    /// each passed while it waited for a terminal that would not take it.
+    /// Returns how many answers did not reach the application after they left the response lane,
+    /// as [`crate::session::Session::replies_dropped`] says.
     #[must_use]
     pub fn replies_dropped(&self) -> u64 {
         self.writer.dropped_replies.load(Ordering::Acquire)
