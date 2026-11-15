@@ -29,7 +29,8 @@
 #
 # Where the variable is not set, the run makes a directory of its own under the temporary folder
 # (readable by this account only) and says where it is on standard error. The temporary folder is
-# the one TMPDIR names, else /tmp, and on Windows, where TMPDIR is not set, the one TEMP names.
+# the one TMPDIR names, else /tmp, and on Windows, where TMPDIR is not set or is /tmp (a login
+# shell's profile exports it so), the one TEMP names.
 #
 # The reader guards a test run against a mistake: for any value of the evidence variable, and any
 # temporary variable as a platform, a runner, one of our scripts or a developer's shell sets it,
@@ -37,9 +38,13 @@
 # it refuses nothing that the run set right. It is no boundary against a process of the same
 # account, which can write wherever the run can and can change a link or a folder while the reader
 # reads. It does not close a case that somebody arranges: a name with a line feed beside a link at
-# the shortened name, a link whose target climbs through another link, or a server named with no
-# share. On Windows the comparison ignores letter case, so a folder made case-sensitive, and a
-# letter that the disk and the reader do not fold alike, are not told apart.
+# the shortened name, or a server named with no share. On Windows the comparison ignores letter
+# case, so a folder made case-sensitive, and a letter that the disk and the reader do not fold
+# alike, are not told apart.
+#
+# On Windows this reader takes the temporary folder from TEMP and the TypeScript reader takes TEMP
+# first; the Rust reader and the PowerShell reader take TMP first. Where TMP and TEMP differ, only a
+# value under the runner's folder satisfies all four readers.
 
 # Succeeds on Windows (Git Bash), where a name is the same in any letter case.
 _kr_artifacts_windows() {
@@ -167,7 +172,7 @@ _kr_artifacts_refuse() {
   local _kr_roots
   _kr_roots="$(_kr_artifacts_roots | awk 'BEGIN { s = "" } { s = s (NR > 1 ? ", " : "") $0 } END { print s }')"
   if [ "$#" -ge 3 ]; then
-    printf '%s\n' "kr-artifacts: no directory of this run's own can be made for its evidence: the temporary folder '$3' is refused: $2. It has to be an absolute path to a folder inside one of this platform's temporary roots (${_kr_roots}). Point TMPDIR (on Windows, TEMP) at such a folder, or set KR_TEST_ARTIFACTS_DIR to a folder under one of the roots." >&2
+    printf '%s\n' "kr-artifacts: no directory of this run's own can be made for its evidence: the temporary folder '$3' is refused: $2. It has to be an absolute path to a folder inside one of this platform's temporary roots (${_kr_roots}). Point TMPDIR (on Windows, TEMP: a TMPDIR that is /tmp is passed over there) at such a folder, or set KR_TEST_ARTIFACTS_DIR to a folder under one of the roots." >&2
   else
     printf '%s\n' "kr-artifacts: the evidence directory '$1' (KR_TEST_ARTIFACTS_DIR) is refused: $2. It has to be an absolute path inside one of this platform's temporary roots (${_kr_roots}). Set it to a folder under one of them, or leave it unset and the run makes a directory of its own." >&2
   fi
@@ -254,13 +259,13 @@ _kr_artifacts_confine() {
 }
 
 # Makes a directory of this run's own under the temporary folder and prints its real path. The
-# temporary folder is TMPDIR, else /tmp, and on Windows, where TMPDIR is not set, the folder TEMP
-# names: /tmp there is a folder that TEMP may not name, and it is no root then. The folder is
-# checked before the directory is made in it, so that a temporary folder that is no root is left
-# as it was.
+# temporary folder is TMPDIR, else /tmp, and on Windows, where TMPDIR is not set or is /tmp (a login
+# shell's profile exports it so), the folder TEMP names: /tmp there is a folder that TEMP may not
+# name, and it is no root then. The folder is checked before the directory is made in it, so that a
+# temporary folder that is no root is left as it was.
 _kr_artifacts_own() {
   local _kr_temporary="${TMPDIR:-/tmp}" _kr_made
-  if _kr_artifacts_windows && [ -z "${TMPDIR:-}" ]; then
+  if _kr_artifacts_windows && { [ -z "${TMPDIR:-}" ] || [ "$TMPDIR" = /tmp ]; }; then
     _kr_temporary="$(_kr_artifacts_windows_temp)" || {
       _kr_artifacts_refuse "${TEMP:-}" "TEMP names no folder that exists" "${TEMP:-}"
       return 1
