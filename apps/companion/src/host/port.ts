@@ -973,7 +973,7 @@ export interface RevocationHost {
 }
 
 /** Why this computer's reading of its own mailbox stopped before it read the mailbox through. */
-export type MailboxStop = 'unreachable' | 'refused' | 'waiting' | 'records' | 'full'
+export type MailboxStop = 'unreachable' | 'refused' | 'waiting' | 'capacity' | 'records' | 'full'
 
 /**
  * This computer's reading of its own mailbox, where a host says that its feed changed. A host's
@@ -987,6 +987,11 @@ export interface MailboxView {
   readonly announcements: number
   /** Why the last reading stopped before it read the mailbox through; null when it did not. */
   readonly stopped: MailboxStop | null
+  /**
+   * What the service named, as it wrote it, when the reading stopped for want of managed capacity:
+   * the paths that still work. Empty for every other stop.
+   */
+  readonly alternatives: readonly string[]
 }
 
 /** Every host this computer can revoke devices on. */

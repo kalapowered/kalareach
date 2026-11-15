@@ -587,6 +587,41 @@ fn nothing_was_stored(error: &ClientError) -> bool {
         .is_some_and(|code| !matches!(code, "INTERNAL" | "OUTCOME_UNKNOWN"))
 }
 
+/// The command's error, with what a service with no managed capacity for a new feed named after
+/// its own words: "Until then:" and each alternative as the service wrote it. A refusal that named
+/// none is told as it was.
+fn told_the_alternatives(alternatives: Option<String>, mut told: CommandError) -> CommandError {
+    if let Some(alternatives) = alternatives {
+        if !told.message.ends_with('.') {
+            told.message.push('.');
+        }
+        told.message.push(' ');
+        told.message.push_str(&alternatives);
+    }
+    told
+}
+
+#[cfg(test)]
+mod alternatives_tests {
+    use super::*;
+
+    /// KR-REQ-17.48: what a feed with no managed capacity named is told after the service's own
+    /// words, as the service wrote it, and a refusal that named none is told as it was.
+    #[test]
+    fn kr_req_17_48_the_alternatives_a_service_named_are_told_after_its_words() {
+        let told = told_the_alternatives(
+            Some("Until then: A path of its own. A second path of its own.".to_owned()),
+            CommandError::refused("Managed capacity for new feeds is not available now"),
+        );
+        assert_eq!(
+            told.message,
+            "Managed capacity for new feeds is not available now. Until then: A path of its own. A second path of its own."
+        );
+        let alone = told_the_alternatives(None, CommandError::refused("It was refused."));
+        assert_eq!(alone.message, "It was refused.");
+    }
+}
+
 /// What a digest of `parts` is called to the page: its first twelve bytes in hexadecimal.
 fn digest(parts: &[&[u8]]) -> String {
     let mut hash = sha2::Sha256::new();
@@ -1284,10 +1319,19 @@ impl Revocations {
                     result: Ok(()),
                     stored_nothing: false,
                 },
-                Err(error) => Dispatched {
-                    stored_nothing: nothing_was_stored(&error),
-                    result: Err(CommandError::from(error)),
-                },
+                Err(error) => {
+                    let alternatives = error
+                        .alternatives()
+                        .until_then()
+                        .map(|told| told.as_str().to_owned());
+                    Dispatched {
+                        stored_nothing: nothing_was_stored(&error),
+                        result: Err(told_the_alternatives(
+                            alternatives,
+                            CommandError::from(error),
+                        )),
+                    }
+                }
             },
         }
     }

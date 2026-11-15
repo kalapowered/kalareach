@@ -99,6 +99,10 @@ pub enum Stopped {
     Refused,
     /// The service asked to be left alone, and has not finished asking.
     Waiting,
+    /// The service has no managed capacity for a new mailbox now and named the alternatives that
+    /// still work. That is a limit of the service, and the service also asked to be left alone
+    /// when it named a delay.
+    Capacity,
     /// This computer could not read its hosts, take the lock or read its record.
     Records,
     /// The record is full, so nothing more is accepted until its oldest identifiers are due to be
@@ -117,6 +121,18 @@ pub struct MailboxView {
     pub announcements: u64,
     /// Why the last pass stopped before it read the mailbox through, when it did.
     pub stopped: Option<Stopped>,
+    /// The alternatives the service named, as it wrote them, when the pass stopped for want of
+    /// managed capacity. Empty for every other stop.
+    pub alternatives: Vec<String>,
+}
+
+impl MailboxView {
+    /// Records why the last pass stopped, or that it did not, and what the service named beside a
+    /// stop that is not for want of capacity: nothing.
+    fn stop(&mut self, why: Option<Stopped>) {
+        self.stopped = why;
+        self.alternatives.clear();
+    }
 }
 
 /// What a pass left, for the screen.
@@ -153,7 +169,7 @@ pub struct MailboxDesk {
     observed: Mutex<Observed>,
     /// Where each service that asked to be left alone has its delay end, on a clock that only moves
     /// forward.
-    asked_to_wait: Mutex<BTreeMap<GatewayOrigin, Instant>>,
+    asked_to_wait: Mutex<BTreeMap<GatewayOrigin, (Instant, Vec<String>)>>,
     /// The time a pass has, in milliseconds.
     within_ms: AtomicU64,
 }
@@ -201,9 +217,22 @@ impl MailboxDesk {
         self.observed.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The service asked to be left alone, and has not finished asking. It is a stop for want of
+    /// capacity while what the service named beside the delay is held, and a wait otherwise.
+    fn waiting(&self, alternatives: Vec<String>) -> MailboxView {
+        let mut observed = self.observed();
+        if alternatives.is_empty() {
+            observed.view.stop(Some(Stopped::Waiting));
+        } else {
+            observed.view.stop(Some(Stopped::Capacity));
+            observed.view.alternatives = alternatives;
+        }
+        observed.view.clone()
+    }
+
     fn stopped(&self, why: Stopped) -> MailboxView {
         let mut observed = self.observed();
-        observed.view.stopped = Some(why);
+        observed.view.stop(Some(why));
         observed.view.clone()
     }
 
@@ -215,8 +244,8 @@ impl MailboxDesk {
             return self.view();
         };
         let origin = self.sync.origin();
-        if self.must_wait(&origin) {
-            return self.stopped(Stopped::Waiting);
+        if let Some(alternatives) = self.must_wait(&origin) {
+            return self.waiting(alternatives);
         }
         let client = match self.client(&origin) {
             Ok(client) => client,
@@ -232,23 +261,26 @@ impl MailboxDesk {
             // Another window of the application is reading it, and holds the lock for the pass.
             Ok(Attempt::Skipped) => {}
             Ok(Attempt::Read(Ok(outcome))) => {
-                observed.view.stopped = None;
+                observed.view.stop(None);
                 if outcome == Outcome::ReadThrough {
                     observed.view.last_read_ms = Some(now);
                 }
             }
             Ok(Attempt::Read(Err(Stop::Service(error)))) => {
                 let why = self.service_stopped(&error, &origin);
-                observed.view.stopped = Some(why);
+                observed.view.stop(Some(why));
+                if why == Stopped::Capacity {
+                    observed.view.alternatives = told_alternatives(&error);
+                }
             }
             Ok(Attempt::Read(Err(Stop::Local(RecordError::Full)))) => {
-                observed.view.stopped = Some(Stopped::Full);
+                observed.view.stop(Some(Stopped::Full));
             }
             Ok(Attempt::Read(Err(Stop::Local(RecordError::Records(error))))) => {
                 tracing::warn!(%error, "this computer's mailbox record could not be used");
-                observed.view.stopped = Some(Stopped::Records);
+                observed.view.stop(Some(Stopped::Records));
             }
-            Err(_elapsed) => observed.view.stopped = Some(Stopped::Unreachable),
+            Err(_elapsed) => observed.view.stop(Some(Stopped::Unreachable)),
         }
         observed.view.clone()
     }
@@ -290,15 +322,18 @@ impl MailboxDesk {
         .leaving_delays_to_the_caller())
     }
 
-    /// Whether the service at `origin` asked to be left alone and has not finished asking.
-    fn must_wait(&self, origin: &GatewayOrigin) -> bool {
+    /// Whether the service at `origin` asked to be left alone and has not finished asking, and
+    /// what it named beside the delay: the alternatives, when it had no managed capacity.
+    fn must_wait(&self, origin: &GatewayOrigin) -> Option<Vec<String>> {
         let mut asked = self
             .asked_to_wait
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
-        asked.retain(|_, until| *until > now);
-        asked.contains_key(origin)
+        asked.retain(|_, (until, _)| *until > now);
+        asked
+            .get(origin)
+            .map(|(_, alternatives)| alternatives.clone())
     }
 
     /// What a refusal or a failure of the service means for the next pass. A delay the service
@@ -322,10 +357,24 @@ impl MailboxDesk {
                     .asked_to_wait
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                let owed = asked.entry(origin.clone()).or_insert(until);
-                *owed = (*owed).max(until);
-                return Stopped::Waiting;
+                let owed = asked
+                    .entry(origin.clone())
+                    .or_insert_with(|| (until, Vec::new()));
+                owed.0 = owed.0.max(until);
+                owed.1 = if is_short_budget(error) {
+                    told_alternatives(error)
+                } else {
+                    Vec::new()
+                };
+                return if is_short_budget(error) {
+                    Stopped::Capacity
+                } else {
+                    Stopped::Waiting
+                };
             }
+        }
+        if is_short_budget(error) {
+            return Stopped::Capacity;
         }
         match refused.code {
             ErrorCode::PermissionDenied
@@ -499,6 +548,26 @@ impl Reading for Desk<'_> {
     }
 }
 
+/// Whether a refusal says the service has no managed capacity for a new name: it is a rate limit
+/// or a service that cannot take it, and it names the alternatives that still work. Only the
+/// words depend on this; what the pass does is decided by the code and the delay.
+fn is_short_budget(error: &ClientError) -> bool {
+    matches!(
+        error.code(),
+        ErrorCode::RateLimited | ErrorCode::ServiceCapacity
+    ) && !error.alternatives().is_empty()
+}
+
+/// The alternatives a refusal named, as the service wrote them.
+fn told_alternatives(error: &ClientError) -> Vec<String> {
+    error
+        .alternatives()
+        .as_given()
+        .iter()
+        .map(|one| one.as_str().to_owned())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,5 +596,43 @@ mod tests {
             load(&path, until).expect("a record").identifiers.is_empty(),
             "forgotten when its retention ends"
         );
+    }
+    /// A refusal as a service words it when it has no capacity for a new mailbox.
+    fn refused(code: ErrorCode, alternatives: &[&str]) -> ClientError {
+        ClientError::Refused {
+            error: kr_protocol::error::ProtocolError::new(code, "Refused."),
+            retry_after_seconds: Some(600),
+            action: kr_client::retry::UserAction::Wait,
+            service_code: Some("SERVICE_UNAVAILABLE"),
+            alternatives: kr_client::services::Alternatives::for_test(alternatives),
+        }
+    }
+
+    /// KR-REQ-17.48: a refusal for a short budget that names alternatives stops the pass for want
+    /// of capacity and carries them as the service wrote them; one that names none, or that is
+    /// another refusal, does not. A stop that is not for capacity carries no alternatives.
+    #[test]
+    fn kr_req_17_48_a_short_budget_that_names_alternatives_is_a_stop_for_capacity() {
+        for code in [ErrorCode::RateLimited, ErrorCode::ServiceCapacity] {
+            let error = refused(code, &["A path of its own.", "A second path of its own."]);
+            assert!(is_short_budget(&error));
+            assert_eq!(
+                told_alternatives(&error),
+                ["A path of its own.", "A second path of its own."]
+            );
+            assert!(!is_short_budget(&refused(code, &[])), "a fault names none");
+        }
+        assert!(!is_short_budget(&refused(
+            ErrorCode::PermissionDenied,
+            &["A path of its own."]
+        )));
+        let mut view = MailboxView {
+            stopped: Some(Stopped::Capacity),
+            alternatives: vec!["A path of its own.".to_owned()],
+            ..MailboxView::default()
+        };
+        view.stop(Some(Stopped::Unreachable));
+        assert!(view.alternatives.is_empty());
+        assert_eq!(view.stopped, Some(Stopped::Unreachable));
     }
 }

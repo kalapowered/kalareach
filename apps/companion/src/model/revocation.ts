@@ -239,6 +239,11 @@ export function describeMailbox(mailbox: MailboxView): string | null {
       return `The sync service turned back this computer's request for its mailbox. Check the sync service setting. ${still}`
     case 'waiting':
       return `The sync service asked this computer to wait before it reads its mailbox again. ${still}`
+    case 'capacity':
+      return `The sync service has no managed capacity for new mailboxes now, which is a limit of the service and not a fault of this computer. ${[
+        'Until then:',
+        ...mailbox.alternatives,
+      ].join(' ')} ${still}`
     case 'records':
       return `This computer could not use the records it reads its mailbox with, so it reads none. ${still}`
     case 'full':
