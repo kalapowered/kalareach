@@ -835,6 +835,11 @@ pub struct Controller {
     /// every shipped build.
     #[cfg(test)]
     before_the_effect: ReadPause,
+    /// Where this host's own tests stop a retained create answer once its check has passed, before
+    /// the lookup of the reservation the answer is about waits for the registry, so that a fence
+    /// can land in between. Compiled away in every shipped build.
+    #[cfg(test)]
+    before_a_reservation_is_looked_up: ReadPause,
     /// Where this host's own tests stop a voice change that found no record of its action, once the
     /// early look is over and before it claims the action, so that a copy of it can claim and
     /// record the action in between. Compiled away in every shipped build.
