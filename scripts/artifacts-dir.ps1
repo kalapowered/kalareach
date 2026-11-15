@@ -97,7 +97,11 @@ function Get-TemporaryRoots {
         # path on its disk.
         if ($found.TrimEnd($separators) -eq [System.IO.Path]::GetPathRoot($found).TrimEnd($separators)) { continue }
         $real = $found.TrimEnd($separators)
-        if (-not ($roots -contains $real)) { $roots += $real }
+        # Two names for one folder are one root; the comparison is the one that confines a value, so
+        # roots that differ in letter case alone are two where the disk tells them apart.
+        $known = $false
+        foreach ($root in $roots) { if ($root.Equals($real, $comparison)) { $known = $true } }
+        if (-not $known) { $roots += $real }
     }
     return $roots
 }
