@@ -14,7 +14,11 @@
 //!
 //! The lane holds replies; the session loop delivers them. [`LaneGate`] carries what the loop knows
 //! about the write it is about to make, so a reply cannot land inside an unfinished bracketed paste
-//! or split a recognised human input frame.
+//! or split a recognised human input frame. A closed gate changes what is written and nothing
+//! else: a reply that waits behind it ages as one that waits for room does, and is dropped, with
+//! its record, at its deadline, however long the paste stays open. The one hold under which a reply
+//! does not age is the cursor hold, which keeps every other reply behind the cursor report that the
+//! root editor is owed.
 //!
 //! Nothing here is history. A reply that was never drained is dropped when the lane resets, and a
 //! reconnecting client is never sent a reply or a probe answer from before it arrived.
@@ -350,9 +354,11 @@ impl ResponseLane {
     /// Returns when the first of the waiting replies that age lapses, as a reading of the clock the
     /// lane is driven by.
     ///
-    /// A reply a hold keeps does not age, and one with no deadline never lapses, so neither is
-    /// counted. A caller that cannot drain the lane before then, for want of room, looks again at
-    /// this reading to have the lapsed reply dropped and recorded.
+    /// A reply the cursor hold keeps does not age, and one with no deadline never lapses, so
+    /// neither is counted. A caller that cannot write before then, for want of room or because the
+    /// gate is closed, looks again at a reading later than this one to have the lapsed reply dropped
+    /// and recorded: a drain at such a reading removes it, so this reading, taken after a drain, is
+    /// one that the next drain acts on.
     #[must_use]
     pub fn next_expiry_ms(&self) -> Option<u64> {
         self.queue
@@ -403,18 +409,21 @@ impl ResponseLane {
     /// human input the same loop is delivering. A reply that does not fit the remaining budget
     /// stays where it is, including the first one: a budget of zero takes nothing.
     ///
-    /// A reply that has waited past its deadline is dropped here rather than written, and the drop
-    /// shows up in the degradation record. `now_ms` is a reading of the same continuous clock the
-    /// replies were offered on.
+    /// A reply that has waited past its deadline is dropped here rather than written, wherever it
+    /// stands in the queue and whatever the gate allows, and the drop shows up in the degradation
+    /// record. A closed gate writes nothing, but it does not stop a reply from ageing: behind an
+    /// open paste or a held frame the reply is dropped at its deadline, not when the gate opens.
+    /// `now_ms` is a reading of the same continuous clock the replies were offered on.
     ///
     /// With [`LaneGate::cursor_report_first`] set, the cursor reports go first, in their order, and
     /// nothing else is taken until one has been: the other replies are held, not dropped, except
     /// that one which had already waited past its deadline when the hold first kept it is dropped
-    /// then. A reply the hold kept does not age while it is kept, so when a cursor report ends the
-    /// hold each of them has the time it had left when it was first kept. A hold that ends any
-    /// other way is ended by [`Self::end_hold`], which gives no time back: a reply that has by then
-    /// waited past its deadline is dropped as it would be behind a paste, because an answer that
-    /// old would reach whatever reads next, which did not ask.
+    /// then. The cursor hold is the one hold under which a reply does not age: a reply it kept has
+    /// no deadline running while it is kept, so when a cursor report ends the hold each of them has
+    /// the time it had left when it was first kept. A hold that ends any other way is ended by
+    /// [`Self::end_hold`], which gives no time back: a reply that has by then waited past its
+    /// deadline is dropped, because an answer that old would reach whatever reads next, which did
+    /// not ask.
     pub fn drain(&mut self, gate: LaneGate, max_bytes: usize, now_ms: u64) -> Vec<Response> {
         self.drain_within(gate, DrainBudget::bytes(max_bytes), now_ms)
     }
@@ -423,13 +432,17 @@ impl ResponseLane {
     ///
     /// A reply that would pass either figure stays where it is, in its place and with its deadline,
     /// and so does everything behind it. A reply that has waited past its deadline is dropped
-    /// whatever the budget, because the deadline is not the caller's to extend.
+    /// whatever the budget, the place it stands in and the gate, because the deadline is not the
+    /// caller's to extend.
     pub fn drain_within(
         &mut self,
         gate: LaneGate,
         budget: DrainBudget,
         now_ms: u64,
     ) -> Vec<Response> {
+        // Before the gate is read: a reply ages behind an open paste or a held frame as it does
+        // anywhere else, and the gate decides what is written, not what is dropped.
+        self.drop_lapsed(now_ms, gate.cursor_report_first);
         if !gate.allows_write() {
             return Vec::new();
         }
@@ -437,21 +450,13 @@ impl ResponseLane {
         let mut taken = 0usize;
         if gate.cursor_report_first {
             self.hold_behind_cursor_report(now_ms);
-            self.take_cursor_reports(budget, now_ms, &mut taken, &mut out);
+            self.take_cursor_reports(budget, &mut taken, &mut out);
             if out.is_empty() {
                 return out;
             }
             self.release_held(now_ms);
         }
         while let Some(front) = self.queue.front() {
-            if front.lapsed(now_ms) {
-                let Some(expired) = self.queue.pop_front() else {
-                    break;
-                };
-                self.queued_bytes -= expired.bytes.len();
-                self.degradation.expired += 1;
-                continue;
-            }
             if taken + front.bytes.len() > budget.bytes || out.len() >= budget.replies {
                 break;
             }
@@ -466,23 +471,33 @@ impl ResponseLane {
         out
     }
 
-    /// Marks the replies that wait behind a cursor report, from now on, and drops one that had
-    /// already waited past its deadline before it was first kept.
+    /// Drops every reply that has waited past its deadline at `now_ms`, wherever it stands in the
+    /// queue and whatever the room for it.
+    ///
+    /// A drain stops at the first reply that does not fit, so a reply behind it would otherwise
+    /// stand past its deadline until the drain got that far. While a hold is in force
+    /// (`hold_in_force`), a reply it keeps does not age and is left alone.
+    ///
+    /// A reply that this removes is gone, so a reading later than a reply's deadline is always
+    /// followed by its removal at the next drain, and [`Self::next_expiry_ms`], read after a drain,
+    /// is a deadline that the next drain acts on.
+    fn drop_lapsed(&mut self, now_ms: u64, hold_in_force: bool) {
+        self.queue.retain(|reply| {
+            let kept = (hold_in_force && reply.held_since.is_some()) || !reply.lapsed(now_ms);
+            if !kept {
+                self.queued_bytes -= reply.bytes.len();
+                self.degradation.expired += 1;
+            }
+            kept
+        });
+    }
+
+    /// Marks the replies that wait behind a cursor report, from now on.
     fn hold_behind_cursor_report(&mut self, now_ms: u64) {
         self.holding = true;
-        let mut index = 0;
-        while index < self.queue.len() {
-            let reply = &mut self.queue[index];
-            if matches!(reply.kind, ResponseKind::CursorPosition) || reply.held_since.is_some() {
-                index += 1;
-            } else if reply.lapsed(now_ms) {
-                if let Some(expired) = self.queue.remove(index) {
-                    self.queued_bytes -= expired.bytes.len();
-                    self.degradation.expired += 1;
-                }
-            } else {
+        for reply in &mut self.queue {
+            if !matches!(reply.kind, ResponseKind::CursorPosition) && reply.held_since.is_none() {
                 reply.held_since = Some(now_ms);
-                index += 1;
             }
         }
     }
@@ -491,7 +506,6 @@ impl ResponseLane {
     fn take_cursor_reports(
         &mut self,
         budget: DrainBudget,
-        now_ms: u64,
         taken: &mut usize,
         out: &mut Vec<Response>,
     ) {
@@ -500,11 +514,6 @@ impl ResponseLane {
             let reply = &self.queue[index];
             if !matches!(reply.kind, ResponseKind::CursorPosition) {
                 index += 1;
-            } else if reply.lapsed(now_ms) {
-                if let Some(expired) = self.queue.remove(index) {
-                    self.queued_bytes -= expired.bytes.len();
-                    self.degradation.expired += 1;
-                }
             } else if *taken + reply.bytes.len() > budget.bytes || out.len() >= budget.replies {
                 break;
             } else if let Some(report) = self.queue.remove(index) {
