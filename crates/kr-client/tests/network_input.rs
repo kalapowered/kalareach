@@ -3064,9 +3064,15 @@ mod local {
             *self.stalled.lock().expect("stalled") = Some(stall);
         }
 
-        /// Waits until a bounded send has reached its stall.
+        /// Waits until a bounded send has reached its stall: a lane that never sends fails the case
+        /// here, by this assertion, and not by a wait that nothing ends.
         async fn stalled_send(&self) {
-            self.entered.notified().await;
+            let reached =
+                tokio::time::timeout(Duration::from_secs(5), self.entered.notified()).await;
+            assert!(
+                reached.is_ok(),
+                "no send reached the connection in five seconds"
+            );
         }
 
         /// Lets the stalled send go on.
