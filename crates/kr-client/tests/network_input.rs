@@ -3551,10 +3551,9 @@ mod local {
     async fn told_by_the_bound(
         request: tokio::sync::oneshot::Receiver<kr_client::Result<kr_client::Settled>>,
     ) -> kr_client::Result<kr_client::Settled> {
-        let told = tokio::time::timeout(LOCAL_SEND_BOUND + Duration::from_secs(1), request).await;
-        assert!(told.is_ok(), "the request's send stage outlasted its bound");
-        told.ok()
-            .expect("in time")
+        tokio::time::timeout(LOCAL_SEND_BOUND + Duration::from_secs(1), request)
+            .await
+            .unwrap_or_else(|_| panic!("the request's send stage outlasted its bound"))
             .expect("the channel is answered")
     }
 
