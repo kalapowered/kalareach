@@ -145,10 +145,12 @@ echo
 # backslash or is relative is a mistake that the readers pass over, but this line does not: the run
 # root, and so the children's evidence directory, then stand where their readers refuse them, and
 # each measurement fails with the reader's words and records nothing. A relative value is read from
-# the repository root, where this script runs, and ends it at once where no such folder is there. A
-# value that names the top of a file system still gets a run root under it, where the account can
-# write there, and the children's readers accept that folder, so their records wait in it until they
-# are copied, and a KILL leaves them there.
+# the repository root, where this script runs, and ends it at once where no such folder is there.
+# Where the caller names an evidence directory under another root, a value that names the top of a
+# file system still gets a run root under it, where the account can write there, and the children's
+# readers accept that folder, so their records wait in it until they are copied, and a KILL leaves
+# them there. Where no evidence directory is named, the reader refuses such a value before the run
+# root is made.
 # Nothing is written outside the run root and the caller's directory.
 # shellcheck source=scripts/lib/artifacts-dir.sh
 . "$root/scripts/lib/artifacts-dir.sh"

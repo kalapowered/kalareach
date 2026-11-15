@@ -248,8 +248,8 @@ fn records_are_appended_to_a_directory_named_under_the_callers_temporary_folder(
     assert_eq!(sections(&record), 4, "{text}");
 }
 
-/// A run that a time-out or a cancel cuts in the middle of a measurement keeps what that
-/// measurement had recorded: the exit trap appends it to the caller's directory.
+/// A run that TERM cuts in the middle of a measurement keeps what that measurement had recorded:
+/// the exit trap appends it to the caller's directory.
 #[test]
 fn a_run_ended_by_a_signal_inside_a_measurement_keeps_what_the_measurement_recorded() {
     let temporary = tempfile::tempdir().expect("a temporary folder");
