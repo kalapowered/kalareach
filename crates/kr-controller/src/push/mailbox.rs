@@ -199,10 +199,7 @@ mod tests {
     /// A refusal as a service words it when it has no capacity for a new mailbox.
     fn refused(code: ErrorCode, alternatives: &[&str]) -> ClientError {
         ClientError::Refused {
-            error: ProtocolError::new(
-                code,
-                "Managed capacity for new mailboxes is not available now.",
-            ),
+            error: ProtocolError::new(code, "There is no room for new mailboxes right now."),
             retry_after_seconds: Some(600),
             action: UserAction::Wait,
             service_code: Some("SERVICE_UNAVAILABLE"),
@@ -227,7 +224,7 @@ mod tests {
             let (before, waits) = told_later(&refused(code, &[]));
             assert!(
                 before.starts_with("the mailbox service did not take it yet: ")
-                    && before.contains("Managed capacity for new mailboxes is not available now."),
+                    && before.contains("There is no room for new mailboxes right now."),
                 "the control holds the service's own message: {before}"
             );
             assert_eq!(waits, Some(Duration::from_secs(600)));
