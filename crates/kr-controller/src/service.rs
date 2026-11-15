@@ -801,6 +801,11 @@ pub struct Controller {
     /// be owed in that wait. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     before_the_policy_lock: ThreadPause,
+    /// Where this host's own tests stop a frame's ask once the local owner's lease has been read,
+    /// and before the footing's question, so that a fence, a withdrawal or a policy commit can come
+    /// after the last wait. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    after_the_lease_is_read: ThreadPause,
     /// Where this host's own tests stop the authority feed's check of a network connection just
     /// before it takes the connection's shares lock, so that a fence can be owed in that wait.
     /// Compiled away in every shipped build.
@@ -1844,6 +1849,11 @@ mod the_fence_at_every_effect;
 /// What a request's footing reads of a barrier, a fence and a registration without taking a lock.
 #[cfg(test)]
 mod a_footing_over_a_barrier;
+
+/// What the local writer asks after its last wait, and what it writes in place of a frame that the
+/// question stops.
+#[cfg(test)]
+mod a_frame_is_asked_where_it_lands;
 
 /// The walks over the method table that hold the local door's routes.
 #[cfg(test)]

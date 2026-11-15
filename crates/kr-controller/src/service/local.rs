@@ -17,11 +17,14 @@ use kr_protocol::scalars::{CanonicalSet, Nullable, U64};
 use kr_transport::window::MAX_WINDOW_VALIDITY;
 
 use crate::error::{ControllerError, Result};
-use crate::given::local_door::{Declined, DoorReply, ReplySink, Standing, declined, told};
+use crate::given::local_door::{
+    Declined, DoorReply, ReplySink, Standing, WrittenUnder, declined, told,
+};
 use crate::given::{Given, Recorded, Settled};
 
 use super::identifiers::{Arrival, SpendError};
-use super::{Controller, error_reply, net, respond};
+use super::local_access::LeaseHeld;
+use super::{Controller, Footing, Lapse, error_reply, net, respond};
 
 /// How often the daemon replaces a live connection's action window.
 ///
@@ -328,22 +331,84 @@ impl Controller {
         )
     }
 
+    /// The footing of a request that arrived on `connection_id`, made once at the door in the same
+    /// read as the revision the request is admitted under: every later question of it, by the door
+    /// that tells the reply and by the writer, reads atomics and clocks alone. A registration that
+    /// has gone gives a footing that names none, which every member that names a registration
+    /// refuses.
+    pub(super) fn footing_of_a_request(&self, connection_id: ConnectionId) -> Footing {
+        self.footing_on(connection_id, None)
+            .unwrap_or_else(|_| Footing::untargeted(Arc::clone(&self.copies)))
+    }
+
+    /// The question a frame is asked immediately before the transport takes any of its bytes: the
+    /// local owner's lease is read first, which waits for the policy lock, and the footing's one
+    /// question is asked after that, with the bound of the lease that reading found. Nothing but
+    /// the question stands between it and the transport's write.
+    ///
+    /// A bound whose cell moved to another lineage between the reading and the question is not
+    /// decided by the question: the lease is read again and the question asked with the new bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first member that refuses; a lease that is not live refuses first.
+    pub(super) fn ask_where_a_frame_lands(
+        &self,
+        leased: Option<Method>,
+        under: &WrittenUnder,
+    ) -> std::result::Result<(), Lapse> {
+        loop {
+            let held = match leased {
+                Some(method) => self.local_hold(method).map_err(|_| Lapse::LeaseEnded)?,
+                None => LeaseHeld::default(),
+            };
+            #[cfg(feature = "testing")]
+            self.after_the_lease_is_read.wait();
+            match under.asked_holding(held.bound) {
+                Err(Lapse::BoundMoved) => {}
+                asked => return asked,
+            }
+        }
+    }
+
+    /// What stops a read's frame being written now, for the attention release that asks it before
+    /// every transport write: none while the lease holds and the registration stands, and
+    /// otherwise the reply of the member that refused, in the words of the door's own check.
+    pub(super) fn the_refusal_where_a_read_lands(
+        &self,
+        method: Option<Method>,
+        under: &WrittenUnder,
+        request_id: RequestId,
+    ) -> Option<ControlFrame> {
+        let lapse = self
+            .ask_where_a_frame_lands(Self::held_to_the_lease(method), under)
+            .err()?;
+        Some(under.withheld(lapse, request_id, false, || {
+            self.lease_ended_reply(request_id, method)
+        }))
+    }
+
+    /// The method, where its use is held to the local owner's lease.
+    fn held_to_the_lease(method: Option<Method>) -> Option<Method> {
+        method.filter(|method| {
+            kr_protocol::method::local_hold(*method) == kr_protocol::method::LocalHold::Held
+        })
+    }
+
     /// Writes the answer to a local caller's request for `method`, and says whether the
     /// connection goes on.
     ///
-    /// The answer of a method that is held to the local owner's lease is written only while the
-    /// lease holds. The lease is asked again before every transport write, and while the peer has
-    /// no room it is asked again each time the peer reads, so an answer that waited for a peer is
-    /// not finished under a lease that ended meanwhile: one none of which has gone is taken back
-    /// and its refusal written, and one the peer has part of ends the connection.
-    ///
-    /// An answer read from a record is written only while the standing it passed the kept
-    /// answer's check under holds (`from_a_record`): it is asked at the same places, the fence this
-    /// host owes and the registration at its revision. One none of which has gone is taken back and
-    /// the outcome is told as not shown, or, for a reply that says an identifier was spent, the
-    /// refusal of the check that failed; one the peer has part of ends the connection. After
-    /// the last ask before the transport takes a byte the bytes are the transport's, and no later
-    /// ask exists.
+    /// Every frame is asked before every transport write, and while the peer has no room it is
+    /// asked again each time the peer reads. The ask reads the local owner's lease first, which
+    /// waits for the policy lock that a policy commit holds across its storage writes, and then
+    /// the one question of the request's footing ([`WrittenUnder`]): the registration, and for a
+    /// reply read from a record also the fence and the revision it was admitted under. The
+    /// question reads atomics and clocks alone, so after the lease's reading the bytes follow with
+    /// nothing between them but instructions and the transport's own write. A frame none of which
+    /// has gone is taken back and the question asked once more: where it passes, the lease was
+    /// presented again or the fence given back meanwhile and the frame is offered afresh; where it
+    /// refuses, the reply is the one of the member that refused, and no ask follows it. A frame
+    /// the peer has part of ends the connection.
     pub(crate) async fn write_answer(
         &self,
         writer: &mut kr_ipc::framed::FrameWriter,
@@ -351,32 +416,15 @@ impl Controller {
         answer: &ControlFrame,
         method: Option<Method>,
         request_id: RequestId,
-        from_a_record: Option<crate::given::local_door::FromARecord>,
+        under: &WrittenUnder,
     ) -> bool {
         use kr_ipc::framed::CheckedWrite;
 
-        let leased = method.filter(|method| {
-            kr_protocol::method::local_hold(*method) == kr_protocol::method::LocalHold::Held
-        });
-        if leased.is_none() && from_a_record.is_none() {
-            return writer.write_message(answer).await.is_ok();
-        }
+        let leased = Self::held_to_the_lease(method);
         let Ok(bytes) = kr_ipc::framed::FrameWriter::encode(kind, answer) else {
             return false;
         };
-        let record_stands = || from_a_record.is_none_or(|record| record.stands(self));
-        // The lease is asked first: its reading waits for the policy lock, which a policy commit
-        // holds across its storage writes, and the record's fence is read after that wait. The
-        // record's check takes locks of its own, so the lease's end that the reading returned is
-        // compared with the clock again after them, with no lock of its own.
-        let permitted = || {
-            let Some(end) = leased.map_or(Some(None), |method| {
-                self.local_hold(method).ok().map(|held| held.end)
-            }) else {
-                return false;
-            };
-            record_stands() && self.lease_is_live_until(end).is_ok()
-        };
+        let permitted = || self.ask_where_a_frame_lands(leased, under).is_ok();
         let mut begun = false;
         loop {
             let attempt = if begun {
@@ -396,17 +444,22 @@ impl Controller {
                     if !writer.withdraw_unstarted() {
                         return false;
                     }
-                    if permitted() {
-                        // The lease was presented again, or the fence given back, meanwhile:
-                        // offered afresh.
-                        begun = false;
-                        continue;
+                    match self.ask_where_a_frame_lands(leased, under) {
+                        Ok(()) => {
+                            // The lease was presented again, or the fence given back, meanwhile:
+                            // offered afresh.
+                            begun = false;
+                        }
+                        Err(lapse) => {
+                            let reply = under.withheld(
+                                lapse,
+                                request_id,
+                                crate::given::may_have_taken_effect(answer),
+                                || self.lease_ended_reply(request_id, method),
+                            );
+                            return writer.write_message(&reply).await.is_ok();
+                        }
                     }
-                    let reply = match from_a_record {
-                        Some(record) if !record.stands(self) => record.withheld(self, request_id),
-                        _ => self.lease_ended_reply(request_id, method),
-                    };
-                    return writer.write_message(&reply).await.is_ok();
                 }
                 Err(_) => return false,
             }
@@ -475,6 +528,16 @@ impl Controller {
         &self,
     ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
         self.before_the_policy_lock.arm()
+    }
+
+    /// Arms the pause the next frame written to a local connection stops at once the local owner's
+    /// lease has been read, before the footing's question. Returns the end that says the frame has
+    /// arrived, and the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_after_the_lease_is_read(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.after_the_lease_is_read.arm()
     }
 
     /// Arms the pause the next check of the authority feed on a network connection stops at before
@@ -988,19 +1051,22 @@ impl Controller {
                                     Ok(_) => match self.read_refused(&request) {
                                         Some(refused) => refused,
                                         None => {
-                                            // Held to the local owner's lease at every transport
-                                            // write, as to the privacy fence.
+                                            // Held to the local owner's lease and to the
+                                            // registration at every transport write, as to the
+                                            // privacy fence.
                                             let method = request.method.method();
-                                            let permitted = || {
-                                                method.is_none_or(|method| {
-                                                    self.local_hold(method).is_ok()
-                                                })
+                                            let under = WrittenUnder::of_a_read(
+                                                self.footing_of_a_request(connection_id),
+                                            );
+                                            let refused = || {
+                                                self.the_refusal_where_a_read_lands(
+                                                    method,
+                                                    &under,
+                                                    request.request_id,
+                                                )
                                             };
-                                            let lease = crate::attention::LeaseHold {
-                                                permitted: &permitted,
-                                                refusal: self
-                                                    .lease_ended_reply(request.request_id, method),
-                                            };
+                                            let lease =
+                                                crate::attention::LeaseHold { refused: &refused };
                                             if self
                                                 .attention
                                                 .write_released_held(
@@ -1046,6 +1112,9 @@ impl Controller {
                                     Ok(_) => match self.read_refused(&request) {
                                         Some(refused) => refused,
                                         None => {
+                                            let under = WrittenUnder::of_a_read(
+                                                self.footing_of_a_request(connection_id),
+                                            );
                                             if !self
                                                 .write_answer(
                                                     writer,
@@ -1053,7 +1122,7 @@ impl Controller {
                                                     &answer,
                                                     request.method.method(),
                                                     request.request_id,
-                                                    None,
+                                                    &under,
                                                 )
                                                 .await
                                             {
@@ -1224,10 +1293,13 @@ impl Controller {
         // a retained lookup, a lock or a task being scheduled would admit a mutation under an
         // authority the other door refuses the same mutation under. A retained answer is checked
         // against it, and so is every effect this door performs.
-        let admitted = self.admitted_revision(connection_id).ok();
-        // What every reply is told under: the connection the request arrived on and the revision it
-        // was admitted under.
-        let standing = Standing::new(self, connection_id, admitted, request_id);
+        // The footing is made in the same read, so a reply is asked at the revision the request
+        // was admitted under and never at the table's present stamp.
+        let footing = self.footing_of_a_request(connection_id);
+        let admitted = footing.admitted_revision();
+        // What every reply is told under: the footing the request arrived on and was admitted
+        // under.
+        let standing = Standing::new(self, footing, request_id);
         let mut retained = self.retained(actor_id, &mutation, method).await;
         if retained.is_none() && crate::transfer::TransferModule::serves(method) {
             retained = self.transfer.retained(actor_id, &mutation, method).await;

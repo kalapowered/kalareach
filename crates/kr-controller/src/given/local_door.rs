@@ -11,14 +11,16 @@ use kr_ipc::framed::FrameWriter;
 use kr_protocol::envelope::{ControlFrame, Outcome, Response};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::frame::StreamKind;
-use kr_protocol::ids::{AuthorityRevision, ConnectionId, RequestId};
+use kr_protocol::ids::RequestId;
 use kr_protocol::method::Method;
 
 use super::{Origin, Settled, may_have_taken_effect, names_a_reused_identifier};
+use crate::authority::AdmissionLapse;
 use crate::error::ControllerError;
+use crate::grants::policy::HeldBound;
 use crate::service::{
-    Controller, EnvelopeRefused, HostWithdrawal, LeaseNotLive, SpendFailed, Unauthorised,
-    error_reply, respond,
+    Ask, Controller, EnvelopeRefused, Footing, HostWithdrawal, Lapse, LeaseNotLive, SpendFailed,
+    Unauthorised, error_reply, respond,
 };
 
 /// What the local door answers a mutation with, and so how the answer is written.
@@ -30,78 +32,157 @@ pub(crate) struct DoorReply {
     /// The request the frame answers, for the lease's own word when the lease ends while the frame
     /// is written.
     request_id: RequestId,
-    /// Whether the frame is a result, or an answer that may derive from a record. A result of a
-    /// method held to the local owner's lease is written only while the lease holds; a refusal
-    /// that carries none is written as it is.
-    carries_a_result: bool,
+    /// What a result, or an answer that may derive from a record, is written under: the question
+    /// the sink asks again where the transport takes its bytes. A refusal that carries none has no
+    /// such standing and is written as it is.
+    written_under: Option<WrittenUnder>,
     /// Whether the daemon stops once this reply has been written: it answers a stop request whose
     /// wait for the creates under way has ended.
     stops_the_daemon: bool,
-    /// For a reply read from a record, the standing it passed the kept answer's check under, which
-    /// the sink asks again immediately before the transport takes its bytes.
-    from_a_record: Option<FromARecord>,
 }
 
-/// The standing a reply read from a record was given under: the connection it arrived on and the
-/// revision of the authority the request was admitted under.
+/// What a frame is written under: the footing of the request it answers, the question that is asked
+/// of it again where the transport takes its bytes, and in whose words a frame that question stops
+/// is replaced.
 ///
-/// The writer asks it ([`Controller::check_retained_answer`]) after its last wait and immediately
-/// before the transport takes the bytes, so a fence this host comes to owe, or a registration
-/// withdrawn or replaced, while the reply waits for the peer stops it. After that ask the bytes are
-/// the transport's, and no later ask exists.
-#[derive(Clone, Copy)]
-pub(crate) struct FromARecord {
-    connection_id: ConnectionId,
-    admitted: Option<AuthorityRevision>,
-    /// Whether the reply says another request spent the identifier of this one. That request has
-    /// no effect of its own, so where the standing no longer holds the person is told the refusal
-    /// of the check that failed; a copy of what an earlier request did is told as not shown.
-    conflict: bool,
+/// The writer asks the question after its last wait, immediately before every transport write, and
+/// the reply in place of a frame it stopped comes from the member that refused at that ask: no
+/// further ask follows it.
+#[derive(Clone)]
+pub(crate) struct WrittenUnder {
+    footing: Footing,
+    ask: Ask,
+    words: Words,
 }
 
-impl FromARecord {
-    /// The standing of a reply read from a record on `connection_id`, admitted under `admitted`,
-    /// for a case that writes a reply by itself.
-    #[cfg(test)]
-    pub(crate) const fn for_a_case(
-        connection_id: ConnectionId,
-        admitted: AuthorityRevision,
-    ) -> Self {
+/// In whose words a frame that the writer's last question stopped is replaced.
+#[derive(Clone, Copy, Debug)]
+enum Words {
+    /// A read's answer, or an attention read's release: a registration that has gone is refused in
+    /// the words of the door's own check of the registration.
+    Read,
+    /// A mutation's reply that carries only what the request itself did: not shown where it may
+    /// have taken effect, and the refusal of the member that refused where it says nothing was done.
+    OwnEffect,
+    /// A reply read from a record: the refusal of the member that refused for a reply that says
+    /// another request spent the identifier of this one (that request had no effect of its own),
+    /// and the outcome that is not shown for a copy of what an earlier request did.
+    Record { conflict: bool },
+}
+
+impl WrittenUnder {
+    /// The standing of a read's answer: the registration and the lease.
+    pub(crate) const fn of_a_read(footing: Footing) -> Self {
         Self {
-            connection_id,
-            admitted: Some(admitted),
-            conflict: false,
+            footing,
+            ask: Ask::READ,
+            words: Words::Read,
         }
     }
 
-    /// As [`Self::for_a_case`], for a reply that says another request spent the identifier.
-    #[cfg(test)]
-    pub(crate) const fn for_a_conflict_case(
-        connection_id: ConnectionId,
-        admitted: AuthorityRevision,
-    ) -> Self {
+    /// The standing of a mutation's reply that carries only what the request did: the registration
+    /// and the lease, and no fence, since the door told it while no fence was owed.
+    const fn of_an_own_effect(footing: Footing) -> Self {
         Self {
-            connection_id,
-            admitted: Some(admitted),
-            conflict: true,
+            footing,
+            ask: Ask::READ,
+            words: Words::OwnEffect,
         }
     }
 
-    /// Whether the reply still stands: the fence, the registration and its exact revision.
-    pub(crate) fn stands(&self, controller: &Controller) -> bool {
-        controller
-            .check_retained_answer(self.connection_id, self.admitted)
-            .is_ok()
+    /// As [`Self::of_an_own_effect`], for the reply of a request whose own barrier withdrew every
+    /// connection of the host, its own included: the registration is gone by the request's own
+    /// doing, so what is asked is that no fence is owed and no later barrier has moved the
+    /// revision that withdrawal set, and the lease.
+    const fn of_an_own_withdrawal(footing: Footing, withdrew: &HostWithdrawal) -> Self {
+        Self {
+            footing,
+            ask: withdrew.ask().and_the_lease(),
+            words: Words::OwnEffect,
+        }
     }
 
-    /// What is written in place of the reply, once it no longer stands: the refusal of the check
-    /// that failed for a reply that says an identifier was spent, and the outcome that is not shown
-    /// for a copy of what an earlier request did.
-    pub(crate) fn withheld(&self, controller: &Controller, request_id: RequestId) -> ControlFrame {
-        match controller.check_retained_answer(self.connection_id, self.admitted) {
-            Err(refusal) if self.conflict => refused_with(request_id, &refusal),
-            _ => respond(request_id, Err(ControllerError::outcome_not_shown())),
+    /// The standing of a reply read from a record: the registration at the revision the request
+    /// was admitted under, the fence, and the lease. `conflict` says the reply is that another
+    /// request spent the identifier.
+    const fn of_a_record(footing: Footing, conflict: bool) -> Self {
+        Self {
+            footing,
+            ask: Ask::KEPT_ANSWER,
+            words: Words::Record { conflict },
         }
+    }
+
+    /// The standing of a reply read from a record, for a case that writes a reply by itself.
+    #[cfg(test)]
+    pub(crate) const fn for_a_record_case(footing: Footing, conflict: bool) -> Self {
+        Self::of_a_record(footing, conflict)
+    }
+
+    /// The standing of a mutation's own reply, for a case that writes a reply by itself.
+    #[cfg(test)]
+    pub(crate) const fn for_an_own_effect_case(footing: Footing) -> Self {
+        Self::of_an_own_effect(footing)
+    }
+
+    /// The question, for a lease whose reading found `bound`: no lock is taken, nothing is awaited
+    /// and nothing is written ([`Footing::ask`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns the member that refuses.
+    pub(crate) fn asked_holding(&self, bound: Option<HeldBound>) -> Result<(), Lapse> {
+        self.footing.clone().holding(bound).ask(self.ask)
+    }
+
+    /// What is written in place of a frame that the last question stopped, for the member `lapse`
+    /// that refused it.
+    ///
+    /// `lease_ended` is the reply of a lease that ended. `effect` says the frame states a result,
+    /// or a word that does not say nothing was done.
+    pub(crate) fn withheld(
+        &self,
+        lapse: Lapse,
+        request_id: RequestId,
+        effect: bool,
+        lease_ended: impl FnOnce() -> ControlFrame,
+    ) -> ControlFrame {
+        if lapse == Lapse::LeaseEnded {
+            return lease_ended();
+        }
+        let not_shown = || respond(request_id, Err(ControllerError::outcome_not_shown()));
+        match self.words {
+            Words::Record { conflict: false } => not_shown(),
+            Words::OwnEffect if effect => not_shown(),
+            Words::Record { conflict: true } | Words::OwnEffect | Words::Read => {
+                refused_with(request_id, &refusal_of(&self.footing, self.words, lapse))
+            }
+        }
+    }
+}
+
+/// The refusal of the member `lapse` that refused, in the words of the door's own check for that
+/// condition. A registration that has gone is refused in the words of the registration check that
+/// the door asks, which is the reply's own except for a reply read from a record, whose check is
+/// the kept answer's.
+fn refusal_of(footing: &Footing, words: Words, lapse: Lapse) -> ControllerError {
+    let registration_gone = || {
+        Lapse::Withdrawn
+            .refusal()
+            .expect("a withdrawn authority has words")
+    };
+    match lapse {
+        Lapse::Admission(AdmissionLapse::Deregistered)
+            if !matches!(words, Words::Record { .. }) || footing.connection_id().is_none() =>
+        {
+            registration_gone()
+        }
+        Lapse::Admission(AdmissionLapse::Revoked | AdmissionLapse::Expired)
+            if footing.connection_id().is_none() =>
+        {
+            registration_gone()
+        }
+        lapse => lapse.refusal().unwrap_or_else(registration_gone),
     }
 }
 
@@ -166,9 +247,8 @@ pub(crate) fn declined(
     DoorReply {
         frame,
         request_id,
-        carries_a_result: false,
+        written_under: None,
         stops_the_daemon: false,
-        from_a_record: None,
     }
 }
 
@@ -176,43 +256,45 @@ fn refused_with(request_id: RequestId, error: &ControllerError) -> ControlFrame 
     error_reply(request_id, error.code(), error.to_string())
 }
 
-/// What a request stands on when its reply is told: the connection it arrived on, the revision of
-/// the authority it was admitted under, and the request it answers.
+/// What a request stands on when its reply is told: the footing it was admitted under, made once at
+/// the door in the same read as the revision of the authority it was admitted under, and the
+/// request it answers.
 pub(crate) struct Standing<'a> {
     controller: &'a Controller,
-    connection_id: ConnectionId,
-    admitted: Option<AuthorityRevision>,
+    footing: Footing,
     request_id: RequestId,
 }
 
 impl<'a> Standing<'a> {
     pub(crate) const fn new(
         controller: &'a Controller,
-        connection_id: ConnectionId,
-        admitted: Option<AuthorityRevision>,
+        footing: Footing,
         request_id: RequestId,
     ) -> Self {
         Self {
             controller,
-            connection_id,
-            admitted,
+            footing,
             request_id,
         }
     }
 }
 
 /// The reply to a mutation whose outcome the host holds: what a write came to, as the caller may be
-/// shown it under the authority it still has.
+/// shown it under the authority it still has. Each ask below is the footing's one question, which
+/// reads no lock; the writer asks it again after its last wait ([`WrittenUnder`]), and that ask is
+/// not this one made twice: it is the one that decides what reaches the transport.
 ///
 /// - A copy the service withheld is not shown.
-/// - A copy, which states what an earlier request or attempt did, is given only under the strict
-///   check ([`Controller::check_retained_answer`]: the fence, the registration and its exact
-///   revision, no deadline); otherwise it is not shown.
-/// - An answer that says another request spent the identifier is given only under the strict
-///   check; otherwise the check's own refusal, which is true: this request was not performed.
+/// - A copy, which states what an earlier request or attempt did, is given only while the kept
+///   answer's question holds ([`Ask::KEPT_ANSWER`]: the fence, the revision the request was
+///   admitted under and the registration, no deadline); otherwise it is not shown.
+/// - An answer that says another request spent the identifier is given only under the same
+///   question; otherwise the refusal of the member that refused, which is true: this request was
+///   not performed.
 /// - Any other answer carries only this request's own effect. It is given while the connection's
-///   registration stands and no fence is owed; otherwise it is not shown when it may have taken
-///   effect, and the check's refusal when it says nothing was done.
+///   registration stands and no fence is owed ([`Ask::FRESH_REPLY`]); otherwise it is not shown
+///   when it may have taken effect, and the refusal of the member that refused when it says nothing
+///   was done.
 /// - The same, when the request's own effect raised the barrier that withdrew every connection of
 ///   the host, its own included ([`HostWithdrawal`]): the registration is then gone by the
 ///   request's own doing, so the answer is given while no fence is owed and no later barrier has
@@ -232,50 +314,48 @@ pub(crate) async fn told(settled: Settled<ControlFrame>, standing: &Standing<'_>
     let answer = given.into_answer();
     let Standing {
         controller,
-        connection_id,
-        admitted,
+        footing,
         request_id,
-    } = *standing;
+    } = standing;
+    let request_id = *request_id;
     let not_shown = || respond(request_id, Err(ControllerError::outcome_not_shown()));
-    // Set where the answer is read from a record and passes the strict check: the sink asks the
-    // same check again where the bytes are handed over.
-    let mut from_a_record = None;
-    let record_standing = FromARecord {
-        connection_id,
-        admitted,
-        conflict: false,
+    // What the frame is written under: a reply read from a record that passes the kept answer's
+    // question is written under that question again, and any other under the request's own.
+    let mut written_under = match &withdrew {
+        Some(withdrew) => WrittenUnder::of_an_own_withdrawal(footing.clone(), withdrew),
+        None => WrittenUnder::of_an_own_effect(footing.clone()),
     };
     let frame = match origin {
         Origin::Withheld => not_shown(),
-        Origin::Copied => match controller.check_retained_answer(connection_id, admitted) {
+        Origin::Copied => match footing.ask(Ask::KEPT_ANSWER) {
             Ok(()) => {
-                from_a_record = Some(record_standing);
+                written_under = WrittenUnder::of_a_record(footing.clone(), false);
                 answer
             }
             Err(_) => not_shown(),
         },
         Origin::Fresh if names_a_reused_identifier(&answer) => {
-            match controller.check_retained_answer(connection_id, admitted) {
+            match footing.ask(Ask::KEPT_ANSWER) {
                 Ok(()) => {
-                    from_a_record = Some(FromARecord {
-                        conflict: true,
-                        ..record_standing
-                    });
+                    written_under = WrittenUnder::of_a_record(footing.clone(), true);
                     answer
                 }
-                Err(refusal) => refused_with(request_id, &refusal),
+                Err(lapse) => refused_with(
+                    request_id,
+                    &refusal_of(footing, Words::Record { conflict: true }, lapse),
+                ),
             }
         }
         // The refusal says what was done before it, and under authority that no longer stands
         // that is not shown, whatever the check's own refusal would say of nothing having been done.
         Origin::AfterAnEffect => {
-            match own_withdrawal_or_standing(controller, connection_id, withdrew).await {
+            match own_withdrawal_or_standing(controller, footing, withdrew.as_ref()).await {
                 Ok(()) => answer,
                 Err(_) => not_shown(),
             }
         }
         Origin::Fresh => {
-            match own_withdrawal_or_standing(controller, connection_id, withdrew).await {
+            match own_withdrawal_or_standing(controller, footing, withdrew.as_ref()).await {
                 Ok(()) => answer,
                 // The check's refusal says nothing was done, which is true of a refusal and false of a
                 // result, or of any word that does not say so.
@@ -289,9 +369,8 @@ pub(crate) async fn told(settled: Settled<ControlFrame>, standing: &Standing<'_>
     DoorReply {
         frame,
         request_id,
-        carries_a_result: true,
+        written_under: Some(written_under),
         stops_the_daemon: stops_after_the_answer,
-        from_a_record,
     }
 }
 
@@ -300,15 +379,14 @@ pub(crate) async fn told(settled: Settled<ControlFrame>, standing: &Standing<'_>
 /// revision that barrier set still in force.
 async fn own_withdrawal_or_standing(
     controller: &Controller,
-    connection_id: ConnectionId,
-    withdrew: Option<HostWithdrawal>,
+    footing: &Footing,
+    withdrew: Option<&HostWithdrawal>,
 ) -> Result<(), ControllerError> {
     match withdrew {
-        Some(withdrew) => controller.withdrawal_stands(&withdrew).await,
-        None => controller
-            .authorised(connection_id)
-            .map_err(ControllerError::from)
-            .and_then(|_| controller.check_fence()),
+        Some(withdrew) => controller.withdrawal_stands(withdrew).await,
+        None => footing
+            .ask(Ask::FRESH_REPLY)
+            .map_err(|lapse| refusal_of(footing, Words::OwnEffect, lapse)),
     }
 }
 
@@ -335,9 +413,10 @@ impl<'a> ReplySink<'a> {
     /// Writes `reply` as the answer to a request for `method`, and says whether the connection goes
     /// on.
     ///
-    /// A reply that carries a result is written under the local owner's lease, which is asked again
-    /// before every transport write ([`Controller::write_answer`]); a refusal that carries none is
-    /// written as it is. The reply to a stop request whose wait has ended is written under a bound
+    /// A reply that carries a result is written under the local owner's lease and the footing of
+    /// its request, which are asked again before every transport write
+    /// ([`Controller::write_answer`]); a refusal that carries none is written as it is. The reply
+    /// to a stop request whose wait has ended is written under a bound
     /// instead, and the daemon is told to stop after it
     /// ([`Controller::write_the_answer_of_a_stop`]).
     pub(crate) async fn write(
@@ -349,9 +428,8 @@ impl<'a> ReplySink<'a> {
         let DoorReply {
             frame,
             request_id,
-            carries_a_result,
+            written_under,
             stops_the_daemon,
-            from_a_record,
         } = reply;
         #[cfg(feature = "testing")]
         controller.note_a_reply_written(request_id, &frame);
@@ -360,7 +438,7 @@ impl<'a> ReplySink<'a> {
                 .write_the_answer_of_a_stop(self.writer, self.kind, &frame)
                 .await;
         }
-        if carries_a_result {
+        if let Some(written_under) = written_under {
             controller
                 .write_answer(
                     self.writer,
@@ -368,7 +446,7 @@ impl<'a> ReplySink<'a> {
                     &frame,
                     method,
                     request_id,
-                    from_a_record,
+                    &written_under,
                 )
                 .await
         } else {

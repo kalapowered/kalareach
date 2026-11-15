@@ -17,6 +17,7 @@ use kr_protocol::frame::StreamKind;
 use kr_protocol::ids::RequestId;
 use kr_protocol::method::Method;
 
+use crate::given::local_door::WrittenUnder;
 use crate::service::Controller;
 
 /// The request the answer in these tests is to.
@@ -25,7 +26,7 @@ const REQUEST: RequestId = RequestId::new(7);
 /// A daemon that is exclusively organisation-managed when `exclusive`, whose local owner has no
 /// lease, and a local connection to it: the writer the daemon answers on and the reader its caller
 /// reads from.
-async fn connected(
+pub(super) async fn connected(
     exclusive: bool,
 ) -> (
     kr_ipc::testing::TempHost,
@@ -72,6 +73,62 @@ pub(super) async fn connected_under_a_lease() -> (
     FrameWriter,
     FrameReader,
 ) {
+    let (temp, controller, continuous, _presenter, writer, reader) =
+        connected_under_a_lease_that_can_be_presented_again().await;
+    (temp, controller, continuous, writer, reader)
+}
+
+/// What presents the local owner's lease of a daemon again, with other rights.
+pub(super) struct Presenter {
+    controller: Arc<Controller>,
+    organisation: crate::grants::organisation::testing::TestOrganisation,
+    key: kr_crypto::keys::AuthorisationKeyPair,
+    wall: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Presenter {
+    /// Presents a lease for the same account and key that holds `rights` and no others, which a
+    /// lease that held other rights is narrowed by: a run of the lease's bound that began under
+    /// the earlier lease does not continue.
+    pub(super) fn present(&self, rights: &[kr_protocol::rights::ActionRight]) {
+        // Issued a second after the lease it narrows, so that it is the newest this host holds.
+        let now = self
+            .wall
+            .fetch_add(1_000, std::sync::atomic::Ordering::SeqCst)
+            + 1_000;
+        let reading = crate::service::net::devices::ObservedUtc {
+            now: kr_protocol::scalars::TimestampMs::new(now),
+            behind_ms: 0,
+        };
+        let account = kr_protocol::ids::AccountId::new("ada").expect("an account");
+        let lease = self
+            .organisation
+            .lease(&account, *self.key.public(), now, rights);
+        self.controller
+            .update_policy(|policy| {
+                policy.install_lease(crate::grants::organisation::LeasePresentation {
+                    lease: &lease,
+                    device_id: self.controller.local_owner_device(),
+                    proven_key: self.key.public(),
+                    reading: Some(reading),
+                    now: self.controller.clock.now(),
+                    generation: self.controller.generation(),
+                })
+            })
+            .expect("the lease is written down")
+            .expect("the lease installs");
+    }
+}
+
+/// As [`connected_under_a_lease`], with what presents the owner's lease again.
+pub(super) async fn connected_under_a_lease_that_can_be_presented_again() -> (
+    kr_ipc::testing::TempHost,
+    Arc<Controller>,
+    kr_transport::clock::ManualClock,
+    Presenter,
+    FrameWriter,
+    FrameReader,
+) {
     let temp = kr_ipc::testing::TempHost::create();
     let (continuous, wall, clocks) = crate::service::net::tests::manual_clocks();
     let controller = crate::service::net::tests::daemon_on_clocks_to_move(&temp, clocks).await;
@@ -114,7 +171,13 @@ pub(super) async fn connected_under_a_lease() -> (
         .expect("the lease is written down")
         .expect("the lease installs and binds the owner's device");
     let (writer, reader) = local_connection(&temp).await;
-    (temp, controller, continuous, writer, reader)
+    let presenter = Presenter {
+        controller: Arc::clone(&controller),
+        organisation,
+        key,
+        wall,
+    };
+    (temp, controller, continuous, presenter, writer, reader)
 }
 
 /// The answer the effect produced: a result.
@@ -125,9 +188,38 @@ fn result() -> ControlFrame {
     })
 }
 
+/// A local registration of the owner at the revision in force, and the footing of a request that
+/// arrived on it.
+pub(super) fn registered(
+    controller: &Controller,
+) -> (
+    kr_protocol::ids::ConnectionId,
+    kr_protocol::ids::AuthorityRevision,
+    crate::service::Footing,
+) {
+    use kr_protocol::ids::{ActorId, ConnectionId};
+
+    let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+    let revision = controller.policy().authority_revision();
+    controller.admitted_write().insert(
+        connection_id,
+        crate::service::AdmittedConnection::local(
+            ActorId::new("owner").expect("a principal"),
+            revision,
+            kr_protocol::local::LocalClientKind::Cli,
+        ),
+    );
+    (
+        connection_id,
+        revision,
+        controller.footing_of_a_request(connection_id),
+    )
+}
+
 /// Writes `answer` to the caller of `method` and returns what the caller reads.
 async fn written_for(method: Method, exclusive: bool) -> ControlFrame {
     let (_temp, controller, mut writer, mut reader) = connected(exclusive).await;
+    let (_, _, footing) = registered(&controller);
     assert!(
         controller
             .write_answer(
@@ -136,7 +228,7 @@ async fn written_for(method: Method, exclusive: bool) -> ControlFrame {
                 &result(),
                 Some(method),
                 REQUEST,
-                None
+                &WrittenUnder::for_an_own_effect_case(footing),
             )
             .await,
         "the connection goes on"
@@ -216,8 +308,6 @@ enum FenceLands {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reply_read_from_a_record_is_not_written_whole_when_a_fence_is_owed_before_or_in_the_wait()
  {
-    use kr_protocol::ids::{ActorId, ConnectionId};
-
     for (conflict, lands) in [false, true].into_iter().flat_map(|conflict| {
         [
             FenceLands::Never,
@@ -227,15 +317,7 @@ async fn a_reply_read_from_a_record_is_not_written_whole_when_a_fence_is_owed_be
         .map(|lands| (conflict, lands))
     }) {
         let (_temp, controller, mut writer, mut reader) = connected(false).await;
-        let connection_id = ConnectionId::new(kr_ipc::new_uuid());
-        let revision = controller.policy().authority_revision();
-        controller.admitted_write().insert(
-            connection_id,
-            crate::service::AdmittedConnection::new(
-                ActorId::new("owner").expect("a principal"),
-                revision,
-            ),
-        );
+        let (_connection_id, _revision, footing) = registered(&controller);
         // More than a socket holds, so the write waits for the peer to read. A conflict is a reply
         // that says another request spent the identifier.
         let answer = ControlFrame::Response(Response {
@@ -265,17 +347,7 @@ async fn a_reply_read_from_a_record_is_not_written_whole_when_a_fence_is_owed_be
                         &answer,
                         Some(Method::PrivacySet),
                         REQUEST,
-                        Some(if conflict {
-                            crate::given::local_door::FromARecord::for_a_conflict_case(
-                                connection_id,
-                                revision,
-                            )
-                        } else {
-                            crate::given::local_door::FromARecord::for_a_case(
-                                connection_id,
-                                revision,
-                            )
-                        }),
+                        &WrittenUnder::for_a_record_case(footing, conflict),
                     )
                     .await;
                 // The connection ends with the writer, as it does when the daemon's loop stops.
@@ -338,19 +410,9 @@ async fn a_reply_read_from_a_record_is_not_written_whole_when_a_fence_is_owed_be
 /// whole answer is read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reply_read_from_a_record_is_not_written_when_a_fence_is_owed_while_the_lease_is_read() {
-    use kr_protocol::ids::{ActorId, ConnectionId};
-
     for owed in [false, true] {
         let (_temp, controller, mut writer, mut reader) = connected(false).await;
-        let connection_id = ConnectionId::new(kr_ipc::new_uuid());
-        let revision = controller.policy().authority_revision();
-        controller.admitted_write().insert(
-            connection_id,
-            crate::service::AdmittedConnection::new(
-                ActorId::new("owner").expect("a principal"),
-                revision,
-            ),
-        );
+        let (_connection_id, _revision, footing) = registered(&controller);
         let (arrived, go) = controller.pause_before_the_policy_lock();
         let writing = {
             let controller = Arc::clone(&controller);
@@ -362,10 +424,7 @@ async fn a_reply_read_from_a_record_is_not_written_when_a_fence_is_owed_while_th
                         &result(),
                         Some(Method::PrivacySet),
                         REQUEST,
-                        Some(crate::given::local_door::FromARecord::for_a_case(
-                            connection_id,
-                            revision,
-                        )),
+                        &WrittenUnder::for_a_record_case(footing, false),
                     )
                     .await;
                 drop(writer);
@@ -409,19 +468,10 @@ async fn a_reply_read_from_a_record_is_not_written_when_a_fence_is_owed_while_th
 async fn a_conflict_the_local_door_told_is_written_as_the_checks_refusal_when_a_fence_is_owed() {
     use crate::given::local_door::{ReplySink, Standing, told};
     use crate::given::{Given, Settled};
-    use kr_protocol::ids::{ActorId, ConnectionId};
 
     for owed in [false, true] {
         let (_temp, controller, mut writer, mut reader) = connected(false).await;
-        let connection_id = ConnectionId::new(kr_ipc::new_uuid());
-        let revision = controller.policy().authority_revision();
-        controller.admitted_write().insert(
-            connection_id,
-            crate::service::AdmittedConnection::new(
-                ActorId::new("owner").expect("a principal"),
-                revision,
-            ),
-        );
+        let (_connection_id, _revision, footing) = registered(&controller);
         let conflict = ControlFrame::Response(Response {
             request_id: REQUEST,
             outcome: Outcome::Error(kr_protocol::error::ProtocolError::new(
@@ -431,7 +481,7 @@ async fn a_conflict_the_local_door_told_is_written_as_the_checks_refusal_when_a_
         });
         let reply = told(
             Settled::of(Given::fresh(conflict.clone())),
-            &Standing::new(&controller, connection_id, Some(revision), REQUEST),
+            &Standing::new(&controller, footing, REQUEST),
         )
         .await;
         controller.hold_fence(owed);
@@ -461,28 +511,18 @@ async fn a_conflict_the_local_door_told_is_written_as_the_checks_refusal_when_a_
 }
 
 /// KR-REQ-17.54: a reply read from a record is written under a lease that is live when the write is
-/// let go, not only when its reading began. The record's own check takes locks after the lease is
-/// read, and a lease that ends in that wait stops the reply before the transport takes it: the
-/// stored answer is never written, and the caller is told the outcome is unknown. The control: where
-/// the lease still stands after the wait, the whole answer is read.
+/// let go, not only when its reading began. The question the writer asks after the lease's reading
+/// reads the bound of that lease without a lock, so a lease that ends between the reading and the
+/// question stops the reply before the transport takes it: the stored answer is never written, and
+/// the caller is told the outcome is unknown. The control: where the lease still stands after the
+/// pause, the whole answer is read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_reply_read_from_a_record_is_not_written_when_the_lease_ends_while_the_record_is_checked()
-{
-    use kr_protocol::ids::{ActorId, ConnectionId};
-
+async fn a_reply_read_from_a_record_is_not_written_when_the_lease_ends_after_it_is_read() {
     for ends in [false, true] {
         let (_temp, controller, continuous, mut writer, mut reader) =
             connected_under_a_lease().await;
-        let connection_id = ConnectionId::new(kr_ipc::new_uuid());
-        let revision = controller.policy().authority_revision();
-        controller.admitted_write().insert(
-            connection_id,
-            crate::service::AdmittedConnection::new(
-                ActorId::new("owner").expect("a principal"),
-                revision,
-            ),
-        );
-        let (arrived, go) = controller.pause_before_the_last_fence_read();
+        let (_connection_id, _revision, footing) = registered(&controller);
+        let (arrived, go) = controller.pause_after_the_lease_is_read();
         let writing = {
             let controller = Arc::clone(&controller);
             tokio::spawn(async move {
@@ -493,27 +533,24 @@ async fn a_reply_read_from_a_record_is_not_written_when_the_lease_ends_while_the
                         &result(),
                         Some(Method::PrivacySet),
                         REQUEST,
-                        Some(crate::given::local_door::FromARecord::for_a_case(
-                            connection_id,
-                            revision,
-                        )),
+                        &WrittenUnder::for_a_record_case(footing, false),
                     )
                     .await;
                 drop(writer);
                 stood
             })
         };
-        // The lease was read live, and the record's check is at its last lock.
+        // The lease was read live, and the question is about to be asked.
         tokio::task::spawn_blocking(move || {
             arrived.recv_timeout(std::time::Duration::from_secs(30))
         })
         .await
         .expect("the wait ends")
-        .expect("the record's check is reached");
+        .expect("the lease is read for the reply");
         if ends {
             continuous.advance(std::time::Duration::from_secs(16 * 60));
         }
-        go.send(()).expect("the check goes on");
+        go.send(()).expect("the question goes on");
         let read = tokio::time::timeout(std::time::Duration::from_secs(30), reader.read_message())
             .await
             .expect("the daemon wrote or ended the connection");
