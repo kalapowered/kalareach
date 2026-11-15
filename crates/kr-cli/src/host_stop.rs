@@ -885,7 +885,8 @@ async fn stop_the_daemon(
             // The request was never made, so nothing left and there is no stop to wait for. The
             // daemon may have gone meanwhile, as it does when another command's stop has taken
             // effect: its end is looked for once, within the one deadline. A daemon that stays is
-            // the unmade request's failure.
+            // the unmade request's failure. The deadline counts from the failure.
+            let deadline = tokio::time::Instant::now() + END_BOUND;
             progress.remove_marker();
             // The connection is let go before the look, as before the wait of a request that was
             // asked: where the platform keeps a pipe instance for as long as a handle to it is
@@ -899,6 +900,7 @@ async fn stop_the_daemon(
                 info.generation,
                 holder.as_ref(),
                 closed,
+                deadline,
             )
             .await
             {
@@ -1023,20 +1025,23 @@ async fn stop_the_daemon(
 /// daemon holds it. A daemon that closed the connection is going, and a listener that is gone is
 /// waited for to its end within the one deadline, once. A daemon that did not close it and still
 /// answers at its endpoint stays, and nothing is waited for. A daemon that has not ended by the
-/// deadline is the failure's, and so is one whose end cannot be looked at.
+/// deadline is the failure's, and so is one whose end cannot be looked at. The deadline is the
+/// caller's, set before the look, so that the look and the wait together stay inside it.
 async fn ended_before_the_request(
     host: &HostPaths,
     environment: &EnvironmentPaths,
     generation: ControllerGeneration,
     old: Option<&ProcessStartIdentity>,
     closed: bool,
+    deadline: tokio::time::Instant,
 ) -> Option<End> {
     if !closed
         && endpoint_look(environment, generation, startup::ANSWER_BOUND).await == Endpoint::Same
     {
         return None;
     }
-    match wait_for_the_end(host, environment, generation, old, END_BOUND).await {
+    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+    match wait_for_the_end(host, environment, generation, old, left).await {
         End::NotEnded(_) => None,
         ended => Some(ended),
     }
