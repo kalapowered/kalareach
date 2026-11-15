@@ -143,14 +143,7 @@ async fn a_result_is_not_shown_once_the_connection_is_withdrawn_after_the_route_
 
     // Another device's revocation restamps every registration and withdraws none of them.
     let restamped = told_after_the_route_answers(&controller, a_result(&temp), |_| {
-        controller
-            .admitted_write()
-            .values_mut()
-            .for_each(|connection| {
-                connection.admitted_revision = kr_protocol::ids::AuthorityRevision::new(
-                    connection.admitted_revision.get() + 1,
-                );
-            });
+        another_devices_restamp(&controller);
     })
     .await;
     assert!(
@@ -234,14 +227,7 @@ async fn the_four_modules_first_admissions_are_told_under_the_authority_they_end
         let withdrawn = leg(|controller, connection_id| controller.deregister(connection_id)).await;
         let fenced = leg(|controller, _| controller.hold_fence(true)).await;
         let restamped = leg(|controller, _| {
-            controller
-                .admitted_write()
-                .values_mut()
-                .for_each(|connection| {
-                    connection.admitted_revision = kr_protocol::ids::AuthorityRevision::new(
-                        connection.admitted_revision.get() + 1,
-                    );
-                });
+            another_devices_restamp(&controller);
         })
         .await;
         // A result, and a word that does not say the action was not done, may be of an effect that
@@ -304,14 +290,7 @@ async fn the_report_privacy_set_answers_is_not_shown_once_authority_has_moved_af
         "with nothing in between the report is told: {control:?}"
     );
     let restamped = told_after_the_route_answers(&controller, setting(false), |_| {
-        controller
-            .admitted_write()
-            .values_mut()
-            .for_each(|connection| {
-                connection.admitted_revision = kr_protocol::ids::AuthorityRevision::new(
-                    connection.admitted_revision.get() + 1,
-                );
-            });
+        another_devices_restamp(&controller);
     })
     .await;
     not_shown(&restamped);
@@ -381,14 +360,7 @@ async fn a_refusal_privacy_sets_service_function_raises_is_told_as_itself_and_is
         "with nothing moved the refusal is told with its own code: {control:?}"
     );
     let restamped = told_after_the_route_answers(&controller, refusing(), |_| {
-        controller
-            .admitted_write()
-            .values_mut()
-            .for_each(|connection| {
-                connection.admitted_revision = kr_protocol::ids::AuthorityRevision::new(
-                    connection.admitted_revision.get() + 1,
-                );
-            });
+        another_devices_restamp(&controller);
     })
     .await;
     not_shown(&restamped);
@@ -645,16 +617,26 @@ async fn a_device_revocation_at_the_most_a_notice_names_is_not_shown_when_anothe
     not_shown(&told_a_device_revocation_at_the_most_a_notice_names(true).await);
 }
 
-/// What the door tells of `settled` for `connection_id`, admitted under `admitted`.
+/// Another device's revocation, from a closure that cannot wait: the stored revision advances,
+/// every surviving registration is stamped with it, and the revision in memory moves with it.
+fn another_devices_restamp(controller: &Controller) {
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(
+            super::the_fence_at_every_effect::another_devices_revocation_lands(controller),
+        );
+    });
+}
+
+/// What the door tells of `settled` for `connection_id`, admitted under the revision it holds now.
 async fn told_as(
     controller: &Controller,
     connection_id: ConnectionId,
     settled: Settled<ControlFrame>,
 ) -> ControlFrame {
-    let admitted = controller.admitted_revision(connection_id).ok();
+    let footing = controller.footing_of_a_request(connection_id);
     told(
         settled,
-        &Standing::new(controller, connection_id, admitted, RequestId::new(1)),
+        &Standing::new(controller, footing, RequestId::new(1)),
     )
     .await
     .into_frame()
@@ -796,16 +778,12 @@ async fn a_copy_is_told_only_under_the_revision_it_was_admitted_under() {
     let (_temp, controller, _clock) = daemon().await;
     let (connection_id, _) = admitted(&controller).await;
     let answer = || super::respond(RequestId::new(1), Ok(ParamsValue::empty()));
-    let admitted_under = controller.admitted_revision(connection_id).ok();
+    // Made before the restamp, as the door makes it beside the revision the request is admitted under.
+    let footing = controller.footing_of_a_request(connection_id);
     let told = |settled| async {
         told(
             settled,
-            &Standing::new(
-                &controller,
-                connection_id,
-                admitted_under,
-                RequestId::new(1),
-            ),
+            &Standing::new(&controller, footing.clone(), RequestId::new(1)),
         )
         .await
         .into_frame()
@@ -813,13 +791,7 @@ async fn a_copy_is_told_only_under_the_revision_it_was_admitted_under() {
 
     let copy = told(Settled::of(Given::copied(answer()))).await;
     assert!(refusal(&copy).is_none(), "with nothing replaced: {copy:?}");
-    controller
-        .admitted_write()
-        .values_mut()
-        .for_each(|connection| {
-            connection.admitted_revision =
-                kr_protocol::ids::AuthorityRevision::new(connection.admitted_revision.get() + 1);
-        });
+    another_devices_restamp(&controller);
     let copy = told(Settled::of(Given::copied(answer()))).await;
     not_shown(&copy);
     let fresh = told(Settled::of(Given::fresh(answer()))).await;
@@ -883,4 +855,96 @@ async fn a_debt_published_before_the_proof_is_asked_stops_the_result_without_the
     not_shown(&told);
     drop(registry);
     controller.hold_fence(false);
+}
+
+/// What a request whose own barrier withdrew the whole host is handed, once its result has been
+/// told: the result is written under the question of its own withdrawal, which asks that no fence
+/// is owed and that the revision its barrier set is still in force, and not the registration, which
+/// its own barrier took. `later` is made at the pause that stands after the writer's last wait.
+async fn written_after_its_own_withdrawal(later: Option<&str>) -> Vec<ControlFrame> {
+    use crate::given::local_door::ReplySink;
+    use kr_protocol::frame::StreamKind;
+
+    let (_temp, controller, mut writer, mut reader) =
+        super::a_result_the_lease_ended_over::connected(false).await;
+    let (connection_id, _, footing) = super::a_result_the_lease_ended_over::registered(&controller);
+    let (_barrier, proof) = controller
+        .barrier_proving(a_host_wide_debt(
+            &controller,
+            "the request's own withdrawal",
+        ))
+        .await
+        .expect("the barrier");
+    assert!(
+        controller.authorised(connection_id).is_err(),
+        "the request's own barrier withdrew its connection"
+    );
+    let reply = told(
+        a_result_carrying(proof),
+        &Standing::new(&controller, footing, RequestId::new(1)),
+    )
+    .await;
+    let (arrived, go) = controller.pause_after_the_lease_is_read();
+    let writing = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        async move {
+            let stood = ReplySink::new(&mut writer, kr_protocol::frame::StreamKind::Control)
+                .write(&controller, reply, Some(Method::GrantRevoke))
+                .await;
+            drop(writer);
+            stood
+        }
+    });
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30)))
+        .await
+        .expect("the waiting thread ends")
+        .expect("the writer reaches its question");
+    match later {
+        Some("a fence") => controller.hold_fence(true),
+        Some("another withdrawal") => {
+            controller
+                .barrier(a_host_wide_debt(
+                    &controller,
+                    "another request's withdrawal",
+                ))
+                .await
+                .expect("a second barrier");
+        }
+        _ => {}
+    }
+    go.send(()).expect("the writer goes on");
+    assert!(writing.await.expect("the write ends"));
+    controller.hold_fence(false);
+    let mut handed = Vec::new();
+    while let Ok(read) = tokio::time::timeout(
+        Duration::from_secs(30),
+        reader.read_message::<ControlFrame>(),
+    )
+    .await
+    .expect("the daemon wrote or ended the connection")
+    {
+        handed.push(read);
+    }
+    let _ = StreamKind::Control;
+    handed
+}
+
+/// KR-REQ-09.09, 09.12: the result of a request that withdrew the whole host through its own
+/// barrier is written through the actual writer under its proof, though its registration is gone:
+/// once, whole. A fence owed after the writer's last wait, or another withdrawal that moved the
+/// revision then, stops it before the transport takes a byte, and the caller is handed the outcome
+/// that is not shown, once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_result_of_a_request_that_withdrew_the_host_is_written_while_its_proof_stands() {
+    let control = written_after_its_own_withdrawal(None).await;
+    assert_eq!(control.len(), 1, "the control: one frame: {control:?}");
+    assert!(
+        refusal(&control[0]).is_none(),
+        "the control: the result is written: {control:?}"
+    );
+    for later in ["a fence", "another withdrawal"] {
+        let handed = written_after_its_own_withdrawal(Some(later)).await;
+        assert_eq!(handed.len(), 1, "{later}: one frame: {handed:?}");
+        not_shown(&handed[0]);
+    }
 }

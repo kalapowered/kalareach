@@ -133,16 +133,11 @@ pub(super) async fn told_now(
     mutation: &MutationRequest,
     settled: impl std::future::Future<Output = crate::given::Settled<ControlFrame>>,
 ) -> ControlFrame {
-    let admitted = controller.admitted_revision(connection_id).ok();
+    let footing = controller.footing_of_a_request(connection_id);
     let settled = settled.await;
     crate::given::local_door::told(
         settled,
-        &crate::given::local_door::Standing::new(
-            controller,
-            connection_id,
-            admitted,
-            mutation.request_id,
-        ),
+        &crate::given::local_door::Standing::new(controller, footing, mutation.request_id),
     )
     .await
     .into_frame()

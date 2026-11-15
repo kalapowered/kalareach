@@ -591,12 +591,13 @@ impl Ticket {
     }
 }
 
-/// A lease that an answer is held to as it is written ([`AttentionModule::write_released_held`]).
+/// The lease and the registration that an answer is held to as it is written
+/// ([`AttentionModule::write_released_held`]).
 pub struct LeaseHold<'a> {
-    /// Whether the lease holds now.
-    pub permitted: &'a (dyn Fn() -> bool + Sync),
-    /// What is written instead of an answer none of which has gone, once the lease has ended.
-    pub refusal: kr_protocol::envelope::ControlFrame,
+    /// What stops the answer being written now: none while the lease holds and the registration
+    /// stands, and otherwise what is written instead of an answer none of which has gone, in the
+    /// words of the member that refused.
+    pub refused: &'a (dyn Fn() -> Option<kr_protocol::envelope::ControlFrame> + Sync),
 }
 
 /// One read of this group's answer, ready to be released to the reader who asked.
@@ -1287,7 +1288,7 @@ impl AttentionModule {
                 let may_write = || {
                     (!text_held
                         || (standing.is_some() && ticket.holds_text(&fences, self.release_ms())))
-                        && lease.is_none_or(|lease| (lease.permitted)())
+                        && lease.is_none_or(|lease| (lease.refused)().is_none())
                 };
                 if begun {
                     writer.resume_frame_checked(may_write)
@@ -1300,7 +1301,7 @@ impl AttentionModule {
                 CheckedWrite::Complete => return Ok(()),
                 CheckedWrite::Blocked => writer.writable().ready().await?,
                 CheckedWrite::Refused => {
-                    let lapsed = lease.filter(|lease| !(lease.permitted)());
+                    let lapsed = lease.and_then(|lease| (lease.refused)());
                     if !writer.withdraw_unstarted() {
                         return Err(kr_ipc::IpcError::socket(
                             "write",
@@ -1310,9 +1311,9 @@ impl AttentionModule {
                             ),
                         ));
                     }
-                    if let Some(lease) = lapsed {
+                    if let Some(refusal) = lapsed {
                         // The refusal carries no result, so it is written whatever the lease says.
-                        return writer.write_message(&lease.refusal).await;
+                        return writer.write_message(&refusal).await;
                     }
                     if text_held && let Some(withheld) = &withheld {
                         // The ticket stopped it: the same answer without its text, which the lease

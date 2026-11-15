@@ -845,6 +845,7 @@ impl Controller {
     }
 
     /// Returns the authority revision a connection was admitted under.
+    #[cfg(test)]
     pub(super) fn admitted_revision(
         &self,
         connection_id: ConnectionId,

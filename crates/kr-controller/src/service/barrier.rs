@@ -353,6 +353,14 @@ impl std::fmt::Debug for HostWithdrawal {
     }
 }
 
+impl HostWithdrawal {
+    /// The footing's question that says this withdrawal still stands: no fence is owed and the
+    /// revision in force is the one its barrier set.
+    pub(crate) const fn ask(&self) -> super::footing::Ask {
+        super::footing::Ask::own_withdrawal(self.revision)
+    }
+}
+
 /// What a barrier's first step took: the revision it set and the debts it captured, with how far
 /// each reaches.
 struct Withdrawn {

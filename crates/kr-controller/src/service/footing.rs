@@ -238,6 +238,28 @@ impl Ask {
         deadline: false,
         bound: true,
     };
+
+    /// A mutation's own reply as the local door tells it: the registration and the fence. The
+    /// revision the request was admitted under is not asked, since a reply carries what the
+    /// request itself did, and another device's withdrawal that moves the revision takes none of
+    /// that back; and no deadline, since the effect has run.
+    pub(crate) const FRESH_REPLY: Self = Self {
+        flag: true,
+        revision: Revision::Unasked,
+        latch: true,
+        deadline: false,
+        bound: false,
+    };
+
+    /// This question, with the lease's bound also asked, for a request whose method is held to the
+    /// local owner's lease.
+    #[must_use]
+    pub(crate) const fn and_the_lease(self) -> Self {
+        Self {
+            bound: true,
+            ..self
+        }
+    }
 }
 
 /// Which member refused, with the words of the door's own check for that condition.
