@@ -77,7 +77,12 @@ const CLIENT_WINDOW_FRAMES: u32 = 32;
 const CLIENT_WINDOW_BYTES: u64 = 512 * 1024;
 
 /// How long a frame has from the moment the host passes it on to the worker's answer. The bound is
-/// absolute: waiting for the writer or for room in the socket does not renew it.
+/// absolute: waiting for the writer or for room in the socket does not renew it. Each side of the
+/// lane enforces it on its own, so that neither depends on the other's timer: the writer asks
+/// before every write to the socket and does not write a frame past its deadline (it cuts the
+/// stream instead), and the reader cuts the stream when the oldest frame that the worker has not
+/// answered passes its deadline. The end is a cut in both, and the device is told nothing of the
+/// frame: its outcome stays uncertain. Both read the host's own clock.
 const FRAME_DEADLINE: Duration = CALL_TIMEOUT;
 
 /// How many frames the host keeps read and not yet routed: the one that waits for the worker's
@@ -1264,11 +1269,26 @@ async fn write_lane(
             continue;
         }
         flow.stages.before_a_lane_write().await;
+        // Whether the frame's deadline passed before a write to the socket that was about to be
+        // made. A frame past its deadline is not given to the worker whatever it waited for, and
+        // its end is a cut and never a refusal: the device's frame may be answered or not, and
+        // it is told nothing of it.
+        let mut expired = false;
         let written = tokio::time::timeout_at(
             item.deadline,
-            writer.write_while(&item.frame, || remote.feed_admits(&item.standing)),
+            writer.write_while(&item.frame, || {
+                if tokio::time::Instant::now() >= item.deadline {
+                    expired = true;
+                    return false;
+                }
+                remote.feed_admits(&item.standing)
+            }),
         )
         .await;
+        if expired {
+            flow.end(End::Cut);
+            return;
+        }
         match written {
             Ok(Ok(FrameWhile::Sent)) => {}
             Ok(Ok(FrameWhile::Withdrawn)) => {
