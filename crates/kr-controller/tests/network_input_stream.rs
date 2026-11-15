@@ -908,8 +908,10 @@ async fn a_frame_past_its_deadline_and_withdrawn_is_cut_and_not_refused() {
 
 /// The writer asks whether the stream has ended immediately before it writes, so a frame that is
 /// held at the write when the stream's graceful end comes is not given to the worker: a detach ends
-/// the stream once the worker's notice that the lease ended is applied, with the writer held after
-/// the host's decision, and the frame is let go unwritten when the writer is let go. The device is
+/// the stream once the worker's notice that the lease ended is applied, with the lane's writer held
+/// after the host's decision and the acknowledgement writer held at its look at the end (a stream
+/// that finishes drops the lane's writer, which would never reach the write). The frame is let go
+/// unwritten when the lane's writer is let go, and only then is the stream finished. The device is
 /// told nothing of the frame, which it counts as uncertain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_frame_held_at_the_write_when_the_stream_ends_is_not_written() {
@@ -917,6 +919,7 @@ async fn a_frame_held_at_the_write_when_the_stream_ends_is_not_written() {
     let mut stream = rig.open().await;
     let stages = rig.adopted.host.network().input_stages();
     let (at_write, go_write) = stages.hold_before_a_lane_write();
+    let (at_look, go_look) = stages.hold_after_a_graceful_look();
     stream
         .write_message(&rig.frame(0, b"a"))
         .await
@@ -930,6 +933,7 @@ async fn a_frame_held_at_the_write_when_the_stream_ends_is_not_written() {
         stages.counts().detach_ends == 1
     })
     .await;
+    arrived(at_look).await;
     let _ = go_write.send(());
 
     until("the frame is let go", || stages.counts().unanswered == 0).await;
@@ -937,6 +941,7 @@ async fn a_frame_held_at_the_write_when_the_stream_ends_is_not_written() {
         rig.lane.frames().is_empty(),
         "the worker was given a frame after the stream ended"
     );
+    let _ = go_look.send(());
     let ended = loop {
         match next_or_reset(&mut stream).await {
             Ok(Some(ack)) => assert!(
