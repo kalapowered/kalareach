@@ -174,6 +174,14 @@ pub(crate) async fn told(settled: Settled<ControlFrame>, standing: &Standing<'_>
                 Err(refusal) => refused_with(request_id, &refusal),
             }
         }
+        // The refusal says what was done before it, and under authority that no longer stands
+        // that is not shown, whatever the check's own refusal would say of nothing having been done.
+        Origin::AfterAnEffect => {
+            match own_withdrawal_or_standing(controller, connection_id, withdrew).await {
+                Ok(()) => answer,
+                Err(_) => not_shown(),
+            }
+        }
         Origin::Fresh => {
             match own_withdrawal_or_standing(controller, connection_id, withdrew).await {
                 Ok(()) => answer,

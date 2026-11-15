@@ -50,6 +50,9 @@ pub(crate) enum Origin {
     /// Every answer was made by the submission itself.
     #[default]
     Fresh,
+    /// A refusal the submission made after it had already changed something: it does not say that
+    /// nothing was done.
+    AfterAnEffect,
     /// An answer was read from the record of an earlier submission.
     Copied,
     /// A service read an earlier submission's record and withheld it.
@@ -69,6 +72,16 @@ impl<T> Given<T> {
     pub const fn fresh(answer: T) -> Self {
         Self {
             origin: Origin::Fresh,
+            answer,
+        }
+    }
+
+    /// A refusal the submission made after it had already changed something. Where the door will
+    /// not show it, it does not say that nothing was done: the device is told the outcome is not
+    /// shown.
+    pub const fn after_an_effect(answer: T) -> Self {
+        Self {
+            origin: Origin::AfterAnEffect,
             answer,
         }
     }
@@ -133,7 +146,9 @@ impl<T> Given<T> {
     pub(crate) fn into_withheld(self) -> T {
         match self.origin {
             Origin::Withheld => self.answer,
-            Origin::Fresh => panic!("the service answered for itself and withheld nothing"),
+            Origin::Fresh | Origin::AfterAnEffect => {
+                panic!("the service answered for itself and withheld nothing")
+            }
             Origin::Copied => panic!("the service gave the record back"),
         }
     }
@@ -183,6 +198,20 @@ impl<T, E> Given<Result<T, E>> {
             };
         }
         Self::of(answer, copied)
+    }
+}
+
+impl<T> Given<Result<T, crate::error::ControllerError>> {
+    /// The answer to a change of this daemon's own that can end something before it is refused: a
+    /// refusal that says what was already done ([`crate::error::ControllerError::after_an_effect`])
+    /// is told as one that does not say nothing was done.
+    pub(crate) fn of_a_change(result: Result<T, crate::error::ControllerError>) -> Self {
+        match result {
+            Err(crate::error::ControllerError::AfterAnEffect { .. }) => {
+                Self::after_an_effect(result)
+            }
+            _ => Self::fresh(result),
+        }
     }
 }
 
