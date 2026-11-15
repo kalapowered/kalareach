@@ -597,14 +597,16 @@ impl RemoteConnection {
         // device an outcome is unknown for a launch outside it, and end nothing here: a copy of the
         // action that this host refuses on its own account and words as a repeat's
         // (`told_of_a_repeat`); an answer read from a record before any dispatch; and the write
-        // boundary, where a bound that the decision held (a membership lease, an offline bound)
-        // ends after this function returned and before the answer is written, so the answer is
-        // decided again and refused with the word that says it may have taken effect. The first two
-        // are for a copy of an action whose first call ran through this function and decided its
-        // own end, and a client holds typing behind a launch only on the connection that sent it,
-        // so a copy sent after that connection was lost finds nothing to release. The third has no
-        // such copy: the stream stays open, and the client's hold on its typing ends when the
-        // person discards it or the connection ends.
+        // boundary, where the answer is decided again or is too large to write. A bound that the
+        // decision held (a membership lease, an offline bound) can end after this function returned
+        // and before the answer is written; the decisions can run out while the authority keeps
+        // moving; and the host's edit of the answer can make it larger than the stream carries.
+        // Each refuses the answer with the word that says the launch may have taken effect. The
+        // first two paths are for a copy of an action whose first call ran through this function
+        // and decided its own end, and a client holds typing behind a launch only on the
+        // connection that sent it, so a copy sent after that connection was lost finds nothing to
+        // release. The write boundary has no such copy: the stream stays open, and the client's
+        // hold on its typing ends when the person discards it or the connection ends.
         if let Some(read) = &read
             && mutation.method.method() == Some(Method::ShellLaunch)
             && a_launch_is_told_unknown(&answer)
