@@ -209,6 +209,15 @@ impl Controller {
         };
     }
 
+    /// Makes the answer to a stop request carry `bytes` of padding in the arguments it reports, so
+    /// that it is larger than the buffer of a socket and cannot be taken whole by a peer that reads
+    /// nothing.
+    #[cfg(feature = "testing")]
+    pub fn pad_the_stop_answer(&self, bytes: usize) {
+        self.stop_answer_padding
+            .store(bytes, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// How many writes of a local connection's loop have had to wait for their peer.
     #[cfg(feature = "testing")]
     pub fn local_writes_blocked(&self) -> usize {

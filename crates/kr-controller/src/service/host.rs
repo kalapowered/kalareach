@@ -1806,6 +1806,16 @@ impl Controller {
                 .collect(),
             directory: started.working_directory,
         });
+        #[cfg(feature = "testing")]
+        let launch = launch.map(|mut launch| {
+            let padding = self
+                .stop_answer_padding
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if padding > 0 {
+                launch.arguments.push("x".repeat(padding));
+            }
+            launch
+        });
         let pid = U64::new(u64::from(std::process::id()));
         if params.launch_only {
             return Ok(Stopped {
