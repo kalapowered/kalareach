@@ -210,6 +210,14 @@ async fn carry(
     flow.stages.before_a_serial_call().await;
     {
         let mut state = flow.lock();
+        if state.ended.is_some() {
+            // The stream ended while the frame was decided: nothing is written for it. The check is
+            // made here, where the frame is entered, and the call that is entered below is never
+            // dropped, since a call stopped part way through its write would close the link that
+            // carries the worker's other requests. The end stands as it was decided, and the frame
+            // is left with no word of its own.
+            return;
+        }
         state.in_flight += 1;
         state.outstanding.push_back(Outstanding {
             request_id,
