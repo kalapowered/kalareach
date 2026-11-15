@@ -133,6 +133,23 @@ pub enum PairingError {
         reason: String,
     },
 
+    /// The rendezvous service has no managed capacity for a new invitation now, and said which
+    /// paths still work.
+    ///
+    /// Not a fault of the service or of this host: the service answered that a budget is short and
+    /// named what a person can do meanwhile. It reports under the code of
+    /// [`PairingError::RendezvousUnavailable`], which already stands for a service that "has no
+    /// capacity", so no reader of the code changes. `told` is what a person reads, composed by the
+    /// one reader that made this, and is the whole of this error's text.
+    #[error("{told}")]
+    RendezvousCapacity {
+        /// What a person is told: the service's words, the wait when it named one, and the paths
+        /// that still work.
+        told: String,
+        /// The seconds the service asked the host to wait, when it named them, as it named them.
+        retry_after_seconds: Option<u64>,
+    },
+
     /// The locally configured rendezvous origin is wrong or missing.
     #[error("the rendezvous origin is not configured correctly: {reason}")]
     RendezvousConfiguration {
@@ -201,7 +218,9 @@ impl PairingError {
             Self::TooLarge { .. } => ErrorCode::InvalidArgument,
             Self::NotIssuingOwner => ErrorCode::PermissionDenied,
             Self::OwnerConfirmationRequired => ErrorCode::OwnerConfirmationRequired,
-            Self::RendezvousUnavailable { .. } => ErrorCode::RendezvousUnavailable,
+            Self::RendezvousUnavailable { .. } | Self::RendezvousCapacity { .. } => {
+                ErrorCode::RendezvousUnavailable
+            }
             Self::RendezvousConfiguration { .. } => ErrorCode::RendezvousConfigError,
             Self::Store { .. } => ErrorCode::StorageUnavailable,
             Self::Refused { code, .. } => *code,
@@ -232,6 +251,25 @@ mod tests {
         ] {
             assert_eq!(error.code(), ErrorCode::PairingAuthFailed, "{error}");
         }
+    }
+
+    /// KR-REQ-17.48: a service with no managed capacity for a new invitation reports under the
+    /// code of an unavailable service, and its text is what a person is to read, whole.
+    #[test]
+    fn kr_req_17_48_a_capacity_answer_reports_the_unavailable_code_and_says_what_it_carries() {
+        let error = PairingError::RendezvousCapacity {
+            told: "The words. Until then: A path.".to_owned(),
+            retry_after_seconds: Some(60),
+        };
+        assert_eq!(error.code(), ErrorCode::RendezvousUnavailable);
+        assert_eq!(error.to_string(), "The words. Until then: A path.");
+        assert_eq!(
+            error.code(),
+            PairingError::RendezvousUnavailable {
+                reason: "x".to_owned()
+            }
+            .code()
+        );
     }
 
     /// KR-REQ-10.19: expiry, exhausted attempts and an owner's refusal report different codes.

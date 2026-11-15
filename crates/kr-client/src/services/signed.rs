@@ -871,7 +871,7 @@ fn answer_of(answer: &ServiceHttpAnswer, repeat: Repeat) -> Result<Answer> {
         code: named_code(&named.code),
         message: ServiceMessage::from_refusal(named.message),
         retry_after_seconds: named.retry_after_seconds,
-        alternatives: named_alternatives(named.alternatives),
+        alternatives: Alternatives::from_member(named.alternatives),
         answer: answer.body.clone(),
     }))
 }
@@ -940,23 +940,6 @@ const SERVICE_CODES: [&str; 20] = [
     "SERVICE_UNAVAILABLE",
     "OUTCOME_UNKNOWN",
 ];
-
-/// The alternatives a refusal named, when it named a list of texts. A member of any other shape is
-/// read as none: what a service adds to tell a person more is never a reason to refuse to read
-/// what it decided.
-fn named_alternatives(member: Option<serde_json::Value>) -> Alternatives {
-    let Some(serde_json::Value::Array(items)) = member else {
-        return Alternatives::none();
-    };
-    let mut texts = Vec::with_capacity(items.len());
-    for item in items {
-        match item {
-            serde_json::Value::String(text) => texts.push(text),
-            _ => return Alternatives::none(),
-        }
-    }
-    Alternatives::named(texts)
-}
 
 /// The code the contract names that `text` spells, as this client's own constant.
 pub(super) fn named_code(text: &str) -> Option<&'static str> {
