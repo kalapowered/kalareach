@@ -7,7 +7,10 @@
 //! Its limits: it stops at a source file's test module, so a text after that module is not read;
 //! it skips the `tests` folders and every comment that is not help; and it reads every guide under
 //! `docs` except the conformance document, which lists the words of a source check and gives no
-//! person an instruction.
+//! person an instruction. It also misses a command's word that follows a string continuation (a
+//! `kr host` at the end of one line of a string and its word at the start of the next), and a plain
+//! `kill` with a process number, which is not the forced one and carries no signal for the scan to
+//! read.
 
 use std::path::{Path, PathBuf};
 
