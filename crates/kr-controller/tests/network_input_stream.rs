@@ -3738,8 +3738,9 @@ async fn the_host_checks_the_position_alone_for_a_worker_without_the_lane() {
 }
 
 /// The worker tells the host nothing of its lease, so a barrier of an epoch newer than any typing
-/// the host has read is judged too (the typing it names may still be on its way), an older epoch is
-/// stale and forwarded, and an epoch that has no accepted typing needs none.
+/// the worker has accepted is judged too (the typing it names may still be on its way), an older
+/// epoch than the worker has accepted typing of is stale and forwarded, and an epoch that has no
+/// accepted typing needs none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_barrier_is_judged_from_the_typing_for_a_worker_without_the_lane() {
     let (rig, _stream) = typed_serial(3).await;
@@ -3772,10 +3773,13 @@ async fn a_barrier_is_judged_from_the_typing_for_a_worker_without_the_lane() {
     rig.stop().await;
 }
 
-/// An epoch of which the worker refused a frame is over: the host judges no barrier of it, since the
-/// frames behind the refusal are not sent and the device has been told.
+/// A refusal of a frame moves nothing but the stream's own cutoff: no later frame of that epoch is
+/// sent. The worker's lease stands as it was, so a barrier of the epoch is judged against the frames
+/// that were accepted before the refusal. A count above them is refused: it is not reached, and
+/// since the frames behind the refusal were not sent it can no longer be reached. A count that the
+/// accepted frames make is forwarded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_barrier_of_an_epoch_the_worker_refused_a_frame_of_is_forwarded() {
+async fn a_barrier_of_an_epoch_the_worker_refused_a_frame_of_is_judged_by_what_was_accepted() {
     let rig = Rig::start_serial().await;
     let _calls = script_calls(&rig, None, |sequence| {
         if sequence == 1 {
@@ -3784,6 +3788,7 @@ async fn a_barrier_of_an_epoch_the_worker_refused_a_frame_of_is_forwarded() {
             took()
         }
     });
+    let sent = script_dependents(&rig, None);
     let mut stream = rig.open().await;
     type_and_wait(&rig, &mut stream, 0, b"a").await;
     let before = send_after(&rig, Dependent::Launch, rig.epoch, 5).await;
@@ -3800,12 +3805,282 @@ async fn a_barrier_of_an_epoch_the_worker_refused_a_frame_of_is_forwarded() {
         matches!(next(&mut stream).await, Some(InputAck::Refused { .. })),
         "the refusal is told"
     );
-    let after = send_after(&rig, Dependent::Launch, rig.epoch, 5).await;
+    for count in [5, 2] {
+        let after = send_after(&rig, Dependent::Launch, rig.epoch, count).await;
+        assert!(
+            after.refused_here,
+            "{count} frames are not reached, and the refused one will never be: {:?}",
+            after.answer
+        );
+    }
     assert!(
-        !after.refused_here,
-        "the epoch is over and not judged: {:?}",
-        after.answer
+        forwarded(&sent).is_empty(),
+        "nothing was forwarded: {:?}",
+        forwarded(&sent)
     );
+    let reached = send_after(&rig, Dependent::Launch, rig.epoch, 1).await;
+    assert!(
+        !reached.refused_here,
+        "the one frame that was accepted is reached: {:?}",
+        reached.answer
+    );
+    assert_eq!(forwarded(&sent), vec![Method::ShellLaunch]);
+    assert_eq!(position_refusals(&rig), 3);
+    rig.stop().await;
+}
+
+/// What the stand-in for the worker was sent for the dependent requests, by method, in order.
+fn forwarded(sent: &Dependents) -> Vec<Method> {
+    sent.lock()
+        .expect("not poisoned")
+        .iter()
+        .map(|(method, _)| *method)
+        .collect()
+}
+
+/// Has the host's calls to the worker answered by `answer`, which is given each frame's epoch and
+/// sequence. A call for an epoch other than the rig's waits for a permit of the gate first, so that
+/// a case can hold typing of a newer epoch with no answer.
+fn script_by_epoch(
+    rig: &Rig,
+    answer: impl Fn(InputLeaseEpoch, u64) -> SerialAnswer + Send + Sync + 'static,
+) -> (Arc<Calls>, Arc<tokio::sync::Semaphore>) {
+    let calls = Arc::new(Calls::default());
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let (record, holds, epoch) = (Arc::clone(&calls), Arc::clone(&gate), rig.epoch);
+    rig.adopted
+        .host
+        .network()
+        .input_stages()
+        .script_serial_calls(move |params| {
+            let answer = answer(params.epoch, params.sequence.get());
+            let (record, holds) = (Arc::clone(&record), Arc::clone(&holds));
+            async move {
+                record
+                    .sequences
+                    .lock()
+                    .expect("not poisoned")
+                    .push(params.sequence.get());
+                if params.epoch != epoch {
+                    holds.acquire().await.expect("the gate stands").forget();
+                }
+                answer
+            }
+        });
+    (calls, gate)
+}
+
+/// A device that is not honest sends a frame the worker refuses, and then a request that carries a
+/// barrier for typing the worker never took. The refusal did not end the worker's lease for any of
+/// the codes: it stands as it was, and an older worker cannot check a barrier once the host has
+/// taken the members out, so the host refuses what it knows is not reached and forwards nothing.
+async fn a_barrier_is_refused_after_a_refusal_that_leaves_the_lease_standing(
+    code: ErrorCode,
+    sequence: u64,
+) {
+    let rig = Rig::start_serial().await;
+    let _calls = script_by_epoch(&rig, move |_, _| gives(code));
+    let sent = script_dependents(&rig, None);
+    let mut stream = rig.open().await;
+    stream
+        .write_message(&rig.frame(sequence, b"k"))
+        .await
+        .expect("the frame is written");
+    assert!(
+        matches!(
+            next(&mut stream).await,
+            Some(InputAck::Refused { error, .. }) if error.code == code
+        ),
+        "the refusal is told"
+    );
+    for request in [Dependent::Release, Dependent::Detach, Dependent::Launch] {
+        let refused = send_after(&rig, request, rig.epoch, 1).await;
+        assert!(
+            refused.refused_here,
+            "{request:?}: no frame was accepted: {:?}",
+            refused.answer
+        );
+    }
+    assert!(
+        forwarded(&sent).is_empty(),
+        "nothing was forwarded: {:?}",
+        forwarded(&sent)
+    );
+    let none = send_after(&rig, Dependent::Launch, rig.epoch, 0).await;
+    assert!(
+        !none.refused_here,
+        "a barrier of no typing is reached: {:?}",
+        none.answer
+    );
+    assert_eq!(position_refusals(&rig), 3);
+    rig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_barrier_is_refused_after_a_frame_refused_for_its_sequence() {
+    a_barrier_is_refused_after_a_refusal_that_leaves_the_lease_standing(
+        ErrorCode::InvalidArgument,
+        1,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_barrier_is_refused_after_a_frame_refused_for_room() {
+    a_barrier_is_refused_after_a_refusal_that_leaves_the_lease_standing(
+        ErrorCode::ResourceUnavailable,
+        0,
+    )
+    .await;
+}
+
+/// Typing of a newer epoch that the host has only read moves nothing: the worker has not taken it,
+/// so the epoch the worker still holds is judged against what it accepted. The newer typing has no
+/// answer yet, or the worker refused it.
+async fn typing_the_host_has_only_read_moves_no_barrier(refused: bool) {
+    let rig = Rig::start_serial().await;
+    let held = rig.epoch;
+    let (calls, gate) = script_by_epoch(&rig, move |epoch, _| {
+        if epoch == held || !refused {
+            took()
+        } else {
+            gives(ErrorCode::LeaseLost)
+        }
+    });
+    let sent = script_dependents(&rig, None);
+    let mut stream = rig.open().await;
+    type_and_wait(&rig, &mut stream, 0, b"a").await;
+    type_and_wait(&rig, &mut stream, 1, b"b").await;
+    if refused {
+        gate.add_permits(1);
+    }
+    stream
+        .write_message(&frame_of(held.get() + 1, 0, b"c"))
+        .await
+        .expect("the frame is written");
+    if refused {
+        assert!(
+            matches!(next(&mut stream).await, Some(InputAck::Refused { .. })),
+            "the refusal is told"
+        );
+    } else {
+        until("the call for the newer epoch is made", || {
+            calls.started() == 3
+        })
+        .await;
+    }
+    let short = send_after(&rig, Dependent::Release, held, 5).await;
+    assert!(
+        short.refused_here,
+        "the worker still holds the epoch and has accepted two frames of it: {:?}",
+        short.answer
+    );
+    assert!(forwarded(&sent).is_empty(), "nothing was forwarded");
+    let reached = send_after(&rig, Dependent::Release, held, 2).await;
+    assert!(
+        !reached.refused_here,
+        "the two frames that were accepted are reached: {:?}",
+        reached.answer
+    );
+    assert_eq!(forwarded(&sent), vec![Method::InputRelease]);
+    gate.add_permits(1);
+    rig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn typing_of_a_newer_epoch_that_the_worker_has_not_answered_moves_no_barrier() {
+    typing_the_host_has_only_read_moves_no_barrier(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn typing_of_a_newer_epoch_that_the_worker_refused_moves_no_barrier() {
+    typing_the_host_has_only_read_moves_no_barrier(true).await;
+}
+
+/// The paths of an honest device stay: once the worker has accepted typing of a newer epoch its
+/// lease has moved on, and a barrier of an older epoch is forwarded unchecked, as the worker treats
+/// it; a barrier of the newer epoch is judged by what the worker accepted of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_barrier_of_an_older_epoch_is_forwarded_once_the_worker_accepted_a_newer_one() {
+    let rig = Rig::start_serial().await;
+    let (_calls, gate) = script_by_epoch(&rig, |_, _| took());
+    gate.add_permits(1);
+    let sent = script_dependents(&rig, None);
+    let mut stream = rig.open().await;
+    let held = rig.epoch;
+    let newer = InputLeaseEpoch::new(held.get() + 1);
+    type_and_wait(&rig, &mut stream, 0, b"a").await;
+    stream
+        .write_message(&frame_of(newer.get(), 0, b"b"))
+        .await
+        .expect("the frame is written");
+    loop {
+        match next(&mut stream).await {
+            Some(InputAck::Accepted { epoch, .. }) if epoch == newer => break,
+            Some(InputAck::Accepted { .. }) => {}
+            other => panic!("the typing was to be accepted, and the host said {other:?}"),
+        }
+    }
+    let stale = send_after(&rig, Dependent::Launch, held, 99).await;
+    assert!(
+        !stale.refused_here,
+        "an older epoch is stale and forwarded: {:?}",
+        stale.answer
+    );
+    let short = send_after(&rig, Dependent::Launch, newer, 5).await;
+    assert!(
+        short.refused_here,
+        "one frame of the newer epoch is accepted: {:?}",
+        short.answer
+    );
+    let reached = send_after(&rig, Dependent::Launch, newer, 1).await;
+    assert!(
+        !reached.refused_here,
+        "the frame of the newer epoch is reached: {:?}",
+        reached.answer
+    );
+    assert_eq!(forwarded(&sent).len(), 2);
+    assert_eq!(position_refusals(&rig), 1);
+    rig.stop().await;
+}
+
+/// An ending that the device sends again with no position goes through, after a refusal of a frame
+/// and after the host's own refusal of the ending's first try: the host never refuses an ending for
+/// good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ending_sent_again_with_no_position_goes_through_after_a_refusal() {
+    let rig = Rig::start_serial().await;
+    let _calls = script_by_epoch(&rig, |_, _| gives(ErrorCode::ResourceUnavailable));
+    let sent = script_dependents(&rig, None);
+    let mut stream = rig.open().await;
+    stream
+        .write_message(&rig.frame(0, b"k"))
+        .await
+        .expect("the frame is written");
+    assert!(
+        matches!(next(&mut stream).await, Some(InputAck::Refused { .. })),
+        "the refusal is told"
+    );
+    let first = send_after(&rig, Dependent::Release, rig.epoch, 1).await;
+    assert!(first.refused_here, "the first try: {:?}", first.answer);
+    let target = rig.adopted.workers[0].target(rig.adopted.host.environment_id);
+    let again = rig
+        .device
+        .mutate(
+            Method::InputRelease,
+            ActionId::new(kr_ipc::new_uuid()),
+            target,
+            &InputReleaseParams {
+                session_id: rig.session,
+                attachment_id: rig.attachment,
+                epoch: rig.epoch,
+                after_input: None,
+                fenced_report: false,
+            },
+        )
+        .await;
+    assert!(again.is_ok(), "the release goes through: {again:?}");
+    assert_eq!(forwarded(&sent), vec![Method::InputRelease]);
     assert_eq!(position_refusals(&rig), 1);
     rig.stop().await;
 }
