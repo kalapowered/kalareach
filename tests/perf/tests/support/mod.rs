@@ -22,28 +22,49 @@ fn is_outside_tmp(folder: &Path) -> bool {
     }
 }
 
+/// What the case needs where the build folder is under `/tmp`, as the failure says it.
+const VAR_TMP_NEED: &str = " The build folder is under /tmp, so this case needs a /var/tmp that \
+                            exists, can be written, lets programs run and is not inside /tmp, as \
+                            the README says of the clean-checkout check.";
+
 /// Runs `case` of the calling test program in a program of its own, as a caller runs it that sets
 /// its temporary folder and the evidence directory under it. The caller's folder is a folder of its
-/// own in the build folder, or in `/var/tmp` where the build folder is under `/tmp`, so that it is
-/// outside `/tmp`. The evidence directory stands beside the folder that the case gives the script as
-/// its temporary folder, not inside it, so the script's reader refuses the directory if the helper
-/// passes it on.
+/// own, named `kr-perf-caller.` and a suffix, in the build folder, or in `/var/tmp` where the build
+/// folder is under `/tmp`, so that it is outside `/tmp`. The helper removes that folder, and only
+/// that one, by its exact path; a run that is killed leaves it, and the prefix finds it. The
+/// evidence directory stands in the caller's folder beside the case's own folder, which holds the
+/// script's temporary folder, and not inside the script's temporary folder, so the script's reader
+/// refuses the directory if the helper passes it on.
+///
+/// Where the build folder is under `/tmp`, the case needs a `/var/tmp` that exists, can be written,
+/// lets programs run and is not itself inside `/tmp`, as the README says of the clean-checkout
+/// check. It looks in no other folder and never skips. A `/var/tmp` that is absent or cannot be
+/// written, or that is inside `/tmp`, fails the case with words that name this need. A `/var/tmp`
+/// where programs cannot run fails the case at the script's start, where the nested program's text
+/// shows that a stand-in did not start.
 pub fn run_as_a_caller_with_an_evidence_folder(case: &str) {
     let build = Path::new(env!("CARGO_TARGET_TMPDIR"));
-    let parent = if is_outside_tmp(build) {
-        build
+    let (parent, need) = if is_outside_tmp(build) {
+        (build, "")
     } else {
-        Path::new("/var/tmp")
+        (Path::new("/var/tmp"), VAR_TMP_NEED)
     };
-    let caller = tempfile::tempdir_in(parent)
-        .unwrap_or_else(|error| panic!("a caller's folder in {}: {error}", parent.display()));
-    assert!(
-        is_outside_tmp(caller.path()),
-        "this case needs a folder outside /tmp, and neither the build folder nor /var/tmp is \
-         one: {} is inside it",
-        caller.path().display()
-    );
+    let caller = tempfile::Builder::new()
+        .prefix("kr-perf-caller.")
+        .tempdir_in(parent)
+        .unwrap_or_else(|error| {
+            panic!(
+                "a caller's folder cannot be made in {}: {error}.{need}",
+                parent.display()
+            )
+        });
     let physical = std::fs::canonicalize(caller.path()).expect("resolves");
+    assert!(
+        is_outside_tmp(&physical),
+        "the caller's folder {} is inside /tmp, which every reader takes as a root, and this case \
+         needs a folder outside it.{need}",
+        physical.display()
+    );
     let output = Command::new(std::env::current_exe().expect("this program"))
         .args([case, "--exact", "--test-threads=1"])
         .env("TMPDIR", &physical)
