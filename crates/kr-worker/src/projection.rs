@@ -387,6 +387,13 @@ impl TerminalEngine {
         })
     }
 
+    /// Returns the clock the engine's windows, the response lane's deadlines among them, are
+    /// measured on.
+    #[must_use]
+    pub(crate) fn clock(&self) -> Arc<dyn kr_ipc::clock::SharedClock> {
+        Arc::clone(&self.clock)
+    }
+
     /// Reads the clock the engine's windows are measured on, in milliseconds.
     ///
     /// It is a reading of the continuous clock: meaningful beside another reading of it, and not as

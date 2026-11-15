@@ -913,6 +913,8 @@ impl SessionRuntime {
         // starting is marked there.
         let activity = session.activity();
         let idle_sweep = session.idle_sweep();
+        // The pump decides when to look at the lane on the lane's own clock.
+        let pump_clock = session.lane_clock();
         let trace = crate::trace::LockTrace::shared();
         session.record_into(trace.clone());
         let session = Arc::new(Mutex::new(session));
@@ -1590,20 +1592,23 @@ impl SessionRuntime {
         let pump_session = Arc::clone(&session);
         let pump_domain = Arc::clone(&domain);
         let pump_sink = sink.clone();
-        let pump_clock = Arc::clone(&shared_clock);
         let task = tokio::spawn(async move {
-            let mut tried = None;
             loop {
-                pump_domain
-                    .pump_asked(pump_clock.as_ref(), &mut tried)
-                    .await;
+                pump_domain.pump_asked(pump_clock.as_ref()).await;
                 // Waited for off the executor: the session may be held by a commit.
-                off_the_executor(|| {
-                    if let Ok(mut session) = pump_session.lock() {
-                        session.serve_the_pump();
-                        pump_sink.flush(&pump_domain);
-                    }
+                let served = off_the_executor(|| {
+                    let Ok(mut session) = pump_session.lock() else {
+                        return false;
+                    };
+                    session.serve_the_pump();
+                    pump_sink.flush(&pump_domain);
+                    true
                 });
+                // A session whose lock is poisoned can be served no more, and a pump that went on
+                // would be asked for again at once by a deadline no pass can end.
+                if !served {
+                    break;
+                }
             }
         });
         runtime.tasks.0.push(task.abort_handle());
