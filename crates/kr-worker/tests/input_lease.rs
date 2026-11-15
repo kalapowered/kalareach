@@ -2497,6 +2497,34 @@ fn the_editor_leaves(runtime: &Arc<SessionRuntime>, session_id: SessionId) {
     let _ = runtime.drive_fence(|driver| driver.bridge_event(RequestId::new(2), &event));
 }
 
+/// The root editor of [`powershell_root_session`] reports itself idle, which it does once it is
+/// reading keys. It is owed no cursor report any more, and none came.
+#[cfg(not(windows))]
+fn the_editor_idles(runtime: &Arc<SessionRuntime>, session_id: SessionId) {
+    use kr_protocol::ids::RequestId;
+    use kr_protocol::root::{
+        CwdRevision, EditorBufferRevision, EditorKeymap, EditorState, KeyQueueSnapshot,
+        PendingReaderInput, PromptGeneration, ReaderContext, ReaderRevision,
+    };
+    use kr_shell_integration::contract::events::{BridgeEvent, ReaderIdle};
+
+    let event = BridgeEvent::ReaderIdle(ReaderIdle {
+        session_id,
+        prompt_generation: PromptGeneration::new(1),
+        reader_revision: ReaderRevision::new(1),
+        reader_context: ReaderContext::Primary,
+        snapshot: KeyQueueSnapshot::drained(),
+        editor: EditorState {
+            buffer_empty: true,
+            buffer_revision: EditorBufferRevision::new(1),
+            keymap: EditorKeymap::Emacs,
+            pending: PendingReaderInput::NONE,
+        },
+        cwd_revision: CwdRevision::new(1),
+    });
+    let _ = runtime.drive_fence(|driver| driver.bridge_event(RequestId::new(2), &event));
+}
+
 /// KR-REQ-08.48: a takeover ends the keystrokes of the lease that was taken, and not the host's
 /// answer to the application.
 ///
@@ -3105,8 +3133,8 @@ async fn an_answer_that_the_end_of_a_cursor_hold_frees_behind_an_open_paste_is_d
 ///
 /// The share of the host's answers is full, and the writer holds all of them, before the root
 /// editor begins its read. The lane then keeps one more answer behind the editor's cursor report,
-/// and the answer does not age. The editor leaves with no cursor report: the answer is free, with
-/// the deadline it had, and there is no room for it. After that nothing happens: no key, no
+/// and the answer does not age. The editor reads keys with no cursor report sent: the answer is
+/// free, with the deadline it had, and there is no room for it. After that nothing happens: no key, no
 /// output, no room and no other timer. The pass that ended the hold is the only one that can tell
 /// the pump when to look again, and the lane's clock moves only while the pump stands at its
 /// timer, so the drop is the pump's own wake at the deadline.
@@ -3141,7 +3169,7 @@ async fn an_answer_that_the_end_of_a_cursor_hold_frees_with_no_room_is_dropped_a
     }
     // Before the deadline.
     clock.advance(Duration::from_millis(1_900));
-    the_editor_leaves(&runtime, session_id);
+    the_editor_idles(&runtime, session_id);
 
     tokio::time::timeout(Duration::from_secs(20), timer_ended)
         .await
