@@ -315,10 +315,6 @@ fn a_path_is_shown_whole_when_the_composer_wrapped_it_and_not_when_only_its_end_
     assert!(!shows_whole(&apart, path));
 }
 
-/// How long the view-only control watches the owner's screen for the input of a device that may
-/// not type.
-const VIEW_ONLY_WATCH: Duration = Duration::from_secs(2);
-
 /// Attaches `remote` to the session to observe it, as a device whose grant has no typing right
 /// does. The attach names the session on the connection, so the host has the connection's route to
 /// the worker, which the admission of a typing stream waits for.
@@ -1625,13 +1621,9 @@ fn gateway_forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_u
             // the typing right stands between the viewer and a lane: a device without it is not
             // served, and the host ends the stream before its first word and tells no code. The
             // case requires that the lane does not open. A lane that opened (a host that skips the
-            // decision), an open that ran out of time and any other end fail the case; so does a
-            // screen that shows the input, which is the second check.
-            let before = session.person.window.screen();
-            assert!(
-                !before.iter().any(|row| row.contains(&shows)),
-                "the agent's screen shows {shows:?} before the view-only device types"
-            );
+            // decision), an open that ran out of time and any other end fail the case. The viewer
+            // sends no byte, so the refusal of the open is the whole of what is checked on its
+            // side; the owner's input that follows is the control.
             let lane_saw = ctx
                 .runtime
                 .block_on(kr_e2e_m1b::typing::Typing::refused_open(
@@ -1643,16 +1635,6 @@ fn gateway_forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_u
                 .unwrap_or_else(|why| {
                     panic!("a view-only device's lane does not open, and the host ends it: {why}")
                 });
-            let watched_until = Instant::now() + VIEW_ONLY_WATCH;
-            while Instant::now() < watched_until {
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            let viewer_rows = session.person.window.screen();
-            assert!(
-                !viewer_rows.iter().any(|row| row.contains(&shows)),
-                "the owner's screen shows the view-only device's input {shows:?}:\n{}",
-                viewer_rows.join("\n")
-            );
             let admitted = owner
                 .type_text(&session.remote, &ctx.runtime, &input)
                 .unwrap_or_else(|why| panic!("the owner device's input is admitted: {why}"));
@@ -1674,8 +1656,6 @@ fn gateway_forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_u
                     "viewer": {
                         "attached_to_observe": observing.to_string(),
                         "lane_saw": lane_saw,
-                        "owner_screen_showed_its_input": false,
-                        "watched_for_ms": u64::try_from(VIEW_ONLY_WATCH.as_millis()).unwrap_or(u64::MAX),
                     },
                     "owner_sent_bytes": admitted.bytes,
                 },
