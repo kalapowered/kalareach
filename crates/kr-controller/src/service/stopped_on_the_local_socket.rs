@@ -368,7 +368,7 @@ fn a_gate_closed_for_a_stop_stays_closed_and_an_updates_steps_meet_the_stops_wor
     let handover = Handover::default();
     let under_way = handover.admit().expect("a create is under way");
     let attempt = handover
-        .close(&target(), Duration::from_secs(300))
+        .close(&target(), Duration::from_secs(300), || Ok(()))
         .expect("an attempt begins");
     handover.begin_stop();
 
@@ -379,22 +379,22 @@ fn a_gate_closed_for_a_stop_stays_closed_and_an_updates_steps_meet_the_stops_wor
     };
     stops_words(
         handover
-            .close(&target(), Duration::from_secs(300))
+            .close(&target(), Duration::from_secs(300), || Ok(()))
             .expect_err("a daemon that stops does not prepare"),
     );
     stops_words(
         handover
-            .resume(None)
+            .resume(None, || Ok(()))
             .expect_err("a daemon that stops does not resume"),
     );
     stops_words(
         handover
-            .resume(Some(attempt))
+            .resume(Some(attempt), || Ok(()))
             .expect_err("a daemon that stops does not resume an attempt"),
     );
     stops_words(
         handover
-            .stop(Some(attempt))
+            .stop(Some(attempt), || Ok(()))
             .expect_err("an update's stop does not end the daemon that stops"),
     );
     stops_words(
@@ -420,7 +420,7 @@ fn a_gate_closed_for_a_stop_stays_closed_and_an_updates_steps_meet_the_stops_wor
     // for the update's own words.
     let update = Handover::default();
     let attempt = update
-        .close(&target(), Duration::from_secs(300))
+        .close(&target(), Duration::from_secs(300), || Ok(()))
         .expect("an attempt begins");
     let refused = update.admit().err().expect("the gate is closed");
     assert_eq!(refused.code(), ErrorCode::ResourceUnavailable);
