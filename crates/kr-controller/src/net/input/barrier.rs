@@ -3,7 +3,7 @@
 //! A release, a detach or a launch may carry the count of frames it must follow: the typing that
 //! its sender wrote on the stream before it, which the worker's input domain checks again in the
 //! same hold as the action. The host reads the barrier against its own record of the stream
-//! ([`super::InputStreams::position_not_reached`]) and forwards the request unless that record
+//! ([`super::InputStreams::read_position`]) and forwards the request unless that record
 //! shows the position is not reached.
 //!
 //! The barrier and the request for the fenced count are members that only a worker which serves
