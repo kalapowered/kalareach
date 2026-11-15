@@ -826,17 +826,11 @@ async fn a_read_of_a_session_nothing_holds_takes_it_and_gives_its_content() {
 }
 
 /// A live session that the maintenance pass holds behind a storage call: the read answers within
-/// its bound, says that the session is live, and says what the session was when it published.
-///
-/// The three places that publish before a close are shown by what the answer carries: the launch by
-/// the root shell, which the record made when the session was made does not have, and the change of
-/// the application by its name.
+/// its bound, says that the session is live, and says what the session was when it launched its
+/// shell, which the record made when the session was made does not have.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_read_of_a_live_session_that_is_held_answers_within_its_bound_and_says_live() {
     let host = host().await;
-    host.runtime
-        .session()
-        .set_application(Some("an editor".to_owned()));
     let (holder, mut reader) = (host.client().await, host.client().await);
     let standing = stall(&host, Stalled::Prune, holder).await;
     let (answered, read) = read_within_its_bound(&mut reader, &host, "held live").await;
@@ -850,7 +844,6 @@ async fn a_read_of_a_live_session_that_is_held_answers_within_its_bound_and_says
         read.session.root_process.0.is_some(),
         "the session published its summary when it launched its shell"
     );
-    assert_eq!(read.session.application.as_deref(), Some("an editor"));
     assert_eq!(read.session.session_id, host.session_id);
     assert!(
         read.launch_profile.0.is_none() && read.last_command_block.0.is_none(),
@@ -860,6 +853,25 @@ async fn a_read_of_a_live_session_that_is_held_answers_within_its_bound_and_says
         read.endpoint.0.is_some(),
         "a live session names its endpoint"
     );
+}
+
+/// The name of the application in the session's foreground is published when it changes, so a read
+/// of a held session names the application that the session had when it was held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_read_of_a_held_session_names_the_application_the_session_had() {
+    let host = host().await;
+    host.runtime
+        .session()
+        .set_application(Some("an editor".to_owned()));
+    let (holder, mut reader) = (host.client().await, host.client().await);
+    let standing = stall(&host, Stalled::Prune, holder).await;
+    let (answered, read) = read_within_its_bound(&mut reader, &host, "held application").await;
+    let _ = standing.release.send(());
+    assert!(
+        answered <= READ_BOUND,
+        "the read of a held session was answered after {answered:?}, past {READ_BOUND:?}"
+    );
+    assert_eq!(read.session.application.as_deref(), Some("an editor"));
 }
 
 /// A read that names another session is refused whether or not the session is held.
