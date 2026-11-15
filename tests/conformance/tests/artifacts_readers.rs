@@ -57,6 +57,10 @@ enum Reader {
     /// The system's own bash, `/bin/bash`, which is bash 3.2 on a Mac and the first bash of a
     /// hosted macOS runner's search path, where a developer's Mac usually has a newer one first.
     SystemShell,
+    /// Git's own `bash.exe` started as a login shell (`--login`), whose profile sets the shell's
+    /// temporary variables before the reader runs. Windows only.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    LoginShell,
     PowerShell,
 }
 
@@ -224,20 +228,23 @@ impl Reader {
     ) -> Reading {
         let root = repository();
         let mut run = match self {
-            Reader::Shell | Reader::SystemShell => {
+            Reader::Shell | Reader::SystemShell | Reader::LoginShell => {
                 let program = match self {
                     Reader::SystemShell => system_shell().expect("the system has a bash"),
                     _ => shell().expect("a shell is installed"),
                 };
                 let mut run = Command::new(program);
+                if matches!(self, Reader::LoginShell) {
+                    run.arg("--login");
+                }
                 run.args([
                     "-c",
                     r#". "$1"
                     [ -z "${KR_READER_CALLER_OPTION:-}" ] || shopt -s "$KR_READER_CALLER_OPTION"
                     printf 'slash_tmp=%s\n' "$(cygpath -w /tmp 2>/dev/null)"
                     kr_artifacts_dir
-                    printf 'directory=%s\nexported=%s\n' "$kr_artifacts" "$(printenv KR_TEST_ARTIFACTS_DIR)"
-                    printf 'nocasematch=%s\n' "$(shopt -q nocasematch && echo on || echo off)""#,
+                    printf 'nocasematch=%s\n' "$(shopt -q nocasematch && echo on || echo off)"
+                    printf 'directory=%s\nexported=%s\n' "$kr_artifacts" "$(printenv KR_TEST_ARTIFACTS_DIR)""#,
                     "bash",
                 ])
                 // With forward slashes, which Git Bash reads and a Windows path's backslashes it
@@ -1246,7 +1253,8 @@ mod windows_paths {
 
     /// With `TMP` and `TEMP` apart and no variable set, the run's own directory is made under the
     /// folder `TEMP` names, which is the reader's temporary folder, and not under `/tmp`, which
-    /// Git Bash made from `TMP`.
+    /// Git Bash made from `TMP`. The shell's `TMPDIR` is not set, or is `/tmp` as a login shell's
+    /// profile exports it (the third leg starts a login shell and so reads that profile).
     #[test]
     fn a_run_whose_tmp_and_temp_differ_gets_its_own_directory_under_temp() {
         if shell().is_none() {
@@ -1254,22 +1262,31 @@ mod windows_paths {
         }
         let there = tempfile::tempdir().expect("a folder that /tmp is");
         let here = tempfile::tempdir().expect("the reader's temporary folder");
-        let named = [
-            ("TMP", there.path().as_os_str()),
-            ("TEMP", here.path().as_os_str()),
-            ("TMPDIR", OsStr::new("")),
-        ];
-        let reading = Reader::Shell.read_with(None, None, &named);
-        assert_own_slash_tmp(&reading, &real(there.path()));
-        assert!(reading.succeeded, "{reading:?}");
-        let directory = reading.directory.clone().expect("a directory");
-        assert!(directory.is_dir(), "{}", directory.display());
-        assert!(
-            same(directory.parent().expect("a parent"), &real(here.path())),
-            "the directory is made under TEMP's folder: {}",
-            directory.display()
-        );
-        std::fs::remove_dir(&directory).expect("removes the directory the run made");
+        for (reader, tmpdir) in [
+            (Reader::Shell, ""),
+            (Reader::Shell, "/tmp"),
+            (Reader::LoginShell, ""),
+        ] {
+            let named = [
+                ("TMP", there.path().as_os_str()),
+                ("TEMP", here.path().as_os_str()),
+                ("TMPDIR", OsStr::new(tmpdir)),
+            ];
+            let reading = reader.read_with(None, None, &named);
+            assert_own_slash_tmp(&reading, &real(there.path()));
+            assert!(
+                reading.succeeded,
+                "{reader:?} with TMPDIR {tmpdir:?}: {reading:?}"
+            );
+            let directory = reading.directory.clone().expect("a directory");
+            assert!(directory.is_dir(), "{}", directory.display());
+            assert!(
+                same(directory.parent().expect("a parent"), &real(here.path())),
+                "{reader:?} with TMPDIR {tmpdir:?}: the directory is made under TEMP's folder: {}",
+                directory.display()
+            );
+            std::fs::remove_dir(&directory).expect("removes the directory the run made");
+        }
     }
 
     /// A `TEMP` with a line feed at its end names no folder, so Git Bash's `/tmp`, which is the
@@ -1440,6 +1457,76 @@ mod windows_paths {
             "a UNC value under no UNC root",
             OUTSIDE,
         );
+    }
+
+    /// `folder` by the machine's own administrative share, as Git Bash writes it (`//localhost/C$/…`),
+    /// and as Windows writes it. `None` where the share cannot be reached.
+    fn shell_share(folder: &Path) -> Option<(PathBuf, PathBuf)> {
+        let windows = by_unc(folder)?;
+        let shell = PathBuf::from(windows.to_string_lossy().replace('\\', "/"));
+        Some((shell, windows))
+    }
+
+    /// A share's path begins with two slashes and keeps them: a value under a runner folder that is
+    /// a share's folder is that folder, and is not read as a folder of the local `/localhost/…`.
+    #[test]
+    fn a_value_under_a_shares_folder_is_read_by_the_shell_reader_as_that_folder() {
+        if shell().is_none() {
+            return;
+        }
+        let temporary = tempfile::tempdir().expect("a temporary folder");
+        let ordinary = real(temporary.path());
+        let Some((share, by_windows)) = shell_share(&ordinary) else {
+            return;
+        };
+        for written in [
+            format!("{}/evidence", share.display()),
+            format!("{}//evidence", share.display()),
+        ] {
+            let reading = Reader::Shell.read_with(
+                Some(OsStr::new(&written)),
+                None,
+                &[("RUNNER_TEMP", share.as_os_str())],
+            );
+            assert!(reading.succeeded, "{written}: {reading:?}");
+            let directory = reading.directory.as_deref().expect("a directory");
+            // The share's folder may come back by its share or by the drive it is on.
+            assert!(
+                same(directory, &by_windows.join("evidence"))
+                    || same(directory, &ordinary.join("evidence")),
+                "{written}: {directory:?}"
+            );
+        }
+    }
+
+    /// With the temporary folder a share's folder and no variable set, the run's own directory is
+    /// made in that folder.
+    #[test]
+    fn a_run_whose_temporary_folder_is_a_shares_folder_gets_its_own_directory_there() {
+        if shell().is_none() {
+            return;
+        }
+        let temporary = tempfile::tempdir().expect("a temporary folder");
+        let ordinary = real(temporary.path());
+        let Some((_, by_windows)) = shell_share(&ordinary) else {
+            return;
+        };
+        let named = [
+            ("TMP", by_windows.as_os_str()),
+            ("TEMP", by_windows.as_os_str()),
+            ("TMPDIR", OsStr::new("")),
+        ];
+        let reading = Reader::Shell.read_with(None, None, &named);
+        assert!(reading.succeeded, "{reading:?}");
+        let directory = reading.directory.clone().expect("a directory");
+        assert!(directory.is_dir(), "{}", directory.display());
+        assert!(
+            same(directory.parent().expect("a parent"), &by_windows)
+                || same(directory.parent().expect("a parent"), &ordinary),
+            "the directory is made in the share's folder: {}",
+            directory.display()
+        );
+        std::fs::remove_dir(&directory).expect("removes the directory the run made");
     }
 
     /// The reader takes the extended-length spelling of a value and of a root (`\\?\C:\…`, and
