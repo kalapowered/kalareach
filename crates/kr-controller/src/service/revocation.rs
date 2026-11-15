@@ -107,6 +107,7 @@ impl Controller {
             Some(grant_id),
             revocation.revoked.iter().copied().collect(),
             own,
+            claim,
         )
         .await
     }
@@ -334,6 +335,7 @@ impl Controller {
                     None,
                     revocation.revoked.iter().copied().collect(),
                     own,
+                    None,
                 )
                 .await?;
                 Err(error)
@@ -344,6 +346,7 @@ impl Controller {
                     None,
                     revocation.revoked.iter().copied().collect(),
                     own,
+                    claim,
                 )
                 .await
             }
@@ -409,6 +412,7 @@ impl Controller {
             transfer.issued,
             transfer.revoked.revoked.iter().copied().collect(),
             own,
+            claim,
         )
         .await
     }
@@ -444,18 +448,22 @@ impl Controller {
     /// fence for), and its barrier captures whatever is still owed, which is how a retry of a
     /// revocation whose barrier failed fences for it. Nothing newly withdrawn and nothing owed is
     /// answered with the revision in force and the barrier as it stands.
+    ///
+    /// `claim` is the hold of the action whose answer this is, when the answer is to be kept: what
+    /// the entries of the barrier read is kept beside it ([`Self::keep_what_was_read`]).
     pub(super) async fn complete_revocation(
         &self,
         audience: Audience,
         named: Option<kr_protocol::ids::GrantId>,
         revoked_grants: kr_protocol::scalars::CanonicalSet<kr_protocol::ids::GrantId>,
         own: OwnBarrier,
+        claim: Option<&crate::grants::ClaimHold>,
     ) -> Result<kr_protocol::sharing::RevocationResult> {
         // Both come from the barrier: it reads the registry, which is where a revision is
         // allocated, and a second reading taken separately can be a different one. An answer that
         // named one revision and carried a barrier for another would be evidence of no single
         // moment.
-        let barrier = self.barrier(own).await?;
+        let (barrier, reads) = self.barrier_reading(own).await?;
         let barrier = self.barrier_for(audience, named, barrier)?;
         // A revoked owner is no longer a key the feed may be told can remove this host.
         if let Some(runtime) = self.feed_runtime() {
@@ -471,7 +479,24 @@ impl Controller {
         if !answer.fits_a_frame() {
             Self::report_uncarriable_answer("a revocation");
         }
+        Self::keep_what_was_read(claim, &answer.barrier, &reads);
         Ok(answer)
+    }
+
+    /// Keeps, with the answer that `claim` records, what the entries of the answer's barrier read:
+    /// for the workers the answer carries, once it is cut to what a frame holds. The entries and
+    /// what they read come from one report, so the record describes these entries and no later
+    /// state. A repeat of the action reads it ([`Self::with_the_names_since`]).
+    fn keep_what_was_read(
+        claim: Option<&crate::grants::ClaimHold>,
+        barrier: &kr_protocol::action::RevocationBarrier,
+        reads: &std::collections::BTreeMap<kr_protocol::ids::SessionId, crate::authority::Reads>,
+    ) {
+        if let Some(claim) = claim
+            && let Some(record) = crate::authority::KeptReads::of(barrier, reads).encode()
+        {
+            claim.keep_reads(record);
+        }
     }
 
     /// The barrier as `audience` is told of it.
@@ -524,8 +549,9 @@ impl Controller {
         replacement: kr_protocol::grant::Grant,
         revoked_grants: kr_protocol::scalars::CanonicalSet<kr_protocol::ids::GrantId>,
         own: OwnBarrier,
+        claim: Option<&crate::grants::ClaimHold>,
     ) -> Result<kr_protocol::sharing::GrantTransferResult> {
-        let barrier = self.barrier(own).await?;
+        let (barrier, reads) = self.barrier_reading(own).await?;
         let answer = kr_protocol::sharing::GrantTransferResult::bounded(
             replacement,
             barrier.authority_revision,
@@ -535,6 +561,7 @@ impl Controller {
         if !answer.fits_a_frame() {
             Self::report_uncarriable_answer("a transfer");
         }
+        Self::keep_what_was_read(claim, &answer.revoked.barrier, &reads);
         Ok(answer)
     }
 

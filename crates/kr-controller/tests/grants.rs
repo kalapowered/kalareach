@@ -657,7 +657,8 @@ fn a_claim_excludes_every_other_attempt_and_is_never_taken_over() {
     assert_eq!(
         recorded(answered, 2_004),
         ActionRecord::Answered {
-            result: b"first".to_vec()
+            result: b"first".to_vec(),
+            reads: None
         }
     );
 
@@ -740,7 +741,8 @@ fn a_claim_that_kept_nothing_is_given_back_and_one_that_kept_an_answer_never_is(
             .recorded_action(&actor, answered, &digest)
             .expect("readable"),
         Some(ActionRecord::Answered {
-            result: b"kept".to_vec()
+            result: b"kept".to_vec(),
+            reads: None
         })
     );
     let refused = ActionId::new(Uuid::from_bytes([3; 16]));
@@ -865,7 +867,8 @@ fn a_claim_left_unfinished_is_settled_once_and_only_where_nothing_holds_it() {
             .recorded_action(&actor, held, &digest)
             .expect("readable"),
         Some(ActionRecord::Answered {
-            result: b"settled".to_vec()
+            result: b"settled".to_vec(),
+            reads: None
         })
     );
 
@@ -1059,7 +1062,8 @@ fn an_earlier_receipts_table_migrates_once_and_its_open_claims_are_unfinished() 
                 .recorded_action(&actor, answered, &digest)
                 .expect("readable"),
             Some(ActionRecord::Answered {
-                result: b"done".to_vec()
+                result: b"done".to_vec(),
+                reads: None
             })
         );
         match directory

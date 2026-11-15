@@ -695,7 +695,7 @@ impl Controller {
                     );
                 }
                 let completed = self
-                    .complete_revocation(Audience::Host, None, CanonicalSet::new(), own)
+                    .complete_revocation(Audience::Host, None, CanonicalSet::new(), own, None)
                     .await?;
                 // The organisation's list goes with its enrolment. A withdrawal only widens the
                 // adapters the host admits, so a put that does not land waits for the next pass.
@@ -721,7 +721,7 @@ impl Controller {
         mutation: &MutationRequest,
         record: &crate::grants::ActionRecord,
     ) -> Option<OrganisationChangeMarker> {
-        let crate::grants::ActionRecord::Answered { result } = record else {
+        let crate::grants::ActionRecord::Answered { result, .. } = record else {
             return None;
         };
         if !matches!(
@@ -757,7 +757,7 @@ impl Controller {
         marker: OrganisationChangeMarker,
     ) -> Result<ParamsValue> {
         let completed = self
-            .complete_revocation(Audience::Host, None, CanonicalSet::new(), own)
+            .complete_revocation(Audience::Host, None, CanonicalSet::new(), own, None)
             .await?;
         match marker {
             OrganisationChangeMarker::Withdrawn { .. } => encode(&completed),

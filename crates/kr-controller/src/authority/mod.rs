@@ -32,6 +32,9 @@ use kr_protocol::scalars::Nullable;
 use kr_transport::clock::{ContinuousClock, ContinuousInstant};
 use kr_transport::lease::{DispatchLease, LeaseIssuer, LeaseRefusal, WorkerBinding};
 
+mod reads;
+pub(crate) use reads::{KeptReads, Reads};
+
 /// One mutation's admission, carried from the moment this daemon accepted it to the moment its
 /// effect is committed.
 ///
@@ -357,6 +360,14 @@ impl Told {
     }
 }
 
+/// What the result of one revision names of one worker, with what it read to name it.
+#[derive(Debug)]
+struct Seen {
+    told: Told,
+    /// What each revision read holds of the names, when every one of them could be named.
+    reads: Option<Reads>,
+}
+
 /// What one worker has said about each revocation it has answered, oldest first.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct WorkerFences {
@@ -635,8 +646,13 @@ impl WorkerFences {
     /// revision reported, and what its fences for the revisions that announcement carried reported.
     ///
     /// A result whose own report has not arrived reads the rest all the same.
-    fn told_at(&self, revision: AuthorityRevision) -> Option<Told> {
-        let carries = match self.carries.get(&revision) {
+    ///
+    /// `through` is a repeat's own read, and changes nothing here: the entry also reads each of
+    /// those revisions that is below `revision`, has not gone from this result for room, and has a
+    /// report held now. A revision with no report held is not added, so a sentence that the next
+    /// announcement asks stays true of the ones that are read.
+    fn told_at(&self, revision: AuthorityRevision, through: &[AuthorityRevision]) -> Option<Seen> {
+        let mut carries = match self.carries.get(&revision) {
             Some(carries) => carries.clone(),
             None if self
                 .forgotten_through
@@ -649,6 +665,14 @@ impl WorkerFences {
             }
             None => Carries::default(),
         };
+        carries
+            .revisions
+            .extend(through.iter().copied().filter(|read| {
+                *read < revision
+                    && !carries.gone.contains(read)
+                    && carries.gone_through.is_none_or(|gone| *read > gone)
+                    && self.at(*read).is_some()
+            }));
         if self.at(revision).is_none() && carries == Carries::default() {
             return None;
         }
@@ -664,7 +688,29 @@ impl WorkerFences {
         let carried: Vec<Option<&FenceReport>> =
             selected.iter().map(|carried| self.at(*carried)).collect();
         let unread = carries.unread || selected.len() < carries.revisions.len();
-        Some(Told::read(own, &carried, &carries, unread))
+        // What the numbers hold of each revision read, from the same reports the entry is made of.
+        // An entry that could not name every revision it reads has no record.
+        let reads = (!unread)
+            .then(|| {
+                let mut accounted = BTreeSet::new();
+                let mut named = BTreeSet::new();
+                for (read, report) in std::iter::once((revision, self.at(revision)))
+                    .chain(selected.iter().map(|carried| (*carried, self.at(*carried))))
+                {
+                    if report.is_some_and(|report| report.reported) {
+                        accounted.insert(read);
+                    } else {
+                        named.insert(read);
+                    }
+                }
+                accounted.extend(carries.gone.iter().copied());
+                Reads::new(accounted, named)
+            })
+            .flatten();
+        Some(Seen {
+            told: Told::read(own, &carried, &carries, unread),
+            reads,
+        })
     }
 
     /// Returns the revisions the results this worker has reports for read and the worker has not
@@ -777,6 +823,16 @@ impl Round<'_> {
     ) -> RevocationBarrier {
         self.barrier.report(revision, workers)
     }
+
+    /// The report of [`Self::report`], with what each entry in it read, taken together.
+    pub(crate) fn report_with_reads(
+        &self,
+        revision: AuthorityRevision,
+        workers: impl IntoIterator<Item = SessionId>,
+        through: &BTreeMap<SessionId, Vec<AuthorityRevision>>,
+    ) -> (RevocationBarrier, BTreeMap<SessionId, Reads>) {
+        self.barrier.report_reading(revision, workers, through)
+    }
 }
 
 impl Drop for Round<'_> {
@@ -885,35 +941,6 @@ fn said_since(kept: &str, now_sentences: &[&str]) -> bool {
     })
 }
 
-/// The names an entry accounts for: those it lists by its totals, those it says it lost and those
-/// it says are still to come.
-fn names_accounted_for(worker: &WorkerBarrier) -> u64 {
-    worker
-        .rejected_actions_total
-        .get()
-        .saturating_add(worker.possibly_executed_total.get())
-        .saturating_add(worker.omitted_actions.get())
-        .saturating_add(worker.names_pending.get())
-}
-
-/// Whether the daemon's entry `now` accounts for at least the names the answer `given`, made by
-/// this run of the daemon, accounted for, so that the entry is the authority on what its worker's
-/// evidence lacks.
-///
-/// In one run a worker's names only move: from still to come to listed, and, when a report goes
-/// for room, from listed or still to come to lost, all of them charged to the results that carried
-/// the report. What an entry accounts for therefore does not fall. An entry that does has lost the
-/// revision's own report, and says nothing of it; so does one that says the daemon holds no names
-/// under the revision.
-#[must_use]
-pub(crate) fn accounts_for_what_was_given(now: &WorkerBarrier, given: &WorkerBarrier) -> bool {
-    names_accounted_for(now) >= names_accounted_for(given)
-        && !now
-            .detail
-            .split("; ")
-            .any(|sentence| sentence.starts_with(NO_NAMES_HELD))
-}
-
 /// The sentences of `given`'s detail on the revisions its worker has not said what its fence named
 /// for, cannot say, or whose fences are not read, that `now`, the daemon's own entry for the same
 /// worker, does not already say and does not show to be out of date ([`said_since`]).
@@ -934,21 +961,24 @@ pub(crate) fn kept_sentences_beside(now: &WorkerBarrier, given: &WorkerBarrier) 
 /// `given` held, and the merged entry carries it.
 ///
 /// The entry says what `now` says, except that this daemon holds no names under the revision,
-/// which is not so for the merged entry once `brought` says that names of `given` went into it. When
-/// `given` owed or had lost `owed` names it adds a sentence that up to as many of the actions the
-/// fence named may not be named here, and it keeps what `given` said of the revisions its worker had
-/// not said what its fence named for ([`kept_sentences_beside`]).
+/// which is not so for the merged entry once `brought` says that names of `given` went into it.
 ///
-/// The figure is an upper one because the names `now` lacks and the names `given` lacked need not be
-/// the same, and nothing in either entry says which of one's missing names the other lists. Where
-/// `now` lacks names too the figure is for both and the sentence says so, so that a person does not
-/// add it to `now`'s own sentence beside it.
+/// `strict` is `Some(owed)` where `now` is not the authority on what it lacks
+/// ([`Reads::covered_by`]): `given` owed or had lost `owed` names, and the entry adds a sentence
+/// that up to as many of the actions the fence named may not be named here, and keeps what `given`
+/// said of the revisions its worker had not said what its fence named for
+/// ([`kept_sentences_beside`]). The figure is an upper one because the names `now` lacks and the
+/// names `given` lacked need not be the same, and nothing in either entry says which of one's
+/// missing names the other lists. Where `now` lacks names too the figure is for both and the
+/// sentence says so, so that a person does not add it to `now`'s own sentence beside it. Where
+/// `now` is the authority, `strict` is `None` and the entry says only what `now` says: it reads
+/// every revision `given` read, so its sentences say what is so now.
 #[must_use]
 pub(crate) fn detail_beside_the_names_of(
     now: &WorkerBarrier,
     given: &WorkerBarrier,
     brought: bool,
-    owed: u64,
+    strict: Option<u64>,
 ) -> String {
     let mut sentences: Vec<String> = now
         .detail
@@ -958,6 +988,9 @@ pub(crate) fn detail_beside_the_names_of(
         })
         .map(str::to_owned)
         .collect();
+    let Some(owed) = strict else {
+        return sentences.join("; ");
+    };
     let lacks = now
         .omitted_actions
         .get()
@@ -994,9 +1027,6 @@ pub(crate) fn detail_beside_the_names_of(
 /// or comes after and creates nothing.
 #[derive(Debug)]
 pub struct AuthorityBarrier {
-    /// The authority revision in force when this barrier was made: every revision above it was
-    /// raised by the run of the daemon that owns the barrier ([`Self::made_by_this_run`]).
-    begun_at: AuthorityRevision,
     leases: LeaseIssuer,
     order: Mutex<Roster>,
     fences: Mutex<HashMap<SessionId, WorkerFences>>,
@@ -1009,7 +1039,6 @@ impl AuthorityBarrier {
     #[must_use]
     pub fn new(generation: ControllerGeneration, authority_revision: AuthorityRevision) -> Self {
         Self {
-            begun_at: authority_revision,
             leases: LeaseIssuer::with_maximum_validity(generation, authority_revision),
             order: Mutex::new(Roster::default()),
             fences: Mutex::new(HashMap::new()),
@@ -1026,16 +1055,6 @@ impl AuthorityBarrier {
     #[must_use]
     pub fn authority_revision(&self) -> AuthorityRevision {
         self.leases.authority_revision()
-    }
-
-    /// Whether this run of the daemon raised `revision`, and so announced it and holds in memory
-    /// what its workers said of it. A revision at or below the one in force when this barrier was
-    /// made was raised by an earlier run, and a revision raised by no run at all, as an answer to a
-    /// revocation that changed nothing is, is read as one: the daemon is not the authority on
-    /// what it lacks of either.
-    #[must_use]
-    pub(crate) fn made_by_this_run(&self, revision: AuthorityRevision) -> bool {
-        revision > self.begun_at
     }
 
     /// Takes the next ticket for a round or an exchange that is about to run.
@@ -1448,23 +1467,46 @@ impl AuthorityBarrier {
         revision: AuthorityRevision,
         workers: impl IntoIterator<Item = SessionId>,
     ) -> RevocationBarrier {
+        self.report_reading(revision, workers, &BTreeMap::new()).0
+    }
+
+    /// The barrier as [`Self::report`] reports it, and with it what each entry read, made under
+    /// the same lock so that no report can go between an entry and the record of what it read.
+    ///
+    /// `through` names, for a worker, revisions that its entry reads besides what its announcement
+    /// carried ([`WorkerFences::told_at`]): a repeat's own read, never an announcement's.
+    fn report_reading(
+        &self,
+        revision: AuthorityRevision,
+        workers: impl IntoIterator<Item = SessionId>,
+        through: &BTreeMap<SessionId, Vec<AuthorityRevision>>,
+    ) -> (RevocationBarrier, BTreeMap<SessionId, Reads>) {
         let roster = self.ordered();
         let status = self.leases.status(revision);
         let fences = self.lock();
         let mut reported: Vec<WorkerBarrier> = Vec::new();
+        let mut reads = BTreeMap::new();
         let mut seen = Vec::new();
-        for session_id in workers {
-            if seen.contains(&session_id) {
-                continue;
-            }
-            seen.push(session_id);
-            reported.push(Self::describe(
+        let mut describe = |session_id: SessionId| {
+            let (described, read) = Self::describe(
                 &status,
                 &roster.retired,
                 &fences,
                 session_id,
                 revision,
-            ));
+                through.get(&session_id).map_or(&[], Vec::as_slice),
+            );
+            if let Some(read) = read {
+                reads.insert(session_id, read);
+            }
+            described
+        };
+        for session_id in workers {
+            if seen.contains(&session_id) {
+                continue;
+            }
+            seen.push(session_id);
+            reported.push(describe(session_id));
         }
         // A worker the directory no longer lists but the lease issuer still holds a record of is
         // still part of the barrier: it is exactly the case where a worker was lost rather than
@@ -1475,8 +1517,7 @@ impl AuthorityBarrier {
                 continue;
             }
             seen.push(*session_id);
-            let described =
-                Self::describe(&status, &roster.retired, &fences, *session_id, revision);
+            let described = describe(*session_id);
             // A worker this daemon no longer lists and has confirmed ended, whose fence named
             // nothing under this revision, states nothing: it can no longer dispatch, and there is
             // no action to name. Listing it would only make every revocation's answer longer by
@@ -1497,7 +1538,7 @@ impl AuthorityBarrier {
         let lost = roster.lost.get(&revision).copied().unwrap_or(0);
         report.workers_total =
             kr_protocol::scalars::U64::new(report.workers_total.get().saturating_add(lost));
-        report
+        (report, reads)
     }
 
     fn describe(
@@ -1506,12 +1547,20 @@ impl AuthorityBarrier {
         fences: &HashMap<SessionId, WorkerFences>,
         session_id: SessionId,
         revision: AuthorityRevision,
-    ) -> WorkerBarrier {
+        through: &[AuthorityRevision],
+    ) -> (WorkerBarrier, Option<Reads>) {
         let held = fences.get(&session_id);
         // The names are this revocation's own, and those of the fences that ran for the same
         // announcement. Whether the barrier holds is a question a later revocation also answers,
         // because installing it fences everything this one would have.
-        let told = held.and_then(|held| held.told_at(revision));
+        let seen = held.and_then(|held| held.told_at(revision, through));
+        // An entry with nothing of its own revision or the ones it reads is blank, and says that it
+        // read its own revision and holds no report of it.
+        let reads = match &seen {
+            Some(seen) => seen.reads.clone(),
+            None => Reads::new(BTreeSet::new(), BTreeSet::from([revision])),
+        };
+        let told = seen.map(|seen| seen.told);
         let acknowledged = held
             .and_then(WorkerFences::installed)
             .filter(|held| *held >= revision);
@@ -1630,30 +1679,33 @@ impl AuthorityBarrier {
                 "{NOT_READ}{revision} are not read for what their fences named"
             ));
         }
-        WorkerBarrier {
-            session_id,
-            state,
-            acknowledged_revision: Nullable(acknowledged),
-            // Whatever this worker reported, whether or not its barrier ended up held by an
-            // acknowledgement or by its own ending. An ending proves that no further dispatch can
-            // happen; it says nothing about what already did, and dropping the names would lose
-            // exactly the actions section 9 requires to be named.
-            rejected_actions_total: kr_protocol::scalars::U64::new(
-                told.as_ref().map_or(0, |told| told.rejected.len() as u64),
-            ),
-            possibly_executed_total: kr_protocol::scalars::U64::new(
-                told.as_ref()
-                    .map_or(0, |told| told.possibly_executed.len() as u64),
-            ),
-            rejected_actions: told
-                .as_ref()
-                .map(|told| told.rejected.clone())
-                .unwrap_or_default(),
-            possibly_executed: told.map(|told| told.possibly_executed).unwrap_or_default(),
-            omitted_actions: kr_protocol::scalars::U64::new(omitted_names),
-            names_pending: kr_protocol::scalars::U64::new(pending_names),
-            detail,
-        }
+        (
+            WorkerBarrier {
+                session_id,
+                state,
+                acknowledged_revision: Nullable(acknowledged),
+                // Whatever this worker reported, whether or not its barrier ended up held by an
+                // acknowledgement or by its own ending. An ending proves that no further dispatch can
+                // happen; it says nothing about what already did, and dropping the names would lose
+                // exactly the actions section 9 requires to be named.
+                rejected_actions_total: kr_protocol::scalars::U64::new(
+                    told.as_ref().map_or(0, |told| told.rejected.len() as u64),
+                ),
+                possibly_executed_total: kr_protocol::scalars::U64::new(
+                    told.as_ref()
+                        .map_or(0, |told| told.possibly_executed.len() as u64),
+                ),
+                rejected_actions: told
+                    .as_ref()
+                    .map(|told| told.rejected.clone())
+                    .unwrap_or_default(),
+                possibly_executed: told.map(|told| told.possibly_executed).unwrap_or_default(),
+                omitted_actions: kr_protocol::scalars::U64::new(omitted_names),
+                names_pending: kr_protocol::scalars::U64::new(pending_names),
+                detail,
+            },
+            reads,
+        )
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<SessionId, WorkerFences>> {
@@ -4105,13 +4157,246 @@ mod tests {
         );
     }
 
-    /// A revision above the one in force when the barrier was made was raised by this run of the
-    /// daemon; the one in force then and every one before it was raised by an earlier run.
+    /// The revisions an entry read, as the record of what it read holds them.
+    fn reads_of(accounted: &[u64], named: &[u64]) -> Reads {
+        Reads::new(
+            accounted.iter().map(|number| revision(*number)).collect(),
+            named.iter().map(|number| revision(*number)).collect(),
+        )
+        .expect("a few revisions")
+    }
+
+    /// The reads of the first worker's entry for `revision`, as the barrier reports them.
+    fn reads_for(barrier: &AuthorityBarrier, revision: AuthorityRevision) -> Option<Reads> {
+        barrier
+            .report_reading(revision, [session(1)], &BTreeMap::new())
+            .1
+            .remove(&session(1))
+    }
+
+    /// Evidence that names one action and says that two names are still to come.
+    fn evidence_owing_two(byte: u8) -> Option<kr_protocol::action::FenceEvidence> {
+        let mut owing = evidence(vec![action(byte)], Vec::new()).expect("evidence");
+        owing.remaining = kr_protocol::scalars::U64::new(2);
+        Some(owing)
+    }
+
+    /// KR-REQ-09.13: an entry says which revisions its numbers account for and which it only
+    /// names: a report held whole or in part, and one let go for room and charged to the entry, are
+    /// accounted for; a revision with no report held, and one the worker said nothing about, are
+    /// only named; an entry whose own report has gone is blank and names its own revision; an
+    /// entry that could not name every revision it read has no record of what it read.
     #[test]
-    fn only_a_revision_above_the_one_the_barrier_began_at_was_raised_by_this_run() {
-        let barrier = AuthorityBarrier::new(ControllerGeneration::new(7), revision(3));
-        assert!(!barrier.made_by_this_run(revision(2)));
-        assert!(!barrier.made_by_this_run(revision(3)));
-        assert!(barrier.made_by_this_run(revision(4)));
+    fn an_entry_says_which_revisions_its_numbers_account_for_and_which_it_only_names() {
+        // Whole, in part and not held: revision 6 carries 4 (whole) and 5 (no report held) and
+        // holds its own with two names still to come.
+        let barrier = barrier();
+        let binding = barrier.bind(session(1));
+        barrier.announced(session(1), revision(0), &told(4, 6));
+        assert!(barrier.acknowledge(
+            session(1),
+            binding,
+            revision(4),
+            evidence(vec![action(10)], Vec::new()),
+        ));
+        assert!(barrier.acknowledge_announced(
+            session(1),
+            binding,
+            revision(6),
+            evidence_owing_two(11),
+        ));
+        assert_eq!(
+            reads_for(&barrier, revision(6)),
+            Some(reads_of(&[4, 6], &[5]))
+        );
+
+        // A carried report that said nothing is only named.
+        let barrier = self::barrier();
+        let binding = barrier.bind(session(1));
+        barrier.announced(session(1), revision(0), &told(4, 5));
+        assert!(barrier.acknowledge(session(1), binding, revision(4), None));
+        assert!(barrier.acknowledge_announced(
+            session(1),
+            binding,
+            revision(5),
+            evidence(Vec::new(), Vec::new()),
+        ));
+        assert_eq!(reads_for(&barrier, revision(5)), Some(reads_of(&[5], &[4])));
+
+        // Lost for room and charged: revision 4's whole report goes, and its names are counted in
+        // the entry's omitted count.
+        let barrier = self::barrier();
+        let binding = barrier.bind(session(1));
+        barrier.announced(session(1), revision(0), &told(4, 5));
+        assert!(barrier.acknowledge(
+            session(1),
+            binding,
+            revision(4),
+            evidence(vec![action(10)], Vec::new()),
+        ));
+        assert!(barrier.acknowledge_announced(
+            session(1),
+            binding,
+            revision(5),
+            evidence(Vec::new(), Vec::new()),
+        ));
+        for number in 6..=12 {
+            assert!(barrier.acknowledge(
+                session(1),
+                binding,
+                revision(number),
+                evidence(Vec::new(), Vec::new()),
+            ));
+        }
+        let (entry, reads) = barrier.report_reading(revision(5), [session(1)], &BTreeMap::new());
+        assert_eq!(entry.workers[0].omitted_actions.get(), 1, "{entry:?}");
+        assert_eq!(reads.get(&session(1)), Some(&reads_of(&[4, 5], &[])));
+
+        // Its own report gone: the entry is blank, and names its own revision.
+        for number in 13..=14 {
+            assert!(barrier.acknowledge(
+                session(1),
+                binding,
+                revision(number),
+                evidence(Vec::new(), Vec::new()),
+            ));
+        }
+        let (entry, reads) = barrier.report_reading(revision(5), [session(1)], &BTreeMap::new());
+        assert_eq!(
+            entry.workers[0].rejected_actions_total.get(),
+            0,
+            "{entry:?}"
+        );
+        assert_eq!(reads.get(&session(1)), Some(&reads_of(&[], &[5])));
+
+        // A report that said nothing and went for room: some revision is not read, and nothing can
+        // be said of what the entry read.
+        let barrier = self::barrier();
+        let binding = barrier.bind(session(1));
+        barrier.announced(session(1), revision(0), &told(4, 5));
+        assert!(barrier.acknowledge(session(1), binding, revision(4), None));
+        assert!(barrier.acknowledge_announced(
+            session(1),
+            binding,
+            revision(5),
+            evidence(Vec::new(), Vec::new()),
+        ));
+        for number in 6..=12 {
+            assert!(barrier.acknowledge(
+                session(1),
+                binding,
+                revision(number),
+                evidence(Vec::new(), Vec::new()),
+            ));
+        }
+        assert_eq!(reads_for(&barrier, revision(5)), None);
+    }
+
+    /// KR-REQ-09.13, KR-REQ-10.45: a repeat's read goes through the kept record, and the plain
+    /// entry of a restarted daemon does not. The earlier run told the worker revision 4 and
+    /// revision 5 together, so the entry of 5 read both reports. The restarted daemon tells it 5
+    /// alone, because the registry holds the worker at 5, and collects both reports: the entry of 5
+    /// reads its own report only, so the kept entry is not covered by it; read through the record, it
+    /// reads both and is. A revision with no report held now is not added, and nothing the
+    /// announcements recorded changes.
+    #[test]
+    fn a_repeats_read_through_the_kept_record_reads_what_a_restart_forgot() {
+        let earlier = barrier();
+        let binding = earlier.bind(session(1));
+        earlier.announced(session(1), revision(0), &told(4, 5));
+        assert!(earlier.acknowledge(
+            session(1),
+            binding,
+            revision(4),
+            evidence(vec![action(10)], Vec::new()),
+        ));
+        assert!(earlier.acknowledge_announced(
+            session(1),
+            binding,
+            revision(5),
+            evidence_owing_two(11),
+        ));
+        let (kept_entry, kept_reads) =
+            earlier.report_reading(revision(5), [session(1)], &BTreeMap::new());
+        let kept = KeptReads::of(&kept_entry, &kept_reads);
+        let kept_reads = kept.of_worker(session(1)).expect("the kept entry's reads");
+        assert_eq!(kept_reads, &reads_of(&[4, 5], &[]));
+
+        let later = barrier();
+        let binding = later.bind(session(1));
+        later.announced(session(1), revision(5), &told(5, 5));
+        assert!(later.acknowledge_announced(
+            session(1),
+            binding,
+            revision(5),
+            evidence(vec![action(11), action(12)], Vec::new()),
+        ));
+        assert!(later.acknowledge(
+            session(1),
+            binding,
+            revision(4),
+            evidence(vec![action(10)], Vec::new()),
+        ));
+        let (plain, plain_reads) =
+            later.report_reading(revision(5), [session(1)], &BTreeMap::new());
+        assert_eq!(plain.workers[0].rejected_actions.len(), 2, "{plain:?}");
+        assert!(
+            !kept_reads.covered_by(&plain_reads[&session(1)]),
+            "the plain entry reads its own report alone"
+        );
+
+        let (through, through_reads) =
+            later.report_reading(revision(5), [session(1)], &kept.through());
+        assert_eq!(through.workers[0].rejected_actions.len(), 3, "{through:?}");
+        assert!(
+            kept_reads.covered_by(&through_reads[&session(1)]),
+            "the entry read through the record reads both reports"
+        );
+
+        let (again, _) = later.report_reading(revision(5), [session(1)], &BTreeMap::new());
+        assert_eq!(again, plain, "the announcement's own state is as it was");
+
+        let unheld = BTreeMap::from([(session(1), vec![revision(2), revision(3), revision(4)])]);
+        let (_, with_unheld) = later.report_reading(revision(5), [session(1)], &unheld);
+        assert_eq!(
+            with_unheld.get(&session(1)),
+            Some(&reads_of(&[4, 5], &[])),
+            "a revision no report is held for is not added"
+        );
+    }
+
+    /// KR-REQ-09.13: the record describes the entry it was taken with, whatever goes afterwards. The
+    /// entry and its reads come from one report; a report that goes for room after it is captured
+    /// is not in the record, so a later entry that has lost it is not covered by the captured one.
+    #[test]
+    fn the_record_describes_the_entry_it_was_taken_with_whatever_goes_afterwards() {
+        let barrier = barrier();
+        let binding = barrier.bind(session(1));
+        assert!(barrier.acknowledge(
+            session(1),
+            binding,
+            revision(5),
+            evidence(vec![action(10)], Vec::new()),
+        ));
+        let (entry, reads) = barrier.report_reading(revision(5), [session(1)], &BTreeMap::new());
+        let stored = KeptReads::of(&entry, &reads).encode().expect("a record");
+        for number in 6..=13 {
+            assert!(barrier.acknowledge(
+                session(1),
+                binding,
+                revision(number),
+                evidence(Vec::new(), Vec::new()),
+            ));
+        }
+        let (blank, blank_reads) =
+            barrier.report_reading(revision(5), [session(1)], &BTreeMap::new());
+        assert_eq!(blank.workers[0].rejected_actions.len(), 0, "{blank:?}");
+        let kept = KeptReads::decode(&stored).expect("the record decodes");
+        let kept = kept.of_worker(session(1)).expect("the entry's reads");
+        assert_eq!(kept, &reads_of(&[5], &[]), "as the captured entry read");
+        assert!(
+            !kept.covered_by(&blank_reads[&session(1)]),
+            "the entry that has lost the report is not the authority"
+        );
     }
 }
