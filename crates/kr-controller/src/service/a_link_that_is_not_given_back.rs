@@ -1386,6 +1386,10 @@ async fn the_first_exchange_of_an_ask_ends_by_the_deadline_it_was_given() {
 /// may take, and then lets it go. The check that gives the link back comes after the wait, so it
 /// sees the time that the wait took: no page goes, the link is in its slot, the worker's lease goes
 /// on renewing, and the names that were not asked for stay owed to the pass that collects them.
+///
+/// The case holds a round while it runs, as an announcement does, so that the daemon's own pass,
+/// which gives way to one, does not collect those names while the case waits and send a page of its
+/// own to the worker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_collection_whose_wait_for_the_link_left_too_little_time_gives_the_link_back_whole() {
     let (silent, heard) = stalled().await;
@@ -1398,6 +1402,7 @@ async fn a_collection_whose_wait_for_the_link_left_too_little_time_gives_the_lin
             .leases
             .acknowledge(session_id, binding, revision, Some(evidence(3)))
     );
+    let _round = controller.leases.begin_round();
     let mut elsewhere = controller
         .worker_client(&silent.worker)
         .await
