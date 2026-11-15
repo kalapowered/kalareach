@@ -37,14 +37,15 @@ pub enum NotTyped {
 }
 
 impl NotTyped {
-    /// The code the host refused the typing with, when it refused.
+    /// The code the host refused the typing with, when the host's own word says one: its refusal
+    /// of the open, or of a frame. A lane that did not open for another reason (the stream was
+    /// reset, or the open timed out) gives none, so that a case cannot take it for a refusal.
     #[must_use]
     pub fn code(&self) -> Option<ErrorCode> {
         match self {
             Self::Opening(ClientError::Host(refusal)) | Self::Refused(refusal) => {
                 Some(refusal.code)
             }
-            Self::Opening(error) => Some(error.code()),
             _ => None,
         }
     }
@@ -69,11 +70,29 @@ impl std::fmt::Display for NotTyped {
             Self::Ended(cause) => {
                 write!(
                     formatter,
-                    "the input lane ended before the typing was accepted: {cause:?}"
+                    "the input lane ended before the typing was accepted: {}",
+                    end_words(cause)
                 )
             }
             Self::Waited(what) => write!(formatter, "waited {ACCEPTANCE_WAIT:?} for {what}"),
         }
+    }
+}
+
+/// What a lane's end says, in words: the cause's own debug text hides what it holds.
+fn end_words(cause: &EndCause) -> String {
+    match cause {
+        EndCause::Reset => "the stream was reset while the connection stood".to_owned(),
+        EndCause::Finished => "the lane finished its side".to_owned(),
+        EndCause::Connection { refusal: None } => "the connection ended".to_owned(),
+        EndCause::Connection {
+            refusal: Some(refusal),
+        } => format!("the host ended the connection: {refusal}"),
+        EndCause::Breach(why) => format!("the host broke the stream's contract: {why}"),
+        EndCause::Uncertain(error) => {
+            format!("the host's answer does not say whether the typing was accepted: {error}")
+        }
+        EndCause::Closed => "the lane was dropped".to_owned(),
     }
 }
 
