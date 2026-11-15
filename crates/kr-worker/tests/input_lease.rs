@@ -3969,6 +3969,148 @@ async fn a_forwarded_batch_made_of_two_writes_is_dropped_by_the_tighter_deadline
     );
 }
 
+/// A session whose application is inside a bracketed paste that a batch of the lease opened, and
+/// whose lease holder is about to hand over the batch that closes it under an authority that runs
+/// out.
+struct PasteLeftOpen {
+    _host: kr_ipc::testing::TempHost,
+    runtime: Arc<SessionRuntime>,
+    clock: kr_ipc::clock::ManualSharedClock,
+    id: AttachmentId,
+    epoch: u64,
+}
+
+impl PasteLeftOpen {
+    /// The batch that opens the paste is written under an authority that stands.
+    async fn start() -> Self {
+        let host = kr_ipc::testing::TempHost::create();
+        let mut config = configuration(
+            &host,
+            "stty raw -echo; printf '\\033[?2004hkr-ready.'; exec cat",
+        );
+        let clock = kr_ipc::clock::ManualSharedClock::new();
+        config.time.continuous = Arc::new(clock.clone());
+        let session_id = config.session_id;
+        let mut session = Session::open(config).expect("opens");
+        session.launch().expect("launches");
+        let id = attach(&mut session, &terminal(session_id, Some("xterm-256color")));
+        let epoch = session
+            .acquire_input(id, connection(), None)
+            .expect("the keys")
+            .lease
+            .epoch
+            .get();
+        let runtime = Arc::new(
+            SessionRuntime::start(session, std::sync::Arc::new(clock.clone())).expect("starts"),
+        );
+        retained_within(&runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
+        let now = kr_ipc::clock::SharedClock::boot_elapsed_ms(&clock);
+        {
+            let mut session = runtime.session();
+            session
+                .write_input(
+                    id,
+                    epoch,
+                    0,
+                    b"\x1b[200~kr-pasted",
+                    Some(now + 600_000),
+                    Instant::now(),
+                )
+                .expect("accepted");
+            runtime.flush_input();
+        }
+        retained_within(&runtime, b"kr-pasted", LIVENESS_DEADLINE).await;
+        Self {
+            _host: host,
+            runtime,
+            clock,
+            id,
+            epoch,
+        }
+    }
+
+    /// The batch that closes the paste is accepted, its authority runs out before the writer
+    /// meets it, and the application asks a question. The answer is behind it.
+    fn close_it_under_an_authority_that_runs_out(&self) {
+        let now = kr_ipc::clock::SharedClock::boot_elapsed_ms(&self.clock);
+        let mut session = self.runtime.session();
+        session
+            .write_input(
+                self.id,
+                self.epoch,
+                1,
+                PASTE_END,
+                Some(now + 1_000),
+                Instant::now(),
+            )
+            .expect("accepted");
+        session.ingest_output(STATUS_QUESTION);
+        self.clock.advance(Duration::from_millis(1_500));
+        self.runtime.flush_input();
+    }
+
+    /// Waits for the answer and says what the application has by then. What the session retains is
+    /// the question itself, which the case fed in, and then what the application echoed: the end
+    /// of the paste, and the answer behind it.
+    async fn the_answer_after_the_end_of_the_paste(&self) {
+        let seen = retained_within(&self.runtime, STATUS_ANSWER, LIVENESS_DEADLINE).await;
+        assert!(
+            contains(&seen, b"\x1b[200~kr-pasted\x1b[5n\x1b[201~\x1b[0n"),
+            "the answer came inside a paste that was left open: {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+    }
+
+    /// The holder takes the keys again, which reports what the end of its lease left behind, and
+    /// then writes in its new epoch. The write shows how many times the paste was ended.
+    async fn takes_the_keys_again_and_writes(&self) -> kr_protocol::input::InputAcquireResult {
+        let answer = {
+            let mut session = self.runtime.session();
+            let answer = session
+                .acquire_input(self.id, connection(), None)
+                .expect("the holder takes the keys again");
+            let later = kr_ipc::clock::SharedClock::boot_elapsed_ms(&self.clock) + 60_000;
+            session
+                .write_input(
+                    self.id,
+                    answer.lease.epoch.get(),
+                    0,
+                    b"kr-next",
+                    Some(later),
+                    Instant::now(),
+                )
+                .expect("accepted");
+            self.runtime.flush_input();
+            answer
+        };
+        let seen = retained_within(&self.runtime, b"kr-next", LIVENESS_DEADLINE).await;
+        assert_eq!(
+            count(&seen, PASTE_END),
+            1,
+            "the paste was ended once: {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+        answer
+    }
+
+    /// What the report of the next acquire says about the end of this epoch: the closing batch
+    /// that was never written is counted, the writer's own terminator is not a keystroke of the
+    /// lease, and a paste was closed before input was handed over.
+    fn assert_the_report(fenced: u64, answer: &kr_protocol::input::InputAcquireResult) {
+        assert_eq!(fenced, 6, "the end counts the closing batch");
+        assert_eq!(
+            answer.discarded_bytes.get(),
+            6,
+            "the next acquire reports the closing batch"
+        );
+        assert!(
+            answer.closed_open_paste,
+            "the next acquire says that no paste was closed, though the worker closed the one \
+             the application was inside before it handed input over"
+        );
+    }
+}
+
 /// KR-REQ-08.64, in part.
 ///
 /// A host's answer never goes into a paste that a dropped batch was to close. A batch opens a
@@ -3976,104 +4118,69 @@ async fn a_forwarded_batch_made_of_two_writes_is_dropped_by_the_tighter_deadline
 /// the writer meets it. The response lane reads the accepted stream, which says the paste is
 /// closed, so the application's next question is answered at once. The writer ends the
 /// application's open paste at the epoch's first drop, so the answer comes after the end of the
-/// paste and not inside it, and the epoch's end writes no second terminator.
+/// paste and not inside it, and the epoch's end writes no second terminator. The end of the lease
+/// comes after the writer's, and the next acquire still reports that a paste was closed.
 #[tokio::test(flavor = "multi_thread")]
 #[cfg_attr(
     windows,
     ignore = "a Windows pseudo-console begins its output with mode sequences of its own and holds back an unfinished sequence, which this case reads as the application's bytes"
 )]
 async fn a_reply_comes_after_the_end_of_a_paste_whose_closing_batch_the_writer_dropped() {
-    const PASTE_END: &[u8] = b"\x1b[201~";
-    let host = kr_ipc::testing::TempHost::create();
-    let mut config = configuration(
-        &host,
-        "stty raw -echo; printf '\\033[?2004hkr-ready.'; exec cat",
-    );
-    let clock = kr_ipc::clock::ManualSharedClock::new();
-    config.time.continuous = Arc::new(clock.clone());
-    let session_id = config.session_id;
-    let mut session = Session::open(config).expect("opens");
-    session.launch().expect("launches");
-    let id = attach(&mut session, &terminal(session_id, Some("xterm-256color")));
-    let epoch = session
-        .acquire_input(id, connection(), None)
-        .expect("the keys")
-        .lease
-        .epoch
-        .get();
-    let runtime = Arc::new(
-        SessionRuntime::start(session, std::sync::Arc::new(clock.clone())).expect("starts"),
-    );
-    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
-    retained_within(&runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
-    let now = kr_ipc::clock::SharedClock::boot_elapsed_ms(&clock);
-
-    // The batch that opens the paste is written under an authority that stands.
-    {
-        let mut session = runtime.session();
-        session
-            .write_input(
-                id,
-                epoch,
-                0,
-                b"\x1b[200~kr-pasted",
-                Some(now + 600_000),
-                Instant::now(),
-            )
-            .expect("accepted");
-        runtime.flush_input();
-    }
-    retained_within(&runtime, b"kr-pasted", LIVENESS_DEADLINE).await;
-
-    // The batch that closes it is accepted, its authority runs out before the writer meets it,
-    // and the application asks a question. The answer is behind it.
-    {
-        let mut session = runtime.session();
-        session
-            .write_input(id, epoch, 1, PASTE_END, Some(now + 1_000), Instant::now())
-            .expect("accepted");
-        session.ingest_output(STATUS_QUESTION);
-        clock.advance(Duration::from_millis(1_500));
-        runtime.flush_input();
-    }
-    // What the session retains is the question itself, which the case fed in, and then what the
-    // application echoed: the end of the paste, and the answer behind it.
-    let seen = retained_within(&runtime, STATUS_ANSWER, LIVENESS_DEADLINE).await;
-    assert!(
-        contains(&seen, b"\x1b[200~kr-pasted\x1b[5n\x1b[201~\x1b[0n"),
-        "the answer came inside a paste that was left open: {:?}",
-        String::from_utf8_lossy(&seen)
-    );
+    let case = PasteLeftOpen::start().await;
+    case.close_it_under_an_authority_that_runs_out();
+    case.the_answer_after_the_end_of_the_paste().await;
 
     // The epoch's end counts the closing batch, which was never written, and the writer's own
     // terminator is not a keystroke of the lease: it is not counted. The next epoch's batch
     // shows that the end wrote no second one.
-    let (_, fenced) = runtime
+    let (_, fenced) = case
+        .runtime
         .session()
-        .release_input(id, epoch, None)
+        .release_input(case.id, case.epoch, None)
         .expect("the holder releases");
-    assert_eq!(fenced, 6, "the end counts the closing batch");
-    {
-        let mut session = runtime.session();
-        let epoch = session
-            .acquire_input(id, connection(), None)
-            .expect("the holder takes the keys again")
-            .lease
-            .epoch
-            .get();
-        let later = kr_ipc::clock::SharedClock::boot_elapsed_ms(&clock) + 60_000;
-        session
-            .write_input(id, epoch, 0, b"kr-next", Some(later), Instant::now())
-            .expect("accepted");
-        runtime.flush_input();
-    }
-    let seen = retained_within(&runtime, b"kr-next", LIVENESS_DEADLINE).await;
-    assert_eq!(
-        count(&seen, PASTE_END),
-        1,
-        "the paste was ended once: {:?}",
-        String::from_utf8_lossy(&seen)
-    );
+    let answer = case.takes_the_keys_again_and_writes().await;
+    PasteLeftOpen::assert_the_report(fenced, &answer);
+
+    case.runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
+}
+
+/// KR-REQ-08.64, in part.
+///
+/// The same, with the end of the lease before the writer ends the paste: the writer has dropped
+/// the batch and told the session, and stands there while the lease ends, as the session's own
+/// task can end it before the writer's next step. The paste is still ended once, before the
+/// answer, and the next acquire reports that a paste was closed.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console begins its output with mode sequences of its own and holds back an unfinished sequence, which this case reads as the application's bytes"
+)]
+async fn the_end_of_a_lease_before_the_writer_ends_the_paste_it_dropped_reports_the_paste_closed() {
+    let case = PasteLeftOpen::start().await;
+    let (at_the_drop, go) = case.runtime.input().drop_hold().arm();
+    case.close_it_under_an_authority_that_runs_out();
+    tokio::time::timeout(LIVENESS_DEADLINE, at_the_drop)
+        .await
+        .expect("the writer dropped the closing batch")
+        .expect("the writer stands at the drop");
+
+    let (_, fenced) = case
+        .runtime
+        .session()
+        .release_input(case.id, case.epoch, None)
+        .expect("the holder releases");
+    go.send(()).expect("lets the writer go on");
+    case.the_answer_after_the_end_of_the_paste().await;
+    let answer = case.takes_the_keys_again_and_writes().await;
+    PasteLeftOpen::assert_the_report(fenced, &answer);
+
+    case.runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
 }
 
 // ---------------------------------------------------------------------------------------------
