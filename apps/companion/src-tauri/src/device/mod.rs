@@ -195,6 +195,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// A local failure worded as the client's own `Display` words `failure`, with none of its members.
 fn failed(failure: &PairingFailure) -> CommandError {
     CommandError::local_failure(failure.to_string())
 }
