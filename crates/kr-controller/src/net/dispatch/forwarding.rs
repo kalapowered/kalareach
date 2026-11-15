@@ -494,10 +494,11 @@ impl RemoteConnection {
         // lease has moved past the barrier's epoch, the request goes on. A worker that serves a lane
         // decides for itself, and this check only saves it a forward; for a worker that does not,
         // the members that carry the position are taken out below and this check is the only one.
-        if let Some(barrier) = super::super::input::barrier::barrier_of(mutation)
+        let barrier = super::super::input::barrier::barrier_of(mutation)?;
+        if let Some(barrier) = &barrier
             && self
                 .inputs
-                .position_not_reached(self.connection_id(), &barrier)
+                .position_not_reached(self.connection_id(), barrier)
         {
             return Err(super::super::input::barrier::not_reached());
         }
@@ -596,7 +597,7 @@ impl RemoteConnection {
                 self.inputs.serves_lane(&proxy),
                 answering,
                 &mutation.params,
-            );
+            )?;
         }
         let scripted = if carries_lane_members {
             self.inputs.scripted_answer(&mutation)
