@@ -123,6 +123,11 @@ fn direct_addr(side: &Side) -> EndpointAddr {
 /// What the test host did and what it should answer.
 #[derive(Debug, Default)]
 struct HostScript {
+    /// Whether the host holds a connection that it has admitted until `close_now`, and then closes
+    /// it with an application error code, as a host does that ends a connection.
+    closes_when_told: std::sync::atomic::AtomicBool,
+    /// Tells the host to close the connection that it holds for `closes_when_told`.
+    close_now: tokio::sync::Notify,
     /// How many reads have arrived.
     reads: AtomicU64,
     /// The action identifiers the client submitted, in order.
@@ -228,6 +233,12 @@ fn spawn_host(
                 };
                 let mut reader = authorised.control_reader;
                 let writer = Arc::new(Mutex::new(authorised.control_writer));
+                if script.closes_when_told.load(Ordering::Acquire) {
+                    script.close_now.notified().await;
+                    connection.close(7_u32.into(), b"the host closed the connection");
+                    connection.closed().await;
+                    return;
+                }
                 if let Some(mut pushes) = pushes.lock().await.take() {
                     let writer = Arc::clone(&writer);
                     tokio::spawn(async move {
@@ -583,6 +594,53 @@ async fn one_connection_carries_one_session() {
     );
 
     session.close();
+    serving.abort();
+}
+
+/// The paired transport answers "closed" for this side's close alone. A host that closes the
+/// connection is not this side closing it: the session's read loop reads what the host sent first,
+/// a refusal included, and ends the session after it, so a send that fails on such a connection
+/// must not record the end ahead of that.
+#[tokio::test]
+async fn a_connection_that_the_host_closed_is_not_one_that_this_side_closed() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    script.closes_when_told.store(true, Ordering::Release);
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+
+    let closed_by_the_host = dial(&client, &host).await;
+    script.close_now.notify_one();
+    let read_to_the_end = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match kr_client::transport::ControlTransport::recv(&closed_by_the_host).await {
+                Ok(Some(_)) => {}
+                outcome => return outcome,
+            }
+        }
+    })
+    .await
+    .expect("the host's close reaches the client");
+    assert!(
+        read_to_the_end.is_err(),
+        "the connection was lost under the control stream: {read_to_the_end:?}"
+    );
+    assert!(
+        !kr_client::transport::ControlTransport::is_closed(&closed_by_the_host),
+        "the host closed the connection and this side did not"
+    );
+
+    script.closes_when_told.store(false, Ordering::Release);
+    let standing = dial(&client, &host).await;
+    assert!(
+        !kr_client::transport::ControlTransport::is_closed(&standing),
+        "a connection that stands has not been closed"
+    );
+    kr_client::transport::ControlTransport::close(&standing);
+    assert!(
+        kr_client::transport::ControlTransport::is_closed(&standing),
+        "this side closed the connection"
+    );
     serving.abort();
 }
 

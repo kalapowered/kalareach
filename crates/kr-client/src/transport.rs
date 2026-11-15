@@ -15,7 +15,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, ConnectionError};
 use iroh::{Endpoint, EndpointAddr};
 use kr_crypto::connect::PairedPeer;
 use kr_protocol::envelope::ControlFrame;
@@ -433,11 +433,17 @@ impl ControlTransport for NetworkTransport {
             .close(CLIENT_CLOSED.into(), b"the client closed the connection");
     }
 
-    /// The connection's own record: it has a reason once it is closed, by this side or by the
-    /// peer. A send that is cut short resets its stream and leaves the connection open, so this
-    /// does not answer for that.
+    /// Whether this side closed the connection. The library records `LocallyClosed` when the
+    /// application calls `close`, and for no other reason: a close by the peer (`ApplicationClosed`
+    /// and `ConnectionClosed`), a reset, an idle timeout and a protocol error are the peer's or the
+    /// network's, and the session's read loop ends the session for them after it has read what the
+    /// peer sent first, a refusal included. A send that is cut short resets its stream and leaves
+    /// the connection open, so this does not answer for that.
     fn is_closed(&self) -> bool {
-        self.connection.close_reason().is_some()
+        matches!(
+            self.connection.close_reason(),
+            Some(ConnectionError::LocallyClosed)
+        )
     }
 }
 
