@@ -181,6 +181,14 @@ const AUTHORITY_ENDED_PAGE: &str = "This host's authority for this sign-in ended
      waited for you. Nothing was signed in. The host revokes what the account service issued. To \
      sign in, start again on the host.";
 
+/// What the browser shows when the same happened and the revocation of what the service issued
+/// reached neither the service nor the queue: the token is in the process's memory alone, and is
+/// sent again the next time the host uses the account.
+const AUTHORITY_ENDED_REVOCATION_OWED_PAGE: &str = "This host's authority for this sign-in ended \
+     while the sign-in waited for you. Nothing was signed in. The host could not yet revoke what the \
+     account service issued. The host tries again the next time it uses the account, and what was \
+     issued ends by itself when it expires. To sign in, start again on the host.";
+
 /// What a waiting sign-in came to.
 #[derive(Clone, Copy)]
 enum Outcome {
@@ -189,14 +197,26 @@ enum Outcome {
     /// The host's authority for the sign-in ended while it waited, so no grant was kept. It is
     /// reported as a grant that was not kept ([`AccountAttempt::NotKept`]); the browser is told why.
     AuthorityEnded,
+    /// As [`Self::AuthorityEnded`], and the revocation of what the service issued is still owed.
+    AuthorityEndedRevocationOwed,
 }
 
 impl Outcome {
+    /// What a sign-in came to when the keep withheld its grant, because the authority it was
+    /// started under no longer stood: `commit` says whether the revocation of what the service
+    /// issued reached neither the service nor the queue ([`Commit::WithheldOwing`]).
+    const fn withheld(commit: Commit) -> Self {
+        match commit {
+            Commit::WithheldOwing => Self::AuthorityEndedRevocationOwed,
+            _ => Self::AuthorityEnded,
+        }
+    }
+
     /// What the account's report names.
     const fn attempt(self) -> AccountAttempt {
         match self {
             Self::Attempt(attempt) => attempt,
-            Self::AuthorityEnded => AccountAttempt::NotKept,
+            Self::AuthorityEnded | Self::AuthorityEndedRevocationOwed => AccountAttempt::NotKept,
         }
     }
 
@@ -205,6 +225,7 @@ impl Outcome {
         match self {
             Self::Attempt(attempt) => page(attempt),
             Self::AuthorityEnded => AUTHORITY_ENDED_PAGE,
+            Self::AuthorityEndedRevocationOwed => AUTHORITY_ENDED_REVOCATION_OWED_PAGE,
         }
     }
 }
@@ -821,7 +842,7 @@ impl HostAccount {
     ///
     /// `stands` is asked before the waiting sign-in is ended and again before this one is shown as
     /// waiting, because the waits between them can outlast the request's authority. A refusal after
-    /// the waiting sign-in was ended says so ([`EARLIER_SIGN_IN_CANCELLED`]).
+    /// the waiting sign-in was ended says so (the words of `EARLIER_SIGN_IN_CANCELLED`).
     ///
     /// # Errors
     ///
@@ -929,7 +950,7 @@ impl HostAccount {
     /// a last time under the account's own hold, immediately before the revocation is queued and the
     /// grant deleted, because each wait between them can outlast the request's authority: a token
     /// refresh keeps that hold across its request to the service. A refusal after the waiting
-    /// sign-in was ended says so ([`EARLIER_SIGN_IN_CANCELLED`]).
+    /// sign-in was ended says so (the words of `EARLIER_SIGN_IN_CANCELLED`).
     ///
     /// # Errors
     ///
@@ -1370,7 +1391,9 @@ impl Inner {
                     .await
                 {
                     Ok(Commit::Kept) => {}
-                    Ok(Commit::Withheld) => return Outcome::AuthorityEnded,
+                    Ok(withheld @ (Commit::Withheld | Commit::WithheldOwing)) => {
+                        return Outcome::withheld(withheld);
+                    }
                     Ok(Commit::Unsettled) => {
                         // The store reported a failure and then could not say which grant it
                         // held. No token was ended while the store may hold it, and the account
@@ -1595,6 +1618,26 @@ impl AccountTokenSource for HostTokens {
 
 #[cfg(test)]
 mod tests {
+    /// A sign-in whose authority ended is told so in the browser, and what is said of the
+    /// revocation is what the keep did: it is sent or queued (the host revokes what was issued),
+    /// or it reached neither the service nor the queue (the host could not yet revoke it, and
+    /// tries again the next time it uses the account).
+    #[test]
+    fn a_sign_in_whose_authority_ended_says_what_became_of_the_revocation() {
+        let queued = super::Outcome::withheld(super::Commit::Withheld).page();
+        let owed = super::Outcome::withheld(super::Commit::WithheldOwing).page();
+        assert!(
+            queued.contains("authority for this sign-in ended"),
+            "{queued}"
+        );
+        assert!(queued.contains("The host revokes what the account service issued."));
+        assert!(!queued.contains("could not yet revoke"), "{queued}");
+        assert!(owed.contains("authority for this sign-in ended"), "{owed}");
+        assert!(owed.contains("could not yet revoke what the account service issued"));
+        assert!(owed.contains("tries again the next time it uses the account"));
+        assert!(!owed.contains("The host revokes what"), "{owed}");
+    }
+
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::Poll;
 

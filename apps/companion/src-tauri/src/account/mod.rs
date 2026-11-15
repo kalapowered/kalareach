@@ -448,9 +448,10 @@ impl Account {
                         Ok(IdentityRead::Disagreed) => Some(Outcome::NotForThisSignIn),
                         _ => None,
                     },
-                    Ok(Commit::Withheld) => {
+                    Ok(Commit::Withheld | Commit::WithheldOwing) => {
                         // The check always stands, so the keep never withholds here; were it to,
-                        // nothing was kept and the tokens were ended.
+                        // nothing was kept and the tokens were ended, or, for the second, are
+                        // held in memory for the next send.
                         Some(Outcome::NotKept)
                     }
                     Ok(Commit::Unsettled) => {
