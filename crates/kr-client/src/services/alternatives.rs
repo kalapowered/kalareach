@@ -72,7 +72,10 @@ impl Alternative {
             Self::DirectConnection => {
                 "A direct connection between the devices, which needs no managed relay."
             }
-            Self::OwnRelay => "A self-hosted relay configured in the service settings.",
+            Self::OwnRelay => {
+                "A relay that the host's owner runs. The host must name it in its configuration \
+                 and use no managed relay. A new invitation from that host then names it."
+            }
         }
     }
 
@@ -326,7 +329,8 @@ mod tests {
         "A settings sync service that you run yourself.",
         "A backup storage service that you run yourself.",
         "A direct connection between the devices, which needs no managed relay.",
-        "A self-hosted relay configured in the service settings.",
+        "A relay that the host's owner runs. The host must name it in its configuration and use no \
+         managed relay. A new invitation from that host then names it.",
     ];
 
     /// KR-REQ-17.48: the seven alternatives a service names are the words this build recognises,
