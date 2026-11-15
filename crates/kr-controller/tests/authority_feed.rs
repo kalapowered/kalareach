@@ -5492,14 +5492,30 @@ async fn a_connection_is_served_while_the_feed_holds_the_read_open_past_the_boun
     rig.served
         .web()
         .fail_with_member(AUTHORITY, "read", 1, Moment::Hold);
-    let session = within(
+    let mut session = within(
         "the connection is served",
         connect(&rig.host, &phone, &record),
     )
     .await;
-    rig.doctor_as(&session)
-        .await
-        .expect("served while the feed still holds the read");
+    // The gate comes after the handshake, so `connect` returns before it and the doctor read is the
+    // request the gate holds: it is bounded by `within`, like every other wait of the case. A
+    // session that the transport ended while the machine stood still (its 30-second inactivity
+    // threshold passed with nothing sent) answers a read with `ConnectionEnded`; the case dials
+    // again and reads again on that failure alone, with the feed's read still held, and a failure of
+    // any other kind fails the case.
+    let doctor = within("the doctor read is answered", async {
+        loop {
+            match rig.doctor_as(&session).await {
+                Err(kr_client::ClientError::ConnectionEnded) => {
+                    session.close();
+                    session = connect(&rig.host, &phone, &record).await;
+                }
+                answered => return answered,
+            }
+        }
+    })
+    .await;
+    doctor.expect("served while the feed still holds the read");
     // The read is still held: a connection served after the host gave the read up would find the
     // feed unreachable instead.
     assert!(!rig.shown().await.list.feed_stale);
