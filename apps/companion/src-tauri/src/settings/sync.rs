@@ -1869,7 +1869,7 @@ mod tests {
         SyncError::Client(Box::new(kr_client::ClientError::Refused {
             error: kr_protocol::error::ProtocolError::new(
                 ErrorCode::ServiceCapacity,
-                "Managed capacity for new settings sync data is not available now.",
+                "There is no room for new settings sync data right now.",
             ),
             retry_after_seconds: Some(600),
             action: kr_client::retry::UserAction::Wait,
@@ -1884,7 +1884,7 @@ mod tests {
         let error = refused(&[]);
         let today = error.to_string();
         assert!(
-            today.contains("Managed capacity for new settings sync data is not available now."),
+            today.contains("There is no room for new settings sync data right now."),
             "the control holds the service's message: {today}"
         );
         let told = sync_failure(error);
