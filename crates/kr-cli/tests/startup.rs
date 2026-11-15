@@ -6522,3 +6522,35 @@ fn a_daemon_that_does_not_answer_host_info_is_a_holder_that_is_silent_and_no_sto
     daemon.let_go();
     daemon.end();
 }
+
+/// KR-REQ-07.12 (a lock that could not be looked at): a daemon that closes the connection with no
+/// answer leaves an unknown outcome, and the check of the lock then fails (a directory stands where
+/// the lock file is). The text says that the daemon did not show whether it took the stop and that
+/// whether it ended could not be read, and never that the daemon was told.
+#[test]
+fn an_unknown_answer_followed_by_a_failed_lock_check_does_not_say_the_daemon_was_told() {
+    let host = Standalone::create();
+    let lock = host.tree.environment().singleton_lock();
+    let _ = std::fs::remove_file(&lock);
+    std::fs::create_dir_all(&lock).expect("a directory where the lock file is");
+    let mut daemon = TestDaemon::serve(&host, "kr-controller/9.9.9", OnStop::Cut, true);
+    let output = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
+    let said = document(&output, "kr host stop");
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    assert_eq!(stop_of(&said), "maybe_asked", "{said}");
+    let message = said["message"].as_str().expect("a message");
+    assert!(
+        message.contains("did not show whether it took the stop ("),
+        "{message}"
+    );
+    assert!(
+        message.contains("whether it has ended could not be read after 30 seconds: "),
+        "{message}"
+    );
+    assert!(!message.contains("was told to stop"), "{message}");
+    assert!(
+        message.ends_with("Run kr host stop again in a moment."),
+        "{message}"
+    );
+    daemon.end();
+}
