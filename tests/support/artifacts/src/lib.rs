@@ -577,6 +577,61 @@ mod tests {
             .expect("a folder beside the build")
     }
 
+    /// The words of a refusal of a backslash off Windows, the same in every reader.
+    #[cfg(unix)]
+    const BACKSLASH: &str = "a backslash is not taken in the folder's path on this platform";
+
+    /// Off Windows a value that holds a backslash is refused before any other read of it, so that
+    /// every reader returns the same folder or refuses: no reader can keep such a folder as
+    /// written for the programs that read the variable after it.
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_in_a_value_is_refused_off_windows() {
+        let parent = temporary();
+        let root = real(parent.path());
+        std::os::unix::fs::symlink("/etc", root.join("out")).expect("a link out of the root");
+        for value in [
+            format!(r"{}/a\..\..\kr-letters", root.display()),
+            format!(r"{}\a\..\..\kr-letters", root.display()),
+            format!(r"{}/out\kr-evidence", root.display()),
+            format!(r"{}/a\b", root.display()),
+            r"\private\tmp\kr-evidence".to_owned(),
+        ] {
+            let refused = confine(Path::new(&value)).expect_err(&value).to_string();
+            assert!(refused.contains(BACKSLASH), "{value}: {refused}");
+        }
+        assert!(!Path::new("/etc/kr-evidence").exists());
+    }
+
+    /// A temporary variable that holds a backslash is passed over as a root, and the run's own
+    /// directory is made under the next root, `/tmp`.
+    #[cfg(unix)]
+    #[test]
+    fn a_temporary_variable_with_a_backslash_is_passed_over_as_a_root_off_windows() {
+        let parent = beside_the_build();
+        let root = real(parent.path());
+        let lettered = root.join("a\\b");
+        std::fs::create_dir_all(&lettered).expect("a folder with a backslash in its name");
+        std::fs::create_dir_all(root.join("a").join("b")).expect("the folder it reads as");
+        std::os::unix::fs::symlink(&lettered, root.join("link")).expect("a link");
+        let named = [("TMPDIR", lettered.as_os_str())];
+        for value in [
+            root.join("a").join("b").join("evidence"),
+            root.join("link").join("evidence"),
+        ] {
+            let output = read_in_a_run_with(Some(value.as_os_str()), None, &named);
+            assert!(!output.status.success(), "{value:?}: {output:?}");
+            let words = String::from_utf8_lossy(&output.stderr);
+            assert!(words.contains("not inside a temporary root"), "{words}");
+            assert!(!words.contains("a\\b"), "a root that holds a backslash: {words}");
+        }
+        let output = read_in_a_run_with(None, None, &named);
+        assert!(output.status.success(), "{output:?}");
+        let own = printed(&output);
+        assert_eq!(own.parent(), Some(real(Path::new("/tmp")).as_path()));
+        std::fs::remove_dir(&own).expect("removes the run's own directory");
+    }
+
     #[test]
     fn the_runners_temporary_folder_is_a_root_of_a_run_that_names_it_and_of_no_other() {
         let runner = beside_the_build();

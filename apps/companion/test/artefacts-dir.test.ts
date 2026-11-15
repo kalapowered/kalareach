@@ -12,7 +12,7 @@ import {
   symlinkSync
 } from 'node:fs'
 import { platform, tmpdir } from 'node:os'
-import { join, relative } from 'node:path'
+import { dirname, join, relative } from 'node:path'
 import { chdir, cwd } from 'node:process'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -29,6 +29,9 @@ const VARIABLE = 'KR_TEST_ARTIFACTS_DIR'
 const windows = platform() === 'win32'
 const elsewhere = windows ? 'C:\\Windows\\kr-evidence' : '/etc/kr-evidence'
 const made: string[] = []
+
+/** The words of every reader's refusal of a backslash off Windows. */
+const BACKSLASH = "a backslash is not taken in the folder's path on this platform"
 
 function folder(parent: string): string {
   const path = mkdtempSync(join(parent, 'artefacts-reader-'))
@@ -110,6 +113,41 @@ describe('the evidence directory reader', () => {
     symlinkSync('/etc', join(parent, 'escape'))
     expect(() => read(join(parent, 'escape', 'kr-evidence'))).toThrow(/temporary roots/)
     expect(existsSync('/etc/kr-evidence')).toBe(false)
+  })
+
+  it.skipIf(windows)('refuses a value that holds a backslash, before any other read of it', () => {
+    const parent = folder(tmpdir())
+    const root = realpathSync.native(parent)
+    symlinkSync('/etc', join(root, 'out'))
+    for (const value of [
+      `${root}/a\\..\\..\\kr-letters`,
+      `${root}\\a\\..\\..\\kr-letters`,
+      `${root}/out\\kr-evidence`,
+      `${root}/a\\b`,
+      '\\private\\tmp\\kr-evidence'
+    ]) {
+      expect(() => read(value)).toThrow(BACKSLASH)
+      expect(() => read(value)).toThrow(/KR_TEST_ARTIFACTS_DIR.*temporary roots/s)
+    }
+    expect(existsSync('/etc/kr-evidence')).toBe(false)
+  })
+
+  it.skipIf(windows)('passes over a temporary variable that holds a backslash as a root', () => {
+    // The folder sits outside every platform root, so a root that is passed over admits nothing.
+    const parent = folder(cwd())
+    const root = realpathSync.native(parent)
+    const lettered = join(root, 'a\\b')
+    mkdirSync(lettered, { recursive: true })
+    mkdirSync(join(root, 'a', 'b'), { recursive: true })
+    symlinkSync(lettered, join(root, 'link'))
+    vi.stubEnv('TMPDIR', lettered)
+    expect(() => read(join(root, 'a', 'b', 'evidence'))).toThrow('not inside a temporary root')
+    expect(() => read(join(root, 'link', 'evidence'))).toThrow('not inside a temporary root')
+    // The run's own directory is made under the next root.
+    vi.stubEnv(VARIABLE, undefined)
+    const own = artefactsDirectory()
+    made.push(own)
+    expect(dirname(own)).toBe(realpathSync.native('/tmp'))
   })
 
   it.skipIf(windows)('honours a root behind a link and refuses its neighbours', () => {
@@ -233,9 +271,10 @@ describe('the evidence directory reader', () => {
     expect(spellingOf(path, true)).toBe(expected)
   })
 
-  it('reads a backslash off Windows as a letter of a name', () => {
-    expect(spellingOf('/tmp/a\\..\\b', false)).toBe('taken')
-    expect(spellingOf('C:\\x', false)).toBe('not-absolute')
+  it('reads a backslash off Windows as a spelling that is not taken', () => {
+    expect(spellingOf('/tmp/a\\..\\b', false)).toBe('backslash')
+    expect(spellingOf('\\tmp\\x', false)).toBe('backslash')
+    expect(spellingOf('relative/x', false)).toBe('not-absolute')
   })
 
   it('says that there are no roots where there are none, and shows no empty list', () => {
