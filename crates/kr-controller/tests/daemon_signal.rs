@@ -198,11 +198,22 @@ impl Host {
             .expect("an endpoint");
         let started = std::time::Instant::now();
         loop {
-            if LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
-                .await
-                .is_ok()
+            // A daemon that accepts the connection and never answers its hello is held to the
+            // same bound as one that does not accept.
+            let remaining = LIVENESS.saturating_sub(started.elapsed());
+            match tokio::time::timeout(
+                remaining,
+                LocalClient::connect(&endpoint, LocalClientKind::Cli, build()),
+            )
+            .await
             {
-                return;
+                Ok(Ok(_)) => return,
+                Ok(Err(_)) => {}
+                Err(_) => panic!(
+                    "the daemon did not answer within {LIVENESS:?}; its log says: {}",
+                    std::fs::read_to_string(self.tree.root().join("daemon.log"))
+                        .unwrap_or_else(|error| format!("<unreadable: {error}>"))
+                ),
             }
             assert!(
                 started.elapsed() < LIVENESS,
