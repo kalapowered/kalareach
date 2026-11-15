@@ -4527,11 +4527,11 @@ async fn a_worker_that_gives_no_count_is_not_given_one() {
 #[derive(Clone, Copy, Debug)]
 enum Revoked {
     /// A launch of a worker without the lane, whose result is unknown, ends the stream it followed.
-    ByAnUnknownLaunch,
+    AnUnknownLaunch,
     /// A stream that opens for the same attachment replaces it.
-    ByAReplacement,
+    AReplacement,
     /// The connection's grant ends, and its release revokes every stream it holds.
-    ByTheConnectionsRelease,
+    TheConnectionsRelease,
 }
 
 /// A frame waits at the adapter's entry, after the host's decision and before its call, while its
@@ -4554,7 +4554,7 @@ async fn a_frame_waiting_to_be_called_is_not_called_once_its_stream_is_revoked(h
     let mut newer = None;
     let mut handler = None;
     match how {
-        Revoked::ByAnUnknownLaunch => {
+        Revoked::AnUnknownLaunch => {
             stages.script_dependent_answers(|_| SerialAnswer::Silent);
             let unknown = send_after(&rig, Dependent::Launch, rig.epoch, 1).await;
             assert!(
@@ -4563,8 +4563,8 @@ async fn a_frame_waiting_to_be_called_is_not_called_once_its_stream_is_revoked(h
                 unknown.answer
             );
         }
-        Revoked::ByAReplacement => newer = Some(rig.open().await),
-        Revoked::ByTheConnectionsRelease => {
+        Revoked::AReplacement => newer = Some(rig.open().await),
+        Revoked::TheConnectionsRelease => {
             // The handler is held, so the connection's end waits behind it and the stream's end is
             // the release's alone.
             let (answered, release) = rig.adopted.host.pause_after_a_frame_is_answered();
@@ -4610,22 +4610,20 @@ async fn a_frame_waiting_to_be_called_is_not_called_once_its_stream_is_revoked(h
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_frame_waiting_to_be_called_is_not_called_after_an_unknown_launch_ends_its_stream() {
-    a_frame_waiting_to_be_called_is_not_called_once_its_stream_is_revoked(
-        Revoked::ByAnUnknownLaunch,
-    )
-    .await;
+    a_frame_waiting_to_be_called_is_not_called_once_its_stream_is_revoked(Revoked::AnUnknownLaunch)
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_frame_waiting_to_be_called_is_not_called_after_a_newer_stream_replaces_its_stream() {
-    a_frame_waiting_to_be_called_is_not_called_once_its_stream_is_revoked(Revoked::ByAReplacement)
+    a_frame_waiting_to_be_called_is_not_called_once_its_stream_is_revoked(Revoked::AReplacement)
         .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_frame_waiting_to_be_called_is_not_called_after_the_connections_release() {
     a_frame_waiting_to_be_called_is_not_called_once_its_stream_is_revoked(
-        Revoked::ByTheConnectionsRelease,
+        Revoked::TheConnectionsRelease,
     )
     .await;
 }
@@ -4738,11 +4736,9 @@ async fn a_newer_epoch_counts_from_nothing_after_a_refusal_in_an_older_one() {
         .write_message(&frame_of(next_epoch.get(), 0, b"b"))
         .await
         .expect("the frame is written");
-    loop {
-        match next(&mut newer).await {
-            Some(InputAck::Accepted { epoch, .. }) if epoch == next_epoch => break,
-            other => panic!("the typing was to be accepted, and the host said {other:?}"),
-        }
+    match next(&mut newer).await {
+        Some(InputAck::Accepted { epoch, .. }) if epoch == next_epoch => {}
+        other => panic!("the typing was to be accepted, and the host said {other:?}"),
     }
     let short = send_after(&rig, Dependent::Launch, next_epoch, 2).await;
     assert!(
