@@ -34,6 +34,44 @@ pub(crate) struct DoorReply {
     /// method held to the local owner's lease is written only while the lease holds; a refusal
     /// that carries none is written as it is.
     carries_a_result: bool,
+    /// For a reply read from a record, the standing it passed the kept answer's check under, which
+    /// the sink asks again immediately before the transport takes its bytes.
+    from_a_record: Option<FromARecord>,
+}
+
+/// The standing a reply read from a record was given under: the connection it arrived on and the
+/// revision of the authority the request was admitted under.
+///
+/// The writer asks it ([`Controller::check_retained_answer`]) after its last wait and immediately
+/// before the transport takes the bytes, so a fence this host comes to owe, or a registration
+/// withdrawn or replaced, while the reply waits for the peer stops it. After that ask the bytes are
+/// the transport's, and no later ask exists.
+#[derive(Clone, Copy)]
+pub(crate) struct FromARecord {
+    connection_id: ConnectionId,
+    admitted: Option<AuthorityRevision>,
+}
+
+impl FromARecord {
+    /// The standing of a reply read from a record on `connection_id`, admitted under `admitted`,
+    /// for a case that writes a reply by itself.
+    #[cfg(test)]
+    pub(crate) const fn for_a_case(
+        connection_id: ConnectionId,
+        admitted: AuthorityRevision,
+    ) -> Self {
+        Self {
+            connection_id,
+            admitted: Some(admitted),
+        }
+    }
+
+    /// Whether the reply still stands: the fence, the registration and its exact revision.
+    pub(crate) fn stands(&self, controller: &Controller) -> bool {
+        controller
+            .check_retained_answer(self.connection_id, self.admitted)
+            .is_ok()
+    }
 }
 
 impl DoorReply {
@@ -98,6 +136,7 @@ pub(crate) fn declined(
         frame,
         request_id,
         carries_a_result: false,
+        from_a_record: None,
     }
 }
 
@@ -162,15 +201,28 @@ pub(crate) async fn told(settled: Settled<ControlFrame>, standing: &Standing<'_>
         request_id,
     } = *standing;
     let not_shown = || respond(request_id, Err(ControllerError::outcome_not_shown()));
+    // Set where the answer is read from a record and passes the strict check: the sink asks the
+    // same check again where the bytes are handed over.
+    let mut from_a_record = None;
+    let record_standing = FromARecord {
+        connection_id,
+        admitted,
+    };
     let frame = match origin {
         Origin::Withheld => not_shown(),
         Origin::Copied => match controller.check_retained_answer(connection_id, admitted) {
-            Ok(()) => answer,
+            Ok(()) => {
+                from_a_record = Some(record_standing);
+                answer
+            }
             Err(_) => not_shown(),
         },
         Origin::Fresh if names_a_reused_identifier(&answer) => {
             match controller.check_retained_answer(connection_id, admitted) {
-                Ok(()) => answer,
+                Ok(()) => {
+                    from_a_record = Some(record_standing);
+                    answer
+                }
                 Err(refusal) => refused_with(request_id, &refusal),
             }
         }
@@ -198,6 +250,7 @@ pub(crate) async fn told(settled: Settled<ControlFrame>, standing: &Standing<'_>
         frame,
         request_id,
         carries_a_result: true,
+        from_a_record,
     }
 }
 
@@ -254,12 +307,20 @@ impl<'a> ReplySink<'a> {
             frame,
             request_id,
             carries_a_result,
+            from_a_record,
         } = reply;
         #[cfg(feature = "testing")]
         controller.note_a_reply_written(request_id, &frame);
         if carries_a_result {
             controller
-                .write_answer(self.writer, self.kind, &frame, method, request_id)
+                .write_answer(
+                    self.writer,
+                    self.kind,
+                    &frame,
+                    method,
+                    request_id,
+                    from_a_record,
+                )
                 .await
         } else {
             self.writer.write_message(&frame).await.is_ok()

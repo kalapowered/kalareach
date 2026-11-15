@@ -301,6 +301,13 @@ impl Controller {
     /// no room it is asked again each time the peer reads, so an answer that waited for a peer is
     /// not finished under a lease that ended meanwhile: one none of which has gone is taken back
     /// and its refusal written, and one the peer has part of ends the connection.
+    ///
+    /// An answer read from a record is written only while the standing it passed the kept
+    /// answer's check under holds (`from_a_record`): it is asked at the same places, the fence this
+    /// host owes and the registration at its revision. One none of which has gone is taken back and
+    /// the outcome is told as not shown, and one the peer has part of ends the connection. After
+    /// the last ask before the transport takes a byte the bytes are the transport's, and no later
+    /// ask exists.
     pub(crate) async fn write_answer(
         &self,
         writer: &mut kr_ipc::framed::FrameWriter,
@@ -308,18 +315,22 @@ impl Controller {
         answer: &ControlFrame,
         method: Option<Method>,
         request_id: RequestId,
+        from_a_record: Option<crate::given::local_door::FromARecord>,
     ) -> bool {
         use kr_ipc::framed::CheckedWrite;
 
-        let Some(method) = method.filter(|method| {
+        let leased = method.filter(|method| {
             kr_protocol::method::local_hold(*method) == kr_protocol::method::LocalHold::Held
-        }) else {
+        });
+        if leased.is_none() && from_a_record.is_none() {
             return writer.write_message(answer).await.is_ok();
-        };
+        }
         let Ok(bytes) = kr_ipc::framed::FrameWriter::encode(kind, answer) else {
             return false;
         };
-        let permitted = || self.local_hold(method).is_ok();
+        let record_stands = || from_a_record.is_none_or(|record| record.stands(self));
+        let lease_holds = || leased.is_none_or(|method| self.local_hold(method).is_ok());
+        let permitted = || record_stands() && lease_holds();
         let mut begun = false;
         loop {
             let attempt = if begun {
@@ -339,15 +350,18 @@ impl Controller {
                     if !writer.withdraw_unstarted() {
                         return false;
                     }
-                    if self.local_hold(method).is_ok() {
-                        // The lease was presented again meanwhile: offered afresh.
+                    if permitted() {
+                        // The lease was presented again, or the fence given back, meanwhile:
+                        // offered afresh.
                         begun = false;
                         continue;
                     }
-                    return writer
-                        .write_message(&self.lease_ended_reply(request_id, Some(method)))
-                        .await
-                        .is_ok();
+                    let reply = if record_stands() {
+                        self.lease_ended_reply(request_id, method)
+                    } else {
+                        respond(request_id, Err(ControllerError::outcome_not_shown()))
+                    };
+                    return writer.write_message(&reply).await.is_ok();
                 }
                 Err(_) => return false,
             }
@@ -930,6 +944,7 @@ impl Controller {
                                                     &answer,
                                                     request.method.method(),
                                                     request.request_id,
+                                                    None,
                                                 )
                                                 .await
                                             {

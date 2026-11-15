@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use kr_protocol::envelope::{ControlFrame, Outcome, Response};
 use kr_protocol::error::ProtocolError;
-use kr_protocol::ids::{ConnectionId, DeviceId, RequestId};
+use kr_protocol::ids::{AuthorityRevision, ConnectionId, DeviceId, RequestId};
 use kr_transport::listener::{AuthorisedSession, ControlSender};
 
 use crate::grants::policy::{BoundIdentity, HeldBound, Stands};
@@ -280,8 +280,9 @@ pub(super) enum Answers {
     /// whatever the frame says.
     Action,
     /// The answer kept from an earlier submission of an action, which a device is shown only as a
-    /// read of the receipt it is.
-    Kept,
+    /// read of the receipt it is. It goes only while the standing it was checked under holds: the
+    /// registration at the revision the request was admitted under, and no fence owed.
+    Kept(AuthorityRevision),
 }
 
 impl Answers {
@@ -296,7 +297,7 @@ impl Answers {
     pub(super) fn refusing(self, answer: &ControlFrame, refusal: ProtocolError) -> ProtocolError {
         match self {
             Self::Action => super::after_the_outcome(answer, refusal),
-            Self::Kept => super::outcome_not_shown(),
+            Self::Kept(_) => super::outcome_not_shown(),
             Self::Read | Self::Nothing => refusal,
         }
     }
@@ -593,6 +594,12 @@ impl RemoteOutput {
         // the turn is taken, for the one frame every attempt below writes.
         let shown = super::super::device_errors::frame_for_a_device(frame);
         let refusal;
+        // What a kept answer stands on, asked with the other bounds. It is not asked of a refusal
+        // written in the answer's place: that frame carries nothing the record held.
+        let mut kept_standing = match answers {
+            Answers::Kept(admitted_revision) => Some(admitted_revision),
+            Answers::Nothing | Answers::Read | Answers::Action => None,
+        };
         let frame: &ControlFrame = match &shown {
             Cow::Owned(mapped) if !super::super::device_errors::fits(mapped, self.max_payload) => {
                 // The host's edits made the answer larger than the stream carries, and the stream
@@ -605,6 +612,7 @@ impl RemoteOutput {
                     })) => Some(super::failure(request_id, answers.refusing(frame, error))),
                     other => other,
                 };
+                kept_standing = None;
                 match &refusal {
                     Some(refusal) => refusal,
                     None => return Written::Withdrawn,
@@ -635,6 +643,7 @@ impl RemoteOutput {
                     .controller
                     .feed_refusal_on(self.authority.connection_id)
                     .is_some())
+                && self.kept_answer_stands(kept_standing)
                 && bounds_hold(&self.authority.controller, under, HeldBound::stands_at)
                 && relaying
                     .as_ref()
@@ -731,6 +740,26 @@ impl RemoteOutput {
         if let Some(waiting) = waiting {
             let _ = waiting.send(());
         }
+    }
+
+    /// Whether the standing an answer kept from an earlier submission was checked under still
+    /// holds: the fence this host owes and the registration at the revision the request was
+    /// admitted under, asked as the kept answer's own check asks them. Any other answer stands.
+    ///
+    /// Asked inside the poll that hands bytes to the stream, so the last ask before the transport
+    /// takes a byte is made after every wait of the write: the turn, the stream's room and the
+    /// reader's pace. After that ask the bytes are the transport's and no later ask exists.
+    fn kept_answer_stands(&self, standing: Option<AuthorityRevision>) -> bool {
+        standing.is_none_or(|admitted_revision| {
+            self.authority
+                .controller
+                .check_retained_under(&crate::authority::AdmittedMutation {
+                    connection_id: self.authority.connection_id,
+                    admitted_revision,
+                    deadline: None,
+                })
+                .is_ok()
+        })
     }
 
     /// Returns whether a byte of a frame may go on this connection at this instant.
