@@ -345,6 +345,10 @@ async fn asked_again_at_a_doubling_interval(first_ask_takes: Duration) {
     worker
         .service
         .hold_the_boundary_for_one_announcement_after(0);
+    // The pass asks a pending worker on its own schedule. An ask that came before the case has
+    // arranged the first one, with the names forgotten and the link held, would be the first ask
+    // instead, and the case would measure the gaps from it: the pass's asks wait until then.
+    host.controller().hold_the_pass_asks_for_tests(true);
     let barrier = host
         .controller()
         .revoke_authority()
@@ -364,6 +368,7 @@ async fn asked_again_at_a_doubling_interval(first_ask_takes: Duration) {
                 .expect("the worker is reached"),
         )
     };
+    host.controller().hold_the_pass_asks_for_tests(false);
 
     until(DEBT_PASS_INTERVAL * 2 + SLACK, "the first ask", || {
         !asks_of(host.controller(), session_id).is_empty()
