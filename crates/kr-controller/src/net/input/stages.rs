@@ -6,19 +6,62 @@
 #[cfg(feature = "testing")]
 pub(super) use with_seams::Tally;
 #[cfg(feature = "testing")]
-pub use with_seams::{InputStageCounts, InputStages};
+pub use with_seams::{InputStageCounts, InputStages, SerialAnswer};
 
 #[cfg(not(feature = "testing"))]
 pub(super) use without_seams::{InputStages, Tally};
 
 #[cfg(feature = "testing")]
 mod with_seams {
-    use std::sync::Arc;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError};
 
+    use kr_protocol::envelope::{MutationRequest, Outcome, Request, Response};
+    use kr_protocol::error::ProtocolError;
+    use kr_protocol::ids::RequestId;
+    use kr_protocol::input::InputWriteParams;
     use tokio::sync::{oneshot, watch};
 
+    use crate::error::{ControllerError, Result};
     use crate::service::net::chunks::Hold;
+    use crate::service::net::proxy::Forwarded;
+
+    /// What a suite's stand-in for a worker's link answers one call of the serial adapter with.
+    #[derive(Clone, Debug)]
+    pub enum SerialAnswer {
+        /// The worker answers with this outcome.
+        Answered(Outcome),
+        /// The worker answers with this error, and the answer carries the refusal of the link
+        /// itself, which a worker gives after it has taken what it was sent, as well as before.
+        Marked(ProtocolError),
+        /// The worker's answer does not come in time.
+        Silent,
+        /// The link ends under the call.
+        Lost,
+    }
+
+    type SerialScript = dyn Fn(InputWriteParams) -> Pin<Box<dyn Future<Output = SerialAnswer> + Send>>
+        + Send
+        + Sync;
+
+    type DependentScript = dyn Fn(&MutationRequest) -> Outcome + Send + Sync;
+
+    /// A script a suite gives the door.
+    struct Script<T: ?Sized>(Arc<T>);
+
+    impl<T: ?Sized> Clone for Script<T> {
+        fn clone(&self) -> Self {
+            Self(Arc::clone(&self.0))
+        }
+    }
+
+    impl<T: ?Sized> std::fmt::Debug for Script<T> {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a script")
+        }
+    }
 
     /// A count of what a stage holds now, and the most it has held.
     #[derive(Debug, Default)]
@@ -105,6 +148,9 @@ mod with_seams {
         before_a_frame_is_judged: Hold,
         before_a_release: Hold,
         after_a_graceful_look: Hold,
+        before_a_serial_call: Hold,
+        serial_script: Mutex<Option<Script<SerialScript>>>,
+        dependent_script: Mutex<Option<Script<DependentScript>>>,
         held: Arc<Gauge>,
         unanswered: Arc<Gauge>,
         host_holds: Gauge,
@@ -131,6 +177,9 @@ mod with_seams {
                 before_a_frame_is_judged: Hold::default(),
                 before_a_release: Hold::default(),
                 after_a_graceful_look: Hold::default(),
+                before_a_serial_call: Hold::default(),
+                serial_script: Mutex::new(None),
+                dependent_script: Mutex::new(None),
                 held: Arc::default(),
                 unanswered: Arc::default(),
                 host_holds: Gauge::default(),
@@ -208,6 +257,40 @@ mod with_seams {
         #[must_use]
         pub fn hold_after_a_graceful_look(&self) -> Held {
             self.after_a_graceful_look.arm()
+        }
+
+        /// Holds the serial adapter at its next frame, after the host's decision for it and before
+        /// the call to the worker is made. The hold fires once.
+        #[must_use]
+        pub fn hold_before_a_serial_call(&self) -> Held {
+            self.before_a_serial_call.arm()
+        }
+
+        /// Has the serial adapter's calls answered by `script`, which is given each call's
+        /// parameters and answers when it is awaited, instead of calling the worker.
+        pub fn script_serial_calls<F, Fut>(&self, script: F)
+        where
+            F: Fn(InputWriteParams) -> Fut + Send + Sync + 'static,
+            Fut: Future<Output = SerialAnswer> + Send + 'static,
+        {
+            let script: Arc<SerialScript> = Arc::new(move |params| Box::pin(script(params)));
+            *self
+                .serial_script
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(Script(script));
+        }
+
+        /// Has a release, a detach and a launch that the host forwards answered by `script`, which
+        /// is given the request as it would be sent to the worker, instead of sending it.
+        pub fn script_dependent_requests(
+            &self,
+            script: impl Fn(&MutationRequest) -> Outcome + Send + Sync + 'static,
+        ) {
+            let script: Arc<DependentScript> = Arc::new(script);
+            *self
+                .dependent_script
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(Script(script));
         }
 
         /// Gives the frames that the host passes on from now a deadline of `deadline` from the moment
@@ -295,6 +378,70 @@ mod with_seams {
 
         pub(in crate::service::net) async fn after_a_graceful_look(&self) {
             self.after_a_graceful_look.wait().await;
+        }
+
+        pub(in crate::service::net) async fn before_a_serial_call(&self) {
+            self.before_a_serial_call.wait().await;
+        }
+
+        /// The call of the serial adapter that a suite scripts, as the proxy would give it, when it
+        /// scripts them.
+        pub(in crate::service::net) fn scripted_call(
+            &self,
+            request: &Request,
+        ) -> Option<Pin<Box<dyn Future<Output = Result<Forwarded>> + Send>>> {
+            let script = self
+                .serial_script
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()?;
+            let params = request.params.to_typed::<InputWriteParams>().ok()?;
+            let answer = (script.0)(params);
+            Some(Box::pin(async move {
+                let answered = |outcome, link_fenced| {
+                    Ok(Forwarded {
+                        response: Response {
+                            request_id: RequestId::new(0),
+                            outcome,
+                        },
+                        retained: false,
+                        link_fenced,
+                    })
+                };
+                match answer.await {
+                    SerialAnswer::Answered(outcome) => answered(outcome, false),
+                    SerialAnswer::Marked(error) => answered(Outcome::Error(error), true),
+                    SerialAnswer::Silent => Err(ControllerError::Uncertain {
+                        detail: "this session did not answer in time, so what became of the \
+                                 action is unknown"
+                            .to_owned(),
+                    }),
+                    SerialAnswer::Lost => Err(ControllerError::supervision(
+                        "this session's link ended before it answered",
+                    )),
+                }
+            }))
+        }
+
+        /// The answer that a suite scripts for a release, a detach or a launch, when it scripts
+        /// them.
+        pub(in crate::service::net) fn scripted_answer(
+            &self,
+            mutation: &MutationRequest,
+        ) -> Option<Forwarded> {
+            let script = self
+                .dependent_script
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()?;
+            Some(Forwarded {
+                response: Response {
+                    request_id: mutation.request_id,
+                    outcome: (script.0)(mutation),
+                },
+                retained: false,
+                link_fenced: false,
+            })
         }
 
         pub(in crate::service::net) fn frame_read(&self) {
@@ -400,6 +547,15 @@ mod without_seams {
         pub(in crate::service::net) async fn before_a_release(&self) {}
 
         pub(in crate::service::net) async fn after_a_graceful_look(&self) {}
+
+        pub(in crate::service::net) async fn before_a_serial_call(&self) {}
+
+        pub(in crate::service::net) fn scripted_answer(
+            &self,
+            _mutation: &kr_protocol::envelope::MutationRequest,
+        ) -> Option<crate::service::net::proxy::Forwarded> {
+            None
+        }
 
         pub(in crate::service::net) fn frame_read(&self) {}
 
