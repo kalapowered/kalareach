@@ -921,12 +921,20 @@ impl Controller {
                         kr_protocol::hostinfo::configuration::FILE_NAME,
                     ))
                 })?;
+                // The feed's exchanges are made under the deadlines the product ships with. A
+                // build with the testing feature lets a suite give others.
+                #[cfg(feature = "testing")]
+                let deadlines = crate::testing::feed_deadlines()
+                    .unwrap_or(crate::authority_feed::FEED_DEADLINES);
+                #[cfg(not(feature = "testing"))]
+                let deadlines = crate::authority_feed::FEED_DEADLINES;
                 let client = crate::authority_feed::managed_client(
                     &origin,
                     Self::outbound_of(&started)?.proxy()?,
                     Arc::new(crate::push::sender::HostSigner::new(
                         device_keys.authorisation.clone(),
                     )),
+                    deadlines,
                 )?;
                 Some(crate::authority_feed::FeedRuntime::new(
                     client,

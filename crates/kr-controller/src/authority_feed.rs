@@ -117,7 +117,8 @@ tokio::task_local! {
     pub(crate) static CARRYING_OUT: ();
 }
 
-/// The feed's client for `origin`, signing as the host.
+/// The feed's client for `origin`, signing as the host and making its exchanges under
+/// `feed_deadlines`.
 ///
 /// # Errors
 ///
@@ -127,11 +128,12 @@ pub fn managed_client(
     origin: &GatewayOrigin,
     proxy: Option<&ProxyUrl>,
     signer: Arc<dyn ServiceSigner>,
+    feed_deadlines: HttpDeadlines,
 ) -> Result<AuthorityFeedClient> {
     let http: Arc<dyn ServiceHttp> = Arc::new(
         HttpService::through(
             origin.clone(),
-            FEED_DEADLINES,
+            feed_deadlines,
             managed_response_limits(),
             proxy,
         )
@@ -2572,8 +2574,13 @@ mod tests {
     fn carrier() -> FeedRuntime {
         let key = AuthorisationKeyPair::generate().expect("a key");
         let origin = GatewayOrigin::new("http://127.0.0.1:9").expect("an origin");
-        let client =
-            managed_client(&origin, None, Arc::new(NoSigner(key.clone()))).expect("a client");
+        let client = managed_client(
+            &origin,
+            None,
+            Arc::new(NoSigner(key.clone())),
+            FEED_DEADLINES,
+        )
+        .expect("a client");
         FeedRuntime::new(
             client,
             &origin,

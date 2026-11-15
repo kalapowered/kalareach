@@ -108,6 +108,33 @@ pub(crate) fn git_read_bound() -> Option<Duration> {
 }
 
 tokio::task_local! {
+    /// The deadlines the client of the authority feed is made with, for the daemon being started
+    /// in this task.
+    static FEED_DEADLINES_OF_THE_START: kr_client::services::HttpDeadlines;
+}
+
+/// Runs `start` so that the daemon it starts makes its exchanges with the authority feed under
+/// `deadlines` in place of [`crate::authority_feed::FEED_DEADLINES`].
+///
+/// The client's deadlines run in real time. A suite that is not about them gives its daemons
+/// deadlines longer than its own bound on a wait, so that a machine that stalls a case while a
+/// request is in flight does not make the client give the request up; a suite about them gives
+/// short ones of its own.
+pub async fn with_feed_deadlines<F: Future>(
+    deadlines: kr_client::services::HttpDeadlines,
+    start: F,
+) -> F::Output {
+    FEED_DEADLINES_OF_THE_START.scope(deadlines, start).await
+}
+
+/// The deadlines a suite gave the feed's client of the daemon being started, when it did.
+pub(crate) fn feed_deadlines() -> Option<kr_client::services::HttpDeadlines> {
+    FEED_DEADLINES_OF_THE_START
+        .try_with(|deadlines| *deadlines)
+        .ok()
+}
+
+tokio::task_local! {
     /// How the daemon being started in this task waits for the effect of a mutation a paired
     /// device sends.
     static EFFECT_WAIT_OF_THE_START: EffectWait;

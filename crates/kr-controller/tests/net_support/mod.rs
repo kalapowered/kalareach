@@ -448,6 +448,11 @@ pub struct Waits {
     /// cases run Git and write to the disk on a machine that may be loaded gives it a long one; a
     /// suite about the wait holds the timer it is counted by.
     pub effect_wait: Option<kr_controller::testing::EffectWait>,
+    /// The deadlines the daemon's client of the authority feed is made with, when the suite gives
+    /// others than the product's. The client's deadlines run in real time: a suite that is not
+    /// about them gives deadlines longer than its own bound on a wait, so that a stalled machine
+    /// does not make the client give a request up.
+    pub feed_deadlines: Option<kr_client::services::HttpDeadlines>,
 }
 
 /// How a suite stands the signed release matrix up for a daemon.
@@ -701,6 +706,7 @@ impl Host {
             origin,
             timer,
             clocks,
+            None,
         )
         .await
     }
@@ -713,6 +719,7 @@ impl Host {
         origin: &str,
         timer: Arc<dyn kr_controller::quiet::Timer>,
         clocks: Clocks,
+        feed_deadlines: Option<kr_client::services::HttpDeadlines>,
     ) -> Self {
         let temp = kr_ipc::testing::TempHost::create();
         let secrets = open_store_in(&temp.environment().secrets_dir())
@@ -739,6 +746,7 @@ impl Host {
             Waits {
                 timer: Some(timer),
                 reader_shares_the_timer: false,
+                feed_deadlines,
                 ..Waits::default()
             },
         )
@@ -908,6 +916,7 @@ impl Host {
                 reader_shares_the_timer: false,
                 release_matrix: matrix,
                 effect_wait: None,
+                feed_deadlines: None,
             },
         )
         .await;
@@ -1136,6 +1145,15 @@ impl Host {
                                     started,
                                 )
                                 .await
+                            }
+                            None => started.await,
+                        }
+                    };
+                    let started = async {
+                        match waits.feed_deadlines {
+                            Some(deadlines) => {
+                                kr_controller::testing::with_feed_deadlines(deadlines, started)
+                                    .await
                             }
                             None => started.await,
                         }
@@ -1620,6 +1638,7 @@ impl Stopped {
                 reader_shares_the_timer,
                 release_matrix: waits.release_matrix,
                 effect_wait: waits.effect_wait,
+                feed_deadlines: waits.feed_deadlines,
             },
         )
         .await;
