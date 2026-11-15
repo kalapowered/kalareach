@@ -6626,7 +6626,9 @@ fn an_unknown_answer_followed_by_a_failed_lock_check_does_not_say_the_daemon_was
 /// connection leaves the command unable to make its request. Nothing was sent, so the result is
 /// `not_asked`, with the text of its own, no wait for an end and no record; the exit is the
 /// failure's (3). The daemon here stays and answers at its endpoint, which is what tells it from
-/// one that has ended.
+/// one that has ended. It received `host.info` exactly twice, once from the command and once from
+/// the command's one look at the endpoint: a command that made no look would have sent it once,
+/// and one that waited would have looked again and again.
 #[test]
 fn a_request_that_could_not_be_made_is_not_asked_and_nothing_is_waited_for() {
     let host = Standalone::create();
@@ -6651,10 +6653,18 @@ fn a_request_that_could_not_be_made_is_not_asked_and_nothing_is_waited_for() {
         message.ends_with(". Nothing was sent, and nothing was stopped."),
         "{message}"
     );
+    let received = daemon.received();
     assert!(
-        !daemon.received().iter().any(|method| method == "host.stop"),
-        "no request to stop left: {:?}",
-        daemon.received()
+        !received.iter().any(|method| method == "host.stop"),
+        "no request to stop left: {received:?}"
+    );
+    assert_eq!(
+        received
+            .iter()
+            .filter(|method| *method == "host.info")
+            .count(),
+        2,
+        "the command asked once and looked once, and waited for nothing: {received:?}"
     );
     assert!(attempts(&host).is_empty(), "no record stands");
     daemon.end();
