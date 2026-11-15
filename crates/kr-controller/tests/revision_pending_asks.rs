@@ -693,8 +693,10 @@ async fn a_pending_worker_outside_the_directory_is_reconciled_by_the_pass_itself
 /// ask is stuck.
 ///
 /// One worker owes names of the restriction, and another is pending and cannot be reached: its
-/// connection is held, so the pass's ask waits for it. The names are collected by the pass all the
-/// same, and the pending worker acknowledges once its connection is free.
+/// connection is held, so the pass's ask waits for it. One pass is arranged to find both at its
+/// beginning, the names collectible and the ask due, and it must collect the names before it begins
+/// the ask. A pass that asked first would hold the names for the whole of the ask and collect them
+/// only after the ask gave up. The pending worker acknowledges once its connection is free.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn the_names_other_workers_owe_are_collected_while_one_ask_is_stuck() {
     let Adopted {
@@ -707,6 +709,9 @@ async fn the_names_other_workers_owe_are_collected_while_one_ask_is_stuck() {
     let device = ActorId::new("device:phone").expect("a principal");
     owing.limit_evidence_page_for_tests(1);
     owing.seed_undispatched_intents(&device, 3);
+    // No pass begins from here until the case lets this one go, so that the pass that finds the
+    // names and the ask together is the one the case arranges, and not one that came before it.
+    let (arrived, go) = host.controller().stop_before_an_evidence_pass_for_tests();
     host.controller().limit_evidence_pages_for_tests(0);
     stuck
         .service
@@ -727,29 +732,31 @@ async fn the_names_other_workers_owe_are_collected_while_one_ask_is_stuck() {
         .hold_a_worker_link_for_tests(stuck.session_id)
         .await
         .expect("the worker is reached");
-    // The first ask of the pass begins, waits for the connection and gives up after ten seconds;
-    // the second is due ten seconds after that, and the passes come five seconds apart. The limit
-    // is lifted after the last pass before the second ask, so that the names are first asked for at
-    // the pass that begins it: before that ask when the pass collects names first, and only after
-    // the ask has given up, ten seconds later, when it asks first.
+    tokio::time::timeout(DEBT_PASS_INTERVAL * 2 + SLACK, arrived)
+        .await
+        .expect("a pass of the daemon began")
+        .expect("the pass says that it has arrived");
+    assert!(
+        asks_of(host.controller(), stuck.session_id).is_empty(),
+        "no ask of the worker whose connection is held was made before the pass"
+    );
+    // The pass finds the names collectible and the ask due, both at its beginning.
+    host.controller().limit_evidence_pages_for_tests(usize::MAX);
+    go.send(()).expect("the pass is waiting");
     until(
         DEBT_PASS_INTERVAL * 2 + SLACK,
-        "the first ask of the pass",
+        "the pass's ask of the worker whose connection is held",
         || !asks_of(host.controller(), stuck.session_id).is_empty(),
     )
     .await;
-    let first_ask = asks_of(host.controller(), stuck.session_id)[0];
-    tokio::time::sleep_until(first_ask + Duration::from_secs(17)).await;
-    host.controller().limit_evidence_pages_for_tests(usize::MAX);
-    let by = first_ask + Duration::from_secs(25);
-    while !host.controller().names_owed_for_tests().is_empty() {
-        assert!(
-            tokio::time::Instant::now() < by,
-            "the names the first worker owed were not collected at the pass that began the second \
-             ask of the other worker, whose connection is held"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    // The ask waits for the connection the case holds, so it is still going. A pass that collects
+    // first has collected the names by now; one that asks first holds them until the ask gives up.
+    assert_eq!(
+        host.controller().names_owed_for_tests(),
+        Vec::new(),
+        "the pass began its ask of the worker whose connection is held before it collected the \
+         names that the first worker owed"
+    );
     assert_eq!(
         host.controller()
             .revision_pending()
@@ -757,10 +764,6 @@ async fn the_names_other_workers_owe_are_collected_while_one_ask_is_stuck() {
             .expect("the registry is read"),
         vec![stuck.session_id],
         "the second worker is still pending, its connection held"
-    );
-    assert!(
-        !asks_of(host.controller(), stuck.session_id).is_empty(),
-        "the pass asked the worker whose connection is held"
     );
 
     drop(link);

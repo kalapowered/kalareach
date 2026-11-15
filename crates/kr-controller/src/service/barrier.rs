@@ -676,6 +676,8 @@ async fn evidence_pass(daemon: std::sync::Weak<Controller>, mut passes: PassSche
         passes.next().await;
         let tick = tokio::time::Instant::now();
         let held = while_held(&daemon, async |controller: &Arc<Controller>| {
+            #[cfg(feature = "testing")]
+            controller.before_an_evidence_pass.wait().await;
             // The names that workers owe are asked for before any worker that is pending is, so
             // that one worker that does not answer cannot stop them.
             controller.collect_names_owed().await;
