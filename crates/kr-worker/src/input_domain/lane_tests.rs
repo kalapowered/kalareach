@@ -810,3 +810,25 @@ fn the_end_of_a_hold_gives_the_window_back_what_a_drop_outside_a_hold_returned()
         "the host was not told of the credit: {told:?}"
     );
 }
+
+/// The answers' allowance is what is left of the whole room as admission reads it: the room that
+/// the window keeps back for its lane is not left to the host's own answers, as it is not left to a
+/// person's keys.
+#[test]
+fn the_answers_allowance_leaves_the_room_the_window_keeps_back() {
+    let mut rig = Rig::new();
+    let mut view = View::new();
+    rig.take(&mut view);
+    for _ in 0..15 {
+        rig.write(&mut view, None, &[b'x'; 32 * 1024])
+            .expect("the room has space");
+    }
+    let _lane = rig.bind(&view);
+    let ledger = rig.input.ledger();
+    assert_ne!(ledger.reserved, Cost::default(), "{ledger:?}");
+    let allowance = rig.input.reply_allowance();
+    assert!(
+        allowance.bytes <= ledger.free.bytes,
+        "the allowance passes what is left of the room: {allowance:?} against {ledger:?}"
+    );
+}
