@@ -32,8 +32,10 @@ const CHILD: &str = "KR_STAND_IN_CHILD";
 /// The stand-in for `cargo`: every build and every suite succeeds at once, and each measurement
 /// runs this test program, which records a section. Where `KR_STAND_IN_HOLD` names a folder, the
 /// measurement that `KR_STAND_IN_HOLD_AT` counts to stops after it has recorded, while the folder
-/// holds a file named `held` (which it makes) and for two minutes at most.
-const CARGO: &str = r#"#!/bin/sh
+/// holds a file named `held` (which it makes) and for two minutes at most. Where `KR_STAND_IN_LATE`
+/// is set, the last measurement leaves a process behind that records one more section once the
+/// measurement's own record has been taken out of the run root, and ends.
+const CARGO: &str = r###"#!/bin/sh
 case "$*" in
   build*) exit 0 ;;
   *--ignored*)
@@ -51,11 +53,18 @@ case "$*" in
         done
       fi
     fi
+    case "$*" in
+      *idle_resources_for_twenty_sessions*)
+        if [ -n "${KR_STAND_IN_LATE:-}" ]; then
+          sh -c 'while [ -e "$1/performance.md" ]; do sleep 0.1; done; printf "## a stand-in measurement\n\n" >> "$1/performance.md"' late "$KR_TEST_ARTIFACTS_DIR" > /dev/null 2>&1 &
+        fi
+        ;;
+    esac
     echo "test result: ok. 1 passed; 0 failed; 0 ignored"
     ;;
   *) echo "test result: ok. 3 passed; 0 failed; 0 ignored" ;;
 esac
-"#;
+"###;
 
 /// The stand-in measurement: where this program was started by the stand-in `cargo`, it records one
 /// section in the evidence directory that its environment names, as a measurement does.
@@ -268,5 +277,29 @@ fn a_run_killed_inside_its_second_measurement_has_the_record_of_the_first() {
         1,
         "the section that the first measurement recorded is in the caller's directory, and the \
          second measurement's, which was still in the run root, is not"
+    );
+}
+
+/// A record that a process of the run makes after its measurement ended, and that is still in the run
+/// root when the survivor check ends, is kept before the run root goes.
+#[test]
+fn a_record_made_after_its_measurement_ended_is_kept_when_the_run_ends() {
+    let temporary = tempfile::tempdir().expect("a temporary folder");
+    let evidence = temporary.path().join("evidence");
+    std::fs::create_dir_all(&evidence).expect("the named directory");
+    let output = script(temporary.path(), Some(&evidence))
+        .env("KR_STAND_IN_LATE", "1")
+        .output()
+        .expect("the script runs");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        sections(&evidence.join("performance.md")),
+        5,
+        "the four measurements' sections and the late one are in the caller's directory"
     );
 }
