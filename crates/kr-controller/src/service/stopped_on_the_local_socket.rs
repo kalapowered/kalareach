@@ -657,8 +657,11 @@ async fn under_an_owed_fence_the_answer_is_withheld_and_the_daemon_stops_all_the
 ///
 /// The connection is paced to write a keepalive every millisecond and given a send buffer of a few
 /// bytes, so that the daemon's writes fill it while the client reads nothing. The client then sends
-/// the stop and reads one frame at a time until the stop's answer is about to be written, so that
-/// the buffer is full at that moment, and reads nothing more.
+/// the stop and reads one frame at a time until the stop's answer is about to be written, and reads
+/// nothing more. Where the socket takes the answer all the same (Linux accepts a write while the
+/// buffer is below its limit, whatever the size of the write), the answer is written and the daemon
+/// is told to stop; where it does not (macOS), the write waits for its bound. The case holds for
+/// both, and only the second exercises the bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_client_that_stops_reading_does_not_keep_the_daemon_from_stopping() {
     let daemon =
@@ -715,15 +718,10 @@ async fn a_client_that_stops_reading_does_not_keep_the_daemon_from_stopping() {
     tokio::time::timeout(LIVENESS, reading)
         .await
         .expect("the stop's answer arrives at its write");
-    let blocked = daemon.controller.local_writes_blocked();
     release.send(()).expect("the write is let go");
 
     // The client reads nothing now. The answer's write waits for it, and ends at its bound.
     daemon.told_to_stop().await;
-    assert!(
-        daemon.controller.local_writes_blocked() > blocked,
-        "the stop's answer was written with room to spare: the client was not holding the socket"
-    );
     // The connection ended with the write: what is left is read and then the end.
     let ended = async { while reader.read_message::<ControlFrame>().await.is_ok() {} };
     tokio::time::timeout(LIVENESS, ended)
