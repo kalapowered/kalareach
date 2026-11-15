@@ -412,11 +412,15 @@ pub struct Controller {
     /// The tasks that hold this daemon through `barrier::while_held`, which are not counted as its
     /// owners.
     task_holds: Arc<barrier::TaskHolds>,
-    /// Where this host's own tests stop a task that looks at whether it is the daemon's last holder
-    /// between the two counts it compares, so that another task can begin in between. The pause
-    /// holds the thread. Compiled away in every shipped build.
-    #[cfg(any(test, feature = "testing"))]
-    between_the_task_counts: crate::attention::Pause,
+    /// Where this host's own tests stop one named task that looks at whether it is the daemon's
+    /// last holder between the two counts it compares, so that other tasks can begin or end in
+    /// between. The pause holds the thread. Compiled away in every shipped build.
+    #[cfg(test)]
+    between_the_task_counts: barrier::TaskPause,
+    /// Where this host's own tests stop one named task whose work is over, before it leaves the
+    /// task count. Compiled away in every shipped build.
+    #[cfg(test)]
+    before_a_task_leaves_the_count: barrier::TaskPause,
     /// The links remote connections hold to each session's worker, which the session's closure
     /// ends. Weakly, because a link belongs to the connection that opened it.
     ///
