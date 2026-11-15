@@ -659,6 +659,11 @@ pub struct Controller {
     /// so that the worker can be made busy in between. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     after_an_acknowledgement: ReadPause,
+    /// Where this host's own tests stop a request for a page of a worker's fence evidence once it
+    /// holds the worker's link and has checked that time is left for it, before its time limit
+    /// starts, so that time can pass in between. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    before_a_pages_limit: ReadPause,
     /// How many pages of one worker's fence evidence this host's own tests let one announcement
     /// collect, where they need fewer than the bound that is in force. Compiled away in every
     /// shipped build.
@@ -1272,6 +1277,17 @@ impl Controller {
         &self,
     ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         self.after_an_acknowledgement.arm()
+    }
+
+    /// Stops the next request for a page of a worker's fence evidence once it holds the worker's
+    /// link and has checked that time is left for it, before its time limit starts, for this
+    /// host's own tests. Returns the end that says the request has arrived there, and the end that
+    /// lets it go. The stop fires once.
+    #[cfg(feature = "testing")]
+    pub fn stop_before_a_pages_limit_for_tests(
+        &self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        self.before_a_pages_limit.arm()
     }
 
     /// Stops the next barrier once it has advanced the revision and before it tells the workers,

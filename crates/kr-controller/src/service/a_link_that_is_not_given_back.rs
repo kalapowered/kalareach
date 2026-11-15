@@ -39,6 +39,10 @@ struct Heard {
     frames: std::sync::Mutex<Vec<ControlFrame>>,
     /// How many connections it has accepted.
     connections: AtomicUsize,
+    /// How long an answering worker ([`answering`]) takes over the acknowledgement of each
+    /// announcement it is sent from now on, in the order they arrive. It answers at once when none
+    /// is left.
+    delays: std::sync::Mutex<std::collections::VecDeque<Duration>>,
 }
 
 impl Heard {
@@ -100,6 +104,87 @@ fn stalling(
             }
         })
     }
+}
+
+/// An endpoint that proves itself as a worker and acknowledges each announcement it is sent, after
+/// the pause that [`Heard::delays`] holds for it, with a fence that names nothing and has nothing
+/// more to say. It answers nothing else.
+fn answering(
+    heard: Arc<Heard>,
+) -> impl FnOnce(Listener, Arc<WorkerIdentity>, String) -> tokio::task::JoinHandle<()> {
+    move |listener, identity, endpoint_text| {
+        tokio::spawn(async move {
+            loop {
+                let Ok((connection, peer)) = listener.accept().await else {
+                    return;
+                };
+                heard.connections.fetch_add(1, Ordering::SeqCst);
+                let identity = Arc::clone(&identity);
+                let endpoint_text = endpoint_text.clone();
+                let heard = Arc::clone(&heard);
+                tokio::spawn(async move {
+                    let (mut reader, mut writer) = split(connection, StreamKind::Control);
+                    let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+                    while let Ok(frame) = reader.read_message::<ControlFrame>().await {
+                        let answers = world::handshake(
+                            &frame,
+                            &identity,
+                            &endpoint_text,
+                            connection_id,
+                            &peer,
+                            &kr_protocol::scalars::CanonicalSet::new(),
+                        );
+                        if let Some(answers) = answers {
+                            for answer in answers {
+                                if writer.write_message(&answer).await.is_err() {
+                                    return;
+                                }
+                            }
+                            continue;
+                        }
+                        let announced = match &frame {
+                            ControlFrame::AuthorityRevision(notice) => Some(notice.revision),
+                            _ => None,
+                        };
+                        heard
+                            .frames
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(frame);
+                        let Some(revision) = announced else {
+                            continue;
+                        };
+                        let pause = heard
+                            .delays
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .pop_front()
+                            .unwrap_or_default();
+                        tokio::time::sleep(pause).await;
+                        let ack = ControlFrame::AuthorityRevisionAck(
+                            kr_protocol::worker::AuthorityRevisionAck {
+                                session_id: identity.session_id(),
+                                revision,
+                                fence: Some(evidence(0)),
+                            },
+                        );
+                        if writer.write_message(&ack).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        })
+    }
+}
+
+/// A daemon with one answering worker in its directory ([`answering`]), which has acknowledged the
+/// revision in force, so its lease renews.
+async fn answered() -> (Silent, Arc<Heard>) {
+    let heard = Arc::new(Heard::default());
+    let silent = world::fake_world_reached(answering(Arc::clone(&heard))).await;
+    world::acknowledged(&silent.controller, silent.session_id);
+    (silent, heard)
 }
 
 /// A daemon with one stalling worker in its directory, which has acknowledged the revision in
@@ -1483,6 +1568,252 @@ async fn an_ask_whose_wait_runs_past_its_bound_ends_at_it_with_no_link_out() {
         controller.leases.owing_names(),
         vec![session_id],
         "the names stay owed for the pass's collection"
+    );
+    silent.serving.abort();
+}
+
+/// KR-REQ-09.12: the first exchange of an ask has a limit of its own that starts once the ask has
+/// the worker's link.
+///
+/// Another operation keeps the link for seven of the ask's fifteen seconds. The announcement then
+/// begins with eight seconds left, which is more than an exchange takes, and the worker answers it
+/// four seconds later, inside them. A limit that started before the wait would have run out three
+/// seconds before that answer, with the announcement on the wire, and a link that goes out of its
+/// holder's hand stops the renewal of the lease of a worker that has acknowledged before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_exchange_of_an_ask_starts_its_limit_once_the_ask_has_the_link() {
+    let (silent, heard) = answered().await;
+    let controller = Arc::clone(&silent.controller);
+    let session_id = silent.session_id;
+    heard
+        .delays
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push_back(Duration::from_secs(4));
+    let mut elsewhere = controller
+        .worker_client(&silent.worker)
+        .await
+        .expect("another operation takes the worker's link");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let (asked, ()) = tokio::join!(
+        controller.ask_worker_revision(session_id, Some(deadline)),
+        async {
+            tokio::time::sleep(Duration::from_secs(7)).await;
+            elsewhere.give_back();
+            drop(elsewhere);
+        },
+    );
+    assert_eq!(heard.frames(), 1, "the announcement went");
+    assert_eq!(
+        asked.unwrap_or(Asked::Failed),
+        Asked::Acknowledged,
+        "the worker answered within the time an exchange has"
+    );
+    assert!(
+        !controller.leases.is_fenced(session_id),
+        "the renewal of the worker's lease was not stopped"
+    );
+    assert!(leases(&controller, session_id));
+    assert!(
+        slot_holds_a_link(&controller, session_id).await,
+        "the link is back in its slot"
+    );
+    silent.serving.abort();
+}
+
+/// Raises two barriers for changes that reach more grants than one notice names, while the
+/// worker is not in the directory, so that a daemon that has recorded nothing of the worker tells
+/// it three revisions in at least two notices. Then lists the worker again.
+async fn after_barriers_that_need_several_notices(silent: &Silent) {
+    let controller = &silent.controller;
+    let session_id = silent.session_id;
+    controller.directory.lock().await.remove(session_id);
+    let bound = u32::try_from(kr_protocol::worker::MAX_REVISION_REACH_NAMES).expect("fits");
+    let mut newest = AuthorityRevision::new(0);
+    for first in [1_u32, 100_000] {
+        let grants: std::collections::BTreeSet<_> = (first..first + bound / 2 + 1)
+            .map(|number| {
+                let mut bytes = [0_u8; 16];
+                bytes[..4].copy_from_slice(&number.to_be_bytes());
+                kr_protocol::ids::GrantId::new(kr_protocol::scalars::Uuid::from_bytes(bytes))
+            })
+            .collect();
+        let reach = crate::service::Reach::Grants {
+            holding_leases: grants.clone(),
+            grants,
+        };
+        let debt = controller
+            .owe_debt("a change", reach.clone())
+            .expect("written");
+        let own = controller.publish_debts(&[(debt, reach)]);
+        controller.barrier(own).await.expect("a barrier");
+        newest = controller
+            .registry
+            .lock()
+            .await
+            .authority_revision()
+            .expect("readable");
+    }
+    assert!(
+        controller
+            .revision_notices(newest, AuthorityRevision::new(0), 0)
+            .len()
+            >= 2,
+        "the worker is told in several notices"
+    );
+    controller
+        .directory
+        .lock()
+        .await
+        .insert(silent.worker.clone(), None);
+}
+
+/// One ask of fifteen seconds, whose first notice begins after another operation has held the
+/// registry for six, is answered after one second, and whose second would be recorded in the
+/// registry only when that operation lets the registry go `release_at` after the ask began. The
+/// worker would answer a second notice four seconds after it was sent. Returns what the ask said.
+async fn a_telling_that_waits_for_the_registry_between_its_notices(
+    silent: &Silent,
+    heard: &Heard,
+    release_at: Duration,
+) -> Asked {
+    let controller = &silent.controller;
+    let session_id = silent.session_id;
+    {
+        let mut delays = heard
+            .delays
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        delays.push_back(Duration::from_secs(1));
+        delays.extend(std::iter::repeat_n(Duration::from_secs(4), 8));
+    }
+    let began = tokio::time::Instant::now();
+    let deadline = began + Duration::from_secs(15);
+    let first = controller.registry.lock().await;
+    let (asked, ()) = tokio::join!(
+        tokio::time::timeout(
+            deadline - began + Duration::from_secs(5),
+            controller.ask_worker_revision(session_id, Some(deadline)),
+        ),
+        async {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            drop(first);
+            until("the first notice reached the worker", || {
+                heard.frames() >= 1
+            })
+            .await;
+            let held = controller.registry.lock().await;
+            tokio::time::sleep_until(began + release_at).await;
+            drop(held);
+        },
+    );
+    asked
+        .expect("the ask ended by itself, a few seconds after its bound at the latest")
+        .unwrap_or(Asked::Failed)
+}
+
+/// What a telling that sent no notice after its first leaves behind: the first was the only frame,
+/// the ask has run out, and the worker's lease goes on renewing over a link that is in its slot.
+async fn the_second_notice_was_not_sent(silent: &Silent, heard: &Heard, asked: Asked) {
+    let controller = &silent.controller;
+    assert_eq!(
+        heard.frames(),
+        1,
+        "only the first notice went to the worker"
+    );
+    assert_eq!(asked, Asked::Failed, "the ask ran out");
+    assert!(
+        !controller.leases.is_fenced(silent.session_id),
+        "the renewal of the worker's lease was not stopped"
+    );
+    assert!(leases(controller, silent.session_id));
+    assert!(
+        slot_holds_a_link(controller, silent.session_id).await,
+        "the link went back whole"
+    );
+    assert_eq!(heard.connections(), 1, "no other link was opened");
+}
+
+/// KR-REQ-09.12: the notices of one telling after the first begin only with an exchange's time left
+/// before the ask's deadline, also after a wait for the registry between them.
+///
+/// The first notice is answered at seven seconds of the ask's fifteen, and the registry is held
+/// until twelve, so the second would begin with three seconds left, inside the five an exchange
+/// takes, and the worker would answer it four seconds later. A deadline that cut it would drop the
+/// link with the notice on the wire and stop the worker's renewal. So nothing more is sent, and the
+/// link goes back whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_notice_that_would_begin_with_too_little_time_is_not_sent() {
+    let (silent, heard) = answered().await;
+    after_barriers_that_need_several_notices(&silent).await;
+    let asked = a_telling_that_waits_for_the_registry_between_its_notices(
+        &silent,
+        &heard,
+        Duration::from_secs(12),
+    )
+    .await;
+    the_second_notice_was_not_sent(&silent, &heard, asked).await;
+    silent.serving.abort();
+}
+
+/// KR-REQ-09.12: a wait for the registry between two notices that runs past the ask's deadline ends
+/// at it with the link given back whole.
+///
+/// The registry is held beyond the fifteen seconds. The deadline cuts the wait, nothing is on the
+/// wire, and the renewal of the worker's lease, which a link dropped in the holder's hand would
+/// stop, goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wait_for_the_registry_between_two_notices_that_runs_past_the_deadline_gives_the_link_back()
+ {
+    let (silent, heard) = answered().await;
+    after_barriers_that_need_several_notices(&silent).await;
+    let asked = a_telling_that_waits_for_the_registry_between_its_notices(
+        &silent,
+        &heard,
+        Duration::from_secs(17),
+    )
+    .await;
+    the_second_notice_was_not_sent(&silent, &heard, asked).await;
+    silent.serving.abort();
+}
+
+/// KR-REQ-09.12: the time limit of a page of evidence is an instant, taken once for the check that
+/// time is left and for the timer, so that time passing between them cannot put its end behind
+/// the ask's deadline.
+///
+/// The collection has eight seconds. The check finds all eight, and four go by before the page is
+/// sent. A timer of five seconds that started then would end at nine; the page ends at five, by the
+/// instant the check was made for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_whose_limit_starts_late_still_ends_by_the_deadline() {
+    let (silent, heard) = stalled().await;
+    let controller = Arc::clone(&silent.controller);
+    let session_id = silent.session_id;
+    let revision = controller.leases.authority_revision();
+    let binding = controller.leases.binding(session_id);
+    assert!(
+        controller
+            .leases
+            .acknowledge(session_id, binding, revision, Some(evidence(3)))
+    );
+    let (arrived, go) = controller.stop_before_a_pages_limit_for_tests();
+    let began = tokio::time::Instant::now();
+    let until = began + Duration::from_secs(8);
+    tokio::join!(
+        controller.collect_owed_evidence(session_id, binding, revision, Some(until)),
+        async {
+            arrived
+                .await
+                .expect("the request reached the stop before its limit");
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            let _ = go.send(());
+        },
+    );
+    let lasted = began.elapsed();
+    assert_eq!(heard.frames(), 1, "the page was sent");
+    assert!(
+        lasted <= Duration::from_secs(8),
+        "the page ended {lasted:?} after the collection began, past the eight seconds it had"
     );
     silent.serving.abort();
 }
