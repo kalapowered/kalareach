@@ -74,6 +74,7 @@ rc=$?
 if [ "$rc" -eq 0 ] && has sbx-k-mig '0001_probe_notes.sql'; then ok K.3.3 "the D1 migration applied in the service's unit in $(elapsed "$start" "$(now)") s"; else fail K.3.3 "the D1 migration: exit $rc; $(tail -3 "$SBX_LOGS/sbx-k-mig.log" | tr '\n' ';' | cut -c1-200)"; fi
 
 t0=$(now)
+watch_mem sbx-k-svc &
 UNIT_MAX=1500 unit_svc sbx-k-svc --no-wait --type exec --exit-type cgroup "${SVCENV[@]}" -- \
   "$NODE" "$K_TOOLS/start-worker.mjs" "$WRANGLER_BIN" "$WORKER_DIR/wrangler.toml" 8443 /home/kr-svc/state /home/kr-svc/certs /home/kr-svc/worker.log
 ready=0
@@ -83,9 +84,15 @@ for _ in $(seq 1 120); do
 done
 t1=$(now)
 if [ "$ready" -eq 1 ]; then ok K.3.4 "the Worker answered https://127.0.0.1:8443 in the service's namespace $(elapsed "$t0" "$t1") s after its unit started (start time)"; else fail K.3.4 "the Worker did not answer within 60 s"; fi
-state=$(sudo -n systemctl show -p ActiveState,SubState,MainPID --value sbx-k-svc.service 2>/dev/null | tr '\n' ' ')
-echo "service unit after the starter exited: $state"
-case $state in active*) ok K.3.5 "the starter exited and left a detached server; the unit stayed active ($state)" ;; *) fail K.3.5 "the unit is not active: $state" ;; esac
+active=$(sudo -n systemctl show -p ActiveState --value sbx-k-svc.service 2>/dev/null)
+sub=$(sudo -n systemctl show -p SubState --value sbx-k-svc.service 2>/dev/null)
+mainpid=$(sudo -n systemctl show -p MainPID --value sbx-k-svc.service 2>/dev/null)
+echo "service unit after the starter exited: ActiveState=$active SubState=$sub MainPID=$mainpid"
+if [ "$active" = active ] && [ "$mainpid" = 0 ]; then
+  ok K.3.5 "the starter exited (MainPID 0) and left a detached server; the unit stayed active ($active/$sub): its exit is the control group's"
+else
+  fail K.3.5 "the unit is not active with the starter gone: $active/$sub MainPID=$mainpid"
+fi
 
 # ---- the proxy, and what the legs' namespace reaches ----
 msg=$(start_proxy 8443 "$svc_ino")
@@ -170,8 +177,17 @@ fi
 # ---- teardown: the proxy, the service, and everything of the service account ----
 sudo -n cat /home/kr-svc/worker.log 2>/dev/null | tail -n 40 >"$SBX_LOGS/sbx-k-worker.log"
 echo "Worker log: $(wc -l <"$SBX_LOGS/sbx-k-worker.log") lines (warn level)"
+# Wrangler's own outbound call (it asks Cloudflare for the Request.cf object) failed in the unit,
+# and the Worker served the clients all the same.
+if grep -q 'getaddrinfo EAI_AGAIN' "$SBX_LOGS/sbx-k-worker.log" && grep -q '^RESULT https-post ok' "$SBX_LOGS/sbx-k-c1.log"; then
+  ok K.3.8b "Wrangler's own outbound call failed at once in the unit (its log: $(grep -m1 -o 'Unable to fetch the `Request.cf` object' "$SBX_LOGS/sbx-k-worker.log"), then getaddrinfo EAI_AGAIN) and it served the clients all the same"
+else
+  fail K.3.8b "no outbound failure in Wrangler's log, or the Worker did not serve: $(head -3 "$SBX_LOGS/sbx-k-worker.log" | tr '\n' ';' | cut -c1-200)"
+fi
 stop_proxy
 bash "$SBX_DIR/stop-unit.sh" --name sbx-k-svc --log-dir "$SBX_LOGS" || fail K.3.9 "the service unit did not end"
+stop_mem sbx-k-svc
+echo "the service unit's peak memory (Wrangler, workerd and the starter): $(mem_peak sbx-k-svc)"
 bash "$SBX_DIR/replay-log.sh" "$SBX_LOGS/sbx-k-worker.log" sbx-k-worker
 unit_gone sbx-k-svc && ok K.3.9 "the service unit ended on stop with an empty control group" || fail K.3.9 "the service unit is still there"
 if no_processes kr-svc; then ok K.3.10 "no process of the service account is left (workerd and Wrangler ended with the unit)"; else fail K.3.10 "the service account has processes: $(ps -u kr-svc -o pid=,comm= | tr '\n' ';' | cut -c1-200)"; fi
