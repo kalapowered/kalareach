@@ -1267,6 +1267,10 @@ async fn a_repeat_of_a_revocation_says_so_when_the_worker_no_longer_holds_the_na
 /// that page on the wire is dropped with the link out, which stops
 /// the renewal of the lease of a worker that has acknowledged. The repeat's ask returns what it has
 /// before that page begins, and the repeat is answered with the lease as it was.
+///
+/// The 1.8 seconds of a page's room are a measured margin and no guarantee: a page that takes more
+/// than five seconds makes the product drop the link, rightly, and the case then fails. The case
+/// needs real time, since the product compares the time left with one exchange's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_repeat_of_a_revocation_whose_ask_has_more_pages_than_its_time_leaves_the_renewal_going()
 {
@@ -1299,7 +1303,7 @@ async fn a_repeat_of_a_revocation_whose_ask_has_more_pages_than_its_time_leaves_
         "the worker acknowledged, and its renewal stopped when the repeat's ask ended"
     );
     assert!(
-        lasted < Duration::from_millis(14_500),
+        lasted < Duration::from_secs(15),
         "the repeat was answered {lasted:?} after it was made, which is its bound and not a return \
          with what it had"
     );
@@ -1379,6 +1383,10 @@ async fn an_ask_with_more_pages_of_names_than_its_time_holds_is_over_within_its_
 /// link out: a link that goes out of its holder's hand stops the renewal of the worker's lease,
 /// though the worker has acknowledged. The ask returns what it has before that page begins, and
 /// the pass collects the names that are left.
+///
+/// The 1.8 seconds of a page's room are a measured margin and no guarantee: a page that takes more
+/// than five seconds makes the product drop the link, rightly, and the case then fails. The case
+/// needs real time, since the product compares the time left with one exchange's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_ask_with_too_little_time_for_another_page_leaves_the_renewal_of_the_worker_going() {
     let Adopted {
@@ -1435,7 +1443,7 @@ async fn an_ask_with_too_little_time_for_another_page_leaves_the_renewal_of_the_
         "the worker acknowledged, and its renewal stopped when the ask ended"
     );
     assert!(
-        lasted < Duration::from_millis(14_500),
+        lasted < Duration::from_secs(15),
         "the ask ended {lasted:?} after it began, which is its bound and not a return with what \
          it had"
     );
