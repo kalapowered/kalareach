@@ -308,7 +308,7 @@ pub enum EndCause {
     /// host refused, or that a hold ended before it was written, was counted by the event that
     /// told of it, and those counts stand. A network lane says so once the host has read the stream
     /// to its end and finished its own side; a local lane says so when its writer has gone through
-    /// the queue and the connection stands.
+    /// the queue, the session's record has no end and the transport can still send.
     Finished,
     /// The connection ended. `refusal` is what the host refused the connection with when it was the
     /// host that ended it, which is how a host that withdrew the connection ends it.
@@ -1709,9 +1709,10 @@ impl InputLane {
     /// nothing. The holder keeps the lane until [`InputEvent::Ended`] says
     /// [`EndCause::Finished`]: dropping it sooner resets the stream. A network lane says it once
     /// the host has finished its side. A local lane says it once its writer has gone through the
-    /// queue and the connection stands: a key's write waits for the host's answer to the frame, and
-    /// an ordered request's send stage waits for the frame to be written and not for the host's
-    /// answer. A connection that ends under the last send ends the lane with its own cause.
+    /// queue, the session's record has no end and the transport can still send: a key's write waits
+    /// for the host's answer to the frame, and an ordered request's send stage waits for the frame
+    /// to be written and not for the host's answer. A connection that ends under the last send, or
+    /// whose write side is lost before the lane's last step, ends the lane with its own cause.
     pub fn finish(&self) {
         self.shared.lock().finish();
         self.shared.wake.notify_one();
