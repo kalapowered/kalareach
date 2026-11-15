@@ -2735,9 +2735,15 @@ async fn the_remainder_of_a_batch_the_writer_abandons_at_its_deadline_is_counted
 /// writer will not write, is already in the stream that the response lane reads. The writer ends
 /// the application's open paste when it abandons the batch, so that the answer to the question the
 /// application asks next comes after the end of the paste and not inside it.
+///
+/// The service ends the epoch of a dropped batch from a task of its own, and an epoch's end moves
+/// the fence, which also makes the writer end a paste. That task is held until the answer has
+/// been checked, so the end of the paste that the answer follows can only be the writer's own, at
+/// the drop. The epoch's end then comes, and the next acquire says that a paste was closed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_writer_ends_the_paste_it_abandons_part_way_before_a_reply_is_written() {
     const BODY: usize = 60_000;
+    const END_AND_ANSWER: &[u8] = b"\x1b[201~\x1b[0n";
     let mut rig = Rig::start_unreading().await;
     let attachment = rig.attach().await;
     let epoch = rig.acquire(attachment).await;
@@ -2751,6 +2757,7 @@ async fn the_writer_ends_the_paste_it_abandons_part_way_before_a_reply_is_writte
     // The frame that closes the paste is accepted too, and the writer will not write it.
     lane.send(b"\x1b[201~").await;
     lane.accepted().await;
+    let boundary = rig.service.hold_the_dispatch_boundary();
     until("the opening frame's authority ended", WAIT, || {
         kr_ipc::clock::boot_elapsed_ms() >= deadline
     })
@@ -2759,6 +2766,25 @@ async fn the_writer_ends_the_paste_it_abandons_part_way_before_a_reply_is_writte
     rig.runtime.session().ingest_output(b"\x1b[5n");
     rig.runtime.flush_input();
     rig.let_the_application_read().await;
+
+    // What the application has: the part of the paste that was written, the end of the paste that
+    // the writer wrote in its place, and then the answer. How much of the paste was written is
+    // for the epoch's end to say.
+    tokio::time::timeout(WAIT, async {
+        while !rig.received().ends_with(END_AND_ANSWER) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the application did not get the end of the paste and then the answer, but {} bytes \
+             ending {:?}",
+            rig.received().len(),
+            String::from_utf8_lossy(&rig.received()[rig.received().len().saturating_sub(24)..])
+        )
+    });
+    drop(boundary);
 
     let notice = the_notice_after_the_room_came_back(&rig, &mut lane).await;
     let ended = notice.ended.0.expect("the notice says an epoch ended");
@@ -2769,11 +2795,17 @@ async fn the_writer_ends_the_paste_it_abandons_part_way_before_a_reply_is_writte
         fenced > 6 && fenced < sent,
         "the writer was part way through the paste: {fenced} of {sent} bytes were not written"
     );
-    // What the application has: the part of the paste that was written, the end of the paste that
-    // the writer wrote in its place, and then the answer.
     let mut expected = opening[..sent - fenced].to_vec();
-    expected.extend_from_slice(b"\x1b[201~\x1b[0n");
+    expected.extend_from_slice(END_AND_ANSWER);
     rig.received_exactly(&expected).await;
+    // The writer closed the paste the application was inside before the next holder took the
+    // keys, and the next acquire says so.
+    let next = rig.acquire_result(attachment).await;
+    assert!(
+        next.closed_open_paste,
+        "the next acquire says that no paste was closed, though the worker closed the one the \
+         application was inside before it handed input over"
+    );
     rig.finish().await;
 }
 
