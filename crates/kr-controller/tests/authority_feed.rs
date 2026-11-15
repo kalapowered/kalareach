@@ -44,7 +44,7 @@ use kr_protocol::scalars::{
 };
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 use kr_protocol::sharing::{DeviceListParams, DeviceListResult, OfflineValidityPolicy};
-use kr_service_stand_in::{Moment, Served, serve};
+use kr_service_stand_in::{Moment, Served, serve, short_budget};
 use net_support::{Device, Host, MovedWall, RawDevice, connect, pair_with, paired_dial, proposal};
 
 const AUTHORITY: &str = "/api/authority/sync";
@@ -2963,6 +2963,81 @@ async fn a_withdrawal_the_host_cannot_verify_takes_its_keys_off_the_feeds_list_w
         }
     })
     .await;
+}
+
+/// KR-REQ-17.48: a service with no managed capacity for a new authority feed says so with the
+/// delay it asks for and the alternatives that still work, and `kr doctor` says it as a limit of
+/// the service and not a fault of this host, in each of the three forms a list takes: every
+/// alternative recognised, some, and none. A refusal for a fault, which names none, keeps the
+/// fault's words. The carrier waits as it does for any delay, whichever words are said.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_17_48_a_service_with_no_capacity_for_a_new_feed_is_said_as_its_limit() {
+    const OWN: &str = "An authority feed service that you run yourself.";
+    const HOST: &str = "A revocation made on the host itself, without the feed.";
+    const LIMIT: &str = "the service has no managed capacity for new authority feeds now, which is a limit of the service and not a fault of this host";
+    for (status, code, alternatives, ending) in [
+        (
+            429,
+            "RATE_LIMITED",
+            vec![OWN, HOST],
+            Some(format!("Until then: {OWN} {HOST}")),
+        ),
+        (
+            503,
+            "SERVICE_UNAVAILABLE",
+            vec![HOST, "A path this version has never heard of."],
+            Some(format!(
+                "Until then: {HOST} The service named 1 more that this version cannot show."
+            )),
+        ),
+        (
+            503,
+            "SERVICE_UNAVAILABLE",
+            vec!["A path of its own."],
+            Some("The service named 1 that this version cannot show.".to_owned()),
+        ),
+        (503, "SERVICE_UNAVAILABLE", Vec::new(), None),
+    ] {
+        let rig = Rig::start().await;
+        rig.until_the_carrier_is_idle().await;
+        rig.served
+            .web()
+            .fail(AUTHORITY, 1, short_budget(status, code, 600, &alternatives));
+        rig.timer.release_held();
+        rig.poll().await;
+        let check = rig.shown().await.check.expect("the feed check");
+        let detail = check.detail().to_owned();
+        assert_eq!(check.status, DoctorStatus::Warning, "{detail}");
+        match ending {
+            Some(ending) => {
+                assert!(detail.contains(LIMIT), "{detail}");
+                assert!(detail.ends_with(&ending), "{detail}");
+                assert_eq!(
+                    detail.contains("Until then"),
+                    ending.starts_with("Until then"),
+                    "{detail}"
+                );
+                assert_eq!(
+                    check.remedy(),
+                    Some(
+                        "This host asks again by itself. What is shown of remote revocations \
+                         is stale until the feed answers."
+                    ),
+                    "{detail}"
+                );
+            }
+            None => {
+                assert!(detail.contains("turned a request back"), "{detail}");
+                assert!(!detail.contains(LIMIT), "{detail}");
+                assert!(!detail.contains("Until then"), "{detail}");
+            }
+        }
+        let (waited, _release) = within("the carrier waits", rig.timer.next_wait()).await;
+        assert!(
+            waited >= Duration::from_secs(600),
+            "the carrier waits out the delay whichever words are said: {waited:?}"
+        );
+    }
 }
 
 /// A change to the list of keys that may remove the feed, turned back with a delay, ends the pass:

@@ -52,6 +52,7 @@ use std::time::Duration;
 
 use kr_client::error::ClientError;
 use kr_client::mailbox_reader::{Outcome, Page, Reading, Stop, read_mailbox};
+use kr_client::services::Offered;
 use kr_client::services::mailbox::MailboxClient;
 use kr_client::services::{
     HttpDeadlines, HttpService, ServiceHttp, ServiceSigner, managed_response_limits,
@@ -125,6 +126,10 @@ enum Stopped {
     Unreachable,
     /// The service turned a request back for a reason only the owner can change.
     Refused(ErrorCode),
+    /// The service has no managed capacity for a new mailbox now and named the alternatives that
+    /// still work. That is a limit of the service. The host waits as it does for any delay, and
+    /// this only decides what it says.
+    Capacity(Offered),
     /// This host could not read its devices or write its record. The service is not at fault.
     Local,
 }
@@ -144,6 +149,11 @@ impl Stopped {
                     code @ (ErrorCode::PermissionDenied
                     | ErrorCode::InvalidArgument
                     | ErrorCode::HostNotConfigured) => Self::Refused(code),
+                    ErrorCode::RateLimited | ErrorCode::ServiceCapacity
+                        if !error.alternatives().is_empty() =>
+                    {
+                        Self::Capacity(error.alternatives().offered())
+                    }
                     _ => Self::Unreachable,
                 }
             }
@@ -321,6 +331,19 @@ impl MailboxReader {
                         .stated(", which could not be reached; ")
                         .sentence(&read)
                         .stated(feed),
+                    Some("This host asks again by itself."),
+                ),
+                Some(Stopped::Capacity(offered)) => (
+                    DoctorStatus::Warning,
+                    crate::capacity::listed(
+                        reads
+                            .stated(", and ")
+                            .stated(crate::capacity::MAILBOXES)
+                            .stated("; ")
+                            .sentence(&read)
+                            .stated(feed),
+                        offered,
+                    ),
                     Some("This host asks again by itself."),
                 ),
                 Some(Stopped::Refused(_)) => (

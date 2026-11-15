@@ -66,7 +66,7 @@ use kr_protocol::privacy::{
 };
 use kr_protocol::scalars::{AuthorisationKey, Nullable, Signature64, TimestampMs, Uuid};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
-use kr_service_stand_in::{ACCOUNT, Moment, Served, TOKEN, serve};
+use kr_service_stand_in::{ACCOUNT, Moment, Served, TOKEN, serve, short_budget};
 use kr_transport::clock::ManualClock;
 
 const CREATE: &str = "/api/storage/upload/create";
@@ -1383,6 +1383,75 @@ async fn the_daemon_waits_as_long_as_the_service_asked_and_a_person_is_waited_fo
         timer.run_by_itself();
         rig.until("generation 1 is published", |rig| rig.published(1))
             .await;
+    }
+}
+
+/// KR-REQ-17.48: a service with no managed capacity for a new backup collection says so with the
+/// delay it asks for and the alternatives that still work, and `kr doctor` says it as a limit of
+/// the service and not a fault of this host, in each of the three forms a list takes: every
+/// alternative recognised, some, and none. A refusal for a fault, which names none, keeps the
+/// fault's words. The daemon waits as it does for any delay, whichever words are said.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_17_48_a_service_with_no_capacity_for_a_new_collection_is_said_as_its_limit() {
+    const OWN: &str = "A backup storage service that you run yourself.";
+    const LIMIT: &str = "the service has no managed capacity for new backup collections now, which is a limit of the service and not a fault of this host";
+    for (status, code, alternatives, ending) in [
+        (
+            429,
+            "RATE_LIMITED",
+            vec![OWN],
+            Some(format!("Until then: {OWN}")),
+        ),
+        (
+            503,
+            "SERVICE_UNAVAILABLE",
+            vec![OWN, "A path this version has never heard of."],
+            Some(format!(
+                "Until then: {OWN} The service named 1 more that this version cannot show."
+            )),
+        ),
+        (
+            503,
+            "SERVICE_UNAVAILABLE",
+            vec!["A path of its own.", "A second path of its own."],
+            Some("The service named 2 that this version cannot show.".to_owned()),
+        ),
+        (503, "SERVICE_UNAVAILABLE", Vec::new(), None),
+    ] {
+        let timer = HeldTimer::held();
+        let rig = Rig::start(Arrangement::NORMAL, Arc::clone(&timer)).await;
+        let web = Arc::clone(rig.served.web());
+        within("the first status read", web.requests_reach(STATUS, 1)).await;
+        web.fail(CREATE, 1, short_budget(status, code, 600, &alternatives));
+        rig.admit(1, &[(1, plaintext(2048))]);
+        let (waited, _release) = within("the pass is held back", timer.next_wait()).await;
+        assert!(
+            waited >= Duration::from_secs(600),
+            "the daemon waits out the delay whichever words are said: {waited:?}"
+        );
+        let (_, detail) = rig.storage_check().await;
+        let remedy = rig.storage_remedy().await;
+        match ending {
+            Some(ending) => {
+                assert!(detail.contains(LIMIT), "{detail}");
+                assert!(detail.ends_with(&ending), "{detail}");
+                assert_eq!(
+                    detail.contains("Until then"),
+                    ending.starts_with("Until then"),
+                    "{detail}"
+                );
+                assert_eq!(remedy, "This host asks again by itself.");
+            }
+            None => {
+                assert!(detail.contains("busy or unreachable"), "{detail}");
+                assert!(!detail.contains(LIMIT), "{detail}");
+                assert!(!detail.contains("Until then"), "{detail}");
+                assert!(
+                    remedy.contains("Check that the service is reachable"),
+                    "{remedy}"
+                );
+            }
+        }
     }
 }
 
