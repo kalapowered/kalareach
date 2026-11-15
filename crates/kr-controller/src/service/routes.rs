@@ -28,7 +28,10 @@ use super::{Controller, encode, error_reply, net, parse, respond};
 /// backups before each request that changes the storage service and in the transaction that records
 /// the setup, the deletion in the write that records it, the confirmation where it removes the
 /// record of the wait under that record's lock, and the sign-in and the sign-out before each change
-/// of the account.
+/// of the account, the sign-out's last ask under the account's hold. The sign-in's keep is another
+/// ask: it runs after the request has answered and its connection has ended, so it asks the fence
+/// this host owes and the local owner's membership lease, under the account's hold, immediately
+/// before it writes its grant.
 ///
 /// The fence check and the registration check run for each of them before it does anything. A
 /// method that takes an admission asks both inside the service that performs it, so this list is
