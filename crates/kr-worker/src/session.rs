@@ -447,6 +447,14 @@ pub struct Session {
     /// When the first request to stop was made, for this host's own tests.
     #[cfg(feature = "testing")]
     stop_requested: Option<std::time::Instant>,
+    /// Where the removal of an attachment that the root editor's own gesture asked for waits before
+    /// it begins, for this host's own tests: the end that says the removal has arrived, and the end
+    /// that lets it go on.
+    #[cfg(feature = "testing")]
+    before_a_removal: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
     /// The session's live agent instances, and how many announcements it has made about them.
     agent_instances: AgentInstances,
     /// Why the last interrupt this session tried did not reach the foreground group.
@@ -755,6 +763,8 @@ impl Session {
             foreground_reads: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "testing")]
             stop_requested: None,
+            #[cfg(feature = "testing")]
+            before_a_removal: None,
             agent_instances: AgentInstances::default(),
             interrupt_failed: None,
             reconsidered_at: (0, 0),
@@ -781,6 +791,24 @@ impl Session {
     #[cfg(feature = "testing")]
     pub(crate) fn wait_for_the_spool_write(&self) {
         self.history.wait_for_the_spool_write();
+    }
+
+    /// Stops the next removal of an attachment that the root editor's own gesture asked for, in the
+    /// session's carry-out and before the removal begins, for this host's own tests. The input
+    /// domain is let go there, as it is between a stimulus and its removal.
+    ///
+    /// Returns the end that says the removal has arrived, and the end that lets it go on.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_a_removal(
+        &mut self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (arrived, watch) = tokio::sync::oneshot::channel();
+        let (release, go) = std::sync::mpsc::channel();
+        self.before_a_removal = Some((arrived, go));
+        (watch, release)
     }
 
     /// Gives the session the recorder its runtime's tasks share, so the ingest's spans fall beside
@@ -1102,6 +1130,11 @@ impl Session {
                     attachment,
                     discarded,
                 } => {
+                    #[cfg(feature = "testing")]
+                    if let Some((arrived, go)) = self.before_a_removal.take() {
+                        let _ = arrived.send(());
+                        let _ = go.recv();
+                    }
                     // A detach the reader asked for removes exactly the attachment the fence named,
                     // and the keys the machine dropped with it are part of what its lease's end
                     // discarded.
