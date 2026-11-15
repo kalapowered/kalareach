@@ -4,6 +4,11 @@
 //! input proxy, which carries that attachment's typing to the worker as forwarded `input.write`
 //! requests and carries the worker's window, credit and answers back. Every case here is a host
 //! that does what the daemon does, frame by frame, and reads what the worker puts on the lane.
+//!
+//! The application of a case is a POSIX script that waits on a named pipe, which a Windows host
+//! cannot make this way, so the suite is not built there.
+
+#![cfg(unix)]
 
 use std::sync::Arc;
 use std::time::Duration;
