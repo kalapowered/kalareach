@@ -882,8 +882,8 @@ async fn a_launch_held_across_a_restart_resolves_as_one_that_produced_no_session
     );
 }
 
-/// A launch held between its reservation and its worker's claim, while the daemon is stopped by a
-/// request on its local socket, is cut at the end of the wait for the creates under way: the stop
+/// KR-REQ-24.05: a launch held between its reservation and its worker's claim, while the daemon is
+/// stopped by a request on its local socket, is cut at the end of the wait for the creates under way: the stop
 /// does not refuse for it, counts it as one that did not settle, answers, and the daemon ends by
 /// itself with status zero. The next start resolves the launch as one that produced no session, as
 /// after a crash, and does not launch it again.
