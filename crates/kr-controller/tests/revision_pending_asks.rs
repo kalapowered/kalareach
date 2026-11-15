@@ -298,6 +298,10 @@ async fn an_answer_puts_the_interval_back_to_five_seconds() {
     drop(workers);
 }
 
+/// How much before its time the pass may ask a worker again, so that a worker that is due at the
+/// next pass is asked at it.
+const ASKED_EARLY_BY: Duration = Duration::from_millis(250);
+
 /// KR-REQ-09.12: a worker that acknowledges a revision and sends no names with it is asked again
 /// at an interval that doubles, and stays pending.
 ///
@@ -306,8 +310,30 @@ async fn an_answer_puts_the_interval_back_to_five_seconds() {
 /// asks that failed are, ten seconds and then twenty after the one before, and not one for each
 /// pass for as long as the daemon runs. The worker is no more and no less pending than before, and
 /// no ask of this kind asks whether the worker has ended.
+///
+/// The case reads the instants the asks began at and measures the gaps between them: each ask comes
+/// no sooner than its pace allows, and it does come. It counts nothing at an instant of its own,
+/// since which pass an ask falls into depends on how long the asks before it took.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_acknowledgement_with_no_names_is_asked_again_at_a_doubling_interval() {
+    asked_again_at_a_doubling_interval(Duration::ZERO).await;
+}
+
+/// KR-REQ-09.12: the interval after an acknowledgement with no names is counted from the end of the
+/// ask, which here takes a second because the worker's link is not free.
+///
+/// The pass asks at its ticks, five seconds apart, so a second more in the first ask moves the
+/// second ask from the tick that is ten seconds after the first to the one after it, and the third
+/// with it. The asks still come at their paces, counted from where each ask ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_late_acknowledgement_with_no_names_is_asked_again_at_a_doubling_interval() {
+    asked_again_at_a_doubling_interval(Duration::from_secs(1)).await;
+}
+
+/// The two cases above: the worker acknowledges with no names, and the first ask of the pass takes
+/// `first_ask_takes` to be answered, the worker's link being held for that long when it is not
+/// nothing.
+async fn asked_again_at_a_doubling_interval(first_ask_takes: Duration) {
     let Adopted {
         host,
         owner: _,
@@ -327,33 +353,50 @@ async fn an_acknowledgement_with_no_names_is_asked_again_at_a_doubling_interval(
     let revision = barrier.authority_revision;
     worker.service.forget_evidence_for_tests(revision.get());
     let reconciled = host.controller().reconciliations_for_tests(session_id);
+    let link = if first_ask_takes.is_zero() {
+        None
+    } else {
+        Some(
+            host.controller()
+                .hold_a_worker_link_for_tests(session_id)
+                .await
+                .expect("the worker is reached"),
+        )
+    };
 
     until(DEBT_PASS_INTERVAL * 2 + SLACK, "the first ask", || {
         !asks_of(host.controller(), session_id).is_empty()
     })
     .await;
-    // Six passes after the first ask: one ask at each of them, or the first and two more.
-    tokio::time::sleep_until(
-        asks_of(host.controller(), session_id)[0] + DEBT_PASS_INTERVAL * 6 + Duration::from_secs(2),
-    )
-    .await;
-    let asks = asks_of(host.controller(), session_id);
-    assert_eq!(
-        asks.len(),
-        3,
-        "asks at the pass, then ten seconds after the first and twenty after the second: {:?}",
-        asks.iter().map(|at| *at - asks[0]).collect::<Vec<_>>()
-    );
-    assert!(
-        asks[1] - asks[0] >= Duration::from_secs(10) - Duration::from_millis(500),
-        "the second ask came {:?} after the first",
-        asks[1] - asks[0]
-    );
-    assert!(
-        asks[2] - asks[1] >= Duration::from_secs(20) - Duration::from_millis(500),
-        "the third ask came {:?} after the second",
-        asks[2] - asks[1]
-    );
+    // The first ask cannot end before this instant.
+    let mut not_ended_before = asks_of(host.controller(), session_id)[0];
+    if let Some(link) = link {
+        tokio::time::sleep(first_ask_takes).await;
+        not_ended_before = tokio::time::Instant::now();
+        drop(link);
+    }
+    // The wait after an acknowledgement with no names is ten seconds from the end of the ask, and
+    // twenty after the next.
+    let mut interval = Duration::from_secs(10);
+    for later in 1..=2 {
+        until(
+            interval + DEBT_PASS_INTERVAL + SLACK + first_ask_takes,
+            "the next ask, at the first pass after its time",
+            || asks_of(host.controller(), session_id).len() > later,
+        )
+        .await;
+        let asks = asks_of(host.controller(), session_id);
+        assert!(
+            asks[later] >= not_ended_before + interval - ASKED_EARLY_BY,
+            "ask {} came {:?} after the instant that the ask before it could not have ended before, \
+             and its wait was {interval:?}: {:?}",
+            later + 1,
+            asks[later] - not_ended_before,
+            asks.iter().map(|at| *at - asks[0]).collect::<Vec<_>>()
+        );
+        not_ended_before = asks[later];
+        interval *= 2;
+    }
     assert_eq!(
         host.controller().revision_pending().await.expect("a read"),
         vec![session_id],
