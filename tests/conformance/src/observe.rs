@@ -251,7 +251,7 @@ fn refusals(lines: impl Iterator<Item = String>) -> (Vec<Refusal>, Facts) {
             cause = None;
         }
         if trimmed.contains("exit status: 126")
-            || trimmed.contains("exit code: 126")
+            || trimmed.contains("(exit code: 126)")
             || trimmed.contains("(exit 126)")
         {
             saw_126 = true;
@@ -874,6 +874,12 @@ mod tests {
             ]));
             assert!(found.is_empty(), "{form}: {found:?}");
         }
+        // A Windows code that only begins with the digits of 126 is not the shell's.
+        let (found, _) = refusals(text(&[
+            "/t/a: /t/a: cannot execute binary file",
+            "process didn't exit successfully: `/t/a` (exit code: 1260)",
+        ]));
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
