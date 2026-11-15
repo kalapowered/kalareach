@@ -162,11 +162,11 @@ impl Alternatives {
 }
 
 impl fmt::Debug for Alternatives {
-    /// How many it named. Never one of them, which are the service's.
+    /// Whether it named any. Never one of them, which are the service's.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Alternatives")
-            .field("named", &self.items().len())
+            .field("named", &self.0.is_some())
             .finish()
     }
 }
@@ -256,12 +256,13 @@ mod tests {
         assert!(Alternatives::none().is_empty());
     }
 
-    /// KR-REQ-17.48: the list is the service's text, so its rendering names how many and never
-    /// what they say.
+    /// KR-REQ-17.48: the list is the service's text, so its rendering says whether it named any
+    /// and never what they say.
     #[test]
-    fn kr_req_17_48_a_rendering_of_the_alternatives_says_how_many_and_never_what() {
+    fn kr_req_17_48_a_rendering_of_the_alternatives_says_whether_it_named_any_and_never_what() {
         let rendered = format!("{:?}", Alternatives::named(vec![SEVEN[2].to_owned()]));
-        assert!(rendered.contains('1'));
+        assert!(rendered.contains("true"));
         assert!(!rendered.contains("revocation"));
+        assert!(format!("{:?}", Alternatives::none()).contains("false"));
     }
 }
