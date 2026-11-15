@@ -1171,8 +1171,10 @@ impl Controller {
             connections: Mutex::new(BTreeMap::new()),
             openings: std::sync::Mutex::new(BTreeMap::new()),
             task_holds: Arc::new(super::barrier::TaskHolds::default()),
-            #[cfg(any(test, feature = "testing"))]
-            between_the_task_counts: crate::attention::Pause::default(),
+            #[cfg(test)]
+            between_the_task_counts: super::barrier::TaskPause::default(),
+            #[cfg(test)]
+            before_a_task_leaves_the_count: super::barrier::TaskPause::default(),
             proxies: std::sync::Mutex::new(BTreeMap::new()),
             pending: Mutex::new(BTreeMap::new()),
             unwritten_failures: std::sync::Mutex::new(std::collections::BTreeSet::new()),
