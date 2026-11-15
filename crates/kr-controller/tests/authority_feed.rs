@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use kr_client::services::authority::{AuthorityFeedClient, AuthorityFeedState, RejectionReason};
 use kr_client::services::{HttpDeadlines, HttpService, ServiceHttp, managed_response_limits};
-use kr_controller::authority_feed::FeedRuntime;
+use kr_controller::authority_feed::{FEED_DEADLINES, FeedRuntime};
 use kr_controller::grants::restored::{self, Found};
 use kr_controller::service::Clocks;
 use kr_controller::service::net::{DEVICE_LIVE_CONNECTIONS, DEVICE_SILENT_FOR};
@@ -5326,6 +5326,11 @@ async fn a_connection_is_served_while_the_feed_holds_the_read_open_past_the_boun
     rig.runtime()
         .wait_for_a_synchronisation_at_most(Duration::from_millis(100));
 
+    // The feed's client gives a request up at deadlines that run in real time, and no clock of the
+    // rig moves them: a machine that stalls the case for longer than the shortest of them while the
+    // read is held finds the feed correctly unreachable. The case counts the real time from before
+    // the read is held, so from before the request can have been made.
+    let held_from = std::time::Instant::now();
     rig.served
         .web()
         .fail_with_member(AUTHORITY, "read", 1, Moment::Hold);
@@ -5337,9 +5342,25 @@ async fn a_connection_is_served_while_the_feed_holds_the_read_open_past_the_boun
     rig.doctor_as(&session)
         .await
         .expect("served while the feed still holds the read");
-    // The read is still held: a connection served after the host gave the read up would find the
-    // feed unreachable instead.
-    assert!(!rig.shown().await.list.feed_stale);
+    let shown = rig.shown().await;
+    let held_for = held_from.elapsed();
+    let check = shown.check.expect("the doctor reports the feed");
+    let deadlines = FEED_DEADLINES;
+    if held_for < deadlines.connect.min(deadlines.read).min(deadlines.total) {
+        // The read is still held, and the client cannot have given it up: a connection served
+        // after the host gave the read up would find the feed unreachable instead.
+        assert!(!shown.list.feed_stale, "{check:?}");
+    } else {
+        // The machine stalled the case for longer than the client waits, so either side of the
+        // deadline is right, and each must show what it is: the read held and the feed current, or
+        // the read given up and the feed unreachable.
+        let status = if shown.list.feed_stale {
+            DoctorStatus::Warning
+        } else {
+            DoctorStatus::Ok
+        };
+        assert_eq!(check.status, status, "{check:?}");
+    }
     rig.served.web().release_held();
 }
 
