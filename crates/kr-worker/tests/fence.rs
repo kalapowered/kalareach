@@ -4735,6 +4735,21 @@ async fn detach(
     kr_protocol::attachment::SessionDetachResult,
     kr_protocol::error::ProtocolError,
 > {
+    detach_after(client, wired, attachment_id, line_token, None).await
+}
+
+/// Calls `session.detach` with whatever this caller holds and the position of the typing that the
+/// detach follows.
+async fn detach_after(
+    client: &mut LocalClient,
+    wired: &Wired,
+    attachment_id: Nullable<AttachmentId>,
+    line_token: Nullable<String>,
+    after_input: Option<kr_protocol::input::InputBarrier>,
+) -> std::result::Result<
+    kr_protocol::attachment::SessionDetachResult,
+    kr_protocol::error::ProtocolError,
+> {
     client
         .mutate(
             Method::SessionDetach,
@@ -4743,7 +4758,7 @@ async fn detach(
             &kr_protocol::attachment::SessionDetachParams {
                 attachment_id,
                 line_token,
-                after_input: None,
+                after_input,
                 fenced_report: false,
             },
         )
@@ -4827,6 +4842,117 @@ async fn a_detach_that_names_nothing_removes_the_attachment_the_line_was_typed_f
             .session()
             .attachment_capabilities(typist)
             .is_none()
+    );
+    wired.close().await;
+}
+
+/// Types one line from a first attachment, which is given a capability for it, and then lets a
+/// second attachment take the keys. Returns the first attachment, the second and the capability.
+async fn a_line_with_a_capability_and_a_later_holder(
+    wired: &mut Wired,
+    client: &mut LocalClient,
+) -> (AttachmentId, AttachmentId, String) {
+    let typist = holder_over(client, wired).await;
+    let fence = fenced(wired, 1, 1).await;
+    accept(wired, &fence, typist).await;
+    let token = recorded_token(wired)
+        .await
+        .expect("a capability was minted for the line");
+    let later = holder_over(client, wired).await;
+    assert_ne!(later, typist);
+    (typist, later, token)
+}
+
+/// The position that a request of `attachment_id` counts at the lease's current epoch.
+fn barrier_at(
+    wired: &Wired,
+    attachment_id: AttachmentId,
+    count: u64,
+) -> kr_protocol::input::InputBarrier {
+    kr_protocol::input::InputBarrier {
+        attachment_id,
+        epoch: wired.runtime.session().lease().epoch,
+        count: U64::new(count),
+        launch: Nullable::null(),
+    }
+}
+
+/// KR-REQ-23.36, C21: a detach that presents a line's capability and a barrier that names another
+/// attachment than the one the capability resolves to is a definite refusal, whatever position the
+/// barrier counts: a request orders itself after its own typing and no one else's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detach_by_a_capability_whose_barrier_names_another_attachment_is_refused_and_detaches_nothing()
+ {
+    let mut wired = wired().await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let (typist, later, token) =
+        a_line_with_a_capability_and_a_later_holder(&mut wired, &mut client).await;
+
+    let refused = detach_after(
+        &mut client,
+        &wired,
+        Nullable::null(),
+        Nullable::some(token),
+        Some(barrier_at(&wired, later, 0)),
+    )
+    .await
+    .expect_err("the barrier names an attachment that the capability does not");
+    assert_eq!(refused.code, ErrorCode::InvalidArgument);
+    assert_eq!(
+        refused.message,
+        kr_worker::input_domain::POSITION_NAMES_ANOTHER
+    );
+    assert_eq!(
+        wired.runtime.session().attachments().len(),
+        2,
+        "nothing was detached"
+    );
+    assert!(
+        wired
+            .runtime
+            .session()
+            .attachment_capabilities(typist)
+            .is_some(),
+        "the attachment that the capability names stays"
+    );
+    wired.close().await;
+}
+
+/// KR-REQ-23.36: a detach that presents a line's capability and a barrier for the attachment that
+/// the capability resolves to is taken, also when the keys have moved to another attachment since.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detach_by_a_capability_whose_barrier_names_its_own_attachment_at_count_zero_is_taken() {
+    let mut wired = wired().await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let (typist, later, token) =
+        a_line_with_a_capability_and_a_later_holder(&mut wired, &mut client).await;
+
+    let detached = detach_after(
+        &mut client,
+        &wired,
+        Nullable::null(),
+        Nullable::some(token),
+        Some(barrier_at(&wired, typist, 0)),
+    )
+    .await
+    .expect("a position that names the capability's own attachment is taken");
+    assert_eq!(detached.attachment_id, typist);
+    assert_eq!(
+        wired.runtime.session().attachments().len(),
+        1,
+        "only the capability's attachment went"
+    );
+    assert!(
+        wired
+            .runtime
+            .session()
+            .attachment_capabilities(later)
+            .is_some(),
+        "the holder that came later stays"
     );
     wired.close().await;
 }
