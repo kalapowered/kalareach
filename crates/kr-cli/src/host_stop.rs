@@ -733,7 +733,9 @@ enum Asked {
     /// The daemon refused, and its word is that nothing was done.
     Refused(ProtocolError),
     /// The request could not be made: nothing was sent.
-    NotComposed(Shown),
+    /// The request could not be made: nothing was sent. `closed` is whether the daemon closed the
+    /// connection, which a daemon does when it goes.
+    NotComposed { why: Shown, closed: bool },
 }
 
 /// Sends the request, says that it left, and waits for its answer.
@@ -757,7 +759,12 @@ async fn ask(
         .await;
     let mutation = match composed {
         Ok(mutation) => mutation,
-        Err(error) => return Asked::NotComposed(Shown::ipc(&error)),
+        Err(error) => {
+            return Asked::NotComposed {
+                closed: matches!(error, kr_ipc::IpcError::PeerClosed),
+                why: Shown::ipc(&error),
+            };
+        }
     };
     // Set before the request is written: an interrupt from here on may find it taken.
     progress.enter(Stage::Asked);
@@ -874,9 +881,35 @@ async fn stop_the_daemon(
             progress.enter(Stage::Asked);
             (Knows::MaybeAsked, None, None, Some(said))
         }
-        Asked::NotComposed(why) => {
-            // The request was never made, so nothing left: there is no end to wait for.
+        Asked::NotComposed { why, closed } => {
+            // The request was never made, so nothing left and there is no stop to wait for. The
+            // daemon may have gone meanwhile, as it does when another command's stop has taken
+            // effect: its end is looked for once, within the one deadline. A daemon that stays is
+            // the unmade request's failure.
             progress.remove_marker();
+            let named = holder.as_ref().map(|holder| holder.pid.get());
+            if let Some(ended) = ended_before_the_request(
+                host,
+                &environment.paths,
+                info.generation,
+                holder.as_ref(),
+                closed,
+            )
+            .await
+            {
+                let facts = Facts {
+                    knows: Knows::Ended,
+                    pid: named,
+                    unsettled: None,
+                    records: none.records.clone(),
+                };
+                return done(
+                    &ended_before_the_request_said(id, named, ended, &why),
+                    &facts,
+                    json,
+                    earlier,
+                );
+            }
             return failed(
                 CliError::HostUnavailable(shown!(
                     "kr host stop could not make its request for the control daemon of \
@@ -975,6 +1008,55 @@ async fn stop_the_daemon(
                 },
                 &result(knows),
                 json,
+            )
+        }
+    }
+}
+
+/// Where the request could not be made, whether the daemon had ended when it could not be: the end,
+/// where the daemon's process has gone and the environment's lock is free or another control
+/// daemon holds it. A daemon that closed the connection is going, and a listener that is gone is
+/// waited for to its end within the one deadline, once. A daemon that did not close it and still
+/// answers at its endpoint stays, and nothing is waited for. A daemon that has not ended by the
+/// deadline is the failure's, and so is one whose end cannot be looked at.
+async fn ended_before_the_request(
+    host: &HostPaths,
+    environment: &EnvironmentPaths,
+    generation: ControllerGeneration,
+    old: Option<&ProcessStartIdentity>,
+    closed: bool,
+) -> Option<End> {
+    if !closed
+        && endpoint_look(environment, generation, startup::ANSWER_BOUND).await == Endpoint::Same
+    {
+        return None;
+    }
+    match wait_for_the_end(host, environment, generation, old, END_BOUND).await {
+        End::NotEnded(_) => None,
+        ended => Some(ended),
+    }
+}
+
+/// What the command says where the daemon had ended when its request could not be made: that it
+/// ended, why the request could not be made and that this command sent nothing. It says nothing of
+/// which came first, which the command did not see. Where something holds the environment now, the
+/// words are those of any end that finds a successor.
+fn ended_before_the_request_said(
+    id: EnvironmentId,
+    old: Option<u64>,
+    ended: End,
+    why: &Shown,
+) -> Shown {
+    match ended {
+        End::Successor(successor) => successor_said(id, old, successor, None),
+        _ => {
+            let process = old.map_or_else(|| Shown::said(""), |pid| shown!(" (process {})", pid));
+            shown!(
+                "The control daemon for environment {}{} ended, and this command could not make \
+                 its request for it: {}. This command sent nothing.",
+                id,
+                process,
+                *why
             )
         }
     }
