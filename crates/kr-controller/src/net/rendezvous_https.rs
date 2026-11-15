@@ -170,8 +170,9 @@ impl HttpsRendezvous {
     ///
     /// # Errors
     ///
-    /// Returns [`PairingError::RendezvousConfiguration`] or
-    /// [`PairingError::RendezvousUnavailable`], as this module's note describes.
+    /// Returns [`PairingError::RendezvousConfiguration`], [`PairingError::RendezvousUnavailable`]
+    /// or, when a budget is short and the service named the paths that still work,
+    /// [`PairingError::RendezvousCapacity`], as this module's note describes.
     pub async fn reserve(
         &self,
         origin: &RendezvousOrigin,
@@ -235,8 +236,9 @@ impl HttpsRendezvous {
     ///
     /// # Errors
     ///
-    /// Returns [`PairingError::RendezvousConfiguration`] or
-    /// [`PairingError::RendezvousUnavailable`], as this module's note describes. A record that is
+    /// Returns [`PairingError::RendezvousConfiguration`], [`PairingError::RendezvousUnavailable`]
+    /// or, when a budget is short and the service named the paths that still work,
+    /// [`PairingError::RendezvousCapacity`], as this module's note describes. A record that is
     /// already gone is refused like a token that does not match, which is the service being
     /// unavailable to this release.
     pub async fn release(
