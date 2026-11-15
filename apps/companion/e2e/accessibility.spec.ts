@@ -408,8 +408,11 @@ async function tap(page: Page, x: number, y: number): Promise<void> {
   }
   const state = await touchSession(page)
   state.at = Math.max(state.at + 1, Date.now() / 1000)
-  await state.session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }], timestamp: state.at })
-  await state.session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [], timestamp: state.at + 0.05 })
+  // Both events go at once: the protocol keeps their order, and the browser takes the release as soon as it has the press, not a round trip later.
+  await Promise.all([
+    state.session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }], timestamp: state.at }),
+    state.session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [], timestamp: state.at + 0.05 })
+  ])
 }
 
 /** A touch's tap at a point with the real time of the engine's own clock: the release is stamped when it happens. */
