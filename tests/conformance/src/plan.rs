@@ -375,25 +375,57 @@ pub const fn unrun_reason(platform: Platform) -> &'static str {
     }
 }
 
+/// Whether a step is the workspace's tests: the one command that builds and runs the tests of every
+/// package, which on a platform that has it is most of the plan's time and cannot be cut by count.
+fn runs_the_workspace(step: &Step) -> bool {
+    step.reading == Reading::Cargo && step.command.iter().any(|word| word == "--workspace")
+}
+
 /// The steps of one part of a platform's plan, for a plan that one job cannot hold and separate runs
 /// carry out in parts: the build steps that open the plan, which every part needs for the programs
 /// the suites start, and then the remaining steps, cut in order into parts of nearly equal count.
-/// `part` is the number of the part from 1 and the number of parts.
+/// A plan that holds the workspace's tests puts that step, with the opening builds, in part 1 by
+/// itself, and cuts the other steps into the remaining parts by count. `part` is the number of the
+/// part from 1 and the number of parts.
 #[must_use]
 pub fn part_of(steps: Vec<Step>, part: (usize, usize)) -> Vec<Step> {
     let (number, parts) = part;
+    let parts = parts.max(1);
     let opening = steps
         .iter()
         .take_while(|step| step.reading == Reading::Build)
         .count();
-    let rest = steps.len() - opening;
-    let from = opening + rest * number.saturating_sub(1) / parts.max(1);
-    let to = opening + rest * number / parts.max(1);
+    let alone = if parts > 1 {
+        steps
+            .iter()
+            .position(runs_the_workspace)
+            .filter(|index| *index >= opening)
+    } else {
+        None
+    };
+    let (share, shares) = if alone.is_some() {
+        (number.saturating_sub(1), parts - 1)
+    } else {
+        (number, parts)
+    };
+    let rest = steps.len() - opening - usize::from(alone.is_some());
+    let from = rest * share.saturating_sub(1) / shares;
+    let to = rest * share / shares;
+    let mut position = 0;
     steps
         .into_iter()
         .enumerate()
-        .filter(|(index, _)| *index < opening || (from..to).contains(index))
-        .map(|(_, step)| step)
+        .filter_map(|(index, step)| {
+            if index < opening || (alone == Some(index) && number == 1) {
+                return Some(step);
+            }
+            if alone == Some(index) {
+                return None;
+            }
+            let at = position;
+            position += 1;
+            (from..to).contains(&at).then_some(step)
+        })
         .collect()
 }
 
@@ -607,6 +639,15 @@ pub fn steps(
             Group::Phones => steps.extend(phones(platform, evidence)),
             _ => {}
         }
+    }
+    if platform == Platform::MacOs {
+        // The macOS plan is run in parts, and each part's suites launch the worker this plan
+        // builds, so its build steps open the plan, where [`part_of`] keeps them in every part.
+        let (builds, others): (Vec<Step>, Vec<Step>) = steps
+            .into_iter()
+            .partition(|step| step.reading == Reading::Build);
+        steps = builds;
+        steps.extend(others);
     }
     steps
 }
@@ -2408,6 +2449,131 @@ mod tests {
         assert_eq!(names((1, 2)), ["a", "b", "t0", "t1", "t2"]);
         assert_eq!(names((2, 2)), ["a", "b", "t3", "t4", "t5", "t6"]);
         assert_eq!(names((1, 1)).len(), steps.len());
+    }
+
+    fn step_of(what: &str, command: &[&str], reading: Reading) -> Step {
+        Step {
+            group: Group::Rust,
+            what: what.to_owned(),
+            command: command.iter().map(|word| (*word).to_owned()).collect(),
+            needs: Vec::new(),
+            reading,
+            filter: None,
+            skips: Vec::new(),
+        }
+    }
+
+    /// Cuts `plan` into `parts` parts and holds that every part opens with the plan's opening
+    /// builds and that the other steps of the parts are the plan's, each once.
+    fn holds_every_step_once(plan: &[Step], parts: usize) {
+        let opening = plan
+            .iter()
+            .take_while(|step| step.reading == Reading::Build)
+            .count();
+        let named = |step: &Step| format!("{} :: {}", step.what, step.line());
+        let mut seen = Vec::new();
+        for number in 1..=parts {
+            let part = part_of(plan.to_vec(), (number, parts));
+            assert!(part.len() >= opening, "part {number} of {parts}");
+            let (builds, others) = part.split_at(opening);
+            assert_eq!(
+                builds,
+                &plan[..opening],
+                "builds lead part {number}/{parts}"
+            );
+            seen.extend(others.iter().map(named));
+        }
+        let mut expected: Vec<String> = plan[opening..].iter().map(named).collect();
+        seen.sort();
+        expected.sort();
+        assert_eq!(seen, expected, "{parts} parts");
+    }
+
+    #[test]
+    fn the_workspace_tests_stand_alone_in_part_one_and_the_other_steps_are_cut_by_count() {
+        let mut steps = vec![
+            step_of("a", &["cargo", "build"], Reading::Build),
+            step_of("w", &["cargo", "test", "--workspace"], Reading::Cargo),
+        ];
+        steps.extend((0..7).map(|n| step_of(&format!("t{n}"), &["cargo", "test"], Reading::Cargo)));
+        let names = |part| -> Vec<String> {
+            part_of(steps.clone(), part)
+                .into_iter()
+                .map(|step| step.what)
+                .collect()
+        };
+        assert_eq!(names((1, 2)), ["a", "w"]);
+        assert_eq!(
+            names((2, 2)),
+            ["a", "t0", "t1", "t2", "t3", "t4", "t5", "t6"]
+        );
+        assert_eq!(names((1, 3)), ["a", "w"]);
+        assert_eq!(names((2, 3)), ["a", "t0", "t1", "t2"]);
+        assert_eq!(names((3, 3)), ["a", "t3", "t4", "t5", "t6"]);
+        assert_eq!(names((1, 1)).len(), steps.len());
+        for parts in 1..=3 {
+            holds_every_step_once(&steps, parts);
+        }
+    }
+
+    #[test]
+    fn the_macos_plan_opens_with_the_worker_build_and_keeps_the_workspace_tests_alone_in_part_one()
+    {
+        let applications = ApplicationsPlan {
+            left_out: Vec::new(),
+        };
+        let plan = steps(Platform::MacOs, &Group::ALL, "/tmp/e", Some(&applications));
+        assert_eq!(plan[0].reading, Reading::Build);
+        assert!(plan[0].command.iter().any(|word| word == "kr-worker"));
+        assert!(runs_the_workspace(&plan[1]), "{}", plan[1].line());
+        assert_eq!(
+            plan.iter()
+                .filter(|step| step.reading == Reading::Build)
+                .count(),
+            1
+        );
+        for parts in 1..=3 {
+            holds_every_step_once(&plan, parts);
+        }
+        assert_eq!(part_of(plan.clone(), (1, 2)), plan[..2]);
+        assert_eq!(part_of(plan.clone(), (1, 1)), plan);
+        let second = part_of(plan.clone(), (2, 2));
+        assert_eq!(second[0], plan[0]);
+        assert_eq!(second[1..], plan[2..]);
+    }
+
+    #[test]
+    fn a_plan_without_the_workspace_tests_is_cut_by_count_and_empty_groups_leave_empty_parts() {
+        for platform in [Platform::Linux, Platform::MacOs, Platform::Windows] {
+            let plan = steps(platform, &Group::ALL, "/tmp/e", None);
+            for parts in 1..=3 {
+                holds_every_step_once(&plan, parts);
+            }
+        }
+        let only_the_workspace = steps(Platform::MacOs, &[Group::Rust], "/tmp/e", None);
+        assert_eq!(only_the_workspace.len(), 1);
+        assert_eq!(
+            part_of(only_the_workspace.clone(), (1, 2)),
+            only_the_workspace
+        );
+        assert!(part_of(only_the_workspace, (2, 2)).is_empty());
+    }
+
+    #[test]
+    fn the_windows_plan_is_cut_into_the_two_parts_it_was_cut_into_before_the_workspace_rule() {
+        let plan = steps(Platform::Windows, &Group::ALL, "/tmp/e", None);
+        assert!(!plan.iter().any(runs_the_workspace));
+        let mut cut = String::new();
+        for number in 1..=2 {
+            cut.push_str(&format!("part {number}/2\n"));
+            for step in part_of(plan.clone(), (number, 2)) {
+                cut.push_str(&format!("{} :: {}\n", step.what, step.line()));
+            }
+        }
+        assert_eq!(
+            cut,
+            include_str!("../tests/fixtures/plan-parts/windows.txt")
+        );
     }
 
     #[test]

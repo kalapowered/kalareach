@@ -1,0 +1,104 @@
+part 1/2
+the control daemon, the worker, the forwarder and the plugin host the suites start, and the release tool whose header a case reads :: cargo build --locked -p kr-controller -p kr-worker -p kr-hook -p kr-plugin-host -p kr-release
+the description process the update suite assembles into releases :: cargo build --locked -p kr-describe-model --bin kr-describe-inference
+the terminal engine, the repository boundary, the attach client and pairing :: cargo test --locked -p kr-term -p kr-project -p kr-cli -- --show-output
+the Rust reader of the evidence directory :: cargo test --locked -p kr-test-artifacts -- --show-output
+the PowerShell and shell readers of the evidence directory :: cargo test --locked -p kr-conformance --test artifacts_readers -- --show-output
+the worker's library :: cargo test --locked -p kr-worker --lib -- --show-output
+the platform time adapter :: cargo test --locked -p kr-worker --test receipts -- --nocapture --exact the_platform_time_adapter_reads_this_machines_own_time_service every_recorded_platform_reading_classifies_the_way_the_fixture_states retrust_needs_the_host_time_authority_or_the_owner_and_never_a_paired_peer
+the protocol's library :: cargo test --locked -p kr-protocol --lib -- --show-output
+the binder, the channels, the connectors and the attention source :: cargo test --locked -p kr-worker --test binder --test channels --test connectors --test attention_source -- --show-output
+the configuration lock :: cargo test --locked -p kr-controller --lib config:: -- --show-output
+the bridge store's records :: cargo test --locked -p kr-controller --lib bridge::store:: -- --show-output
+the host environment a session takes :: cargo test --locked -p kr-controller --lib a_create_that_launches_nothing:: -- --show-output
+the attention inbox's transport :: cargo test --locked -p kr-controller --lib attention:: -- --show-output
+the decision a device reads :: cargo test --locked -p kr-controller --lib a_share_that_names_a_current_decision:: -- --show-output
+a read that meets a worker on its way out :: cargo test --locked -p kr-controller --lib service::a_read_that_meets_a_worker_on_its_way_out:: -- --show-output
+the device dispatch :: cargo test --locked -p kr-controller --lib service::net::dispatch::tests:: -- --show-output
+the daemon's attention, barrier, configuration and diagnostics :: cargo test --locked -p kr-controller --test attention --test barrier --test configuration --test network_host -- --show-output
+the forwarder :: cargo test --locked -p kr-hook -- --show-output
+the launch endpoint, the registration and the credential :: cargo test --locked -p kr-worker --test windows_endpoint -- --show-output
+the listener, the transport and the broker over the launch endpoint :: cargo test --locked -p kr-worker --test listener --test transport --test broker --test gateway -- --show-output
+the agent mutations through the dispatch path :: cargo test --locked -p kr-worker --test agent_service -- --show-output
+which handles a started process holds :: cargo test --locked -p kr-worker --test windows_inheritance -- --show-output
+the connector the worker reads from an installed package :: cargo test --locked -p kr-worker --test connectors -- --show-output
+what a launch reads of its application's mode :: cargo test --locked -p kr-worker --test launch_probe -- --show-output
+the command backends :: cargo test --locked -p kr-worker --test command_backends -- --show-output
+the forwarder's placeholder :: cargo test --locked -p kr-plugin-sdk --lib forwarder -- --show-output
+the command a typed name is looked up by :: cargo test --locked -p kr-shell-integration --lib host::command -- --show-output
+the terminal a session opens in :: cargo test --locked -p kr-shell-integration --lib host::terminal::tests::native_windows:: -- --nocapture
+the doctor's reading of the platform's command backends :: cargo test --locked -p kr-controller --lib catalogue::integrations -- --show-output
+the doctor's reading of the launch probes :: cargo test --locked -p kr-controller --lib catalogue::launch_probes -- --show-output
+the settings-sync store :: cargo test --locked -p kr-client --test sync -- --show-output
+a pseudo-console, PowerShell and the session job object :: cargo test --locked -p kr-worker --test windows -- --show-output
+a launched agent's helper placed by its job :: cargo test --locked -p kr-worker --test question_bindings -- --show-output
+the local endpoint, the descriptors and the process identity :: cargo test --locked -p kr-ipc --test windows -- --show-output
+the store of releases :: cargo test --locked -p kr-ipc --test install -- --show-output
+stopping a recorded process by its identity :: cargo test --locked -p kr-ipc --test stop -- --show-output
+what a pipe says of its peer :: cargo test --locked -p kr-ipc --test peer_gone -- --show-output
+the local IPC library :: cargo test --locked -p kr-ipc --lib -- --show-output
+the daemon's side of the description process, among it the cases that hold the process behind its job's memory limit :: cargo test --locked -p kr-describe --test supervise -- --show-output
+what a question's caller token reaches :: cargo test --locked -p kr-worker --test questions_answer -- --show-output
+controller and local authority at a worker's pipe :: cargo test --locked -p kr-worker --test authority -- --show-output
+the registry's records of a previous release's workers :: cargo test --locked -p kr-controller --lib registry -- --show-output
+the environment's singleton lock :: cargo test --locked -p kr-controller --lib singleton -- --show-output
+the environment's scheduled task, registered, read back and run :: cargo test --locked -p kr-controller --lib supervision::windows -- --show-output
+a start through the environment's scheduled task :: cargo test --locked -p kr-controller --test task_supervisor -- --show-output
+the plugin host started through the environment's scheduled task :: cargo test --locked -p kr-controller --test plugin_runtime_service -- --show-output
+the plugin host's launcher :: cargo test --locked -p kr-plugin-service --lib launcher:: -- --show-output
+the compile budget's reading of a thread's processor time :: cargo test --locked -p kr-plugin-runtime --test execution kr_req_11_41_the_budget_counts_the_compiling_threads_own_processor_time -- --show-output
+the plugin runtime's library :: cargo test --locked -p kr-plugin-runtime --lib -- --show-output
+the plugin runtime running real components :: cargo test --locked -p kr-plugin-runtime --test execution -- --show-output --skip kr_req_11_41_the_budget_counts_the_compiling_threads_own_processor_time
+the plugin runtime's service over a pipe :: cargo test --locked -p kr-plugin-runtime --test service -- --show-output
+part 2/2
+the control daemon, the worker, the forwarder and the plugin host the suites start, and the release tool whose header a case reads :: cargo build --locked -p kr-controller -p kr-worker -p kr-hook -p kr-plugin-host -p kr-release
+the description process the update suite assembles into releases :: cargo build --locked -p kr-describe-model --bin kr-describe-inference
+the control daemon started through the environment's scheduled task :: cargo test --locked -p kr-cli --test startup_windows -- --ignored --skip a_task_the_task_scheduler_does_not_start --show-output
+the attention store :: cargo test --locked -p kr-attention -- --show-output
+the client's stores and their directory flush :: cargo test --locked -p kr-client --lib -- --show-output
+the terminal input encoder :: cargo test --locked -p kr-keys -- --show-output
+the loopback listener a sign-in comes back to :: cargo test --locked -p kr-loopback -- --show-output
+the host's sign-in and sign-out through the daemon :: cargo test --locked -p kr-controller --test voice_broker sign -- --show-output
+the client and the command line held to the rendering rule :: cargo test --locked -p kr-client --test shown_rule -- --show-output
+the shared directory flush :: cargo test --locked -p kr-flush -- --show-output
+each store opens and reads what the previous holder committed while it still maps the index :: cargo test --locked -p kr-controller -p kr-changeset -p kr-delivery -p kr-describe -p kr-automation --lib a_previous_holder_that_is_letting_go -- --show-output
+a command node refused where no command can be run :: cargo test --locked -p kr-automation --test definitions a_command_node_is_refused_where_no_command_can_be_run -- --show-output
+a descendant keeps its causal root, depth and parent :: cargo test --locked -p kr-automation --test causal_budget a_descendant_takes_its_ancestry_from_the_node_that_produced_its_trigger -- --show-output
+a workflow does not retrigger on its own descendants by default :: cargo test --locked -p kr-automation --test causal_budget self_retrigger_is_refused_without_explicit_recurrence -- --show-output
+the contact skill's installer :: cargo test --locked -p kr-controller --lib agent_tools -- --show-output
+the contact skill installed and removed through the daemon :: cargo test --locked -p kr-controller --test agent_tools --test contact_skill -- --show-output
+the directory secret store and the libsodium boundary :: cargo test --locked -p kr-crypto -- --show-output
+the libsodium boundary in the release profile :: cargo test --locked --release -p kr-crypto -- --show-output
+the machine group record :: cargo test --locked -p kr-controller --lib machine -- --show-output
+the plugin catalogue's package store :: cargo test --locked -p kr-plugin-catalogue -- --show-output
+plugins installed through the daemon's catalogue :: cargo test --locked -p kr-controller --test catalogue -- --show-output
+the PowerShell bridge client over a named pipe :: cargo test --locked -p kr-shell-integration --test pwsh_windows -- --show-output
+the PowerShell package a Windows host publishes :: cargo test --locked -p kr-shell-integration --test pwsh_windows_package -- --show-output
+the reference bridge over a real endpoint :: cargo test --locked -p kr-shell-integration --lib host::scripted:: -- --show-output
+the repository boundary :: cargo test --locked -p kr-project --test boundary -- --show-output
+what an apply carries across :: cargo test --locked -p kr-changeset --test apply -- --show-output
+filesystem authority and access-control lists :: cargo test --locked -p kr-transfer --lib --test authority -- --show-output
+a collection key kept in this machine's credential store :: cargo test --locked -p kr-client --lib -- --ignored --exact sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again --show-output
+the persistence suite :: cargo test --locked -p kr-worker --test persistence -- --show-output
+the archive's cleanup of a crashed session :: cargo test --locked -p kr-controller --test archive -- --show-output
+the project and workspace methods through the daemon :: cargo test --locked -p kr-controller --test project -- --show-output
+a paired device's project methods :: cargo test --locked -p kr-controller --test network_project -- --show-output
+the session snapshot suite :: cargo test --locked -p kr-worker --test snapshot -- --show-output
+the terminal suite :: cargo test --locked -p kr-worker --test terminal -- --show-output
+the session suite :: cargo test --locked -p kr-worker --test session -- --show-output
+the local owner suite :: cargo test --locked -p kr-worker --test local_owner -- --show-output
+the input lease suite :: cargo test --locked -p kr-worker --test input_lease -- --show-output
+the fence suite :: cargo test --locked -p kr-worker --test fence -- --show-output
+the desktop suite :: cargo test --locked -p kr-worker --test desktop -- --show-output
+the worker's performance suite :: cargo test --locked -p kr-worker --test performance -- --show-output
+the shell suite :: cargo test --locked -p kr-controller --test shell -- --show-output
+the privacy suite :: cargo test --locked -p kr-controller --test privacy -- --show-output
+the descriptions suite :: cargo test --locked -p kr-controller --test descriptions -- --show-output
+the refusal of a native bridge recipe :: cargo test --locked -p kr-controller --test native_bridge -- --show-output
+how a session's closure reaches its attachments :: cargo test --locked -p kr-worker --test closure -- --show-output
+the daemon ended during output :: cargo test --locked -p kr-worker --test controller_kill -- --show-output
+the decisions a membership lease gives :: cargo test --locked -p kr-controller --test grants --test organisation -- --show-output
+an expired membership on a live connection :: cargo test --locked -p kr-controller --test network -- --ignored --exact a_members_running_subscription_ends_with_its_lease_and_a_new_lease_serves_the_device_again a_members_read_and_mutation_are_refused_on_a_connection_that_stays_up_once_its_lease_ends an_exclusive_host_holds_its_local_owner_to_a_lease_at_the_worker_and_at_the_daemon ending_exclusive_management_serves_the_local_owner_without_a_lease_and_turning_it_on_closes_it_again a_shorter_renewal_ends_the_local_owners_access_at_the_worker_when_the_new_lease_does --show-output
+the recovery bundle store and its write record :: cargo test --locked -p kr-client --test recovery -- --show-output
+the host's events reaching a real window :: cargo test --locked -p companion-tauri --test host_events -- --show-output
+the real-worker host tests, through the environment's scheduled task :: cargo test --locked -p kr-worker --test host -- --show-output
