@@ -540,6 +540,14 @@ impl HostAccount {
         self.inner.waiting.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Whether a change of the account has begun and not ended, for a test that waits for a
+    /// sign-out to be past its early asks and on its way to the account's hold.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn is_being_changed(&self) -> bool {
+        *self.inner.changing.borrow()
+    }
+
     /// Holds every request for a token at the gate a change of the account raises, until the
     /// returned guard is dropped, for a test that needs a call to be waiting for its token.
     #[cfg(feature = "testing")]
@@ -852,8 +860,10 @@ impl HostAccount {
     /// moved off the managed broker signs out all the same: the account service it keeps its grant
     /// for does not depend on the broker.
     ///
-    /// `stands` is asked before the waiting sign-in is ended and again before the grant is removed,
-    /// because the waits between them can outlast the request's authority.
+    /// `stands` is asked before the waiting sign-in is ended, again once the account is settled, and
+    /// a last time under the account's own hold, immediately before the revocation is queued and the
+    /// grant deleted, because each wait between them can outlast the request's authority: a token
+    /// refresh keeps that hold across its request to the service.
     ///
     /// # Errors
     ///
@@ -886,14 +896,17 @@ impl HostAccount {
             })?;
         self.still_stands(stands).await?;
         let _change = self.inner.begin_change()?;
-        let done = held
-            .signed_in
-            .sign_out()
-            .await
-            .map_err(|error| ControllerError::Storage {
-                operation: "sign this host out",
-                detail: error.to_string(),
-            })?;
+        // The account's own hold can be kept across a token refresh's request to the service, and
+        // the change waits for it. The last ask is made under that hold, immediately before the
+        // revocation is queued and the grant deleted.
+        let done =
+            held.signed_in
+                .sign_out(stands)
+                .await
+                .map_err(|error| ControllerError::Storage {
+                    operation: "sign this host out",
+                    detail: error.to_string(),
+                })??;
         // What came of earlier attempts says nothing about a host with no account.
         self.inner.state.lock().expect("the sign-in state").last = None;
         Ok(AccountSignedOut {

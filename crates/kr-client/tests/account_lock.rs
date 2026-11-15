@@ -171,7 +171,11 @@ fn child_process() {
             "sign-out" => {
                 wait_for(&directory.join("refresh-started"));
                 let account = account_that_announces(&directory, &origin);
-                let out = account.sign_out().await.expect("a sign-out");
+                let out = account
+                    .sign_out(|| Ok::<(), ()>(()))
+                    .await
+                    .expect("a sign-out")
+                    .expect("nothing refuses it");
                 println!("signout {} {}", out.was_signed_in, out.service_told);
                 std::fs::write(directory.join("signed-out"), b"").expect("a marker");
             }

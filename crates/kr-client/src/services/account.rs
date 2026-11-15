@@ -2633,8 +2633,11 @@ impl SignedInAccount {
             Ok(identity) if identity.subject != grant.subject => {
                 // Only the grant the read was for is undone, and only while it is still here.
                 if self
-                    .remove_grant(Some(&grant.grant_id))
+                    .remove_grant(Some(&grant.grant_id), || {
+                        Ok::<(), std::convert::Infallible>(())
+                    })
                     .await?
+                    .unwrap_or_else(|never| match never {})
                     .was_signed_in
                 {
                     Ok(IdentityRead::Disagreed)
@@ -2661,18 +2664,36 @@ impl SignedInAccount {
     /// Signs this device out: the grant is removed at once and its revocation queued, then every
     /// queued revocation is sent.
     ///
+    /// `stands` is asked under the account's hold, immediately before the revocation is queued and
+    /// the grant is deleted. The hold can be kept by a token refresh across its request to the
+    /// service, so whatever the caller checked before calling has had that wait to go stale; the
+    /// answer given here is the last one before the change. Where it refuses, nothing is removed,
+    /// queued or sent, and the refusal is returned.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the store cannot be changed; the device is then still signed in.
-    pub async fn sign_out(&self) -> Result<SignOut> {
-        self.remove_grant(None).await
+    /// Returns an error when the store cannot be changed; the device is then still signed in. The
+    /// inner result is `stands`'s refusal.
+    pub async fn sign_out<E>(
+        &self,
+        stands: impl FnOnce() -> std::result::Result<(), E>,
+    ) -> Result<std::result::Result<SignOut, E>> {
+        self.remove_grant(None, stands).await
     }
 
     /// Removes the grant, or only the grant `only` names while it is still the one here, queues
-    /// its revocation, then sends every queued revocation.
-    async fn remove_grant(&self, only: Option<&str>) -> Result<SignOut> {
+    /// its revocation, then sends every queued revocation. `stands` is asked under the hold, before
+    /// anything changes.
+    async fn remove_grant<E>(
+        &self,
+        only: Option<&str>,
+        stands: impl FnOnce() -> std::result::Result<(), E>,
+    ) -> Result<std::result::Result<SignOut, E>> {
         let was_signed_in = {
             let _held = self.hold().await?;
+            if let Err(refusal) = stands() {
+                return Ok(Err(refusal));
+            }
             match self.read_grant()? {
                 Some(grant) if only.is_none_or(|id| id == grant.grant_id) => {
                     self.queue(&grant.grant_id, grant.refresh_token.clone())?;
@@ -2685,10 +2706,10 @@ impl SignedInAccount {
             }
         };
         let remaining = self.send_pending().await?;
-        Ok(SignOut {
+        Ok(Ok(SignOut {
             was_signed_in,
             service_told: remaining == 0,
-        })
+        }))
     }
 
     /// Settles what an earlier run left: a grant whose own revocation is queued was being signed

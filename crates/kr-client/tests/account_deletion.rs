@@ -1448,7 +1448,11 @@ async fn a_closed_deletion_is_shown_to_the_page_that_follows_it_and_to_no_page_t
         DeletionProgress::None,
         "the other account is not told about it, even by a page that follows it"
     );
-    rig.account.sign_out().await.expect("and out");
+    rig.account
+        .sign_out(|| Ok::<(), ()>(()))
+        .await
+        .expect("and out")
+        .expect("nothing refuses it");
     rig.wire.then([recorded("status_open")]);
     assert_eq!(
         rig.deletion

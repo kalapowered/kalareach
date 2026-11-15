@@ -1302,7 +1302,7 @@ async fn a_sign_out_during_a_refresh_waits_and_revokes_the_rotated_token() {
     }
     let signing_out = {
         let signed_in = Arc::clone(&signed_in);
-        tokio::spawn(async move { signed_in.sign_out().await })
+        tokio::spawn(async move { signed_in.sign_out(|| Ok::<(), ()>(())).await })
     };
     tokio::task::yield_now().await;
     assert!(
@@ -1314,7 +1314,11 @@ async fn a_sign_out_during_a_refresh_waits_and_revokes_the_rotated_token() {
         .await
         .expect("a task")
         .expect("the refresh finished first");
-    let signed_out = signing_out.await.expect("a task").expect("a sign-out");
+    let signed_out = signing_out
+        .await
+        .expect("a task")
+        .expect("a sign-out")
+        .expect("nothing refuses it");
     assert!(signed_out.was_signed_in);
     assert!(signed_out.service_told);
     assert_eq!(
@@ -1384,7 +1388,11 @@ async fn recovery_keeps_a_later_sign_in_while_an_earlier_revocation_is_pending()
         .await
         .expect("A");
     stub.revoke_works.store(false, Ordering::SeqCst);
-    let out = signed_in.sign_out().await.expect("a sign-out");
+    let out = signed_in
+        .sign_out(|| Ok::<(), ()>(()))
+        .await
+        .expect("a sign-out")
+        .expect("nothing refuses it");
     assert!(out.was_signed_in && !out.service_told);
     signed_in
         .commit(issued_for("account-1", "grant-b", &["openid"]), "b-nonce")
@@ -2098,7 +2106,11 @@ async fn a_token_only_memory_holds_is_counted_as_waiting() {
         None,
         "the queue holds nothing of the token"
     );
-    let signed_out = signed_in.sign_out().await.expect("a sign-out");
+    let signed_out = signed_in
+        .sign_out(|| Ok::<(), ()>(()))
+        .await
+        .expect("a sign-out")
+        .expect("nothing refuses it");
     assert!(
         !signed_out.service_told,
         "a sign-out does not say the service was told when a token is still waiting"
@@ -2422,7 +2434,11 @@ async fn a_sign_out_with_the_service_unreachable_signs_out_here_and_sends_later(
         .await
         .expect("a sign-in");
     stub.revoke_works.store(false, Ordering::SeqCst);
-    let out = signed_in.sign_out().await.expect("a sign-out");
+    let out = signed_in
+        .sign_out(|| Ok::<(), ()>(()))
+        .await
+        .expect("a sign-out")
+        .expect("nothing refuses it");
     assert!(out.was_signed_in);
     assert!(!out.service_told);
     assert_eq!(
