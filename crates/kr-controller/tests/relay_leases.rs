@@ -1740,7 +1740,7 @@ async fn a_host_that_signed_out_does_not_replace_a_lease_on_another_relay() {
     rig.host
         .controller()
         .host_account()
-        .sign_out()
+        .sign_out(&|| Ok(()))
         .await
         .expect("the host signs out");
     let asked = rig.requests_for(&owner);
@@ -2943,7 +2943,7 @@ async fn a_host_that_signed_out_does_not_ask_for_the_lease_the_service_ended() {
     rig.host
         .controller()
         .host_account()
-        .sign_out()
+        .sign_out(&|| Ok(()))
         .await
         .expect("the host signs out");
     rig.served.web().end_relay_lease(&first.lease_id);
@@ -3374,7 +3374,7 @@ async fn an_aged_row_stays_while_the_host_is_signed_out() {
     rig.host
         .controller()
         .host_account()
-        .sign_out()
+        .sign_out(&|| Ok(()))
         .await
         .expect("the host signs out");
     let asked = rig.requests(ISSUE);

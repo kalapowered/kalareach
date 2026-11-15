@@ -235,7 +235,17 @@ struct Accounts {
     running: tokio::sync::Mutex<Option<Running>>,
     /// The origin of the storage service the person runs, once the host has an account at it.
     storage_origin: std::sync::OnceLock<String>,
+    /// Where this host's own tests stop a sign-in or a sign-out where it asks whether the request
+    /// it serves still stands, so that the authority can change in between. Compiled away in every
+    /// shipped build.
+    #[cfg(feature = "testing")]
+    before_it_asks_whether_it_stands: crate::service::ReadPause,
 }
+
+/// Whether the request that asked for a change of the account still stands: the check every
+/// service asks of the admission its request carries, asked again where the change is about to
+/// land, after the waits that come first.
+pub type Stands<'a> = &'a (dyn Fn() -> Result<()> + Send + Sync);
 
 /// The managed calls on this host, as the account needs to know them.
 pub trait Calls: Send + Sync {
@@ -347,6 +357,8 @@ impl HostAccount {
         let accounts = Arc::new(Accounts {
             running: tokio::sync::Mutex::new(None),
             storage_origin: std::sync::OnceLock::new(),
+            #[cfg(feature = "testing")]
+            before_it_asks_whether_it_stands: crate::service::ReadPause::default(),
         });
         Self::build(store, environment_id, service, refused, accounts, None)
     }
@@ -722,15 +734,46 @@ impl HostAccount {
         }
     }
 
+    /// Asks `stands`, after the waits a change has made and before the effect it goes on to. A
+    /// request whose authority was withdrawn, or whose deadline passed, while it waited for a call
+    /// to settle, for a sign-in to end or for the service changes nothing.
+    async fn still_stands(&self, stands: Stands<'_>) -> Result<()> {
+        #[cfg(feature = "testing")]
+        self.inner
+            .accounts
+            .before_it_asks_whether_it_stands
+            .wait()
+            .await;
+        stands()
+    }
+
+    /// Arms the pause the next sign-in or sign-out stops at where it asks whether its request still
+    /// stands, which each does before it ends a waiting sign-in and again before its change lands.
+    /// Returns the end that says the call has arrived, and the end that lets it go. The pause fires
+    /// once.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_it_asks_whether_it_stands(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.inner.accounts.before_it_asks_whether_it_stands.arm()
+    }
+
     /// Starts a sign-in: ends the one that is waiting, whichever account it is of, listens for the
     /// browser's answer and returns when the daemon is ready for it. The address the person opens is in
     /// [`Self::report`].
     ///
+    /// `stands` is asked before the waiting sign-in is ended and again before this one is shown as
+    /// waiting, because the waits between them can outlast the request's authority.
+    ///
     /// # Errors
     ///
     /// Returns why no sign-in can start: this host presents its account to no service, a sign-in is
-    /// finishing, a managed call is open, or another program holds the loopback address.
-    pub async fn sign_in(&self) -> Result<AccountSignInStarted> {
+    /// finishing, a managed call is open, another program holds the loopback address, or the request
+    /// no longer stands.
+    pub async fn sign_in(&self, stands: Stands<'_>) -> Result<AccountSignInStarted> {
         let held = self.inner.presenting()?;
         if self.inner.a_call_is_open_after_settling().await {
             return Err(Inner::call_is_open());
@@ -742,6 +785,7 @@ impl HostAccount {
             older.not_finishing()?;
         }
         self.inner.not_finishing()?;
+        self.still_stands(stands).await?;
         if let Some(older) = running.take() {
             older.end().await;
         }
@@ -769,6 +813,7 @@ impl HostAccount {
                 });
             }
         };
+        self.still_stands(stands).await?;
         let request = AuthorisationRequest::asking_at_origin(
             &held.origin,
             Client::Desktop,
@@ -807,19 +852,23 @@ impl HostAccount {
     /// moved off the managed broker signs out all the same: the account service it keeps its grant
     /// for does not depend on the broker.
     ///
+    /// `stands` is asked before the waiting sign-in is ended and again before the grant is removed,
+    /// because the waits between them can outlast the request's authority.
+    ///
     /// # Errors
     ///
     /// Returns why the host cannot sign out: it cannot reach the account service, a sign-in is
-    /// finishing, a managed call is open, or the store could not be changed (the host then keeps
-    /// the grant, unless only its deletion failed after its revocation was queued, in which case
-    /// the next start removes it).
-    pub async fn sign_out(&self) -> Result<AccountSignedOut> {
+    /// finishing, a managed call is open, the request no longer stands, or the store could not be
+    /// changed (the host then keeps the grant, unless only its deletion failed after its
+    /// revocation was queued, in which case the next start removes it).
+    pub async fn sign_out(&self, stands: Stands<'_>) -> Result<AccountSignedOut> {
         let held = self.inner.service()?;
         if self.inner.a_call_is_open_after_settling().await {
             return Err(Inner::call_is_open());
         }
         let mut running = self.inner.accounts.running.lock().await;
         self.inner.not_finishing()?;
+        self.still_stands(stands).await?;
         // Only this account's waiting sign-in ends with its sign-out.
         if running
             .as_ref()
@@ -835,6 +884,7 @@ impl HostAccount {
                 operation: "settle this host's account before signing it out",
                 detail,
             })?;
+        self.still_stands(stands).await?;
         let _change = self.inner.begin_change()?;
         let done = held
             .signed_in

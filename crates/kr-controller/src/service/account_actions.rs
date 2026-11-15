@@ -232,9 +232,13 @@ impl Controller {
     pub(super) async fn account_storage_sign_in(
         &self,
         mutation: &kr_protocol::envelope::MutationRequest,
+        carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
         let _: AccountSignInParams = parse(&mutation.params)?;
-        let started = self.own_storage_account()?.sign_in().await?;
+        let started = self
+            .own_storage_account()?
+            .sign_in(&|| self.check_registration(&carried))
+            .await?;
         ParamsValue::from_typed(&started)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }
@@ -250,9 +254,13 @@ impl Controller {
     pub(super) async fn account_storage_sign_out(
         &self,
         mutation: &kr_protocol::envelope::MutationRequest,
+        carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
         let _: AccountSignOutParams = parse(&mutation.params)?;
-        let done = self.own_storage_account()?.sign_out().await?;
+        let done = self
+            .own_storage_account()?
+            .sign_out(&|| self.check_registration(&carried))
+            .await?;
         ParamsValue::from_typed(&done)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }
@@ -279,9 +287,13 @@ impl Controller {
     pub(super) async fn account_sign_in(
         &self,
         mutation: &kr_protocol::envelope::MutationRequest,
+        carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
         let _: AccountSignInParams = parse(&mutation.params)?;
-        let started = self.account.sign_in().await?;
+        let started = self
+            .account
+            .sign_in(&|| self.check_registration(&carried))
+            .await?;
         ParamsValue::from_typed(&started)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }
@@ -294,9 +306,13 @@ impl Controller {
     pub(super) async fn account_sign_out(
         &self,
         mutation: &kr_protocol::envelope::MutationRequest,
+        carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
         let _: AccountSignOutParams = parse(&mutation.params)?;
-        let done = self.account.sign_out().await?;
+        let done = self
+            .account
+            .sign_out(&|| self.check_registration(&carried))
+            .await?;
         ParamsValue::from_typed(&done)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }

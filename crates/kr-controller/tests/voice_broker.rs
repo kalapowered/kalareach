@@ -1392,7 +1392,7 @@ async fn an_open_call_holds_the_managed_account_and_not_the_storage_account() {
     let storage = host.controller().storage_account();
     storage.listen_on("127.0.0.1:0".parse().expect("an address"));
     storage
-        .sign_in()
+        .sign_in(&|| Ok(()))
         .await
         .expect("the storage account's sign-in is not held by the call");
 
@@ -1590,6 +1590,202 @@ async fn a_sign_out_ends_the_sign_in_that_is_waiting() {
             .all(|request| !request.path.starts_with("/auth/")),
         "no code was exchanged"
     );
+    host.stop().await;
+}
+
+/// A sign-in at the host's local socket, and what the daemon answers.
+async fn try_sign_in(host: &net_support::Host) -> Result<(), ProtocolError> {
+    host.client()
+        .await
+        .mutate(
+            Method::AccountSignIn,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &AccountSignInParams {},
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .map(|_| ())
+}
+
+/// Runs `call` to the place a sign-in or a sign-out asks whether its request still stands, owes
+/// this host a fence there, lets the call go, and returns what it answered. With `second` the call
+/// is let go of the first of its two asks and stopped at the second, where its change is about to
+/// land.
+async fn answered_with_a_fence_owed_at_the_ask<T>(
+    host: &net_support::Host,
+    second: bool,
+    call: impl std::future::Future<Output = T>,
+) -> T {
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+    let account = host.controller().host_account();
+    let (arrived, go) = account.pause_before_it_asks_whether_it_stands();
+    let (answered, ()) = tokio::join!(call, async {
+        tokio::time::timeout(WAIT, arrived)
+            .await
+            .expect("the call reaches its ask")
+            .expect("the pause is armed");
+        if second {
+            let (again, go_again) = account.pause_before_it_asks_whether_it_stands();
+            go.send(()).expect("the call goes on");
+            tokio::time::timeout(WAIT, again)
+                .await
+                .expect("the call reaches its second ask")
+                .expect("the pause is armed");
+            host.controller().hold_fence(true);
+            go_again.send(()).expect("the call goes on");
+        } else {
+            host.controller().hold_fence(true);
+            go.send(()).expect("the call goes on");
+        }
+    });
+    host.controller().hold_fence(false);
+    answered
+}
+
+/// KR-REQ-09.09: a sign-out waits for the call to settle and for the sign-in that waits, and asks
+/// the admission it carries again before it ends that sign-in. A fence this host comes to owe in
+/// the wait stops it: the sign-in that waits is not ended and the sign-out is refused. The control:
+/// with no fence the same sign-out ends the sign-in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_out_that_meets_a_fence_before_it_ends_a_waiting_sign_in_ends_nothing() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    listen_for_sign_ins(&host);
+    let _waiting = start_sign_in(&host).await;
+
+    let refused = answered_with_a_fence_owed_at_the_ask(
+        &host,
+        false,
+        sign_out_as(&host, ActionId::new(kr_ipc::new_uuid())),
+    )
+    .await
+    .expect_err("a sign-out under a fence this host owes is refused");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "{refused:?}"
+    );
+    assert!(
+        matches!(
+            account_report(&host).await.state,
+            AccountState::WaitingForBrowser { .. }
+        ),
+        "the sign-in that waits is not ended"
+    );
+
+    sign_out(&host).await;
+    assert_eq!(account_report(&host).await.state, AccountState::SignedOut);
+    host.stop().await;
+}
+
+/// KR-REQ-09.09: a sign-out asks the admission it carries again after its waits, before it removes
+/// the grant. A fence this host comes to owe at that place stops it: the grant stays and the host
+/// stays signed in. The control: with no fence the same sign-out removes the grant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_out_that_meets_a_fence_before_it_removes_the_grant_removes_nothing() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    sign_in_with(&host, broker.issue_grant(600)).await;
+
+    let refused = answered_with_a_fence_owed_at_the_ask(
+        &host,
+        true,
+        sign_out_as(&host, ActionId::new(kr_ipc::new_uuid())),
+    )
+    .await
+    .expect_err("a sign-out under a fence this host owes is refused");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "{refused:?}"
+    );
+    assert!(
+        matches!(
+            account_report(&host).await.state,
+            AccountState::SignedIn { .. }
+        ),
+        "the grant is still held"
+    );
+
+    assert!(sign_out(&host).await.was_signed_in);
+    assert_eq!(account_report(&host).await.state, AccountState::SignedOut);
+    host.stop().await;
+}
+
+/// KR-REQ-09.09: a sign-in asks the admission it carries again before it ends the sign-in that
+/// waits. A fence this host comes to owe in the wait stops it: the earlier sign-in is not ended and
+/// the new one does not start. The control: with no fence the new sign-in takes the earlier one's
+/// place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_that_meets_a_fence_before_it_ends_a_waiting_sign_in_ends_nothing() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    listen_for_sign_ins(&host);
+    let (_, earlier) = start_sign_in(&host).await;
+
+    let refused = answered_with_a_fence_owed_at_the_ask(&host, false, try_sign_in(&host))
+        .await
+        .expect_err("a sign-in under a fence this host owes is refused");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "{refused:?}"
+    );
+    let AccountState::WaitingForBrowser {
+        redirect_address, ..
+    } = account_report(&host).await.state
+    else {
+        panic!("the earlier sign-in is still waiting");
+    };
+    assert_eq!(redirect_address, earlier, "and it is the earlier one");
+
+    try_sign_in(&host).await.expect("with no fence it starts");
+    let AccountState::WaitingForBrowser {
+        redirect_address, ..
+    } = account_report(&host).await.state
+    else {
+        panic!("the new sign-in waits");
+    };
+    assert_ne!(
+        redirect_address, earlier,
+        "and it took the earlier one's place"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-09.09: a sign-in asks the admission it carries again once it has the address the browser
+/// comes back to, before it shows itself as waiting. A fence this host comes to owe in between stops
+/// it: the host is not left waiting for a browser. The control: with no fence the same sign-in waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_that_meets_a_fence_before_it_waits_for_the_browser_does_not_wait() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    listen_for_sign_ins(&host);
+
+    let refused = answered_with_a_fence_owed_at_the_ask(&host, true, try_sign_in(&host))
+        .await
+        .expect_err("a sign-in under a fence this host owes is refused");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "{refused:?}"
+    );
+    assert_eq!(account_report(&host).await.state, AccountState::SignedOut);
+
+    try_sign_in(&host).await.expect("with no fence it starts");
+    assert!(matches!(
+        account_report(&host).await.state,
+        AccountState::WaitingForBrowser { .. }
+    ));
     host.stop().await;
 }
 

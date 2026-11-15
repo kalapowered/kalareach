@@ -472,7 +472,7 @@ async fn a_daemon_started_over_a_document_it_cannot_use_keeps_the_account_local(
         Some(SignInUnavailable::NotUsable)
     );
     let refused = account
-        .sign_in()
+        .sign_in(&|| Ok(()))
         .await
         .expect_err("a sign-in is refused over a document the host cannot use");
     assert!(
@@ -480,7 +480,7 @@ async fn a_daemon_started_over_a_document_it_cannot_use_keeps_the_account_local(
             if text.contains("config.json")),
         "the refusal names the document: {refused:?}"
     );
-    let done = tokio::time::timeout(WATCHDOG, account.sign_out())
+    let done = tokio::time::timeout(WATCHDOG, account.sign_out(&|| Ok(())))
         .await
         .expect("the sign-out ends")
         .expect("the grant is removed here");
