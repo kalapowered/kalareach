@@ -176,9 +176,9 @@ impl Controller {
                     .closed_by_voice(proposal, session_id, &closed.value)
                     .await)
             }
-            Ok(Ok(Err(error))) => {
+            Ok(Ok(Err(refused))) => {
                 lets_go_at(hold, deadline, &self.clock);
-                Err(error)
+                Err(refused.error)
             }
             Ok(Err(_)) | Err(_) => {
                 lets_go_at(hold, deadline, &self.clock);
