@@ -68,13 +68,20 @@ struct EvidenceBudget {
 }
 
 impl EvidenceBudget {
-    /// Whether one more exchange, which takes [`WORKER_EXCHANGE`] at most, ends before the
-    /// collection must be over.
-    fn has_time_for_an_exchange(&self) -> bool {
-        self.until.is_none_or(|until| {
-            until.saturating_duration_since(tokio::time::Instant::now()) >= WORKER_EXCHANGE
-        })
+    /// Whether no more exchange may be made: the pages are used, or too little time is left for
+    /// one.
+    fn is_spent(&self) -> bool {
+        self.pages == 0 || !has_time_for_an_exchange(self.until)
     }
+}
+
+/// Whether one more exchange, which takes [`WORKER_EXCHANGE`] at most, ends before `until`, the
+/// instant a caller that bounds the whole of its work must be done by. Without a bound there is
+/// always time.
+pub(super) fn has_time_for_an_exchange(until: Option<tokio::time::Instant>) -> bool {
+    until.is_none_or(|until| {
+        until.saturating_duration_since(tokio::time::Instant::now()) >= WORKER_EXCHANGE
+    })
 }
 
 /// How many more times an announcement may ask again for a page a worker refused for now, and how
@@ -985,14 +992,14 @@ impl Controller {
         // for, its pages as well as its first, out of the same budget. They are older than this
         // revision, which the worker acknowledged, so asking makes it fence nothing.
         for earlier in self.leases.unasked_before(session_id, revision) {
-            if budget.pages == 0 {
+            if budget.is_spent() {
                 return;
             }
             self.collect_fence_evidence(session_id, binding, earlier, &mut budget, retries, true)
                 .await;
         }
         for older in self.leases.evidence_outstanding(session_id, revision) {
-            if budget.pages == 0 {
+            if budget.is_spent() {
                 return;
             }
             self.collect_fence_evidence(session_id, binding, older, &mut budget, retries, false)
@@ -1132,7 +1139,7 @@ impl Controller {
                 // the wire, and the link with it, which stops the renewal of the lease of a worker
                 // that has acknowledged. Nothing has been sent yet, so the link goes back whole
                 // and the pass that collects names asks for what is left.
-                if !budget.has_time_for_an_exchange() {
+                if !has_time_for_an_exchange(budget.until) {
                     link.give_back();
                     return;
                 }
@@ -1903,6 +1910,27 @@ impl Controller {
         Ok(pending)
     }
 
+    /// Asks one worker for its acknowledgement of the revision in force, as every caller that
+    /// bounds an ask does, and says what came of it. The ask began at `began` and is over
+    /// [`PASS_ASK_BOUND`] later: the exchange, the names an acknowledgement leaves and every wait
+    /// between them. One deadline serves both ends of that, the limit on the whole ask and the
+    /// instant the collection of names gives the link back at, so that no exchange is on the wire
+    /// when the bound ends: the names an ask gives up are asked for by the pass's collection, and
+    /// what is cut is never lost.
+    pub(super) async fn ask_within_the_bound(
+        self: &Arc<Self>,
+        session_id: SessionId,
+        began: tokio::time::Instant,
+    ) -> Asked {
+        let deadline = began + PASS_ASK_BOUND;
+        tokio::time::timeout_at(
+            deadline,
+            self.ask_worker_revision(session_id, Some(deadline)),
+        )
+        .await
+        .map_or(Asked::Failed, |asked| asked.unwrap_or(Asked::Failed))
+    }
+
     /// Asks the workers that have not acknowledged the revision in force, those whose pace
     /// ([`AskPace`]) allows it at `tick`, and settles the fence this host owes once none is pending.
     ///
@@ -1947,16 +1975,7 @@ impl Controller {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push((session_id, began));
-                // The whole ask is bounded, the exchange and what follows an answer: the names an
-                // acknowledgement leaves are asked for by the pass beside it when it is cut, so
-                // what is cut is never lost.
-                let deadline = began + PASS_ASK_BOUND;
-                let asked = tokio::time::timeout_at(
-                    deadline,
-                    self.ask_worker_revision(session_id, Some(deadline)),
-                )
-                .await
-                .map_or(Asked::Failed, |asked| asked.unwrap_or(Asked::Failed));
+                let asked = self.ask_within_the_bound(session_id, began).await;
                 (session_id, asked, began, tokio::time::Instant::now())
             });
             for (session_id, asked, began, ended) in all_at_once(asks).await {

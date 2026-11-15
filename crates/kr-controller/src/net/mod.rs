@@ -2522,9 +2522,11 @@ impl Controller {
     /// lease, and the link is good, so it goes back and the next ask meets the worker's own
     /// attempt at its boundary on the same link instead of opening one that waits there.
     ///
-    /// A caller that bounds the whole ask gives the instant its bound ends as `until`, so that the
-    /// collection of the names an acknowledgement leaves does not begin an exchange that the bound
-    /// would cut ([`Self::collect_owed_evidence`]).
+    /// A caller that bounds the whole ask gives the instant its bound ends as `until`, so that no
+    /// exchange of the ask begins that the bound would cut: neither the first, which the waits
+    /// before it count against, nor those of the names an acknowledgement leaves
+    /// ([`Self::collect_owed_evidence`]). Each begins only with an exchange's time left, and its own
+    /// limit ends at or before `until`.
     ///
     /// # Errors
     ///
@@ -2571,13 +2573,24 @@ impl Controller {
         })?;
         // The bound covers the whole exchange, including waiting for this worker's connection:
         // another operation may be holding it, and a wait that only started once it was free would
-        // not be a bound at all.
+        // not be a bound at all. The waits above have counted against a caller's bound already, so
+        // the exchange's own limit ends at or before the instant that bound ends.
+        let limit = tokio::time::Instant::now() + ACKNOWLEDGEMENT_TIMEOUT;
+        let limit = until.map_or(limit, |until| limit.min(until));
         let exchange = async {
             // The link is taken out of the shared slot for the exchange and goes back only when it
             // ended in an answer. A cancelled exchange, this one running out of time, would
             // otherwise leave a connection in the slot with an acknowledgement still on the wire,
             // and the next caller would read somebody else's answer as its own.
             let mut link = self.worker_client(&worker).await?;
+            // An announcement that the caller's bound would cut is dropped with the link, which
+            // stops the renewal of the lease of a worker that has acknowledged before. Nothing has
+            // been sent yet, so with less than an exchange's time left the link goes back whole:
+            // the ask has run out, as it does when the bound cuts a wait.
+            if !super::barrier::has_time_for_an_exchange(until) {
+                link.give_back();
+                return Ok(Told::Failed);
+            }
             // The first page of whatever its fence named: this worker has said nothing about this
             // revocation yet, so there is nothing to continue from.
             let told = self
@@ -2588,7 +2601,7 @@ impl Controller {
             }
             Ok::<_, ControllerError>(told)
         };
-        let told = match tokio::time::timeout(ACKNOWLEDGEMENT_TIMEOUT, exchange).await {
+        let told = match tokio::time::timeout_at(limit, exchange).await {
             Ok(Ok(told)) => told,
             // A worker that did not answer, or that could not be reached, has not installed the
             // revision. Renewal stops for it until it does: the link it was reached over gave up
