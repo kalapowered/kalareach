@@ -18,6 +18,7 @@ use kr_protocol::method::Method;
 use kr_protocol::pairing::{KeyPurpose, RevocationCompletion, RevocationRequest, RevocationTarget};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{KeyId, Nullable, TimestampMs, U64};
+use kr_transport::clock::ContinuousInstant;
 
 use super::revocation::Audience;
 use super::{Controller, FeedStanding};
@@ -793,20 +794,23 @@ impl Controller {
     }
 
     /// Writes down a successful synchronisation, and, for a host under a bounded offline-validity
-    /// policy, extends the bound from it.
-    pub(crate) fn authority_feed_synchronised(&self) {
+    /// policy, extends the bound from it. It returns the instant on the continuous clock that the
+    /// synchronisation was recorded at, which the carrier counts its next poll from.
+    pub(crate) fn authority_feed_synchronised(&self) -> ContinuousInstant {
         let now = self.wall_now_ms();
-        {
+        let on = {
             let mut feed = self.authority_feed();
             // The instant is read under the feed's guard, as a status's reading is, so that no
             // reader's instant is earlier than the one recorded here.
-            feed.synchronised(now, self.clock.now());
+            let on = self.clock.now();
+            feed.synchronised(now, on);
             if let Err(error) = self.keep_feed(&mut feed) {
                 eprintln!(
                     "kr-controller: could not write the authority feed's record down: {error}"
                 );
             }
-        }
+            on
+        };
         if self.policy().offline_validity().is_some()
             && let Err(error) = self.update_policy(|policy| policy.note_feed_synchronised(now))
         {
@@ -815,6 +819,7 @@ impl Controller {
                  {error}"
             );
         }
+        on
     }
 
     /// Notes that the feed could not be reached or read through, so what is shown is stale.

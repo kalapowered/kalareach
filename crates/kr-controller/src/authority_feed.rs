@@ -99,7 +99,7 @@ pub const GATE_WAIT: Duration = Duration::from_secs(5);
 
 /// How often the carrier reads the daemon's continuous clock while it waits to ask the feed again.
 ///
-/// The timer a wait is made by does not count the time a machine sleeps on every platform, so the
+/// The timer a wait is made by does not count the time a machine sleeps on macOS and Linux, so the
 /// wait is also over when the continuous clock has passed its end. A machine that slept through a
 /// wait therefore asks again within this long of waking.
 const CLOCK_LOOK: Duration = Duration::from_secs(5);
@@ -430,6 +430,9 @@ struct Shared {
     looks: Mutex<Arc<dyn Timer>>,
     /// How many passes have finished, for whatever waits on one.
     passes: tokio::sync::watch::Sender<u64>,
+    /// What a suite has the next pass run right after it records its synchronisation.
+    #[cfg(feature = "testing")]
+    after_the_record: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Shared {
@@ -670,6 +673,8 @@ impl FeedRuntime {
                 controller: OnceLock::new(),
                 looks: Mutex::new(looks),
                 passes: tokio::sync::watch::channel(0).0,
+                #[cfg(feature = "testing")]
+                after_the_record: Mutex::new(None),
             }),
             timer,
             task: Mutex::new(None),
@@ -774,6 +779,18 @@ impl FeedRuntime {
             .looks
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = timer;
+    }
+
+    /// Runs `then` once, right after the next pass records its synchronisation and before the pass
+    /// returns to the carrier: where a suite about a machine that slept while the record was
+    /// written moves its clocks.
+    #[cfg(feature = "testing")]
+    pub fn after_the_next_record(&self, then: impl FnOnce() + Send + 'static) {
+        *self
+            .shared
+            .after_the_record
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(then));
     }
 
     /// Shortens what a connection waits for a synchronisation, for a suite that holds the feed's
@@ -1256,6 +1273,8 @@ async fn drive(shared: Arc<Shared>, timer: Arc<dyn Timer>) {
             return;
         };
         let mut chained = false;
+        // The instant the pass recorded its synchronisation at, when it recorded one.
+        let mut recorded = None;
         let wait = if shared.removed.load(Ordering::SeqCst) {
             None
         } else if let Some(owed) = shared.quiet.owed() {
@@ -1263,11 +1282,15 @@ async fn drive(shared: Arc<Shared>, timer: Arc<dyn Timer>) {
             Some(owed.left)
         } else {
             match pass(&shared, &controller).await {
-                Ok(Pass::Read) => {
+                Ok(Pass::Read(at)) => {
+                    recorded = Some(at);
                     backoff = Backoff::default();
                     Some(Duration::from_millis(FEED_POLL_INTERVAL_MS))
                 }
-                Ok(Pass::Unfinished) => Some(backoff.next_delay()),
+                Ok(Pass::Unfinished(at)) => {
+                    recorded = Some(at);
+                    Some(backoff.next_delay())
+                }
                 Ok(Pass::More) => {
                     chained = true;
                     None
@@ -1285,8 +1308,10 @@ async fn drive(shared: Arc<Shared>, timer: Arc<dyn Timer>) {
             }
         };
         // The wait is counted on the daemon's continuous clock as well as by the timer, which
-        // does not count the time the machine sleeps on every platform.
-        let began = controller.continuous_now();
+        // does not count the time the machine sleeps on macOS and Linux. A wait after a pass that
+        // recorded a synchronisation begins at the instant it recorded, so that a sleep between
+        // that record and this point counts; a wait after a pass that recorded none begins now.
+        let began = recorded.unwrap_or_else(|| controller.continuous_now());
         let owed = shared.quiet.owed();
         drop(controller);
         if chained {
@@ -1327,12 +1352,13 @@ async fn drive(shared: Arc<Shared>, timer: Arc<dyn Timer>) {
 
 /// A wait between two passes, as the daemon's continuous clock counts it.
 struct Wait {
-    /// When the wait began.
+    /// What the wait is counted from: the instant the pass before it recorded its synchronisation
+    /// at, or, after a pass that recorded none, the instant the wait began.
     began: ContinuousInstant,
     /// How long it is.
     duration: Duration,
     /// The delay the service named when it began, if one was owed: it is counted on the timer's
-    /// clock, which does not count the time the machine sleeps on every platform.
+    /// clock, which does not count the time the machine sleeps on macOS and Linux.
     owed: Option<Owed>,
 }
 
@@ -1369,10 +1395,12 @@ async fn until_the_continuous_clock_ends(shared: &Shared, looks: &dyn Timer, wai
 /// How a pass ended when it did not fail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pass {
-    /// The feed was read through, and everything in it settled.
-    Read,
-    /// The feed was read, and something it holds is not settled yet: a barrier still running.
-    Unfinished,
+    /// The feed was read through, and everything in it settled. It carries the instant on the
+    /// continuous clock that the pass recorded its synchronisation at.
+    Read(ContinuousInstant),
+    /// The feed was read, and something it holds is not settled yet: a barrier still running. It
+    /// carries the instant that the pass recorded its synchronisation at.
+    Unfinished(ContinuousInstant),
     /// The feed was read as far as a pass reads, and the scan goes on at once where this stopped;
     /// or it was read through while the host caught up with it, and a new scan begins at once to
     /// judge what that put off.
@@ -1685,11 +1713,22 @@ async fn pass(
     // still pending in the workers is carried out, and a withdrawal this host cannot verify raises
     // the refusal that its own wait keeps up.
     shared.observed().stopped = None;
-    controller.authority_feed_synchronised();
+    let recorded = controller.authority_feed_synchronised();
+    #[cfg(feature = "testing")]
+    {
+        let then = shared
+            .after_the_record
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(then) = then {
+            then();
+        }
+    }
     Ok(if unfinished {
-        Pass::Unfinished
+        Pass::Unfinished(recorded)
     } else {
-        Pass::Read
+        Pass::Read(recorded)
     })
 }
 

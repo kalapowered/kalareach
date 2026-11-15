@@ -4700,6 +4700,55 @@ async fn a_carrier_that_slept_through_its_wait_reads_the_feed_within_five_second
     assert_eq!(check.status, DoctorStatus::Ok, "{check:?}");
 }
 
+/// KR-REQ-10.46: a machine that slept after a pass recorded its synchronisation, while the record
+/// was written down, asks the feed again within five seconds of waking. The poll's wait ends one
+/// poll after the instant the pass recorded, and not one poll after the carrier came to wait: a
+/// feed that answers every poll does not read stale for a whole poll after a long sleep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_machine_that_slept_after_a_pass_recorded_its_synchronisation_asks_the_feed_within_five_seconds()
+ {
+    let (moved, clocks) = Moved::new();
+    let rig = Rig::start_on(clocks).await;
+    let looks = HeldTimer::held();
+    rig.runtime().count_looks_by(Arc::clone(&looks) as _);
+    // The machine sleeps five minutes between the pass's record and the carrier's wait.
+    rig.runtime().after_the_next_record({
+        let moved = moved.clone();
+        move || moved.advance_continuous(Duration::from_secs(5 * 60))
+    });
+    rig.poll().await;
+    assert!(
+        rig.shown().await.list.feed_stale,
+        "the control: the sleep came after the record, so the record is five minutes old"
+    );
+    let wakes = rig.runtime().wakes();
+    let reads = rig.arrivals("read");
+    let mut passes = rig.runtime().passes();
+    let seen = *passes.borrow_and_update();
+
+    // The first look after the sleep finds the end of the poll behind the clock, and a pass begins.
+    let release = a_look("the carrier looks at the clock", &looks).await;
+    release.notify_one();
+    soon("the pass the sleep owed", async {
+        while rig.arrivals("read") == reads || *passes.borrow_and_update() <= seen {
+            passes.changed().await.expect("the carrier is running");
+        }
+    })
+    .await;
+    assert_eq!(
+        rig.runtime().wakes(),
+        wakes,
+        "nothing woke the carrier: the look did"
+    );
+    let shown = rig.shown().await;
+    assert!(
+        !shown.list.feed_stale,
+        "the pass read the feed, and the status is current after it"
+    );
+    let check = shown.check.expect("the doctor reports the feed");
+    assert_eq!(check.status, DoctorStatus::Ok, "{check:?}");
+}
+
 /// KR-REQ-10.46: the delay a feed named is counted on the timer's clock, which does not count the
 /// time a machine sleeps on macOS and Linux either. A machine that slept past it asks the feed again
 /// within five seconds of waking, and does not wait out what the timer's clock still holds of it.
@@ -4719,6 +4768,9 @@ async fn a_carrier_that_slept_past_a_delay_the_feed_named_reads_the_feed_within_
             retry_after_seconds: Some(120),
         },
     );
+    // The machine has run five minutes since the last record. A failed pass records nothing, so
+    // its wait is counted from its own end: from the last record it would be over at once.
+    moved.advance_continuous(Duration::from_secs(5 * 60));
     rig.poll().await;
     assert!(
         rig.shown().await.list.feed_stale,
