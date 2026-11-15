@@ -7785,6 +7785,7 @@ async fn a_detach_is_taken_to_have_acted_unless_it_was_refused_before_it_could()
                 outcome,
             },
             retained: false,
+            link_fenced: false,
         }))
     };
     let error = |code: ErrorCode| answered(Outcome::Error(ProtocolError::new(code, "the step")));

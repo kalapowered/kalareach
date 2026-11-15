@@ -175,6 +175,11 @@ pub struct Forwarded {
     /// present view authority over the subject before it returns either half of a retained
     /// result. Keeping the two apart here is what lets the dispatcher make that check.
     pub retained: bool,
+    /// Whether the answer carried the refusal of the link itself
+    /// ([`kr_protocol::error::ProtocolError::link_fenced`]), which is taken off the response and
+    /// ends the link. An error with the mark can follow a worker having accepted what it was sent,
+    /// so it does not show that the request was refused.
+    pub link_fenced: bool,
 }
 
 /// What a link to a worker is opened for, which decides whether its session's closure ends it.
@@ -482,6 +487,33 @@ impl WorkerProxy {
         history: Option<&HistoryScope>,
         still_admitted: &(dyn Fn() -> Result<()> + Sync),
     ) -> Result<Response> {
+        // A read is a read whichever way the worker answered it, so the marker means nothing here.
+        Ok(self
+            .forward_read_whole(
+                request,
+                actor,
+                authority_deadline_boot_ms,
+                history,
+                still_admitted,
+            )
+            .await?
+            .response)
+    }
+
+    /// Forwards one admitted read as [`Self::forward_read`] does and returns the answer whole, with
+    /// whether it carried the refusal of the link itself.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::forward_mutation`].
+    pub async fn forward_read_whole(
+        &self,
+        request: &Request,
+        actor: &ActorEnvelope,
+        authority_deadline_boot_ms: Nullable<U64>,
+        history: Option<&HistoryScope>,
+        still_admitted: &(dyn Fn() -> Result<()> + Sync),
+    ) -> Result<Forwarded> {
         let request_id = self.next_request_id();
         let mut forwarded = request.clone();
         forwarded.request_id = request_id;
@@ -491,11 +523,7 @@ impl WorkerProxy {
             authority_deadline_boot_ms,
             history: history.cloned(),
         }));
-        // A read is a read whichever way the worker answered it, so the marker means nothing here.
-        Ok(self
-            .call(request_id, &frame, still_admitted)
-            .await?
-            .response)
+        self.call(request_id, &frame, still_admitted).await
     }
 
     /// Calls one read on this link as the daemon itself, for its own housekeeping.
@@ -745,6 +773,7 @@ async fn read_loop(
                     Forwarded {
                         response,
                         retained: false,
+                        link_fenced: spent,
                     },
                     spent,
                 );
@@ -760,6 +789,7 @@ async fn read_loop(
                 Forwarded {
                     response: *response,
                     retained: true,
+                    link_fenced: false,
                 },
                 false,
             ),

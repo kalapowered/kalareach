@@ -10,22 +10,25 @@
 
 mod net_support;
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use kr_controller::service::net::SerialAnswer;
 use kr_controller::service::net::devices::DeviceRecord;
 use kr_protocol::attachment::{
-    AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult, SessionDetachParams,
+    AttachMode, AttachmentCapability, GeometryState, SessionAttachParams, SessionAttachResult,
+    SessionDetachParams, SessionDetachResult,
 };
 use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Response};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::{StreamHeader, StreamKind, StreamResource};
 use kr_protocol::ids::{
-    ActionId, AttachmentId, InputLeaseEpoch, InputSequence, RequestId, SessionId,
+    ActionId, AttachmentId, GeometryEpoch, InputLeaseEpoch, InputSequence, RequestId, SessionId,
 };
 use kr_protocol::input::{
-    InputAck, InputAcquireParams, InputAcquireResult, InputBarrier, InputFrame, InputReleaseParams,
-    input_claim,
+    InputAck, InputAcquireParams, InputAcquireResult, InputBarrier, InputFrame, InputLeaseResult,
+    InputLeaseState, InputReleaseParams, InputWriteResult, input_claim,
 };
 use kr_protocol::local::{InputLaneReady, LaneEnded, LaneLaunch, LaneWindow};
 use kr_protocol::method::Method;
@@ -3011,6 +3014,17 @@ struct Sent {
 /// Sends `request` as the device does, with a barrier that names `epoch` and `count` of the typing
 /// it follows. A refusal by the position check is asserted to be the conflict that it gives.
 async fn send_after(rig: &Rig, request: Dependent, epoch: InputLeaseEpoch, count: u64) -> Sent {
+    send_asking(rig, request, epoch, count, false).await
+}
+
+/// As [`send_after`], for a device that sets `fenced_report` on a release or a detach as given.
+async fn send_asking(
+    rig: &Rig,
+    request: Dependent,
+    epoch: InputLeaseEpoch,
+    count: u64,
+    fenced_report: bool,
+) -> Sent {
     let barrier = Some(InputBarrier {
         attachment_id: rig.attachment,
         epoch,
@@ -3035,7 +3049,7 @@ async fn send_after(rig: &Rig, request: Dependent, epoch: InputLeaseEpoch, count
                         attachment_id: rig.attachment,
                         epoch: rig.epoch,
                         after_input: barrier,
-                        fenced_report: false,
+                        fenced_report,
                     },
                 )
                 .await
@@ -3050,7 +3064,7 @@ async fn send_after(rig: &Rig, request: Dependent, epoch: InputLeaseEpoch, count
                         attachment_id: Nullable::some(rig.attachment),
                         line_token: Nullable::null(),
                         after_input: barrier,
-                        fenced_report: false,
+                        fenced_report,
                     },
                 )
                 .await
@@ -3321,5 +3335,601 @@ async fn a_release_after_a_thousand_distinct_keys_is_forwarded_and_one_key_more_
         released.answer
     );
     assert_eq!(position_refusals(&rig), 1);
+    rig.stop().await;
+}
+
+// A worker that does not state the input lane is served by the host one call at a time over its
+// link, and a worker that does is sent the barrier and asked for the count.
+
+impl Rig {
+    /// A rig whose worker does not state the input lane: the host serves its typing over the link
+    /// that carries the worker's other requests, one call at a time.
+    async fn start_serial() -> Self {
+        let rig = Self::start().await;
+        rig.adopted.host.network().use_no_input_lane();
+        rig
+    }
+}
+
+/// The calls a stand-in for the worker was given, in the order it was given them, and the most it
+/// had at once.
+#[derive(Default)]
+struct Calls {
+    sequences: Mutex<Vec<u64>>,
+    now: AtomicU64,
+    peak: AtomicU64,
+}
+
+impl Calls {
+    fn sequences(&self) -> Vec<u64> {
+        self.sequences.lock().expect("not poisoned").clone()
+    }
+
+    fn started(&self) -> usize {
+        self.sequences.lock().expect("not poisoned").len()
+    }
+
+    fn peak(&self) -> u64 {
+        self.peak.load(Ordering::SeqCst)
+    }
+}
+
+/// The answer of a worker that takes a frame.
+fn took() -> SerialAnswer {
+    SerialAnswer::Answered(Outcome::Ok(
+        ParamsValue::from_typed(&InputWriteResult {
+            sequence: InputSequence::new(0),
+            forwarded_bytes: U64::new(1),
+            held_prefix_bytes: U64::new(0),
+        })
+        .expect("a result"),
+    ))
+}
+
+/// The answer of a worker that gives `code`, with no mark of the link.
+fn gives(code: ErrorCode) -> SerialAnswer {
+    SerialAnswer::Answered(Outcome::Error(ProtocolError::new(
+        code,
+        "the worker's words",
+    )))
+}
+
+/// Has the host's calls to the worker answered by `answer`, which is given each frame's sequence.
+/// Every call waits for a permit of `gate` first, when there is one.
+fn script_calls(
+    rig: &Rig,
+    gate: Option<Arc<tokio::sync::Semaphore>>,
+    answer: impl Fn(u64) -> SerialAnswer + Send + Sync + 'static,
+) -> Arc<Calls> {
+    let calls = Arc::new(Calls::default());
+    let record = Arc::clone(&calls);
+    rig.adopted
+        .host
+        .network()
+        .input_stages()
+        .script_serial_calls(move |params| {
+            let sequence = params.sequence.get();
+            let answer = answer(sequence);
+            let record = Arc::clone(&record);
+            let gate = gate.clone();
+            async move {
+                record
+                    .sequences
+                    .lock()
+                    .expect("not poisoned")
+                    .push(sequence);
+                let now = record.now.fetch_add(1, Ordering::SeqCst) + 1;
+                record.peak.fetch_max(now, Ordering::SeqCst);
+                if let Some(gate) = gate {
+                    gate.acquire().await.expect("the gate stands").forget();
+                }
+                record.now.fetch_sub(1, Ordering::SeqCst);
+                answer
+            }
+        });
+    calls
+}
+
+/// Writes frames 0 to 2 on a stream of a worker without the lane whose answer to frame 1 is
+/// `answer` and to the others is that it took them, and reads what the host tells the device until
+/// the stream ends. A device that is to be answered for all it wrote finishes its stream when
+/// `finish` is true.
+async fn typed_three_with(
+    answer: SerialAnswer,
+    finish: bool,
+) -> (
+    Rig,
+    Arc<Calls>,
+    Vec<InputAck>,
+    kr_transport::Result<Option<InputAck>>,
+) {
+    let rig = Rig::start_serial().await;
+    let calls = script_calls(&rig, None, move |sequence| {
+        if sequence == 1 {
+            answer.clone()
+        } else {
+            took()
+        }
+    });
+    let stream = rig.open().await;
+    let (mut reader, mut writer) = stream.split();
+    for sequence in 0..3 {
+        // A stream that the host has reset may refuse a late write, which is not what a case reads.
+        let _ = writer.write_message(&rig.frame(sequence, b"k")).await;
+    }
+    if finish {
+        drop(writer);
+    }
+    let mut told = Vec::new();
+    let ended = loop {
+        match next_on(&mut reader).await {
+            Ok(Some(ack)) => told.push(ack),
+            ended => break ended,
+        }
+    };
+    (rig, calls, told, ended)
+}
+
+/// A worker refuses frame 1 with `code` before it could accept it: the device is told once, in the
+/// worker's code, with the prefix that was accepted; the frame is never sent again and the frames
+/// behind it are not sent; and the stream ends cleanly when the device finishes it.
+async fn a_refusal_is_told_and_final(code: ErrorCode) {
+    let (rig, calls, told, ended) = typed_three_with(gives(code), true).await;
+    assert!(
+        matches!(ended, Ok(None)),
+        "the stream ends cleanly: {ended:?}"
+    );
+    let refusals: Vec<&InputAck> = told
+        .iter()
+        .filter(|ack| matches!(ack, InputAck::Refused { .. }))
+        .collect();
+    assert_eq!(refusals.len(), 1, "the refusal is told once: {told:?}");
+    match refusals[0] {
+        InputAck::Refused {
+            epoch,
+            sequence,
+            accepted_through,
+            error,
+        } => {
+            assert_eq!(*epoch, rig.epoch);
+            assert_eq!(sequence.get(), 1);
+            assert_eq!(accepted_through.0.map(InputSequence::get), Some(0));
+            assert_eq!(error.code, code);
+        }
+        other => panic!("a refusal was expected: {other:?}"),
+    }
+    assert_eq!(
+        calls.sequences(),
+        vec![0, 1],
+        "the refused frame is sent once and nothing after it is sent"
+    );
+    rig.stop().await;
+}
+
+/// A worker's answer to frame 1 leaves it unknown whether the worker took the frame: the device is
+/// told nothing of the frame, the stream is reset, and nothing is sent again.
+async fn an_uncertain_frame_cuts_the_stream(answer: SerialAnswer) {
+    let (rig, calls, told, ended) = typed_three_with(answer, false).await;
+    assert!(ended.is_err(), "the stream is reset: {ended:?}");
+    assert!(
+        told.iter()
+            .all(|ack| matches!(ack, InputAck::Accepted { through, .. } if through.get() == 0)),
+        "the device is told of the first frame only, and not refused for the second: {told:?}"
+    );
+    assert_eq!(
+        calls.sequences(),
+        vec![0, 1],
+        "the frame is not sent again and nothing after it is sent"
+    );
+    rig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_without_the_lane_takes_typing_one_call_at_a_time() {
+    let rig = Rig::start_serial().await;
+    let mut stream = rig.open().await;
+    // Printable keys, since the worker's terminal is a real one: a control byte can end it.
+    let keys: Vec<Vec<u8>> = (0..20).map(|n| format!("k{n:02}").into_bytes()).collect();
+    send_all(&rig, &mut stream, &keys).await;
+    assert_eq!(
+        rig.adopted
+            .host
+            .network()
+            .input_stages()
+            .counts()
+            .unanswered_peak,
+        1,
+        "one call is outstanding at a time"
+    );
+    assert!(rig.lane.frames().is_empty(), "no lane was opened");
+    rig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_frame_is_not_sent_while_the_first_waits_for_its_answer() {
+    let rig = Rig::start_serial().await;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let calls = script_calls(&rig, Some(Arc::clone(&gate)), |_| took());
+    let mut stream = rig.open().await;
+    for sequence in 0..4 {
+        stream
+            .write_message(&rig.frame(sequence, b"k"))
+            .await
+            .expect("the frame is written");
+    }
+    until("the first call is made", || calls.started() == 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(calls.started(), 1, "no second call while the first waits");
+    assert_eq!(
+        rig.adopted.host.network().input_stages().counts().read,
+        1,
+        "the host reads no second frame while a call is outstanding"
+    );
+    gate.add_permits(4);
+    read_until_accepted(&mut stream, 3).await;
+    assert_eq!(
+        calls.sequences(),
+        vec![0, 1, 2, 3],
+        "each frame once, in order"
+    );
+    assert_eq!(calls.peak(), 1, "one call at a time");
+    rig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_for_room_is_final_and_not_retried() {
+    a_refusal_is_told_and_final(ErrorCode::ResourceUnavailable).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lease_lost_answer_is_a_refusal_before_acceptance() {
+    a_refusal_is_told_and_final(ErrorCode::LeaseLost).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_invalid_argument_answer_is_a_refusal_before_acceptance() {
+    a_refusal_is_told_and_final(ErrorCode::InvalidArgument).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_closed_answer_is_a_refusal_before_acceptance() {
+    a_refusal_is_told_and_final(ErrorCode::SessionClosed).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unmarked_permission_denied_answer_is_a_refusal_before_acceptance() {
+    a_refusal_is_told_and_final(ErrorCode::PermissionDenied).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_marked_permission_denied_answer_after_acceptance_leaves_the_frame_uncertain() {
+    an_uncertain_frame_cuts_the_stream(SerialAnswer::Marked(ProtocolError::new(
+        ErrorCode::PermissionDenied,
+        "the worker's words",
+    )))
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_with_any_other_code_leaves_the_frame_uncertain() {
+    an_uncertain_frame_cuts_the_stream(gives(ErrorCode::StorageUnavailable)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unknown_outcome_leaves_the_frame_uncertain() {
+    an_uncertain_frame_cuts_the_stream(gives(ErrorCode::OutcomeUnknown)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_that_never_comes_leaves_the_frame_uncertain() {
+    an_uncertain_frame_cuts_the_stream(SerialAnswer::Silent).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_lost_under_the_call_leaves_the_frame_uncertain() {
+    an_uncertain_frame_cuts_the_stream(SerialAnswer::Lost).await;
+}
+
+/// The authority behind a frame is withdrawn after the host decided it and before its call is
+/// written: the call is never written, the device is told the authority was withdrawn, and the
+/// stream ends cleanly, as for a worker with a lane.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withdrawal_before_the_call_is_written_is_a_refusal_and_a_clean_end() {
+    let rig = Rig::start_serial().await;
+    let mut stream = rig.open().await;
+    let stages = rig.adopted.host.network().input_stages();
+    type_and_wait(&rig, &mut stream, 0, b"a").await;
+
+    let (at_release, go_release) = stages.hold_before_a_release();
+    let (at_call, go_call) = stages.hold_before_a_serial_call();
+    stream
+        .write_message(&rig.frame(1, b"b"))
+        .await
+        .expect("the frame is written");
+    arrived(at_call).await;
+    rig.adopted
+        .host
+        .controller()
+        .raise_the_unverified_withdrawal_refusal()
+        .await;
+    arrived(at_release).await;
+    let _ = go_call.send(());
+
+    match next_or_reset(&mut stream).await {
+        Ok(Some(InputAck::Refused {
+            epoch,
+            sequence,
+            error,
+            ..
+        })) => {
+            assert_eq!(epoch, rig.epoch);
+            assert_eq!(sequence.get(), 1);
+            assert_eq!(error.code, ErrorCode::PermissionDenied);
+        }
+        other => panic!("the host was to refuse the frame, and the stream gave {other:?}"),
+    }
+    assert!(
+        matches!(next_or_reset(&mut stream).await, Ok(None)),
+        "the stream ends cleanly, by the check and not by the release"
+    );
+    drop(go_release);
+    rig.stop().await;
+}
+
+/// A detach of the attachment ends the stream of a worker without the lane at once and tells the
+/// device no count: the worker tells that lane nothing of its lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detach_ends_the_stream_of_a_worker_without_the_lane_and_tells_no_count() {
+    let (rig, mut stream) = typed_serial(2).await;
+    detach(&rig).await;
+    loop {
+        match next_or_reset(&mut stream).await {
+            Ok(Some(InputAck::EpochEnded { .. })) => {
+                panic!("a count that nothing the worker said gave was told")
+            }
+            Ok(Some(_)) => {}
+            ended => {
+                assert!(
+                    matches!(ended, Ok(None)),
+                    "the stream ends cleanly: {ended:?}"
+                );
+                break;
+            }
+        }
+    }
+    rig.stop().await;
+}
+
+/// A rig of a worker without the lane, with a stream open and `accepted` frames of one byte typed
+/// and accepted.
+async fn typed_serial(accepted: u64) -> (Rig, DataStream) {
+    let rig = Rig::start_serial().await;
+    let mut stream = rig.open().await;
+    for sequence in 0..accepted {
+        type_and_wait(&rig, &mut stream, sequence, b"k").await;
+    }
+    (rig, stream)
+}
+
+/// For a worker without the lane the host's own record is the only check: a barrier above the
+/// accepted count is refused with nothing forwarded, and one at the count is forwarded and taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_host_checks_the_position_alone_for_a_worker_without_the_lane() {
+    let (rig, _stream) = typed_serial(3).await;
+    let over = send_after(&rig, Dependent::Release, rig.epoch, 5).await;
+    assert!(
+        over.refused_here,
+        "two frames more are not reached: {:?}",
+        over.answer
+    );
+    let at = send_after(&rig, Dependent::Release, rig.epoch, 3).await;
+    assert!(
+        !at.refused_here && at.answer.is_ok(),
+        "the release is taken: {:?}",
+        at.answer
+    );
+    assert_eq!(position_refusals(&rig), 1);
+    rig.stop().await;
+}
+
+/// The worker tells the host nothing of its lease, so a barrier of an epoch newer than any typing
+/// the host has read is judged too (the typing it names may still be on its way), an older epoch is
+/// stale and forwarded, and an epoch that has no accepted typing needs none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_barrier_is_judged_from_the_typing_for_a_worker_without_the_lane() {
+    let (rig, _stream) = typed_serial(3).await;
+    let newer = InputLeaseEpoch::new(rig.epoch.get() + 1);
+    let older = InputLeaseEpoch::new(
+        rig.epoch
+            .get()
+            .checked_sub(1)
+            .expect("the lease is past its first epoch"),
+    );
+    let short = send_after(&rig, Dependent::Launch, newer, 1).await;
+    assert!(
+        short.refused_here,
+        "typing of a newer epoch is not accepted yet: {:?}",
+        short.answer
+    );
+    let none = send_after(&rig, Dependent::Launch, newer, 0).await;
+    assert!(
+        !none.refused_here,
+        "a barrier of no typing is reached: {:?}",
+        none.answer
+    );
+    let stale = send_after(&rig, Dependent::Launch, older, 99).await;
+    assert!(
+        !stale.refused_here,
+        "an older epoch is stale and forwarded: {:?}",
+        stale.answer
+    );
+    assert_eq!(position_refusals(&rig), 1);
+    rig.stop().await;
+}
+
+/// An epoch of which the worker refused a frame is over: the host judges no barrier of it, since the
+/// frames behind the refusal are not sent and the device has been told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_barrier_of_an_epoch_the_worker_refused_a_frame_of_is_forwarded() {
+    let rig = Rig::start_serial().await;
+    let _calls = script_calls(&rig, None, |sequence| {
+        if sequence == 1 {
+            gives(ErrorCode::ResourceUnavailable)
+        } else {
+            took()
+        }
+    });
+    let mut stream = rig.open().await;
+    type_and_wait(&rig, &mut stream, 0, b"a").await;
+    let before = send_after(&rig, Dependent::Launch, rig.epoch, 5).await;
+    assert!(
+        before.refused_here,
+        "one frame of five is accepted: {:?}",
+        before.answer
+    );
+    stream
+        .write_message(&rig.frame(1, b"b"))
+        .await
+        .expect("the frame is written");
+    assert!(
+        matches!(next(&mut stream).await, Some(InputAck::Refused { .. })),
+        "the refusal is told"
+    );
+    let after = send_after(&rig, Dependent::Launch, rig.epoch, 5).await;
+    assert!(
+        !after.refused_here,
+        "the epoch is over and not judged: {:?}",
+        after.answer
+    );
+    assert_eq!(position_refusals(&rig), 1);
+    rig.stop().await;
+}
+
+/// What a stand-in for the worker was sent for a release, a detach and a launch, in order.
+type Dependents = Arc<Mutex<Vec<(Method, ParamsValue)>>>;
+
+/// Has the release, the detach and the launch that the host forwards answered by a stand-in for the
+/// worker that records what it is sent, and reports `count` as the bytes the lease's end discarded
+/// in its answers to the release and the detach.
+fn script_dependents(rig: &Rig, count: Option<u64>) -> Dependents {
+    let sent = Dependents::default();
+    let record = Arc::clone(&sent);
+    let epoch = rig.epoch;
+    let attachment = rig.attachment;
+    rig.adopted
+        .host
+        .network()
+        .input_stages()
+        .script_dependent_requests(move |mutation| {
+            let method = mutation.method.method().expect("a method of the table");
+            record
+                .lock()
+                .expect("not poisoned")
+                .push((method, mutation.params.clone()));
+            match method {
+                Method::InputRelease => Outcome::Ok(
+                    ParamsValue::from_typed(&InputLeaseResult {
+                        lease: InputLeaseState {
+                            epoch,
+                            holder: Nullable::null(),
+                            connection_id: Nullable::null(),
+                            next_sequence: InputSequence::new(3),
+                        },
+                        fenced_bytes: count.map(U64::new),
+                    })
+                    .expect("a result"),
+                ),
+                Method::SessionDetach => Outcome::Ok(
+                    ParamsValue::from_typed(&SessionDetachResult {
+                        attachment_id: attachment,
+                        geometry: GeometryState {
+                            owner: Nullable::null(),
+                            epoch: GeometryEpoch::new(1),
+                            dimensions: Dimensions::new(80, 24),
+                        },
+                        remaining: U64::new(0),
+                        fenced_bytes: count.map(U64::new),
+                    })
+                    .expect("a result"),
+                ),
+                _ => Outcome::Error(ProtocolError::new(ErrorCode::InvalidArgument, "not run")),
+            }
+        });
+    sent
+}
+
+/// The parameters the stand-in was sent for `method`.
+fn sent_for(sent: &Dependents, method: Method) -> ParamsValue {
+    sent.lock()
+        .expect("not poisoned")
+        .iter()
+        .find(|(asked, _)| *asked == method)
+        .map(|(_, params)| params.clone())
+        .unwrap_or_else(|| panic!("the stand-in was sent no {method:?}"))
+}
+
+/// The release, the detach and the launch of a device that has typed three frames, which asks for
+/// the count and names the barrier itself, so that the host's choice of what to send is the only
+/// thing that decides what the worker is sent.
+async fn send_the_dependents(rig: &Rig) {
+    for request in [Dependent::Release, Dependent::Detach, Dependent::Launch] {
+        let sent = send_asking(rig, request, rig.epoch, 3, true).await;
+        assert!(
+            !sent.refused_here,
+            "the position is reached: {:?}",
+            sent.answer
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_without_the_lane_is_sent_none_of_the_new_members() {
+    let (rig, _stream) = typed_serial(3).await;
+    let sent = script_dependents(&rig, None);
+    send_the_dependents(&rig).await;
+    let release: InputReleaseParams = sent_for(&sent, Method::InputRelease)
+        .to_typed()
+        .expect("release parameters");
+    assert!(
+        release.after_input.is_none(),
+        "the release carries no barrier"
+    );
+    assert!(!release.fenced_report, "the release asks for no count");
+    let detach: SessionDetachParams = sent_for(&sent, Method::SessionDetach)
+        .to_typed()
+        .expect("detach parameters");
+    assert!(
+        detach.after_input.is_none(),
+        "the detach carries no barrier"
+    );
+    assert!(!detach.fenced_report, "the detach asks for no count");
+    let launch: ShellLaunchParams = sent_for(&sent, Method::ShellLaunch)
+        .to_typed()
+        .expect("launch parameters");
+    assert!(
+        launch.after_input.is_none(),
+        "the launch carries no barrier"
+    );
+    rig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_that_gives_no_count_is_not_given_one() {
+    let (rig, _stream) = typed_serial(3).await;
+    let _sent = script_dependents(&rig, None);
+    let release = send_asking(&rig, Dependent::Release, rig.epoch, 3, true).await;
+    let released: InputLeaseResult = release
+        .answer
+        .expect("the release is answered")
+        .to_typed()
+        .expect("a lease result");
+    assert_eq!(released.fenced_bytes, None, "no count is invented");
+    let detach = send_asking(&rig, Dependent::Detach, rig.epoch, 3, true).await;
+    let detached: SessionDetachResult = detach
+        .answer
+        .expect("the detach is answered")
+        .to_typed()
+        .expect("a detach result");
+    assert_eq!(detached.fenced_bytes, None, "no count is invented");
     rig.stop().await;
 }

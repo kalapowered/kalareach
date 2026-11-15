@@ -64,7 +64,7 @@ use crate::service::Controller;
 
 mod acting;
 mod decision;
-mod forwarding;
+pub(super) mod forwarding;
 mod narrowing;
 mod opening;
 mod output;

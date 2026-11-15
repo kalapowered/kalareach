@@ -66,7 +66,7 @@ mod earlier_attention_clock;
 mod heard;
 mod input;
 #[cfg(feature = "testing")]
-pub use input::{InputStageCounts, InputStages};
+pub use input::{InputStageCounts, InputStages, SerialAnswer};
 pub mod invitations;
 pub mod lifetimes;
 pub mod methods;
@@ -651,6 +651,13 @@ impl Network {
     #[cfg(feature = "testing")]
     pub fn use_input_lane_at(&self, endpoint: kr_ipc::paths::Endpoint) {
         self.guard.host.input.use_lane_at(endpoint);
+    }
+
+    /// Has this host serve typing as it does for a worker that does not state the input lane,
+    /// after [`Self::use_input_lane_at`] had it use a scripted lane.
+    #[cfg(feature = "testing")]
+    pub fn use_no_input_lane(&self) {
+        self.guard.host.input.use_no_lane();
     }
 
     /// How many tasks that serve a terminal-input stream have ended, however they ended, as a count
