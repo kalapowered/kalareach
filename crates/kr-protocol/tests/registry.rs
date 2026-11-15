@@ -469,7 +469,12 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
     // the one step the updating release asks of the running daemon: close its gate, settle, say how
     // it was started, and stop. It is the owner's act at this machine, like any change to what the
     // host runs: served on the local socket alone and asking for host management.
-    let updates = [("host.update.handover", EffectClass::Write)];
+    // A stop of the daemon on its local socket is asked the same way and for the same right, which
+    // is what restarting it, under an update or by itself, needs.
+    let updates = [
+        ("host.update.handover", EffectClass::Write),
+        ("host.stop", EffectClass::Write),
+    ];
     for (name, effect) in updates {
         let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
         assert_eq!(entry.effect, effect, "{name} carries its own effect class");

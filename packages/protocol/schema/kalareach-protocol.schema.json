@@ -18962,6 +18962,62 @@
       "type": "object",
       "x-kalareach-read-only-metadata": true
     },
+    "HostLaunch": {
+      "additionalProperties": false,
+      "description": "How a control daemon was started, as `host.stop` reports it.",
+      "properties": {
+        "arguments": {
+          "description": "The arguments it was started with, its program's own name left out.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "directory": {
+          "description": "The directory it was started in.",
+          "type": "string"
+        },
+        "variables": {
+          "description": "Each variable that decides where the daemon keeps something\n([`crate::hostinfo::configuration::path_variables`]), with the value it has in the\ndaemon's process.",
+          "items": {
+            "$ref": "#/$defs/HostLaunchVariable"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "arguments",
+        "variables",
+        "directory"
+      ],
+      "type": "object"
+    },
+    "HostLaunchVariable": {
+      "additionalProperties": false,
+      "description": "One variable that decides where a daemon keeps something, as the daemon has it.",
+      "properties": {
+        "name": {
+          "description": "The variable's name.",
+          "type": "string"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Its value in the daemon's process; null where the process has none, which is not the same\nas an empty value."
+        }
+      },
+      "required": [
+        "name",
+        "value"
+      ],
+      "type": "object"
+    },
     "HostMetrics": {
       "description": "What a host says of its metrics to the caller that asks for its diagnostics.\n\nA host counts them for its owner and for a device that manages it, and withholds them from any\nother caller. A report that counted nothing is not a host that does not say, so the two are\nstates of their own. A host of an earlier level says neither: the member that holds this is\nmissing from its answer.",
       "oneOf": [
@@ -19103,6 +19159,51 @@
         "device_key_revision",
         "boot_epoch",
         "clock_epoch"
+      ],
+      "type": "object"
+    },
+    "HostStopParams": {
+      "additionalProperties": false,
+      "description": "`host.stop` parameters.",
+      "properties": {
+        "launch_only": {
+          "description": "True to ask how the daemon was started and nothing else: the daemon stops nothing, closes\nno gate and counts no create. False stops the daemon. A request states it, so one that\nleaves it out is refused and stops nothing.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "launch_only"
+      ],
+      "type": "object"
+    },
+    "HostStopResult": {
+      "additionalProperties": false,
+      "description": "`host.stop` result: the daemon that took the request, the creates that did not settle before\nit stopped, and how it was started.",
+      "properties": {
+        "launch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HostLaunch"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How the daemon was started, or null where it cannot say: an argument that is not text, a\nworking directory that no longer exists or a variable whose value is not text."
+        },
+        "pid": {
+          "$ref": "#/$defs/U64",
+          "description": "The daemon's process identifier."
+        },
+        "unsettled": {
+          "$ref": "#/$defs/U64",
+          "description": "How many creates under way had not settled when the wait for them ended\n([`STOP_SETTLE_MS`]); each is resolved by the next start as after a crash. Zero for a\nrequest that asked for the launch alone."
+        }
+      },
+      "required": [
+        "pid",
+        "unsettled",
+        "launch"
       ],
       "type": "object"
     },
@@ -22649,6 +22750,11 @@
         {
           "const": "host.update.handover",
           "description": "Make way for another installed release: close this control daemon's gate to new sessions, let the creates it started settle, say how it was started, and stop when told to. No session stops.",
+          "type": "string"
+        },
+        {
+          "const": "host.stop",
+          "description": "Stops this control daemon. It is served on the daemon's local socket alone. It closes the gate to new sessions, waits up to ten seconds for creates that are under way, answers the daemon's process identifier, the count of creates that did not settle and how the daemon was started, and then ends the daemon. No session stops. With `launch_only` set it stops nothing, closes no gate and answers only how the daemon was started. A request states `launch_only`. While the host owes a fence the answer is withheld, and a stop still ends the daemon. It is served while the local owner's membership lease has lapsed, and it keeps no record of the request.",
           "type": "string"
         },
         {
@@ -44941,6 +45047,12 @@
     },
     "host_selection": {
       "$ref": "#/$defs/HostSelection"
+    },
+    "host_stop_params": {
+      "$ref": "#/$defs/HostStopParams"
+    },
+    "host_stop_result": {
+      "$ref": "#/$defs/HostStopResult"
     },
     "host_update_handover_params": {
       "$ref": "#/$defs/HostUpdateHandoverParams"

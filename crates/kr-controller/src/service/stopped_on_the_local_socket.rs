@@ -26,7 +26,7 @@ use kr_protocol::update::{
 
 use crate::service::Controller;
 
-use super::host::{Handover, StopCause};
+use super::host::Handover;
 use super::the_fence_at_every_effect::{accepted, admitted, daemon, mutation_of, refusal};
 
 /// How long a wait for something that is going to happen is given. A bound on a hang: nothing is
