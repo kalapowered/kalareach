@@ -201,13 +201,13 @@ impl std::fmt::Debug for Clocks {
 /// says it has arrived and waits there until the test lets it go. Armed once, it fires once.
 #[cfg(any(test, feature = "testing"))]
 #[derive(Debug, Default)]
-struct ReadPause(std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>);
+pub(crate) struct ReadPause(std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>);
 
 #[cfg(any(test, feature = "testing"))]
 impl ReadPause {
     /// Arms the pause. Returns the end that says the read has arrived, and the end that lets it
     /// go.
-    fn arm(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    pub(crate) fn arm(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (arrived, arrival) = oneshot::channel();
         let (go, going) = oneshot::channel();
         *self
@@ -218,7 +218,7 @@ impl ReadPause {
     }
 
     /// Waits here when the pause is armed.
-    async fn wait(&self) {
+    pub(crate) async fn wait(&self) {
         let armed = self
             .0
             .lock()
