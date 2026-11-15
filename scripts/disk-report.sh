@@ -278,7 +278,12 @@ kernel_storage_errors() {
     first="$(awk '$1 == "S" { print $2; exit }' "$samples" 2> /dev/null)"
     [ -n "${first:-}" ] || return 0
     minutes=$((($(date +%s) - first) / 60 + 2))
-    out="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/disk-faults.txt"
+    # The log is kept in the evidence directory where the run names one. Where it names none, or one
+    # the reader refuses (said on the error stream), it is kept in /tmp/kr-test-artifacts.
+    # shellcheck source=scripts/lib/artifacts-dir.sh
+    . "$(dirname "${BASH_SOURCE[0]}")/lib/artifacts-dir.sh"
+    evidence="$(kr_artifacts_dir_if_set && printf '%s' "$kr_artifacts")" || evidence=""
+    out="${evidence:-/tmp/kr-test-artifacts}/disk-faults.txt"
     mkdir -p "$(dirname "$out")" 2> /dev/null
     predicate='process == "kernel" AND (eventMessage CONTAINS "I/O error" OR eventMessage CONTAINS "cluster_pageout" OR eventMessage CONTAINS "cluster_push() failed" OR eventMessage CONTAINS "trim_list failed")'
     read_ok=0
