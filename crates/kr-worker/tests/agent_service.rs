@@ -1835,6 +1835,9 @@ async fn kr_req_09_09_a_binding_that_moves_after_the_admission_is_refused_at_the
     }
 }
 
+/// A step the test gives a transport's admission, with the number of the admission that runs it.
+type AdmissionStep = (usize, Box<dyn FnOnce() + Send>);
+
 /// A transport whose own admission runs a step the test gives it at the admission it names, as a
 /// wait for the transport's locks does for a binding that moves meanwhile, and that counts what it
 /// was asked to carry.
@@ -1842,7 +1845,7 @@ async fn kr_req_09_09_a_binding_that_moves_after_the_admission_is_refused_at_the
 struct MovingBindingUpstream {
     carried: std::sync::atomic::AtomicUsize,
     admissions: std::sync::atomic::AtomicUsize,
-    in_its_admission: std::sync::Mutex<Option<(usize, Box<dyn FnOnce() + Send>)>>,
+    in_its_admission: std::sync::Mutex<Option<AdmissionStep>>,
 }
 
 impl std::fmt::Debug for MovingBindingUpstream {
@@ -1911,8 +1914,7 @@ async fn kr_req_09_09_a_binding_that_moves_in_the_transports_admission_is_refuse
                         .advance_binding(
                             instance(),
                             Some(
-                                kr_protocol::ids::AgentThreadId::new("thread-2")
-                                    .expect("a thread"),
+                                kr_protocol::ids::AgentThreadId::new("thread-2").expect("a thread"),
                             ),
                             TimestampMs::new(5),
                         )
