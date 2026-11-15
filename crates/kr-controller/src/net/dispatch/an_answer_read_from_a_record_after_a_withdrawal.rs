@@ -327,3 +327,33 @@ async fn a_mutation_the_worker_answers_from_its_receipt_is_not_shown_when_a_fenc
         }
     }
 }
+
+/// KR-REQ-09.09: a mutation that names a session whose closure is recorded is refused from the
+/// record, which the device is told only while this host owes no fence. A fence is owed at the place
+/// before the mutation's effect; the device is told the outcome is not shown, and not that the
+/// session closed. The control: with no fence owed the device is told the session closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mutation_refused_from_a_closure_record_is_not_shown_when_a_fence_lands_after_the_read() {
+    for owed in [false, true] {
+        let world = fake::fake_worker(None).await;
+        let (connection, _) = paired_connection(&world.controller, 44, EVERY_RIGHT);
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        world
+            .controller
+            .retire(&closure_of(session_id))
+            .await
+            .expect("the closure is recorded");
+
+        let prompt = a_prompt_to(&world, &connection, session_id);
+        let answered =
+            answered_with_the_fence(&world, &connection, prompt, Pause::BeforeTheEffect, owed)
+                .await;
+        let told = refusal_of(&answered);
+        if owed {
+            assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+        } else {
+            assert_eq!(told.code, ErrorCode::SessionClosed, "{told:?}");
+        }
+        world.serving.abort();
+    }
+}
