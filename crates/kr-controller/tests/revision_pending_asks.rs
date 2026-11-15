@@ -202,6 +202,10 @@ async fn an_ask_that_timed_out_doubles_its_interval() {
     worker
         .service
         .hold_the_boundary_for_one_announcement_after(0);
+    // The pass asks a pending worker on its own schedule. An ask that came before the case holds
+    // the link would take it, be answered, and end, and the first ask that the case measures would
+    // not be that one: the pass's asks wait until the case holds the link.
+    host.controller().hold_the_pass_asks_for_tests(true);
     let barrier = host
         .controller()
         .revoke_authority()
@@ -213,6 +217,7 @@ async fn an_ask_that_timed_out_doubles_its_interval() {
         .hold_a_worker_link_for_tests(session_id)
         .await
         .expect("the worker is reached");
+    host.controller().hold_the_pass_asks_for_tests(false);
 
     until(
         Duration::from_secs(90),
@@ -221,14 +226,15 @@ async fn an_ask_that_timed_out_doubles_its_interval() {
     )
     .await;
     let asks = asks_of(host.controller(), session_id);
-    // Fifteen seconds for the ask to give up, then the interval.
+    // Fifteen seconds for the ask to give up, then the interval, and the pass may ask a little
+    // before its time.
     assert!(
-        asks[1] - asks[0] >= Duration::from_secs(19),
+        asks[1] - asks[0] >= Duration::from_secs(25) - ASKED_EARLY_BY,
         "the second ask came {:?} after the first, which gave up after 15 s and waits 10 s more",
         asks[1] - asks[0]
     );
     assert!(
-        asks[2] - asks[1] >= Duration::from_secs(29),
+        asks[2] - asks[1] >= Duration::from_secs(35) - ASKED_EARLY_BY,
         "the third ask came {:?} after the second, which gave up after 15 s and waits 20 s more",
         asks[2] - asks[1]
     );
@@ -239,9 +245,11 @@ async fn an_ask_that_timed_out_doubles_its_interval() {
 
 /// KR-REQ-09.12: any answer puts the interval back to five seconds.
 ///
-/// The first ask times out, which doubles the interval. The connection is then given back and the
-/// boundary is held, so the next ask is refused on a live link: an answer. The ask after it comes
-/// at the next pass and not after the doubled interval.
+/// The case holds the worker's connection, and the first ask waits for it with fifteen seconds
+/// to run. The case gives the connection back after eleven, so the ask takes it with four seconds
+/// left, which is less than an exchange, sends nothing, gives the link back and ends as failed,
+/// which doubles the interval. The boundary is held by then, so the next ask is refused on a live
+/// link: an answer. The ask after it comes at the next pass and not after the doubled interval.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_answer_puts_the_interval_back_to_five_seconds() {
     let Adopted {
@@ -254,6 +262,10 @@ async fn an_answer_puts_the_interval_back_to_five_seconds() {
     worker
         .service
         .hold_the_boundary_for_one_announcement_after(0);
+    // The pass asks a pending worker on its own schedule. An ask that came before the case holds
+    // the link would take it, be answered, and end, and the first ask that the case measures would
+    // not be that one: the pass's asks wait until the case holds the link.
+    host.controller().hold_the_pass_asks_for_tests(true);
     let barrier = host
         .controller()
         .revoke_authority()
@@ -265,6 +277,7 @@ async fn an_answer_puts_the_interval_back_to_five_seconds() {
         .hold_a_worker_link_for_tests(session_id)
         .await
         .expect("the worker is reached");
+    host.controller().hold_the_pass_asks_for_tests(false);
     until(
         DEBT_PASS_INTERVAL * 2 + SLACK,
         "the first ask of the pass",
@@ -272,8 +285,8 @@ async fn an_answer_puts_the_interval_back_to_five_seconds() {
     )
     .await;
     let held = worker.hold_the_dispatch_boundary().await;
-    // The first ask may wait for the connection for fifteen seconds; the case gives it back after
-    // eleven.
+    // The first ask waits for the connection with fifteen seconds to run; the case gives it back
+    // after eleven, so the ask has four left and ends as failed.
     tokio::time::sleep(Duration::from_secs(11)).await;
     drop(link);
 
@@ -286,7 +299,7 @@ async fn an_answer_puts_the_interval_back_to_five_seconds() {
     let asks = asks_of(host.controller(), session_id);
     assert!(
         asks[1] - asks[0] >= Duration::from_secs(19),
-        "the ask that timed out was followed after {:?}",
+        "the ask that ended as failed was followed after {:?}",
         asks[1] - asks[0]
     );
     assert!(
