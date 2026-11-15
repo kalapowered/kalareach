@@ -819,6 +819,27 @@ impl RemoteConnection {
         .await
     }
 
+    /// What a device is told of a refusal that a record the service keeps made, read before the
+    /// action was begun: the object a request acts on belongs to another subject than the request
+    /// names. The refusal is the record's word, so it goes through the check every answer read from
+    /// a record goes through ([`Self::kept_answer`]), asked once the record is read: a fence this
+    /// host owes, or a registration withdrawn or replaced while the record was read, stops it, and
+    /// the device is told the outcome is not shown. `asked` is left holding the decision the
+    /// refusal is written under.
+    pub(super) fn kept_refusal(
+        &self,
+        refusal: Recorded<ProtocolError>,
+        validated: AuthorityRevision,
+        decided: &Asked,
+        asked: &mut Option<Asked>,
+    ) -> ProtocolError {
+        *asked = Some(decided.clone().kept());
+        if self.admitted_to_answer(validated).is_err() {
+            return outcome_not_shown();
+        }
+        network_door::kept(crate::service::net::AtTheNetworkDoor::here(), refusal)
+    }
+
     /// What a device is told of a copy a service withheld: the service read the record of an
     /// earlier submission and refused to give it back under the authority this request arrived
     /// under.

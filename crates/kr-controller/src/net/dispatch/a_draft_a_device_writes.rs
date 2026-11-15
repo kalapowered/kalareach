@@ -23,7 +23,9 @@ use kr_protocol::transfer::{
     DraftCreateParams, DraftCreateResult, DraftUpdateParams, DraftUpdateResult, InsertionMethod,
 };
 
-use super::a_copy_from_a_services_record::{EVERY_RIGHT, mutation_of, two_copies, written};
+use super::a_copy_from_a_services_record::{
+    EVERY_RIGHT, mutation_of, refusal_of, two_copies, written,
+};
 use super::write_boundary::paired_connection;
 use crate::service::a_close_a_worker_never_answers as fake;
 use crate::transfer::DEVICE_OPEN_DRAFTS;
@@ -349,6 +351,63 @@ async fn a_draft_bound_to_a_session_is_written_only_by_a_request_that_names_that
     );
     assert_eq!(named.draft.revision, DraftRevision::new(2));
     world.serving.abort();
+}
+
+/// KR-REQ-09.09: the refusal that a request and the draft it acts on name different sessions is
+/// what the transfer journal stores, so the door tells it only while no fence is owed. The update
+/// passes the door's entry check; a fence this host owes once the stored subject is read is what
+/// the answer meets, and the device is told the outcome is not shown, as it is for any answer read
+/// from a record. The control: with no fence the refusal is given as it is, and the draft is as it
+/// was in both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_refusal_from_a_stored_subject_at_the_network_door_is_not_shown_when_a_fence_lands_after_the_read()
+{
+    for owed in [false, true] {
+        let world = fake::fake_worker(None).await;
+        let controller = &world.controller;
+        let (connection, _) = paired_connection(controller, 34, EVERY_RIGHT);
+        let device = connection.device.principal();
+        // A draft the service holds for no session, which an update that names one does not match.
+        let draft = a_draft_for(&world, &device, None);
+        let update = write_naming(
+            &world,
+            &connection,
+            Method::DraftUpdate,
+            2,
+            &update_of(draft.draft_id, draft.revision, "another subject"),
+            Some(world.session_id),
+        );
+
+        let (arrived, go) = controller.before_the_effect.arm();
+        let (answered, ()) = tokio::join!(
+            connection.answer_now(ControlFrame::Mutation(Box::new(update))),
+            async {
+                tokio::time::timeout(WAIT_BOUND, arrived)
+                    .await
+                    .expect("the update reaches the place it is stopped at")
+                    .expect("the pause is armed");
+                controller.hold_fence(owed);
+                go.send(()).expect("the update goes on");
+            }
+        );
+        let told = refusal_of(&answered.expect("the update is answered"));
+        if owed {
+            assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+        } else {
+            assert_eq!(told.code, ErrorCode::InvalidArgument, "{told:?}");
+        }
+        let read = controller
+            .transfer()
+            .service()
+            .draft(&device, draft.draft_id)
+            .expect("the device's draft");
+        assert_eq!(
+            (read.revision, read.text.as_str()),
+            (draft.revision, "an open draft"),
+            "the draft is as it was (fence owed: {owed})"
+        );
+        world.serving.abort();
+    }
 }
 
 /// KR-REQ-23.41: a `draft.create` names in its target the application its parameters name, as it
