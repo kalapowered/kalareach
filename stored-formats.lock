@@ -531,7 +531,7 @@
         "migrates_from": 1,
         "reads_through": 17
       },
-      "digest": "f834674d24152414d4e63c60c48b7c07db2b90ee8bfd9f5e1d0cf58be38e8d2c",
+      "digest": "60b6109b5aee6f8479da08b92e7ab915572fa0449c2f683cac4453dc9938954c",
       "kept": [
         "SessionCreateParams",
         "ClosureRecord",
@@ -568,7 +568,26 @@
         "KeyDeclaration (crates/kr-controller/src/net/devices.rs)",
         "Stored, StoredWorker (crates/kr-controller/src/authority/reads.rs)",
         "words of methods a recorded pairing action names",
-        "words of launch phases"
+        "words of launch phases",
+        "DevicePublicKeys",
+        "ErrorCode",
+        "ClientBundle",
+        "ProposedGrant",
+        "PolicyAuthorityLink",
+        "OfflineValidityPolicy",
+        "RevocationRequest",
+        "DevicePushRegisterResult",
+        "DeliveryDestinationConfigureResult",
+        "DeliveryDestinationRemoveResult",
+        "AccountSignInStarted",
+        "AccountSignedOut",
+        "PairingConsumedReason",
+        "words of process start sources",
+        "ProcessStartSource",
+        "words of invitation states",
+        "InvitationState (crates/kr-pairing/src/platform.rs)",
+        "words of host owner kinds",
+        "HostOwner (crates/kr-controller/src/net/invitations.rs)"
       ]
     },
     {
