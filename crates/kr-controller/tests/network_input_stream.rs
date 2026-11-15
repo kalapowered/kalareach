@@ -3681,6 +3681,43 @@ async fn a_withdrawal_before_the_call_is_written_is_a_refusal_and_a_clean_end() 
     rig.stop().await;
 }
 
+/// A frame whose stream ended while the host decided it is not written: the adapter looks at the
+/// stream's end where it enters the frame, under the state's lock, and a call that is already at the
+/// link's writer is never dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_whose_stream_ended_during_the_decision_is_not_written_to_the_worker() {
+    let rig = Rig::start_serial().await;
+    let calls = script_calls(&rig, None, |_| took());
+    let stages = rig.adopted.host.network().input_stages();
+    let mut ended = rig.adopted.host.network().input_tasks_ended();
+    let mut stream = rig.open().await;
+    let (at_call, go_call) = stages.hold_before_a_serial_call();
+    stream
+        .write_message(&rig.frame(0, b"a"))
+        .await
+        .expect("the frame is written");
+    arrived(at_call).await;
+
+    detach(&rig).await;
+    until("the detach ended the stream", || {
+        stages.counts().detach_ends == 1
+    })
+    .await;
+    let _ = go_call.send(());
+    tokio::time::timeout(WAIT, ended.changed())
+        .await
+        .expect("the stream task ended in time")
+        .expect("the count stands");
+    // A call that was made would have been recorded by now.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        calls.sequences().is_empty(),
+        "the worker was given a frame after the stream ended: {:?}",
+        calls.sequences()
+    );
+    rig.stop().await;
+}
+
 /// A detach of the attachment ends the stream of a worker without the lane at once and tells the
 /// device no count: the worker tells that lane nothing of its lease.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
