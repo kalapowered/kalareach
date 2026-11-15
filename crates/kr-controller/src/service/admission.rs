@@ -110,7 +110,12 @@ impl Controller {
                     }
                 }
             })?;
-        refusal.map_or(Ok(()), Err)
+        if let Some(refusal) = refusal {
+            return Err(refusal);
+        }
+        // The feed's check took the connection's shares lock, and a fence that was published while
+        // it waited is read here, after that lock, as the last reading of the check.
+        self.check_fence()
     }
 
     /// The refusal the authority feed puts on remote grants, as an error, when one stands and
