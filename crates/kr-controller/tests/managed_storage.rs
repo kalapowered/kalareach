@@ -9553,17 +9553,17 @@ async fn a_second_ask_sends_what_is_still_unanswered_when_no_pass_is_owed_it() {
     served.web().mend();
     let (controller, endpoint, _serving) = start_daemon(&host, timer).await;
 
-    // The restarted carrier has looked, and sent nothing it was not just asked for.
+    // The restarted carrier has looked, and sent nothing it was not just asked for, and no pass is
+    // owed it when the second ask comes. A pass starts on one of three standing permits (work,
+    // fence, person), and each pass uses one up. A pass that begins after a call to `carry_now`
+    // ends after every pass that began before it. So one call for each permit leaves no pass in
+    // hand and no permit standing, whatever the start of the daemon left, and only the second
+    // ask's own wake can then start the pass that sends.
+    const PERMITS_THAT_START_A_PASS: usize = 3;
     let runtime = controller.backup_runtime().expect("a carrier");
-    let mut passes = runtime.passes();
-    runtime.wake();
-    let seen = *passes.borrow_and_update();
-    within("a pass after the restart", async {
-        while *passes.borrow_and_update() <= seen {
-            passes.changed().await.expect("the carrier is running");
-        }
-    })
-    .await;
+    for _ in 0..PERMITS_THAT_START_A_PASS {
+        within("a pass after the restart", runtime.carry_now()).await;
+    }
     assert_eq!(served.web().requests_to(DELETE), sent);
     let confirmed = || {
         controller
@@ -9629,9 +9629,10 @@ async fn a_deletion_asked_under_privacy_mode_is_sent_after_a_restart_once_privac
     let runtime = controller.backup_runtime().expect("a carrier");
     let mut passes = runtime.passes();
 
-    // Still private: the restarted host looks and sends nothing it was not just asked for.
-    runtime.wake();
+    // Still private: the restarted host looks and sends nothing it was not just asked for. The
+    // count is read before the wake, so that a pass that ends at once is one the loop sees.
     let seen = *passes.borrow_and_update();
+    runtime.wake();
     within("a pass after the restart", async {
         while *passes.borrow_and_update() <= seen {
             passes.changed().await.expect("the carrier is running");
