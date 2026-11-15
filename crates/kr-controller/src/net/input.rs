@@ -230,6 +230,11 @@ impl Live {
         *self.lease() = Lease::Told(epoch);
     }
 
+    /// Whether this stream's worker serves no lane, and so tells the host nothing of its lease.
+    fn serial(&self) -> bool {
+        matches!(*self.lease(), Lease::NotTold)
+    }
+
     /// The highest accepted sequence of `epoch`, when the epoch is the one the account holds.
     fn through(&self, epoch: InputLeaseEpoch) -> Option<u64> {
         match self.account().accepted {
@@ -261,6 +266,11 @@ impl Live {
 
 /// One attachment of one connection.
 type Key = (ConnectionId, AttachmentId);
+
+/// A call of a release, a detach or a launch that a suite scripts, which answers when it is awaited.
+type ScriptedAnswer = std::pin::Pin<
+    Box<dyn std::future::Future<Output = crate::error::Result<super::proxy::Forwarded>> + Send>,
+>;
 
 /// Why a stream was not given a place.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -313,12 +323,18 @@ impl InputStreams {
         self.max_per_connection
     }
 
-    /// The answer a suite gives a release, a detach or a launch in place of the worker's.
+    /// The answer a suite gives a release, a detach or a launch in place of the worker's, which it
+    /// may hold back before it is given.
     pub(super) fn scripted_answer(
         &self,
         mutation: &kr_protocol::envelope::MutationRequest,
-    ) -> Option<crate::error::Result<super::proxy::Forwarded>> {
-        self.stages.scripted_answer(mutation)
+    ) -> Option<ScriptedAnswer> {
+        let answer = self.stages.scripted_answer(mutation)?;
+        let stages = Arc::clone(&self.stages);
+        Some(Box::pin(async move {
+            stages.before_a_dependent_answer().await;
+            answer
+        }))
     }
 
     /// Whether the worker behind `proxy` serves typing on a lane of its own, which it says by
@@ -438,48 +454,71 @@ impl InputStreams {
         }
     }
 
-    /// Ends the stream that serves `attachment` of `connection` as uncertain: the device is told
-    /// nothing, and the stream is reset, so the device counts what it has not been told as
-    /// unknown. A stream that does not stand is left as it is.
-    pub(super) fn cut(&self, connection: ConnectionId, attachment: AttachmentId) {
-        let live = self.live().get(&(connection, attachment)).map(Arc::clone);
-        if let Some(live) = live {
-            live.handle.revoke();
-        }
-    }
-
-    /// Whether the host's own record of the stream that serves the barrier's attachment for
-    /// `connection` shows that the typing the barrier names has not all been accepted: the worker
-    /// has accepted fewer frames of the barrier's epoch than its count. The answer is no, and the
-    /// request is forwarded for the worker to decide, when the stream does not stand (it ended or
-    /// never opened), and when the barrier's epoch is one that the worker's lease has moved past.
-    /// Which epochs those are depends on what the worker tells the host:
+    /// Reads the host's own record of the stream that serves the barrier's attachment for
+    /// `connection`, and says whether it shows that the typing the barrier names has not all been
+    /// accepted: the worker has accepted fewer frames of the barrier's epoch than its count. The
+    /// request is not short, and is forwarded for the worker to decide, when the stream does not
+    /// stand (it ended or never opened), and when the barrier's epoch is one that the worker's
+    /// lease has moved past. Which epochs those are depends on what the worker tells the host:
     ///
     /// - A worker that serves a lane tells its lease, and the barrier is judged only when its epoch
     ///   is the epoch of the lease the stream's attachment holds now. For any other epoch the worker
     ///   treats the barrier as stale, and the check is advisory: it saves a forward, and the worker
     ///   checks its own position.
     /// - A worker that serves no lane tells nothing, and the host's check is the only one. A
-    ///   barrier is judged unless the worker has accepted typing of a newer epoch on this stream,
-    ///   which is what shows its lease has moved on. Nothing else moves that: not typing that the
-    ///   host has only read, and not a refusal, which does not end the lease.
+    ///   barrier is judged unless the worker has accepted typing of a newer epoch for this
+    ///   attachment, which is what shows its lease has moved on. Nothing else moves that: not typing
+    ///   that the host has only read, and not a refusal, which does not end the lease.
+    ///
+    /// What the worker accepted and refused is the attachment's, and a stream that replaced another
+    /// judges by what the streams before it left; an epoch that none of them named counts from
+    /// nothing.
     ///
     /// Only the connection that opened the stream is reached, so a barrier names no stream of
     /// another connection. The device is never told anything on its stream by a refusal made here.
-    pub(super) fn position_not_reached(
+    /// The reading holds the stream it read, so that whoever acts on what it showed reaches that
+    /// stream and not one that stands later.
+    pub(super) fn read_position(
         &self,
         connection: ConnectionId,
         barrier: &InputBarrier,
-    ) -> bool {
+    ) -> Reading {
         let live = self
             .live()
             .get(&(connection, barrier.attachment_id))
             .map(Arc::clone);
-        let short = live.is_some_and(|live| live.short_of(barrier.epoch, barrier.count.get()));
+        let short = live
+            .as_ref()
+            .is_some_and(|live| live.short_of(barrier.epoch, barrier.count.get()));
         if short {
             self.stages.position_refused();
         }
-        short
+        Reading { live, short }
+    }
+}
+
+/// What the host's record of a barrier's stream showed when its position was read.
+pub(super) struct Reading {
+    live: Option<Arc<Live>>,
+    short: bool,
+}
+
+impl Reading {
+    /// Whether the record showed that the typing the barrier names has not all been accepted.
+    pub(super) const fn not_reached(&self) -> bool {
+        self.short
+    }
+
+    /// Ends the stream that was read, as uncertain, when its worker serves no lane: the device is
+    /// told nothing, and the stream is reset, so the device counts what it has not been told as
+    /// unknown. A stream that opened after the reading is left as it is, and so is a stream whose
+    /// worker serves a lane, which writes its own marker when the launch's handling ends.
+    pub(super) fn end_when_serial(&self) {
+        if let Some(live) = &self.live
+            && live.serial()
+        {
+            live.handle.revoke();
+        }
     }
 }
 

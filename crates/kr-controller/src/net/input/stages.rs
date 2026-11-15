@@ -178,6 +178,7 @@ mod with_seams {
         before_a_release: Hold,
         after_a_graceful_look: Hold,
         before_a_serial_call: Hold,
+        before_a_dependent_answer: Hold,
         serial_script: Mutex<Option<Script<SerialScript>>>,
         dependent_script: Mutex<Option<Script<DependentScript>>>,
         held: Arc<Gauge>,
@@ -208,6 +209,7 @@ mod with_seams {
                 before_a_release: Hold::default(),
                 after_a_graceful_look: Hold::default(),
                 before_a_serial_call: Hold::default(),
+                before_a_dependent_answer: Hold::default(),
                 serial_script: Mutex::new(None),
                 dependent_script: Mutex::new(None),
                 held: Arc::default(),
@@ -295,6 +297,13 @@ mod with_seams {
         #[must_use]
         pub fn hold_before_a_serial_call(&self) -> Held {
             self.before_a_serial_call.arm()
+        }
+
+        /// Holds the call of the next release, detach or launch that a suite scripts, before its
+        /// scripted answer is given, so the request is out with no answer. The hold fires once.
+        #[must_use]
+        pub fn hold_before_a_dependent_answer(&self) -> Held {
+            self.before_a_dependent_answer.arm()
         }
 
         /// Has the serial adapter's calls answered by `script`, which is given each call's
@@ -458,6 +467,10 @@ mod with_seams {
             Some(forwarded_as((script.0)(mutation), mutation.request_id))
         }
 
+        pub(in crate::service::net) async fn before_a_dependent_answer(&self) {
+            self.before_a_dependent_answer.wait().await;
+        }
+
         pub(in crate::service::net) fn frame_read(&self) {
             self.read.fetch_add(1, Ordering::SeqCst);
         }
@@ -578,6 +591,8 @@ mod without_seams {
         ) -> Option<crate::error::Result<crate::service::net::proxy::Forwarded>> {
             None
         }
+
+        pub(in crate::service::net) async fn before_a_dependent_answer(&self) {}
 
         pub(in crate::service::net) fn frame_read(&self) {}
 
