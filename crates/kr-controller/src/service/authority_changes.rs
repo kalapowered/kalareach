@@ -5388,6 +5388,48 @@ mod tests {
         );
     }
 
+    /// KR-REQ-09.12: a holding entry that the daemon's entry replaces, as the authority, keeps the
+    /// total of the actions that may have run at the larger of the two, as it keeps the rejected
+    /// total, whether or not the daemon's list holds the names.
+    #[test]
+    fn a_holding_entry_the_daemon_replaces_keeps_the_larger_possibly_executed_total() {
+        use kr_protocol::action::BarrierState;
+        use kr_protocol::scalars::U64;
+
+        let mut given = worker_entry(1, BarrierState::Acknowledged, &[], 3);
+        given.possibly_executed_total = U64::new(7);
+        let mut now = worker_entry(1, BarrierState::Acknowledged, &[1, 2], 0);
+        now.possibly_executed_total = U64::new(2);
+
+        let worker = read_worker(given, now, true);
+        assert_eq!(worker.names_pending.get(), 0, "{worker:?}");
+        assert_eq!(worker.possibly_executed_total.get(), 7, "{worker:?}");
+    }
+
+    /// KR-REQ-09.12: where the daemon's entry is the authority and the merge runs because its list
+    /// lacks a name the kept answer listed, the kept answer's sentence on the revisions the worker
+    /// had not said what its fence named for goes: the daemon's own words say what is so now.
+    #[test]
+    fn where_the_daemon_is_the_authority_and_a_name_is_put_back_no_kept_sentence_stays() {
+        use kr_protocol::action::BarrierState;
+        use kr_protocol::scalars::U64;
+
+        let mut given = worker_entry(1, BarrierState::Pending, &[1, 2], 0);
+        given.detail = NOT_SAID_TWO.to_owned();
+        let mut now = worker_entry(1, BarrierState::Acknowledged, &[1], 0);
+        now.rejected_actions_total = U64::new(2);
+
+        let worker = read_worker(given.clone(), now.clone(), true);
+        assert_eq!(
+            worker.rejected_actions.len(),
+            2,
+            "the lost name is listed again"
+        );
+        assert_eq!(worker.detail, "", "{worker:?}");
+        let worker = read_worker(given, now, false);
+        assert!(worker.detail.contains(NOT_SAID_TWO), "{worker:?}");
+    }
+
     /// KR-REQ-09.12, KR-REQ-10.45: where the daemon's entry is the authority, a pending entry's
     /// repeat keeps each total at the larger of the two entries', as it keeps every name, and adds
     /// no figure of its own to the daemon's words.
