@@ -1351,6 +1351,51 @@ async fn close(world: &Silent) -> SessionCloseResult {
         .expect("decodes")
 }
 
+/// A worker that gave its volatile closure, and ended without a durable one of its own, is recorded
+/// as it said: the account stands, volatile, and is not replaced by one that says less of how the
+/// session ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_that_ended_after_its_volatile_closure_is_recorded_as_it_said() {
+    let script = Scripted::new();
+    script.accepts_with_its_closure();
+    script.its_closure_is_volatile(true);
+    let world = scripted(&script).await;
+    let answered = close(&world).await;
+    assert_eq!(answered.durability, Durability::Volatile, "{answered:?}");
+    assert!(
+        !recorded(&world).await,
+        "a volatile closure is held and not recorded"
+    );
+    let record = world
+        .controller
+        .record_final(
+            world.session_id,
+            ClosureReason::WorkerCrash,
+            &world.worker.descriptor.process_start_identity,
+            &crate::archive::Fenced::nothing(world.session_id),
+            super::close::Death::Confirmed,
+        )
+        .await
+        .expect("the closure of a worker that ended is recorded");
+    assert_eq!(
+        (record.reason, record.durability),
+        (ClosureReason::CloseRequested, Durability::Volatile),
+        "the worker's own account stands: {record:?}"
+    );
+    assert_eq!(
+        world
+            .controller
+            .registry
+            .lock()
+            .await
+            .closure(world.session_id)
+            .expect("the registry answers"),
+        Some(record),
+        "and it is the one recorded"
+    );
+    world.serving.abort();
+}
+
 /// Whether the registry has a closure recorded for the session.
 pub(super) async fn recorded(world: &Silent) -> bool {
     world
