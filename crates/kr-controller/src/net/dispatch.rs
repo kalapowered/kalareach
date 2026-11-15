@@ -409,6 +409,8 @@ mod a_draft_a_device_writes;
 mod a_draft_a_device_ends;
 
 #[cfg(test)]
+mod a_closure_that_is_not_durable_yet;
+#[cfg(test)]
 mod an_answer_that_cannot_be_recorded;
 
 #[cfg(test)]

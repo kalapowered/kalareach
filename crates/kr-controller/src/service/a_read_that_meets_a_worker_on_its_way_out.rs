@@ -72,6 +72,9 @@ pub(super) struct Scripted {
     /// Whether its acceptance carries its own account of how the session ended, as the answer of a
     /// worker that has finished its closure does.
     accepts_with_its_closure: AtomicBool,
+    /// Whether the closure its acceptance carries is volatile, as the account of a worker whose
+    /// durable record is not written yet.
+    volatile_closure: AtomicBool,
     /// The answer it gave each close, by the close's action, as its journal keeps it.
     answered: std::sync::Mutex<BTreeMap<ActionId, ParamsValue>>,
     /// Every generation a daemon presented to it, in the order they came.
@@ -143,6 +146,7 @@ impl Scripted {
             describes_its_close: AtomicBool::new(true),
             names: std::sync::Mutex::new(None),
             accepts_with_its_closure: AtomicBool::new(false),
+            volatile_closure: AtomicBool::new(false),
             answered: std::sync::Mutex::new(BTreeMap::new()),
             generations: std::sync::Mutex::new(Vec::new()),
             connections: AtomicUsize::new(0),
@@ -404,6 +408,11 @@ impl Scripted {
         self.accepts_with_its_closure.store(true, Ordering::Release);
     }
 
+    /// Has the closure this worker's acceptances carry be volatile, or durable again.
+    pub(super) fn its_closure_is_volatile(&self, volatile: bool) {
+        self.volatile_closure.store(volatile, Ordering::Release);
+    }
+
     /// Has this worker's acceptances describe `session_id` in place of its own session.
     fn describing(&self, session_id: SessionId) {
         *self
@@ -424,12 +433,16 @@ impl Scripted {
         {
             described.session_id = named;
         }
+        let mut closure = closure_of(session_id);
+        if self.volatile_closure.load(Ordering::Acquire) {
+            closure.durability = Durability::Volatile;
+        }
         SessionCloseResult {
             session_id,
             state: SessionState::Closing,
-            durability: Durability::Durable,
+            durability: closure.durability,
             closure: if self.accepts_with_its_closure.load(Ordering::Acquire) {
-                Nullable::some(closure_of(session_id))
+                Nullable::some(closure)
             } else {
                 Nullable::null()
             },

@@ -597,6 +597,57 @@ async fn a_close_that_cannot_read_this_daemons_authority_in_time_gives_the_link_
     serving.abort();
 }
 
+/// A close that has to wait for the directory waits inside the budget of the exchange, as the
+/// wait for the link and for the registry does, and closes nothing when the directory does not come
+/// free in time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_that_cannot_read_the_directory_in_time_closes_nothing() {
+    let Silent {
+        _temp,
+        controller,
+        environment_id,
+        session_id,
+        actor,
+        accepted,
+        serving,
+        ..
+    } = silent_worker().await;
+    acknowledged(&controller, session_id);
+    let carried = admission(&controller, accepted).await;
+
+    // Something else is holding the directory for longer than a closure may take.
+    let held = controller.directory.lock().await;
+    let started = tokio::time::Instant::now();
+    let refused = tokio::time::timeout(
+        CLOSE_EXCHANGE + Duration::from_secs(3),
+        controller.session_close(
+            &close_request(environment_id, session_id),
+            &actor,
+            Some(accepted),
+            carried,
+        ),
+    )
+    .await;
+    let waited = started.elapsed();
+    drop(held);
+    let refused = refused
+        .unwrap_or_else(|_| {
+            panic!("the close was still waiting for the directory after {waited:?}")
+        })
+        .into_answer_for_test()
+        .expect_err("a close that cannot read the directory in time closes nothing");
+    assert!(
+        waited >= CLOSE_EXCHANGE - Duration::from_secs(1),
+        "the close waited for the directory as long as a closure may take: {waited:?}"
+    );
+    assert_eq!(
+        refused.code(),
+        ErrorCode::ResourceUnavailable,
+        "the caller is told this daemon could not answer, not that the worker did: {refused}"
+    );
+    serving.abort();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_client_is_retired_rather_than_held_for_the_next_caller() {
     let Silent {

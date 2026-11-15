@@ -2354,9 +2354,11 @@ impl Controller {
         let params: kr_protocol::session::SessionCloseParams =
             crate::service::parse(&mutation.params)?;
         let session_id = params.session_id;
-        if self.directory.lock().await.get(session_id).is_none() {
-            // Nothing is running under that identity. Either it has already closed, and the record
-            // is the answer, or it never existed here.
+        if self.directory.lock().await.get(session_id).is_none()
+            || self.knows_how_it_ended(session_id)
+        {
+            // Nothing is running under that identity, or this daemon knows how it ended. Either
+            // it has already closed, and the record is the answer, or it never existed here.
             //
             // Whatever comes back here comes from a record rather than from a close performed now,
             // which is the same read the worker's own journal would have been. The caller decides
@@ -2464,7 +2466,7 @@ impl Controller {
             let (answer, closed) = crate::service::close::read_close_answer(proxy.level(), &value)
                 .map_err(|_| unreadable_close_answer())?;
             if let Some(reply) = closed {
-                let _ = self.settle_close_answer(session_id, &reply).await;
+                self.settle_close_answer(session_id, &reply).await;
             }
             return Ok(answer);
         }
@@ -2476,15 +2478,8 @@ impl Controller {
         // is shown of it is decided where its answer is written.
         //
         // The worker took the close, so a closure it carries that this host cannot record leaves
-        // the close made: the caller is not told the store failed, which says nothing took effect.
-        self.settle_close_answer(session_id, &reply)
-            .await
-            .map_err(|unrecorded| ControllerError::Uncertain {
-                detail: format!(
-                    "the worker closed the session and this host could not record its closure: \
-                     {unrecorded}"
-                ),
-            })?;
+        // the close made: the answer is the worker's, and the record is written on a task.
+        self.settle_close_answer(session_id, &reply).await;
         crate::service::encode(&reply)
     }
 
