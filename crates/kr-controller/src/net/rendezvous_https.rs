@@ -1013,16 +1013,22 @@ mod tests {
 
     impl Scripted {
         async fn answering(answers: &[(u16, &str)]) -> Self {
-            Self::serving(answers, false).await
+            Self::serving(answers, false, false).await
+        }
+
+        /// As [`Self::answering`], with each answer that names a wait in its error also serving it
+        /// as `Retry-After`, as the service does.
+        async fn answering_with_retry_after(answers: &[(u16, &str)]) -> Self {
+            Self::serving(answers, false, true).await
         }
 
         /// As [`Self::answering`], with the first answer held back until [`Self::let_go`], as a room
         /// that is held up holds it.
         async fn holding_the_first(answers: &[(u16, &str)]) -> Self {
-            Self::serving(answers, true).await
+            Self::serving(answers, true, false).await
         }
 
-        async fn serving(answers: &[(u16, &str)], holding: bool) -> Self {
+        async fn serving(answers: &[(u16, &str)], holding: bool, retry_after: bool) -> Self {
             let answers: Vec<(u16, String)> = answers
                 .iter()
                 .map(|(status, body)| (*status, (*body).to_owned()))
@@ -1078,9 +1084,18 @@ mod tests {
                                 Err(_) => return,
                             }
                         }
+                        let header = if retry_after {
+                            serde_json::from_str::<serde_json::Value>(&body)
+                                .ok()
+                                .and_then(|value| value["error"]["retryAfterSeconds"].as_u64())
+                                .map(|seconds| format!("Retry-After: {seconds}\r\n"))
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
                         let answer = format!(
                             "HTTP/1.1 {status} Answer\r\nContent-Type: application/json\r\n\
-                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                             {header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                             body.len()
                         );
                         let _ = stream.write_all(answer.as_bytes()).await;
@@ -1299,6 +1314,240 @@ mod tests {
                 "{status} {body}"
             );
             assert_eq!(service.requests(), 1, "{status} {body}");
+        }
+    }
+
+    /// The words of a reservation that a budget refused, and the one item of the list beside them:
+    /// what a person is told when the service has no managed capacity for a new invitation.
+    const NETWORK_SHORT: &str =
+        "Managed capacity for new pairing invitations is not available from this network now.";
+    const SERVICE_SHORT: &str =
+        "Managed capacity for new pairing invitations is not available now.";
+    const LIMITS_UNREADABLE: &str = "The service could not read its limits for new pairing \
+                                     invitations, so it accepts none for now.";
+    const DIRECT_INVITATION: &str = "A direct invitation, which needs no rendezvous service and \
+                                     works where the new device can reach this host directly.";
+
+    /// The service's refusal of a request: its code, its words, the wait it names and, when it has
+    /// one, the list of paths that still work, inside the error as every other member is.
+    fn refusal(code: &str, message: &str, delay: u64, list: &[&str]) -> String {
+        let mut error = serde_json::json!({
+            "code": code,
+            "message": message,
+            "retryAfterSeconds": delay,
+        });
+        if !list.is_empty() {
+            error["alternatives"] = serde_json::json!(list);
+        }
+        serde_json::json!({ "ok": false, "error": error }).to_string()
+    }
+
+    /// What the host made of one answer, given again for every request it sent: the failure, the
+    /// text it keeps, the wait the answer owes, how many requests the service was sent and whether
+    /// the host kept that wait between them.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Reading {
+        code: ErrorCode,
+        kept: String,
+        owed: Option<Duration>,
+        requests: usize,
+        waited_as_owed: bool,
+    }
+
+    /// Reads `body` as the answer to a reservation, through `read_answer` alone and through
+    /// `control` over a service that answers it every time, with `Retry-After` beside it when the
+    /// body names a wait.
+    async fn read_every_time(status: u16, body: &str) -> Reading {
+        let kept = code_and_text(reserved(status, body));
+        let service = Scripted::answering_with_retry_after(&[(status, body)]).await;
+        let error = reserve_for(&service, Duration::from_secs(300))
+            .await
+            .expect_err("the service refuses");
+        let requests = service.requests();
+        let owed = send_again_after(&answered(status, body));
+        Reading {
+            code: error.code(),
+            kept: format!(
+                "{kept} | {}",
+                error
+                    .to_string()
+                    .replace(service.gateway.as_str(), "ORIGIN")
+            ),
+            owed,
+            requests,
+            waited_as_owed: requests < 2
+                || owed.is_some_and(|wait| service.gap_before_the_second() >= wait),
+        }
+    }
+
+    fn code_and_text(result: kr_pairing::Result<bool>) -> String {
+        let error = result.expect_err("the service refuses");
+        format!("{:?}: {error}", error.code())
+    }
+
+    /// One answer the service gives a reservation that a budget refused.
+    struct Refused {
+        name: &'static str,
+        status: u16,
+        code: &'static str,
+        delay: u64,
+        message: &'static str,
+        list: &'static [&'static str],
+        /// What the host must do with it, whatever the words: requests sent, and the wait owed.
+        requests: usize,
+        owed: Option<u64>,
+    }
+
+    /// KR-REQ-17.48: a reservation that a budget refused is answered with the service's new words
+    /// and, when the budget was short, a list of the paths that still work inside the error. The
+    /// host's reader, which is the released one, reads each such body as it reads the same body with
+    /// the words that were sent before: the same failure and text, the same wait owed, the same
+    /// requests, whether the status is 429 or 503 and whether the wait is a second or a day.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kr_req_17_48_a_reservation_refused_with_the_new_words_and_a_list_is_read_as_with_the_old()
+     {
+        const BUSY: &str = "SERVICE_UNAVAILABLE";
+        const LIMITED: &str = "RATE_LIMITED";
+        let max_attempts = usize::try_from(MAX_ATTEMPTS).expect("a count");
+        let list: &'static [&'static str] = &[DIRECT_INVITATION];
+        let rows = [
+            Refused {
+                name: "a network's budget is short, an hour",
+                status: 429,
+                code: LIMITED,
+                delay: 3600,
+                message: NETWORK_SHORT,
+                list,
+                requests: 1,
+                owed: None,
+            },
+            Refused {
+                name: "a network's budget is short, a day",
+                status: 429,
+                code: LIMITED,
+                delay: 86_400,
+                message: NETWORK_SHORT,
+                list,
+                requests: 1,
+                owed: None,
+            },
+            Refused {
+                name: "a network with no readable address is short, a second",
+                status: 429,
+                code: LIMITED,
+                delay: 1,
+                message: SERVICE_SHORT,
+                list,
+                requests: 1,
+                owed: None,
+            },
+            Refused {
+                name: "the service's budget is short, an hour",
+                status: 503,
+                code: BUSY,
+                delay: 3598,
+                message: SERVICE_SHORT,
+                list,
+                requests: 1,
+                owed: Some(3598),
+            },
+            Refused {
+                name: "the service's budget is short, a day",
+                status: 503,
+                code: BUSY,
+                delay: 86_400,
+                message: SERVICE_SHORT,
+                list,
+                requests: 1,
+                owed: Some(86_400),
+            },
+            Refused {
+                name: "the service's budget is short, 21 seconds",
+                status: 503,
+                code: BUSY,
+                delay: 21,
+                message: SERVICE_SHORT,
+                list,
+                requests: 1,
+                owed: Some(21),
+            },
+            Refused {
+                name: "the service's budget is short, a second",
+                status: 503,
+                code: BUSY,
+                delay: 1,
+                message: SERVICE_SHORT,
+                list,
+                requests: max_attempts,
+                owed: Some(1),
+            },
+            Refused {
+                name: "the service's budget is short, no wait",
+                status: 503,
+                code: BUSY,
+                delay: 0,
+                message: SERVICE_SHORT,
+                list,
+                requests: max_attempts,
+                owed: Some(0),
+            },
+            Refused {
+                name: "the service cannot read its limits, a minute, no list",
+                status: 503,
+                code: BUSY,
+                delay: 60,
+                message: LIMITS_UNREADABLE,
+                list: &[],
+                requests: 1,
+                owed: Some(60),
+            },
+        ];
+
+        for row in rows {
+            let new = refusal(row.code, row.message, row.delay, row.list);
+            let old = refusal(row.code, "The words sent before.", row.delay, &[]);
+            let (new_reading, old_reading) = (
+                read_every_time(row.status, &new).await,
+                read_every_time(row.status, &old).await,
+            );
+
+            println!(
+                "READING {} | {} {} delay {} | {:?} | requests {} | owed {:?} | kept as owed {}",
+                row.name,
+                row.status,
+                row.code,
+                row.delay,
+                new_reading.kept,
+                new_reading.requests,
+                new_reading.owed,
+                new_reading.waited_as_owed
+            );
+            assert_eq!(new_reading, old_reading, "{}", row.name);
+            assert_eq!(
+                new_reading.code,
+                ErrorCode::RendezvousUnavailable,
+                "{}",
+                row.name
+            );
+            assert!(
+                new_reading.kept.contains(&format!("answered {}", row.code)),
+                "{}: {}",
+                row.name,
+                new_reading.kept
+            );
+            assert!(
+                !new_reading.kept.contains(row.message) && !new_reading.kept.contains("Managed"),
+                "the words and the list are not kept: {}",
+                new_reading.kept
+            );
+            assert_eq!(new_reading.requests, row.requests, "{}", row.name);
+            assert_eq!(
+                new_reading.owed,
+                row.owed.map(Duration::from_secs),
+                "{}",
+                row.name
+            );
+            assert!(new_reading.waited_as_owed, "{}", row.name);
         }
     }
 
