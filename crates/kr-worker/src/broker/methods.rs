@@ -358,7 +358,40 @@ pub struct MutationAdmission {
     turn_id: Option<kr_protocol::ids::AgentTurnId>,
 }
 
+/// What a permit was admitted against, copied out of its admission so that the broker's checks can
+/// be asked again on the thread that makes the transport's call, where the permit itself cannot go.
+#[derive(Clone, Copy, Debug)]
+pub struct AdmittedAgainst {
+    application_instance_id: ApplicationInstanceId,
+    binding_revision: AgentBindingRevision,
+    resource_id: Option<kr_protocol::ids::PendingResourceId>,
+}
+
+impl AdmittedAgainst {
+    const fn application_instance_id(&self) -> ApplicationInstanceId {
+        self.application_instance_id
+    }
+
+    const fn binding_revision(&self) -> AgentBindingRevision {
+        self.binding_revision
+    }
+
+    const fn resource_id(&self) -> Option<kr_protocol::ids::PendingResourceId> {
+        self.resource_id
+    }
+}
+
 impl MutationAdmission {
+    /// What this admission was made against, for the broker's checks to be asked again.
+    #[must_use]
+    pub const fn admitted_against(&self) -> AdmittedAgainst {
+        AdmittedAgainst {
+            application_instance_id: self.application_instance_id,
+            binding_revision: self.binding_revision,
+            resource_id: self.resource_id,
+        }
+    }
+
     pub(crate) fn new(
         request: UpstreamRequest,
         dispatch: std::sync::Arc<dyn UpstreamDispatch>,
@@ -2271,16 +2304,35 @@ impl Broker {
         dispatch: &std::sync::Arc<dyn UpstreamDispatch>,
         request: &UpstreamRequest,
     ) -> Result<()> {
-        self.recheck_broker(admitted, request)?;
-        // The transport is asked outside the broker's lock: it takes locks of its own.
-        dispatch.admit(request)
+        let against = admitted.admitted_against();
+        self.recheck_broker(&against, request)?;
+        // The transport is asked outside the broker's lock: it takes locks of its own, and the
+        // binding can move while they are waited for. What the broker holds is read again after
+        // them, so the last ask before the permit leaves is the broker's.
+        dispatch.admit(request)?;
+        self.recheck_broker(&against, request)
     }
 
-    fn recheck_broker(
+    /// Asks the broker's checks again, immediately before the transport's call that takes the
+    /// operation, on the thread that makes it: the hop to that thread waits for the blocking pool,
+    /// and the binding can move in that wait.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::NotTransmitted`] with what refused, since nothing has been handed to
+    /// the transport.
+    pub fn recheck_before_submit(
         &self,
-        admitted: &MutationAdmission,
+        against: &AdmittedAgainst,
         request: &UpstreamRequest,
     ) -> Result<()> {
+        #[cfg(feature = "testing")]
+        self.at_submit_pause();
+        self.recheck_broker(against, request)
+            .map_err(|refusal| BrokerError::NotTransmitted(Box::new(refusal)))
+    }
+
+    fn recheck_broker(&self, admitted: &AdmittedAgainst, request: &UpstreamRequest) -> Result<()> {
         let state = self.state();
         state.volatile.require_rich_work()?;
         let application_instance_id = admitted.application_instance_id();

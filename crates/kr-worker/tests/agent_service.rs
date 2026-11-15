@@ -1835,6 +1835,173 @@ async fn kr_req_09_09_a_binding_that_moves_after_the_admission_is_refused_at_the
     }
 }
 
+/// A transport whose own admission runs a step the test gives it, as a wait for the transport's
+/// locks does for a binding that moves meanwhile, and that counts what it was asked to carry.
+#[derive(Default)]
+struct MovingBindingUpstream {
+    carried: std::sync::atomic::AtomicUsize,
+    in_its_admission: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl std::fmt::Debug for MovingBindingUpstream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("MovingBindingUpstream")
+    }
+}
+
+impl UpstreamDispatch for MovingBindingUpstream {
+    fn admit(&self, _request: &UpstreamRequest) -> Result<(), BrokerError> {
+        let step = self
+            .in_its_admission
+            .lock()
+            .expect("the record is not poisoned")
+            .take();
+        if let Some(step) = step {
+            step();
+        }
+        Ok(())
+    }
+
+    fn submit(&self, request: &UpstreamRequest) -> Result<PendingTransmission, BrokerError> {
+        self.carried
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(PendingTransmission::settled(Ok(UpstreamOutcome {
+            upstream_request_id: None,
+            turn_id: request.turn_id.clone(),
+            provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
+        })))
+    }
+}
+
+/// KR-REQ-09.09: the binding revision is compared again after the transport's own admission, which
+/// takes locks of its own. The binding moves inside that admission, after the broker's first
+/// comparison passed: the answer sends nothing, its receipt is `refused` and the resource stays
+/// answerable. The control: with the binding where it was, the same answer is carried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_09_a_binding_that_moves_in_the_transports_admission_is_refused_at_the_permit() {
+    for moved in [false, true] {
+        let host = host().await;
+        let upstream = Arc::new(MovingBindingUpstream::default());
+        register(&host, None);
+        let resource_id = offer_approval(&host, Arc::clone(&upstream));
+        if moved {
+            let broker = Arc::clone(host.service.broker());
+            *upstream
+                .in_its_admission
+                .lock()
+                .expect("the record is not poisoned") = Some(Box::new(move || {
+                broker
+                    .advance_binding(
+                        instance(),
+                        Some(kr_protocol::ids::AgentThreadId::new("thread-2").expect("a thread")),
+                        TimestampMs::new(5),
+                    )
+                    .expect("the binding moves");
+            }));
+        }
+        let mut client = cli(&host).await;
+        let mutation = approval_mutation(&client, &host, 22, resource_id);
+        let action_id = mutation.action_id;
+        let outcome = send(&mut client, mutation).await;
+        if moved {
+            let Outcome::Error(error) = outcome else {
+                panic!("an answer whose binding moved in the admission applied: {outcome:?}");
+            };
+            assert_eq!(error.code, ErrorCode::StaleSession);
+            assert_eq!(
+                upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "the rich answer wrote no frame"
+            );
+            assert_eq!(
+                receipt(&mut client, action_id).await.state,
+                ReceiptState::Refused,
+                "a refusal established before any byte was queued"
+            );
+            assert_eq!(
+                host.service
+                    .broker()
+                    .pending(resource_id)
+                    .expect("retained")
+                    .state,
+                kr_protocol::gateway::PendingState::Pending,
+                "the claim was given back"
+            );
+        } else {
+            assert!(
+                matches!(outcome, Outcome::Ok(_)),
+                "the control is carried: {outcome:?}"
+            );
+            assert_eq!(
+                upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the control reached the upstream"
+            );
+        }
+    }
+}
+
+/// KR-REQ-09.09: the broker's checks are asked once more on the thread that makes the transport's
+/// call, immediately before it, because the hop to that thread waits for the blocking pool. The
+/// binding moves while the call waits there, after the permit was taken and the marker written: the
+/// transport is never asked to carry the answer. The control: with the binding where it was, the
+/// same answer is carried once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_09_a_binding_that_moves_before_the_transports_call_is_refused_there() {
+    for moved in [false, true] {
+        let host = host().await;
+        let upstream = Arc::new(CountingUpstream::default());
+        register(&host, None);
+        let resource_id = offer_approval(&host, Arc::clone(&upstream));
+        let mut client = cli(&host).await;
+        let mutation = approval_mutation(&client, &host, 22, resource_id);
+
+        let (arrived, release) = host.service.broker().pause_before_submit();
+        let sending = tokio::spawn(async move {
+            let outcome = send(&mut client, mutation).await;
+            (outcome, client)
+        });
+        tokio::task::spawn_blocking(move || arrived.recv_timeout(LIVENESS_DEADLINE))
+            .await
+            .expect("the wait ends")
+            .expect("the call reaches the thread that makes the transport's call");
+        if moved {
+            host.service
+                .broker()
+                .advance_binding(
+                    instance(),
+                    Some(kr_protocol::ids::AgentThreadId::new("thread-2").expect("a thread")),
+                    TimestampMs::new(5),
+                )
+                .expect("the binding moves");
+        }
+        release.send(()).expect("the call is let go");
+
+        let (outcome, _client) = sending.await.expect("the mutation is answered");
+        if moved {
+            let Outcome::Error(error) = outcome else {
+                panic!("an answer whose binding moved before the call applied: {outcome:?}");
+            };
+            assert_eq!(error.code, ErrorCode::StaleSession);
+            assert_eq!(
+                upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "the transport was never asked to carry the answer"
+            );
+        } else {
+            assert!(
+                matches!(outcome, Outcome::Ok(_)),
+                "the control is carried: {outcome:?}"
+            );
+            assert_eq!(
+                upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the control reached the upstream once"
+            );
+        }
+    }
+}
+
 /// Section 9 and KR-REQ-11.27: an approval whose dispatch marker the receipt journal refused
 /// leaves its reservation back where it was.
 ///
