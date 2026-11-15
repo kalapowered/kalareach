@@ -663,6 +663,14 @@ impl Network {
         self.guard.host.input.tasks_ended()
     }
 
+    /// Revokes every terminal-input stream of `connection`, as the release of its link to the
+    /// worker does, and does nothing else: the connection, its control stream and its link stand, so
+    /// a suite can show what a stream does when only the host's revocation reaches it.
+    #[cfg(feature = "testing")]
+    pub fn revoke_input_streams_of(&self, connection: ConnectionId) {
+        self.guard.host.input.revoke_connection(connection);
+    }
+
     /// Stops accepting connections and closes the endpoint.
     pub async fn shutdown(self) {
         self.guard.shutdown().await;

@@ -5278,3 +5278,78 @@ async fn a_decision_waiting_for_the_registry_is_let_go_before_a_withdrawal_waits
     drop(go_release);
     rig.stop().await;
 }
+
+// The host's revocation of a stream while its connection stands. The stream's wait for the registry
+// hears the revocation itself: the end of the connection's control stream, which the cases above
+// use, also ends the task of every stream the connection serves, whether or not the wait hears
+// anything.
+
+/// A frame whose decision waits for the registry, which the case holds, while the host revokes the
+/// connection's input streams and the connection itself stands. The stream's task ends with the
+/// registry still held, the device finds its stream reset, the worker was given no frame after the
+/// first, and the connection goes on answering.
+async fn a_frame_that_waits_for_the_registry_is_let_go_when_the_host_revokes_its_stream(
+    serial: bool,
+) {
+    let rig = if serial {
+        Rig::start_serial().await
+    } else {
+        Rig::start().await
+    };
+    let calls = serial.then(|| script_calls(&rig, None, |_| took()));
+    let stages = rig.adopted.host.network().input_stages();
+    let mut stream = rig.open().await;
+    type_and_wait(&rig, &mut stream, 0, b"a").await;
+    let mut ended = rig.adopted.host.network().input_tasks_ended();
+    let registry = rig.adopted.host.controller().hold_the_registry().await;
+    stream
+        .write_message(&rig.frame(1, b"b"))
+        .await
+        .expect("the frame is written");
+    until("the frame's decision waits for the registry", || {
+        stages.counts().decisions_waiting == 1
+    })
+    .await;
+    rig.adopted
+        .host
+        .network()
+        .revoke_input_streams_of(rig.device.connection_id());
+    tokio::time::timeout(WAIT, ended.changed())
+        .await
+        .expect("the stream's task ended in time, with the registry held")
+        .expect("the count stands");
+    drop(registry);
+    assert!(
+        reads_to_the_end(&mut stream, 1).await.is_err(),
+        "the revoked stream is reset"
+    );
+    rig.device
+        .read(Method::HostInfo, &NoParams {})
+        .await
+        .expect("the connection stands and answers");
+    match calls {
+        Some(calls) => assert_eq!(
+            calls.sequences(),
+            vec![0],
+            "the worker was given the frame that waited"
+        ),
+        None => assert_eq!(
+            rig.lane.frames().len(),
+            1,
+            "the lane was given the frame that waited"
+        ),
+    }
+    rig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_waiting_for_the_registry_is_let_go_when_the_host_revokes_the_stream_of_a_worker_without_the_lane()
+ {
+    a_frame_that_waits_for_the_registry_is_let_go_when_the_host_revokes_its_stream(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_waiting_for_the_registry_is_let_go_when_the_host_revokes_the_stream_of_a_worker_with_the_lane()
+ {
+    a_frame_that_waits_for_the_registry_is_let_go_when_the_host_revokes_its_stream(false).await;
+}
