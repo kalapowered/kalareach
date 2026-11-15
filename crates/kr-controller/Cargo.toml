@@ -146,6 +146,11 @@ tough.workspace = true
 # A loopback room for the host's WebSocket to attach to, and the room's end of it.
 futures-util.workspace = true
 tokio-websockets = { workspace = true, features = ["server"] }
+# The scan of the daemon's source for every task it starts reads the source of this crate and of
+# the crates it links through their syntax trees and their macros' token streams.
+proc-macro2.workspace = true
+quote.workspace = true
+syn.workspace = true
 
 [lints]
 workspace = true
