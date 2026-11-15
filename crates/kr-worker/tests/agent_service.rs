@@ -1526,6 +1526,71 @@ async fn kr_req_11_33_what_changes_inside_the_admission_interval_is_still_a_reje
     }
 }
 
+/// KR-REQ-09.09 and KR-REQ-12.06: a live application's binding revision that moves between the
+/// durable acceptance of an answer and its dispatch is refused at the dispatch with a rejection:
+/// the receipt is `rejected`, no dispatch marker was ever written, and nothing reaches the
+/// upstream. The binding the answer was admitted under is not the one it is dispatched under.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_09_a_binding_that_moves_between_acceptance_and_dispatch_is_a_rejection() {
+    let host = host().await;
+    let upstream = Arc::new(CountingUpstream::default());
+    register(&host, None);
+    let resource_id = offer_approval(&host, Arc::clone(&upstream));
+    let mut client = cli(&host).await;
+    let mutation = approval_mutation(&client, &host, 18, resource_id);
+    let action_id = mutation.action_id;
+
+    let (arrived, release) = host.service.pause_before_admission();
+    let sending = tokio::spawn(async move {
+        let outcome = send(&mut client, mutation).await;
+        (outcome, client)
+    });
+    tokio::task::spawn_blocking(move || {
+        arrived
+            .recv_timeout(LIVENESS_DEADLINE)
+            .expect("the service reached the pause before its admission")
+    })
+    .await
+    .expect("the wait finishes");
+
+    // The receipt is durably accepted and nothing has been marked for dispatch.
+    let (state, events) = durable(&host, action_id);
+    assert_eq!(state.as_deref(), Some("accepted"));
+    assert!(!events.iter().any(|event| event == "dispatching"));
+
+    host.service
+        .broker()
+        .advance_binding(
+            instance(),
+            Some(kr_protocol::ids::AgentThreadId::new("thread-2").expect("a thread")),
+            TimestampMs::new(5),
+        )
+        .expect("the binding moves");
+    release.send(()).expect("the service is let go");
+
+    let (outcome, mut client) = sending.await.expect("the mutation is answered");
+    let Outcome::Error(error) = outcome else {
+        panic!("an answer admitted under a binding that moved is not dispatched: {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::StaleSession);
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Rejected,
+        "a refusal decided before the marker is a rejection"
+    );
+    let (state, events) = durable(&host, action_id);
+    assert_eq!(state.as_deref(), Some("rejected"));
+    assert!(
+        !events.iter().any(|event| event == "dispatching"),
+        "and no dispatch marker was ever written"
+    );
+    assert_eq!(
+        upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "nothing reached the upstream"
+    );
+}
+
 /// KR-REQ-11.33 and section 9: a native answer that takes the resource's transmission after a rich
 /// answer was admitted and its receipt marked, and before the broker's own marker, leaves the rich
 /// answer a refusal the caller can read as one: nothing of it went, so its receipt is `refused` and
@@ -1623,7 +1688,7 @@ async fn kr_req_11_33_a_rich_answer_a_native_answer_overtakes_before_its_marker_
     );
 }
 
-/// KR-REQ-12.06 and section 9: a rich answer stopped at its take by something that came after its
+/// KR-REQ-12.06, KR-REQ-09.09 and section 9: a rich answer stopped at its take by something that came after its
 /// admission (a suspension, a moved binding) sent nothing, so its receipt is `refused` and its
 /// error is the cause's own, not an outcome nobody can establish. The resource stays answerable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
