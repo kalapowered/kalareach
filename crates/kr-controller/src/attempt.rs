@@ -11,11 +11,12 @@
 //!
 //! - A command writes, rewrites and removes only its own file, and removes it once it has seen its
 //!   own result.
-//! - A control daemon of this build that has bound its endpoints removes every file that does not
-//!   name it as the daemon to stop ([`remove_those_that_stop_another_daemon`]): a daemon that
-//!   serves is a daemon that some command's attempt did not leave without one.
-//! - A command at its start prints the files of attempts whose process has gone, and removes those
-//!   it printed once it ends with its own result seen ([`Recorded::remove`]).
+//! - A control daemon of this build that has bound its endpoints removes the files that do not name
+//!   it as the daemon to stop, among the first [`CLEAN_LIMIT`] entries it reads, and leaves the rest
+//!   ([`remove_those_that_stop_another_daemon`]): a daemon that serves is a daemon that some
+//!   command's attempt did not leave without one.
+//! - A command at its start reads the files of attempts whose process has gone, and removes those
+//!   only after its own result has been written and has put them out ([`Recorded::remove`]).
 //! - A reader of a message that no control daemon runs removes nothing.
 //!
 //! No rule goes by a file's time, and the lock file's time says nothing: a daemon that takes the
@@ -38,6 +39,12 @@ pub const DIRECTORY: &str = "host-attempts";
 
 /// The most a file is read for: a file this host wrote is far smaller.
 const READ_LIMIT: u64 = 4096;
+
+/// The most entries of the attempts' directory that a daemon reads at its start. A file is the
+/// record of one command that was killed, and a command removes its own, so a real folder holds a
+/// handful; the daemon does not spend its start on a folder that holds more. What it leaves, a
+/// later daemon or a command reads.
+pub const CLEAN_LIMIT: usize = 64;
 
 /// The command that made an attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,7 +187,7 @@ impl Recorded {
         }
     }
 
-    /// Removes the file: the removal of a command that printed it and has seen its own result.
+    /// Removes the file: the removal of a command that has put it out in its own result.
     pub fn remove(&self) {
         let _ = std::fs::remove_file(&self.path);
     }
@@ -190,10 +197,16 @@ impl Recorded {
 /// that cannot be read, parsed or trusted is none.
 #[must_use]
 pub fn recorded(environment: &EnvironmentPaths) -> Vec<Recorded> {
+    found(environment, usize::MAX)
+}
+
+/// The files among the first `at_most` entries of the environment's directory that can be read.
+fn found(environment: &EnvironmentPaths, at_most: usize) -> Vec<Recorded> {
     let Ok(entries) = std::fs::read_dir(directory(environment)) else {
         return Vec::new();
     };
     let mut found: Vec<Recorded> = entries
+        .take(at_most)
         .filter_map(std::result::Result::ok)
         .filter_map(|entry| read(&entry.path()))
         .collect();
@@ -220,15 +233,16 @@ fn read(path: &Path) -> Option<Recorded> {
     })
 }
 
-/// Removes every attempt's file of an environment that does not name `daemon` as the daemon to
-/// stop, and says how many it removed. A control daemon calls it right after it has bound its
-/// endpoints: it serves, so no attempt that named another daemon is a stop that is still to
-/// come, and an attempt that names this daemon is a stop of this daemon that is under way.
+/// Removes the attempts' files of an environment that do not name `daemon` as the daemon to stop,
+/// among the first [`CLEAN_LIMIT`] entries of its directory, and says how many it removed. A
+/// control daemon calls it right after it has bound its endpoints: it serves, so no attempt that
+/// named another daemon is a stop that is still to come, and an attempt that names this daemon is
+/// a stop of this daemon that is under way. The entries past the limit are left.
 pub fn remove_those_that_stop_another_daemon(
     environment: &EnvironmentPaths,
     daemon: &ProcessStartIdentity,
 ) -> usize {
-    recorded(environment)
+    found(environment, CLEAN_LIMIT)
         .into_iter()
         .filter(|recorded| recorded.attempt.daemon.as_ref() != Some(daemon))
         .map(|recorded| recorded.remove())
@@ -365,6 +379,21 @@ mod tests {
         let left = recorded(&environment);
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].attempt.daemon.as_ref(), Some(&this_daemon));
+    }
+
+    /// The daemon's clean-up at its start reads a bounded number of entries and leaves the rest,
+    /// which a later reader still finds.
+    #[test]
+    fn a_daemon_reads_a_bounded_number_of_entries_and_leaves_the_rest() {
+        let host = temp();
+        let environment = host.environment();
+        let this_daemon = another(100);
+        for number in 0..CLEAN_LIMIT + 5 {
+            left_by(&environment, &format!("file-{number}"), own(), 1, None);
+        }
+        let removed = remove_those_that_stop_another_daemon(&environment, &this_daemon);
+        assert_eq!(removed, CLEAN_LIMIT);
+        assert_eq!(recorded(&environment).len(), 5, "the rest is left");
     }
 
     /// A file that cannot be parsed is none, and is not removed by reading it.
