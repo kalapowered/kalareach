@@ -2389,6 +2389,114 @@ async fn running_session(
     (host, runtime, clock, session_id, holder, epoch)
 }
 
+/// As [`silent_session`], for a managed session whose root editor is PowerShell's, qualified and
+/// with its hooks active, that has not begun a read. A case sends the editor the events it needs
+/// through [`the_editor_enters`] and [`the_editor_leaves`].
+#[cfg(not(windows))]
+async fn powershell_root_session() -> (
+    kr_ipc::testing::TempHost,
+    Arc<SessionRuntime>,
+    kr_ipc::clock::ManualSharedClock,
+    SessionId,
+    AttachmentId,
+    u64,
+) {
+    use kr_protocol::ids::{InputLeaseEpoch, RequestId};
+    use kr_protocol::root::PromptGeneration;
+    use kr_shell_integration::contract::events::{BridgeEvent, HooksActivated};
+    use kr_shell_integration::contract::fence::LeaseView;
+    use kr_shell_integration::contract::qualification::ShellKind;
+
+    let host = kr_ipc::testing::TempHost::create();
+    let mut config = configuration(
+        &host,
+        "stty raw -echo; printf 'kr-ready.'; exec cat > /dev/null",
+    );
+    config.shell_mode = ShellMode::Managed;
+    let clock = kr_ipc::clock::ManualSharedClock::new();
+    config.time.continuous = Arc::new(clock.clone());
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    session.install_fence(kr_worker::fence::FenceDriver::new(
+        session_id,
+        LeaseView::unheld(InputLeaseEpoch::new(0)),
+        Arc::new(kr_transport::clock::ManualClock::new()),
+    ));
+    {
+        let mut driver = session.fence_mut().expect("a driver");
+        assert!(driver.registered(ShellKind::PowerShell, "psreadline-2.3"));
+        let _ = driver.bridge_event(
+            RequestId::new(1),
+            &BridgeEvent::HooksActivated(HooksActivated {
+                session_id,
+                prompt_generation: PromptGeneration::new(1),
+                modules: Vec::new(),
+            }),
+        );
+        assert!(driver.phase().reports_ready());
+    }
+    let holder = attach(&mut session, &terminal(session_id, Some("xterm-256color")));
+    let epoch = session
+        .acquire_input(holder, connection(), None)
+        .expect("the keys")
+        .lease
+        .epoch
+        .get();
+    let runtime = Arc::new(
+        SessionRuntime::start(session, std::sync::Arc::new(clock.clone())).expect("starts"),
+    );
+    retained_within(&runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
+    (host, runtime, clock, session_id, holder, epoch)
+}
+
+/// The root editor of [`powershell_root_session`] starts a read, and is owed the reply to its
+/// cursor question: the lane keeps every other answer behind that reply.
+#[cfg(not(windows))]
+fn the_editor_enters(runtime: &Arc<SessionRuntime>, session_id: SessionId) {
+    use kr_protocol::ids::RequestId;
+    use kr_protocol::root::{
+        CwdRevision, EditorBufferRevision, EditorKeymap, EditorState, PendingReaderInput,
+        PromptGeneration, ReaderContext, ReaderRevision, RootEditorEnterParams,
+    };
+    use kr_shell_integration::contract::events::BridgeEvent;
+
+    let event = BridgeEvent::EditorEnter(RootEditorEnterParams {
+        session_id,
+        root_process: kr_ipc::identity::current_process_start_identity().expect("this process"),
+        prompt_generation: PromptGeneration::new(1),
+        reader_revision: ReaderRevision::new(1),
+        reader_context: ReaderContext::Primary,
+        editor: EditorState {
+            buffer_empty: true,
+            buffer_revision: EditorBufferRevision::new(1),
+            keymap: EditorKeymap::Emacs,
+            pending: PendingReaderInput::NONE,
+        },
+        cwd_revision: CwdRevision::new(1),
+    });
+    let _ = runtime.drive_fence(|driver| driver.bridge_event(RequestId::new(2), &event));
+}
+
+/// The root editor of [`powershell_root_session`] returns a line. It is owed no cursor report any
+/// more, and none came.
+#[cfg(not(windows))]
+fn the_editor_leaves(runtime: &Arc<SessionRuntime>, session_id: SessionId) {
+    use kr_protocol::ids::RequestId;
+    use kr_protocol::root::{
+        EditorLeaveReason, PromptGeneration, ReaderRevision, RootEditorLeaveParams,
+    };
+    use kr_shell_integration::contract::events::BridgeEvent;
+
+    let event = BridgeEvent::EditorLeave(RootEditorLeaveParams {
+        session_id,
+        prompt_generation: PromptGeneration::new(1),
+        reader_revision: ReaderRevision::new(1),
+        reason: EditorLeaveReason::CommandAccepted,
+    });
+    let _ = runtime.drive_fence(|driver| driver.bridge_event(RequestId::new(2), &event));
+}
+
 /// KR-REQ-08.48: a takeover ends the keystrokes of the lease that was taken, and not the host's
 /// answer to the application.
 ///
@@ -2660,6 +2768,7 @@ async fn an_answer_that_waits_for_room_is_dropped_at_its_deadline_with_nothing_e
     let (_host, runtime, clock, _session_id, _holder, _epoch) = silent_session().await;
     let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
     let (writer_stopped, _release_writer) = runtime.input().writer_hold().arm();
+    let (timer_ended, release_pump) = runtime.input().pause_the_pump_at_its_timer();
 
     {
         let mut session = runtime.session();
@@ -2681,12 +2790,18 @@ async fn an_answer_that_waits_for_room_is_dropped_at_its_deadline_with_nothing_e
         assert_eq!(session.engine().replies_expired(), 0);
     }
 
-    // The pump looks at the lane once more after the pass that left the answer waiting, to learn
-    // the deadline it has to wake at. That look must be over before the clock moves, or it would
-    // find the answer lapsed and drop it, and the wake at the deadline would never be shown.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // The pass that left the answer waiting told the pump its deadline, and the pump has since
+    // had its pass and is waiting for that deadline: its timer ends only then. The lane's clock
+    // has not moved, so a pass that the notice woke would have found the answer in time, and the
+    // drop that follows is the pump's own wake at the deadline.
+    tokio::time::timeout(Duration::from_secs(20), timer_ended)
+        .await
+        .expect("the pump waits for the answer's deadline, and its timer ends")
+        .expect("the pump's stop fires");
+    assert_eq!(runtime.session().engine().replies_expired(), 0);
     // Two seconds and a little more after the answer was offered.
     clock.advance(Duration::from_millis(2_100));
+    drop(release_pump);
     tokio::time::timeout(Duration::from_secs(10), async {
         while runtime.session().engine().replies_expired() == 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2844,6 +2959,7 @@ async fn room_given_back_after_the_pumps_pass_has_ended_brings_the_waiting_answe
 async fn an_answer_behind_an_open_paste_is_dropped_at_its_deadline_by_the_pump_and_never_written() {
     let (_host, runtime, clock, _session_id, holder, epoch) = silent_session().await;
     let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
+    let (timer_ended, release_pump) = runtime.input().pause_the_pump_at_its_timer();
 
     {
         let mut session = runtime.session();
@@ -2858,7 +2974,18 @@ async fn an_answer_behind_an_open_paste_is_dropped_at_its_deadline_by_the_pump_a
             "the answer waits behind the open paste"
         );
     }
+    // The pass that offered the answer told the pump its deadline, and the pump has since had its
+    // pass and is waiting for that deadline: its timer ends only then. The lane's clock stays
+    // before the deadline until it does, or the pass that the notice woke would drop the answer
+    // by itself, and the pump's own wake at the deadline would never be shown.
+    tokio::time::timeout(Duration::from_secs(20), timer_ended)
+        .await
+        .expect("the pump waits for the answer's deadline, and its timer ends")
+        .expect("the pump's stop fires");
+    assert!(runtime.session().engine().replies_pending());
+    assert_eq!(runtime.session().engine().replies_expired(), 0);
     clock.advance(Duration::from_millis(2_100));
+    drop(release_pump);
     tokio::time::timeout(Duration::from_secs(10), async {
         while runtime.session().engine().replies_expired() == 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2868,10 +2995,21 @@ async fn an_answer_behind_an_open_paste_is_dropped_at_its_deadline_by_the_pump_a
     .expect("the answer is dropped at its deadline with the paste open, and the drop is recorded");
     assert!(!runtime.session().engine().replies_pending());
 
+    the_paste_ends_and_the_dropped_answer_was_never_written(&runtime, holder, epoch, 1).await;
+}
+
+/// Ends the paste that `holder` has open, as its write number `sequence`, and says that the answer
+/// the lane dropped behind it was never written and was counted once.
+async fn the_paste_ends_and_the_dropped_answer_was_never_written(
+    runtime: &Arc<SessionRuntime>,
+    holder: AttachmentId,
+    epoch: u64,
+    sequence: u64,
+) {
     {
         let mut session = runtime.session();
         session
-            .write_input(holder, epoch, 1, b"\x1b[201~", None, Instant::now())
+            .write_input(holder, epoch, sequence, b"\x1b[201~", None, Instant::now())
             .expect("the paste ends");
         runtime.flush_input();
     }
@@ -2896,6 +3034,144 @@ async fn an_answer_behind_an_open_paste_is_dropped_at_its_deadline_by_the_pump_a
         .sum();
     assert_eq!(answers, 0, "the dropped answer is not written");
     assert_eq!(runtime.session().engine().replies_expired(), 1);
+}
+
+/// KR-REQ-08.49: an answer that a cursor hold kept, and that the end of the hold frees while a
+/// paste is open, is dropped at its deadline by the pump, with its record, and never written.
+///
+/// The root editor is owed the reply to its cursor question, so the lane keeps the host's answer
+/// to the application's question behind that reply, and the answer does not age. A paste opens.
+/// The editor then leaves with no cursor report: the answer is free, with the deadline it had,
+/// and nothing can be written while the paste is open. After that nothing happens: no key, no
+/// output, no room and no other timer. The pass that ended the hold is the only one that can tell
+/// the pump when to look again, and the lane's clock moves only while the pump stands at its
+/// timer, so the drop is the pump's own wake at the deadline.
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_that_the_end_of_a_cursor_hold_frees_behind_an_open_paste_is_dropped_at_its_deadline()
+ {
+    let (_host, runtime, clock, session_id, holder, epoch) = powershell_root_session().await;
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
+    let (timer_ended, release_pump) = runtime.input().pause_the_pump_at_its_timer();
+
+    the_editor_enters(&runtime, session_id);
+    {
+        let mut session = runtime.session();
+        session.ingest_output(b"\x1b[?2004h");
+        // Offered at zero, so its deadline is at two seconds, once it ages.
+        session.ingest_output(STATUS_QUESTION);
+        assert!(
+            session.engine().replies_pending(),
+            "the answer waits for the cursor report"
+        );
+    }
+    clock.advance(Duration::from_millis(100));
+    {
+        let mut session = runtime.session();
+        session
+            .write_input(holder, epoch, 0, b"\x1b[200~pasted", None, Instant::now())
+            .expect("the paste opens");
+        runtime.flush_input();
+    }
+    // Before the deadline, with the paste open.
+    clock.advance(Duration::from_millis(1_800));
+    the_editor_leaves(&runtime, session_id);
+
+    tokio::time::timeout(Duration::from_secs(20), timer_ended)
+        .await
+        .expect("the pump waits for the deadline that the end of the hold gave the answer")
+        .expect("the pump's stop fires");
+    {
+        let session = runtime.session();
+        assert!(session.engine().replies_pending());
+        assert_eq!(session.engine().replies_expired(), 0);
+    }
+    clock.advance(Duration::from_millis(200));
+    drop(release_pump);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while runtime.session().engine().replies_expired() == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the answer is dropped at its deadline with the paste open, and the drop is recorded");
+    assert!(!runtime.session().engine().replies_pending());
+
+    the_paste_ends_and_the_dropped_answer_was_never_written(&runtime, holder, epoch, 1).await;
+}
+
+/// KR-REQ-08.49: an answer that a cursor hold kept, and that the end of the hold frees while the
+/// writer's queue has no room, is dropped at its deadline by the pump, with its record.
+///
+/// The share of the host's answers is full, and the writer holds all of them, before the root
+/// editor begins its read. The lane then keeps one more answer behind the editor's cursor report,
+/// and the answer does not age. The editor leaves with no cursor report: the answer is free, with
+/// the deadline it had, and there is no room for it. After that nothing happens: no key, no
+/// output, no room and no other timer. The pass that ended the hold is the only one that can tell
+/// the pump when to look again, and the lane's clock moves only while the pump stands at its
+/// timer, so the drop is the pump's own wake at the deadline.
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_that_the_end_of_a_cursor_hold_frees_with_no_room_is_dropped_at_its_deadline() {
+    let (_host, runtime, clock, session_id, _holder, _epoch) = powershell_root_session().await;
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
+    let (writer_stopped, _release_writer) = runtime.input().writer_hold().arm();
+    let (timer_ended, release_pump) = runtime.input().pause_the_pump_at_its_timer();
+
+    {
+        let mut session = runtime.session();
+        session.ingest_output(&STATUS_QUESTION.repeat(256));
+        runtime.flush_input();
+    }
+    tokio::time::timeout(Duration::from_secs(20), writer_stopped)
+        .await
+        .expect("the writer takes the first batch")
+        .expect("the writer's stop fires");
+    // The lane's rate limit is per second: the answer after those is a second later.
+    clock.advance(Duration::from_secs(1));
+    the_editor_enters(&runtime, session_id);
+    {
+        let mut session = runtime.session();
+        // Offered at one second, so its deadline is at three, once it ages.
+        session.ingest_output(STATUS_QUESTION);
+        assert!(
+            session.engine().replies_pending(),
+            "the answer waits for the cursor report"
+        );
+    }
+    // Before the deadline.
+    clock.advance(Duration::from_millis(1_900));
+    the_editor_leaves(&runtime, session_id);
+
+    tokio::time::timeout(Duration::from_secs(20), timer_ended)
+        .await
+        .expect("the pump waits for the deadline that the end of the hold gave the answer")
+        .expect("the pump's stop fires");
+    {
+        let session = runtime.session();
+        assert!(
+            session.engine().replies_pending(),
+            "the answer waits in the lane for room"
+        );
+        assert_eq!(session.engine().replies_expired(), 0);
+    }
+    clock.advance(Duration::from_millis(200));
+    drop(release_pump);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while runtime.session().engine().replies_expired() == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the answer is dropped at its deadline with no room, and the drop is recorded");
+    let mut session = runtime.session();
+    assert!(!session.engine().replies_pending());
+    session.pump_replies();
+    assert_eq!(
+        session.engine().replies_expired(),
+        1,
+        "the drop is counted once"
+    );
 }
 
 /// KR-REQ-08.49: a terminal that refuses a write ends the writer, and what the writer leaves
