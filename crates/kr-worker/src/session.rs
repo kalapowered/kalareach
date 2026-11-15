@@ -5845,4 +5845,257 @@ mod tests {
             );
         }
     }
+
+    /// The cursor hold, on a root editor that PowerShell runs: what the pass that ends it publishes
+    /// for the answers it kept, read from the room the pump reads.
+    ///
+    /// Nothing serves these sessions, so the only passes are the ones a case makes, and the
+    /// deadline the room holds is the one the last pass left there.
+    #[cfg(not(windows))]
+    mod the_hold_of_a_cursor_report {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        use kr_ipc::clock::{ManualSharedClock, SharedClock};
+        use kr_protocol::attachment::{AttachMode, AttachmentCapability, SessionAttachParams};
+        use kr_protocol::identity::{DesktopBinding, WorkerProfile};
+        use kr_protocol::ids::{
+            AttachmentId, ConnectionId, EnvironmentId, InputLeaseEpoch, RequestId, SessionEpoch,
+            SessionId,
+        };
+        use kr_protocol::root::{
+            CwdRevision, EditorBufferRevision, EditorKeymap, EditorLeaveReason, EditorState,
+            PendingReaderInput, PromptGeneration, ReaderContext, ReaderRevision,
+            RootEditorEnterParams, RootEditorLeaveParams,
+        };
+        use kr_protocol::scalars::{CanonicalSet, Nullable};
+        use kr_protocol::session::{Dimensions, DisplayNumber, LaunchProfile, ShellMode};
+        use kr_shell_integration::contract::events::{BridgeEvent, HooksActivated};
+        use kr_shell_integration::contract::fence::LeaseView;
+        use kr_shell_integration::contract::qualification::ShellKind;
+
+        use crate::fence::FenceDriver;
+        use crate::session::{Session, SessionConfig};
+
+        /// The application asks for the device status, and the answer is the host's to give.
+        const QUESTION: &[u8] = b"\x1b[5n";
+
+        /// A managed session with a PowerShell root, on a lane clock the case moves.
+        struct Prompt {
+            session: Session,
+            session_id: SessionId,
+            clock: ManualSharedClock,
+            holder: AttachmentId,
+            epoch: u64,
+            _host: kr_ipc::testing::TempHost,
+        }
+
+        impl Prompt {
+            fn new() -> Self {
+                let host = kr_ipc::testing::TempHost::create();
+                let session_id = SessionId::new(kr_ipc::new_uuid());
+                let clock = ManualSharedClock::new();
+                let mut time = crate::action::time::TimeSources::system();
+                time.continuous = Arc::new(clock.clone());
+                let mut session = Session::open(SessionConfig {
+                    session_id,
+                    session_epoch: SessionEpoch::V1,
+                    environment_id: EnvironmentId::new(kr_ipc::new_uuid()),
+                    display_number: DisplayNumber::new(1),
+                    shell: crate::testing::posix_script("sleep 120"),
+                    shell_mode: ShellMode::Managed,
+                    worker_profile: WorkerProfile::HeadlessUser,
+                    desktop: DesktopBinding::none(),
+                    dimensions: Dimensions::new(80, 24),
+                    journal_path: Some(host.environment().journal_database(session_id)),
+                    spool_directory: Some(host.environment().session_spool(session_id)),
+                    worker_endpoint: None,
+                    send_queue_bytes: 8 * 1024 * 1024,
+                    resident_bytes: 1024 * 1024,
+                    time,
+                    launch_profile: LaunchProfile::default(),
+                })
+                .expect("opens");
+                session.launch().expect("launches");
+                session.install_fence(FenceDriver::new(
+                    session_id,
+                    LeaseView::unheld(InputLeaseEpoch::new(0)),
+                    Arc::new(kr_transport::clock::ManualClock::new()),
+                ));
+                {
+                    let mut driver = session.fence_mut().expect("a driver");
+                    assert!(driver.registered(ShellKind::PowerShell, "psreadline-2.3"));
+                    let _ = driver.bridge_event(
+                        RequestId::new(1),
+                        &BridgeEvent::HooksActivated(HooksActivated {
+                            session_id,
+                            prompt_generation: PromptGeneration::new(1),
+                            modules: Vec::new(),
+                        }),
+                    );
+                }
+                let mut requested = CanonicalSet::new();
+                requested.insert(AttachmentCapability::ObserveTerminal);
+                requested.insert(AttachmentCapability::Input);
+                let params = SessionAttachParams {
+                    session_id,
+                    mode: AttachMode::Terminal,
+                    claim_geometry: false,
+                    dimensions: Nullable::some(Dimensions::new(80, 24)),
+                    terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                    requested,
+                };
+                let holder = AttachmentId::new(kr_ipc::new_uuid());
+                session
+                    .attach(&params, params.requested.clone(), holder)
+                    .expect("attaches");
+                let epoch = session
+                    .acquire_input(holder, ConnectionId::new(kr_ipc::new_uuid()), None)
+                    .expect("the lease is granted")
+                    .lease
+                    .epoch
+                    .get();
+                Self {
+                    session,
+                    session_id,
+                    clock,
+                    holder,
+                    epoch,
+                    _host: host,
+                }
+            }
+
+            fn editor_reports(&mut self, event: BridgeEvent) {
+                let _ = self
+                    .session
+                    .stimulate_fence(|driver| driver.bridge_event(RequestId::new(2), &event))
+                    .expect("a driver");
+            }
+
+            /// The root editor starts a read, and is owed the reply to its cursor question.
+            fn editor_enters(&mut self) {
+                self.editor_reports(BridgeEvent::EditorEnter(RootEditorEnterParams {
+                    session_id: self.session_id,
+                    root_process: kr_ipc::identity::current_process_start_identity()
+                        .expect("this process"),
+                    prompt_generation: PromptGeneration::new(1),
+                    reader_revision: ReaderRevision::new(1),
+                    reader_context: ReaderContext::Primary,
+                    editor: EditorState {
+                        buffer_empty: true,
+                        buffer_revision: EditorBufferRevision::new(1),
+                        keymap: EditorKeymap::Emacs,
+                        pending: PendingReaderInput::NONE,
+                    },
+                    cwd_revision: CwdRevision::new(1),
+                }));
+            }
+
+            /// The root editor returns a line, and is owed nothing, though no cursor report came.
+            fn editor_leaves(&mut self) {
+                self.editor_reports(BridgeEvent::EditorLeave(RootEditorLeaveParams {
+                    session_id: self.session_id,
+                    prompt_generation: PromptGeneration::new(1),
+                    reader_revision: ReaderRevision::new(1),
+                    reason: EditorLeaveReason::CommandAccepted,
+                }));
+            }
+
+            /// The deadline that the last pass left in the room for the pump to wake at.
+            fn published(&self) -> Option<u64> {
+                self.session.input.lock().writer().room.reply_expiry()
+            }
+        }
+
+        impl Drop for Prompt {
+            fn drop(&mut self) {
+                let _ = self.session.force_close();
+            }
+        }
+
+        /// KR-REQ-08.49: the pass that ends a cursor hold with no cursor report, while a paste is
+        /// open and nothing can be written, publishes the deadline of the answer the hold kept.
+        ///
+        /// The hold stops an answer from ageing, and the lane has no deadline to give for it. The
+        /// editor leaves while the paste is open, which frees the answer with the deadline it had,
+        /// and the gate is shut, so nothing goes out. No later pass is owed, so the pass that ends
+        /// the hold is the only one that can tell the pump when to look again.
+        #[test]
+        fn the_pass_that_ends_a_hold_behind_an_open_paste_publishes_the_answers_deadline() {
+            let mut prompt = Prompt::new();
+            prompt.editor_enters();
+            let _ = prompt.session.ingest_output(b"\x1b[?2004h");
+            let offered_at = prompt.clock.boot_elapsed_ms();
+            let _ = prompt.session.ingest_output(QUESTION);
+            assert!(prompt.session.engine.replies_pending());
+            assert_eq!(
+                prompt.published(),
+                None,
+                "the hold keeps the answer from ageing"
+            );
+
+            prompt.clock.advance(Duration::from_millis(100));
+            prompt
+                .session
+                .write_input(
+                    prompt.holder,
+                    prompt.epoch,
+                    0,
+                    b"\x1b[200~pasted",
+                    None,
+                    Instant::now(),
+                )
+                .expect("the paste opens");
+            assert_eq!(
+                prompt.published(),
+                None,
+                "the editor is still owed its report"
+            );
+
+            prompt.clock.advance(Duration::from_millis(400));
+            prompt.editor_leaves();
+            assert!(prompt.session.engine.replies_pending());
+            assert_eq!(prompt.session.engine.replies_expired(), 0);
+            assert_eq!(
+                prompt.published(),
+                Some(offered_at + 2_000),
+                "the answer ages again with the deadline it had, and the pump is told it"
+            );
+        }
+
+        /// KR-REQ-08.49: the same pass, with the writer's queue full of the host's answers
+        /// instead of a paste open.
+        ///
+        /// The share of answers is full before the editor's read begins, and nothing takes them.
+        /// The answer that the hold keeps is freed with no room to go out into.
+        #[test]
+        fn the_pass_that_ends_a_hold_with_no_room_publishes_the_answers_deadline() {
+            let mut prompt = Prompt::new();
+            let _ = prompt.session.ingest_output(&QUESTION.repeat(256));
+            // The lane's rate limit is per second: the answer after these is a second later.
+            prompt.clock.advance(Duration::from_secs(1));
+            prompt.editor_enters();
+            let offered_at = prompt.clock.boot_elapsed_ms();
+            let _ = prompt.session.ingest_output(QUESTION);
+            assert!(prompt.session.engine.replies_pending());
+            assert_eq!(
+                prompt.published(),
+                None,
+                "the hold keeps the answer from ageing"
+            );
+
+            prompt.clock.advance(Duration::from_millis(500));
+            prompt.editor_leaves();
+            assert!(
+                prompt.session.engine.replies_pending(),
+                "there is no room for it"
+            );
+            assert_eq!(prompt.session.engine.replies_expired(), 0);
+            assert_eq!(
+                prompt.published(),
+                Some(offered_at + 2_000),
+                "the answer ages again with the deadline it had, and the pump is told it"
+            );
+        }
+    }
 }
