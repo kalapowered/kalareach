@@ -235,6 +235,15 @@ async fn next_or_reset(stream: &mut DataStream) -> kr_transport::Result<Option<I
         .expect("the host answers or ends the stream in time")
 }
 
+/// The next acknowledgement from the read half of a split stream, as [`next_or_reset`] gives it.
+async fn next_on(
+    reader: &mut kr_transport::streams::DataReader,
+) -> kr_transport::Result<Option<InputAck>> {
+    tokio::time::timeout(WAIT, reader.read_message::<InputAck>())
+        .await
+        .expect("the host answers or ends the stream in time")
+}
+
 /// Reads the stream to its end. A frame written after a restriction may be answered before the
 /// stream ends, and no answer may accept it: `first_unaccepted` is the sequence of the first frame
 /// written after the restriction. Returns what ended the stream.
@@ -2064,6 +2073,72 @@ async fn full_stages_are_emptied_when_a_newer_stream_replaces_the_stream() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_stages_are_emptied_when_the_workers_lane_ends() {
     full_stages_then(Ending::LaneClosed).await;
+}
+
+/// What the host holds for a stream is let go with the stream's state: a stream that is replaced
+/// while frames of it are at the host gives them back, and a stream that ends with the record of
+/// its newest refusal gives the record back. The counts are read after the replacement and after
+/// the close, and they are of the streams that stand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_frames_and_the_record_a_stream_held_are_let_go_when_it_is_replaced_and_when_it_ends() {
+    let rig = Rig::start().await;
+    let stages = rig.adopted.host.network().input_stages();
+    let mut older = rig.open().await;
+    rig.lane.hold_answers();
+    for sequence in 0..2 {
+        older
+            .write_message(&rig.frame(sequence, b"a"))
+            .await
+            .expect("the frame is written");
+    }
+    rig.lane
+        .until("both frames are at the lane", |frames| frames.len() == 2)
+        .await;
+    assert_eq!(
+        stages.counts().host_holds,
+        2,
+        "the host holds both frames, with no answer"
+    );
+    let newer = rig.open().await;
+    assert!(
+        next_or_reset(&mut older).await.is_err(),
+        "the older stream is reset"
+    );
+    until("the replaced stream's frames are let go", || {
+        stages.counts().host_holds == 0
+    })
+    .await;
+
+    rig.lane.refuse_from(0);
+    rig.lane.release_answers();
+    let (mut reader, mut writer) = newer.split();
+    writer
+        .write_message(&rig.frame(0, b"b"))
+        .await
+        .expect("the frame is written");
+    assert!(
+        matches!(
+            next_on(&mut reader).await,
+            Ok(Some(InputAck::Refused { .. }))
+        ),
+        "the frame is refused"
+    );
+    assert_eq!(
+        stages.counts().records,
+        1,
+        "the host keeps the record of the newest epoch's refusal while the stream stands"
+    );
+    drop(writer);
+    assert!(
+        matches!(next_on(&mut reader).await, Ok(None)),
+        "the stream ends cleanly"
+    );
+    until("the ended stream's record is let go", || {
+        let counts = stages.counts();
+        counts.records == 0 && counts.host_holds == 0
+    })
+    .await;
+    rig.stop().await;
 }
 
 /// C7, the host's half: a worker that does not answer or give credit stops the host reading, control
