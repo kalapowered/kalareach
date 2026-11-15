@@ -381,7 +381,7 @@ fn ask(host: &Host, request: &str) -> Question {
                 requested_expiry_ms: Nullable::some(DurationMs::new(600_000)),
                 wait_ms: Nullable::null(),
             },
-            now(),
+            &mut kr_worker::questions::Standing::fixed(now()),
         )
         .expect("the agent asks");
     asked.question

@@ -381,7 +381,7 @@ impl World {
                     requested_expiry_ms: Nullable::null(),
                     wait_ms: Nullable::null(),
                 },
-                question_clock(),
+                &mut kr_worker::questions::Standing::fixed(question_clock()),
             )
             .expect("a verified source creates a question")
             .0
@@ -398,7 +398,7 @@ impl World {
                     question_id: question.question_id,
                     expected_revision: question.revision,
                 },
-                question_clock(),
+                &mut kr_worker::questions::Standing::fixed(question_clock()),
             )
             .expect("the question is withdrawn");
     }

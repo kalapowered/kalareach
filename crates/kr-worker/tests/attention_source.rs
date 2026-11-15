@@ -393,7 +393,7 @@ fn ask(host: &Host, request: &str, question: &str) -> kr_protocol::question::Que
                 requested_expiry_ms: Nullable::null(),
                 wait_ms: Nullable::null(),
             },
-            now(),
+            &mut kr_worker::questions::Standing::fixed(now()),
         )
         .expect("a verified source creates a question")
         .0
@@ -410,7 +410,7 @@ fn cancel(host: &Host, question: &kr_protocol::question::Question) {
                 question_id: question.question_id,
                 expected_revision: question.revision,
             },
-            now(),
+            &mut kr_worker::questions::Standing::fixed(now()),
         )
         .expect("the question is withdrawn");
 }

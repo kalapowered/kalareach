@@ -65,7 +65,7 @@ use kr_worker::broker::{
 };
 use kr_worker::journal::{Journal, Submission};
 use kr_worker::questions::binding::VerifiedSource;
-use kr_worker::questions::{Now, QuestionError, Questions};
+use kr_worker::questions::{Now, QuestionError, Questions, Standing};
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session as TerminalSession, SessionConfig};
@@ -456,13 +456,18 @@ fn now() -> Now {
     }
 }
 
+/// A request that nothing refuses, read now.
+fn at() -> Standing<'static> {
+    Standing::fixed(now())
+}
+
 /// The agent asks, and the question is pending in the worker's ledger. Returns what it asked and
 /// the token the agent reads its answer with.
 fn ask(host: &Host) -> (QuestionId, CallerToken) {
     let (asked, _) = host
         .service
         .questions()
-        .create(&asker(), &asking(host.session_id), now())
+        .create(&asker(), &asking(host.session_id), &mut at())
         .expect("the agent asks");
     assert_eq!(asked.question.state, QuestionState::Pending);
     (asked.question.question_id, asked.caller_token)
@@ -958,7 +963,7 @@ fn the_worker_half_of_the_death_test() {
     let questions = Questions::open(Some(path.as_path()), session_id, SessionEpoch::V1)
         .expect("the question ledger opens");
     questions
-        .create(&asker(), &asking(session_id), now())
+        .create(&asker(), &asking(session_id), &mut at())
         .expect("the agent asks");
     let mut out = std::io::stdout();
     writeln!(out, "{HOLDING}").expect("says so");
@@ -1096,7 +1101,7 @@ fn kr_req_24_06_a_workers_death_ends_what_it_held_live_and_leaves_its_dispatch_u
                 expected_revision: question.revision,
                 answer: QuestionAnswer::Decision { decided: true },
             },
-            now(),
+            &mut at(),
         )
         .expect_err("nobody answers it now");
     assert!(

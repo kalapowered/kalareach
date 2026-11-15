@@ -15,13 +15,18 @@ use kr_protocol::question::{
     QuestionReadParams, QuestionState,
 };
 use kr_protocol::scalars::{DurationMs, Nullable, TimestampMs, Uuid};
-use kr_worker::questions::{Now, QuestionError, Questions};
+use kr_worker::questions::{Now, QuestionError, Questions, Standing};
 
 fn now(utc_ms: u64) -> Now {
     Now {
         utc_ms: TimestampMs::new(utc_ms),
         boot_ms: utc_ms,
     }
+}
+
+/// A request that nothing refuses, read at `utc_ms`.
+fn at(utc_ms: u64) -> Standing<'static> {
+    Standing::fixed(now(utc_ms))
 }
 
 fn source() -> kr_worker::questions::binding::VerifiedSource {
@@ -60,7 +65,7 @@ fn the_originating_agent_is_told_the_answering_device_the_actor_and_the_revision
     let source = source();
 
     let (created, _) = questions
-        .create(&source, &create(session_id), now(1_000))
+        .create(&source, &create(session_id), &mut at(1_000))
         .expect("the agent asks");
     let caller_token: CallerToken = created.caller_token;
     let question_id = created.question.question_id;
@@ -80,7 +85,7 @@ fn the_originating_agent_is_told_the_answering_device_the_actor_and_the_revision
                 expected_revision: asked_revision,
                 answer: QuestionAnswer::Decision { decided: true },
             },
-            now(2_000),
+            &mut at(2_000),
         )
         .expect("the person answers");
     assert_eq!(resolved.question.state, QuestionState::Answered);
@@ -133,7 +138,7 @@ fn an_answer_to_a_revision_that_is_no_longer_current_is_refused() {
         Questions::open(None, session_id, SessionEpoch::V1).expect("the question ledger opens");
     let source = source();
     let (created, _) = questions
-        .create(&source, &create(session_id), now(1_000))
+        .create(&source, &create(session_id), &mut at(1_000))
         .expect("the agent asks");
     let question_id = created.question.question_id;
 
@@ -148,7 +153,7 @@ fn an_answer_to_a_revision_that_is_no_longer_current_is_refused() {
                 expected_revision: created.question.revision,
                 answer: QuestionAnswer::Decision { decided: true },
             },
-            now(2_000),
+            &mut at(2_000),
         )
         .expect("the first answer wins");
 
@@ -165,7 +170,7 @@ fn an_answer_to_a_revision_that_is_no_longer_current_is_refused() {
                 expected_revision: created.question.revision,
                 answer: QuestionAnswer::Decision { decided: false },
             },
-            now(2_100),
+            &mut at(2_100),
         )
         .expect_err("a resolved question takes no second answer");
 }
@@ -182,7 +187,7 @@ fn a_pending_question_takes_an_answer_or_a_cancellation_only_for_its_own_revisio
     let source = source();
     let actor_id = ActorId::new("device:phone").expect("a principal");
     let device_id = Some(DeviceId::new(Uuid::from_bytes([9; 16])));
-    let answer = |question_id, expected_revision, at| {
+    let answer = |question_id, expected_revision, ms| {
         questions.answer(
             &actor_id,
             device_id,
@@ -192,17 +197,17 @@ fn a_pending_question_takes_an_answer_or_a_cancellation_only_for_its_own_revisio
                 expected_revision,
                 answer: QuestionAnswer::Decision { decided: true },
             },
-            now(at),
+            &mut at(ms),
         )
     };
-    let cancel = |question_id, expected_revision, at| {
+    let cancel = |question_id, expected_revision, ms| {
         questions.cancel(
             &QuestionCancelParams {
                 session_id,
                 question_id,
                 expected_revision,
             },
-            now(at),
+            &mut at(ms),
         )
     };
     let state = |question_id, at| {
@@ -222,7 +227,7 @@ fn a_pending_question_takes_an_answer_or_a_cancellation_only_for_its_own_revisio
     };
 
     let (created, _) = questions
-        .create(&source, &create(session_id), now(1_000))
+        .create(&source, &create(session_id), &mut at(1_000))
         .expect("the agent asks");
     let question_id = created.question.question_id;
     let shown = created.question.revision;
@@ -250,7 +255,7 @@ fn a_pending_question_takes_an_answer_or_a_cancellation_only_for_its_own_revisio
         let questions =
             Questions::open(None, session_id, SessionEpoch::V1).expect("the question ledger opens");
         let (expiring, _) = questions
-            .create(&source, &create(session_id), now(3_000))
+            .create(&source, &create(session_id), &mut at(3_000))
             .expect("the agent asks");
         let question_id = expiring.question.question_id;
         let expected_revision = expiring.question.revision;
@@ -263,7 +268,7 @@ fn a_pending_question_takes_an_answer_or_a_cancellation_only_for_its_own_revisio
                         question_id,
                         expected_revision,
                     },
-                    late,
+                    &mut kr_worker::questions::Standing::fixed(late),
                 )
                 .map(|_| ())
         } else {
@@ -277,7 +282,7 @@ fn a_pending_question_takes_an_answer_or_a_cancellation_only_for_its_own_revisio
                         expected_revision,
                         answer: QuestionAnswer::Decision { decided: true },
                     },
-                    late,
+                    &mut kr_worker::questions::Standing::fixed(late),
                 )
                 .map(|_| ())
         };
@@ -300,7 +305,7 @@ fn a_caller_token_works_only_for_the_helper_it_was_issued_to() {
         Questions::open(None, session_id, SessionEpoch::V1).expect("the question ledger opens");
     let asker = source();
     let (created, _) = questions
-        .create(&asker, &create(session_id), now(1_000))
+        .create(&asker, &create(session_id), &mut at(1_000))
         .expect("the agent asks");
     let question_id = created.question.question_id;
     let token: CallerToken = created.caller_token;
@@ -329,7 +334,7 @@ fn a_caller_token_works_only_for_the_helper_it_was_issued_to() {
         Err(QuestionError::TokenRejected { .. })
     ));
     assert!(matches!(
-        questions.cancel_own(&other, &cancel(&token), now(1_200)),
+        questions.cancel_own(&other, &cancel(&token), &mut at(1_200)),
         Err(QuestionError::TokenRejected { .. })
     ));
 
@@ -337,10 +342,10 @@ fn a_caller_token_works_only_for_the_helper_it_was_issued_to() {
     let mut second = create(session_id);
     second.request_id = "push-after-review".to_owned();
     let (another, _) = questions
-        .create(&asker, &second, now(1_300))
+        .create(&asker, &second, &mut at(1_300))
         .expect("the agent asks again");
     assert!(matches!(
-        questions.cancel_own(&asker, &cancel(&another.caller_token), now(1_400)),
+        questions.cancel_own(&asker, &cancel(&another.caller_token), &mut at(1_400)),
         Err(QuestionError::TokenRejected { .. })
     ));
 
@@ -353,7 +358,7 @@ fn a_caller_token_works_only_for_the_helper_it_was_issued_to() {
         "nothing refused changed it"
     );
     let (cancelled, _) = questions
-        .cancel_own(&asker, &cancel(&token), now(1_600))
+        .cancel_own(&asker, &cancel(&token), &mut at(1_600))
         .expect("the helper that asked cancels it");
     assert_eq!(cancelled.question.state, QuestionState::Cancelled);
 }

@@ -3304,7 +3304,7 @@ async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
                 requested_expiry_ms: Nullable::some(kr_protocol::scalars::DurationMs::new(600_000)),
                 wait_ms: Nullable::null(),
             },
-            now(),
+            &mut kr_worker::questions::Standing::fixed(now()),
         )
         .expect("the agent asks while the store is working");
 

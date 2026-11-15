@@ -913,7 +913,11 @@ impl Wired {
         };
         self.service
             .questions()
-            .create(&source, &params, asked_at)
+            .create(
+                &source,
+                &params,
+                &mut kr_worker::questions::Standing::fixed(asked_at),
+            )
             .expect("the question is asked")
             .0
             .question
@@ -932,10 +936,10 @@ impl Wired {
                     expected_revision: question.revision,
                     answer: QuestionAnswer::Decision { decided: true },
                 },
-                kr_worker::questions::Now {
+                &mut kr_worker::questions::Standing::fixed(kr_worker::questions::Now {
                     utc_ms: kr_ipc::now_ms(),
                     boot_ms: kr_ipc::clock::boot_elapsed_ms(),
-                },
+                }),
             )
             .expect("the question is answered");
     }

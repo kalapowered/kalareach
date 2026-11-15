@@ -7339,6 +7339,31 @@ impl WorkerService {
         self.check_accepted_deadline(deadline)
     }
 
+    /// Runs one of the question and alert arms, whose writes ask this request's authority again
+    /// after the arm has waited for the ledger's lock and read what it needs, immediately before
+    /// each write of its own.
+    ///
+    /// What the ask refuses with is the refusal [`Self::still_admitted`] gives, told as it is: the
+    /// dispatch records it as a refusal and never as an unknown outcome.
+    fn at_the_ledger<T>(
+        &self,
+        caller: &Caller,
+        method: Method,
+        deadline: ContinuousInstant,
+        arm: impl FnOnce(&mut crate::questions::Standing<'_>) -> crate::questions::Result<T>,
+    ) -> Result<T> {
+        let clock = || self.question_clock();
+        let mut still = || {
+            self.still_admitted(caller, method, deadline)
+                .map_err(|refusal| crate::questions::QuestionError::Withdrawn(Box::new(refusal)))
+        };
+        let mut at = crate::questions::Standing::new(&clock, &mut still);
+        arm(&mut at).map_err(|error| match error {
+            crate::questions::QuestionError::Withdrawn(refusal) => *refusal,
+            other => WorkerError::from(other),
+        })
+    }
+
     /// Refuses a paired device's dispatch that does not hold a live lease from the generation this
     /// worker accepts, for the revision it has acknowledged to that generation and installed.
     ///
@@ -10123,25 +10148,25 @@ impl WorkerService {
             Method::QuestionCreate => {
                 let params: kr_protocol::question::QuestionCreateParams = parse(params)?;
                 let source = Self::bound_source(state)?;
-                let (result, _) = self
-                    .questions
-                    .create(&source, &params, self.question_clock())?;
+                let (result, _) = self.at_the_ledger(caller, method, deadline, |at| {
+                    self.questions.create(&source, &params, at)
+                })?;
                 Ok((encode(&result)?, AfterEffect::None))
             }
             Method::QuestionCancelOwn => {
                 let params: kr_protocol::question::QuestionCancelOwnParams = parse(params)?;
                 let source = Self::bound_source(state)?;
-                let (result, _) =
-                    self.questions
-                        .cancel_own(&source, &params, self.question_clock())?;
+                let (result, _) = self.at_the_ledger(caller, method, deadline, |at| {
+                    self.questions.cancel_own(&source, &params, at)
+                })?;
                 Ok((encode(&result)?, AfterEffect::None))
             }
             Method::AlertCreate => {
                 let params: kr_protocol::question::AlertCreateParams = parse(params)?;
                 let source = Self::bound_source(state)?;
-                let result = self
-                    .questions
-                    .alert(&source, &params, self.question_clock())?;
+                let result = self.at_the_ledger(caller, method, deadline, |at| {
+                    self.questions.alert(&source, &params, at)
+                })?;
                 Ok((encode(&result)?, AfterEffect::None))
             }
             // The answering surface. It needs no caller token: what admits it is the actor the
@@ -10149,19 +10174,19 @@ impl WorkerService {
             // a source cannot reach it and answer its own question.
             Method::QuestionAnswer => {
                 let params: kr_protocol::question::QuestionAnswerParams = parse(params)?;
-                let (resolution, _) = self.questions.answer(
-                    &caller.actor_id,
-                    caller.device(),
-                    &params,
-                    self.question_clock(),
-                )?;
+                let (resolution, _) = self.at_the_ledger(caller, method, deadline, |at| {
+                    self.questions
+                        .answer(&caller.actor_id, caller.device(), &params, at)
+                })?;
                 // What is kept is the question as it stood, and each reader is shown an answer
                 // built from it ([`Self::shown`]).
                 Ok((encode(&resolution)?, AfterEffect::None))
             }
             Method::QuestionCancel => {
                 let params: kr_protocol::question::QuestionCancelParams = parse(params)?;
-                let (resolution, _) = self.questions.cancel(&params, self.question_clock())?;
+                let (resolution, _) = self.at_the_ledger(caller, method, deadline, |at| {
+                    self.questions.cancel(&params, at)
+                })?;
                 Ok((encode(&resolution)?, AfterEffect::None))
             }
             Method::ActionCancel => {
@@ -10180,7 +10205,11 @@ impl WorkerService {
                 // keyed by the verified actor and the action together, and host-owner authority
                 // over somebody else's intent is the local owner's alone.
                 let target = Self::cancellation_target(journal, caller, params.action_id)?;
-                let receipt = journal.cancel(target, params.action_id, kr_ipc::now_ms())?;
+                // The receipt is read again inside the journal's cancel and its advance, and the
+                // asks stand after the last of those reads, before the write.
+                let receipt = journal.cancel(target, params.action_id, kr_ipc::now_ms(), || {
+                    self.still_admitted(caller, method, deadline)
+                })?;
                 Ok((
                     encode(&kr_protocol::receipt::ActionCancelResult { receipt })?,
                     AfterEffect::None,

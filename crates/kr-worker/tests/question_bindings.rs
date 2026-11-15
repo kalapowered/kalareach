@@ -32,7 +32,9 @@ use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
 use kr_worker::broker::{Broker, BrokerTransport, Credential, ManagedProcess, TransportHandle};
 use kr_worker::ownership::OwnershipBoundary;
 use kr_worker::persistence::JournalHealth;
-use kr_worker::questions::{Now, QuestionError, Questions, SessionBoundary, VerifiedSource};
+use kr_worker::questions::{
+    Now, QuestionError, Questions, SessionBoundary, Standing, VerifiedSource,
+};
 
 fn session() -> SessionId {
     SessionId::new(Uuid::from_bytes([7; 16]))
@@ -43,6 +45,11 @@ fn now(utc_ms: u64) -> Now {
         utc_ms: TimestampMs::new(utc_ms),
         boot_ms: utc_ms,
     }
+}
+
+/// A request that nothing refuses, read at `utc_ms`.
+fn at(utc_ms: u64) -> Standing<'static> {
+    Standing::fixed(now(utc_ms))
 }
 
 fn this_process() -> ProcessStartIdentity {
@@ -226,10 +233,10 @@ fn a_launched_agents_questions_are_application_scoped_and_end_with_its_instance(
     let elsewhere = source(parent_process(), 2);
 
     let (asked, _) = questions
-        .create(&agent, &ask("asked"), now(1_000))
+        .create(&agent, &ask("asked"), &mut at(1_000))
         .expect("asked");
     let (unbridged, _) = questions
-        .create(&elsewhere, &ask("unbridged"), now(1_000))
+        .create(&elsewhere, &ask("unbridged"), &mut at(1_000))
         .expect("asked");
     assert_eq!(
         asked.question.source.application_instance_id, instance,
@@ -288,7 +295,7 @@ fn a_launched_agents_questions_are_application_scoped_and_end_with_its_instance(
         .collect();
     assert_eq!(expired, vec![asked.question.question_id]);
     let refused = questions
-        .answer(&person(), None, &answer(&asked.question), now(2_100))
+        .answer(&person(), None, &answer(&asked.question), &mut at(2_100))
         .expect_err("an answer to it is refused");
     assert_eq!(refused.code(), ErrorCode::QuestionExpired);
     let (own, _) = questions
@@ -328,13 +335,13 @@ fn a_switch_an_attesting_bridge_detects_invalidates_the_questions_asked_under_th
     let elsewhere = source(parent_process(), 2);
 
     let (waiting, _) = questions
-        .create(&agent, &ask("waiting"), now(1_000))
+        .create(&agent, &ask("waiting"), &mut at(1_000))
         .expect("asked");
     let (settled, _) = questions
-        .create(&agent, &ask("settled"), now(1_000))
+        .create(&agent, &ask("settled"), &mut at(1_000))
         .expect("asked");
     let (unbridged, _) = questions
-        .create(&elsewhere, &ask("unbridged"), now(1_000))
+        .create(&elsewhere, &ask("unbridged"), &mut at(1_000))
         .expect("asked");
     for created in [&waiting, &settled] {
         assert_eq!(created.question.source.application_instance_id, instance);
@@ -354,7 +361,7 @@ fn a_switch_an_attesting_bridge_detects_invalidates_the_questions_asked_under_th
         "a source no bridge describes is application-scoped and claims no switch detection"
     );
     questions
-        .answer(&person(), None, &answer(&settled.question), now(1_500))
+        .answer(&person(), None, &answer(&settled.question), &mut at(1_500))
         .expect("answered before the switch");
 
     // The agent moves to another thread.
@@ -393,7 +400,7 @@ fn a_switch_an_attesting_bridge_detects_invalidates_the_questions_asked_under_th
     assert_eq!(expired, vec![waiting.question.question_id]);
 
     let refused = questions
-        .answer(&person(), None, &answer(&waiting.question), now(2_200))
+        .answer(&person(), None, &answer(&waiting.question), &mut at(2_200))
         .expect_err("an answer to an invalidated question is refused");
     assert_eq!(refused.code(), ErrorCode::QuestionExpired);
     assert!(
@@ -408,7 +415,7 @@ fn a_switch_an_attesting_bridge_detects_invalidates_the_questions_asked_under_th
     );
 
     let (next, _) = questions
-        .create(&agent, &ask("after the switch"), now(3_000))
+        .create(&agent, &ask("after the switch"), &mut at(3_000))
         .expect("asked");
     assert_eq!(
         next.question.source.agent_binding_revision.as_ref(),
@@ -470,19 +477,19 @@ fn an_answer_does_not_follow_the_agent_into_a_newly_selected_thread() {
 
     // The first thread: one question is answered, and one is still waiting when the agent leaves.
     let (settled, _) = questions
-        .create(&agent, &ask("settled"), now(1_000))
+        .create(&agent, &ask("settled"), &mut at(1_000))
         .expect("asked");
     let (waiting, _) = questions
-        .create(&agent, &ask("waiting"), now(1_000))
+        .create(&agent, &ask("waiting"), &mut at(1_000))
         .expect("asked");
     questions
-        .answer(&person(), None, &answer(&settled.question), now(1_500))
+        .answer(&person(), None, &answer(&settled.question), &mut at(1_500))
         .expect("answered before the switch");
 
     // The agent moves to another thread, and asks in it.
     bridge.switch();
     let (next, _) = questions
-        .create(&agent, &ask("after the switch"), now(3_000))
+        .create(&agent, &ask("after the switch"), &mut at(3_000))
         .expect("asked");
 
     // The answer given before the switch stays the first call's own, read with its own token.
@@ -496,7 +503,7 @@ fn an_answer_does_not_follow_the_agent_into_a_newly_selected_thread() {
     // The question that was still waiting is ended, and an answer to it is refused, so none is
     // kept for the new thread. The agent's own poll reads it ended, with no answer.
     let refused = questions
-        .answer(&person(), None, &answer(&waiting.question), now(3_200))
+        .answer(&person(), None, &answer(&waiting.question), &mut at(3_200))
         .expect_err("an answer to the question the switch ended is refused");
     assert_eq!(refused.code(), ErrorCode::QuestionExpired);
     let ended = own(&waiting, 3_300);
@@ -620,14 +627,14 @@ fn a_request_identifier_two_questions_of_one_instance_share_places_neither_in_a_
     let (first_helper, second_helper) = (source(this_process(), 1), source(parent_process(), 2));
 
     let (alone, _) = questions
-        .create(&first_helper, &ask("alone"), now(1_000))
+        .create(&first_helper, &ask("alone"), &mut at(1_000))
         .expect("asked");
     let (first, _) = questions
-        .create(&first_helper, &ask("shared"), now(1_000))
+        .create(&first_helper, &ask("shared"), &mut at(1_000))
         .expect("asked");
     bridge.vouch(false);
     let (second, _) = questions
-        .create(&second_helper, &ask("shared"), now(1_100))
+        .create(&second_helper, &ask("shared"), &mut at(1_100))
         .expect("asked");
     bridge.vouch(true);
     assert_ne!(
@@ -1122,7 +1129,7 @@ fn a_helper_created_under_the_previous_helpers_identifier_within_one_second_is_r
         "the next helper under the identifier is another source"
     );
     let (asked, _) = questions
-        .create(&previous, &ask("reused-identifier"), now(1_000))
+        .create(&previous, &ask("reused-identifier"), &mut at(1_000))
         .expect("the previous helper asks");
     let own = QuestionReadOwnParams {
         session_id: session(),
@@ -1140,7 +1147,7 @@ fn a_helper_created_under_the_previous_helpers_identifier_within_one_second_is_r
         Err(QuestionError::TokenRejected { .. })
     ));
     assert!(matches!(
-        questions.cancel_own(&next, &cancel, now(1_200)),
+        questions.cancel_own(&next, &cancel, &mut at(1_200)),
         Err(QuestionError::TokenRejected { .. })
     ));
     let (read, _) = questions
@@ -1165,7 +1172,11 @@ fn a_helper_created_under_the_previous_helpers_identifier_within_one_second_is_r
     let next = source(whole_seconds(4242), 2);
     assert_eq!(previous.key(), next.key());
     let (asked, _) = questions
-        .create(&previous, &ask("reused-identifier-in-seconds"), now(1_400))
+        .create(
+            &previous,
+            &ask("reused-identifier-in-seconds"),
+            &mut at(1_400),
+        )
         .expect("the previous helper asks");
     questions
         .read_own(

@@ -35,12 +35,13 @@ use kr_protocol::question::{
     QuestionOwnResult, QuestionReadOwnParams, QuestionReadParams, QuestionReadResult,
     QuestionState, bounded_expiry, build_choices, check_answer, check_text,
 };
+use kr_protocol::scalars::TimestampMs;
 
 pub use crate::questions::binding::{
     AgentBinding, AgentBindings, AgentPlacement, SessionBoundary, VerifiedSource,
 };
 pub use crate::questions::error::{QuestionError, Result, SETUP_INSTRUCTION};
-pub use crate::questions::store::Now;
+pub use crate::questions::store::{Now, Standing};
 
 use crate::questions::store::{Resolved, Store};
 
@@ -70,6 +71,30 @@ pub struct Questions {
     changed: tokio::sync::Notify,
     /// The qualified bridge that says which agent binding a source asks under, when there is one.
     agents: Option<std::sync::Arc<dyn AgentBindings>>,
+    /// Where this host's own tests are told that an arm is about to take the ledger's lock.
+    /// Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    arrival: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+}
+
+/// The ledger's lock, held for this host's own tests until the hold is dropped.
+#[cfg(feature = "testing")]
+#[derive(Debug)]
+pub struct LedgerHold {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "testing")]
+impl Drop for LedgerHold {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl Questions {
@@ -87,7 +112,53 @@ impl Questions {
             store: Mutex::new(Store::open(journal_path, session_id, session_epoch)?),
             changed: tokio::sync::Notify::new(),
             agents: None,
+            #[cfg(feature = "testing")]
+            arrival: Mutex::new(None),
         })
+    }
+
+    /// Takes the ledger's lock and keeps it until the returned hold is dropped, for this host's
+    /// own tests: an arm that is dispatched meanwhile waits for it. It is compiled away in every
+    /// shipped build.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the ledger's lock is poisoned.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn hold_the_ledger(self: &std::sync::Arc<Self>) -> LedgerHold {
+        let (held, taken) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let ledger = std::sync::Arc::clone(self);
+        let thread = std::thread::spawn(move || {
+            let guard = ledger.locked().expect("the ledger is not poisoned");
+            let _ = held.send(());
+            let _ = wait.recv();
+            drop(guard);
+        });
+        taken.recv().expect("the ledger is held");
+        LedgerHold {
+            release: Some(release),
+            thread: Some(thread),
+        }
+    }
+
+    /// Tells the returned end when the next question or alert arm is about to take the ledger's
+    /// lock, for this host's own tests. It fires once, and only for an arm: the sweeps and the
+    /// reads that take the ledger do not fire it. It is compiled away in every shipped build.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the ledger's lock is poisoned.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn announce_the_next_arm(&self) -> std::sync::mpsc::Receiver<()> {
+        let (arrived, watch) = std::sync::mpsc::channel();
+        *self
+            .arrival
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(arrived);
+        watch
     }
 
     /// Stops the commit of the next question, for this host's own tests.
@@ -155,12 +226,17 @@ impl Questions {
         &self,
         source: &VerifiedSource,
         params: &QuestionCreateParams,
-        now: Now,
+        at: &mut Standing<'_>,
     ) -> Result<(QuestionCreateResult, Vec<QuestionEvent>)> {
         check_text(params)?;
         let choices = build_choices(params.kind, &params.choices)?;
         let expiry = bounded_expiry(params.requested_expiry_ms.as_ref().copied()).get();
-        // Read before the ledger is locked: it walks the process table.
+        let mut store = self.locked_by_an_arm()?;
+        let now = at.now();
+        let mut events = expiry_events(store.expire_due(now, self.agents.as_deref())?, now);
+        // Read once the ledger is held and the expiry is written, so that what the question
+        // records is the binding as it stands after the wait, not as it stood before it. It walks
+        // the process table.
         let binding = self.agent_of(source);
         // The thread the bridge vouches is selected now, as the context this question is asked in.
         // It binds the question only once the bridge reports its request ran in that same thread.
@@ -169,10 +245,8 @@ impl Questions {
                 .as_ref()
                 .and_then(|agents| agents.selection(binding.application_instance_id))
         });
-        let mut store = self.locked()?;
-        let mut events = expiry_events(store.expire_due(now, self.agents.as_deref())?, now);
         let header =
-            store.source_header(source, params.agent_name.as_ref().cloned(), binding, now)?;
+            store.source_header(source, params.agent_name.as_ref().cloned(), binding, at)?;
         let created = store.create(
             source,
             &header,
@@ -181,14 +255,14 @@ impl Questions {
             params,
             &choices,
             expiry,
-            now,
+            at,
         )?;
         if !created.deduplicated {
             events.push(QuestionEvent {
                 kind: QuestionEventKind::Created,
                 question: created.question.clone(),
                 pending_since_ms: created.question.created_at_ms,
-                recorded_at_ms: now.utc_ms,
+                recorded_at_ms: created.question.created_at_ms,
             });
         }
         drop(store);
@@ -354,14 +428,19 @@ impl Questions {
         &self,
         source: &VerifiedSource,
         params: &QuestionCancelOwnParams,
-        now: Now,
+        at: &mut Standing<'_>,
     ) -> Result<(QuestionOwnResult, Vec<QuestionEvent>)> {
-        let mut store = self.locked()?;
+        let mut store = self.locked_by_an_arm()?;
+        let now = at.now();
         let mut events = expiry_events(store.expire_due(now, self.agents.as_deref())?, now);
         let row = store.read_row(params.question_id)?;
         store.check_token(&row, source, &params.caller_token)?;
-        let resolved = store.cancel(params.question_id, row.question.revision, now)?;
-        events.push(event(QuestionEventKind::Cancelled, &resolved, now));
+        let resolved = store.cancel(params.question_id, row.question.revision, at)?;
+        events.push(event(
+            QuestionEventKind::Cancelled,
+            &resolved,
+            resolved_at(&resolved),
+        ));
         let question = resolved.question;
         drop(store);
         self.changed.notify_waiters();
@@ -379,7 +458,7 @@ impl Questions {
         &self,
         source: &VerifiedSource,
         params: &AlertCreateParams,
-        now: Now,
+        at: &mut Standing<'_>,
     ) -> Result<AlertCreateResult> {
         if params.dedup_id.trim().is_empty() || params.dedup_id.len() > 256 {
             return Err(QuestionError::InvalidArgument(
@@ -401,11 +480,12 @@ impl Questions {
                 "an agent label is 1 to {MAX_AGENT_NAME_BYTES} bytes of text"
             )));
         }
+        let mut store = self.locked_by_an_arm()?;
+        // Read once the ledger is held, as a question's is.
         let binding = self.agent_of(source);
-        let mut store = self.locked()?;
         let header =
-            store.source_header(source, params.agent_name.as_ref().cloned(), binding, now)?;
-        let (alert, deduplicated) = store.alert(source, &header, params, now)?;
+            store.source_header(source, params.agent_name.as_ref().cloned(), binding, at)?;
+        let (alert, deduplicated) = store.alert(source, &header, params, at)?;
         Ok(AlertCreateResult {
             alert,
             deduplicated,
@@ -468,9 +548,10 @@ impl Questions {
         actor_id: &ActorId,
         device_id: Option<DeviceId>,
         params: &QuestionAnswerParams,
-        now: Now,
+        at: &mut Standing<'_>,
     ) -> Result<(Resolution, Vec<QuestionEvent>)> {
-        let mut store = self.locked()?;
+        let mut store = self.locked_by_an_arm()?;
+        let now = at.now();
         let mut events = expiry_events(store.expire_due(now, self.agents.as_deref())?, now);
         let question = store.read(params.question_id)?;
         check_answer(&question, &params.answer)?;
@@ -480,9 +561,13 @@ impl Questions {
             &params.answer,
             actor_id,
             device_id,
-            now,
+            at,
         )?;
-        events.push(event(QuestionEventKind::Answered, &resolved, now));
+        events.push(event(
+            QuestionEventKind::Answered,
+            &resolved,
+            resolved_at(&resolved),
+        ));
         let question = resolved.question;
         drop(store);
         self.changed.notify_waiters();
@@ -497,12 +582,17 @@ impl Questions {
     pub fn cancel(
         &self,
         params: &QuestionCancelParams,
-        now: Now,
+        at: &mut Standing<'_>,
     ) -> Result<(Resolution, Vec<QuestionEvent>)> {
-        let mut store = self.locked()?;
+        let mut store = self.locked_by_an_arm()?;
+        let now = at.now();
         let mut events = expiry_events(store.expire_due(now, self.agents.as_deref())?, now);
-        let resolved = store.cancel(params.question_id, params.expected_revision, now)?;
-        events.push(event(QuestionEventKind::Cancelled, &resolved, now));
+        let resolved = store.cancel(params.question_id, params.expected_revision, at)?;
+        events.push(event(
+            QuestionEventKind::Cancelled,
+            &resolved,
+            resolved_at(&resolved),
+        ));
         let question = resolved.question;
         drop(store);
         self.changed.notify_waiters();
@@ -575,22 +665,51 @@ impl Questions {
             .lock()
             .map_err(|_| QuestionError::unavailable("the question ledger is poisoned"))
     }
+
+    /// The ledger, taken by one of the five arms that write on a request's behalf. Each of them
+    /// writes the expiry that is due first, which is the host's own record, and asks the request's
+    /// authority again immediately before its own write.
+    fn locked_by_an_arm(&self) -> Result<std::sync::MutexGuard<'_, Store>> {
+        #[cfg(feature = "testing")]
+        if let Some(arrived) = self
+            .arrival
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = arrived.send(());
+        }
+        self.locked()
+    }
 }
 
 /// Renders a resolution as an attention event.
-fn event(kind: QuestionEventKind, resolved: &Resolved, now: Now) -> QuestionEvent {
+fn event(
+    kind: QuestionEventKind,
+    resolved: &Resolved,
+    recorded_at_ms: TimestampMs,
+) -> QuestionEvent {
     QuestionEvent {
         kind,
         question: resolved.question.clone(),
         pending_since_ms: resolved.pending_since_ms,
-        recorded_at_ms: now.utc_ms,
+        recorded_at_ms,
     }
+}
+
+/// When a resolution was written: the reading its own write was stamped with.
+fn resolved_at(resolved: &Resolved) -> TimestampMs {
+    resolved
+        .question
+        .resolved_at_ms
+        .as_ref()
+        .map_or(resolved.question.created_at_ms, |at| *at)
 }
 
 fn expiry_events(expired: Vec<Resolved>, now: Now) -> Vec<QuestionEvent> {
     expired
         .iter()
-        .map(|resolved| event(QuestionEventKind::Expired, resolved, now))
+        .map(|resolved| event(QuestionEventKind::Expired, resolved, now.utc_ms))
         .collect()
 }
 
@@ -666,13 +785,21 @@ mod tests {
     fn a_created_question_emits_one_event_and_a_duplicate_emits_none() {
         let questions = questions();
         let (first, events) = questions
-            .create(&source(), &select_params(), now(1_000))
+            .create(
+                &source(),
+                &select_params(),
+                &mut Standing::fixed(now(1_000)),
+            )
             .expect("created");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, QuestionEventKind::Created);
         assert_eq!(events[0].pending_since_ms, TimestampMs::new(1_000));
         let (second, events) = questions
-            .create(&source(), &select_params(), now(2_000))
+            .create(
+                &source(),
+                &select_params(),
+                &mut Standing::fixed(now(2_000)),
+            )
             .expect("deduplicated");
         assert!(events.is_empty());
         assert!(second.deduplicated);
@@ -683,7 +810,11 @@ mod tests {
     fn a_select_always_offers_the_free_text_option() {
         let questions = questions();
         let (created, _) = questions
-            .create(&source(), &select_params(), now(1_000))
+            .create(
+                &source(),
+                &select_params(),
+                &mut Standing::fixed(now(1_000)),
+            )
             .expect("created");
         let identifiers: Vec<&str> = created
             .question
@@ -705,7 +836,11 @@ mod tests {
     fn a_free_text_answer_reaches_the_source_as_free_text() {
         let questions = questions();
         let (created, _) = questions
-            .create(&source(), &select_params(), now(1_000))
+            .create(
+                &source(),
+                &select_params(),
+                &mut Standing::fixed(now(1_000)),
+            )
             .expect("created");
         let (answered, events) = questions
             .answer(
@@ -719,7 +854,7 @@ mod tests {
                         text: "a third way".to_owned(),
                     },
                 },
-                now(2_000),
+                &mut Standing::fixed(now(2_000)),
             )
             .expect("answered");
         assert_eq!(answered.question.state, QuestionState::Answered);
@@ -751,7 +886,11 @@ mod tests {
     fn an_answer_for_the_wrong_form_is_refused_before_anything_changes() {
         let questions = questions();
         let (created, _) = questions
-            .create(&source(), &select_params(), now(1_000))
+            .create(
+                &source(),
+                &select_params(),
+                &mut Standing::fixed(now(1_000)),
+            )
             .expect("created");
         let error = questions
             .answer(
@@ -763,7 +902,7 @@ mod tests {
                     expected_revision: created.question.revision,
                     answer: QuestionAnswer::Decision { decided: true },
                 },
-                now(2_000),
+                &mut Standing::fixed(now(2_000)),
             )
             .expect_err("refused");
         assert_eq!(error.code(), kr_protocol::error::ErrorCode::InvalidArgument);
@@ -793,7 +932,7 @@ mod tests {
             connection_id: ConnectionId::new(Uuid::from_bytes([9; 16])),
         };
         questions
-            .create(&gone, &select_params(), now(1_000))
+            .create(&gone, &select_params(), &mut Standing::fixed(now(1_000)))
             .expect("created");
         // A read for a question that does not exist. It expires what is due on its way in and then
         // fails, and the transition it made has to survive that failure.
@@ -826,7 +965,11 @@ mod tests {
     fn every_transition_reaches_the_feed_in_order() {
         let questions = questions();
         let (created, _) = questions
-            .create(&source(), &select_params(), now(1_000))
+            .create(
+                &source(),
+                &select_params(),
+                &mut Standing::fixed(now(1_000)),
+            )
             .expect("created");
         questions
             .answer(
@@ -840,7 +983,7 @@ mod tests {
                         choice_id: "left".to_owned(),
                     },
                 },
-                now(2_000),
+                &mut Standing::fixed(now(2_000)),
             )
             .expect("answered");
         let events = questions.events_since(0, 16).expect("the feed");
@@ -870,7 +1013,11 @@ mod tests {
     async fn a_wait_ends_when_a_question_is_answered() {
         let questions = std::sync::Arc::new(questions());
         let (created, _) = questions
-            .create(&source(), &select_params(), now(1_000))
+            .create(
+                &source(),
+                &select_params(),
+                &mut Standing::fixed(now(1_000)),
+            )
             .expect("created");
         let waiting = std::sync::Arc::clone(&questions);
         let waiter = tokio::spawn(async move {
@@ -892,7 +1039,7 @@ mod tests {
                         choice_id: "left".to_owned(),
                     },
                 },
-                now(2_000),
+                &mut Standing::fixed(now(2_000)),
             )
             .expect("answered");
         tokio::time::timeout(std::time::Duration::from_secs(5), waiter)

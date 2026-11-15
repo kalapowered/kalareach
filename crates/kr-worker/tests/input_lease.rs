@@ -3021,7 +3021,7 @@ async fn an_answer_to_a_question_is_never_inserted_into_the_terminal() {
                 requested_expiry_ms: Nullable::some(kr_protocol::scalars::DurationMs::new(600_000)),
                 wait_ms: Nullable::null(),
             },
-            now(),
+            &mut kr_worker::questions::Standing::fixed(now()),
         )
         .expect("the agent asks");
 
@@ -3822,7 +3822,7 @@ async fn stall(rig: &mut Rig, stalled: Stalled) -> Standing {
                         requested_expiry_ms: Nullable::null(),
                         wait_ms: Nullable::null(),
                     },
-                    now,
+                    &mut kr_worker::questions::Standing::fixed(now),
                 );
             });
             let asking = tokio::spawn(async move {

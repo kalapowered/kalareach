@@ -650,7 +650,9 @@ fn settle_every_way(
     journal
         .resolve_unfinished_dispatches(now)
         .expect("recovers the marker");
-    journal.cancel(actor(), id(5), now).expect("cancels");
+    journal
+        .cancel(actor(), id(5), now, || Ok(()))
+        .expect("cancels");
     vec![
         ("an outcome", id(1), ReceiptState::Applied, true),
         ("a refusal", id(2), ReceiptState::Refused, false),

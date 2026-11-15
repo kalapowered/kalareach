@@ -240,6 +240,10 @@ pub struct Journal {
     /// and its first write.
     #[cfg(feature = "testing")]
     marker_read_stall: crate::testing::Stall,
+    /// Where this host's own tests stop the next cancellation between its reads of the receipt and
+    /// its first write.
+    #[cfg(feature = "testing")]
+    cancel_read_stall: crate::testing::Stall,
     /// Where this host's own tests stop the worker once the next dispatch marker has committed.
     #[cfg(feature = "testing")]
     after_marker_stall: crate::testing::Stall,
@@ -396,6 +400,8 @@ impl Journal {
             marker_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             marker_read_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            cancel_read_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             after_marker_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
@@ -1555,12 +1561,17 @@ impl Journal {
     ///
     /// # Errors
     ///
-    /// Returns an error when there is no such receipt, or it already carries a dispatch marker.
+    /// Returns an error when there is no such receipt, or it already carries a dispatch marker,
+    /// and what `still` refuses with.
+    ///
+    /// `still` is asked after the receipt is read here and again in the advance, and immediately
+    /// before the cancellation's first write. What it refuses is refused with nothing written.
     pub fn cancel(
         &mut self,
         actor_id: ActorId,
         action_id: ActionId,
         now_ms: TimestampMs,
+        still: impl FnOnce() -> Result<()>,
     ) -> Result<Receipt> {
         let receipt = self
             .read(actor_id.clone(), action_id)?
@@ -1571,13 +1582,14 @@ impl Journal {
                 receipt.state
             )));
         }
-        self.advance(
+        self.advance_while(
             actor_id,
             action_id,
             ReceiptState::Rejected,
             Some(RejectionReason::Cancelled),
             None,
             now_ms,
+            still,
         )
     }
 
@@ -1915,6 +1927,10 @@ fn withhold_settled_content(
 impl Journal {
     /// Commits the dispatch marker before the external effect.
     ///
+    /// This is [`Journal::mark_dispatching_while`] with an ask that always agrees. It stays for the
+    /// callers outside this crate that pass three arguments; remove it when each of them calls
+    /// [`Journal::mark_dispatching_while`] and none calls this.
+    ///
     /// # Errors
     ///
     /// Returns an error when the receipt is missing, the transition is not permitted, or the write
@@ -2037,6 +2053,8 @@ impl Journal {
             error,
             now_ms,
         } = transition;
+        #[cfg(feature = "testing")]
+        let cancelling = reason == Some(RejectionReason::Cancelled);
         let mut receipt = self
             .read(actor_id.clone(), action_id)?
             .ok_or_else(|| WorkerError::InvalidArgument(format!("no receipt for {action_id}")))?;
@@ -2049,6 +2067,10 @@ impl Journal {
         #[cfg(feature = "testing")]
         if state == ReceiptState::Dispatching {
             self.marker_read_stall.stand();
+        }
+        #[cfg(feature = "testing")]
+        if cancelling {
+            self.cancel_read_stall.stand();
         }
         // The last ask, after every read this step makes and before its first write.
         still()?;
@@ -3528,6 +3550,22 @@ impl Journal {
         self.marker_read_stall.arm()
     }
 
+    /// Stops the next cancellation between its reads of the receipt and its first write, for this
+    /// host's own tests: the receipt is as it was and nothing of the cancellation is written.
+    ///
+    /// Returns the end that says the cancellation has arrived there, and the end that lets it go.
+    /// The stop fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_next_cancel_before_its_write(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.cancel_read_stall.arm()
+    }
+
     /// Stops the worker once the next dispatch marker has committed, for this host's own tests:
     /// the marker is on disk and nothing that follows it has run.
     ///
@@ -3710,6 +3748,8 @@ impl Journal {
             marker_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             marker_read_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            cancel_read_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             after_marker_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]

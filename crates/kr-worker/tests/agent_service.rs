@@ -4642,7 +4642,7 @@ async fn a_yes_to_a_question_leaves_the_connectors_approval_to_its_own_path() {
                 requested_expiry_ms: Nullable::null(),
                 wait_ms: Nullable::null(),
             },
-            now,
+            &mut kr_worker::questions::Standing::fixed(now),
         )
         .expect("a verified source asks");
 
@@ -4819,7 +4819,7 @@ async fn an_answer_is_not_inserted_into_the_thread_the_agent_selected_after_aski
                 requested_expiry_ms: Nullable::null(),
                 wait_ms: Nullable::null(),
             },
-            now,
+            &mut kr_worker::questions::Standing::fixed(now),
         )
         .expect("a verified source asks");
     assert_eq!(
@@ -5197,6 +5197,81 @@ async fn kr_req_09_16_an_answer_whose_deadline_passes_before_its_marker_is_refus
             control.carried, 1,
             "{deadline:?}: the control is carried once"
         );
+    }
+}
+
+/// KR-REQ-09.16 and section 9: the binding revision an answer was admitted under is compared again
+/// where the broker's dispatch marker is committed, under the lock that stays held across the
+/// write. The binding moves while the answer waits between the permit's last check and the commit:
+/// the marker is not written, the transport is never asked, the claim is given back and the request
+/// stays answerable. The control, where the binding stays, writes the marker and carries the
+/// answer once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_16_a_binding_that_moves_before_the_marker_commit_is_refused_at_the_marker() {
+    for moved in [true, false] {
+        let host = host().await;
+        let upstream = Arc::new(CountingUpstream::default());
+        register(&host, None);
+        let resource_id = offer_approval(&host, Arc::clone(&upstream));
+        let mut client = cli(&host).await;
+        let mutation = approval_mutation(&client, &host, 32, resource_id);
+
+        let broker = host.service.broker();
+        let (arrived, release) = broker.pause_before_the_marker_commit();
+        let sending = tokio::spawn(async move { send(&mut client, mutation).await });
+        tokio::task::spawn_blocking(move || arrived.recv_timeout(LIVENESS_DEADLINE))
+            .await
+            .expect("the wait ends")
+            .expect("the answer reaches the wait");
+        if moved {
+            broker
+                .advance_binding(
+                    instance(),
+                    Some(kr_protocol::ids::AgentThreadId::new("thread-2").expect("a thread")),
+                    TimestampMs::new(5),
+                )
+                .expect("the binding moves");
+        }
+        release.send(()).expect("the answer is let go");
+        let outcome = sending.await.expect("the mutation is answered");
+
+        let marker_written = rusqlite::Connection::open_with_flags(
+            &host.journal_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("the ledger opens")
+        .query_row(
+            "SELECT dispatched FROM broker_pending WHERE resource_id = ?1",
+            rusqlite::params![resource_id.get().as_bytes().as_slice()],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("the broker's row is readable")
+            == 1;
+        let carried = upstream.carried.load(std::sync::atomic::Ordering::SeqCst);
+        if moved {
+            let Outcome::Error(error) = outcome else {
+                panic!("an answer whose binding moved before its marker applied: {outcome:?}");
+            };
+            assert_eq!(error.code, ErrorCode::StaleSession);
+            assert!(
+                !marker_written,
+                "the marker was written after the binding moved"
+            );
+            assert_eq!(carried, 0, "the transport was asked");
+            assert_eq!(
+                host.service
+                    .broker()
+                    .pending(resource_id)
+                    .expect("retained")
+                    .state,
+                kr_protocol::gateway::PendingState::Pending,
+                "the claim was given back"
+            );
+        } else {
+            assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
+            assert!(marker_written, "the control writes its marker");
+            assert_eq!(carried, 1, "the control is carried once");
+        }
     }
 }
 

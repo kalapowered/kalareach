@@ -710,7 +710,12 @@ fn a_cancellation_before_dispatch_is_atomic_and_after_it_is_refused() {
     let mut journal = Journal::in_memory().expect("a journal");
     journal.accept(&submission(1, 1, 1)).expect("an intent");
     let cancelled = journal
-        .cancel(actor("device:phone"), action(1), TimestampMs::new(2_000))
+        .cancel(
+            actor("device:phone"),
+            action(1),
+            TimestampMs::new(2_000),
+            || Ok(()),
+        )
         .expect("the intent is cancelled");
     assert_eq!(cancelled.state, ReceiptState::Rejected);
     assert_eq!(cancelled.reason.as_ref(), Some(&RejectionReason::Cancelled));
@@ -722,7 +727,12 @@ fn a_cancellation_before_dispatch_is_atomic_and_after_it_is_refused() {
     journal
         .mark_dispatching(actor("device:phone"), action(2), TimestampMs::new(3_000))
         .expect("a marker");
-    let refused = journal.cancel(actor("device:phone"), action(2), TimestampMs::new(4_000));
+    let refused = journal.cancel(
+        actor("device:phone"),
+        action(2),
+        TimestampMs::new(4_000),
+        || Ok(()),
+    );
     assert!(
         refused.is_err(),
         "past the marker the effect may already have happened, so cancelling it is a separate \
@@ -1777,7 +1787,11 @@ fn asked_with_token(
     let (created, _) = host
         .service
         .questions()
-        .create(&source, &params, now)
+        .create(
+            &source,
+            &params,
+            &mut kr_worker::questions::Standing::fixed(now),
+        )
         .expect("the agent asks");
     (created.question, created.caller_token)
 }
@@ -9360,5 +9374,310 @@ async fn a_rejection_under_privacy_mode_commits_the_receipt_without_the_envelope
             (!private, false),
             "what a crash right after the rejection leaves (privacy mode on: {private})"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-09.16: the question and alert arms and the cancel of an action ask again after their wait
+// ---------------------------------------------------------------------------------------------
+
+/// How long a case waits for a worker to reach a stop before it fails.
+const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The rows of the question ledger that a request's own writes make: questions, sources and alerts.
+fn ledger_rows(host: &Host) -> (i64, i64, i64) {
+    let journal = rusqlite::Connection::open_with_flags(
+        &host.journal_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("opens the journal");
+    let count = |table: &str| -> i64 {
+        journal
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("counts the rows")
+    };
+    (
+        count("questions"),
+        count("question_sources"),
+        count("alerts"),
+    )
+}
+
+/// The arms that write the question ledger on a request's behalf.
+#[derive(Clone, Copy, Debug)]
+enum LedgerArm {
+    Create,
+    CancelOwn,
+    Alert,
+    Answer,
+    Cancel,
+}
+
+impl LedgerArm {
+    const ALL: [Self; 5] = [
+        Self::Create,
+        Self::CancelOwn,
+        Self::Alert,
+        Self::Answer,
+        Self::Cancel,
+    ];
+}
+
+/// What a dispatch of one ledger arm came to when the worker's clock moved by `moved` while the arm
+/// waited for the ledger's lock.
+struct WaitedForTheLedger {
+    host: Host,
+    outcome: Outcome,
+    action_id: ActionId,
+    /// The question the arm acts on, where it acts on one that existed before it.
+    question: kr_protocol::question::Question,
+    rows_before: (i64, i64, i64),
+}
+
+/// Sends the request of `arm` and holds the ledger's lock from the case until the arm is waiting
+/// for it: the arm has passed every ask before it, and the clock moves by `moved` in the wait.
+async fn waited_for_the_ledger(arm: LedgerArm, moved: std::time::Duration) -> WaitedForTheLedger {
+    use kr_transport::clock::ManualClock;
+
+    let clock = ManualClock::new();
+    let host = host_on(
+        |_| {},
+        |_| kr_worker::action::time::TimeSources::system(),
+        Some(Arc::new(clock.clone())),
+    )
+    .await;
+    bound_to_the_session(&host);
+    let mut client = cli(&host).await;
+    let identity = identity(&host, "waiting");
+    let request = match arm {
+        LedgerArm::Create => {
+            Sourced::Question.request(&client, &host, &identity, ParamsValue::empty())
+        }
+        LedgerArm::CancelOwn => {
+            Sourced::OwnCancellation.request(&client, &host, &identity, ParamsValue::empty())
+        }
+        LedgerArm::Alert => Sourced::Alert.request(&client, &host, &identity, ParamsValue::empty()),
+        LedgerArm::Answer => answering(&client, &host, &identity.question, ParamsValue::empty()),
+        LedgerArm::Cancel => cancelling(&client, &host, &identity.question),
+    };
+    let action_id = request.action_id;
+    let rows_before = ledger_rows(&host);
+
+    // The checks that precede the marker take the ledger too, so the lock is held from the stop
+    // after the marker: past them, before the arm.
+    let (marked, go_on) = {
+        let mut session = host.service.runtime().session();
+        session
+            .journal_mut()
+            .expect("a journal")
+            .stall_after_next_marker()
+    };
+    let sending = tokio::spawn(async move {
+        let outcome = send_mutation(&mut client, request).await;
+        (client, outcome)
+    });
+    tokio::time::timeout(STOP_WAIT, marked)
+        .await
+        .expect("the dispatch reaches the stop after its marker in time")
+        .expect("the stop is armed");
+    let ledger = host.service.questions();
+    let arrival = ledger.announce_the_next_arm();
+    let hold = ledger.hold_the_ledger();
+    go_on.send(()).expect("the dispatch is waiting to go on");
+    tokio::task::spawn_blocking(move || arrival.recv_timeout(STOP_WAIT))
+        .await
+        .expect("the wait for the arm ends")
+        .expect("the arm reaches the ledger in time");
+    clock.advance(moved);
+    drop(hold);
+    let (_client, outcome) = sending.await.expect("the dispatch ends");
+    WaitedForTheLedger {
+        host,
+        outcome,
+        action_id,
+        question: identity.question,
+        rows_before,
+    }
+}
+
+/// Checks that the receipt of the dispatch says it was refused, as a refusal that is known to have
+/// done nothing is recorded.
+async fn assert_recorded_refused(host: &Host, action_id: ActionId, context: &str) {
+    let mut client = cli(host).await;
+    assert_eq!(
+        receipt_read_for(&mut client, action_id).await.state,
+        ReceiptState::Refused,
+        "{context}: the refusal is known to have done nothing, so it is recorded as one"
+    );
+}
+
+/// KR-REQ-09.16: a question or alert arm that waits for the ledger's lock asks the request's
+/// deadline again after the wait and immediately before its own write. A deadline that passes while
+/// the arm waits leaves the arm's own write unmade: no question, no source, no alert, no resolution
+/// is written, and the dispatch is refused and recorded as refused, never as unknown. The control,
+/// the same wait with the clock where it was, writes once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_ledger_arm_whose_deadline_passes_while_it_waits_for_the_ledger_writes_nothing() {
+    let past = std::time::Duration::from_millis(DEFAULT_MUTATION_TTL.get() + 1_000);
+    for arm in LedgerArm::ALL {
+        let waited = waited_for_the_ledger(arm, past).await;
+        let Outcome::Error(error) = &waited.outcome else {
+            panic!(
+                "{arm:?}: a deadline that passed in the wait did not refuse: {:?}",
+                waited.outcome
+            );
+        };
+        assert_eq!(
+            error.code,
+            ErrorCode::PermissionDenied,
+            "{arm:?}: {error:?}"
+        );
+        assert_eq!(
+            ledger_rows(&waited.host),
+            waited.rows_before,
+            "{arm:?}: the arm wrote after its deadline passed"
+        );
+        if !matches!(arm, LedgerArm::Create | LedgerArm::Alert) {
+            let stands = waited
+                .host
+                .service
+                .questions()
+                .question(waited.question.question_id)
+                .expect("the question is read");
+            assert_eq!(
+                stands.state,
+                kr_protocol::question::QuestionState::Pending,
+                "{arm:?}: the question was resolved after the deadline passed"
+            );
+            assert_eq!(stands.revision, waited.question.revision, "{arm:?}");
+        }
+        assert_recorded_refused(&waited.host, waited.action_id, &format!("{arm:?}")).await;
+    }
+
+    for arm in LedgerArm::ALL {
+        let waited = waited_for_the_ledger(arm, std::time::Duration::ZERO).await;
+        assert!(
+            matches!(waited.outcome, Outcome::Ok(_)),
+            "{arm:?}: the control is taken: {:?}",
+            waited.outcome
+        );
+        let (questions, sources, alerts) = ledger_rows(&waited.host);
+        let (before_questions, before_sources, before_alerts) = waited.rows_before;
+        match arm {
+            LedgerArm::Create => assert_eq!(questions, before_questions + 1, "{arm:?}"),
+            LedgerArm::Alert => assert_eq!(alerts, before_alerts + 1, "{arm:?}"),
+            LedgerArm::CancelOwn | LedgerArm::Answer | LedgerArm::Cancel => {
+                let resolved = waited
+                    .host
+                    .service
+                    .questions()
+                    .question(waited.question.question_id)
+                    .expect("the question is read");
+                assert_ne!(
+                    resolved.state,
+                    kr_protocol::question::QuestionState::Pending,
+                    "{arm:?}: the control resolves the question once"
+                );
+                assert_eq!(resolved.revision.get(), waited.question.revision.get() + 1);
+                assert_eq!(questions, before_questions, "{arm:?}");
+            }
+        }
+        assert_eq!(sources, before_sources, "{arm:?}");
+        assert_eq!(
+            alerts,
+            before_alerts + i64::from(matches!(arm, LedgerArm::Alert)),
+            "{arm:?}"
+        );
+    }
+}
+
+/// KR-REQ-09.16: the cancel of an action reads its receipt more than once, in the target's two
+/// reads, the journal's cancel and its advance, and asks the request's deadline again after the
+/// last of them, immediately before the write. A deadline that passes between the reads and the
+/// write leaves the cancelled intent as it was and refuses the dispatch as refused. The control
+/// cancels once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_cancel_whose_deadline_passes_between_its_reads_and_its_write_cancels_nothing() {
+    use kr_transport::clock::ManualClock;
+
+    for (moved, refused) in [
+        (
+            std::time::Duration::from_millis(DEFAULT_MUTATION_TTL.get() + 1_000),
+            true,
+        ),
+        (std::time::Duration::ZERO, false),
+    ] {
+        let clock = ManualClock::new();
+        let host = host_on(
+            |_| {},
+            |_| kr_worker::action::time::TimeSources::system(),
+            Some(Arc::new(clock.clone())),
+        )
+        .await;
+        let mut client = cli(&host).await;
+        let mine = {
+            let mut session = host.service.runtime().session();
+            let journal = session.journal_mut().expect("a journal");
+            let mut own = fresh(3, 3, 3);
+            own.actor_id = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+            journal.accept(&own).expect("this connection's own intent");
+            own.action_id
+        };
+        let cancel = MutationRequest {
+            method: Method::ActionCancel.into(),
+            params: ParamsValue::from_typed(&kr_protocol::receipt::ActionCancelParams {
+                action_id: mine,
+            })
+            .expect("encodes"),
+            ..close_mutation(
+                &client,
+                &host,
+                DEFAULT_MUTATION_TTL.get(),
+                ParamsValue::empty(),
+            )
+        };
+        let action_id = cancel.action_id;
+        let (reached, release) = {
+            let mut session = host.service.runtime().session();
+            session
+                .journal_mut()
+                .expect("a journal")
+                .stall_next_cancel_before_its_write()
+        };
+        let sending = tokio::spawn(async move {
+            let outcome = send_mutation(&mut client, cancel).await;
+            (client, outcome)
+        });
+        tokio::time::timeout(STOP_WAIT, reached)
+            .await
+            .expect("the cancel reaches its stop in time")
+            .expect("the stop is armed");
+        clock.advance(moved);
+        release.send(()).expect("the cancel is waiting to go on");
+        let (mut client, outcome) = sending.await.expect("the dispatch ends");
+
+        let intent = receipt_read_for(&mut client, mine).await;
+        if refused {
+            let Outcome::Error(error) = &outcome else {
+                panic!("a deadline that passed before the write did not refuse: {outcome:?}");
+            };
+            assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+            assert_eq!(
+                intent.state,
+                ReceiptState::Accepted,
+                "the intent was cancelled after the deadline passed"
+            );
+            assert_recorded_refused(&host, action_id, "the cancel").await;
+        } else {
+            assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
+            assert_eq!(
+                intent.state,
+                ReceiptState::Rejected,
+                "the control cancels once"
+            );
+            assert_eq!(intent.reason.as_ref(), Some(&RejectionReason::Cancelled));
+        }
     }
 }

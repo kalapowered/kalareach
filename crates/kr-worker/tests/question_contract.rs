@@ -21,13 +21,18 @@ use kr_protocol::question::{
 };
 use kr_protocol::scalars::{DurationMs, Nullable, TimestampMs, Uuid};
 use kr_worker::questions::store::Store;
-use kr_worker::questions::{Now, Questions, VerifiedSource, token};
+use kr_worker::questions::{Now, Questions, Standing, VerifiedSource, token};
 
 fn now(utc_ms: u64) -> Now {
     Now {
         utc_ms: TimestampMs::new(utc_ms),
         boot_ms: utc_ms,
     }
+}
+
+/// A request that nothing refuses, read at `utc_ms`.
+fn at(utc_ms: u64) -> Standing<'static> {
+    Standing::fixed(now(utc_ms))
 }
 
 fn session() -> SessionId {
@@ -131,7 +136,7 @@ fn the_caller_token_is_in_no_event_record_or_log_and_ends_with_the_workers_key()
         .expect("the ledger opens");
     let params = ask("push-anyway", QuestionKind::Confirm);
     let (created, _) = questions
-        .create(&source(1), &params, now(1_000))
+        .create(&source(1), &params, &mut at(1_000))
         .expect("the agent asks");
     let token = created.caller_token.as_slice().to_vec();
     let question_id = created.question.question_id;
@@ -140,7 +145,7 @@ fn the_caller_token_is_in_no_event_record_or_log_and_ends_with_the_workers_key()
             &person(),
             None,
             &answer(question_id, created.question.revision, true),
-            now(2_000),
+            &mut at(2_000),
         )
         .expect("the person answers");
 
@@ -235,7 +240,9 @@ fn the_caller_token_is_in_no_event_record_or_log_and_ends_with_the_workers_key()
         .expect_err("the token ended with the ledger that issued it");
     assert_eq!(refused.code(), ErrorCode::PermissionDenied);
     assert!(
-        restarted.create(&source(1), &params, now(3_000)).is_err(),
+        restarted
+            .create(&source(1), &params, &mut at(3_000))
+            .is_err(),
         "an exact retry cannot recover the token from the journal"
     );
     for bytes in journal_bytes(&journal) {
@@ -250,13 +257,17 @@ fn the_caller_token_is_in_no_event_record_or_log_and_ends_with_the_workers_key()
 fn waiting_and_cancelling_need_the_token_and_the_application_that_asked() {
     let questions = Questions::open(None, session(), SessionEpoch::V1).expect("the ledger opens");
     let (first, _) = questions
-        .create(&source(1), &ask("first", QuestionKind::Confirm), now(1_000))
+        .create(
+            &source(1),
+            &ask("first", QuestionKind::Confirm),
+            &mut at(1_000),
+        )
         .expect("the agent asks");
     let (second, _) = questions
         .create(
             &source(1),
             &ask("second", QuestionKind::Confirm),
-            now(1_000),
+            &mut at(1_000),
         )
         .expect("and asks again");
     let question_id = first.question.question_id;
@@ -278,7 +289,7 @@ fn waiting_and_cancelling_need_the_token_and_the_application_that_asked() {
                 question_id,
                 caller_token: CallerToken::new(second.caller_token.as_slice().to_vec()),
             },
-            now(1_100),
+            &mut at(1_100),
         )
         .expect_err("another question's token");
     assert_eq!(refused.code(), ErrorCode::PermissionDenied);
@@ -300,7 +311,7 @@ fn waiting_and_cancelling_need_the_token_and_the_application_that_asked() {
                 question_id,
                 caller_token: CallerToken::new(first.caller_token.as_slice().to_vec()),
             },
-            now(1_100),
+            &mut at(1_100),
         )
         .expect_err("another application");
     assert_eq!(refused.code(), ErrorCode::PermissionDenied);
@@ -327,7 +338,7 @@ fn waiting_and_cancelling_need_the_token_and_the_application_that_asked() {
                 question_id,
                 caller_token: CallerToken::new(first.caller_token.as_slice().to_vec()),
             },
-            now(1_300),
+            &mut at(1_300),
         )
         .expect("cancels");
     assert_eq!(cancelled.question.state, QuestionState::Cancelled);
@@ -338,7 +349,7 @@ fn waiting_and_cancelling_need_the_token_and_the_application_that_asked() {
         .create(
             &source(1),
             &ask("second", QuestionKind::Confirm),
-            now(1_400),
+            &mut at(1_400),
         )
         .expect("an exact retry");
     assert!(again.deduplicated);
@@ -350,7 +361,7 @@ fn waiting_and_cancelling_need_the_token_and_the_application_that_asked() {
     let mut changed = ask("second", QuestionKind::Confirm);
     changed.question = "Push the branch and the tags anyway?".to_owned();
     let conflict = questions
-        .create(&source(1), &changed, now(1_500))
+        .create(&source(1), &changed, &mut at(1_500))
         .expect_err("a changed payload");
     assert_eq!(conflict.code(), ErrorCode::IdConflict);
 }
@@ -371,26 +382,26 @@ fn a_transition_persists_the_first_answer_wins_and_cancellation_and_expiry_stay_
         .create(
             &source(1),
             &ask("answer-me", QuestionKind::Confirm),
-            now(1_000),
+            &mut at(1_000),
         )
         .expect("asks");
     let (cancelled, _) = questions
         .create(
             &source(1),
             &ask("cancel-me", QuestionKind::Confirm),
-            now(1_000),
+            &mut at(1_000),
         )
         .expect("asks");
     let mut short = ask("let-me-expire", QuestionKind::Confirm);
     short.requested_expiry_ms = Nullable::some(DurationMs::new(60_000));
     let (expiring, _) = questions
-        .create(&source(1), &short, now(1_000))
+        .create(&source(1), &short, &mut at(1_000))
         .expect("asks");
     let (untouched, _) = questions
         .create(
             &source(1),
             &ask("leave-me", QuestionKind::Confirm),
-            now(1_000),
+            &mut at(1_000),
         )
         .expect("asks");
 
@@ -412,7 +423,7 @@ fn a_transition_persists_the_first_answer_wins_and_cancellation_and_expiry_stay_
                         &QuestionAnswer::Decision { decided },
                         &person(),
                         Some(device),
-                        now(2_000),
+                        &mut at(2_000),
                     )
                     .map(|resolved| (decided, resolved.question.state))
                     .map_err(|error| error.code())
@@ -440,7 +451,7 @@ fn a_transition_persists_the_first_answer_wins_and_cancellation_and_expiry_stay_
                 question_id: cancelled.question.question_id,
                 expected_revision: cancelled.question.revision,
             },
-            now(2_000),
+            &mut at(2_000),
         )
         .expect("cancels");
     let swept = questions.sweep(now(1_000 + 60_001)).expect("sweeps");
@@ -537,7 +548,7 @@ fn a_question_is_the_applications_for_a_day_and_a_later_execution_inherits_nothi
         .create(
             &source(1),
             &ask("push-anyway", QuestionKind::Confirm),
-            now(1_000),
+            &mut at(1_000),
         )
         .expect("asks");
     assert_eq!(
@@ -548,7 +559,7 @@ fn a_question_is_the_applications_for_a_day_and_a_later_execution_inherits_nothi
     let mut greedy = ask("keep-it-open", QuestionKind::Confirm);
     greedy.requested_expiry_ms = Nullable::some(DurationMs::new(MAX_EXPIRY.get() * 7));
     let (capped, _) = questions
-        .create(&source(1), &greedy, now(1_000))
+        .create(&source(1), &greedy, &mut at(1_000))
         .expect("asks");
     assert_eq!(
         capped.question.expires_at_ms.get() - capped.question.created_at_ms.get(),
@@ -589,7 +600,7 @@ fn a_question_is_the_applications_for_a_day_and_a_later_execution_inherits_nothi
         .create(
             &later_execution(),
             &ask("push-anyway", QuestionKind::Confirm),
-            now(1_600),
+            &mut at(1_600),
         )
         .expect("a later execution asks under the old request identifier");
     assert!(!fresh.deduplicated);
@@ -618,7 +629,7 @@ fn a_question_ends_when_the_application_that_asked_it_exits() {
         .create(
             &application,
             &ask("while-you-run", QuestionKind::Confirm),
-            now(1_000),
+            &mut at(1_000),
         )
         .expect("asks");
     assert!(
@@ -643,13 +654,17 @@ fn a_question_ends_when_the_application_that_asked_it_exits() {
 fn a_question_identifier_alone_retrieves_no_answer() {
     let questions = Questions::open(None, session(), SessionEpoch::V1).expect("the ledger opens");
     let (asked, _) = questions
-        .create(&source(1), &ask("mine", QuestionKind::Confirm), now(1_000))
+        .create(
+            &source(1),
+            &ask("mine", QuestionKind::Confirm),
+            &mut at(1_000),
+        )
         .expect("asks");
     let (other, _) = questions
         .create(
             &source(1),
             &ask("theirs", QuestionKind::Confirm),
-            now(1_000),
+            &mut at(1_000),
         )
         .expect("asks");
     let question_id = asked.question.question_id;
@@ -658,7 +673,7 @@ fn a_question_identifier_alone_retrieves_no_answer() {
             &person(),
             None,
             &answer(question_id, asked.question.revision, true),
-            now(2_000),
+            &mut at(2_000),
         )
         .expect("answers");
 
@@ -699,7 +714,7 @@ fn a_yes_resolves_the_question_and_raises_no_approval() {
         .create(
             &source(1),
             &ask("delete-branch", QuestionKind::Confirm),
-            now(1_000),
+            &mut at(1_000),
         )
         .expect("asks");
     let before = questions.events_since(0, 64).expect("the feed").len();
@@ -708,7 +723,7 @@ fn a_yes_resolves_the_question_and_raises_no_approval() {
             &person(),
             None,
             &answer(asked.question.question_id, asked.question.revision, true),
-            now(2_000),
+            &mut at(2_000),
         )
         .expect("answers yes");
     assert_eq!(resolved.question.state, QuestionState::Answered);
@@ -764,7 +779,7 @@ fn an_alert_carries_its_identifier_label_text_severity_and_link_and_asks_nothing
         safe_session_link: Nullable::some("kalareach://session/build".to_owned()),
     };
     let first = questions
-        .alert(&source(1), &params, now(1_000))
+        .alert(&source(1), &params, &mut at(1_000))
         .expect("raises");
     assert!(!first.deduplicated);
     let alert = &first.alert;
@@ -792,12 +807,12 @@ fn an_alert_carries_its_identifier_label_text_severity_and_link_and_asks_nothing
         ..params.clone()
     };
     let second = questions
-        .alert(&source(1), &without_link, now(1_100))
+        .alert(&source(1), &without_link, &mut at(1_100))
         .expect("the link is optional");
     assert!(second.alert.safe_session_link.as_ref().is_none());
 
     let repeated = questions
-        .alert(&source(1), &params, now(1_200))
+        .alert(&source(1), &params, &mut at(1_200))
         .expect("repeats");
     assert!(repeated.deduplicated);
     assert_eq!(questions.alerts().expect("reads").len(), 2);
@@ -812,4 +827,102 @@ fn an_alert_carries_its_identifier_label_text_severity_and_link_and_asks_nothing
         )
         .expect("reads");
     assert!(read.questions.is_empty(), "an alert is not a question");
+}
+
+/// What the ledger holds, read through a second connection: questions, sources and events.
+fn ledger_counts(journal: &Path) -> (i64, i64, i64) {
+    let connection =
+        rusqlite::Connection::open_with_flags(journal, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("opens the journal");
+    let count = |table: &str| -> i64 {
+        connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .expect("counts the rows")
+    };
+    (
+        count("questions"),
+        count("question_sources"),
+        count("question_events"),
+    )
+}
+
+/// KR-REQ-09.16: a creation asks its request's authority again immediately before each write of its
+/// own, the source's first row and the question. Where the ask refuses, nothing of the creation is
+/// written, and the refusal is told as the ask gave it. A repeat of a creation asks before it takes
+/// the origin of the question away, and is refused the same way. The control, nothing refusing,
+/// writes the source and the question once.
+#[test]
+fn a_creation_whose_authority_ends_before_a_write_of_its_own_writes_nothing() {
+    let directory = tempfile::tempdir().expect("a directory on the internal disk");
+    let journal = directory.path().join("journal.sqlite");
+    let questions = Questions::open(Some(journal.as_path()), session(), SessionEpoch::V1)
+        .expect("the ledger opens");
+    let clock = || now(1_000);
+    let ended = || {
+        Err(kr_worker::questions::QuestionError::Withdrawn(Box::new(
+            kr_worker::WorkerError::WindowExpired {
+                detail: "ended".to_owned(),
+            },
+        )))
+    };
+
+    let before = ledger_counts(&journal);
+    let mut refusing = ended;
+    let refused = questions
+        .create(
+            &source(1),
+            &ask("first", QuestionKind::Confirm),
+            &mut Standing::new(&clock, &mut refusing),
+        )
+        .expect_err("a creation whose authority ended is refused");
+    assert!(
+        matches!(refused, kr_worker::questions::QuestionError::Withdrawn(_)),
+        "{refused:?}"
+    );
+    assert_eq!(
+        ledger_counts(&journal),
+        before,
+        "a creation wrote after its authority ended"
+    );
+
+    let (created, _) = questions
+        .create(
+            &source(1),
+            &ask("first", QuestionKind::Confirm),
+            &mut Standing::fixed(now(1_100)),
+        )
+        .expect("the control creates");
+    let (after_the_control, sources, _) = ledger_counts(&journal);
+    assert_eq!(
+        after_the_control,
+        before.0 + 1,
+        "the control writes one question"
+    );
+    assert_eq!(sources, before.1 + 1, "the control writes the source once");
+
+    let kept = ledger_counts(&journal);
+    let mut refusing = ended;
+    let repeated = questions
+        .create(
+            &source(1),
+            &ask("first", QuestionKind::Confirm),
+            &mut Standing::new(&clock, &mut refusing),
+        )
+        .expect_err("a repeat whose authority ended is refused");
+    assert!(
+        matches!(repeated, kr_worker::questions::QuestionError::Withdrawn(_)),
+        "{repeated:?}"
+    );
+    assert_eq!(ledger_counts(&journal), kept);
+    let (again, _) = questions
+        .create(
+            &source(1),
+            &ask("first", QuestionKind::Confirm),
+            &mut Standing::fixed(now(1_200)),
+        )
+        .expect("the repeat the control takes");
+    assert!(again.deduplicated);
+    assert_eq!(again.question.question_id, created.question.question_id);
 }

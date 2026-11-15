@@ -74,6 +74,10 @@ pub enum QuestionError {
     /// A field was missing, malformed or out of range.
     #[error("{0}")]
     InvalidArgument(String),
+    /// The authority the request was admitted under ended while it waited for the ledger. What it
+    /// carries is the host's own refusal, which the dispatch tells as it is.
+    #[error("{0}")]
+    Withdrawn(Box<crate::error::WorkerError>),
     /// The durable store could not be read or written.
     #[error("the question ledger is unavailable: {detail}")]
     Unavailable {
@@ -85,7 +89,7 @@ pub enum QuestionError {
 impl QuestionError {
     /// Returns the stable protocol code this failure is reported under.
     #[must_use]
-    pub const fn code(&self) -> ErrorCode {
+    pub fn code(&self) -> ErrorCode {
         match self {
             Self::NotInSession { .. } => ErrorCode::NotInKrSession,
             // What the binding had to read about the caller was not available to it, which is what
@@ -97,6 +101,7 @@ impl QuestionError {
             Self::TokenRejected { .. } | Self::Unknown { .. } => ErrorCode::PermissionDenied,
             Self::StaleRevision { .. } => ErrorCode::DraftConflict,
             Self::Invalid(_) | Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
+            Self::Withdrawn(refusal) => refusal.code(),
             Self::Unavailable { .. } => ErrorCode::StorageUnavailable,
         }
     }

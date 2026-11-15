@@ -62,6 +62,69 @@ pub struct Now {
     pub boot_ms: u64,
 }
 
+/// What a request that waited for the ledger is asked again, and the clock it is written under.
+///
+/// An arm takes the ledger's lock, writes the expiry that is due (the host's own record), reads
+/// what it needs, and only then writes its own record. The clock is read after the lock is held,
+/// and [`Standing::ask`] asks whether the request is still admitted immediately before each write
+/// of the arm's own: it returns a fresh reading, which the write is stamped with, or the refusal
+/// that the request's authority gives, with nothing written.
+pub struct Standing<'a> {
+    inner: Inner<'a>,
+}
+
+enum Inner<'a> {
+    /// The clock, and the question put to the caller's authority.
+    Asked {
+        clock: &'a dyn Fn() -> Now,
+        still: &'a mut dyn FnMut() -> Result<()>,
+    },
+    /// A reading that nothing refuses.
+    #[cfg(any(test, feature = "testing"))]
+    Fixed(Now),
+}
+
+impl<'a> Standing<'a> {
+    /// A request whose authority is asked by `still`, and whose time is read from `clock`.
+    pub fn new(clock: &'a dyn Fn() -> Now, still: &'a mut dyn FnMut() -> Result<()>) -> Self {
+        Self {
+            inner: Inner::Asked { clock, still },
+        }
+    }
+
+    /// A caller with no authority to ask, which reads `now` every time, for this host's own tests.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub const fn fixed(now: Now) -> Self {
+        Self {
+            inner: Inner::Fixed(now),
+        }
+    }
+
+    /// The clock's reading now.
+    pub fn now(&self) -> Now {
+        match &self.inner {
+            Inner::Asked { clock, .. } => clock(),
+            #[cfg(any(test, feature = "testing"))]
+            Inner::Fixed(now) => *now,
+        }
+    }
+
+    /// Asks again whether the request is still admitted, and reads the clock after the answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the caller's authority refuses with.
+    pub fn ask(&mut self) -> Result<Now> {
+        match &mut self.inner {
+            Inner::Asked { still, .. } => still()?,
+            #[cfg(any(test, feature = "testing"))]
+            Inner::Fixed(_) => {}
+        }
+        Ok(self.now())
+    }
+}
+
 /// What a resolution did to a question.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Resolved {
@@ -232,7 +295,7 @@ impl Store {
     pub fn application_instance(
         &self,
         source: &VerifiedSource,
-        now: Now,
+        at: &mut Standing<'_>,
     ) -> Result<ApplicationInstanceId> {
         let key = source.key();
         if let Some(existing) = self
@@ -248,6 +311,8 @@ impl Store {
             return Ok(ApplicationInstanceId::new(uuid_from(&existing)?));
         }
         let minted = kr_ipc::new_uuid();
+        // The source's own row is a write of this request: asked again, with nothing between.
+        let now = at.ask()?;
         self.connection
             .execute(
                 "INSERT INTO question_sources (source_key, application_instance_id, first_seen_ms)
@@ -273,11 +338,11 @@ impl Store {
         source: &VerifiedSource,
         agent_label: Option<String>,
         binding: Option<AgentBinding>,
-        now: Now,
+        at: &mut Standing<'_>,
     ) -> Result<QuestionSource> {
         let application_instance_id = match binding {
             Some(binding) => binding.application_instance_id,
-            None => self.application_instance(source, now)?,
+            None => self.application_instance(source, at)?,
         };
         Ok(QuestionSource {
             application_instance_id,
@@ -311,7 +376,7 @@ impl Store {
         params: &QuestionCreateParams,
         choices: &[QuestionChoice],
         expiry_ms: u64,
-        now: Now,
+        at: &mut Standing<'_>,
     ) -> Result<Created> {
         let key = source.key();
         let digest = payload_digest(params, choices);
@@ -325,6 +390,7 @@ impl Store {
             // call can say which thread asked it: it keeps no origin and stays application-scoped.
             // A binding the sweep already recorded came from the report of the call that created
             // it, before any other call used the identifier, and it stays.
+            at.ask()?;
             self.connection
                 .execute(
                     "DELETE FROM question_origins WHERE question_id = ?1",
@@ -349,6 +415,9 @@ impl Store {
         let caller_token = token::issue()?;
         let tag = token::tag(&self.key, question_id, &caller_token);
         let (nonce, sealed) = token::seal(&self.key, question_id, &caller_token)?;
+        // The question is a write of this request, stamped and given its deadline by the clock as
+        // it reads now, after the ask.
+        let now = at.ask()?;
         let expires_at_ms = TimestampMs::new(now.utc_ms.get().saturating_add(expiry_ms));
         let expires_at_boot_ms = now.boot_ms.saturating_add(expiry_ms);
         let question = Question {
@@ -611,8 +680,9 @@ impl Store {
         answer: &QuestionAnswer,
         actor_id: &ActorId,
         device_id: Option<DeviceId>,
-        now: Now,
+        at: &mut Standing<'_>,
     ) -> Result<Resolved> {
+        let now = at.ask()?;
         let record = AnswerRecord {
             answer: answer.clone(),
             actor_id: actor_id.clone(),
@@ -627,6 +697,7 @@ impl Store {
             QuestionEventKind::Answered,
             Some(&record),
             now,
+            true,
         )
     }
 
@@ -639,8 +710,9 @@ impl Store {
         &mut self,
         question_id: QuestionId,
         expected: QuestionRevision,
-        now: Now,
+        at: &mut Standing<'_>,
     ) -> Result<Resolved> {
+        let now = at.ask()?;
         self.resolve(
             question_id,
             expected,
@@ -648,6 +720,7 @@ impl Store {
             QuestionEventKind::Cancelled,
             None,
             now,
+            true,
         )
     }
 
@@ -777,6 +850,7 @@ impl Store {
                 QuestionEventKind::Expired,
                 None,
                 now,
+                false,
             ) {
                 Ok(resolved) => expired.push(resolved),
                 // Somebody answered or cancelled it between the read above and this write, or it
@@ -808,7 +882,7 @@ impl Store {
         source: &VerifiedSource,
         header: &QuestionSource,
         params: &AlertCreateParams,
-        now: Now,
+        at: &mut Standing<'_>,
     ) -> Result<(Alert, bool)> {
         let key = source.key();
         let digest = alert_digest(params);
@@ -829,6 +903,7 @@ impl Store {
             }
             return Ok((decode::<Alert>(&record)?, true));
         }
+        let now = at.ask()?;
         let alert = Alert {
             dedup_id: params.dedup_id.clone(),
             session_id: self.session_id,
@@ -932,6 +1007,7 @@ impl Store {
         Ok(alerts)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn resolve(
         &mut self,
         question_id: QuestionId,
@@ -940,6 +1016,7 @@ impl Store {
         kind: QuestionEventKind,
         answer: Option<&AnswerRecord>,
         now: Now,
+        enforce_expiry: bool,
     ) -> Result<Resolved> {
         let encoded_answer = match answer {
             Some(record) => Some(encode(record)?),
@@ -958,13 +1035,16 @@ impl Store {
             .execute(
                 "UPDATE questions
                     SET state = ?1, revision = revision + 1, answer = ?2, resolved_at_ms = ?3
-                  WHERE question_id = ?4 AND state = 'pending' AND revision = ?5",
+                  WHERE question_id = ?4 AND state = 'pending' AND revision = ?5
+                    AND (?6 = 0 OR (expires_at_ms > ?3 AND expires_at_boot_ms > ?7))",
                 params![
                     state.as_str(),
                     encoded_answer,
                     millis(now.utc_ms.get()),
                     question_id.get().as_bytes().as_slice(),
                     count(expected.get()),
+                    i64::from(enforce_expiry),
+                    millis(now.boot_ms),
                 ],
             )
             .map_err(QuestionError::unavailable)?;
@@ -987,6 +1067,13 @@ impl Store {
                 QuestionState::Answered | QuestionState::Cancelled => QuestionError::Resolved {
                     state: row.question.state,
                 },
+                // The revision is the one that was named, and the question is pending: only its
+                // deadline, which this write enforces at the time it reads, can have stopped it.
+                QuestionState::Pending if row.question.revision == expected => {
+                    QuestionError::Expired {
+                        at_ms: row.question.expires_at_ms.get(),
+                    }
+                }
                 QuestionState::Pending => QuestionError::StaleRevision {
                     named: expected.get(),
                     current: row.question.revision.get(),
@@ -1330,7 +1417,12 @@ mod tests {
     fn create(store: &mut Store, params: &QuestionCreateParams, at: u64) -> Created {
         let source = source();
         let header = store
-            .source_header(&source, Some("an agent".to_owned()), None, now(at))
+            .source_header(
+                &source,
+                Some("an agent".to_owned()),
+                None,
+                &mut Standing::fixed(now(at)),
+            )
             .expect("a header");
         let choices = build_choices(params.kind, &params.choices).expect("choices");
         store
@@ -1342,7 +1434,7 @@ mod tests {
                 params,
                 &choices,
                 60_000,
-                now(at),
+                &mut Standing::fixed(now(at)),
             )
             .expect("creates")
     }
@@ -1369,7 +1461,7 @@ mod tests {
         let source = source();
         let params = creation("r-1", "shall I really?");
         let header = store
-            .source_header(&source, None, None, now(2_000))
+            .source_header(&source, None, None, &mut Standing::fixed(now(2_000)))
             .expect("a header");
         let choices = build_choices(params.kind, &params.choices).expect("choices");
         let error = store
@@ -1381,7 +1473,7 @@ mod tests {
                 &params,
                 &choices,
                 60_000,
-                now(2_000),
+                &mut Standing::fixed(now(2_000)),
             )
             .expect_err("conflict");
         assert_eq!(error.code(), kr_protocol::error::ErrorCode::IdConflict);
@@ -1400,7 +1492,7 @@ mod tests {
                 &QuestionAnswer::Decision { decided: true },
                 &actor,
                 None,
-                now(2_000),
+                &mut Standing::fixed(now(2_000)),
             )
             .expect("wins");
         assert_eq!(first.question.state, QuestionState::Answered);
@@ -1411,7 +1503,7 @@ mod tests {
                 &QuestionAnswer::Decision { decided: false },
                 &actor,
                 None,
-                now(2_001),
+                &mut Standing::fixed(now(2_001)),
             )
             .expect_err("loses");
         assert_eq!(
@@ -1433,7 +1525,7 @@ mod tests {
                 },
                 &ActorId::new("local:501").expect("a principal"),
                 None,
-                now(2_000),
+                &mut Standing::fixed(now(2_000)),
             )
             .expect("answered");
         let stored = store
@@ -1464,7 +1556,7 @@ mod tests {
         };
         let params = creation("r-1", "shall I?");
         let header = store
-            .source_header(&source, None, None, now(1_000))
+            .source_header(&source, None, None, &mut Standing::fixed(now(1_000)))
             .expect("a header");
         let choices = build_choices(params.kind, &params.choices).expect("choices");
         store
@@ -1476,7 +1568,7 @@ mod tests {
                 &params,
                 &choices,
                 60_000,
-                now(1_000),
+                &mut Standing::fixed(now(1_000)),
             )
             .expect("creates");
         // The deadline is an hour away and the process never existed, so what expires the question
@@ -1500,7 +1592,7 @@ mod tests {
                 &QuestionAnswer::Decision { decided: true },
                 &ActorId::new("local:501").expect("a principal"),
                 None,
-                now(1_000 + 60_002),
+                &mut Standing::fixed(now(1_000 + 60_002)),
             )
             .expect_err("too late");
         assert_eq!(error.code(), kr_protocol::error::ErrorCode::QuestionExpired);
@@ -1549,7 +1641,7 @@ mod tests {
             .cancel(
                 created.question.question_id,
                 created.question.revision,
-                now(2_000),
+                &mut Standing::fixed(now(2_000)),
             )
             .expect("cancels");
         assert_eq!(resolved.question.state, QuestionState::Cancelled);
@@ -1593,7 +1685,7 @@ mod tests {
         let mut store = store();
         let source = source();
         let header = store
-            .source_header(&source, None, None, now(1_000))
+            .source_header(&source, None, None, &mut Standing::fixed(now(1_000)))
             .expect("a header");
         let params = AlertCreateParams {
             session_id: SessionId::new(Uuid::from_bytes([3; 16])),
@@ -1604,11 +1696,11 @@ mod tests {
             safe_session_link: Nullable::null(),
         };
         let (first, deduplicated) = store
-            .alert(&source, &header, &params, now(1_000))
+            .alert(&source, &header, &params, &mut Standing::fixed(now(1_000)))
             .expect("ok");
         assert!(!deduplicated);
         let (second, deduplicated) = store
-            .alert(&source, &header, &params, now(2_000))
+            .alert(&source, &header, &params, &mut Standing::fixed(now(2_000)))
             .expect("ok");
         assert!(deduplicated);
         assert_eq!(first.created_at_ms, second.created_at_ms);
