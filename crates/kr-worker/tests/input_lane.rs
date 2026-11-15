@@ -39,7 +39,8 @@ use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::root::{
     CwdRevision, EditorBufferRevision, EditorKeymap, EditorState, FenceAcknowledgement,
     KeyQueueSnapshot, LaunchCommand, PendingReaderInput, PromptGeneration, QueueDrainReport,
-    ReaderContext, ReaderRevision, RootEditorEnterParams, RootEditorFenceResult, ShellLaunchParams,
+    ReaderContext, ReaderRevision, RootEditorEnterParams, RootEditorFenceResult,
+    RootEofDetachParams, ShellLaunchParams,
 };
 use kr_protocol::scalars::{Bytes, CanonicalSet, Nullable, U64};
 use kr_protocol::session::{ClosureReason, Dimensions, DisplayNumber, ShellMode};
@@ -92,6 +93,20 @@ struct Lane {
 }
 
 impl Lane {
+    /// Reads the worker's answer to the bind, which is the lane's first frame, and takes the
+    /// lane's epoch from it.
+    async fn read_ready(&mut self) {
+        let ready = match tokio::time::timeout(WAIT, self.link.recv())
+            .await
+            .expect("the worker answers the bind")
+        {
+            Ok(ControlFrame::InputLaneReady(ready)) => ready,
+            other => panic!("the lane was not bound: {other:?}"),
+        };
+        self.epoch = ready.epoch;
+        self.ready = ready;
+    }
+
     /// Writes one frame of the lane's attachment, in the epoch and the sequence it is at.
     async fn send(&mut self, bytes: &[u8]) -> RequestId {
         self.send_with(bytes, Nullable::null()).await
@@ -642,8 +657,8 @@ impl Rig {
     }
 
     /// Puts the reader of the root editor at an empty prompt behind an acknowledged fence, so that
-    /// a launch asked of the session is reserved.
-    fn at_a_prompt(&self) {
+    /// a launch asked of the session is reserved, and returns the fence.
+    fn at_a_prompt(&self) -> kr_protocol::root::FenceId {
         let fence_id = self.reader_enters();
         let editor = Self::an_empty_prompt();
         self.runtime
@@ -663,6 +678,7 @@ impl Rig {
                 )))
             })
             .expect("the session has a fence machine");
+        fence_id
     }
 
     /// Attaches a terminal that may type.
@@ -728,26 +744,38 @@ impl Rig {
 
     /// Opens the lane of `attachment` under the proxy link, and reads the worker's answer.
     async fn lane(&self, attachment: AttachmentId) -> Lane {
-        let mut link = self
+        let link = self
             .ask_for_a_lane(1, self.proxy_connection, attachment)
             .await;
-        let ready = match tokio::time::timeout(WAIT, link.recv())
-            .await
-            .expect("the worker answers the bind")
-        {
-            Ok(ControlFrame::InputLaneReady(ready)) => ready,
-            other => panic!("the lane was not bound: {other:?}"),
-        };
+        let mut lane = self.lane_over(link, attachment, None);
+        lane.read_ready().await;
+        lane
+    }
+
+    /// The lane of `attachment` over a link that has been asked for it. Its ready frame is known
+    /// when the case has read it, and `epoch` stands for it until then.
+    fn lane_over(
+        &self,
+        link: BoundLink,
+        attachment: AttachmentId,
+        epoch: Option<InputLeaseEpoch>,
+    ) -> Lane {
+        let epoch = epoch.unwrap_or_else(|| InputLeaseEpoch::new(0));
         Lane {
             link,
             attachment,
             session_id: self.session_id,
             actor: self.actor(1),
-            epoch: ready.epoch,
+            epoch,
             sequence: 0,
             requests: 0,
             credits: Vec::new(),
-            ready,
+            ready: InputLaneReady {
+                epoch,
+                holder: false,
+                frames: 0,
+                bytes: U64::new(0),
+            },
         }
     }
 
@@ -2060,6 +2088,17 @@ async fn next_window(lane: &mut Lane) -> LaneWindow {
     }
 }
 
+/// Reads the notice that the end of an epoch owes, once the terminal's writer has given back the
+/// room of the batch it dropped. The writer asks for the epoch's end before it gives the room
+/// back, so a notice that has not come within this bound, which is far shorter than a case's wait,
+/// is one the worker never sent.
+async fn the_notice_after_the_room_came_back(rig: &Rig, lane: &mut Lane) -> LaneWindow {
+    rig.drained().await;
+    tokio::time::timeout(Duration::from_secs(10), next_window(lane))
+        .await
+        .expect("the writer gave the room back and the end of the epoch was not told")
+}
+
 /// Holds the writer while a frame admitted under an authority that ends soon is accepted, and lets
 /// it go once that authority has ended. The writer then meets a batch it must not write.
 async fn a_batch_that_expires_in_the_writer(rig: &Rig, lane: &mut Lane, bytes: &[u8]) {
@@ -2092,7 +2131,7 @@ async fn a_batch_the_writer_drops_at_its_deadline_ends_the_epoch_and_the_notice_
     let mut lane = rig.lane(attachment).await;
     a_batch_that_expires_in_the_writer(&rig, &mut lane, b"abc").await;
 
-    let notice = next_window(&mut lane).await;
+    let notice = the_notice_after_the_room_came_back(&rig, &mut lane).await;
     assert!(!notice.holder, "the view no longer holds the keys");
     let ended = notice.ended.0.expect("the notice says an epoch ended");
     assert_eq!((ended.epoch, ended.fenced_bytes.get()), (epoch, 3));
@@ -2405,25 +2444,49 @@ async fn an_immediate_refusal_of_a_launch_writes_the_marker() {
 
 /// KR-REQ-23.36, C26: a launch that the machine has reserved for its reader is marked on the lane
 /// while it is still unanswered, and the marker comes behind the acceptance of every frame before
-/// the barrier.
+/// the barrier. The lane's writer stands before the ready frame and the terminal's writer holds the
+/// first batch, so the three answers and the marker wait in the lane's queue, and the link shows
+/// the order in which they were queued.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_marker_of_a_reserved_launch_follows_the_acceptances_before_its_barrier() {
     let mut rig = Rig::start_fenced().await;
     let attachment = rig.attach().await;
     let epoch = rig.acquire(attachment).await;
-    let mut lane = rig.lane(attachment).await;
     rig.at_a_prompt();
+    let (lane_at, lane_go) = rig.service.stall_next_lane_writer();
+    let link = rig
+        .ask_for_a_lane(1, rig.proxy_connection, attachment)
+        .await;
+    let mut lane = rig.lane_over(link, attachment, Some(epoch));
+    tokio::time::timeout(WAIT, lane_at)
+        .await
+        .expect("the lane's writer stood before the ready frame in time")
+        .expect("the lane's writer stood before the ready frame");
+    let (held_at, held_go) = rig.runtime.input().writer_hold().arm();
 
-    // Three frames, whose acceptances the case does not read before the launch is asked for.
+    // Three frames, whose answers wait in the lane's queue.
     for frame in [b"a", b"b", b"c"] {
         lane.send(frame).await;
     }
+    held_at
+        .await
+        .expect("the terminal's writer took the first batch");
     until("the worker accepted the three frames", WAIT, || {
         rig.runtime.input().lock().lease().next_sequence.get() == 3
     })
     .await;
+    let before = rig.runtime.input().lock().queued_lane_frames();
     let launching = rig.launching(Some(barrier(attachment, epoch, 3, Some(9))));
+    until(
+        "the launch's marker was queued on the lane behind the three answers",
+        Duration::from_secs(20),
+        || rig.runtime.input().lock().queued_lane_frames() == before + 1,
+    )
+    .await;
 
+    lane_go.send(()).expect("lets the lane's writer go");
+    held_go.send(()).expect("lets the terminal's writer go");
+    lane.read_ready().await;
     for _ in 0..3 {
         lane.accepted().await;
     }
@@ -2514,9 +2577,12 @@ async fn a_batch_dropped_for_a_holder_with_no_lane_is_counted_by_the_next_acquir
     })
     .await;
     release.send(()).expect("lets the writer go");
-    until("the writer ended the holder's epoch", WAIT, || {
-        rig.runtime.input().lock().lease().holder.0.is_none()
-    })
+    rig.drained().await;
+    until(
+        "the writer ended the holder's epoch",
+        Duration::from_secs(10),
+        || rig.runtime.input().lock().lease().holder.0.is_none(),
+    )
     .await;
 
     let taken = rig.acquire_result(other).await;
@@ -2582,7 +2648,7 @@ async fn the_remainder_of_a_batch_the_writer_abandons_at_its_deadline_is_counted
     .await;
     rig.let_the_application_read().await;
 
-    let notice = next_window(&mut lane).await;
+    let notice = the_notice_after_the_room_came_back(&rig, &mut lane).await;
     let ended = notice.ended.0.expect("the notice says an epoch ended");
     assert_eq!(ended.epoch, epoch);
     let fenced = usize::try_from(ended.fenced_bytes.get()).expect("a count");
@@ -2615,6 +2681,214 @@ async fn the_fenced_count_includes_what_the_root_editors_machine_holds() {
     assert_eq!(
         notice.ended.0.expect("an epoch ended").fenced_bytes.get(),
         2
+    );
+    rig.finish().await;
+}
+
+/// KR-REQ-23.36: what the root editor's machine holds for a holder who detaches is part of the
+/// fenced count, in the answer and in the notice, and the next acquire reports it once. The reader
+/// has not answered the fence it was asked for, so the machine holds the two bytes that the session
+/// accepted, and the detach drops them with no lease change to acknowledge them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detach_counts_what_the_root_editors_machine_holds_in_the_answer_and_in_the_notice() {
+    let mut rig = Rig::start_fenced().await;
+    let attachment = rig.attach().await;
+    let epoch = rig.acquire(attachment).await;
+    let mut lane = rig.lane(attachment).await;
+    rig.reader_enters();
+    typed(&mut lane, &[b"x", b"y"]).await;
+
+    let detached = rig
+        .detach_with(attachment, None, true)
+        .await
+        .expect("detached");
+    assert_eq!(
+        detached.fenced_bytes.map(U64::get),
+        Some(2),
+        "the answer counts the two keys the machine held"
+    );
+    let ended = next_window(&mut lane)
+        .await
+        .ended
+        .0
+        .expect("an epoch ended");
+    assert_eq!(
+        (ended.epoch, ended.fenced_bytes.get()),
+        (epoch, 2),
+        "the notice counts the two keys the machine held"
+    );
+
+    let other = rig.attach().await;
+    assert_eq!(
+        rig.acquire_result(other).await.discarded_bytes.get(),
+        2,
+        "the next acquire reports the same two keys, once"
+    );
+    rig.finish().await;
+}
+
+/// KR-REQ-23.36: a person who types after the launch marker and then closes the view loses the
+/// keys that the machine holds behind the launch, and the notice counts them. The view's end is
+/// the session's detach of its attachment, as the service makes it when a view's connection ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keys_typed_behind_a_launch_are_counted_when_the_view_closes() {
+    let mut rig = Rig::start_fenced().await;
+    let attachment = rig.attach().await;
+    let epoch = rig.acquire(attachment).await;
+    let mut lane = rig.lane(attachment).await;
+    rig.at_a_prompt();
+    let launching = rig.launching(Some(barrier(attachment, epoch, 0, Some(4))));
+    match lane.next_event().await {
+        Some(Seen::Launch(marker)) => assert_eq!(marker.launch, 4),
+        other => panic!("the launch's marker did not come: {other:?}"),
+    }
+    typed(&mut lane, &[b"x", b"y"]).await;
+
+    let detached = rig
+        .runtime
+        .session()
+        .detach(attachment, None)
+        .expect("the view's attachment is removed");
+    assert_eq!(
+        detached.fenced_bytes.map(U64::get),
+        Some(2),
+        "the removal counts the two keys held behind the launch"
+    );
+    let ended = next_window(&mut lane)
+        .await
+        .ended
+        .0
+        .expect("an epoch ended");
+    assert_eq!(
+        (ended.epoch, ended.fenced_bytes.get()),
+        (epoch, 2),
+        "the notice counts the two keys held behind the launch"
+    );
+    let (_proxy, answer) = tokio::time::timeout(WAIT, launching)
+        .await
+        .expect("the removal answers the launch")
+        .expect("the launch's task ran");
+    assert!(
+        answer.is_err(),
+        "nothing was installed for a view that left"
+    );
+    rig.finish().await;
+}
+
+/// KR-REQ-23.36: the session's close drops what the machine holds, and the notice that the epoch
+/// ended counts it. The notice is told when the close's hold ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_close_counts_what_the_root_editors_machine_holds_in_the_notice() {
+    let mut rig = Rig::start_fenced().await;
+    let attachment = rig.attach().await;
+    let epoch = rig.acquire(attachment).await;
+    let mut lane = rig.lane(attachment).await;
+    rig.reader_enters();
+    typed(&mut lane, &[b"x", b"y"]).await;
+
+    rig.runtime.close(ClosureReason::CloseRequested).1.release();
+    let ended = next_window(&mut lane)
+        .await
+        .ended
+        .0
+        .expect("an epoch ended");
+    assert_eq!(
+        (ended.epoch, ended.fenced_bytes.get()),
+        (epoch, 2),
+        "the close's notice counts the two keys the machine held"
+    );
+}
+
+/// KR-REQ-23.36: the root editor's own gesture that detaches the view whose fence it holds ends
+/// the view's lease with the machine's share already dropped. The notice counts the keys held
+/// behind the launch, and the next acquire reports them once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_roots_end_counts_what_the_machine_dropped_with_the_attachment_in_the_notice() {
+    let mut rig = Rig::start_fenced().await;
+    let attachment = rig.attach().await;
+    let epoch = rig.acquire(attachment).await;
+    let mut lane = rig.lane(attachment).await;
+    let fence_id = rig.at_a_prompt();
+    let launching = rig.launching(Some(barrier(attachment, epoch, 0, Some(5))));
+    match lane.next_event().await {
+        Some(Seen::Launch(marker)) => assert_eq!(marker.launch, 5),
+        other => panic!("the launch's marker did not come: {other:?}"),
+    }
+    typed(&mut lane, &[b"x", b"y"]).await;
+
+    let session_id = rig.session_id;
+    rig.runtime
+        .session()
+        .stimulate_fence(|driver| {
+            driver.bridge_event(
+                RequestId::new(3),
+                &BridgeEvent::EofDetach(RootEofDetachParams {
+                    session_id,
+                    fence_id,
+                    prompt_generation: PromptGeneration::new(1),
+                    input_epoch: epoch,
+                }),
+            )
+        })
+        .expect("the session has a fence machine");
+    let ended = next_window(&mut lane)
+        .await
+        .ended
+        .0
+        .expect("an epoch ended");
+    assert_eq!(
+        (ended.epoch, ended.fenced_bytes.get()),
+        (epoch, 2),
+        "the notice counts the two keys the machine dropped with the attachment"
+    );
+
+    let (proxy, answer) = tokio::time::timeout(WAIT, launching)
+        .await
+        .expect("the gesture answers the launch")
+        .expect("the launch's task ran");
+    assert!(
+        answer.is_err(),
+        "nothing was installed for a view that left"
+    );
+    rig.proxy = Some(proxy);
+    let other = rig.attach().await;
+    assert_eq!(
+        rig.acquire_result(other).await.discarded_bytes.get(),
+        2,
+        "the next acquire reports the same two keys, once"
+    );
+    rig.finish().await;
+}
+
+/// KR-REQ-23.36: the release that an application's keyboard negotiation causes has no request to
+/// answer, so its count is told in the notice and carried to the next acquire. The machine holds
+/// two keys of the holder, and both reports have them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_keyboard_mode_release_counts_what_the_root_editors_machine_holds_in_the_notice() {
+    let mut rig = Rig::start_fenced().await;
+    let attachment = rig.attach().await;
+    let epoch = rig.acquire(attachment).await;
+    let mut lane = rig.lane(attachment).await;
+    rig.reader_enters();
+    typed(&mut lane, &[b"x", b"y"]).await;
+
+    // The application asks for every key as an escape code, which the attached terminal does not
+    // produce.
+    rig.runtime.session().ingest_output(b"\x1b[=8;1u");
+    let ended = next_window(&mut lane)
+        .await
+        .ended
+        .0
+        .expect("an epoch ended");
+    assert_eq!(
+        (ended.epoch, ended.fenced_bytes.get()),
+        (epoch, 2),
+        "the notice counts the two keys the machine held"
+    );
+    assert_eq!(
+        rig.runtime.session().interrupted_input().bytes,
+        2,
+        "the same two keys are carried to the next acquire"
     );
     rig.finish().await;
 }
