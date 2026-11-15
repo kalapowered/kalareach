@@ -3705,6 +3705,69 @@ async fn a_detach_ends_the_stream_of_a_worker_without_the_lane_and_tells_no_coun
     rig.stop().await;
 }
 
+/// A launch whose result the host cannot report ends the stream that its barrier names, for a worker
+/// without the lane: that worker writes no marker when its launch handling ends, so the client's
+/// hold on later typing ends only with the stream. The device is told nothing that is not known: the
+/// stream is reset, with no word and no count. A launch that is answered, whether it is refused or
+/// not, leaves the stream standing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_whose_result_is_unknown_ends_the_stream_of_a_worker_without_the_lane() {
+    let (rig, mut stream) = typed_serial(1).await;
+    let silent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let answers = Arc::clone(&silent);
+    rig.adopted
+        .host
+        .network()
+        .input_stages()
+        .script_dependent_answers(move |_| {
+            if answers.load(Ordering::SeqCst) {
+                SerialAnswer::Silent
+            } else {
+                gives(ErrorCode::EditorBusy)
+            }
+        });
+    let refused = send_after(&rig, Dependent::Launch, rig.epoch, 1).await;
+    assert!(
+        matches!(&refused.answer, Err(error) if error.code == ErrorCode::EditorBusy),
+        "the launch is refused by the worker: {:?}",
+        refused.answer
+    );
+    type_and_wait(&rig, &mut stream, 1, b"k").await;
+
+    silent.store(true, Ordering::SeqCst);
+    let unknown = send_after(&rig, Dependent::Launch, rig.epoch, 2).await;
+    assert!(
+        matches!(&unknown.answer, Err(error) if error.code == ErrorCode::OutcomeUnknown),
+        "the launch's result is unknown: {:?}",
+        unknown.answer
+    );
+    match next_or_reset(&mut stream).await {
+        Err(_) => {}
+        other => panic!("the stream was to be reset, with nothing told, and it gave {other:?}"),
+    }
+    rig.stop().await;
+}
+
+/// A worker that states the lane writes the marker that ends the client's hold, so a launch whose
+/// result the host cannot report leaves its stream standing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_whose_result_is_unknown_leaves_the_stream_of_a_worker_with_the_lane() {
+    let (rig, mut stream) = typed(1).await;
+    rig.adopted
+        .host
+        .network()
+        .input_stages()
+        .script_dependent_answers(|_| SerialAnswer::Silent);
+    let unknown = send_after(&rig, Dependent::Launch, rig.epoch, 1).await;
+    assert!(
+        matches!(&unknown.answer, Err(error) if error.code == ErrorCode::OutcomeUnknown),
+        "the launch's result is unknown: {:?}",
+        unknown.answer
+    );
+    type_and_wait(&rig, &mut stream, 1, b"k").await;
+    rig.stop().await;
+}
+
 /// A rig of a worker without the lane, with a stream open and `accepted` frames of one byte typed
 /// and accepted.
 async fn typed_serial(accepted: u64) -> (Rig, DataStream) {

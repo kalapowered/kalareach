@@ -270,7 +270,7 @@ impl InputStreams {
     pub(super) fn scripted_answer(
         &self,
         mutation: &kr_protocol::envelope::MutationRequest,
-    ) -> Option<super::proxy::Forwarded> {
+    ) -> Option<crate::error::Result<super::proxy::Forwarded>> {
         self.stages.scripted_answer(mutation)
     }
 
@@ -370,6 +370,16 @@ impl InputStreams {
             .collect();
         for stream in streams {
             stream.detached.notify_one();
+        }
+    }
+
+    /// Ends the stream that serves `attachment` of `connection` as uncertain: the device is told
+    /// nothing, and the stream is reset, so the device counts what it has not been told as
+    /// unknown. A stream that does not stand is left as it is.
+    pub(super) fn cut(&self, connection: ConnectionId, attachment: AttachmentId) {
+        let live = self.live().get(&(connection, attachment)).map(Arc::clone);
+        if let Some(live) = live {
+            live.handle.revoke();
         }
     }
 

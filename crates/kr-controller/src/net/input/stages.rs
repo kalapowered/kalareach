@@ -28,7 +28,7 @@ mod with_seams {
     use crate::service::net::chunks::Hold;
     use crate::service::net::proxy::Forwarded;
 
-    /// What a suite's stand-in for a worker's link answers one call of the serial adapter with.
+    /// What a suite's stand-in for a worker's link answers one call with.
     #[derive(Clone, Debug)]
     pub enum SerialAnswer {
         /// The worker answers with this outcome.
@@ -42,11 +42,37 @@ mod with_seams {
         Lost,
     }
 
+    /// The result of a call as the proxy would give it for what a suite scripts.
+    fn forwarded_as(answer: SerialAnswer, request_id: RequestId) -> Result<Forwarded> {
+        let answered = |outcome, link_fenced| {
+            Ok(Forwarded {
+                response: Response {
+                    request_id,
+                    outcome,
+                },
+                retained: false,
+                link_fenced,
+            })
+        };
+        match answer {
+            SerialAnswer::Answered(outcome) => answered(outcome, false),
+            SerialAnswer::Marked(error) => answered(Outcome::Error(error), true),
+            SerialAnswer::Silent => Err(ControllerError::Uncertain {
+                detail: "this session did not answer in time, so what became of the action is \
+                         unknown"
+                    .to_owned(),
+            }),
+            SerialAnswer::Lost => Err(ControllerError::supervision(
+                "this session's link ended before it answered",
+            )),
+        }
+    }
+
     type SerialScript = dyn Fn(InputWriteParams) -> Pin<Box<dyn Future<Output = SerialAnswer> + Send>>
         + Send
         + Sync;
 
-    type DependentScript = dyn Fn(&MutationRequest) -> Outcome + Send + Sync;
+    type DependentScript = dyn Fn(&MutationRequest) -> SerialAnswer + Send + Sync;
 
     /// A script a suite gives the door.
     struct Script<T: ?Sized>(Arc<T>);
@@ -286,6 +312,15 @@ mod with_seams {
             &self,
             script: impl Fn(&MutationRequest) -> Outcome + Send + Sync + 'static,
         ) {
+            self.script_dependent_answers(move |request| SerialAnswer::Answered(script(request)));
+        }
+
+        /// As [`Self::script_dependent_requests`], for a script whose answer may be that none comes in
+        /// time or that the link ends under the call.
+        pub fn script_dependent_answers(
+            &self,
+            script: impl Fn(&MutationRequest) -> SerialAnswer + Send + Sync + 'static,
+        ) {
             let script: Arc<DependentScript> = Arc::new(script);
             *self
                 .dependent_script
@@ -398,50 +433,22 @@ mod with_seams {
             let params = request.params.to_typed::<InputWriteParams>().ok()?;
             let answer = (script.0)(params);
             Some(Box::pin(async move {
-                let answered = |outcome, link_fenced| {
-                    Ok(Forwarded {
-                        response: Response {
-                            request_id: RequestId::new(0),
-                            outcome,
-                        },
-                        retained: false,
-                        link_fenced,
-                    })
-                };
-                match answer.await {
-                    SerialAnswer::Answered(outcome) => answered(outcome, false),
-                    SerialAnswer::Marked(error) => answered(Outcome::Error(error), true),
-                    SerialAnswer::Silent => Err(ControllerError::Uncertain {
-                        detail: "this session did not answer in time, so what became of the \
-                                 action is unknown"
-                            .to_owned(),
-                    }),
-                    SerialAnswer::Lost => Err(ControllerError::supervision(
-                        "this session's link ended before it answered",
-                    )),
-                }
+                forwarded_as(answer.await, RequestId::new(0))
             }))
         }
 
-        /// The answer that a suite scripts for a release, a detach or a launch, when it scripts
-        /// them.
+        /// The result that a suite scripts for the call of a release, a detach or a launch, when it
+        /// scripts them.
         pub(in crate::service::net) fn scripted_answer(
             &self,
             mutation: &MutationRequest,
-        ) -> Option<Forwarded> {
+        ) -> Option<Result<Forwarded>> {
             let script = self
                 .dependent_script
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone()?;
-            Some(Forwarded {
-                response: Response {
-                    request_id: mutation.request_id,
-                    outcome: (script.0)(mutation),
-                },
-                retained: false,
-                link_fenced: false,
-            })
+            Some(forwarded_as((script.0)(mutation), mutation.request_id))
         }
 
         pub(in crate::service::net) fn frame_read(&self) {
@@ -553,7 +560,7 @@ mod without_seams {
         pub(in crate::service::net) fn scripted_answer(
             &self,
             _mutation: &kr_protocol::envelope::MutationRequest,
-        ) -> Option<crate::service::net::proxy::Forwarded> {
+        ) -> Option<crate::error::Result<crate::service::net::proxy::Forwarded>> {
             None
         }
 
