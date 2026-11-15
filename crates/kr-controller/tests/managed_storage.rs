@@ -1456,11 +1456,12 @@ async fn kr_req_17_48_a_service_with_no_capacity_for_a_new_collection_is_said_as
 }
 
 /// KR-REQ-17.48: when a line holds the service's limit twice, for a pass that was held back and for
-/// a question that was turned back, and more clauses follow either, the alternatives it named end
-/// the whole line, once, and no clause starts after a full stop.
+/// a question that was turned back, and more clauses follow either, what the two named ends the
+/// whole line, in one list, and no clause starts after a full stop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_17_48_the_alternatives_end_the_storage_checks_whole_line_once() {
     const OWN: &str = "A backup storage service that you run yourself.";
+    const HOST: &str = "A revocation made on the host itself, without the feed.";
     const LIMIT: &str = "the service has no managed capacity for new backup collections now, which is a limit of the service and not a fault of this host";
     let timer = HeldTimer::held();
     let rig = Rig::start(Arrangement::NORMAL, Arc::clone(&timer)).await;
@@ -1471,7 +1472,7 @@ async fn kr_req_17_48_the_alternatives_end_the_storage_checks_whole_line_once() 
     web.fail(
         CREATE,
         1,
-        short_budget(503, "SERVICE_UNAVAILABLE", 0, &[OWN]),
+        short_budget(503, "SERVICE_UNAVAILABLE", 0, &[HOST]),
     );
     rig.admit(1, &[(1, plaintext(2048))]);
     within("the pass is held back", timer.next_wait()).await;
@@ -1480,7 +1481,10 @@ async fn kr_req_17_48_the_alternatives_end_the_storage_checks_whole_line_once() 
     assert_eq!(detail.matches(LIMIT).count(), 2, "{detail}");
     assert!(detail.contains("the last pass took"), "{detail}");
     assert_eq!(detail.matches("Until then").count(), 1, "{detail}");
-    assert!(detail.ends_with(&format!("Until then: {OWN}")), "{detail}");
+    assert!(
+        detail.ends_with(&format!("Until then: {HOST} {OWN}")),
+        "what either hold named, once, in the order the doctor lists them: {detail}"
+    );
     assert!(!detail.contains(".;"), "{detail}");
 }
 
