@@ -509,6 +509,7 @@ impl Seen {
 /// let-go brings, says what it saw and fails when the stop did not happen within its times.
 ///
 /// A second close is sent one second after the first, as a person asks again.
+#[allow(clippy::too_many_arguments)]
 async fn the_stop_is_watched(
     case: &str,
     host: &Host,
