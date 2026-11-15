@@ -10417,7 +10417,7 @@ async fn the_lock_names_every_store_at_the_version_and_digest_the_code_has() {
     );
 }
 
-/// KR-REQ-26.10, KR-REQ-26.13: the release lists the registry at schema version 16 and the
+/// KR-REQ-26.10, KR-REQ-26.13: the release lists the registry at schema version 17 and the
 /// configuration document at version 4 as read through, and no other store. The release after this
 /// one writes them, so a rollback to this one is not refused for a store at those versions.
 #[test]
@@ -10428,7 +10428,7 @@ fn the_release_reads_through_the_registry_and_the_configuration_document_and_no_
         .collect();
     assert_eq!(
         through,
-        vec![("configuration".to_owned(), 4), ("registry".to_owned(), 16)]
+        vec![("configuration".to_owned(), 4), ("registry".to_owned(), 17)]
     );
 }
 
