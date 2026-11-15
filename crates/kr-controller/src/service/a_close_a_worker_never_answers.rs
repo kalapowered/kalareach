@@ -766,3 +766,67 @@ async fn the_link_a_close_fences_is_the_one_it_ran_over() {
     );
     serving.abort();
 }
+
+/// KR-REQ-09.09: a close asks its admission once more after it has read its lease and before it
+/// is forwarded to the worker. A fence this host comes to owe in the wait between the two asks
+/// stops it: nothing reaches the worker. The control: with no fence the close is forwarded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_whose_fence_is_owed_after_its_lease_was_read_is_not_forwarded() {
+    for owed in [false, true] {
+        let recorded: Recorded = Arc::default();
+        let Silent {
+            _temp,
+            controller,
+            environment_id,
+            session_id,
+            actor,
+            accepted,
+            serving,
+            ..
+        } = fake_worker(Some(Arc::clone(&recorded))).await;
+        acknowledged(&controller, session_id);
+        let carried = admission(&controller, accepted).await;
+        let request = close_request(environment_id, session_id);
+        let (arrived, go) = controller.pause_before_the_last_fence_read();
+        let closing = tokio::spawn({
+            let controller = Arc::clone(&controller);
+            async move {
+                controller
+                    .session_close(&request, &actor, Some(accepted), carried)
+                    .await
+                    .into_answer_for_test()
+            }
+        });
+        // The first ask is at its fence.
+        tokio::task::spawn_blocking(move || {
+            arrived.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await
+        .expect("the wait ends")
+        .expect("the close reaches its first ask");
+        let (arrived, go_again) = controller.pause_before_the_last_fence_read();
+        go.send(()).expect("the close goes on");
+        // The second ask is at its fence: the lease was read between the two.
+        tokio::task::spawn_blocking(move || {
+            arrived.recv_timeout(std::time::Duration::from_secs(20))
+        })
+        .await
+        .expect("the wait ends")
+        .expect("the close asks its admission again after its lease");
+        controller.hold_fence(owed);
+        go_again.send(()).expect("the close goes on");
+        let answered = closing.await.expect("the close ends");
+        controller.hold_fence(false);
+        let reached = recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        if owed {
+            answered.expect_err("a close that meets a fence owed closes nothing");
+            assert_eq!(reached, 0, "nothing reached the worker");
+        } else {
+            assert!(reached >= 1, "the control's close reached the worker");
+        }
+        serving.abort();
+    }
+}
