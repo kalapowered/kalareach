@@ -14,6 +14,13 @@
 //! honoured. The value is compared with a root by path components, never by text: `/tmpfoo` is
 //! not inside `/tmp`. A relative value, an empty value and a value with a `..` in it are refused.
 //!
+//! On Windows a value, and each temporary variable, is read as Windows writes a full path:
+//! `C:\folder` or `C:/folder`, `\\server\share\folder` or `//server/share/folder`, either of those
+//! behind `\\?\` with backslashes only; a folder on a share is given in its ordinary form, as one on
+//! a drive is. Any other spelling is refused, in words that say which are taken: a device path, a
+//! server with no share, three separators at the start, a path that depends on the current drive
+//! and one that depends on a drive's current directory.
+//!
 //! Where the variable is not set, the first read makes a directory of this run's own under the
 //! temporary folder, says where it is on standard error, and every later read of the same process
 //! returns the same directory.
@@ -97,12 +104,28 @@ fn check(value: &Path, roots: &[PathBuf]) -> Result<PathBuf, String> {
     if value.as_os_str().is_empty() {
         return Err("it is empty".to_owned());
     }
+    if cfg!(windows) {
+        match windows_spelling(&value.to_string_lossy()) {
+            Spelling::Taken => {}
+            Spelling::NotAbsolute => return Err(format!("it is not an absolute path ({TAKES})")),
+            Spelling::Kind => {
+                return Err(format!(
+                    "it is a Windows path of a kind this reader does not take ({TAKES})"
+                ));
+            }
+        }
+    }
     if !value.is_absolute() {
         return Err("it is not an absolute path".to_owned());
     }
     if value
         .components()
         .any(|component| component == Component::ParentDir)
+        || (cfg!(windows)
+            && value
+                .to_string_lossy()
+                .split(['\\', '/'])
+                .any(|name| name == ".."))
     {
         return Err("it steps up a directory with `..`".to_owned());
     }
@@ -117,12 +140,97 @@ fn check(value: &Path, roots: &[PathBuf]) -> Result<PathBuf, String> {
     }
 }
 
-fn refused(value: &Path, why: &str, roots: &[PathBuf]) -> Refused {
-    let roots = roots
+/// The spellings of an absolute path that this reader takes on Windows, for the words of a refusal.
+const TAKES: &str = concat!(
+    r"on Windows this reader takes C:\folder or C:/folder, \\server\share\folder or ",
+    r"//server/share/folder, and either behind \\?\, as \\?\C:\folder or ",
+    r"\\?\UNC\server\share\folder"
+);
+
+/// How a Windows path is written: whether this reader takes the spelling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Spelling {
+    /// A drive with a root, or a share with a server and a name, with either separator or both;
+    /// either one behind `\\?\` with backslashes only, since Windows reads a slash behind `\\?\`
+    /// as a letter of a name.
+    Taken,
+    /// A relative path, `\folder` (the current drive's root) or `C:folder` (a drive's current
+    /// directory).
+    NotAbsolute,
+    /// Any other spelling: a device path (`\\.\`, or `\\?\` with anything but a drive or a share
+    /// behind it), a server with no share, three separators at the start.
+    Kind,
+}
+
+/// How `text`, a path as Windows writes it, is spelled. The same on every platform, so that the
+/// table of spellings is run wherever the tests are.
+fn windows_spelling(text: &str) -> Spelling {
+    let separator = |character: char| character == '\\' || character == '/';
+    let mut path = text.to_owned();
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        if rest.contains('/') {
+            return Spelling::Kind;
+        }
+        let mut letters = rest.chars();
+        if rest
+            .get(..3)
+            .is_some_and(|head| head.eq_ignore_ascii_case("unc"))
+            && rest.get(3..4) == Some("\\")
+            && rest.len() > 4
+        {
+            path = format!(r"\\{}", &rest[4..]);
+        } else if letters
+            .next()
+            .is_some_and(|letter| letter.is_ascii_alphabetic())
+            && letters.next() == Some(':')
+            && letters.next() == Some('\\')
+        {
+            path = rest.to_owned();
+        } else {
+            return Spelling::Kind;
+        }
+    }
+    let characters: Vec<char> = path.chars().collect();
+    let at = |index: usize| characters.get(index).copied();
+    if at(0).is_some_and(separator) && at(1).is_some_and(separator) {
+        if at(2).is_some_and(|c| c == '.' || c == '?') && at(3).is_none_or(separator) {
+            return Spelling::Kind;
+        }
+        if at(2).is_none_or(separator) {
+            return Spelling::Kind;
+        }
+        let rest: String = characters[2..].iter().collect();
+        return match rest.split_once(separator) {
+            Some((_server, share)) if !share.is_empty() && !share.starts_with(separator) => {
+                Spelling::Taken
+            }
+            _ => Spelling::Kind,
+        };
+    }
+    if at(0).is_some_and(|letter| letter.is_ascii_alphabetic()) && at(1) == Some(':') {
+        return if at(2).is_some_and(separator) {
+            Spelling::Taken
+        } else {
+            Spelling::NotAbsolute
+        };
+    }
+    Spelling::NotAbsolute
+}
+
+/// The roots as the refusal's words list them: never an empty list.
+fn listed(roots: &[PathBuf]) -> String {
+    if roots.is_empty() {
+        return "none: no folder that a temporary variable names exists".to_owned();
+    }
+    roots
         .iter()
         .map(|root| root.display().to_string())
         .collect::<Vec<_>>()
-        .join(", ");
+        .join(", ")
+}
+
+fn refused(value: &Path, why: &str, roots: &[PathBuf]) -> Refused {
+    let roots = listed(roots);
     Refused(format!(
         "the evidence directory `{}` (KR_TEST_ARTIFACTS_DIR) is refused: {why}. It has to be an \
          absolute path inside one of this platform's temporary roots ({roots}). Set it to a folder \
@@ -134,11 +242,7 @@ fn refused(value: &Path, why: &str, roots: &[PathBuf]) -> Refused {
 /// Why the run's own directory cannot be made under `temporary`: nothing was set, so the words
 /// name the temporary folder and do not tell the caller to leave the variable unset.
 fn refused_own(temporary: &Path, why: &str, roots: &[PathBuf]) -> Refused {
-    let roots = roots
-        .iter()
-        .map(|root| root.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let roots = listed(roots);
     Refused(format!(
         "no directory of this run's own can be made for its evidence: the temporary folder `{}` is \
          refused: {why}. It has to be an absolute path to a folder inside one of this platform's \
@@ -205,7 +309,12 @@ fn roots() -> Vec<PathBuf> {
     }
     named.extend(std::env::var_os("RUNNER_TEMP").map(PathBuf::from));
     let mut roots: Vec<PathBuf> = Vec::new();
-    for root in named.iter().filter(|root| root.is_absolute()) {
+    // A temporary variable in a spelling this reader does not take names no root.
+    let taken = |root: &&PathBuf| {
+        root.is_absolute()
+            && (!cfg!(windows) || windows_spelling(&root.to_string_lossy()) == Spelling::Taken)
+    };
+    for root in named.iter().filter(taken) {
         // A temporary folder that is a filesystem root (`/`, `C:\`) would admit every path on its
         // disk, so it is no root.
         if let Ok(real) = real_path(root)
@@ -218,16 +327,23 @@ fn roots() -> Vec<PathBuf> {
     roots
 }
 
-/// The path the system resolves `path` to, links and all. On Windows, a path on a drive is given in
-/// its ordinary form rather than the extended one the system answers with (`\\?\C:\...`), which
-/// the tests are handed and which not every program they start reads.
+/// The path the system resolves `path` to, links and all. On Windows, a path on a drive or a share
+/// is given in its ordinary form rather than the extended one the system answers with
+/// (`\\?\C:\...`, `\\?\UNC\server\share\...`), which the tests are handed and which not every
+/// program they start reads.
 fn real_path(path: &Path) -> std::io::Result<PathBuf> {
     let real = std::fs::canonicalize(path)?;
     if cfg!(windows)
-        && let Some(rest) = real.to_str().and_then(|text| text.strip_prefix(r"\\?\"))
-        && rest.as_bytes().get(1) == Some(&b':')
+        && let Some(text) = real.to_str()
     {
-        return Ok(PathBuf::from(rest));
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return Ok(PathBuf::from(format!(r"\\{rest}")));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\")
+            && rest.as_bytes().get(1) == Some(&b':')
+        {
+            return Ok(PathBuf::from(rest));
+        }
     }
     Ok(real)
 }
@@ -586,5 +702,189 @@ mod tests {
             &[("RUNNER_TEMP", OsStr::new(r"\Windows"))],
         );
         assert!(!output.status.success(), "{output:?}");
+    }
+
+    /// The table of spellings, the same in every reader: what each one is, whatever platform the
+    /// test runs on.
+    #[test]
+    fn the_table_of_windows_spellings_is_read_as_it_is_in_every_reader() {
+        use Spelling::{Kind, NotAbsolute, Taken};
+        let table: &[(&str, Spelling)] = &[
+            (r"C:\Users\x\Temp\evidence", Taken),
+            ("c:/Users/x/Temp/evidence", Taken),
+            (r"C:\Users/x\Temp/evidence", Taken),
+            (r"\\server\share\evidence", Taken),
+            ("//server/share/evidence", Taken),
+            (r"\\server/share\evidence", Taken),
+            (r"//server\share/evidence", Taken),
+            (r"\\localhost\C$\Users\x", Taken),
+            (r"\\?\C:\Users\x\Temp\evidence", Taken),
+            (r"\\?\c:\Users\x", Taken),
+            (r"\\?\UNC\server\share\evidence", Taken),
+            (r"\\?\unc\server\share\evidence", Taken),
+            (r"C:\", Taken),
+            (r"\\?\C:\a/b", Kind),
+            (r"\\?\UNC\server\share/b", Kind),
+            (r"\\?\Volume{1234}\x", Kind),
+            (r"\\?\C:", Kind),
+            (r"\\?\UNC\server", Kind),
+            (r"\\?\", Kind),
+            (r"\\.\C:\Users\x", Kind),
+            (r"\\.\pipe\x", Kind),
+            ("//?/C:/Users/x", Kind),
+            ("//./C:/Users/x", Kind),
+            (r"\\.", Kind),
+            (r"\\server", Kind),
+            ("//server", Kind),
+            ("//server/", Kind),
+            (r"\\server\", Kind),
+            (r"\\server\\share", Kind),
+            ("///server/share/x", Kind),
+            (r"\\\server\share\x", Kind),
+            (r"\Windows\Temp", NotAbsolute),
+            ("C:Windows", NotAbsolute),
+            ("C:", NotAbsolute),
+            (r"relative\x", NotAbsolute),
+            ("./x", NotAbsolute),
+            (r"/tmp/a\b\c", NotAbsolute),
+            ("/c/Users/x/Temp", NotAbsolute),
+            ("/", NotAbsolute),
+        ];
+        for (text, expected) in table {
+            assert_eq!(windows_spelling(text), *expected, "{text}");
+        }
+    }
+
+    /// A refusal that finds no root says so, and does not show an empty list.
+    #[test]
+    fn a_refusal_with_no_roots_says_that_there_are_none() {
+        let refused = confine_in(&std::env::temp_dir().join("evidence"), &[]).expect_err("no root");
+        let words = refused.to_string();
+        assert!(
+            words.contains("(none: no folder that a temporary variable names exists)"),
+            "{words}"
+        );
+        assert!(!words.contains("()"), "{words}");
+    }
+
+    /// The spellings that a platform gives are one folder, whichever one the value is written in,
+    /// and the extended-length form that Rust's own canonical path takes is read as the ordinary one.
+    #[cfg(windows)]
+    #[test]
+    fn every_spelling_that_a_platform_gives_is_read_as_the_same_folder() {
+        let root = temporary();
+        let real = real(root.path());
+        let text = real.to_str().expect("text").to_owned();
+        let canonical = std::fs::canonicalize(&real).expect("canonical");
+        assert!(
+            canonical.to_str().expect("text").starts_with(r"\\?\"),
+            "Rust's canonical path of a drive folder is its extended-length form: {canonical:?}"
+        );
+        let roots = [real.clone()];
+        let written = [
+            format!(r"{text}\evidence"),
+            format!("{}/evidence", text.replace('\\', "/")),
+            format!(r"{text}/evidence"),
+            format!(r"{}\evidence", text.replacen('\\', "/", 1)),
+            format!(r"\\?\{text}\evidence"),
+        ];
+        for value in written {
+            assert_eq!(
+                confine_in(Path::new(&value), &roots).expect(&value),
+                real.join("evidence"),
+                "{value}"
+            );
+        }
+        for value in [
+            format!(r"\\.\{text}\evidence"),
+            format!(r"\\?\{text}\a/evidence"),
+            format!("//?/{}/evidence", text.replace('\\', "/")),
+        ] {
+            let words = confine_in(Path::new(&value), &roots)
+                .expect_err(&value)
+                .to_string();
+            assert!(
+                words.contains("a kind this reader does not take"),
+                "{words}"
+            );
+            assert!(words.contains("//server/share/folder"), "{words}");
+        }
+        for value in [
+            format!(r"{text}\a\..\..\kr-evidence"),
+            format!(r"{text}/a\..\kr-evidence"),
+        ] {
+            let words = confine_in(Path::new(&value), &roots)
+                .expect_err(&value)
+                .to_string();
+            assert!(words.contains("steps up a directory"), "{words}");
+        }
+        for value in [r"\Windows\kr-evidence", "C:kr-evidence", "kr-evidence"] {
+            let words = confine_in(Path::new(value), &roots)
+                .expect_err(value)
+                .to_string();
+            assert!(
+                words.contains("it is not an absolute path (on Windows"),
+                "{words}"
+            );
+        }
+    }
+
+    /// A share is given in its ordinary form, as a drive is: the machine's own administrative share
+    /// of the drive is the share, as in the other readers' cases.
+    #[cfg(windows)]
+    #[test]
+    fn a_share_is_given_in_its_ordinary_form_and_every_spelling_of_it_is_read() {
+        let root = temporary();
+        let real = real(root.path());
+        let text = real.to_str().expect("text").to_owned();
+        let share = format!(r"\\localhost\{}${}", &text[..1], &text[2..]);
+        if std::fs::metadata(&share).is_err() {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "a hosted run reaches {share}, and it could not"
+            );
+            eprintln!("{share} cannot be reached here: the share case is not run");
+            return;
+        }
+        let canonical = std::fs::canonicalize(&share).expect("canonical");
+        assert!(
+            canonical.to_str().expect("text").starts_with(r"\\?\UNC\"),
+            "Rust's canonical path of a share folder is its extended-length form: {canonical:?}"
+        );
+        let ordinary = real_path(Path::new(&share)).expect("resolves");
+        assert!(
+            ordinary
+                .to_str()
+                .expect("text")
+                .starts_with(r"\\localhost\"),
+            "{ordinary:?}"
+        );
+        let roots = [ordinary.clone()];
+        let slashes = share.replace('\\', "/");
+        let written = [
+            format!(r"{share}\evidence"),
+            format!("{slashes}/evidence"),
+            format!(
+                r"{}\evidence",
+                share.replacen(r"\\localhost\", r"\\localhost/", 1)
+            ),
+            format!(r"\\?\UNC\{}\evidence", &share[2..]),
+        ];
+        for value in written {
+            assert_eq!(
+                confine_in(Path::new(&value), &roots).expect(&value),
+                ordinary.join("evidence"),
+                "{value}"
+            );
+        }
+        for value in [r"\\localhost", r"\\\localhost\x\evidence"] {
+            let words = confine_in(Path::new(value), &roots)
+                .expect_err(value)
+                .to_string();
+            assert!(
+                words.contains("a kind this reader does not take"),
+                "{words}"
+            );
+        }
     }
 }
