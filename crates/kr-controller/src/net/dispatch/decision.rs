@@ -44,6 +44,11 @@ pub(super) struct Asked {
     /// admitted under. The answer is written only while the standing it was checked under holds
     /// ([`Answers::Kept`]).
     kept: Option<AuthorityRevision>,
+    /// For a mutation, the revision of the authority the request was admitted under. A reply that
+    /// names a reused identifier is read from a record whatever door found it (the route, the
+    /// door's own stores, a service), and is written only while the standing it was checked under
+    /// holds ([`Answers::Conflict`]).
+    admitted: Option<AuthorityRevision>,
     /// For a page of retained output, the privacy state it was read under, which the page is
     /// released under ([`RemoteConnection::write_answer`]).
     pub(super) read_under: Option<ReadUnder>,
@@ -58,11 +63,20 @@ impl Asked {
         }
     }
 
+    /// Returns the same decision, for a request admitted under the authority at `admitted`.
+    pub(super) fn admitted_under(self, admitted: AuthorityRevision) -> Self {
+        Self {
+            admitted: Some(admitted),
+            ..self
+        }
+    }
+
     /// Returns the same decision, for an answer kept from an earlier submission of the action
     /// whose request was admitted under the authority at `admitted`.
     pub(super) fn kept(self, admitted: AuthorityRevision) -> Self {
         Self {
             kept: Some(admitted),
+            admitted: Some(admitted),
             ..self
         }
     }
@@ -74,12 +88,16 @@ impl Asked {
         self.kept.is_some()
     }
 
-    /// What the answer this was decided for is the answer to.
-    fn answers(&self) -> Answers {
+    /// What `frame`, the answer this was decided for, is the answer to.
+    fn answers(&self, frame: &ControlFrame) -> Answers {
         if self.shown_as.entry().effect != EffectClass::Write {
             Answers::Read
         } else if let Some(admitted) = self.kept {
             Answers::Kept(admitted)
+        } else if let Some(admitted) = self.admitted
+            && crate::given::names_a_reused_identifier(frame)
+        {
+            Answers::Conflict(admitted)
         } else {
             Answers::Action
         }
@@ -179,7 +197,7 @@ impl RemoteConnection {
                     &shown,
                     &asked.decision.bounds(),
                     None,
-                    asked.answers(),
+                    asked.answers(&frame),
                     read_under,
                 )
                 .await
@@ -188,16 +206,24 @@ impl RemoteConnection {
                 Written::Withdrawn => return false,
                 Written::Undecided => {}
             }
-            // An answer kept from an earlier submission that the standing it was checked under no
-            // longer holds for is not decided again: the decision can stand while the fence or the
-            // registration it was asked under does not. The device is told the outcome is not
-            // shown.
-            if let Answers::Kept(admitted) = asked.answers()
-                && self.admitted_to_answer(admitted).is_err()
-            {
-                return output
-                    .send(&failure(request_id, super::outcome_not_shown()))
-                    .await;
+            // An answer kept from an earlier submission, or a conflict read from a record, that
+            // the standing it was checked under no longer holds for is not decided again: the
+            // decision can stand while the fence or the registration it was asked under does not.
+            // A kept answer is told as not shown, because an earlier submission had an effect that
+            // the device may not be shown. A reused identifier has no effect of its own, so the
+            // device is told the refusal of the check that failed.
+            match asked.answers(&frame) {
+                Answers::Kept(admitted) if self.admitted_to_answer(admitted).is_err() => {
+                    return output
+                        .send(&failure(request_id, super::outcome_not_shown()))
+                        .await;
+                }
+                Answers::Conflict(admitted) => {
+                    if let Err(refusal) = self.admitted_to_answer(admitted) {
+                        return output.send(&failure(request_id, refusal)).await;
+                    }
+                }
+                _ => {}
             }
             match self.ask_under(
                 asked.acting.clone(),
@@ -207,10 +233,11 @@ impl RemoteConnection {
             ) {
                 Ok(again) => {
                     let read_under = asked.read_under.take();
-                    let kept = asked.kept;
+                    let (kept, admitted) = (asked.kept, asked.admitted);
                     asked = again.answering(asked.shown_as);
                     asked.read_under = read_under;
                     asked.kept = kept;
+                    asked.admitted = admitted;
                 }
                 // The decision made again refuses what the answer was cut for. An action the
                 // worker carried out is not refused for that: its answer is not shown, and the
@@ -218,7 +245,7 @@ impl RemoteConnection {
                 // from an earlier submission, whatever the answer was: that it was a refusal is
                 // not for a device that may not read it.
                 Err(error) => {
-                    let error = asked.answers().refusing(&frame, error);
+                    let error = asked.answers(&frame).refusing(&frame, error);
                     return output.send(&failure(request_id, error)).await;
                 }
             }
@@ -226,7 +253,9 @@ impl RemoteConnection {
         // The decision held every time it was asked and was lost before each write: the answer is
         // not written, and what the device is told follows what the answer leaves open, as for a
         // decision that refuses.
-        let error = asked.answers().refusing(&frame, authority_kept_moving());
+        let error = asked
+            .answers(&frame)
+            .refusing(&frame, authority_kept_moving());
         output.send(&failure(request_id, error)).await
     }
 
@@ -334,6 +363,7 @@ impl RemoteConnection {
             acting,
             shown_as: entry.method,
             kept: None,
+            admitted: None,
             read_under: None,
         })
     }

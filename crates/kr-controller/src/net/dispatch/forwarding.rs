@@ -770,14 +770,15 @@ impl RemoteConnection {
         decided: &Asked,
         asked: &mut Option<Asked>,
     ) -> std::result::Result<ControlFrame, ProtocolError> {
-        // A reused identifier is this host's word about the identifier and names no result, so it
-        // is no read of a record and is shown as it is, to whoever is still registered. It is
-        // written under the decision of the request, not as an answer kept from an earlier
-        // submission: a refusal to write a kept answer is told as an unknown outcome, and nothing
-        // was carried out here.
+        // A reused identifier is this host's word about the identifier and names no result. It is
+        // read from a record, so it goes under the check every answer read from a record goes
+        // under, here and where it is written ([`Answers::Conflict`]), and it is written under the
+        // decision of the request, not as an answer kept from an earlier submission: it has no
+        // effect of its own, so where that check fails the device is told the check's refusal and
+        // not an unknown outcome.
         let reused = kept.names_a_reused_identifier();
         *asked = Some(if reused {
-            decided.clone()
+            decided.clone().admitted_under(validated)
         } else {
             decided.clone().kept(validated)
         });
@@ -785,8 +786,10 @@ impl RemoteConnection {
         self.controller.after_the_retained_lookup.wait().await;
         // What this host holds is the outcome of an action. When it will not show the device
         // that outcome, it does not tell the device the action did not happen, or that it did.
-        if self.admitted_to_answer(validated).is_err() {
-            return Err(outcome_not_shown());
+        if let Err(refusal) = self.admitted_to_answer(validated) {
+            // A reused identifier has no effect of its own: the device is told the refusal of the
+            // check that failed. An answer kept from an earlier submission is told as not shown.
+            return Err(if reused { refusal } else { outcome_not_shown() });
         }
         if reused {
             return Ok(network_door::kept(
@@ -996,7 +999,8 @@ impl RemoteConnection {
     /// The conflict is read from the route record, and goes back only under the check every answer
     /// read from a record goes under ([`Self::admitted_to_answer`]), asked with the conflict in
     /// hand: a device this host owes a fence, or whose registration was withdrawn or replaced, is
-    /// told the outcome is not shown ([`RouteRefusal::not_shown`]) and not the conflict.
+    /// told the refusal of the check that failed and not the conflict. The request has no effect
+    /// of its own, so that refusal is true, and it shows nothing of the record.
     pub(super) fn claim_route(
         &self,
         mutation: &MutationRequest,
@@ -1044,7 +1048,9 @@ impl RemoteConnection {
                             mutation.action_id
                         ),
                     )),
-                    Err(lapsed) => RouteRefusal::not_shown(lapsed),
+                    // The request has no effect of its own, so the device is told the refusal of
+                    // the check that failed, which shows nothing of the record.
+                    Err(lapsed) => RouteRefusal::Conflict(lapsed),
                 })
             }
         }
@@ -1105,7 +1111,7 @@ impl RemoteConnection {
                         mutation.action_id
                     ),
                 )),
-                Err(lapsed) => RouteRefusal::not_shown(lapsed),
+                Err(lapsed) => RouteRefusal::Conflict(lapsed),
             });
         }
         // An action this host itself owns the receipt of is answered by the daemon or not at all.
