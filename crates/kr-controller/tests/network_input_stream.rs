@@ -3352,16 +3352,6 @@ async fn a_release_after_a_thousand_distinct_keys_is_forwarded_and_one_key_more_
 // link, and a worker that does is sent the barrier and asked for the count.
 
 impl Rig {
-    /// A rig whose worker does not state the input lane: the host serves its typing over the link
-    /// that carries the worker's other requests, one call at a time.
-    async fn start_serial() -> Self {
-        let rig = Self::start().await;
-        rig.adopted.host.network().use_no_input_lane();
-        rig
-    }
-}
-
-impl Rig {
     /// A rig whose typing the host carries on the real worker's own lane. The scripted lane that
     /// the rig begins with stands idle: the host is not pointed at it, so it reads the worker's
     /// answer to the hello and binds a lane on the worker when the worker states one.
@@ -3372,7 +3362,9 @@ impl Rig {
     }
 
     /// A rig whose real worker states no input lane: it leaves the capability out of its answer to
-    /// the hello, as a worker of an earlier release does, before any device connects.
+    /// the hello, as a worker of an earlier release does, before any device connects, so the host
+    /// serves its typing over the link that carries the worker's other requests, one call at a
+    /// time.
     async fn start_withholding_the_lane() -> Self {
         let adopted = Adopted::start(1).await;
         adopted.workers[0]
@@ -3579,7 +3571,7 @@ async fn typed_three_with(
     Vec<InputAck>,
     kr_transport::Result<Option<InputAck>>,
 ) {
-    let rig = Rig::start_serial().await;
+    let rig = Rig::start_withholding_the_lane().await;
     let calls = script_calls(&rig, None, move |sequence| {
         if sequence == 1 {
             answer.clone()
@@ -3662,7 +3654,7 @@ async fn an_uncertain_frame_cuts_the_stream(answer: SerialAnswer) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_without_the_lane_takes_typing_one_call_at_a_time() {
-    let rig = Rig::start_serial().await;
+    let rig = Rig::start_withholding_the_lane().await;
     let mut stream = rig.open().await;
     // Printable keys, since the worker's terminal is a real one: a control byte can end it.
     let keys: Vec<Vec<u8>> = (0..20).map(|n| format!("k{n:02}").into_bytes()).collect();
@@ -3683,7 +3675,7 @@ async fn a_worker_without_the_lane_takes_typing_one_call_at_a_time() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_second_frame_is_not_sent_while_the_first_waits_for_its_answer() {
-    let rig = Rig::start_serial().await;
+    let rig = Rig::start_withholding_the_lane().await;
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let calls = script_calls(&rig, Some(Arc::clone(&gate)), |_| took());
     let mut stream = rig.open().await;
@@ -3771,7 +3763,7 @@ async fn a_link_lost_under_the_call_leaves_the_frame_uncertain() {
 /// stream ends cleanly, as for a worker with a lane.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_withdrawal_before_the_call_is_written_is_a_refusal_and_a_clean_end() {
-    let rig = Rig::start_serial().await;
+    let rig = Rig::start_withholding_the_lane().await;
     let mut stream = rig.open().await;
     let stages = rig.adopted.host.network().input_stages();
     type_and_wait(&rig, &mut stream, 0, b"a").await;
@@ -3817,7 +3809,7 @@ async fn a_withdrawal_before_the_call_is_written_is_a_refusal_and_a_clean_end() 
 /// link's writer is never dropped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_frame_whose_stream_ended_during_the_decision_is_not_written_to_the_worker() {
-    let rig = Rig::start_serial().await;
+    let rig = Rig::start_withholding_the_lane().await;
     let calls = script_calls(&rig, None, |_| took());
     let stages = rig.adopted.host.network().input_stages();
     let mut ended = rig.adopted.host.network().input_tasks_ended();
@@ -3939,7 +3931,7 @@ async fn a_launch_whose_result_is_unknown_leaves_the_stream_of_a_worker_with_the
 /// A rig of a worker without the lane, with a stream open and `accepted` frames of one byte typed
 /// and accepted.
 async fn typed_serial(accepted: u64) -> (Rig, DataStream) {
-    let rig = Rig::start_serial().await;
+    let rig = Rig::start_withholding_the_lane().await;
     let mut stream = rig.open().await;
     for sequence in 0..accepted {
         type_and_wait(&rig, &mut stream, sequence, b"k").await;
@@ -4011,7 +4003,7 @@ async fn a_barrier_is_judged_from_the_typing_for_a_worker_without_the_lane() {
 /// accepted frames make is forwarded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_barrier_of_an_epoch_the_worker_refused_a_frame_of_is_judged_by_what_was_accepted() {
-    let rig = Rig::start_serial().await;
+    let rig = Rig::start_withholding_the_lane().await;
     let _calls = script_calls(&rig, None, |sequence| {
         if sequence == 1 {
             gives(ErrorCode::ResourceUnavailable)
@@ -4109,7 +4101,7 @@ async fn a_barrier_is_refused_after_a_refusal_that_leaves_the_lease_standing(
     code: ErrorCode,
     sequence: u64,
 ) {
-    let rig = Rig::start_serial().await;
+    let rig = Rig::start_withholding_the_lane().await;
     let _calls = script_by_epoch(&rig, move |_, _| gives(code));
     let sent = script_dependents(&rig, None);
     let mut stream = rig.open().await;
@@ -4169,7 +4161,7 @@ async fn a_barrier_is_refused_after_a_frame_refused_for_room() {
 /// so the epoch the worker still holds is judged against what it accepted. The newer typing has no
 /// answer yet, or the worker refused it.
 async fn typing_the_host_has_only_read_moves_no_barrier(refused: bool) {
-    let rig = Rig::start_serial().await;
+    let rig = Rig::start_withholding_the_lane().await;
     let held = rig.epoch;
     let (calls, gate) = script_by_epoch(&rig, move |epoch, _| {
         if epoch == held || !refused {
@@ -4233,7 +4225,7 @@ async fn typing_of_a_newer_epoch_that_the_worker_refused_moves_no_barrier() {
 /// it; a barrier of the newer epoch is judged by what the worker accepted of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_barrier_of_an_older_epoch_is_forwarded_once_the_worker_accepted_a_newer_one() {
-    let rig = Rig::start_serial().await;
+    let rig = Rig::start_withholding_the_lane().await;
     let (_calls, gate) = script_by_epoch(&rig, |_, _| took());
     gate.add_permits(1);
     let sent = script_dependents(&rig, None);
@@ -4280,7 +4272,7 @@ async fn a_barrier_of_an_older_epoch_is_forwarded_once_the_worker_accepted_a_new
 /// good.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_ending_sent_again_with_no_position_goes_through_after_a_refusal() {
-    let rig = Rig::start_serial().await;
+    let rig = Rig::start_withholding_the_lane().await;
     let _calls = script_by_epoch(&rig, |_, _| gives(ErrorCode::ResourceUnavailable));
     let sent = script_dependents(&rig, None);
     let mut stream = rig.open().await;
@@ -4351,7 +4343,7 @@ struct LaunchWithATextGeneration {
 /// member that is wrong. Nothing is forwarded.
 async fn a_request_that_does_not_decode_whole_is_refused_and_nothing_is_forwarded(serial: bool) {
     let rig = if serial {
-        Rig::start_serial().await
+        Rig::start_withholding_the_lane().await
     } else {
         Rig::start().await
     };
