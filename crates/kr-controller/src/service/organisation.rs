@@ -696,7 +696,13 @@ impl Controller {
                     );
                 }
                 let (completed, proof) = self
-                    .complete_revocation_proving(Audience::Host, None, CanonicalSet::new(), own)
+                    .complete_revocation_proving(
+                        Audience::Host,
+                        None,
+                        CanonicalSet::new(),
+                        own,
+                        None,
+                    )
                     .await?;
                 *withdrew = proof;
                 // The organisation's list goes with its enrolment. A withdrawal only widens the
@@ -723,7 +729,7 @@ impl Controller {
         mutation: &MutationRequest,
         record: &crate::grants::ActionRecord,
     ) -> Option<OrganisationChangeMarker> {
-        let crate::grants::ActionRecord::Answered { result } = record else {
+        let crate::grants::ActionRecord::Answered { result, .. } = record else {
             return None;
         };
         if !matches!(
@@ -761,7 +767,7 @@ impl Controller {
         marker: OrganisationChangeMarker,
     ) -> Result<(ParamsValue, Option<super::barrier::HostWithdrawal>)> {
         let (completed, withdrew) = self
-            .complete_revocation_proving(Audience::Host, None, CanonicalSet::new(), own)
+            .complete_revocation_proving(Audience::Host, None, CanonicalSet::new(), own, None)
             .await?;
         let answer = match marker {
             OrganisationChangeMarker::Withdrawn { .. } => encode(&completed)?,

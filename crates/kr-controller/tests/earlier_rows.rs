@@ -678,7 +678,8 @@ fn kr_req_10_51_a_retained_earlier_answer_goes_back_unchanged_and_names_nothing_
                 .recorded_action(&actor, action, &digest)
                 .expect("readable"),
             Some(ActionRecord::Answered {
-                result: payload.clone()
+                result: payload.clone(),
+                reads: None
             }),
             "a retry is given the answer it was given"
         );

@@ -880,7 +880,7 @@ fn kr_req_25_10_a_committed_redemption_is_answered_to_a_repeat_of_its_action() {
         .recorded_action(&actor, action, &digest)
         .expect("readable")
         .expect("the action is on record");
-    let ActionRecord::Answered { result } = record else {
+    let ActionRecord::Answered { result, .. } = record else {
         panic!("the committed redemption is answered: {record:?}");
     };
     let answered: kr_protocol::sharing::GrantRedeemResult =

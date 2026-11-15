@@ -995,7 +995,7 @@ fn recorded_machine_answer(record: crate::grants::ActionRecord) -> Recorded<Resu
 
 fn recorded_answer(record: crate::grants::ActionRecord) -> Result<ParamsValue> {
     match record {
-        crate::grants::ActionRecord::Answered { result } => {
+        crate::grants::ActionRecord::Answered { result, .. } => {
             decoded(&result).map_err(|error| receipt_cannot_be_read(&error))
         }
         crate::grants::ActionRecord::Refused { code, detail } => {
@@ -1068,6 +1068,7 @@ mod tests {
     fn a_receipt_that_cannot_be_read_back_is_an_outcome_nobody_knows() {
         let damaged = recorded_answer(crate::grants::ActionRecord::Answered {
             result: vec![0xff, 0x00, 0x13],
+            reads: None,
         })
         .expect_err("a receipt that cannot be decoded");
         assert!(
@@ -1083,8 +1084,11 @@ mod tests {
         assert_eq!(reused.code(), ErrorCode::IdConflict);
 
         let whole = kr_cbor::encode(&kr_cbor::CanonicalValue::Text("a result".to_owned()));
-        recorded_answer(crate::grants::ActionRecord::Answered { result: whole })
-            .expect("a receipt that decodes is the answer");
+        recorded_answer(crate::grants::ActionRecord::Answered {
+            result: whole,
+            reads: None,
+        })
+        .expect("a receipt that decodes is the answer");
         let refused = recorded_answer(crate::grants::ActionRecord::Refused {
             code: ErrorCode::DraftConflict,
             detail: "the record moved".to_owned(),
