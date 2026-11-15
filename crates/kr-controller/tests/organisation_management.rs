@@ -2526,3 +2526,171 @@ async fn an_environment_forgetting_that_reaches_the_record_after_the_owners_leas
     );
     fixture.host.stop().await;
 }
+
+/// The host exclusively organisation-managed, its local owner under a lease that lasts ten
+/// seconds, which is shorter than the lifetime a request asks for, and the owner's device under a
+/// lease of its own, connected and listing what it is asked to answer.
+async fn a_host_whose_local_owner_holds_a_lease_of_ten_seconds(
+    fixture: &Fixture,
+    owner: &OwnerDevice<'_>,
+) -> RawDevice {
+    let environment = fixture.host.environment_id;
+    let mut client = fixture.host.client().await;
+    fixture
+        .set_exclusive(&mut client, ActionId::new(kr_ipc::new_uuid()), true)
+        .await
+        .expect("the owner makes the host exclusive");
+    // The change withdrew the connection it was made on.
+    drop(client);
+    let raw = owner.connect().await;
+    owner.present(&raw).await.expect("the owner device's lease");
+    let mut client = fixture.host.client().await;
+    let listed = fixture.listed().await;
+    let lease = fixture.organisation.sign(
+        2,
+        fixture.organisation.payload(
+            2,
+            &organisation_support::member("owner"),
+            listed.host_device.authorisation_key,
+            fixture.now(),
+            10_000,
+            &[ActionRight::SessionView],
+        ),
+    );
+    calls::mutate_as::<_, kr_protocol::organisation::MembershipPresentResult>(
+        environment,
+        &mut client,
+        ActionId::new(kr_ipc::new_uuid()),
+        Method::MembershipPresent,
+        &MembershipPresentParams {
+            lease,
+            authority: Nullable::null(),
+        },
+    )
+    .await
+    .expect("the host takes the lease for its local owner");
+    raw
+}
+
+/// The subject of a confirmation that the recovery set does not hold.
+fn an_invitation() -> ConfirmationSubject {
+    ConfirmationSubject::IssueInvitation {
+        mode: kr_protocol::invitation::InviteModeKind::Direct,
+        rendezvous_origin: Nullable::null(),
+        grant_kind: InviteGrantKind::PersonalOwner,
+        proposed_grant: kr_pairing::grants::personal_owner_grant(),
+    }
+}
+
+/// The refusal the local door gives the owner at the host for a subject outside the recovery set
+/// once the owner's lease has ended: asked of a request that arrives then.
+async fn the_door_refusal_after_the_lease_ended(
+    fixture: &Fixture,
+) -> kr_protocol::error::ProtocolError {
+    let mut client = fixture.host.client().await;
+    calls::request(fixture.host.environment_id, &mut client, an_invitation())
+        .await
+        .expect_err("the door refuses a request that arrives once the lease has ended")
+}
+
+/// KR-REQ-17.54: the owner at the host asks for the confirmation of an invitation under a live
+/// lease, and the lease ends after the door decided the request and before the request is
+/// recorded. The host refuses it with the words the door uses for that subject on a host whose
+/// local owner holds no lease, and records no challenge. The control: where the lease stands, the
+/// challenge is recorded and listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_confirmation_request_whose_owner_lease_ends_after_the_door_decided_it_records_no_challenge()
+ {
+    for ends in [false, true] {
+        let fixture = Fixture::start().await;
+        let environment = fixture.host.environment_id;
+        let owner = OwnerDevice::of(&fixture).await;
+        let raw = a_host_whose_local_owner_holds_a_lease_of_ten_seconds(&fixture, &owner).await;
+        let mut client = fixture.host.client().await;
+        let (arrived, release) = fixture.host.controller().pause_after_the_pairing_caller();
+        let asking =
+            tokio::spawn(
+                async move { calls::request(environment, &mut client, an_invitation()).await },
+            );
+        tokio::time::timeout(Duration::from_secs(30), arrived)
+            .await
+            .expect("the request reaches the place after the door decided it")
+            .expect("the pause is armed");
+        if ends {
+            fixture.pass(Duration::from_secs(11));
+        }
+        release.send(()).expect("the request goes on");
+        let asked = asking.await.expect("the request is answered");
+        let listed = pending_on(&raw).await.pending;
+        if ends {
+            let refused = asked.expect_err("a request whose lease ended before it was recorded");
+            let at_the_door = the_door_refusal_after_the_lease_ended(&fixture).await;
+            assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+            assert_eq!(
+                refused.message, at_the_door.message,
+                "the door's own words for that subject"
+            );
+            assert!(listed.is_empty(), "no challenge was recorded: {listed:?}");
+        } else {
+            asked.expect("the challenge is recorded where the lease stands");
+            assert_eq!(listed.len(), 1, "the control's challenge is listed");
+        }
+        raw.close();
+        fixture.host.stop().await;
+    }
+}
+
+/// KR-REQ-17.54: the owner at the host answers a challenge for an invitation with an owner
+/// device's proof under a live lease, and the lease ends after the door decided the answer and
+/// before it is recorded. The host refuses it with the door's words for that subject and records
+/// no answer: the same proof, sent again once a lease stands, is accepted. The control: where the
+/// lease stands, the answer is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_confirmation_answer_whose_owner_lease_ends_after_the_door_decided_it_records_no_answer()
+{
+    for ends in [false, true] {
+        let fixture = Fixture::start().await;
+        let environment = fixture.host.environment_id;
+        let owner = OwnerDevice::of(&fixture).await;
+        let raw = a_host_whose_local_owner_holds_a_lease_of_ten_seconds(&fixture, &owner).await;
+        let mut client = fixture.host.client().await;
+        let challenge = calls::request(environment, &mut client, an_invitation())
+            .await
+            .expect("the leased owner asks for the confirmation of an invitation");
+        let (proof, presented) =
+            calls::sign(&challenge.request, &Signer::OwnerDevice(&fixture.owner));
+        let (arrived, release) = fixture.host.controller().pause_after_the_pairing_caller();
+        let answering = tokio::spawn({
+            let proof = proof.clone();
+            async move { calls::complete(environment, &mut client, proof, presented).await }
+        });
+        tokio::time::timeout(Duration::from_secs(30), arrived)
+            .await
+            .expect("the answer reaches the place after the door decided it")
+            .expect("the pause is armed");
+        if ends {
+            fixture.pass(Duration::from_secs(11));
+        }
+        release.send(()).expect("the answer goes on");
+        let answered = answering.await.expect("the answer is told");
+        if ends {
+            let refused = answered.expect_err("an answer whose lease ended before it was recorded");
+            let at_the_door = the_door_refusal_after_the_lease_ended(&fixture).await;
+            assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+            assert_eq!(
+                refused.message, at_the_door.message,
+                "the door's own words for that subject"
+            );
+            // Nothing was recorded: a lease that stands again lets the same proof be answered.
+            fixture.lease_the_local_owner().await;
+            let mut again = fixture.host.client().await;
+            calls::complete(environment, &mut again, proof, presented)
+                .await
+                .expect("the proof is accepted where no answer was recorded");
+        } else {
+            answered.expect("the answer is recorded where the lease stands");
+        }
+        raw.close();
+        fixture.host.stop().await;
+    }
+}

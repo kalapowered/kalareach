@@ -1215,6 +1215,8 @@ impl Controller {
             #[cfg(feature = "testing")]
             before_a_door_effect: ReadPause::default(),
             #[cfg(feature = "testing")]
+            after_the_pairing_caller: ReadPause::default(),
+            #[cfg(feature = "testing")]
             after_a_route_answers: ReadPause::default(),
             #[cfg(feature = "testing")]
             before_a_reply_is_told: ReadPause::default(),

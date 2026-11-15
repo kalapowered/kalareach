@@ -438,6 +438,19 @@ impl Controller {
         self.before_a_door_effect.arm()
     }
 
+    /// Arms the pause the next pairing or owner-confirmation write stops at once the door has
+    /// decided its caller, before the service that records or answers it is asked. Returns the end
+    /// that says the write has arrived, and the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_after_the_pairing_caller(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.after_the_pairing_caller.arm()
+    }
+
     /// Arms the pause the next local write stops at once the route that performs it has answered,
     /// before the answer is told, so that a connection can be withdrawn or a fence set where the
     /// answer is asked what it stands on. Returns the end that says the route has answered, and the
