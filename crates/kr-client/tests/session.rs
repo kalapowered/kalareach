@@ -3670,9 +3670,20 @@ async fn a_send_whose_time_has_run_out_writes_nothing_and_leaves_nothing_on_the_
     serving.abort();
 }
 
-/// The longest a test waits for a send that is bounded by its time, which is far past the bound: a
-/// send that is not bounded fails the test at this and does not hang it.
-const BOUNDED_SEND_WATCHDOG: Duration = Duration::from_secs(60);
+/// The longest a test waits for a send that is bounded by its time: the bounds of these cases are a
+/// fraction of a second, so a send that is not bounded fails the test at this, by an assertion of
+/// its own, within seconds.
+const BOUNDED_SEND_OBSERVATION: Duration = Duration::from_secs(8);
+
+/// Waits for a send that its own time bounds, for the observation limit at most, and fails with
+/// `what` when it is still going: a send that its time did not stop is the fault, and the case says
+/// so in its own words.
+async fn bounded_send<T>(what: &str, send: impl std::future::Future<Output = T>) -> T {
+    match tokio::time::timeout(BOUNDED_SEND_OBSERVATION, send).await {
+        Ok(sent) => sent,
+        Err(_) => panic!("{what}: the send was still going after {BOUNDED_SEND_OBSERVATION:?}"),
+    }
+}
 
 /// A request composed with `padding` bytes of params, which fills a local socket whose peer reads
 /// nothing.
@@ -3739,16 +3750,15 @@ async fn a_request_that_waits_for_the_connections_writer_past_its_time_is_never_
     began.notified().await;
 
     let second = padded_request(&session, 0x62, 10).await;
-    let withheld = tokio::time::timeout(
-        BOUNDED_SEND_WATCHDOG,
+    let withheld = bounded_send(
+        "a request waiting for the connection's writer is not stopped by its time",
         session.send_before(
             &second,
             tokio::time::Instant::now() + Duration::from_millis(300),
             &|| true,
         ),
     )
-    .await
-    .expect("a request waiting for the writer is bounded by its time");
+    .await;
     assert!(
         matches!(withheld, Err(ClientError::Withheld)),
         "the writer was held past the time"
@@ -3810,16 +3820,15 @@ async fn a_request_the_socket_cannot_take_before_its_time_runs_out_is_cut_off_an
     let session = Session::start(transport.shared()).expect("a session");
 
     let request = padded_request(&session, 0x63, 900_000).await;
-    let withheld = tokio::time::timeout(
-        BOUNDED_SEND_WATCHDOG,
+    let withheld = bounded_send(
+        "a request that the socket cannot take is not stopped by its time",
         session.send_before(
             &request,
             tokio::time::Instant::now() + Duration::from_millis(300),
             &|| true,
         ),
     )
-    .await
-    .expect("a request the socket cannot take is bounded by its time");
+    .await;
     assert!(
         matches!(withheld, Err(ClientError::Withheld)),
         "the socket held part of the frame and took no more before the time ran out"
@@ -3840,6 +3849,139 @@ async fn a_request_the_socket_cannot_take_before_its_time_runs_out_is_cut_off_an
             .await
             .is_err(),
         "the connection ended with the frame"
+    );
+    session.close();
+    serving.abort();
+}
+
+/// A send that its caller stops waiting for with part of its frame gone leaves the peer the start of
+/// a frame that will never be finished, so the connection ends with it, as it does when the time
+/// cuts a frame: the session says that the connection ended, a later call is told so, and the peer
+/// acts on none of it.
+#[tokio::test]
+async fn a_send_dropped_inside_a_frame_ends_the_connection() {
+    let tree = kr_ipc::testing::TempHost::create();
+    let endpoint = tree
+        .paths()
+        .environment(tree.environment_id())
+        .controller_endpoint()
+        .expect("a controller endpoint");
+    let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("a local endpoint");
+    let script = Arc::new(HostScript::default());
+    script.unread.store(true, Ordering::Release);
+    let serving = spawn_local_host(listener, Arc::clone(&script));
+    let transport = kr_client::ipc::IpcTransport::connect(&endpoint, kr_cli_build_id())
+        .await
+        .expect("a local connection");
+    let session = Session::start(transport.shared()).expect("a session");
+
+    let request = padded_request(&session, 0x65, 900_000).await;
+    let waited = tokio::time::timeout(Duration::from_millis(300), session.send(&request)).await;
+    assert!(
+        waited.is_err(),
+        "a frame this size does not fit the socket of a peer that reads nothing, so its send was still going when the caller stopped waiting"
+    );
+    assert!(
+        tokio::time::timeout(BOUNDED_SEND_OBSERVATION, session.closed())
+            .await
+            .is_ok(),
+        "the session did not record the end of the connection after its frame was dropped part way"
+    );
+    let read = session
+        .read::<_, SessionList>(Method::SessionList, &Empty {})
+        .await;
+    assert!(
+        matches!(read, Err(ClientError::ConnectionEnded)),
+        "a later call is told that the connection ended: {read:?}"
+    );
+
+    // The peer reads now: part of the frame, and then the end of the connection.
+    script.unread.store(false, Ordering::Release);
+    script.reading.notify_waiters();
+    assert!(
+        tokio::time::timeout(
+            BOUNDED_SEND_OBSERVATION,
+            script.served_to_the_end.notified()
+        )
+        .await
+        .is_ok(),
+        "the peer was not told that the connection ended"
+    );
+    assert!(
+        script.actions.lock().await.is_empty(),
+        "the peer read no request: the frame it was given stops short"
+    );
+    serving.abort();
+}
+
+/// A send that is dropped before a byte of its frame went takes the frame back and leaves the
+/// connection standing: the next send is written and answered as usual. The drop is made by
+/// unwinding at the write's first look at whether the frame is still wanted, which is before the
+/// socket has taken anything.
+#[tokio::test]
+async fn a_send_dropped_before_a_byte_of_its_frame_went_leaves_the_connection_standing() {
+    let tree = kr_ipc::testing::TempHost::create();
+    let endpoint = tree
+        .paths()
+        .environment(tree.environment_id())
+        .controller_endpoint()
+        .expect("a controller endpoint");
+    let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("a local endpoint");
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_local_host(listener, Arc::clone(&script));
+    let transport = kr_client::ipc::IpcTransport::connect(&endpoint, kr_cli_build_id())
+        .await
+        .expect("a local connection");
+    let session = Arc::new(Session::start(transport.shared()).expect("a session"));
+
+    // The first look is the connection's, once it holds the turn. The second is the write's own,
+    // before it hands the socket a byte; the send is dropped there.
+    let looks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dropped_at_the_write = {
+        let looks = Arc::clone(&looks);
+        move || {
+            if looks.fetch_add(1, Ordering::AcqRel) >= 1 {
+                std::panic::resume_unwind(Box::new("the send is dropped before a byte went"));
+            }
+            true
+        }
+    };
+    let first = padded_request(&session, 0x66, 10).await;
+    let sending = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move {
+            session
+                .send_before(
+                    &first,
+                    tokio::time::Instant::now() + Duration::from_secs(60),
+                    &dropped_at_the_write,
+                )
+                .await
+        })
+    };
+    let joined = sending.await;
+    assert!(
+        joined.is_err_and(|error| error.is_panic()),
+        "the send ran past its first look at the write"
+    );
+    assert_eq!(
+        looks.load(Ordering::Acquire),
+        2,
+        "the send was dropped at the write's own look, before any byte went"
+    );
+
+    let next = padded_request(&session, 0x67, 10).await;
+    let settled = bounded_send("the next send after a dropped one", session.send(&next)).await;
+    assert!(
+        settled.is_ok(),
+        "the connection stands and the next send is answered: {settled:?}"
+    );
+    assert_eq!(
+        script.actions.lock().await.as_slice(),
+        [kr_protocol::ids::ActionId::new(Uuid::from_bytes(
+            [0x67; 16]
+        ))],
+        "the dropped send's frame never reached the peer, and the next one did, whole"
     );
     session.close();
     serving.abort();
@@ -3879,12 +4021,11 @@ async fn a_request_whose_last_byte_goes_as_its_time_passes_is_sent_and_the_conne
         }
         true
     };
-    let settled = tokio::time::timeout(
-        BOUNDED_SEND_WATCHDOG,
+    let settled = bounded_send(
+        "a request whose last write goes as its time passes does not end",
         session.send_before(&request, not_after, &wanted),
     )
-    .await
-    .expect("the send ends");
+    .await;
     assert!(
         settled.is_ok(),
         "a write that completed as the time passed is not cut: {settled:?}"

@@ -192,6 +192,14 @@ pub trait ControlTransport: Send + Sync + std::fmt::Debug {
 
     /// Ends the connection.
     fn close(&self);
+
+    /// Whether this side has ended the connection, which a send that cut a frame short does. It is
+    /// read at once and never waits, so a caller that has just seen a send stop learns from it,
+    /// before the control stream's own end is read, whether the connection went with it. A
+    /// transport that cannot say reports no.
+    fn is_closed(&self) -> bool {
+        false
+    }
 }
 
 /// A connection to a paired host over iroh.
