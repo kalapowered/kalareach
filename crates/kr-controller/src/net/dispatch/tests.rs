@@ -1924,7 +1924,8 @@ async fn try_close_for_a_device_of(
     connection: &super::RemoteConnection,
     close: &MutationRequest,
     rights: &[kr_protocol::rights::ActionRight],
-) -> crate::error::Result<crate::service::net::ClosedRemotely> {
+) -> std::result::Result<crate::service::net::ClosedRemotely, crate::service::net::RefusedRemotely>
+{
     let rights: CanonicalSet<_> = rights.iter().copied().collect();
     let envelope = connection.envelope(
         connection.pairing_acting().grant.grant_id,
@@ -2053,7 +2054,7 @@ async fn a_devices_close_waiting_for_the_workers_link_is_refused_once_a_feed_ref
             }
         );
         if refused {
-            let error = closed.expect_err("the close is refused");
+            let error = closed.expect_err("the close is refused").error;
             assert!(
                 matches!(
                     error,

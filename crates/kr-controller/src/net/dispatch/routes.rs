@@ -1070,32 +1070,42 @@ impl RemoteConnection {
                     }
                 });
                 match self.controller.within_effect_wait(answered).await {
-                    Ok(Ok(Ok(closed))) => {
-                        let answer = ControlFrame::Response(Response {
-                            request_id,
-                            outcome: Outcome::Ok(closed.value),
-                        });
-                        // A close the worker answered from its journal is a read of that receipt,
-                        // and this is the check section 23 wants before either half of a retained
-                        // result goes back, under the decision the answer is then written under.
-                        // The close itself happened: section 7's stop does not wait on this, and
-                        // only the answer does, so a close not shown is not told as one refused.
-                        match closed.retained {
-                            Retained::Not => {}
-                            Retained::Record | Retained::Worker => {
-                                match self.may_read_receipts(
-                                    Some(session_id),
-                                    Method::SessionClose,
-                                    &decided.acting,
-                                ) {
-                                    Ok(read) => *asked = Some(read),
-                                    Err(_) => return Err(outcome_not_shown()),
-                                }
+                    Ok(Ok(settled)) => {
+                        let (retained, told) = match settled {
+                            Ok(closed) => (closed.retained, Ok(closed.value)),
+                            Err(refused) => (refused.retained, Err(refused.error)),
+                        };
+                        // A close answered from the closure record, or from the worker's journal
+                        // whether it carried the close out or refused it, is a read of that record
+                        // or receipt. Section 23 wants the check every answer read from a record
+                        // goes through before either half of a retained result goes back: a fence
+                        // this host owes, or a registration withdrawn or replaced while the record
+                        // was read, stops it, and then present view authority over the session,
+                        // under the decision the answer is then written under. The close itself
+                        // happened: section 7's stop does not wait on this, and only the answer
+                        // does, so a close not shown is not told as one refused.
+                        if retained != Retained::Not {
+                            *asked = Some(decided.clone().kept());
+                            if self.admitted_to_answer(validated).is_err() {
+                                return Err(outcome_not_shown());
+                            }
+                            match self.may_read_receipts(
+                                Some(session_id),
+                                Method::SessionClose,
+                                &decided.acting,
+                            ) {
+                                Ok(read) => *asked = Some(read),
+                                Err(_) => return Err(outcome_not_shown()),
                             }
                         }
-                        answer
+                        match told {
+                            Ok(closed) => ControlFrame::Response(Response {
+                                request_id,
+                                outcome: Outcome::Ok(closed),
+                            }),
+                            Err(error) => return Err(error.to_protocol_error()),
+                        }
                     }
-                    Ok(Ok(Err(error))) => return Err(error.to_protocol_error()),
                     // The close is running on a task that outlives this connection, so a wait
                     // that ended says the outcome is not known rather than that it failed.
                     Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
