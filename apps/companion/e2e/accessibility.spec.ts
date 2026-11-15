@@ -1107,6 +1107,10 @@ const AREA_MIDDLE = ['Some words before [mid link](https://example.org/middle) a
 const LAST = 'https://example.org/last-line'
 const LAST_LINE = 'The last words of the conversation end with [a link](https://example.org/last-line)'
 const CLOSE = ['[first](https://example.org/close-1)  \n[second](https://example.org/close-2)']
+const ORDER_ONE = 'https://example.org/order-1'
+const ORDER_TWO = 'https://example.org/order-2'
+/** Two links on one line with a plain run between them: a hair space and a word joiner, which the case repeats until the gap between the words is the one it measures for. */
+const ORDER = [`[first](${ORDER_ONE})\u200A\u2060[second](${ORDER_TWO})`]
 
 /** The pane's own client box as the page lays it out now: what holds content and can be tapped, with no scroll bar's strip. */
 async function paneBox(page: Page): Promise<{ left: number; top: number; right: number; bottom: number }> {
@@ -1698,6 +1702,126 @@ test.describe('the area in which a tap opens a link', () => {
         await page.waitForTimeout(400)
         expect(await pressedLooks(page), 'the pressed look 400 ms after the last tap').toBe(0)
       })
+
+      test(`gives the plain text between two links on one line to the nearer words, and the look goes with the open, on ${surface} at ${size} text size`, async ({
+        page
+      }) => {
+        // One line with two links and a plain run between their words: hair spaces joined by word joiners, so that no break opens in the run.
+        // The run's length is measured: the case sets the count of hair spaces that makes the gap between the words 36 to 41 px.
+        await pressPage(page, surface, { scale: ratio, only: [PLAIN, PLAIN, ...ORDER, PLAIN, PLAIN] })
+        await wordsOf(page, ORDER_ONE)
+        const fitted = await page.evaluate(
+          ({ one, two, unit }) => {
+            const link = (href: string): HTMLElement | null => document.querySelector<HTMLElement>(`.m-node .md-link[title="${href}"]`)
+            const words = (href: string): DOMRect[] => {
+              const label = link(href)?.querySelector('.md-link-label')
+              if (!label) return []
+              const range = document.createRange()
+              range.selectNodeContents(label)
+              return Array.from(range.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0)
+            }
+            const run = link(one)?.nextSibling
+            if (!(run instanceof Text)) return { count: 0, gap: Number.NaN, tried: ['the run between the links is not a text node'] }
+            const tried: string[] = []
+            for (let count = 1; count <= 120; count += 1) {
+              run.textContent = unit.repeat(count)
+              const left = words(one).at(-1)
+              const right = words(two)[0]
+              if (!left || !right) return { count: 0, gap: Number.NaN, tried: [...tried, 'a link has no words'] }
+              const gap = right.left - left.right
+              const sameLine = Math.abs(right.top - left.top) < 2
+              tried.push(`${String(count)}: ${gap.toFixed(2)}${sameLine ? '' : ' (not on one line)'}`)
+              if (sameLine && gap >= 36 && gap <= 41) return { count, gap, tried: [] }
+              if (!sameLine || gap > 41) break
+            }
+            return { count: 0, gap: Number.NaN, tried }
+          },
+          { one: ORDER_ONE, two: ORDER_TWO, unit: ' ⁠' }
+        )
+        expect(fitted.count, `a count of hair spaces that makes a gap of 36 to 41 px between the words (gaps tried ${fitted.tried.join(', ')})`).toBeGreaterThan(0)
+        const first = await wordsNow(page, ORDER_ONE, -1)
+        const second = await wordsNow(page, ORDER_TWO)
+        const reach = FINGER[surface] / 2
+        const wrong: string[] = []
+        const kinds = new Map<string, number>()
+        let nearFirst = 0
+        let nearSecond = 0
+        // A tap every pixel, from 16 px past the first link's words (past what either engine moves a tap to a link's element) to 16 px before the
+        // second's. A tap counts where the pointer down and the click both name plain text and both targets hold the point; the expected link is
+        // computed at the pointer down's own point, since the engine may round the tap's and the handler decides there.
+        for (let x = Math.ceil(first.right + 16); x <= Math.floor(second.left - 16); x += 1) {
+          const made = await tapAndRead(page, x, first.y)
+          const press = made.presses[0]
+          const click = browsers(made.clicks)[0]
+          const kind = `press ${press?.named.split(' ')[0] ?? '-'}, click ${click?.named.split(' ')[0] ?? '-'}`
+          kinds.set(kind, (kinds.get(kind) ?? 0) + 1)
+          const disagreement = lookDisagrees(made)
+          if (disagreement !== null) wrong.push(`x ${String(x - Math.round(first.right))}: ${disagreement}`)
+          if (press === undefined || !press.named.startsWith('text') || !(click?.named ?? '').startsWith('text')) continue
+          const toFirst = press.x - first.right
+          const toSecond = second.left - press.x
+          if (toFirst > reach || toSecond > reach) continue
+          const expected = toFirst <= toSecond ? ORDER_ONE : ORDER_TWO
+          if (expected === ORDER_ONE) nearFirst += 1
+          else nearSecond += 1
+          if (made.opened.length !== 1 || made.opened[0] !== expected) wrong.push(`x ${String(x - Math.round(first.right))} (pointer down at ${String(press.x)}): opened ${made.opened.join(',') || 'none'}, expected ${expected} once`)
+          if (made.litAtClick[0] !== expected) wrong.push(`x ${String(x - Math.round(first.right))}: the look at the click ${String(made.litAtClick[0] ?? null)}, expected ${expected}`)
+        }
+        const counted = `gap ${fitted.gap.toFixed(2)} px with ${String(fitted.count)} hair spaces; counted taps: ${String(nearFirst)} to the first link, ${String(nearSecond)} to the second; ${[...kinds.entries()].map(([kind, count]) => `${kind}: ${String(count)}`).join('; ')}`
+        test.info().annotations.push({ type: 'order', description: counted })
+        console.log(`order ${test.info().project.name} ${test.info().title}: ${counted}`)
+        expect(nearFirst, 'counted taps that the first link’s words are nearer to').toBeGreaterThanOrEqual(2)
+        expect(nearSecond, 'counted taps that the second link’s words are nearer to').toBeGreaterThanOrEqual(2)
+        expect(wrong, 'taps between the two links on one line that opened the farther link, or none, or lit another').toEqual([])
+        await page.waitForTimeout(400)
+        expect(await pressedLooks(page), 'the pressed look 400 ms after the last tap').toBe(0)
+      })
+
+      if (ratio === 1) {
+        for (const where of ['before', 'after'] as const) {
+          test(`opens and lights the link that the browser's click names, though the page is busy for 1.7 s and for 3.2 s ${where === 'before' ? 'before the handler sees' : 'after the handler saw'} the release, on ${surface}`, async ({
+            page
+          }) => {
+            await pressPage(page, surface, { only: [PLAIN, PLAIN, ...CLOSE, PLAIN, PLAIN] })
+            await wordsOf(page, 'https://example.org/close-1', -1)
+            const apart = (await wordsNow(page, 'https://example.org/close-2')).y - (await wordsNow(page, 'https://example.org/close-1', -1)).y
+            await page.evaluate((half) => {
+              const pane = document.querySelector<HTMLElement>('.m-pane')
+              if (pane) pane.scrollTop += half
+            }, apart / 2)
+            const first = await wordsNow(page, 'https://example.org/close-1', -1)
+            const second = await wordsNow(page, 'https://example.org/close-2')
+            // A point where the page's hit test names plain text and the browser's own click names a link (an engine moves a tap to a link: the
+            // pointer down names plain text in WebKit and the link's element in Chromium). Found by ordinary taps along the two axes.
+            let found: { x: number; y: number; named: string } | null = null
+            for (const x of [first.left + 10, Math.min(first.right, second.right) + 8]) {
+              for (let y = Math.ceil(first.y); y <= Math.floor(second.y) && found === null; y += 1) {
+                const plain = await page.evaluate(({ px, py }) => document.elementFromPoint(px, py)?.closest('.md-link') == null, { px: x, py: y })
+                if (!plain) continue
+                const made = await tapAndRead(page, x, y)
+                const named = browsers(made.clicks)[0]?.named ?? ''
+                if (named.startsWith('link ')) found = { x, y, named }
+              }
+              if (found !== null) break
+            }
+            expect(found, 'a point at which the page’s hit test names plain text and the browser’s click names a link').not.toBeNull()
+            if (found === null) return
+            await busyAtPointerUp(page, 1700, where)
+            const soon = await tapAndRead(page, found.x, found.y, tapNow)
+            expect(lookDisagrees(soon), `the look and the opening of a tap 1.7 s after the release at ${found.named}`).toBeNull()
+            expect(soon.opened, 'links opened by the tap 1.7 s after the release').toEqual([found.named.slice('link '.length)])
+            expect(soon.litAtClick, 'the look at that click').toEqual([found.named.slice('link '.length)])
+            await busyAtPointerUp(page, 3200, where)
+            const late = await tapAndRead(page, found.x, found.y, tapNow)
+            expect(lookDisagrees(late), `the look and the opening of a tap 4.9 s after the release at ${found.named}`).toBeNull()
+            expect(late.opened, 'links opened by the tap 3.2 s after the release, by the browser’s own click').toEqual([found.named.slice('link '.length)])
+            expect(late.litAtClick, 'the look at the click 3.2 s after the release').toEqual([found.named.slice('link '.length)])
+            expect(handlers(late.clicks), 'clicks that the page added to a click on a link').toEqual([])
+            await page.waitForTimeout(400)
+            expect(await pressedLooks(page), 'the pressed look 400 ms after the late tap').toBe(0)
+          })
+        }
+      }
     }
   }
 })
