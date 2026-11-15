@@ -121,24 +121,72 @@ fn client_window() -> InputWindow {
     }
 }
 
-/// What the host knows of one stream, which a position check reads
-/// ([`InputStreams::position_not_reached`]).
+/// What the worker has accepted of one attachment's typing and where it has refused it, which a
+/// position check reads ([`InputStreams::read_position`]).
+///
+/// It belongs to the attachment on its connection and to the epoch of each entry, and not to one
+/// stream: a stream that replaces another for the same attachment, or that opens after another
+/// ended, starts from what the worker has already accepted and refused, so a frame the worker
+/// refused is never counted as accepted because the stream that sent it is gone. An epoch that no
+/// entry names starts empty.
 #[derive(Debug, Default)]
-struct Record {
-    lease: Lease,
+struct Account {
     /// The highest sequence the worker accepted, with its epoch, recorded before the device is
     /// told.
     accepted: Option<(InputLeaseEpoch, u64)>,
+    /// The lowest sequence of the newest epoch that was refused, with its epoch: the frames from it
+    /// on were not accepted in turn, so the count of that epoch cannot pass it.
+    refused: Option<(InputLeaseEpoch, u64)>,
+}
+
+impl Account {
+    /// Records that the worker accepted frames of `epoch` through `through`.
+    fn accept(&mut self, epoch: InputLeaseEpoch, through: u64) {
+        let newer = match self.accepted {
+            None => true,
+            Some((held, held_through)) => {
+                epoch.get() > held.get() || (epoch == held && through > held_through)
+            }
+        };
+        if newer {
+            self.accepted = Some((epoch, through));
+        }
+    }
+
+    /// Records that the frame at `sequence` of `epoch` was refused. An older epoch's refusal, and a
+    /// higher sequence of the epoch held, change nothing.
+    fn refuse(&mut self, epoch: InputLeaseEpoch, sequence: u64) {
+        let lower = match self.refused {
+            None => true,
+            Some((held, at)) => epoch.get() > held.get() || (epoch == held && sequence < at),
+        };
+        if lower {
+            self.refused = Some((epoch, sequence));
+        }
+    }
+
+    /// How many frames of `epoch` the worker has accepted from the first: no frame accepted in the
+    /// epoch is none, and a frame refused ends the count at its sequence.
+    fn count_of(&self, epoch: InputLeaseEpoch) -> u64 {
+        let accepted = match self.accepted {
+            Some((held, through)) if held == epoch => through.saturating_add(1),
+            _ => 0,
+        };
+        match self.refused {
+            Some((held, at)) if held == epoch => accepted.min(at),
+            _ => accepted,
+        }
+    }
 }
 
 /// What the host knows of the epoch of the lease the stream's attachment holds.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 enum Lease {
     /// The worker's own lane tells it: the epoch of the lease the attachment holds now, as the
     /// worker last said, or none while it holds none.
     Told(Option<InputLeaseEpoch>),
     /// A worker with no lane tells nothing of its lease, so the host judges a barrier by what the
-    /// worker accepted on this stream and by nothing else: the worker's lease has moved past an
+    /// worker accepted on this attachment and by nothing else: the worker's lease has moved past an
     /// epoch only when the worker has accepted typing of a newer one. What the host has read from
     /// the device, and what the worker refused, move nothing: a refusal does not end the lease.
     NotTold,
@@ -150,42 +198,44 @@ impl Default for Lease {
     }
 }
 
-/// One live stream: how to end it, and what the worker has accepted on it.
+/// One live stream: how to end it, what it knows of the lease, and the account of what the worker
+/// has accepted and refused of its attachment, which the streams of that attachment share.
 #[derive(Debug)]
 struct Live {
     handle: StreamHandle,
-    record: Mutex<Record>,
+    lease: Mutex<Lease>,
+    account: Arc<Mutex<Account>>,
     /// Woken when the attachment this stream serves is detached.
     detached: tokio::sync::Notify,
 }
 
 impl Live {
-    fn lock(&self) -> MutexGuard<'_, Record> {
-        self.record.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lease(&self) -> MutexGuard<'_, Lease> {
+        self.lease.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn account(&self) -> MutexGuard<'_, Account> {
+        self.account.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Records that the worker accepted frames of `epoch` through `through`.
     fn accept(&self, epoch: InputLeaseEpoch, through: u64) {
-        let mut record = self.lock();
-        let newer = match record.accepted {
-            None => true,
-            Some((held, held_through)) => {
-                epoch.get() > held.get() || (epoch == held && through > held_through)
-            }
-        };
-        if newer {
-            record.accepted = Some((epoch, through));
-        }
+        self.account().accept(epoch, through);
+    }
+
+    /// Records that the frame at `sequence` of `epoch` was refused.
+    fn refused_at(&self, epoch: InputLeaseEpoch, sequence: u64) {
+        self.account().refuse(epoch, sequence);
     }
 
     /// Records the epoch of the lease this stream's attachment holds now, or that it holds none.
     fn hold(&self, epoch: Option<InputLeaseEpoch>) {
-        self.lock().lease = Lease::Told(epoch);
+        *self.lease() = Lease::Told(epoch);
     }
 
-    /// The highest accepted sequence of `epoch`, when the epoch is the one the record holds.
+    /// The highest accepted sequence of `epoch`, when the epoch is the one the account holds.
     fn through(&self, epoch: InputLeaseEpoch) -> Option<u64> {
-        match self.lock().accepted {
+        match self.account().accepted {
             Some((held, through)) if held == epoch => Some(through),
             _ => None,
         }
@@ -197,23 +247,18 @@ impl Live {
     /// the answer is no: the worker's lease has moved on, and the worker treats such a barrier as
     /// stale. No frame accepted in the epoch is a count of none. A count that the accepted frames
     /// do not make is short whether more frames may still be accepted or none will be, since the
-    /// frames behind a refusal are not sent.
+    /// frames behind a refusal are not sent, and a frame that was refused ends the count at its
+    /// sequence, however many the worker accepted after it on another stream.
     fn short_of(&self, epoch: InputLeaseEpoch, count: u64) -> bool {
-        let record = self.lock();
-        let judged = match record.lease {
+        let lease = *self.lease();
+        let account = self.account();
+        let judged = match lease {
             Lease::Told(held) => held == Some(epoch),
-            Lease::NotTold => record
+            Lease::NotTold => account
                 .accepted
                 .is_none_or(|(newest, _)| epoch.get() >= newest.get()),
         };
-        if !judged {
-            return false;
-        }
-        let accepted = match record.accepted {
-            Some((held, through)) if held == epoch => through.saturating_add(1),
-            _ => 0,
-        };
-        accepted < count
+        judged && account.count_of(epoch) < count
     }
 }
 
@@ -236,6 +281,10 @@ pub(super) struct InputStreams {
     /// to open.
     max_per_connection: usize,
     live: Mutex<BTreeMap<Key, Arc<Live>>>,
+    /// What the worker has accepted and refused of each attachment's typing, which outlives the
+    /// stream that sent it: a later stream of the same attachment starts from it. An entry is
+    /// given up when the attachment is detached and when its connection is released.
+    accounts: Mutex<BTreeMap<Key, Arc<Mutex<Account>>>>,
     /// Where a suite stops the streams' stages and what it counts there.
     stages: Arc<InputStages>,
     /// Where a suite has this host connect its input lanes, instead of the worker's own endpoint.
@@ -251,6 +300,7 @@ impl Default for InputStreams {
         Self {
             max_per_connection: kr_transport::listener::DEFAULT_MAX_INPUT_STREAMS,
             live: Mutex::new(BTreeMap::new()),
+            accounts: Mutex::new(BTreeMap::new()),
             stages: Arc::default(),
             #[cfg(feature = "testing")]
             lane_endpoint: Mutex::new(None),
@@ -291,9 +341,17 @@ impl InputStreams {
         self.live.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The accounts of what the worker accepted and refused. Where both are held, the streams are
+    /// locked first.
+    fn accounts(&self) -> MutexGuard<'_, BTreeMap<Key, Arc<Mutex<Account>>>> {
+        self.accounts.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Makes `handle` the stream that serves `attachment` of `connection`, and revokes the stream
     /// it replaces. A stream that is revoked already replaces nothing and is given no place, and a
     /// connection that holds its bound of streams for other attachments is given no further one.
+    /// The stream is given the attachment's account of what the worker accepted and refused, so it
+    /// starts from what the streams before it left, whether or not one still stands.
     fn stand(
         self: &Arc<Self>,
         connection: ConnectionId,
@@ -302,14 +360,6 @@ impl InputStreams {
         lease: Lease,
     ) -> Result<Arc<Standing>, Refusal> {
         let key = (connection, attachment);
-        let live = Arc::new(Live {
-            handle: handle.clone(),
-            record: Mutex::new(Record {
-                lease,
-                accepted: None,
-            }),
-            detached: tokio::sync::Notify::new(),
-        });
         let mut registry = self.live();
         if handle.is_revoked() {
             return Err(Refusal::Revoked);
@@ -321,6 +371,16 @@ impl InputStreams {
         if others >= self.max_per_connection {
             return Err(Refusal::TooMany);
         }
+        let account = Arc::clone(self.accounts().entry(key).or_insert_with(|| {
+            self.stages.account_made();
+            Arc::default()
+        }));
+        let live = Arc::new(Live {
+            handle: handle.clone(),
+            lease: Mutex::new(lease),
+            account,
+            detached: tokio::sync::Notify::new(),
+        });
         let replaced = registry.insert(key, Arc::clone(&live));
         drop(registry);
         if let Some(older) = replaced {
@@ -349,6 +409,10 @@ impl InputStreams {
         for stream in streams {
             stream.handle.revoke();
         }
+        let mut accounts = self.accounts();
+        let before = accounts.len();
+        accounts.retain(|(held, _), _| *held != connection);
+        self.stages.accounts_fell(before - accounts.len());
     }
 
     /// Tells the stream that serves `attachment` of `connection` that the connection detached it. It
@@ -357,9 +421,13 @@ impl InputStreams {
     /// none came yet, writes it to the device, and ends. Only the connection that asked is reached:
     /// a worker detaches a named attachment only for the link that holds it, so no other
     /// connection's stream stands on an attachment this call can remove. A request that names no
-    /// attachment is not told to this hook.
+    /// attachment is not told to this hook. The attachment's account of what the worker accepted
+    /// and refused is given up with it.
     pub(super) fn detached(&self, connection: ConnectionId, attachment: AttachmentId) {
         self.stages.detach_told();
+        if self.accounts().remove(&(connection, attachment)).is_some() {
+            self.stages.accounts_fell(1);
+        }
         let streams: Vec<Arc<Live>> = self
             .live()
             .iter()
@@ -690,6 +758,7 @@ impl State {
                 .map_or(epoch.get(), |newest| newest.max(epoch.get())),
         );
         let accepted_through = live.through(epoch).map(InputSequence::new);
+        live.refused_at(epoch, sequence);
         self.tell(InputAck::Refused {
             epoch,
             sequence: InputSequence::new(sequence),
