@@ -1618,37 +1618,29 @@ fn gateway_forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_u
             // does. The attach names the session on its connection, which the host's admission of a
             // typing stream waits for, so the stream is judged by the host and not left to time out.
             let observing = attach_to_observe(ctx, &watching, session_id);
-            // It then types on the owner device's attachment through the input lane. The host does
-            // not serve the stream of a device that may not type, and it says why by no code: it
-            // ends the stream. So the case requires that the lane does not take the typing (it does
-            // not open, or its first frame is not accepted) and, apart from the lane, that the
-            // owner's screen, watched for a bounded time, does not show the input.
+            // It then opens the input lane of its OWN observing attachment, which its connection's
+            // own link owns, so on either path to the worker nothing but the host's decision about
+            // the typing right stands between the viewer and a lane: a device without it is not
+            // served, and the host ends the stream before its first word and tells no code. The
+            // case requires that the lane does not open. A lane that opened (a host that skips the
+            // decision), an open that ran out of time and any other end fail the case; so does a
+            // screen that shows the input, which is the second check.
             let before = session.person.window.screen();
             assert!(
                 !before.iter().any(|row| row.contains(&shows)),
                 "the agent's screen shows {shows:?} before the view-only device types"
             );
-            let typed = ctx.runtime.block_on(async {
-                let mut lane = kr_e2e_m1b::typing::Typing::open(
+            let lane_saw = ctx
+                .runtime
+                .block_on(kr_e2e_m1b::typing::Typing::refused_open(
                     watching.session(),
                     watching.environment_id(),
                     session_id,
-                    owner.attachment_id(),
-                )
-                .await?;
-                lane.type_bytes(owner.epoch(), input.as_bytes()).await
-            });
-            let lane_saw = match typed {
-                Ok(written) => {
-                    panic!("a view-only device's input is accepted by the host: {written:?}")
-                }
-                Err(not_typed @ kr_e2e_m1b::typing::NotTyped::Opening(_)) => {
-                    format!("the lane did not open: {not_typed}")
-                }
-                Err(not_typed) => {
-                    format!("the lane opened and the typing was not accepted: {not_typed}")
-                }
-            };
+                    observing,
+                ))
+                .unwrap_or_else(|why| {
+                    panic!("a view-only device's lane does not open, and the host ends it: {why}")
+                });
             let watched_until = Instant::now() + VIEW_ONLY_WATCH;
             while Instant::now() < watched_until {
                 std::thread::sleep(Duration::from_millis(200));
