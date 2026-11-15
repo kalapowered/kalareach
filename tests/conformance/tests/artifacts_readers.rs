@@ -1133,35 +1133,104 @@ fn a_second_root_that_differs_in_letter_case_alone_is_a_root_where_the_disk_tell
     }
 }
 
-/// Off Windows a backslash is a letter of a name for the shell reader: a value that holds `\..\`
-/// names a folder under the root. PowerShell's own path commands read a backslash as a separator on
-/// every platform, so its reader refuses the `..` behind one, as it would on Windows.
+/// The words of every reader's refusal of a backslash off Windows.
+#[cfg(unix)]
+const BACKSLASH: &str = "a backslash is not taken in the folder's path on this platform";
+
+/// Off Windows a value of the variable that holds a backslash is refused by every reader, in the
+/// same words, before any other read of it. PowerShell's own path commands read a backslash as a
+/// separator on every platform, so no PowerShell caller can keep such a folder as written, and a
+/// value that the readers cannot read as one folder is refused by all of them. The first three
+/// values are the ones that the readers read four ways: a step up behind a backslash (after a
+/// slash and with none), and a backslash behind a link that leads out of a root.
 #[cfg(unix)]
 #[test]
-fn a_backslash_in_a_value_is_a_letter_of_a_name_off_windows() {
+fn a_backslash_in_a_value_is_refused_by_every_reader_off_windows() {
     for reader in readers_and_system_shell() {
         let temporary = tempfile::tempdir().expect("a temporary folder");
-        let name = r"a\..\..\kr-letters";
-        let value = real(temporary.path()).join(name);
-        let reading = reader.read(Some(value.as_os_str()), None);
-        if reader.is_shell() {
+        let root = real(temporary.path());
+        let outside = Path::new("/etc/kr-evidence");
+        std::os::unix::fs::symlink("/etc", root.join("out")).expect("a link out of the root");
+        for (what, value) in [
+            (
+                "a step up behind a backslash, after a slash",
+                format!(r"{}/a\..\..\kr-letters", root.display()),
+            ),
+            (
+                "a step up behind a backslash, with no slash after the folder",
+                format!(r"{}\a\..\..\kr-letters", root.display()),
+            ),
+            (
+                "a backslash behind a link that leads out of the root",
+                format!(r"{}/out\kr-evidence", root.display()),
+            ),
+            (
+                "a name with a backslash in it, inside the root",
+                format!(r"{}/a\b", root.display()),
+            ),
+            ("backslashes only", r"\private\tmp\kr-evidence".to_owned()),
+        ] {
+            let reading = reader.read(Some(OsStr::new(&value)), None);
+            assert_refused(reader, &reading, what, BACKSLASH);
+            assert!(!outside.exists(), "{reader:?}: {what}");
+        }
+    }
+}
+
+/// A temporary variable that holds a backslash is passed over as a root off Windows, whatever
+/// folders the readers could make of it: the shell reader reads it as a letter of a name and
+/// PowerShell reads it as a separator. The run's own directory is then made under the next root.
+#[cfg(unix)]
+#[test]
+fn a_temporary_variable_with_a_backslash_is_passed_over_as_a_root_off_windows() {
+    for reader in readers_and_system_shell() {
+        let parent = beside_the_build();
+        let root = real(parent.path());
+        // One folder that the backslash names as a letter, and one that it names as a separator,
+        // and a link that leads to the first.
+        let lettered = root.join("a\\b");
+        std::fs::create_dir_all(&lettered).expect("a folder with a backslash in its name");
+        std::fs::create_dir_all(root.join("a").join("b")).expect("the folder it reads as");
+        std::os::unix::fs::symlink(&lettered, root.join("link")).expect("a link");
+        for (what, value) in [
+            (
+                "a folder that a backslash read as a separator names",
+                root.join("a").join("b").join("evidence"),
+            ),
+            (
+                "a folder behind a link to a folder with a backslash in its name",
+                root.join("link").join("evidence"),
+            ),
+        ] {
+            let reading = reader.read(Some(value.as_os_str()), Some(&lettered));
+            assert_refused(reader, &reading, what, OUTSIDE);
             assert!(
-                reading.succeeded,
-                "{reader:?} refused {value:?}: {reading:?}"
-            );
-            let directory = reading.directory.as_deref().expect("a directory");
-            assert!(
-                same(directory, &real(temporary.path()).join(name)),
-                "{reader:?}: {directory:?}"
-            );
-        } else {
-            assert_refused(
-                reader,
-                &reading,
-                "a step up behind a backslash",
-                "steps up a directory",
+                !reading.words.contains("a\\b"),
+                "{reader:?} lists a root that holds a backslash: {}",
+                reading.words
             );
         }
+        // The runner's folder is the one root that is left beside /tmp.
+        let runner = beside_the_build();
+        let value = runner.path().join("evidence");
+        let reading = reader.read_with(
+            Some(value.as_os_str()),
+            Some(&lettered),
+            &[("RUNNER_TEMP", runner.path().as_os_str())],
+        );
+        assert!(
+            reading.succeeded,
+            "{reader:?} refused a value under the runner's folder: {reading:?}"
+        );
+        let reading = reader.read(None, Some(&lettered));
+        assert!(reading.succeeded, "{reader:?}: {reading:?}");
+        let directory = reading.directory.clone().expect("a directory");
+        assert!(
+            same(directory.parent().expect("a parent"), &real(Path::new("/tmp"))),
+            "{reader:?}: the run's own directory is made under /tmp: {}",
+            directory.display()
+        );
+        std::fs::remove_dir(&directory).expect("removes the directory the run made");
     }
 }
 
