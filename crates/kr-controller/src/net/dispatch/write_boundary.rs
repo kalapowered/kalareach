@@ -2080,10 +2080,25 @@ fn paired_connection_writing_to(
     actions: &[ActionRight],
     sink: Box<dyn FrameSink>,
 ) -> super::RemoteConnection {
-    let (mut grant, _) = super::super::tests::granted(
+    paired_connection_expiring(
+        controller,
+        byte,
+        actions,
         kr_protocol::grant::GrantExpiry::Never,
-        controller.policy().authority_revision(),
-    );
+        sink,
+    )
+}
+
+/// As [`paired_connection_writing_to`], with a pairing grant that `expiry` ends.
+fn paired_connection_expiring(
+    controller: &Arc<Controller>,
+    byte: u8,
+    actions: &[ActionRight],
+    expiry: kr_protocol::grant::GrantExpiry,
+    sink: Box<dyn FrameSink>,
+) -> super::RemoteConnection {
+    let (mut grant, _) =
+        super::super::tests::granted(expiry, controller.policy().authority_revision());
     grant.actions = actions.iter().copied().collect();
     let mut device = record_for(&grant);
     device.endpoint_id = kr_protocol::scalars::EndpointKey::from_bytes([byte; 32]);
@@ -3978,5 +3993,82 @@ async fn an_admission_check_that_waits_for_the_shares_lock_meets_a_fence_owed_in
             owed,
             "a fence owed in the wait: {owed}: {checked:?}"
         );
+    }
+}
+
+/// KR-REQ-09.09: the network writer reads the pairing grant's own expiry once more after the locks
+/// that its bounds take, immediately before the bytes are handed to the transport. The wall clock
+/// passes the expiry while the second reading of the bounds waits for the connection's shares
+/// lock, after the writer's first reading of the expiry: the answer is not written, and the
+/// connection ends. The control: with the clock before the expiry the answer is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_whose_grant_expires_while_the_writer_waits_for_the_shares_lock_is_not_written() {
+    for lapsed in [false, true] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (_continuous, wall, clocks) = super::super::tests::manual_clocks();
+        let controller = super::super::tests::daemon_on(&temp, clocks).await;
+        let expires_at_ms = wall.load(Ordering::SeqCst) + 10 * 60 * 1000;
+        let recording = Arc::new(Recording::default());
+        let connection = paired_connection_expiring(
+            &controller,
+            75,
+            &[ActionRight::SessionView],
+            kr_protocol::grant::GrantExpiry::At {
+                expires_at_ms: kr_protocol::scalars::TimestampMs::new(expires_at_ms),
+            },
+            Box::new(Arc::clone(&recording)),
+        );
+        let answered = connection
+            .answer_now(ControlFrame::Request(listing(1)))
+            .await
+            .expect("an answer");
+        // The first reading of the bounds is the writer's decision before its attempt, and the
+        // second is the attempt's own, after the attempt read the grant's expiry for the first time.
+        let (arrived, go) = controller.pause_before_the_shares_lock();
+        let writing = tokio::spawn(async move {
+            let stood = connection.write_answer(connection.output(), answered).await;
+            (stood, connection)
+        });
+        tokio::task::spawn_blocking(move || {
+            arrived.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await
+        .expect("the wait ends")
+        .expect("the writer's decision reaches the shares lock");
+        let (arrived, go_again) = controller.pause_before_the_shares_lock();
+        go.send(()).expect("the decision goes on");
+        tokio::task::spawn_blocking(move || {
+            arrived.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await
+        .expect("the wait ends")
+        .expect("the attempt's bounds reach the shares lock");
+        if lapsed {
+            wall.store(expires_at_ms + 1_000, Ordering::SeqCst);
+        }
+        go_again.send(()).expect("the attempt goes on");
+        let (stood, connection) = writing.await.expect("the write ends");
+        let written = recording.frames();
+        if lapsed {
+            assert!(!stood, "the connection ends");
+            assert!(
+                written.is_empty(),
+                "nothing was handed to the transport: {written:?}"
+            );
+        } else {
+            assert!(stood, "the connection stands");
+            assert!(
+                matches!(
+                    written.as_slice(),
+                    [ControlFrame::Response(kr_protocol::envelope::Response {
+                        outcome: kr_protocol::envelope::Outcome::Ok(_),
+                        ..
+                    })]
+                ),
+                "the answer was written: {written:?}"
+            );
+        }
+        drop(connection);
+        drop(controller);
     }
 }
