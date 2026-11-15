@@ -858,26 +858,31 @@ async fn kr_req_24_09_a_report_made_while_the_daemon_is_down_is_recorded_when_it
 /// failed waits for the claim's deadline and is then made, whatever the daemon did with the claim.
 /// Here it made none, so the binding is still `recorded` and the report ends.
 ///
-/// The daemon stops only once the worker has the draft. A daemon that is gone before the worker
-/// asks for the draft fails the read, so the worker asks for no claim and owes no report; that is a
-/// different outcome, and the test would wait for a report that nothing makes.
+/// The daemon stops only after the worker has read the draft and its call to the component has
+/// returned, and the worker is held there, before it asks for the claim. Other orders owe no
+/// report, and the test would wait for one that nothing makes. A daemon that goes before the worker
+/// has the draft fails the read, so the worker asks for no claim; so does one that is stopped while
+/// it writes its answer to the read, because stopping the daemon ends the exchanges under way. And
+/// the worker's preparation is bounded, from the read to the claim: a stop that the worker waits
+/// on, and that takes the bound's length, ends the preparation before the claim. Held before the
+/// claim, the worker waits on nothing while the daemon stops, and asks the claim of a daemon that
+/// is gone with whatever is left of the bound, or none. The action's accepted deadline is measured
+/// on a clock that stays where it is, so the stop does not run it out either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_24_09_a_claim_the_daemon_did_not_answer_is_settled_by_a_report() {
-    let Some((mut acting, draft, handle)) = offering().await else {
+    let Some((mut acting, draft, handle)) = offering_held().await else {
         return;
     };
     let mut watcher = acting.client().await;
     let mut asking = acting.client().await;
-    let (read, go_on) = acting
+    let held = acting
         .hosted
-        .controller
-        .as_ref()
-        .expect("a daemon")
-        .transfer()
-        .pause_after_a_read();
+        ._service
+        .broker()
+        .component_calls()
+        .hold_replies();
     let mutation = acting.offering(&asking, "attach.photo", draft.draft_id, handle.transfer_id);
     let action_id = mutation.action_id;
-    acting.gate().hold();
     asking
         .writer()
         .write_message(&kr_protocol::envelope::ControlFrame::Mutation(Box::new(
@@ -887,13 +892,14 @@ async fn kr_req_24_09_a_claim_the_daemon_did_not_answer_is_settled_by_a_report()
         .expect("writes the mutation");
     until_receipt(&mut watcher, action_id, ReceiptState::Accepted).await;
 
-    // The daemon is serving the worker's read of the draft. It is let go only once the exchange it
-    // is serving has ended, so the worker has the draft when the daemon goes away, and the
-    // component's reply is kept back, so it has not answered.
-    until_the_daemon_holds(read).await;
-    go_on.send(()).expect("lets the answer go");
+    // The worker has read the draft, its call to the component has returned, and nothing the daemon
+    // serves is in flight. The worker is let go only once the daemon is gone.
+    until("the worker to be held before its claim", || async {
+        held.parked().then_some(())
+    })
+    .await;
     acting.hosted.stop_daemon().await;
-    acting.gate().release();
+    held.release();
     let finished = answer(&mut asking, Some(1)).await;
     let Outcome::Error(refusal) = finished else {
         panic!("an offer whose claim nobody answered was carried: {finished:?}");
@@ -901,9 +907,12 @@ async fn kr_req_24_09_a_claim_the_daemon_did_not_answer_is_settled_by_a_report()
     assert_eq!(refusal.code, ErrorCode::ResourceUnavailable, "{refusal:?}");
     assert!(acting.frames().is_empty());
 
-    until("a report to wait for the claim's deadline", || async {
-        (acting.hosted._service.broker().drafts().reports_waiting() == 1).then_some(())
-    })
+    until(
+        &format!("a report to wait for the claim's deadline, after the refusal {refusal:?}"),
+        || async {
+            (acting.hosted._service.broker().drafts().reports_waiting() == 1).then_some(())
+        },
+    )
     .await;
     acting.hosted.start_daemon_again().await;
     until("the report to be made and refused for good", || async {
