@@ -68,8 +68,9 @@ the macOS and Windows plans against the landing workflow's jobs, so the report c
 them unnoticed.
 
 `.github/workflows/conformance.yml` runs the report on each platform every night, with every group
-the platform runs. A run started by hand takes a `groups` input, written as `--group` names
-separated by spaces, and the switches `linux`, `macos` and `windows`, which leave a job out.
+the platform runs; the macOS and Windows plans each run as two parts, one in each job of a matrix. A
+run started by hand takes a `groups` input, written as `--group` names separated by spaces, and the
+switches `linux`, `macos` and `windows`, which leave a job out.
 
 Every `cargo test` step that keeps each test's output captured runs with `--show-output`, which
 prints what every passing test wrote under its name. A step that shows the output as it is written,
@@ -101,11 +102,16 @@ its output, and the run exits 1. `--all-terminals` takes no `--group`.
 
 `--part <number>/<parts>` runs one part of the platform's plan, for a plan that one job cannot hold.
 Every part runs the build steps that open the plan, which the suites that start a program need, and
-then its share of the other steps, cut in order into parts of nearly equal count. Each part writes
-its own result: a test that another part runs is recorded as not run, with the reason saying that
-this run is one part of the plan, and the result's `run.part` names the part. The Windows job runs
-its plan as two parts, one in each job of its matrix, and a part that fails does not stop the
-other.
+then its share of the other steps, cut in order into parts of nearly equal count. A plan that holds
+the workspace's tests, a single `cargo test --workspace` step that takes most of a plan's time, puts
+that step alone in part 1 with the opening builds, and cuts every other step into the remaining
+parts by count; a plan without that step is cut by count alone. Each part writes its own result: a
+test that another part runs is recorded as not run, with the reason saying that this run is one
+part of the plan, and the result's `run.part` names the part. A group with no step in a part leaves
+that part with nothing to run. The Windows job runs its plan as two parts, cut by count, and the
+macOS job runs its plan as two parts: the build of the worker, which opens the plan, with the
+workspace's tests, and the same build with every other step. Each part is one job of its platform's
+matrix, and a part that fails does not stop the other.
 
 ### The report's own program
 
@@ -129,7 +135,7 @@ The observation changes no exit status: a run with a failed step ends with failu
 
 A hosted macOS runner's data volume has returned I/O errors in bursts while a build ran. The linker writes its output through a memory map, so a program written in a burst can read as zeros or end early with no error from the linker, and Cargo takes it for built. A damaged program does not show who damaged it. When every failed step of a night carries an observation with damage seen, the night fits that fault, and the person runs the failed job once more by hand. That run gets a new runner and a new disk, and its result is the night's. The report starts no such run, and no workflow does. A night with a failed step that carries no such observation is read as the repository's.
 
-The macOS job also keeps two diagnostics, each with its times: the kernel's lines about failed writes to storage over the job's window, in `disk-faults.txt` in the evidence directory, and the free-space samples, which its closing step prints as the lowest in each interval and as one reading every ten minutes. They decide nothing in the report. The report's program starts no program of its own that signals a process or reads a log. `scripts/disk-report.sh` takes the samples and reads the kernel's log, and it signals no process: its sampler ends when a stop file holds its token, and its read of the log runs under `sudo -n`, which never asks for a password, and sets its own alarm, which ends the read after 90 seconds when `log` keeps the default action for the alarm signal, and the step's own limit of four minutes ends it otherwise. Where `sudo -n` is refused a plain read follows, and where neither reads, the script says so.
+Each part of the macOS job also keeps two diagnostics, each with its times: the kernel's lines about failed writes to storage over the job's window, in `disk-faults.txt` in the evidence directory, and the free-space samples, which its closing step prints as the lowest in each interval and as one reading every ten minutes. They decide nothing in the report. The report's program starts no program of its own that signals a process or reads a log. `scripts/disk-report.sh` takes the samples and reads the kernel's log, and it signals no process: its sampler ends when a stop file holds its token, and its read of the log runs under `sudo -n`, which never asks for a password, and sets its own alarm, which ends the read after 90 seconds when `log` keeps the default action for the alarm signal, and the step's own limit of four minutes ends it otherwise. Where `sudo -n` is refused a plain read follows, and where neither reads, the script says so.
 
 ### The classes of test in the landing workflow
 
@@ -588,8 +594,8 @@ recorded with its address as the
 reason, and the log names the address of a library; a program
 built against a library that is not installed is not built, and its reason names the library. The
 nightly workflow keeps the release archives in the Actions cache under the lock that pins them and
-the script that fetches them, and a default-branch run saves them, whether or not its report passed,
-when its index reads, is for that lock, names every program the lock pins and names none of them as
+the script that fetches them, and a default-branch run saves them (the macOS job in its part 1 alone),
+whether or not its report passed, when its index reads, is for that lock, names every program the lock pins and names none of them as
 not installed. The fetch checks each archive it finds there against its pin and fetches
 again any that does not match, so an outage at a release's host costs nothing on a night that
 already holds its archive. Nothing is taken from a package manager.

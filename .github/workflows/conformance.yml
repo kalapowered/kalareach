@@ -206,9 +206,21 @@ jobs:
           if-no-files-found: error
 
   macos:
-    name: macos
+    name: macos part ${{ matrix.part }} of 2
     if: github.event_name != 'workflow_dispatch' || inputs.macos
     runs-on: macos-15
+    # The platform's plan is run in two parts, one in each job of the matrix: the whole plan took 286
+    # minutes on 14 November, 5 minutes under its limit, and ran out of its limit of 287 minutes on 15
+    # November in its last step. Part 1 is the workspace's tests by themselves, which the report
+    # keeps apart for this: they took 186 and 192 minutes on those two nights, 190 and 196 minutes of
+    # the report's step with the fetch of the applications and the build of the report that open it.
+    # Part 2 is every other step of the plan, 92 and 91 minutes on those nights, with the build of
+    # the worker that opens the plan in both parts, and the compiling that the workspace's tests did
+    # for it before. A part that fails does not stop the other.
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2]
     # The limits of the steps add up to less than this one, so a step that hangs is ended and the
     # steps after it still report. The job's own limit is under GitHub's six hours.
     timeout-minutes: 355
@@ -355,38 +367,41 @@ jobs:
           key: conformance-applications-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/conformance/applications.lock', 'scripts/run-conformance.sh') }}
           restore-keys: conformance-applications-${{ runner.os }}-${{ runner.arch }}-
 
-      # The step runs every group of the platform one after the other, and it grows with the
-      # suites. It took 207 to 240 minutes on the eleven nights of 30 October to 9 November, and it
-      # ran into its former limit of 240 minutes on 3, 8 and 9 November. Taking the steps a night
-      # did not reach at the pace of the steps it did, those nights needed about 246, 262 and 244
-      # minutes: 8 November's runner ran 14 percent slower than 7 November's, and the outage of that
-      # night's downloads added 3 minutes more. The limit is what the job's limit leaves once the
-      # other steps have theirs, less 3 minutes for the set-up and clean-up that no step limit
+      # The step runs the groups of its part of the platform's plan one after the other, and it
+      # grows with the suites. The whole plan took 207 to 240 minutes on the eleven nights of 30
+      # October to 9 November, when taking the steps a night did not reach at the pace of the steps
+      # it did gave 262 minutes for 8 November, and then 282 minutes on 14 November and more than
+      # 287 on 15 November. The limit is what the job's limit leaves once
+      # the other steps have theirs, less 3 minutes for the set-up and clean-up that no step limit
       # counts. Those steps' limits add up to 65 minutes, each at least twice the longest its step
       # took in the eleven nights (the disk step, at 3.8 minutes, has 8; the closing report, which
       # also reads the kernel's log for failed writes to the volume, has 4), so the limits of the
-      # job's steps add up to 352 of its 355 minutes, under GitHub's six hours. The report's 287
-      # minutes are 22 over 8 November's need with its outage, 25 over it without, and 3 over it
-      # with the fetch's worst case (22 and a half minutes, in scripts/run-conformance.sh) in place
-      # of the outage.
+      # job's steps add up to 352 of its 355 minutes, under GitHub's six hours. Part 1, the
+      # workspace's tests, took 190 and 196 minutes of the step on 14 and 15 November, so a part
+      # keeps 91 minutes of the 287, more than a quarter of it: a runner a quarter slower than
+      # 15 November's takes 245.
       - name: The conformance report
         timeout-minutes: 287
         env:
           REPORT_GROUPS: ${{ inputs.groups }}
+          REPORT_PART: ${{ matrix.part }}
         run: |
           read -r -a names <<< "$REPORT_GROUPS"
           arguments=()
           for name in ${names[@]+"${names[@]}"}; do
             arguments+=(--group "$name")
           done
-          bash scripts/run-conformance.sh ${arguments[@]+"${arguments[@]}"}
+          bash scripts/run-conformance.sh --part "$REPORT_PART/2" ${arguments[@]+"${arguments[@]}"}
 
       # The archives are held when the index the fetch wrote reads, is for this lock, names every
       # program the lock pins, and names none of them as unavailable: an index that is empty, cut
-      # short or missing a program is not one to save the archives under.
+      # short or missing a program is not one to save the archives under. Both parts restore the
+      # archives and fetch what is missing, since the report's plan reads the index in each; part 1
+      # alone saves them, so that two parts do not save under one key, and the save that follows
+      # this check runs only when it says they are held.
       - name: Check that every application's archive is held
         id: applications-held
-        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.applications.outputs.cache-hit != 'true' && (inputs.groups == '' || contains(inputs.groups, 'applications')) }}
+        if: ${{ !cancelled() && matrix.part == 1 && github.ref == 'refs/heads/main' && steps.applications.outputs.cache-hit != 'true' && (inputs.groups == '' || contains(inputs.groups, 'applications')) }}
         timeout-minutes: 1
         run: |
           index="$HOME/Library/Caches/kalareach/conformance-applications/index.json"
@@ -435,7 +450,7 @@ jobs:
         timeout-minutes: 5
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: conformance-macos
+          name: conformance-macos-part-${{ matrix.part }}
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
           if-no-files-found: error
 

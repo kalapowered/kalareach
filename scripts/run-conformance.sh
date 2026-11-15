@@ -10,6 +10,9 @@
 #   scripts/run-conformance.sh --all-terminals    every group, and then section 27's terminal
 #                                                 matrix, which fails naming each terminal until
 #                                                 its runs exist
+#   scripts/run-conformance.sh --part <n>/<m>     part n of m of the platform's plan, as the
+#                                                 report's own --part cuts it; the nightly macOS
+#                                                 job runs two, as the Windows job does
 #
 # The evidence directory is KR_TEST_ARTIFACTS_DIR, or a new directory under the platform's
 # temporary directory when that is not set. The report refuses one outside the temporary
@@ -35,6 +38,7 @@ cd "$root"
 
 groups=()
 all_terminals=0
+part=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --group)
@@ -43,8 +47,13 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         --all-terminals) all_terminals=1 ;;
+        --part)
+            [ $# -ge 2 ] || { echo "run-conformance: --part needs <number>/<parts>" >&2; exit 2; }
+            part="$2"
+            shift
+            ;;
         -h|--help)
-            sed -n '2,29p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            sed -n '2,32p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             exit 2
             ;;
         *) echo "run-conformance: unknown argument $1" >&2; exit 2 ;;
@@ -393,6 +402,7 @@ if [ ${#groups[@]} -gt 0 ]; then
     done
 fi
 [ "$all_terminals" -eq 1 ] && arguments+=(--all-terminals)
+[ -n "$part" ] && arguments+=(--part "$part")
 
 if selected applications; then
     case "$family" in
