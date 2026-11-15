@@ -162,6 +162,10 @@ pub enum ActionRecord {
     Answered {
         /// The encoded result.
         result: Vec<u8>,
+        /// What the entries of a revocation's result read, kept with it in one write, when the
+        /// action kept that. Nothing for any other action, and for a revocation whose result was
+        /// kept without it.
+        reads: Option<Vec<u8>>,
     },
     /// The action was refused, and this is the refusal it was given.
     Refused {
@@ -230,9 +234,18 @@ impl LiveClaims {
 pub struct ClaimHold {
     live: Arc<LiveClaims>,
     key: ClaimKey,
+    /// What the entries of the result this attempt is making read, to be kept with the result in
+    /// the one write that keeps it. Filled once.
+    reads: std::sync::OnceLock<Vec<u8>>,
 }
 
 impl ClaimHold {
+    /// Sets what the entries of the result read, to be kept with it. Only the first is kept, and
+    /// the answer is whether this was it.
+    pub(crate) fn keep_reads(&self, record: Vec<u8>) -> bool {
+        self.reads.set(record).is_ok()
+    }
+
     /// Keeps this attempt's entry for as long as this daemon runs, however the attempt ends.
     ///
     /// For an attempt that ended after it may have written what it was claimed for, and whose
@@ -540,6 +553,7 @@ impl GrantDirectory {
                      refusal_code   TEXT,
                      refusal_detail TEXT,
                      withdrawn      BLOB,
+                     reads          BLOB,
                      PRIMARY KEY (actor_id, action_id)
                  );
                  CREATE TABLE IF NOT EXISTS voice_delegations (
@@ -2311,6 +2325,7 @@ impl GrantDirectory {
                 hold: ClaimHold {
                     live: Arc::clone(&self.live),
                     key: key.clone(),
+                    reads: std::sync::OnceLock::new(),
                 },
             }))
         });
@@ -2337,7 +2352,7 @@ impl GrantDirectory {
         self.with(|connection| {
             connection
                 .execute(
-                    "UPDATE authority_receipts SET result = ?3, recorded_at_ms = ?4
+                    "UPDATE authority_receipts SET result = ?3, recorded_at_ms = ?4, reads = ?5
                       WHERE actor_id = ?1 AND action_id = ?2
                         AND result IS NULL AND refusal_code IS NULL",
                     params![
@@ -2345,6 +2360,7 @@ impl GrantDirectory {
                         hold.key.1.as_slice(),
                         result,
                         i64::try_from(now_ms).unwrap_or(i64::MAX),
+                        hold.reads.get().map(Vec::as_slice),
                     ],
                 )
                 .map(|_| ())
@@ -3448,7 +3464,13 @@ fn the_share_that_holds_it(earlier: ActionId, doubtful: bool) -> String {
 
 /// One claim row, as the store reads it back: the digest, the result once there is one, and the
 /// refusal's code and words once there is one of those.
-type ClaimRow = (Vec<u8>, Option<Vec<u8>>, Option<String>, Option<String>);
+type ClaimRow = (
+    Vec<u8>,
+    Option<Vec<u8>>,
+    Option<String>,
+    Option<String>,
+    Option<Vec<u8>>,
+);
 
 /// What the store holds about one claimed action, on a connection the caller holds.
 ///
@@ -3462,15 +3484,23 @@ fn read_claim(
 ) -> Result<Option<ActionRecord>> {
     let held: Option<ClaimRow> = connection
         .query_row(
-            "SELECT payload_digest, result, refusal_code, refusal_detail
+            "SELECT payload_digest, result, refusal_code, refusal_detail, reads
                FROM authority_receipts
               WHERE actor_id = ?1 AND action_id = ?2",
             params![key.0, key.1.as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()
         .map_err(ControllerError::registry)?;
-    let Some((digest, result, refusal_code, refusal_detail)) = held else {
+    let Some((digest, result, refusal_code, refusal_detail, reads)) = held else {
         return Ok(None);
     };
     if digest.as_slice() != payload_digest.as_bytes() {
@@ -3479,7 +3509,7 @@ fn read_claim(
         });
     }
     if let Some(result) = result {
-        return Ok(Some(ActionRecord::Answered { result }));
+        return Ok(Some(ActionRecord::Answered { result, reads }));
     }
     if let Some(code) = refusal_code {
         // A refusal kept under a code this build cannot read is the record of an action that was
@@ -3504,9 +3534,11 @@ fn read_claim(
 
 /// Brings a receipts table an earlier build wrote to the shape this one reads, once.
 ///
-/// Two earlier shapes exist. One carried a lease column, from when a later attempt could take over
-/// a claim whose lease had run out; that column goes, and nothing reads it. Both lacked the columns
-/// a refusal and a revocation's withdrawal are kept in, which are added empty. The rows stay as
+/// Three earlier shapes exist. One carried a lease column, from when a later attempt could take over
+/// a claim whose lease had run out; that column goes, and nothing reads it. The first two lacked the
+/// columns a refusal and a revocation's withdrawal are kept in, which are added empty. The third
+/// lacked the column that keeps what a revocation's result read beside it, which is added empty: a
+/// result kept without it reads as one whose entries' reads are not known. The rows stay as
 /// they were: a claim with no result in either shape belongs to an attempt that ended with the
 /// daemon that wrote it, which is what a row with no result and no hold reads as. Such a claim's
 /// revocation may have withdrawn grants without saying which, so its withdrawal is marked as one
@@ -3517,7 +3549,7 @@ fn read_claim(
 /// at once change it once.
 ///
 /// Remove this upgrade once no supported upgrade starts from a build that wrote the receipts table
-/// with the lease column or without the refusal and withdrawal columns.
+/// with the lease column or without the refusal, withdrawal and reads columns.
 fn migrate_receipts(connection: &Connection) -> Result<()> {
     let transaction =
         rusqlite::Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)
@@ -3550,6 +3582,11 @@ fn migrate_receipts(connection: &Connection) -> Result<()> {
                  UPDATE authority_receipts SET withdrawn = x''
                   WHERE result IS NULL AND refusal_code IS NULL;",
             )
+            .map_err(ControllerError::registry)?;
+    }
+    if !columns.contains("reads") {
+        transaction
+            .execute_batch("ALTER TABLE authority_receipts ADD COLUMN reads BLOB;")
             .map_err(ControllerError::registry)?;
     }
     transaction.commit().map_err(ControllerError::registry)
@@ -5155,7 +5192,8 @@ mod tests {
                 .recorded_action(&actor, ActionId::new(Uuid::from_bytes([9; 16])), &digest)
                 .expect("reads"),
             Some(ActionRecord::Answered {
-                result: b"answer".to_vec()
+                result: b"answer".to_vec(),
+                reads: None
             })
         );
 
@@ -5180,6 +5218,140 @@ mod tests {
             store.stored_policy().expect("reads"),
             Some(policy_at(2)),
             "the policy did not move"
+        );
+    }
+
+    /// A revocation's result is kept with what its entries read in the one write that keeps it,
+    /// and the slot that holds it fills once: a second record is refused, and the result a claim
+    /// holds takes no second write that could pair it with another record.
+    #[test]
+    fn a_result_is_kept_with_what_its_entries_read_in_one_write() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        let store = GrantDirectory::open(&path).expect("the store opens");
+        let hold = claimed(&store);
+        assert!(hold.keep_reads(b"first".to_vec()), "the first is kept");
+        assert!(!hold.keep_reads(b"second".to_vec()), "the slot fills once");
+        store
+            .retain_result(&hold, b"answer", 2)
+            .expect("the answer is kept");
+        drop(hold);
+        let actor = ActorId::new("local:1").expect("an actor");
+        let digest = Digest256::from_bytes([3; 32]);
+        let action = ActionId::new(Uuid::from_bytes([9; 16]));
+        let kept = ActionRecord::Answered {
+            result: b"answer".to_vec(),
+            reads: Some(b"first".to_vec()),
+        };
+        assert_eq!(
+            store
+                .recorded_action(&actor, action, &digest)
+                .expect("reads"),
+            Some(kept.clone())
+        );
+        // The row is immutable once it holds a result: nothing later pairs it with other reads.
+        let ActionClaim::Recorded(_) = store
+            .claim_action(&actor, action, &digest, 3)
+            .expect("a second claim")
+        else {
+            panic!("the action holds an answer already");
+        };
+        assert_eq!(
+            store
+                .recorded_action(&actor, action, &digest)
+                .expect("reads"),
+            Some(kept)
+        );
+    }
+
+    /// A result kept by an attempt that filled no slot reads as one whose entries' reads are not
+    /// known: the column holds nothing, and so does a result another writer kept.
+    #[test]
+    fn a_result_kept_without_what_its_entries_read_reads_as_not_known() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        let store = GrantDirectory::open(&path).expect("the store opens");
+        let hold = claimed(&store);
+        store
+            .retain_result(&hold, b"answer", 2)
+            .expect("the answer is kept");
+        drop(hold);
+        let actor = ActorId::new("local:1").expect("an actor");
+        let digest = Digest256::from_bytes([3; 32]);
+        assert_eq!(
+            store
+                .recorded_action(&actor, ActionId::new(Uuid::from_bytes([9; 16])), &digest)
+                .expect("reads"),
+            Some(ActionRecord::Answered {
+                result: b"answer".to_vec(),
+                reads: None
+            })
+        );
+    }
+
+    /// A receipts table that an earlier build wrote, with no column for what a result's entries
+    /// read, gains it empty on open, keeps its rows as they were, and a second open changes nothing.
+    #[test]
+    fn a_receipts_table_without_the_reads_column_gains_it_and_keeps_its_rows() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        {
+            let connection = Connection::open(&path).expect("a database");
+            connection
+                .execute_batch(
+                    "CREATE TABLE authority_receipts (
+                         actor_id       TEXT NOT NULL,
+                         action_id      BLOB NOT NULL,
+                         payload_digest BLOB NOT NULL,
+                         claimed_at_ms  INTEGER NOT NULL,
+                         result         BLOB,
+                         recorded_at_ms INTEGER,
+                         refusal_code   TEXT,
+                         refusal_detail TEXT,
+                         withdrawn      BLOB,
+                         PRIMARY KEY (actor_id, action_id)
+                     );",
+                )
+                .expect("the earlier table");
+            connection
+                .execute(
+                    "INSERT INTO authority_receipts
+                         (actor_id, action_id, payload_digest, claimed_at_ms, result, recorded_at_ms)
+                     VALUES ('local:1', ?1, ?2, 1, x'6b657074', 2)",
+                    params![[9_u8; 16].as_slice(), [3_u8; 32].as_slice()],
+                )
+                .expect("an answered row");
+        }
+        let actor = ActorId::new("local:1").expect("an actor");
+        let digest = Digest256::from_bytes([3; 32]);
+        for _ in 0..2 {
+            let store = GrantDirectory::open(&path).expect("the store opens");
+            assert_eq!(
+                store
+                    .recorded_action(&actor, ActionId::new(Uuid::from_bytes([9; 16])), &digest)
+                    .expect("reads"),
+                Some(ActionRecord::Answered {
+                    result: b"kept".to_vec(),
+                    reads: None
+                }),
+                "the row stays as it was, with nothing read"
+            );
+        }
+        let connection = Connection::open(&path).expect("a database");
+        let columns: Vec<String> = connection
+            .prepare(
+                "SELECT name FROM pragma_table_info('authority_receipts') WHERE name = 'reads'",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()
+            })
+            .expect("the columns");
+        assert_eq!(
+            columns,
+            vec!["reads".to_owned()],
+            "the column is added once"
         );
     }
 }
