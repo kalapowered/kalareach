@@ -186,6 +186,23 @@ pub(super) fn a_detach_may_have_acted(
     }
 }
 
+/// Whether a launch whose call to the worker ended as `carried_out` is told to the device as one
+/// whose outcome is unknown: the host's own call timed out or its link ended under it, or the
+/// worker said so. What the host does not know it does not say, and it does not know whether the
+/// launch will start.
+fn a_launch_is_unknown(
+    carried_out: &std::result::Result<Result<Forwarded>, tokio::task::JoinError>,
+) -> bool {
+    match carried_out {
+        Ok(Ok(answered)) => matches!(
+            &answered.response.outcome,
+            Outcome::Error(error) if error.code == ErrorCode::OutcomeUnknown
+        ),
+        Ok(Err(error)) => error.to_protocol_error().code == ErrorCode::OutcomeUnknown,
+        Err(_) => true,
+    }
+}
+
 impl RemoteConnection {
     /// The entry of `mutation` among the calls that have not claimed the route of their action: the
     /// one the transport's reader made when it read the frame (`hold`), and otherwise a new one,
@@ -592,9 +609,17 @@ impl RemoteConnection {
             answering,
             Method::InputRelease | Method::SessionDetach | Method::ShellLaunch
         );
+        let serves_lane = self.inputs.serves_lane(&proxy);
+        // A worker without the lane writes no marker when its launch handling ends, so the client's
+        // hold on later typing ends only with the stream the launch's barrier names. When the
+        // launch's result stays unknown, that stream is ended below.
+        let launching = barrier
+            .as_ref()
+            .filter(|_| answering == Method::ShellLaunch && !serves_lane)
+            .map(|barrier| barrier.attachment_id);
         if carries_lane_members {
             mutation.params = super::super::input::barrier::params_for_worker(
-                self.inputs.serves_lane(&proxy),
+                serves_lane,
                 answering,
                 &mutation.params,
             )?;
@@ -627,7 +652,7 @@ impl RemoteConnection {
         let standing = self.feed_standing(&acting.grant);
         let effect = tokio::spawn(async move {
             if let Some(answered) = scripted {
-                return Ok(answered);
+                return answered;
             }
             proxy
                 .forward_mutation(
@@ -651,6 +676,11 @@ impl RemoteConnection {
             && a_detach_may_have_acted(&carried_out)
         {
             self.inputs.detached(self.connection_id(), attachment);
+        }
+        if let Some(attachment) = launching
+            && a_launch_is_unknown(&carried_out)
+        {
+            self.inputs.cut(self.connection_id(), attachment);
         }
         match carried_out {
             Ok(Ok(answered)) => {
