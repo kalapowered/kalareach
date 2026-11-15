@@ -25,10 +25,11 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use kr_protocol::envelope::{Outcome, Response};
+use kr_protocol::envelope::{Outcome, Request, Response};
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::{AttachmentId, SessionId};
+use kr_protocol::ids::{AttachmentId, RequestId, SessionId};
 use kr_protocol::input::InputFrame;
+use kr_protocol::retained::Level;
 use kr_transport::streams::{DataReader, StreamHandle};
 use tokio::sync::{oneshot, watch};
 
@@ -85,6 +86,24 @@ const fn precedes_acceptance(code: ErrorCode) -> bool {
             | ErrorCode::ResourceUnavailable
             | ErrorCode::PermissionDenied
     )
+}
+
+/// The `input.write` that carries `frame` to a worker at `level`: its parameters in the shape that
+/// level reads, or the refusal when the level has no counterpart for them. A worker at this release's
+/// own level is written them as they are.
+fn request_for(
+    level: Level,
+    request_id: RequestId,
+    session: SessionId,
+    attachment: AttachmentId,
+    frame: InputFrame,
+) -> Result<Request, ProtocolError> {
+    let mut request = write_request(request_id, session, attachment, frame)
+        .ok_or_else(|| refusal("this typing could not be encoded"))?;
+    request.params = level
+        .encode_input_write(&request.params)
+        .map_err(|error| input_write_refusal(&error))?;
+    Ok(request)
 }
 
 /// Reads the stream and carries each frame to the worker in turn. Returns when the stream ends.
@@ -181,19 +200,13 @@ async fn carry(
         }
     };
     let request_id = flow.next_request_id();
-    let Some(mut request) = write_request(request_id, session, attachment, frame) else {
-        flow.refuse(epoch, sequence, refusal("this typing could not be encoded"));
-        return;
-    };
-    // A worker of a retained level is written the shape that level reads, or the frame is refused
-    // here when the level has no counterpart for it.
-    match proxy.level().encode_input_write(&request.params) {
-        Ok(params) => request.params = params,
+    let request = match request_for(proxy.level(), request_id, session, attachment, frame) {
+        Ok(request) => request,
         Err(error) => {
-            flow.refuse(epoch, sequence, input_write_refusal(&error));
+            flow.refuse(epoch, sequence, error);
             return;
         }
-    }
+    };
     flow.stages.before_a_serial_call().await;
     {
         let mut state = flow.lock();
@@ -260,5 +273,61 @@ async fn carry(
             flow.end(End::Graceful);
         }
         Class::Uncertain => flow.end(End::Cut),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kr_cbor::CanonicalValue;
+    use kr_protocol::ids::InputLeaseEpoch;
+    use kr_protocol::scalars::{Bytes, Uuid};
+
+    use super::*;
+
+    fn written_for(level: Level) -> Request {
+        let frame = InputFrame {
+            epoch: InputLeaseEpoch::new(3),
+            sequence: kr_protocol::ids::InputSequence::new(0),
+            bytes: Bytes::new(b"ls\r".to_vec()),
+        };
+        request_for(
+            level,
+            RequestId::new(1),
+            SessionId::new(Uuid::from_bytes([1; 16])),
+            AttachmentId::new(Uuid::from_bytes([2; 16])),
+            frame,
+        )
+        .expect("the frame is written")
+    }
+
+    fn member<'a>(request: &'a Request, name: &str) -> Option<&'a CanonicalValue> {
+        match request.params.as_value() {
+            CanonicalValue::Map(map) => map.get(name),
+            _ => panic!("the parameters of a write are a map"),
+        }
+    }
+
+    /// A worker of the level before the one that reads the `input` union is written its keys as the
+    /// bytes at the top of the parameters, with no `input` member, and a worker at this release's
+    /// level is written the parameters as they are.
+    #[test]
+    fn a_frame_is_written_in_the_shape_of_the_workers_level() {
+        let retained = written_for(Level::retained(&kr_protocol::retained::RETAINED[0]));
+        assert_eq!(
+            member(&retained, "bytes"),
+            Some(&CanonicalValue::Bytes(b"ls\r".to_vec())),
+            "the keys are bytes at the top"
+        );
+        assert!(
+            member(&retained, "input").is_none(),
+            "the level before has no `input` member"
+        );
+
+        let current = written_for(Level::this());
+        assert!(
+            member(&current, "input").is_some(),
+            "this level reads the union"
+        );
+        assert!(member(&current, "bytes").is_none(), "no bytes at the top");
     }
 }
