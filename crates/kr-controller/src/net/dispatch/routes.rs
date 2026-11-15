@@ -1909,7 +1909,9 @@ impl RemoteConnection {
             }
         };
         match origin {
-            Origin::Fresh => Ok(answer),
+            // No service a paired device reaches refuses after an effect of its own: the answer is
+            // the one the submission made.
+            Origin::Fresh | Origin::AfterAnEffect => Ok(answer),
             Origin::Copied => {
                 self.kept_copy(answer, entry.method, mutation, validated, &decided, asked)
                     .await
@@ -1977,7 +1979,7 @@ impl RemoteConnection {
                         )
                     })?;
                 match origin {
-                    Origin::Fresh => Ok(Some(answer)),
+                    Origin::Fresh | Origin::AfterAnEffect => Ok(Some(answer)),
                     Origin::Copied => self
                         .kept_copy(answer, method, mutation, validated, decided, asked)
                         .await
