@@ -4931,6 +4931,117 @@ async fn a_worker_that_gives_no_count_is_not_given_one() {
     assert_eq!(detached.fenced_bytes, None, "no count is invented");
     rig.stop().await;
 }
+
+// What revokes a stream with no end of the adapter's own, what the worker refused when a stream is
+// replaced, and which stream a launch's unknown result ends.
+
+/// The ways that something revokes a stream that set no end of its flow.
+#[derive(Clone, Copy, Debug)]
+enum Revoked {
+    /// A launch of a worker without the lane, whose result is unknown, ends the stream it followed.
+    ByAnUnknownLaunch,
+    /// A stream that opens for the same attachment replaces it.
+    ByAReplacement,
+    /// The connection's grant ends, and its release revokes every stream it holds.
+    ByTheConnectionsRelease,
+}
+
+/// A frame waits at the adapter's entry, after the host's decision and before its call, while its
+/// stream is revoked by `how`: the adapter makes no call for it. A call that is already at the
+/// link's writer is another matter and is not dropped, so the case holds the frame before that.
+async fn a_frame_waiting_to_be_called_is_not_called_once_its_stream_is_revoked(how: Revoked) {
+    let rig = Rig::start_withholding_the_lane().await;
+    let calls = script_calls(&rig, None, |_| took());
+    let stages = rig.adopted.host.network().input_stages();
+    let mut stream = rig.open().await;
+    type_and_wait(&rig, &mut stream, 0, b"a").await;
+    let mut ended = rig.adopted.host.network().input_tasks_ended();
+    let (at_call, go_call) = stages.hold_before_a_serial_call();
+    stream
+        .write_message(&rig.frame(1, b"b"))
+        .await
+        .expect("the frame is written");
+    arrived(at_call).await;
+
+    let mut newer = None;
+    let mut handler = None;
+    match how {
+        Revoked::ByAnUnknownLaunch => {
+            stages.script_dependent_answers(|_| SerialAnswer::Silent);
+            let unknown = send_after(&rig, Dependent::Launch, rig.epoch, 1).await;
+            assert!(
+                matches!(&unknown.answer, Err(error) if error.code == ErrorCode::OutcomeUnknown),
+                "the launch's result is unknown: {:?}",
+                unknown.answer
+            );
+        }
+        Revoked::ByAReplacement => newer = Some(rig.open().await),
+        Revoked::ByTheConnectionsRelease => {
+            // The handler is held, so the connection's end waits behind it and the stream's end is
+            // the release's alone.
+            let (answered, release) = rig.adopted.host.pause_after_a_frame_is_answered();
+            rig.device
+                .read(Method::HostInfo, &NoParams {})
+                .await
+                .expect("the read is answered");
+            arrived(answered).await;
+            rig.adopted
+                .host
+                .controller()
+                .raise_the_unverified_withdrawal_refusal()
+                .await;
+            // Every stream of the connection is revoked before its accounts are given up.
+            until("the release revoked the streams", || {
+                stages.counts().accounts == 0
+            })
+            .await;
+            handler = Some(release);
+        }
+    }
+
+    // The stream's task is held, so the reset comes when it ends.
+    let _ = go_call.send(());
+    assert!(
+        reads_to_the_end(&mut stream, 1).await.is_err(),
+        "{how:?}: the stream is reset"
+    );
+    tokio::time::timeout(WAIT, ended.changed())
+        .await
+        .expect("the stream task ended in time")
+        .expect("the count stands");
+    // A call that was made would have been recorded by now.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        calls.sequences(),
+        vec![0],
+        "{how:?}: the worker was given the frame that waited, after its stream was revoked"
+    );
+    drop((newer, handler));
+    rig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_waiting_to_be_called_is_not_called_after_an_unknown_launch_ends_its_stream() {
+    a_frame_waiting_to_be_called_is_not_called_once_its_stream_is_revoked(
+        Revoked::ByAnUnknownLaunch,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_waiting_to_be_called_is_not_called_after_a_newer_stream_replaces_its_stream() {
+    a_frame_waiting_to_be_called_is_not_called_once_its_stream_is_revoked(Revoked::ByAReplacement)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_waiting_to_be_called_is_not_called_after_the_connections_release() {
+    a_frame_waiting_to_be_called_is_not_called_once_its_stream_is_revoked(
+        Revoked::ByTheConnectionsRelease,
+    )
+    .await;
+}
+
 /// The worker refuses the frame at sequence 0 for room, which an older worker counts as a sequence
 /// taken, and the device then gets a new stream for the same attachment: while the older still
 /// stands (it replaces it), or after the older's task ended. The new stream's frame 1 is accepted.

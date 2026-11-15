@@ -210,12 +210,15 @@ async fn carry(
     flow.stages.before_a_serial_call().await;
     {
         let mut state = flow.lock();
-        if state.ended.is_some() {
-            // The stream ended while the frame was decided: nothing is written for it. The check is
-            // made here, where the frame is entered, and the call that is entered below is never
-            // dropped, since a call stopped part way through its write would close the link that
-            // carries the worker's other requests. The end stands as it was decided, and the frame
-            // is left with no word of its own.
+        if state.ended.is_some() || handle.is_revoked() {
+            // The stream ended while the frame was decided, or something revoked it that sets no
+            // end of the flow's own (the end at a launch whose result is unknown, a stream that
+            // replaces it, the connection's release): nothing is written for the frame. The check
+            // is made here, where the frame is entered, and the call that is entered below is
+            // never dropped, since a call stopped part way through its write would close the link
+            // that carries the worker's other requests; a frame whose call is already at the
+            // link's writer is written whatever happens to the stream after. The end stands as it
+            // was decided, and the frame is left with no word of its own.
             return;
         }
         state.in_flight += 1;
