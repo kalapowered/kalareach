@@ -173,8 +173,15 @@ pub enum Step {
     Publish(Box<EditorFence>),
     /// Deliver an `editor_busy` event to the attachment it names.
     EditorBusy(Box<EditorBusyEvent>),
-    /// Remove an attachment.
-    RemoveAttachment(AttachmentId),
+    /// Remove an attachment. `discarded` is what the machine dropped of its held input in the
+    /// same stimulus, which no lease change acknowledged: the removal tells it in the end of the
+    /// attachment's lease.
+    RemoveAttachment {
+        /// The attachment to remove.
+        attachment: AttachmentId,
+        /// The bytes of its held input that the machine discarded with the removal.
+        discarded: u64,
+    },
     /// Send the configured native interrupt to the foreground process group.
     Interrupt(InterruptAction),
     /// Close a takeover receipt.
@@ -238,6 +245,17 @@ impl Effects {
             Step::Interrupt(action) => Some(*action),
             _ => None,
         })
+    }
+
+    /// Returns the bytes this stimulus discarded that no lease change acknowledged, which have no
+    /// answer to be told in and are carried to the next acquire.
+    #[must_use]
+    pub fn unacknowledged_discard(&self) -> u64 {
+        if self.lease_acknowledged.is_none() {
+            self.discarded_bytes
+        } else {
+            0
+        }
     }
 
     fn merge(&mut self, other: Self) {
@@ -1338,7 +1356,12 @@ impl FenceDriver {
                 effects.lease_acknowledged = Some(acknowledgement.clone());
             }
             Action::RemoveAttachment(attachment) => {
-                effects.steps.push(Step::RemoveAttachment(*attachment));
+                // The machine drops a departing attachment's held input just before it orders the
+                // removal, in the same stimulus, so what has been discarded so far is its share.
+                effects.steps.push(Step::RemoveAttachment {
+                    attachment: *attachment,
+                    discarded: effects.discarded_bytes,
+                });
             }
             Action::AcknowledgeDetach(result) => {
                 self.answer(&mut effects, EventOutcome::Detached(result.clone()));

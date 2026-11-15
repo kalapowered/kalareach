@@ -453,7 +453,10 @@ fn a_batch_released_behind_a_session_step_is_held_from_that_step() {
     };
     let applied = rig.input.apply_effects(Effects {
         steps: vec![
-            Step::RemoveAttachment(removed),
+            Step::RemoveAttachment {
+                attachment: removed,
+                discarded: 0,
+            },
             Step::Write(Carried::plain(batch)),
         ],
         ..Effects::default()
