@@ -137,11 +137,11 @@ enum Lease {
     /// The worker's own lane tells it: the epoch of the lease the attachment holds now, as the
     /// worker last said, or none while it holds none.
     Told(Option<InputLeaseEpoch>),
-    /// A worker with no lane tells nothing of its lease, so the host reads it from the typing: the
-    /// device types in the epoch it holds, and an epoch the worker refused a frame of is over. The
-    /// epoch is the oldest that can still be judged: the newest epoch read from the device, or the
-    /// one after the newest that was refused, whichever is later; none before either happened.
-    Floor(Option<InputLeaseEpoch>),
+    /// A worker with no lane tells nothing of its lease, so the host judges a barrier by what the
+    /// worker accepted on this stream and by nothing else: the worker's lease has moved past an
+    /// epoch only when the worker has accepted typing of a newer one. What the host has read from
+    /// the device, and what the worker refused, move nothing: a refusal does not end the lease.
+    NotTold,
 }
 
 impl Default for Lease {
@@ -183,31 +183,6 @@ impl Live {
         self.lock().lease = Lease::Told(epoch);
     }
 
-    /// Records that the worker behind this stream tells nothing of its lease.
-    fn hear_nothing_of_the_lease(&self) {
-        self.lock().lease = Lease::Floor(None);
-    }
-
-    /// Records that the device types in `epoch`, which only a stream whose worker tells nothing of
-    /// its lease reads.
-    fn typing_in(&self, epoch: InputLeaseEpoch) {
-        self.raise_the_floor(epoch);
-    }
-
-    /// Records that the worker refused a frame of `epoch`: the epoch is over for the position
-    /// check of a stream whose worker tells nothing of its lease.
-    fn epoch_over(&self, epoch: InputLeaseEpoch) {
-        self.raise_the_floor(InputLeaseEpoch::new(epoch.get().saturating_add(1)));
-    }
-
-    fn raise_the_floor(&self, epoch: InputLeaseEpoch) {
-        if let Lease::Floor(floor) = &mut self.lock().lease
-            && floor.is_none_or(|floor| floor.get() < epoch.get())
-        {
-            *floor = Some(epoch);
-        }
-    }
-
     /// The highest accepted sequence of `epoch`, when the epoch is the one the record holds.
     fn through(&self, epoch: InputLeaseEpoch) -> Option<u64> {
         match self.lock().accepted {
@@ -218,14 +193,18 @@ impl Live {
 
     /// Whether the worker has accepted fewer than `count` frames of `epoch`, when `epoch` is the
     /// epoch of the lease this stream's attachment holds now, or, for a worker that tells nothing
-    /// of its lease, when it is not older than the epochs the host has read and refused. For any
-    /// other epoch the answer is no: it is not this stream's to judge, and the worker treats such a
-    /// barrier as stale. No frame accepted in the epoch is a count of none.
+    /// of its lease, when the worker has accepted no typing of a newer epoch. For any other epoch
+    /// the answer is no: the worker's lease has moved on, and the worker treats such a barrier as
+    /// stale. No frame accepted in the epoch is a count of none. A count that the accepted frames
+    /// do not make is short whether more frames may still be accepted or none will be, since the
+    /// frames behind a refusal are not sent.
     fn short_of(&self, epoch: InputLeaseEpoch, count: u64) -> bool {
         let record = self.lock();
         let judged = match record.lease {
             Lease::Told(held) => held == Some(epoch),
-            Lease::Floor(floor) => floor.is_none_or(|floor| epoch.get() >= floor.get()),
+            Lease::NotTold => record
+                .accepted
+                .is_none_or(|(newest, _)| epoch.get() >= newest.get()),
         };
         if !judged {
             return false;
@@ -320,11 +299,15 @@ impl InputStreams {
         connection: ConnectionId,
         attachment: AttachmentId,
         handle: &StreamHandle,
+        lease: Lease,
     ) -> Result<Arc<Standing>, Refusal> {
         let key = (connection, attachment);
         let live = Arc::new(Live {
             handle: handle.clone(),
-            record: Mutex::new(Record::default()),
+            record: Mutex::new(Record {
+                lease,
+                accepted: None,
+            }),
             detached: tokio::sync::Notify::new(),
         });
         let mut registry = self.live();
@@ -394,13 +377,20 @@ impl InputStreams {
     /// `connection` shows that the typing the barrier names has not all been accepted: the worker
     /// has accepted fewer frames of the barrier's epoch than its count. The answer is no, and the
     /// request is forwarded for the worker to decide, when the stream does not stand (it ended or
-    /// never opened), and when the barrier's epoch is not the epoch of the lease the stream's
-    /// attachment holds now: the worker treats such a barrier as stale.
+    /// never opened), and when the barrier's epoch is one that the worker's lease has moved past.
+    /// Which epochs those are depends on what the worker tells the host:
     ///
-    /// The check is advisory. It saves a forward, and it can never be the only one for a worker that
-    /// reads the barrier, which checks its own position. Only the connection that opened the stream
-    /// is reached, so a barrier names no stream of another connection. The device is never told
-    /// anything on its stream by a refusal made here.
+    /// - A worker that serves a lane tells its lease, and the barrier is judged only when its epoch
+    ///   is the epoch of the lease the stream's attachment holds now. For any other epoch the worker
+    ///   treats the barrier as stale, and the check is advisory: it saves a forward, and the worker
+    ///   checks its own position.
+    /// - A worker that serves no lane tells nothing, and the host's check is the only one. A
+    ///   barrier is judged unless the worker has accepted typing of a newer epoch on this stream,
+    ///   which is what shows its lease has moved on. Nothing else moves that: not typing that the
+    ///   host has only read, and not a refusal, which does not end the lease.
+    ///
+    /// Only the connection that opened the stream is reached, so a barrier names no stream of
+    /// another connection. The device is never told anything on its stream by a refusal made here.
     pub(super) fn position_not_reached(
         &self,
         connection: ConnectionId,
@@ -689,7 +679,6 @@ impl State {
             self.cutoff
                 .map_or(epoch.get(), |newest| newest.max(epoch.get())),
         );
-        live.epoch_over(epoch);
         let accepted_through = live.through(epoch).map(InputSequence::new);
         self.tell(InputAck::Refused {
             epoch,
@@ -724,12 +713,9 @@ impl Flow {
                     Window::None { known: ready.epoch }
                 }
             }
-            None => {
-                live.hear_nothing_of_the_lease();
-                Window::None {
-                    known: InputLeaseEpoch::new(0),
-                }
-            }
+            None => Window::None {
+                known: InputLeaseEpoch::new(0),
+            },
         };
         let mut acks = VecDeque::new();
         acks.push_back(InputAck::Ready {
@@ -850,11 +836,7 @@ impl Flow {
     /// Takes a frame read from the device, and says whether the stream's order holds: a frame of an
     /// epoch lower than the newest one read cuts the stream, as a malformed frame does.
     fn take(&self, epoch: InputLeaseEpoch) -> bool {
-        let ordered = self.lock().read(epoch);
-        if ordered {
-            self.live.typing_in(epoch);
-        }
-        ordered
+        self.lock().read(epoch)
     }
 
     /// Takes back a frame that was entered as outstanding and was not written.
@@ -1134,12 +1116,24 @@ async fn admit(
         () = &mut deadline => return None,
     };
     door.remote.decide_an_input_frame(session).await.ok()?;
+    // The record of the stream is made with the rule that judges a barrier for this worker, so no
+    // request is read against a record that does not have it.
+    let serves_lane = door.host.input.serves_lane(&proxy);
     let standing = door
         .host
         .input
-        .stand(door.remote.connection_id(), attachment, handle)
+        .stand(
+            door.remote.connection_id(),
+            attachment,
+            handle,
+            if serves_lane {
+                Lease::default()
+            } else {
+                Lease::NotTold
+            },
+        )
         .ok()?;
-    let carry = if door.host.input.serves_lane(&proxy) {
+    let carry = if serves_lane {
         let lane = InputLane {
             proxy_connection: proxy.connection_id(),
             attachment_id: attachment,
