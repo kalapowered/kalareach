@@ -5528,8 +5528,9 @@ fn kr_host_stop_is_refused_inside_a_session_and_goes_on_where_a_worker_cannot_sa
 
 /// KR-REQ-07.12 (two stops at once): one daemon has ended, and each command says something true.
 /// A command may see the daemon end, or find no daemon, or meet a holder that does not answer
-/// (the listener has closed and the lock is not yet free) and ask nothing; none says that something
-/// started the daemon again, and at least one saw the end.
+/// (the listener has closed and the lock is not yet free) and ask nothing, or find the connection
+/// closed before it can make its request (exit 3, nothing sent); none says that something started
+/// the daemon again, and at least one saw the end.
 #[test]
 fn two_kr_host_stops_at_once_each_say_what_is_true_and_one_daemon_ends() {
     let (host, _session_id, _created, _daemon) = a_host_with_a_session();
@@ -5550,6 +5551,17 @@ fn two_kr_host_stops_at_once_each_say_what_is_true_and_one_daemon_ends() {
             assert!(
                 out.contains("Stopped the control daemon for environment")
                     || out.contains("No control daemon runs for environment"),
+                "{out} {err}"
+            );
+        } else if output.status.code() == Some(3) {
+            // The daemon was already stopping for the other command: this one met the closed
+            // connection before it could make its request, which left nothing.
+            assert!(
+                err.contains("could not make its request for the control daemon"),
+                "{out} {err}"
+            );
+            assert!(
+                err.contains("Nothing was sent, and nothing was stopped."),
                 "{out} {err}"
             );
         } else {
