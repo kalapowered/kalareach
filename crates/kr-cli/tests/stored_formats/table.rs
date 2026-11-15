@@ -68,8 +68,7 @@ fn reading_through(entry: ReleaseStore, through: u32) -> ReleaseStore {
 #[must_use]
 pub fn known() -> Vec<Known> {
     use kr_protocol::{
-        account, attention, automation, changeset, delivery, error, host_account, identity,
-        pairing, push, sharing, skill, transfer,
+        account, attention, automation, changeset, error, identity, sharing, skill, transfer,
     };
 
     let source = |store, name, file, pinned| Known {
@@ -136,37 +135,6 @@ pub fn known() -> Vec<Known> {
             "WorkflowRunStatus",
             "7840b23fa2bfbd1d3167e89020a9502fda0b13ce1ffd075765332b0ba5886756",
         ),
-        // What the registry keeps inside its tables and the answers it keeps for a retried call.
-        known_protocol::<pairing::DevicePublicKeys>(
-            "registry",
-            "DevicePublicKeys",
-            "a4a908abbd01f0e01b9e41265b30c82b901bf23271b5156c97c5bf06007da604",
-        ),
-        known_protocol::<error::ErrorCode>(
-            "registry",
-            "ErrorCode",
-            "1adf42bfb02be22cdba273eadccfff60f55bf8bac135c476a56678a211e3f353",
-        ),
-        known_protocol::<pairing::ClientBundle>(
-            "registry",
-            "ClientBundle",
-            "5a5f7a11c4a723dbed6a2036b3e178a043479b1fba2bf832f8a72e8549754b68",
-        ),
-        known_protocol::<pairing::ProposedGrant>(
-            "registry",
-            "ProposedGrant",
-            "9f9b7667a7d609186639a05a23abeea6c869c9329759eca726b7e2c464a5b9cf",
-        ),
-        known_protocol::<account::PolicyAuthorityLink>(
-            "registry",
-            "PolicyAuthorityLink",
-            "d9aab1ca1f34156f2a5541e55f6bbef63516ea7073ac3ca2f44cc250a20fdc19",
-        ),
-        known_protocol::<sharing::OfflineValidityPolicy>(
-            "registry",
-            "OfflineValidityPolicy",
-            "2de9e423e33e137cf44fce90d9474ebeff021e6fcb25eb1c85f55ed13a581c04",
-        ),
         // What the policy mirror keeps of the policy inside it.
         known_protocol::<account::PolicyAuthorityLink>(
             "policy-mirror",
@@ -188,36 +156,6 @@ pub fn known() -> Vec<Known> {
             "restored-policy",
             "OfflineValidityPolicy",
             "2de9e423e33e137cf44fce90d9474ebeff021e6fcb25eb1c85f55ed13a581c04",
-        ),
-        known_protocol::<pairing::RevocationRequest>(
-            "registry",
-            "RevocationRequest",
-            "9c4f06edcd64ab8b33dc62ae19587459c4ac85394fbf981eb50284d686d0eeef",
-        ),
-        known_protocol::<push::DevicePushRegisterResult>(
-            "registry",
-            "DevicePushRegisterResult",
-            "e9aaf057c87c511242039f5fde45cea281a56cb916155865a10b0886c91b16e8",
-        ),
-        known_protocol::<delivery::DeliveryDestinationConfigureResult>(
-            "registry",
-            "DeliveryDestinationConfigureResult",
-            "481a136e9e840abc8d93a11972f41ad975655e3d98deb982819a8113c3f4f1b7",
-        ),
-        known_protocol::<delivery::DeliveryDestinationRemoveResult>(
-            "registry",
-            "DeliveryDestinationRemoveResult",
-            "16a90c0562fa5ae4906d61e674153bf59c316d30abc54ec5ecc79b08e019c443",
-        ),
-        known_protocol::<host_account::AccountSignInStarted>(
-            "registry",
-            "AccountSignInStarted",
-            "4c582a489bd5ec4347e20b6f0015386ef7ffc4912739e649b28d88b2cc4bc382",
-        ),
-        known_protocol::<host_account::AccountSignedOut>(
-            "registry",
-            "AccountSignedOut",
-            "1c02b8aa44a0f9f364e09cf7cfcb8c9dad9ac89a63d9294a4bd7a4c019f97442",
         ),
         // The attention store: the words it matches stored text against.
         words_of(
@@ -307,42 +245,6 @@ pub fn known() -> Vec<Known> {
             Some("crates/kr-attention/src/store.rs"),
             &[("crates/kr-attention/src/event.rs", "Origin")],
             "e799e9f01ab42d78a4fd7dcc2d4611e41cfbd1900a5e2c0b620ae7490bfb955c",
-        ),
-        // The registry's columns of words, and the consumed reasons it stores by their protocol
-        // names.
-        words_of(
-            "registry",
-            "process start sources",
-            literal(&[
-                "linux_proc_stat",
-                "macos_proc_bsd_info",
-                "windows_process_creation_time",
-                "windows_process_start_seconds",
-            ]),
-            Some("crates/kr-controller/src/registry.rs"),
-            &[("crates/kr-protocol/src/identity.rs", "ProcessStartSource")],
-            "8d0462fea698cd5062e47b8c5d9d0257dd829ac52bca210fad6dbb814ee278b6",
-        ),
-        words_of(
-            "registry",
-            "invitation states",
-            literal(&["open", "locked", "committed", "consumed"]),
-            Some("crates/kr-controller/src/net/invitations.rs"),
-            &[("crates/kr-pairing/src/platform.rs", "InvitationState")],
-            "30c62bdf8453f6dd1a294b8d52ae7a5e149d0ba6d979fb221f339747b8244326",
-        ),
-        words_of(
-            "registry",
-            "host owner kinds",
-            literal(&["migrated", "first_owner"]),
-            Some("crates/kr-controller/src/net/invitations.rs"),
-            &[("crates/kr-controller/src/net/invitations.rs", "HostOwner")],
-            "12da03792d3c200ec87495bc1ff96a236c5b43a55aeab9f011e38dc7983fd563",
-        ),
-        known_protocol::<pairing::PairingConsumedReason>(
-            "registry",
-            "PairingConsumedReason",
-            "8e47614af034efad7f29d0c65b13daad3f150bbe2d59cda4034dfe69dbfad33c",
         ),
         words_of(
             "catalogue",
@@ -449,7 +351,6 @@ pub fn known() -> Vec<Known> {
 #[must_use]
 pub fn kept_without_a_holder() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("registry", "PairingConsumedReason"),
         // The answers a stored action result holds, which `actions.result` keeps as the bytes the
         // method answered, and the code a refused action keeps in `actions.error_code`.
         ("changesets", "ChangesetCaptureResult"),
@@ -537,9 +438,10 @@ pub fn retained_answers() -> Vec<(kr_protocol::method::Method, &'static str)> {
 pub fn table() -> Vec<Store> {
     use kr_controller::registry::LaunchPhase;
     use kr_protocol::{
-        action, archive, attention, automation, catalogue, changeset, delivery, describe, desktop,
-        grant, hostinfo, identity, invitation, machine, mailbox, organisation, pairing, privacy,
-        project, push, session, sharing, skill, test_report, transfer, voice,
+        account, action, archive, attention, automation, catalogue, changeset, delivery, describe,
+        desktop, error, grant, host_account, hostinfo, identity, invitation, machine, mailbox,
+        organisation, pairing, privacy, project, push, session, sharing, skill, test_report,
+        transfer, voice,
     };
 
     let mut stores = vec![
@@ -722,6 +624,55 @@ pub fn table() -> Vec<Store> {
                         .iter()
                         .map(|phase| phase.as_str().to_owned())
                         .collect(),
+                ),
+                // What the registry keeps inside its tables and the answers it keeps for a retried call.
+                protocol::<pairing::DevicePublicKeys>("DevicePublicKeys"),
+                protocol::<error::ErrorCode>("ErrorCode"),
+                protocol::<pairing::ClientBundle>("ClientBundle"),
+                protocol::<pairing::ProposedGrant>("ProposedGrant"),
+                protocol::<account::PolicyAuthorityLink>("PolicyAuthorityLink"),
+                protocol::<sharing::OfflineValidityPolicy>("OfflineValidityPolicy"),
+                protocol::<pairing::RevocationRequest>("RevocationRequest"),
+                protocol::<push::DevicePushRegisterResult>("DevicePushRegisterResult"),
+                protocol::<delivery::DeliveryDestinationConfigureResult>(
+                    "DeliveryDestinationConfigureResult",
+                ),
+                protocol::<delivery::DeliveryDestinationRemoveResult>(
+                    "DeliveryDestinationRemoveResult",
+                ),
+                protocol::<host_account::AccountSignInStarted>("AccountSignInStarted"),
+                protocol::<host_account::AccountSignedOut>("AccountSignedOut"),
+                // The consumed reasons it stores by their protocol names.
+                protocol::<pairing::PairingConsumedReason>("PairingConsumedReason"),
+                // The registry's columns of words, each with the enum that names the words kept
+                // beside it, so a variant added to one moves the digest.
+                Kept::Words(
+                    "process start sources",
+                    vec![
+                        "linux_proc_stat".to_owned(),
+                        "macos_proc_bsd_info".to_owned(),
+                        "windows_process_creation_time".to_owned(),
+                        "windows_process_start_seconds".to_owned(),
+                    ],
+                ),
+                protocol::<identity::ProcessStartSource>("ProcessStartSource"),
+                Kept::Words(
+                    "invitation states",
+                    vec![
+                        "open".to_owned(),
+                        "locked".to_owned(),
+                        "committed".to_owned(),
+                        "consumed".to_owned(),
+                    ],
+                ),
+                Kept::Source("crates/kr-pairing/src/platform.rs", &["InvitationState"]),
+                Kept::Words(
+                    "host owner kinds",
+                    vec!["migrated".to_owned(), "first_owner".to_owned()],
+                ),
+                Kept::Source(
+                    "crates/kr-controller/src/net/invitations.rs",
+                    &["HostOwner"],
                 ),
             ],
         },
