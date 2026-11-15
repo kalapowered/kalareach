@@ -1035,7 +1035,8 @@ const STARTS_NONE_BESIDE_A_STANDING_DEVICE: [&str; 4] = [
 /// first. So for each script that starts an emulator on a port of its own, the boot wait that is
 /// answered is the one for that port's serial, after the emulator was started on it, and no other
 /// wait is answered: a script that waits with no serial, or on the standing device's, or that starts
-/// its emulator on no port of its own, goes on at the answer of a device that is not its own. The
+/// its emulator on no port of its own, goes on at the answer of a device that is not its own. No
+/// port is started on twice, since one answer for its serial would then stand for both. The
 /// scripts that start none beside a standing device are named, and the case fails when that set
 /// changes; none of them is answered a boot wait.
 #[test]
@@ -1090,6 +1091,16 @@ fn an_emulator_already_up_on_another_port_does_not_answer_for_the_one_a_script_s
                         "port {port}, where a device stands"
                     ))
                 )),
+            }
+        }
+        // Two emulators on one port are one serial, which a single later answer would satisfy for
+        // both.
+        let mut ports = std::collections::BTreeSet::new();
+        for (_, serial) in &own {
+            if !ports.insert(serial) {
+                wrong.push(format!(
+                    "it started two emulators on {serial}, and one boot answer cannot stand for both"
+                ));
             }
         }
         for (started, serial) in &own {
