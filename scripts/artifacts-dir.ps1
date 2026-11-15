@@ -41,7 +41,10 @@
 # it refuses nothing that the run set right. It is no boundary against a process of the same
 # account, which can write wherever the run can and can change a link or a folder while the reader
 # reads. It does not close a case that somebody arranges: a link whose target climbs through
-# another link, which this reader settles by the target's text.
+# another link, which this reader settles by the target's text, and a temporary folder whose path
+# goes through a link whose target holds a backslash off Windows, which the walk reads as a
+# separator, as PowerShell's own commands do, and the system and the other readers read as a letter
+# of a name, so the folder that this reader takes for a root may not be the one that they take.
 # On Windows the comparison ignores letter case, so a folder made case-sensitive, and a letter that
 # the disk and the reader do not fold alike, are not told apart.
 #
