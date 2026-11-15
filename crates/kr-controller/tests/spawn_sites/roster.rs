@@ -19,10 +19,18 @@
 //! the name that is awaited, in the scope where that name is bound, so that a second handle of the
 //! same name in another scope does not stand for it. Where the function is another one, which the
 //! handle is handed to, it checks that the source awaits that name in that function.
+//!
+//! A row of class `request` begins its note with its bound, `bound(form at path:line)`, and then
+//! says it in words. The form is one of five (`FORMS`), and the place is a line of a file of the
+//! tree that holds what the form names, which `bound_problems` checks against the source. The check
+//! reads the line's words, not a parse: it does not see whether the `.await` is the task's handle's,
+//! whether the `JoinSet` is the one the task goes into, whether the `Drop` aborts the task, whether
+//! the receive is in every wait of the task, or a line inside a block comment or a multi-line string.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
-use super::scan::{Scan, Start};
+use super::scan::{Files, Scan, Start};
 
 /// What a start is, for the way a task supervisor treats it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -362,6 +370,198 @@ pub fn disagreements(roster: &Roster, scan: &Scan) -> Vec<String> {
         if !scan.named.contains(path) {
             problems.push(format!(
                 "the roster lists {path} and the daemon's code no longer names it"
+            ));
+        }
+    }
+    problems
+}
+
+/// The five forms in which a `request` row names the bound of its task, each with the words of the
+/// line that its place must hold.
+///
+/// * `await`: the handle is awaited by a future that no deadline, branch or drop can leave; the
+///   place is the await's line, which holds `.await`.
+/// * `owned-set`: the task goes into a set that its owner aborts when it is dropped; the place is the
+///   set's declaration, which holds `JoinSet` and is no `use`.
+/// * `guard`: a guard whose drop aborts the task; the place is the guard's `Drop`, a line that holds
+///   `impl .. Drop for ..`.
+/// * `connection-guard`: the connection's own guard; the place is the guard's `Drop`, as for `guard`,
+///   and the guard's type has `Connection` in its name.
+/// * `channel`: the owner's end of a channel that the task reads in every wait, so that the owner's
+///   dropping it ends the task at its next poll; the place is the task's read of that end, a line that
+///   holds a method call `recv`, `poll_recv`, `recv_many`, `try_recv`, `blocking_recv`, `closed` or
+///   `changed`.
+pub const FORMS: [&str; 5] = ["await", "owned-set", "guard", "connection-guard", "channel"];
+
+const RECEIVES: [&str; 7] = [
+    "recv",
+    "poll_recv",
+    "recv_many",
+    "try_recv",
+    "blocking_recv",
+    "closed",
+    "changed",
+];
+
+/// The words of one line of source: its names, numbers and marks one by one, with a comment that
+/// runs to the end of the line and the inside of a string or a character left out.
+fn words(line: &str) -> Vec<String> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut words = Vec::new();
+    let mut at = 0;
+    while at < chars.len() {
+        let here = chars[at];
+        if here == '/' && chars.get(at + 1) == Some(&'/') {
+            break;
+        }
+        if here == '"' {
+            at += 1;
+            while at < chars.len() && chars[at] != '"' {
+                at += if chars[at] == '\\' { 2 } else { 1 };
+            }
+            at += 1;
+            words.push("\"\"".to_string());
+            continue;
+        }
+        if here == '\'' && chars.get(at + 1) == Some(&'\\') {
+            at += 2;
+            while at < chars.len() && chars[at] != '\'' {
+                at += 1;
+            }
+            at += 1;
+            words.push("''".to_string());
+            continue;
+        }
+        if here == '\'' && chars.get(at + 2) == Some(&'\'') {
+            at += 3;
+            words.push("''".to_string());
+            continue;
+        }
+        if here.is_alphanumeric() || here == '_' {
+            let start = at;
+            while at < chars.len() && (chars[at].is_alphanumeric() || chars[at] == '_') {
+                at += 1;
+            }
+            words.push(chars[start..at].iter().collect());
+            continue;
+        }
+        if !here.is_whitespace() {
+            words.push(here.to_string());
+        }
+        at += 1;
+    }
+    words
+}
+
+/// The type that an `impl .. Drop for ..` of the line is for.
+fn dropped_type(words: &[String]) -> Option<&str> {
+    let start = words.iter().position(|word| word == "impl")?;
+    let at = words[start..]
+        .windows(3)
+        .position(|window| window[0] == "Drop" && window[1] == "for")?;
+    words.get(start + at + 2).map(String::as_str)
+}
+
+/// Whether a line holds what a form's place must hold.
+fn holds(form: &str, line: &str) -> bool {
+    let words = words(line);
+    match form {
+        "await" => words
+            .windows(2)
+            .any(|pair| pair[0] == "." && pair[1] == "await"),
+        "owned-set" => {
+            words.first().is_none_or(|first| first != "use")
+                && words.iter().any(|word| word == "JoinSet")
+        }
+        "guard" => dropped_type(&words).is_some(),
+        "connection-guard" => dropped_type(&words).is_some_and(|name| name.contains("Connection")),
+        "channel" => words
+            .windows(2)
+            .any(|pair| pair[0] == "." && RECEIVES.contains(&pair[1].as_str())),
+        _ => false,
+    }
+}
+
+/// What a `request` row's note says of its bound: `bound(form at path:line)` at the start of the note.
+fn bound_marker(note: &str) -> Result<Option<(&str, &str)>, String> {
+    let Some(inside) = note.strip_prefix("bound(") else {
+        return Ok(None);
+    };
+    let Some((inside, _)) = inside.split_once(')') else {
+        return Err("a bound marker is not closed".to_string());
+    };
+    match inside.split_once(" at ") {
+        Some((form, place)) => Ok(Some((form.trim(), place.trim()))),
+        None => Err("a bound marker is `bound(form at path:line)`".to_string()),
+    }
+}
+
+/// Everything that is wrong with the bounds of the roster's rows, one sentence each. A row of class
+/// `request` begins its note with `bound(form at path:line)`: the form is one of the five of `FORMS`,
+/// and the place is a line of a file of the tree that holds what the form names. A row of another
+/// class has no bound marker. Empty when every bound holds.
+pub fn bound_problems(roster: &Roster, files: &dyn Files) -> Vec<String> {
+    let mut problems = Vec::new();
+    for row in &roster.rows {
+        let describe = format!(
+            "{} | {} | {} | {}",
+            row.file, row.function, row.form, row.callee
+        );
+        let marker = bound_marker(&row.note);
+        if row.class != Class::Request {
+            if !matches!(marker, Ok(None)) {
+                problems.push(format!(
+                    "only a row of class request names a bound, and this row says {}: {describe}",
+                    row.class.name()
+                ));
+            }
+            continue;
+        }
+        let (form, place) = match marker {
+            Err(why) => {
+                problems.push(format!("{why}: {describe}"));
+                continue;
+            }
+            Ok(None) => {
+                problems.push(format!(
+                    "a row of class request begins its note with `bound(form at path:line)`: {describe}"
+                ));
+                continue;
+            }
+            Ok(Some(bound)) => bound,
+        };
+        if !FORMS.contains(&form) {
+            problems.push(format!(
+                "the bound's form `{form}` is none of {}: {describe}",
+                FORMS.join(", ")
+            ));
+            continue;
+        }
+        let Some((path, line)) = place.rsplit_once(':').and_then(|(path, line)| {
+            Some((path, line.parse::<usize>().ok().filter(|line| *line > 0)?))
+        }) else {
+            problems.push(format!(
+                "the bound's place `{place}` is no `path:line`: {describe}"
+            ));
+            continue;
+        };
+        let Some(text) = files.read(Path::new(path)) else {
+            problems.push(format!(
+                "the bound's place names {path}, which is no file of the tree: {describe}"
+            ));
+            continue;
+        };
+        let Some(held) = text.lines().nth(line - 1) else {
+            problems.push(format!(
+                "the bound's place is line {line} of {path}, which has {} lines: {describe}",
+                text.lines().count()
+            ));
+            continue;
+        };
+        if !holds(form, held) {
+            problems.push(format!(
+                "the line at {path}:{line} does not hold what the form `{form}` names ({}): {describe}",
+                held.trim()
             ));
         }
     }

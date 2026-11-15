@@ -25,12 +25,23 @@
 //!   is awaited under that name in the scope where it is bound, by `name.await` or as the future of
 //!   a `select!` branch (not in a branch's handler or precondition, where dropping or aborting it
 //!   waits for nothing); where it is another function, that function awaits that name.
-//! * `request`, `supervised-later`, `other_crate`, the task numbers and the notes are held by a
+//! * `request` names its bound. The note of a `request` row begins with
+//!   `bound(form at path:line)`, where the form is one of five (`await`, `owned-set`, `guard`,
+//!   `connection-guard`, `channel`; `roster::FORMS` says what each means) and the place is a line of
+//!   a file of the tree that holds what the form names: an `.await`, a `JoinSet` that is no `use`,
+//!   an `impl .. Drop for ..` (for `connection-guard` of a type with `Connection` in its name), or a
+//!   method call that receives. A `request` row with no bound, with another word for its form, with
+//!   a place that is no line of a file of the tree or whose line holds none of those words fails.
+//!   The check reads the line's words: it does not see that the `.await` is the task's handle's,
+//!   that the `JoinSet` is the one the task goes into, that the `Drop` aborts the task, or that the
+//!   receive is in every wait of the task; a person's read of the code decides those. A row for which
+//!   no place holds is not `request`.
+//! * `supervised-later`, `other_crate`, the task numbers and the rest of the notes are held by a
 //!   person's read alone. The case holds that each start has a row, not what the row says of the
 //!   start's lifetime or whether the class of a row is right: no case can know that a task outlives
-//!   its request, so the class of every `request` and `other_crate` row is a person's read of the
-//!   code to the end of the task. A start whose end the request does not bound is not `request`;
-//!   where the code does not show the bound, the row takes the supervisor's class.
+//!   its request, so the class of every `other_crate` row is a person's read of the code to the end
+//!   of the task. A start whose end the request does not bound is not `request`; where the code does
+//!   not show the bound, the row takes the supervisor's class.
 //!
 //! The linked crates `kr-worker` and `kr-describe` keep a row for each start by name, and a list
 //! of the function paths of those two crates that the rest of the daemon's code names
@@ -116,6 +127,27 @@ fn the_roster_names_every_start_of_the_daemon_process() {
         assert!(
             roster.rows.iter().any(|row| row.task == Some(number)),
             "the roster has no row for long-lived task {number}"
+        );
+    }
+}
+
+#[test]
+fn every_request_row_names_a_bound_that_its_place_holds() {
+    let roster = real_roster();
+    let disk = scan::Disk(repository());
+    let problems = roster::bound_problems(&roster, &disk);
+    assert!(
+        problems.is_empty(),
+        "{} bound(s) of the roster that do not hold:\n{}",
+        problems.len(),
+        problems.join("\n")
+    );
+    // Each of the five forms is in use, so that a roster that held none would not pass unseen.
+    for form in roster::FORMS {
+        let marker = format!("bound({form} at ");
+        assert!(
+            roster.rows.iter().any(|row| row.note.starts_with(&marker)),
+            "no row names the form {form}"
         );
     }
 }
@@ -1108,4 +1140,130 @@ fn a_start_under_cfg_any_is_skipped_only_when_every_part_is_a_test() {
             ("in_tests_or_testing", true)
         ]
     );
+}
+
+/// Eleven lines, each of which holds the words of some forms and not of the others.
+const BOUND_SOURCE: &str = r#"fn work() {}
+async fn awaiting(handle: Handle) { handle.await; }
+struct Set { tasks: tokio::task::JoinSet<()> }
+impl Drop for Plain { fn drop(&mut self) {} }
+impl Drop for ConnectionGuard { fn drop(&mut self) {} }
+fn reading(mut gone: Receiver) { let _ = gone.recv(); }
+// handle.await; JoinSet; gone.recv()
+fn quoted() { let _ = "handle.await impl Drop for ConnectionGuard JoinSet gone.recv()"; }
+use tokio::task::JoinSet;
+fn quote() { let _ = '"'; handle.await; }
+fn escaped() { let _ = "say \" handle.await"; }
+"#;
+
+fn bound_problems_of(class: &str, note: &str) -> Vec<String> {
+    let roster = roster_of(&format!(
+        "crates/daemon/src/lib.rs | serve | tokio::spawn | work | 1 | {class} | - | {note}\n"
+    ));
+    roster::bound_problems(
+        &roster,
+        &Memory::of(&[("crates/daemon/src/lib.rs", BOUND_SOURCE)]),
+    )
+}
+
+#[test]
+fn a_bound_holds_where_the_line_of_its_place_holds_what_its_form_names() {
+    // Each form, at each line of the source: it holds at the lines that have its words and at no
+    // other, whatever the other lines hold (a comment, a string, a `use`).
+    let holding: [(&str, &[usize]); 5] = [
+        ("await", &[2, 10]),
+        ("owned-set", &[3]),
+        ("guard", &[4, 5]),
+        ("connection-guard", &[5]),
+        ("channel", &[6]),
+    ];
+    for (form, lines) in holding {
+        for line in 1..=11 {
+            let problems = bound_problems_of(
+                "request",
+                &format!("bound({form} at crates/daemon/src/lib.rs:{line}); in words"),
+            );
+            if lines.contains(&line) {
+                assert_eq!(problems, Vec::<String>::new(), "{form} at {line}");
+            } else {
+                assert_eq!(problems.len(), 1, "{form} at {line}: {problems:?}");
+                assert!(
+                    problems[0].contains("does not hold what the form"),
+                    "{form} at {line}: {problems:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_request_row_with_no_bound_or_a_bad_one_is_refused() {
+    let at = |form: &str, place: &str| format!("bound({form} at {place}); in words");
+    let cases: [(String, &str); 14] = [
+        // No bound, or one that is not at the start of the note.
+        (
+            "ends with the request that started it".to_string(),
+            "begins its note with",
+        ),
+        (
+            format!(
+                "ends with its request; {}",
+                at("await", "crates/daemon/src/lib.rs:2")
+            ),
+            "begins its note with",
+        ),
+        // A form that is none of the five, or a misspelt one.
+        (at("joined", "crates/daemon/src/lib.rs:2"), "is none of"),
+        (at("gaurd", "crates/daemon/src/lib.rs:4"), "is none of"),
+        (at("Await", "crates/daemon/src/lib.rs:2"), "is none of"),
+        (at("", "crates/daemon/src/lib.rs:2"), "is none of"),
+        // A place that is no `path:line` of a file of the tree.
+        (at("await", "crates/daemon/src/lib.rs"), "is no `path:line`"),
+        (
+            at("await", "crates/daemon/src/lib.rs:two"),
+            "is no `path:line`",
+        ),
+        (
+            at("await", "crates/daemon/src/lib.rs:0"),
+            "is no `path:line`",
+        ),
+        (
+            at("await", "crates/daemon/src/none.rs:2"),
+            "is no file of the tree",
+        ),
+        (
+            at("await", "crates/daemon/src/lib.rs:12"),
+            "which has 11 lines",
+        ),
+        // A marker that is not well formed.
+        (
+            "bound(await at crates/daemon/src/lib.rs:2".to_string(),
+            "is not closed",
+        ),
+        ("bound(await)".to_string(), "is `bound(form at path:line)`"),
+        (
+            "bound() in words".to_string(),
+            "is `bound(form at path:line)`",
+        ),
+    ];
+    for (note, expected) in cases {
+        let problems = bound_problems_of("request", &note);
+        assert_eq!(problems.len(), 1, "{note}: {problems:?}");
+        assert!(problems[0].contains(expected), "{note}: {problems:?}");
+    }
+
+    // A row of another class has no bound, and is refused when it names one.
+    for class in ["joined", "other_crate", "test"] {
+        assert_eq!(
+            bound_problems_of(class, "a case"),
+            Vec::<String>::new(),
+            "{class}"
+        );
+        let problems = bound_problems_of(class, "bound(await at crates/daemon/src/lib.rs:2)");
+        assert_eq!(problems.len(), 1, "{class}: {problems:?}");
+        assert!(
+            problems[0].contains("only a row of class request names a bound"),
+            "{class}: {problems:?}"
+        );
+    }
 }
