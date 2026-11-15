@@ -1806,6 +1806,16 @@ pub(crate) struct ClosedRemotely {
     pub retained: Retained,
 }
 
+/// What a remote close was refused with, and where the refusal came from: a worker that answers a
+/// close again from a receipt it kept gives back a refusal as it gives back a result.
+#[derive(Debug)]
+pub(crate) struct RefusedRemotely {
+    /// What the close was refused with.
+    pub error: ControllerError,
+    /// Where the refusal came from.
+    pub retained: Retained,
+}
+
 /// Where the answer to a close came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Retained {
@@ -2300,7 +2310,7 @@ impl Controller {
         standing: &FeedStanding,
         accepted: AcceptedDeadline,
         observer: Option<&dispatch::ExpiryObserver>,
-        answer: tokio::sync::oneshot::Sender<Result<ClosedRemotely>>,
+        answer: tokio::sync::oneshot::Sender<std::result::Result<ClosedRemotely, RefusedRemotely>>,
         delivered: tokio::sync::oneshot::Receiver<()>,
         receive: kr_protocol::hello::ReceiveLimits,
     ) -> bool {
@@ -2320,7 +2330,8 @@ impl Controller {
                 receive,
             )
             .await
-            .map(|value| ClosedRemotely { value, retained });
+            .map(|value| ClosedRemotely { value, retained })
+            .map_err(|error| RefusedRemotely { error, retained });
         // A closure this host has accepted and not finished is a request outstanding, and section
         // 3's setting decides whether that keeps the machine awake while it finishes. The local
         // close reviews the setting where it accepts, and a close that arrived over the network is
@@ -2334,6 +2345,24 @@ impl Controller {
             proxy.close();
         }
         reached_the_worker
+    }
+
+    /// The answer to a close of a session that no worker holds: the closure record's, when one is
+    /// recorded, and `retained` says so then. A lookup that finds no closure reads no record, and
+    /// its refusal is this daemon's own word that the session is unknown.
+    async fn closure_answer_to_a_close(
+        &self,
+        session_id: kr_protocol::ids::SessionId,
+        retained: &mut Retained,
+    ) -> Result<kr_protocol::envelope::ParamsValue> {
+        let answer = crate::given::network_door::kept(
+            crate::service::net::AtTheNetworkDoor::here(),
+            self.answer_from_the_closure(session_id).await,
+        );
+        if answer.is_ok() {
+            *retained = Retained::Record;
+        }
+        answer
     }
 
     /// The close itself. `link` receives the link it opened, whichever way the close ended, and
@@ -2361,11 +2390,7 @@ impl Controller {
             // Whatever comes back here comes from a record rather than from a close performed now,
             // which is the same read the worker's own journal would have been. The caller decides
             // whether this device may be told it.
-            *retained = Retained::Record;
-            return crate::given::network_door::kept(
-                crate::service::net::AtTheNetworkDoor::here(),
-                self.answer_from_the_closure(session_id).await,
-            );
+            return self.closure_answer_to_a_close(session_id, retained).await;
         }
         // The accepted deadline as it stands, and no dispatch lease behind it. Section 9 asks for
         // a live lease before a *remote dispatch*, and it exempts stopping owned execution from
@@ -2407,11 +2432,7 @@ impl Controller {
             // The worker was in the directory when this close read it and is not now: its closure
             // was recorded in between, and the record is the answer.
             Err(ControllerError::UnknownSession { .. }) => {
-                *retained = Retained::Record;
-                return crate::given::network_door::kept(
-                    crate::service::net::AtTheNetworkDoor::here(),
-                    self.answer_from_the_closure(session_id).await,
-                );
+                return self.closure_answer_to_a_close(session_id, retained).await;
             }
             Err(error) => return Err(error),
         };
