@@ -207,6 +207,9 @@ pub(crate) struct LeaseEnded {
     pub(crate) left: u64,
     /// The lease whose delivered paste was open, as one more than its epoch; zero for none.
     pub(crate) paste_open_for: u64,
+    /// The lease whose open paste the writer ended when it dropped a batch of that lease, as one
+    /// more than its epoch; zero for none.
+    pub(crate) paste_ended_for: u64,
 }
 
 /// What a lease the host ended by itself left behind, waiting to be reported.
@@ -3685,10 +3688,13 @@ impl Session {
         true
     }
 
-    /// Returns whether a paste the writer was holding open belongs to the lease just ending.
+    /// Returns whether a paste the writer was holding open, or ended at a drop, belongs to the
+    /// lease just ending.
     ///
     /// The writer keeps that latch because a terminator the framer accepted may have been queued
     /// behind a writer that never wrote it, and it clears the latch when it writes the correction.
+    /// A correction made at a drop leaves a mark of its own, because the lease's end comes after it
+    /// in one order and before it in the other, and has to say that a paste was closed in both.
     /// Two things follow. The value has to say *whose* paste it is, or a second lease change in the
     /// writer's window would report the same closure again; so it names the lease that wrote into
     /// the paste, as one more than that lease's epoch, and zero for no paste at all. And it has to
@@ -3696,7 +3702,8 @@ impl Session {
     /// as an answer about the lease before it; so the reading happens inside
     /// [`Session::end_lease`], on the boundary, and travels here.
     const fn delivered_paste_was_ours(ended: &LeaseEnded, ending_epoch: u64) -> bool {
-        ended.paste_open_for != 0 && ended.paste_open_for == ending_epoch.saturating_add(1)
+        let ours = ending_epoch.saturating_add(1);
+        ended.paste_open_for == ours || ended.paste_ended_for == ours
     }
 
     /// Returns what a lease the host ended by itself left behind and nobody has been told about.
