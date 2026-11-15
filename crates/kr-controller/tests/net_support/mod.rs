@@ -184,17 +184,21 @@ const BIND_TRIES: u32 = 5;
 
 /// Lets a stopped daemon go. Each connection's task holds the daemon, and the daemon holds its
 /// environment's lock until the last of them ends. Ending the loops that serve the clients ends the
-/// tasks, at the runtime's next turns, whether or not a client is still connected.
+/// tasks, at the runtime's next turns, whether or not a client is still connected. The bound only
+/// ends a daemon that a fault keeps, and it is as long as a start is given to take over an
+/// environment that is still held ([`kr_controller::testing::ENVIRONMENT_HANDOVER_DEADLINE`]): a
+/// machine that stalls for a few seconds while a task still holds the daemon does not end the case.
 ///
 /// # Panics
 ///
-/// Panics when the daemon is still held ten seconds later.
+/// Panics when the daemon is still held that long after the call.
 async fn let_go(controller: Arc<Controller>) {
     // This handle is let go first: a task that holds the daemon only while something else does
     // ends when this is the only thing besides such tasks that holds it.
     let daemon = Arc::downgrade(&controller);
     drop(controller);
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline =
+        std::time::Instant::now() + kr_controller::testing::ENVIRONMENT_HANDOVER_DEADLINE;
     while daemon.strong_count() > 0 {
         assert!(
             std::time::Instant::now() < deadline,
