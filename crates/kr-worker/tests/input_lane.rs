@@ -624,7 +624,7 @@ impl Rig {
                         prompt_generation: PromptGeneration::new(1),
                         reader_revision: ReaderRevision::new(1),
                         reader_context: ReaderContext::Primary,
-                        editor: editor.clone(),
+                        editor,
                         cwd_revision: CwdRevision::new(1),
                     }),
                 );
@@ -2736,18 +2736,15 @@ async fn the_session_refuses_an_unreached_position_in_the_hold_of_the_action() {
         let beyond = barrier(attachment, epoch, 3, Some(1));
         let release = session
             .release_input(attachment, epoch.get(), Some(&beyond))
-            .err()
-            .expect("the position was not reached");
+            .expect_err("the position was not reached");
         assert_eq!(release.code(), ErrorCode::DraftConflict);
         let detach = session
             .detach(attachment, Some(&beyond))
-            .err()
-            .expect("the position was not reached");
+            .expect_err("the position was not reached");
         assert_eq!(detach.code(), ErrorCode::DraftConflict);
         let launch = session
             .stimulate_fence_after(&beyond, |_| panic!("the machine saw a refused launch"))
-            .err()
-            .expect("the position was not reached");
+            .expect_err("the position was not reached");
         assert_eq!(launch.code(), ErrorCode::DraftConflict);
     }
 
