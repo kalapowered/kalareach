@@ -5646,10 +5646,18 @@ enum OnStop {
     /// Answers `host.info` and, in the same write, sends a frame that cannot be read, and then
     /// closes the connection, so that the command cannot make its request to stop.
     CloseAfterTheLook,
-    /// Answers `host.info`, closes the connection and stops listening, as a daemon whose stop has
-    /// taken effect does: the command cannot make its request, and the daemon has ended.
+    /// Answers `host.info` and, in the same write, sends a frame that cannot be read, then closes
+    /// the connection and stops listening, as a daemon whose stop has taken effect does: the
+    /// command cannot make its request, and the daemon has ended.
     CloseAfterTheLookAndEnd,
+    /// Answers the first `host.info` and closes the connection with nothing else sent, so that the
+    /// command finds it closed; answers the looks that follow for one second, as a daemon that is
+    /// going may, and then stops listening.
+    CloseAndEndAfterASecond,
 }
+
+/// How long `OnStop::CloseAndEndAfterASecond` goes on answering after it has closed a connection.
+const LINGER: Duration = Duration::from_secs(1);
 
 /// A daemon of this test's own that answers `host.info` and the probe the level documents, and
 /// does with a stop what the test says. It holds no lock and runs no session: it is what a person's
@@ -5717,8 +5725,12 @@ impl TestDaemon {
         let socket = PathBuf::from(endpoint.as_text());
         let thread = std::thread::spawn(move || {
             runtime.block_on(async move {
+                // Where the daemon stops answering, after it has closed a connection and lingered.
+                let mut lingers_until: Option<Instant> = None;
                 loop {
-                    if over.load(std::sync::atomic::Ordering::SeqCst) {
+                    if over.load(std::sync::atomic::Ordering::SeqCst)
+                        || lingers_until.is_some_and(|until| Instant::now() >= until)
+                    {
                         break;
                     }
                     let accepted =
@@ -5778,10 +5790,13 @@ impl TestDaemon {
                                         tokio::time::sleep(Duration::from_millis(20)).await;
                                     }
                                 }
-                                then_close = matches!(
-                                    on_stop,
-                                    OnStop::CloseAfterTheLook | OnStop::CloseAfterTheLookAndEnd
-                                ) && request.method.method() == Some(Method::HostInfo);
+                                then_close = request.method.method() == Some(Method::HostInfo)
+                                    && match on_stop {
+                                        OnStop::CloseAfterTheLook
+                                        | OnStop::CloseAfterTheLookAndEnd => true,
+                                        OnStop::CloseAndEndAfterASecond => lingers_until.is_none(),
+                                        _ => false,
+                                    };
                                 let outcome = match request.method.method() {
                                     Some(Method::HostInfo) => Outcome::Ok(
                                         ParamsValue::from_typed(&info).expect("encodes"),
@@ -5815,6 +5830,7 @@ impl TestDaemon {
                                     | OnStop::HoldTheLook
                                     | OnStop::CloseAfterTheLook
                                     | OnStop::CloseAfterTheLookAndEnd
+                                    | OnStop::CloseAndEndAfterASecond
                                     | OnStop::RefuseAndHoldTheProbe => {
                                         ControlFrame::Response(Response {
                                             request_id: mutation.request_id,
@@ -5857,21 +5873,20 @@ impl TestDaemon {
                             }
                             _ => continue,
                         };
-                        let written = if then_close {
-                            // The answer and a frame that cannot be read, in ONE write: the
-                            // command meets the unreadable frame whenever it next reads, whatever
-                            // the order of what follows this write.
-                            let codec = kr_protocol::frame::FrameCodec::new(
-                                kr_protocol::frame::StreamKind::Control,
-                            );
-                            let mut bytes = codec.encode_message(&answer).expect("encodes");
-                            if !matches!(on_stop, OnStop::CloseAfterTheLookAndEnd) {
+                        let written =
+                            if then_close && !matches!(on_stop, OnStop::CloseAndEndAfterASecond) {
+                                // The answer and a frame that cannot be read, in ONE write: the
+                                // command meets the unreadable frame whenever it next reads, whatever
+                                // the order of what follows this write.
+                                let codec = kr_protocol::frame::FrameCodec::new(
+                                    kr_protocol::frame::StreamKind::Control,
+                                );
+                                let mut bytes = codec.encode_message(&answer).expect("encodes");
                                 bytes.extend(codec.encode(&[0xff, 0xff]).expect("frames"));
-                            }
-                            writer.write_frame(&bytes).await
-                        } else {
-                            writer.write_message(&answer).await
-                        };
+                                writer.write_frame(&bytes).await
+                            } else {
+                                writer.write_message(&answer).await
+                            };
                         if written.is_err() {
                             break;
                         }
@@ -5882,6 +5897,9 @@ impl TestDaemon {
                         if then_close {
                             if matches!(on_stop, OnStop::CloseAfterTheLookAndEnd) {
                                 over.store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            if matches!(on_stop, OnStop::CloseAndEndAfterASecond) {
+                                lingers_until = Some(Instant::now() + LINGER);
                             }
                             break;
                         }
@@ -6726,5 +6744,29 @@ fn the_end_of_a_daemon_that_closed_before_the_request_says_that_nothing_was_sent
         out.trim_end().ends_with("This command sent nothing."),
         "{out}"
     );
+    daemon.end();
+}
+
+/// KR-REQ-07.12 (a request that could not be made after a closed connection): a daemon that
+/// answers the look, closes the connection and goes on answering for a second before it stops
+/// listening is waited for to its end, with no look at the endpoint that would find it still
+/// answering and give up at once. The result is the end's: exit 0 and `ended`. A command that
+/// composed its request before it saw the close asked a daemon that had closed, and waits for the
+/// end of a daemon that may have taken the stop; the result is the same.
+#[test]
+fn a_request_that_could_not_be_made_after_a_closed_connection_waits_for_the_daemons_end() {
+    let host = Standalone::create();
+    let mut daemon = TestDaemon::serve(
+        &host,
+        "kr-controller/9.9.9",
+        OnStop::CloseAndEndAfterASecond,
+        true,
+    );
+    let output = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
+    let said = document(&output, "kr host stop");
+    assert_eq!(output.status.code(), Some(0), "{said}");
+    assert_eq!(stop_of(&said), "ended", "{said}");
+    assert!(said["unsettled"].is_null(), "{said}");
+    assert!(attempts(&host).is_empty(), "no record stands");
     daemon.end();
 }
