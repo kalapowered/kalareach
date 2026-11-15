@@ -754,11 +754,18 @@ impl Unwritten {
 /// Settles every batch still waiting in `receiver`, which no writer will write now.
 ///
 /// The channel is closed first: a batch sent after this finds nobody to take it, and the sender
-/// gives it back itself.
+/// gives it back itself. The loop ends when the channel says that it is disconnected and not at
+/// its first empty read: a sender that passed the closed check before the close has counted its
+/// batch and may not have put it in the channel yet, which the channel reports as empty until the
+/// batch is there.
 fn give_back_unwritten(receiver: &mut mpsc::UnboundedReceiver<InputBatch>, unwritten: &Unwritten) {
     receiver.close();
-    while let Ok(batch) = receiver.try_recv() {
-        unwritten.give_back(&batch);
+    loop {
+        match receiver.try_recv() {
+            Ok(batch) => unwritten.give_back(&batch),
+            Err(mpsc::error::TryRecvError::Empty) => std::thread::yield_now(),
+            Err(mpsc::error::TryRecvError::Disconnected) => break,
+        }
     }
 }
 
