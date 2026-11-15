@@ -1957,6 +1957,114 @@ async fn a_sign_in_completed_after_its_authority_ended_keeps_no_grant_and_revoke
     }
 }
 
+/// KR-REQ-17.54: a host that is exclusively organisation-managed answers to its owner's membership
+/// lease, and a sign-in whose person completes it after that lease no longer stands keeps no grant
+/// on the host: what the service issued is revoked and the browser is told why. The host is made
+/// exclusively managed while the sign-in waits, with no lease presented: the owner then has nothing
+/// to answer with, as when the lease the sign-in was started under runs out in the wait. The
+/// control: where the host is not exclusively managed the same sign-in is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_on_an_exclusively_managed_host_whose_lease_ended_while_it_waited_keeps_no_grant()
+{
+    for lease_ended in [false, true] {
+        let broker = Broker::start().await;
+        let owner = DeviceKeys::generate().expect("owner keys");
+        let host =
+            net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+        listen_for_sign_ins(&host);
+        let (url, address) = start_sign_in(&host).await;
+        broker.expect_sign_in(&url);
+
+        if lease_ended {
+            host.controller()
+                .update_policy(|policy| policy.set_exclusively_managed(true))
+                .expect("the policy is written");
+        }
+        let page = browser_answers(&address, &url, "the-code").await;
+        if lease_ended {
+            // The host answers a status request to its lease too, so it is read once the host is
+            // no longer held to one.
+            host.controller()
+                .update_policy(|policy| policy.set_exclusively_managed(false))
+                .expect("the policy is written");
+        }
+        let report = settled(&host).await;
+        if lease_ended {
+            assert!(
+                page.contains("authority for this sign-in ended"),
+                "the browser is told why: {page}"
+            );
+            assert_eq!(report.state, AccountState::SignedOut, "no grant is kept");
+            assert_eq!(
+                broker.revoked(),
+                [broker.refresh(1)],
+                "what the service issued is revoked"
+            );
+        } else {
+            assert!(
+                matches!(report.state, AccountState::SignedIn { .. }),
+                "{report:?}"
+            );
+            assert!(broker.revoked().is_empty());
+        }
+        host.stop().await;
+    }
+}
+
+/// KR-REQ-09.09: a sign-in that is not kept because its authority ended is revoked at the service,
+/// and where the service cannot be reached the revocation stands in the queue, which the daemon
+/// sends when it next starts. The host holds no grant meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_revocation_of_a_sign_in_whose_authority_ended_stands_in_the_queue_until_the_next_start()
+ {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    listen_for_sign_ins(&host);
+    let (url, address) = start_sign_in(&host).await;
+    broker.expect_sign_in(&url);
+
+    // The service cannot be reached when the unkept grant is revoked.
+    broker.refuse_revocations(true);
+    host.controller().hold_fence(true);
+    let page = browser_answers(&address, &url, "the-code").await;
+    host.controller().hold_fence(false);
+    assert!(
+        page.contains("authority for this sign-in ended"),
+        "the browser is told why: {page}"
+    );
+    assert_eq!(settled(&host).await.state, AccountState::SignedOut);
+    assert!(
+        broker.revoked().is_empty(),
+        "the service refused the revocation"
+    );
+    assert!(
+        broker
+            .seen()
+            .iter()
+            .any(|request| request.path == "/auth/oauth2/revoke"
+                && request.body["token"] == broker.refresh(1).as_str()),
+        "the unkept grant was sent to the service at once, and refused"
+    );
+
+    // Nothing remembers it but the queue, which the daemon sends when it next starts.
+    let stopped = host.shut_down().await;
+    broker.refuse_revocations(false);
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while broker.revoked().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the daemon sends the revocation again");
+    assert_eq!(broker.revoked(), [broker.refresh(1)]);
+    assert_eq!(account_report(&host).await.state, AccountState::SignedOut);
+    host.stop().await;
+}
+
 /// KR-REQ-09.09 and 17.54: a token refresh keeps the account's lock across its request to the
 /// service, and a sign-out that has passed its early asks waits for it. A fence this host comes to
 /// owe while it waits stops the sign-out where the grant would go: the grant stays and no revocation
