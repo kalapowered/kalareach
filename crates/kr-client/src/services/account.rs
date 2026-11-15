@@ -2049,6 +2049,13 @@ pub enum Commit {
     /// are the caller's to end ([`SignedInAccount::revoke_unkept`]); [`SignedInAccount::keep`] ends
     /// them.
     Withheld,
+    /// As [`Self::Withheld`], and the revocation of the tokens reached neither the service nor the
+    /// queue: the queue could not take it and the service was not told, so the token is held in
+    /// this process's memory for the next send, and is lost if the process stops before one runs.
+    /// Its family then stays live at the service until it expires. A queue write that reports a
+    /// failure can have installed its entry all the same, in which case the next start sends it
+    /// from the queue as well.
+    WithheldOwing,
 }
 
 /// The account signed in on this device: the grant in secure storage, one lock over every change
@@ -2426,6 +2433,15 @@ impl SignedInAccount {
         self.write_pending(&entries)
     }
 
+    /// Whether this process holds `refresh_token` in memory for the next send.
+    fn held_in_memory(&self, refresh_token: &RefreshToken) -> bool {
+        self.unsettled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|(_, held)| held == refresh_token)
+    }
+
     /// Keeps a token in memory until a send can queue it or the service acknowledges it: the one
     /// way in, so a token is held once however often it is added.
     fn keep_in_memory(&self, grant_id: &str, refresh_token: RefreshToken) {
@@ -2593,7 +2609,8 @@ impl SignedInAccount {
     ///
     /// `stands` is asked as [`Self::commit`] asks it. Where it says no, nothing is kept and the
     /// tokens are ended at the service, queued before they are sent ([`Self::revoke_unkept`]), and
-    /// the outcome is [`Commit::Withheld`].
+    /// the outcome is [`Commit::Withheld`], or [`Commit::WithheldOwing`] when neither the queue nor
+    /// the service took the revocation of a token.
     ///
     /// # Errors
     ///
@@ -2609,10 +2626,17 @@ impl SignedInAccount {
             Ok(Commit::Kept) => Ok(Commit::Kept),
             Ok(Commit::Withheld) => {
                 // The caller's standing did not hold where the grant would have been written, so
-                // the tokens are ended at the service, queued first.
-                let _ = self.revoke_unkept(refresh).await;
-                Ok(Commit::Withheld)
+                // the tokens are ended at the service, queued first. A token that neither the
+                // queue nor the service took is still in memory afterwards, and the caller is
+                // told that its revocation is owed.
+                let _ = self.revoke_unkept(refresh.clone()).await;
+                Ok(if self.held_in_memory(&refresh) {
+                    Commit::WithheldOwing
+                } else {
+                    Commit::Withheld
+                })
             }
+            Ok(Commit::WithheldOwing) => Ok(Commit::WithheldOwing),
             Ok(Commit::Unsettled) => {
                 let _ = self.recover().await;
                 // What the store and the queue hold now, read together: a grant the queue still

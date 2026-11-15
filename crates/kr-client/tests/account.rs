@@ -2403,6 +2403,47 @@ async fn a_token_neither_the_queue_nor_the_service_took_is_kept_for_the_next_sen
     assert_eq!(stub.revoked(), ["grant-x"]);
 }
 
+/// A keep whose caller's standing ended ends the tokens it came with, and says when the revocation
+/// is still owed: the queue could not take it and the service was not told, so the token is only in
+/// this process's memory, and the next send ends it. Where the service was told, or the queue holds
+/// the revocation, nothing is owed.
+#[tokio::test]
+async fn a_keep_whose_standing_ended_says_when_its_revocation_reached_neither_queue_nor_service() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    for (queue_refuses, service_works, expected) in [
+        (true, false, Commit::WithheldOwing),
+        (true, true, Commit::Withheld),
+        (false, false, Commit::Withheld),
+    ] {
+        let stub = Arc::new(Stub::new());
+        stub.revoke_works.store(service_works, Ordering::SeqCst);
+        let store = Arc::new(FaultyStore::new());
+        let signed_in = account_on(&stub, &store);
+        if queue_refuses {
+            store.queue_writes(&[true]);
+        }
+        let outcome = signed_in
+            .keep(
+                issued_for("account-1", "grant-c", &["openid"]),
+                "c-nonce",
+                || false,
+            )
+            .await
+            .expect("a keep");
+        assert_eq!(
+            outcome, expected,
+            "the queue refused: {queue_refuses}, the service works: {service_works}"
+        );
+        if expected == Commit::WithheldOwing {
+            assert!(stub.revoked().is_empty(), "nothing reached the service");
+            stub.revoke_works.store(true, Ordering::SeqCst);
+            assert_eq!(signed_in.send_pending().await.expect("a send"), 0);
+            assert_eq!(stub.revoked(), ["grant-c"], "the next send ends it");
+        }
+    }
+}
+
 /// A token that neither the queue nor the service takes is held in memory once however often it is
 /// refused, so a service that answers later is sent it once, and a service that does not is not
 /// counted as owed it twice.
