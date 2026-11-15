@@ -6,8 +6,8 @@
 //! ([`super::InputStreams::position_not_reached`]) and forwards the request unless that record
 //! shows the position is not reached.
 //!
-//! The members that carry the barrier are read only by a worker which serves typing on a lane of
-//! its own, and are taken out of the request for any other ([`params_for_worker`]).
+//! The barrier and the request for the fenced count are members that only a worker which serves
+//! typing on a lane of its own reads ([`params_for_worker`]).
 
 use kr_protocol::attachment::SessionDetachParams;
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
@@ -57,18 +57,42 @@ pub(in crate::service::net) fn not_reached() -> ProtocolError {
 /// The parameters of a release, a detach or a launch as the worker that will be sent them reads
 /// them.
 ///
-/// A worker that serves typing on a lane of its own (`serves_lane`) reads the barrier and is sent
-/// the members as they were given. Any other worker refuses a member it does not know, so the
-/// members are taken out for it, and the host's own check of the position is the only one. The
-/// choice is the worker's stated capability and never its level.
+/// A worker that serves typing on a lane of its own (`serves_lane`) reads the barrier, and is asked
+/// to report the bytes that the end of the lease discarded, on a release and on a detach, so the
+/// device learns the count from the answer. Any other worker refuses a member it does not know, so
+/// the members are taken out for it, and the host's own check of the position is the only one. The
+/// choice is the worker's stated capability and never its level. Parameters that cannot be read are
+/// sent as they are: the worker refuses them.
 pub(in crate::service::net) fn params_for_worker(
     serves_lane: bool,
     method: Method,
     params: &ParamsValue,
 ) -> ParamsValue {
-    if serves_lane {
-        params.clone()
-    } else {
-        kr_protocol::retained::strip_input_lane_members(method, params)
+    if !serves_lane {
+        return kr_protocol::retained::strip_input_lane_members(method, params);
     }
+    match method {
+        Method::InputRelease => params
+            .to_typed::<InputReleaseParams>()
+            .ok()
+            .and_then(|typed| {
+                ParamsValue::from_typed(&InputReleaseParams {
+                    fenced_report: true,
+                    ..typed
+                })
+                .ok()
+            }),
+        Method::SessionDetach => params
+            .to_typed::<SessionDetachParams>()
+            .ok()
+            .and_then(|typed| {
+                ParamsValue::from_typed(&SessionDetachParams {
+                    fenced_report: true,
+                    ..typed
+                })
+                .ok()
+            }),
+        _ => None,
+    }
+    .unwrap_or_else(|| params.clone())
 }
