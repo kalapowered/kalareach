@@ -988,38 +988,6 @@ fn a_cut_after_which_the_reply_may_have_reached_the_device_is_not_a_shown_bounda
     assert!(cut_unknown(false, false, false, false, false, false).is_some());
 }
 
-/// Whether the old attachment's input, tried on a lane that the case opened for it on the device's
-/// new connection, was turned away by the host: its refusal with a code, its word that the lease
-/// of the epoch ended, or its end of the stream while the connection stood (the host ends the
-/// stream of a worker's refusal that it cannot tell was given before acceptance). Input that was
-/// accepted, a lane that did not open, and typing that nothing answered never put the old
-/// attachment to a decision, and say what turned it away where something did.
-///
-/// # Errors
-///
-/// Returns why the result is not the host's turning the stale attachment away.
-fn stale_input_turned_away<T: std::fmt::Debug>(
-    result: &Result<T, kr_e2e_m1b::typing::NotTyped>,
-) -> Result<String, String> {
-    use kr_e2e_m1b::typing::NotTyped;
-    match result {
-        Err(NotTyped::Refused(error)) => Ok(format!("the host refused it: {error}")),
-        Err(NotTyped::LeaseEnded(epoch)) => Ok(format!(
-            "the host said the old attachment no longer holds the lease of epoch {}",
-            epoch.get()
-        )),
-        Err(not_typed @ NotTyped::Ended(kr_client::input::EndCause::Reset)) => Ok(format!(
-            "the host ended the stream without accepting it: {not_typed}"
-        )),
-        Err(other) => Err(format!(
-            "the old attachment's next input is not turned away by the host, on a lane that opened: {other}"
-        )),
-        Ok(written) => Err(format!(
-            "the old attachment's input was accepted on the new connection: {written:?}"
-        )),
-    }
-}
-
 /// A view of the session's screen from the paired device, over a connection of its own: the
 /// session's own connection carries the typed actions and the keyboard.
 struct Watch {
@@ -1096,35 +1064,6 @@ impl Watch {
         let _ = ctx.runtime.block_on(self.view.detach(&self.remote));
         self.remote.close();
     }
-}
-
-/// A stale attachment's input that the host turned away, by its refusal, its word that the lease
-/// ended or its end of the stream, is what the check requires, and nothing else counts: an
-/// accepted input, a lane that did not open and a stream that ended another way fail the check.
-#[test]
-fn a_stale_attachments_input_that_was_accepted_or_not_turned_away_by_the_host_fails_the_check_of_part_4()
- {
-    use kr_client::input::EndCause;
-    use kr_e2e_m1b::typing::NotTyped;
-    let turned = |not_typed: NotTyped| -> Result<(), NotTyped> { Err(not_typed) };
-    assert!(
-        stale_input_turned_away(&turned(NotTyped::Refused(
-            kr_protocol::error::ProtocolError::new(ErrorCode::LeaseLost, "input.write")
-        )))
-        .is_ok()
-    );
-    assert!(
-        stale_input_turned_away(&turned(NotTyped::LeaseEnded(
-            kr_protocol::ids::InputLeaseEpoch::new(1)
-        )))
-        .is_ok()
-    );
-    assert!(stale_input_turned_away(&turned(NotTyped::Ended(EndCause::Reset))).is_ok());
-    assert!(stale_input_turned_away(&turned(NotTyped::Ended(EndCause::Finished))).is_err());
-    assert!(
-        stale_input_turned_away(&turned(NotTyped::Waited("the acceptance".to_owned()))).is_err()
-    );
-    assert!(stale_input_turned_away::<()>(&Ok(())).is_err());
 }
 
 /// Whether a conversation holds one prompt and one finished reply for it.
@@ -1233,22 +1172,30 @@ fn gateway_a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no
                 once(prompts, 1).unwrap_or_else(|why| panic!("no duplicate work: {why}"));
                 // The old attachment's next input, on the new connection, is turned away by the
                 // host. The keyboard's own lane ended with the old connection, so the input goes on
-                // a fresh lane that the case opens for the old attachment on the new connection,
-                // and the host is asked. The host admits a lane once its connection has its route
-                // to the worker, which a request that names the session fixes: the snapshot below.
+                // a lane that the case opens for the old attachment on the new connection. The
+                // host admits a lane once its connection has its route to the worker, which a
+                // request that names the session fixes: the snapshot below. It then answers by the
+                // path that carries typing to the worker: on the worker's lane path the worker
+                // binds a lane only for an attachment that the connection's own link owns, so the
+                // host ends the stream before its first word; on the serial path the lane opens
+                // and the frame is turned away. Either passes; an open that ran out of time, or
+                // typing that the host accepted, fails the part. The evidence says which path
+                // answered.
                 let _ = events_snapshot(&fresh, &ctx.runtime, session.session_id());
-                let stale = ctx.runtime.block_on(async {
-                    let mut lane = kr_e2e_m1b::typing::Typing::open(
+                let stale_by_the_host = ctx
+                    .runtime
+                    .block_on(kr_e2e_m1b::typing::Typing::replay(
                         fresh.session(),
                         fresh.environment_id(),
                         session.session_id(),
                         keyboard.attachment_id(),
-                    )
-                    .await?;
-                    lane.type_bytes(keyboard.epoch(), b"x").await
-                });
-                let stale_by_the_host = stale_input_turned_away(&stale)
-                    .unwrap_or_else(|why| panic!("the old attachment's next input: {why}"));
+                        keyboard.epoch(),
+                        b"x",
+                    ))
+                    .unwrap_or_else(|why| {
+                        panic!("the old attachment's next input is turned away by the host: {why}")
+                    })
+                    .to_string();
                 // The control: the same prompt sent again is a second request that starts a turn.
                 let again = ctx
                     .prompts(
@@ -1273,7 +1220,7 @@ fn gateway_a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no
                 serde_json::json!({
                     "arm": arm(ctx),
                     "turn_requests": prompts,
-                    "stale_input": { "turned_away_by": "the host, on a lane opened for the old attachment on the new connection", "what": stale_by_the_host },
+                    "stale_input": { "turned_away_by": "the host, on a lane opened for the old attachment on the new connection", "answered": stale_by_the_host },
                     "control": { "what": "the same prompt sent again", "breaks_property": true,
                                  "turn_requests": prompts_twice, "check": control.err() },
                 })
@@ -1497,23 +1444,30 @@ fn gateway_a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no
                     .unwrap_or_else(|why| panic!("no duplicate work after reconnecting: {why}"));
                 // The old attachment's next input, on the new connection, is turned away by the
                 // host. The keyboard's own lane ended with the old connection, so the input goes on
-                // a fresh lane that the case opens for the old attachment on the new connection,
-                // and the host is asked. The host admits a lane once its connection has its route
-                // to the worker, which a request that names the session fixes: the snapshot below.
+                // a lane that the case opens for the old attachment on the new connection. The
+                // host admits a lane once its connection has its route to the worker, which a
+                // request that names the session fixes: the snapshot below. It then answers by the
+                // path that carries typing to the worker: on the worker's lane path the worker
+                // binds a lane only for an attachment that the connection's own link owns, so the
+                // host ends the stream before its first word; on the serial path the lane opens
+                // and the frame is turned away. Either passes; an open that ran out of time, or
+                // typing that the host accepted, fails the part. The evidence says which path
+                // answered.
                 let _ = events_snapshot(&fresh, &ctx.runtime, session.session_id());
-                let stale = ctx.runtime.block_on(async {
-                    let mut lane = kr_e2e_m1b::typing::Typing::open(
+                let stale_by_the_host = ctx
+                    .runtime
+                    .block_on(kr_e2e_m1b::typing::Typing::replay(
                         fresh.session(),
                         fresh.environment_id(),
                         session.session_id(),
                         keyboard.attachment_id(),
-                    )
-                    .await?;
-                    lane.type_bytes(keyboard.epoch(), account.clear.as_bytes())
-                        .await
-                });
-                let stale_by_the_host = stale_input_turned_away(&stale)
-                    .unwrap_or_else(|why| panic!("the old attachment's next input: {why}"));
+                        keyboard.epoch(),
+                        account.clear.as_bytes(),
+                    ))
+                    .unwrap_or_else(|why| {
+                        panic!("the old attachment's next input is turned away by the host: {why}")
+                    })
+                    .to_string();
                 redrawn.close(ctx);
                 // The control: the same prompt sent again, and the count, read again, is two.
                 real.charge(&ctx.run, "4", "the control's prompt sent again");
@@ -1541,7 +1495,7 @@ fn gateway_a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no
                     "cutoff": cutoff,
                     "at_the_drop": { "prompts": at_the_drop.0, "finished_replies": at_the_drop.1 },
                     "after_reconnect": { "prompts": prompts, "finished_replies": replies, "shows": end, "screen_rows_holding_it": redrawn_rows.iter().filter(|row| row.contains(&end)).count() },
-                    "stale_input": { "turned_away_by": "the host, on a lane opened for the old attachment on the new connection", "what": stale_by_the_host },
+                    "stale_input": { "turned_away_by": "the host, on a lane opened for the old attachment on the new connection", "answered": stale_by_the_host },
                     "control": { "what": "the same prompt sent again", "breaks_property": true,
                                  "prompts": prompts_twice, "finished_replies": replies_twice,
                                  "check": control.err() },
