@@ -2942,7 +2942,7 @@ impl WorkerService {
         tasks.spawn(Arc::clone(&self).settle_what_is_owed_to_the_authority());
         // The same for a lease whose batch the writer dropped at its authority's deadline.
         if let Some(dropped) = self.runtime.take_epoch_expiry() {
-            tokio::spawn(Arc::clone(&self).end_leases_of_dropped_batches(dropped));
+            tasks.spawn(Arc::clone(&self).end_leases_of_dropped_batches(dropped));
         }
         // The components of this session's bindings are registered with the plugin runtime from
         // here. Nothing is asked of anybody until a binding wants one.
