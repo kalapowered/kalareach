@@ -1631,6 +1631,13 @@ impl Session {
                 self.transport.send_before(&frame, not_after, wanted).await
             }
         };
+        // A send that stopped or failed may have ended the connection under itself: a frame cut
+        // short closes it. The session records that end here, before it says that the send
+        // stopped, so that whoever is told reads the end with it and need not wait for the control
+        // stream's own end to be read.
+        if !matches!(written, Ok(true)) && self.transport.is_closed() {
+            self.state.end();
+        }
         match written {
             Ok(true) => {}
             Ok(false) => {
