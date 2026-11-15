@@ -3936,3 +3936,47 @@ async fn a_registration_check_that_waits_for_the_shares_lock_meets_a_fence_owed_
         );
     }
 }
+
+/// KR-REQ-09.09: the admission check a service asks inside its transaction reads the fence this
+/// host owes after the last lock that it takes, as the registration check does. A fence published
+/// while the authority feed's check waits for the connection's shares lock is read afterwards and
+/// the check refuses. The control: with no fence the check passes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_admission_check_that_waits_for_the_shares_lock_meets_a_fence_owed_in_the_wait() {
+    for owed in [false, true] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::super::tests::daemon(&temp).await;
+        let (connection, _recording) =
+            paired_connection(&controller, 72, &[ActionRight::SessionView]);
+        let admission = crate::authority::AdmittedMutation {
+            connection_id: connection.connection_id,
+            admitted_revision: controller.policy().authority_revision(),
+            deadline: controller.clock.now().checked_add(Duration::from_secs(60)),
+        };
+        let registry = controller.registry.lock().await;
+        let (arrived, go) = controller.pause_before_the_shares_lock();
+        let releasing = {
+            let controller = Arc::clone(&controller);
+            tokio::spawn(async move {
+                // The check has read the fence once and is at the shares lock, where it waits.
+                tokio::task::spawn_blocking(move || {
+                    arrived.recv_timeout(std::time::Duration::from_secs(30))
+                })
+                .await
+                .expect("the wait ends")
+                .expect("the check reaches the shares lock");
+                controller.hold_fence(owed);
+                go.send(()).expect("the check goes on");
+            })
+        };
+        let checked =
+            tokio::task::block_in_place(|| controller.check_admission(&registry, &admission));
+        releasing.await.expect("the release ends");
+        controller.hold_fence(false);
+        assert_eq!(
+            checked.is_err(),
+            owed,
+            "a fence owed in the wait: {owed}: {checked:?}"
+        );
+    }
+}
