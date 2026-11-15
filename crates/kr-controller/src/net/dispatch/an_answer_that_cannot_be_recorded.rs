@@ -12,7 +12,7 @@ use kr_protocol::ids::ActorId;
 use kr_protocol::method::Method;
 use kr_protocol::scalars::Nullable;
 
-use super::a_copy_from_a_services_record::{EVERY_RIGHT, mutation_of, refusal_of};
+use super::a_copy_from_a_services_record::{EVERY_RIGHT, mutation_of};
 use super::write_boundary::paired_connection;
 use crate::service::a_close_a_worker_never_answers as fake;
 
