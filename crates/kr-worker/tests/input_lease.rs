@@ -2706,6 +2706,190 @@ async fn an_answer_that_waits_for_room_is_dropped_at_its_deadline_with_nothing_e
     );
 }
 
+/// KR-REQ-08.49: the pump looks at the lane's own clock before it gives up on an answer's deadline,
+/// so a timer that ends while that clock still reads the deadline does not leave the answer
+/// standing past it.
+///
+/// The lane drops an answer at a reading later than its deadline, and the pump's timer runs on
+/// another clock, which on some platforms is ahead of the lane's by a step of up to about sixteen
+/// milliseconds. Here the lane's clock stands at the deadline itself when the pump's timer ends.
+/// The clock then moves on, and that is all that happens: nothing notifies the pump.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_is_dropped_when_the_lanes_clock_passes_its_deadline_after_the_timer_found_it_there()
+ {
+    let (_host, runtime, clock, _session_id, _holder, _epoch) = silent_session().await;
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
+    let (writer_stopped, _release_writer) = runtime.input().writer_hold().arm();
+    let (timer_ended, release_pump) = runtime.input().pause_the_pump_at_its_timer();
+
+    {
+        let mut session = runtime.session();
+        session.ingest_output(&STATUS_QUESTION.repeat(256));
+        runtime.flush_input();
+        clock.advance(Duration::from_secs(1));
+        // Offered at one second, so its deadline is at three.
+        session.ingest_output(STATUS_QUESTION);
+    }
+    tokio::time::timeout(Duration::from_secs(20), writer_stopped)
+        .await
+        .expect("the writer takes the first batch")
+        .expect("the writer's stop fires");
+    // The lane's clock stands at the deadline, not past it, whenever the pump's timer ends.
+    clock.advance(Duration::from_secs(2));
+    tokio::time::timeout(Duration::from_secs(20), timer_ended)
+        .await
+        .expect("the pump's timer ends")
+        .expect("the pump's stop fires");
+    {
+        let session = runtime.session();
+        assert!(session.engine().replies_pending());
+        assert_eq!(
+            session.engine().replies_expired(),
+            0,
+            "at the deadline itself an answer has not lapsed"
+        );
+    }
+    drop(release_pump);
+
+    clock.advance(Duration::from_millis(1));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while runtime.session().engine().replies_expired() == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect(
+        "the answer is dropped once the lane's clock passes its deadline, and the drop is recorded",
+    );
+    assert!(!runtime.session().engine().replies_pending());
+}
+
+/// KR-REQ-08.49: room that the writer gives back wakes the pump for the answers that wait for it,
+/// when the pump's pass after the answer began to wait found none and nothing else happens.
+///
+/// The share of the host's answers is full and the writer is held, so one more answer waits in
+/// the lane. The pump looks at the lane once, reads no room, and its pass ends. The writer is
+/// then let go, writes everything and gives its places back. The lane's clock stands still, so
+/// the answer's deadline brings no second look: only the writer's wake can bring the answer out.
+#[tokio::test(flavor = "multi_thread")]
+async fn room_given_back_after_the_pumps_pass_has_ended_brings_the_waiting_answer_out() {
+    let (_host, runtime, clock, _session_id, _holder, _epoch) = silent_session().await;
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
+    let (writer_stopped, release_writer) = runtime.input().writer_hold().arm();
+
+    let (pump_stopped, release_pump) = {
+        let mut session = runtime.session();
+        session.ingest_output(&STATUS_QUESTION.repeat(256));
+        runtime.flush_input();
+        clock.advance(Duration::from_secs(1));
+        session.ingest_output(STATUS_QUESTION);
+        // The pump's pass that follows the answer's first wait takes the session when this block
+        // ends: it is the first pass to reach the stop.
+        runtime.input().pump_hold().arm_blocking()
+    };
+    tokio::time::timeout(Duration::from_secs(20), writer_stopped)
+        .await
+        .expect("the writer takes the first batch")
+        .expect("the writer's stop fires");
+    tokio::time::timeout(Duration::from_secs(20), pump_stopped)
+        .await
+        .expect("the pump's pass reads the room")
+        .expect("the pump's stop fires");
+    assert!(
+        runtime.session().engine().replies_pending(),
+        "the answer waits for room that has not come back"
+    );
+    drop(release_pump);
+    drop(release_writer);
+
+    let written = || -> usize {
+        runtime
+            .input()
+            .terminal_writes()
+            .iter()
+            .map(|write| count(&write.bytes, STATUS_ANSWER))
+            .sum()
+    };
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while written() < 257 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the writer wrote {} of the 257 answers, and the room is free",
+            written()
+        )
+    });
+}
+
+/// KR-REQ-08.48 and KR-REQ-08.49: an answer that waits behind an open paste is dropped at its own
+/// deadline, with its record, though the paste stays open and nothing else happens, and it is
+/// never written.
+///
+/// A closed gate decides what is written and not what ages, and an open paste has no end of its own
+/// in time. The pump wakes for the deadline of what a closed gate keeps, as it does for what waits
+/// for room. When the paste ends nothing is written for the dropped answer and the drop is not
+/// counted again.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_behind_an_open_paste_is_dropped_at_its_deadline_by_the_pump_and_never_written() {
+    let (_host, runtime, clock, _session_id, holder, epoch) = silent_session().await;
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
+
+    {
+        let mut session = runtime.session();
+        session.ingest_output(b"\x1b[?2004h");
+        session
+            .write_input(holder, epoch, 0, b"\x1b[200~pasted", None, Instant::now())
+            .expect("the paste opens");
+        runtime.flush_input();
+        session.ingest_output(STATUS_QUESTION);
+        assert!(
+            session.engine().replies_pending(),
+            "the answer waits behind the open paste"
+        );
+    }
+    clock.advance(Duration::from_millis(2_100));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while runtime.session().engine().replies_expired() == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the answer is dropped at its deadline with the paste open, and the drop is recorded");
+    assert!(!runtime.session().engine().replies_pending());
+
+    {
+        let mut session = runtime.session();
+        session
+            .write_input(holder, epoch, 1, b"\x1b[201~", None, Instant::now())
+            .expect("the paste ends");
+        runtime.flush_input();
+    }
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !runtime
+            .input()
+            .terminal_writes()
+            .iter()
+            .any(|write| count(&write.bytes, &b"\x1b[201~"[..]) > 0)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the end of the paste is written");
+    runtime.session().pump_replies();
+    let answers: usize = runtime
+        .input()
+        .terminal_writes()
+        .iter()
+        .map(|write| count(&write.bytes, STATUS_ANSWER))
+        .sum();
+    assert_eq!(answers, 0, "the dropped answer is not written");
+    assert_eq!(runtime.session().engine().replies_expired(), 1);
+}
+
 /// KR-REQ-08.49: a terminal that refuses a write ends the writer, and what the writer leaves
 /// behind is settled: the room of every batch it held, the answer waiting in the lane for that
 /// room, and the count of answers that did not reach the application.
