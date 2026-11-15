@@ -133,14 +133,14 @@ impl Rig {
         let host_keys = DeviceKeys::generate().expect("host keys");
         let host = within(
             "the host starts",
-            Host::start_with_feed_keys(
+            Box::pin(Host::start_with_feed_keys(
                 &owner,
                 &host_keys,
                 served.origin(),
                 Arc::clone(&timer) as _,
                 clocks,
                 Some(LONG_FEED_DEADLINES),
-            ),
+            )),
         )
         .await;
         wait_for_the_passes(&host);
@@ -261,7 +261,12 @@ impl Rig {
         let device = Device::create().await;
         let record = within(
             "the device pairs",
-            pair_with(&self.host, &device, &self.owner, proposal(rights)),
+            Box::pin(pair_with(
+                &self.host,
+                &device,
+                &self.owner,
+                proposal(rights),
+            )),
         )
         .await;
         (device, record)
@@ -305,12 +310,12 @@ impl Rig {
                 );
             }
         }
-        let stopped = within("the daemon stops", host.shut_down()).await;
+        let stopped = within("the daemon stops", Box::pin(host.shut_down())).await;
         edit(stopped.tree());
         let timer = HeldTimer::held();
         let host = within(
             "the daemon starts again",
-            stopped.start_with_timer(Arc::clone(&timer) as _),
+            Box::pin(stopped.start_with_timer(Arc::clone(&timer) as _)),
         )
         .await;
         wait_for_the_passes(&host);
@@ -406,7 +411,9 @@ impl Rig {
 }
 
 /// A failure guard for a test that waits on a condition: the tests decide on what the daemon did,
-/// and this only keeps one that went wrong from hanging.
+/// and this only keeps one that went wrong from hanging. A test's own future lives on its thread's
+/// stack in a debug build, and `within` holds the work it is given twice over, so the rig boxes the
+/// work that is large (a daemon's start, a stop and a pairing).
 async fn within<T>(what: &str, work: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(Duration::from_secs(180), work)
         .await
