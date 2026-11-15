@@ -755,14 +755,16 @@ async fn a_restarted_daemon_collects_the_names_a_transfer_left_owing() {
         .expect("the transfer is done")
         .to_typed()
         .expect("a transfer result");
+    let given = first
+        .revoked
+        .barrier
+        .workers
+        .iter()
+        .find(|reported| reported.session_id == session_id)
+        .expect("the worker is in the barrier");
     assert!(
-        first
-            .revoked
-            .barrier
-            .workers
-            .iter()
-            .any(|reported| reported.session_id == session_id),
-        "the worker is in the barrier: {first:?}"
+        first.revoked.barrier.holds() && given.names_pending.get() > 0,
+        "the first answer held with names still to come: {given:?}"
     );
     assert_eq!(
         answers_kept_with_a_record(&host),

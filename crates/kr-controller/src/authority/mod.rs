@@ -921,39 +921,22 @@ pub(crate) fn ended_since(given: &WorkerBarrier) -> WorkerBarrier {
     }
 }
 
-/// The count a sentence of the kind `prefix` carries, when it is one.
-fn count_after(sentence: &str, prefix: &str) -> Option<u64> {
-    let rest = sentence.strip_prefix(prefix)?;
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    digits.parse().ok()
-}
-
-/// Whether the daemon's own sentences show that the worker has since said what its fence named for
-/// some of the revisions that `kept`, a sentence of `given`'s detail, says it had not: the daemon's
-/// entry for the same revocation has a sentence of the same kind with a lower count.
-fn said_since(kept: &str, now_sentences: &[&str]) -> bool {
-    [NOT_SAID, CANNOT_SAY].into_iter().any(|prefix| {
-        count_after(kept, prefix).is_some_and(|kept_count| {
-            now_sentences
-                .iter()
-                .any(|now| count_after(now, prefix).is_some_and(|count| count < kept_count))
-        })
-    })
-}
-
 /// The sentences of `given`'s detail on the revisions its worker has not said what its fence named
 /// for, cannot say, or whose fences are not read, that `now`, the daemon's own entry for the same
-/// worker, does not already say and does not show to be out of date ([`said_since`]).
+/// worker, does not already say.
 ///
 /// An entry with no such sentence reads the same whether the worker has said everything or this
 /// daemon holds nothing of those revisions, as it does after a restart, so a sentence stays unless
-/// the daemon's own sentence of its kind shows it out of date.
+/// the daemon's entry says the very same thing. A lower count in the daemon's own sentence of its
+/// kind removes nothing: the two counts need not be of the same revisions, and only an entry that
+/// reads every revision the kept entry read ([`Reads::covered_by`]) says what is so, which is the
+/// case where these sentences are not asked for.
 #[must_use]
 pub(crate) fn kept_sentences_beside(now: &WorkerBarrier, given: &WorkerBarrier) -> Vec<String> {
     let now_sentences: Vec<&str> = now.detail.split("; ").collect();
     what_the_worker_has_not_said(given, now.state == BarrierState::Ended)
         .into_iter()
-        .filter(|kept| !now_sentences.contains(&kept.as_str()) && !said_since(kept, &now_sentences))
+        .filter(|kept| !now_sentences.contains(&kept.as_str()))
         .collect()
 }
 
@@ -997,15 +980,15 @@ pub(crate) fn detail_beside_the_names_of(
         .saturating_add(now.names_pending.get());
     if owed > 0 && lacks > 0 {
         sentences.push(format!(
-            "in all, up to {} of the actions its fence named may not be named here: an earlier \
-             answer to this revocation gave some as still to come or no longer held, this daemon \
-             lacks some, and the two counts may include the same actions",
+            "together, the two counts give up to {} of the actions its fence named that may not \
+             be named here: an earlier answer to this revocation gave some as still to come or no \
+             longer held, this daemon lacks some, and the two counts may include the same actions",
             owed.saturating_add(lacks)
         ));
     } else if owed > 0 {
         sentences.push(format!(
-            "up to {owed} of the actions its fence named may not be named here: an earlier answer \
-             to this revocation gave them as still to come or no longer held"
+            "an earlier answer to this revocation gave up to {owed} of the actions its fence \
+             named as still to come or no longer held, and they may not be named here"
         ));
     }
     sentences.extend(kept_sentences_beside(now, given));
