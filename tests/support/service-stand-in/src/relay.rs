@@ -763,7 +763,8 @@ pub(crate) fn admit(
 /// The paths that still work, as the service names them.
 const ALTERNATIVES: [&str; 2] = [
     "A direct connection between the devices, which needs no managed relay.",
-    "A self-hosted relay configured in the service settings.",
+    "A relay that the host's owner runs. The host must name it in its configuration and use no \
+     managed relay. A new invitation from that host then names it.",
 ];
 
 /// `relay.lease.issue`: opens a lease for a pair, or refills the one the pair holds.

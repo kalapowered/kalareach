@@ -5475,7 +5475,8 @@ async fn a_whole_pairing_through_a_relay_fits_in_the_admission_ceiling() {
 /// The paths the service stand-in names when it cannot admit, as it writes them.
 const STAND_IN_PATHS: [&str; 2] = [
     "A direct connection between the devices, which needs no managed relay.",
-    "A self-hosted relay configured in the service settings.",
+    "A relay that the host's owner runs. The host must name it in its configuration and use no \
+     managed relay. A new invitation from that host then names it.",
 ];
 
 /// The paths a failure carries, as words.
@@ -5513,6 +5514,9 @@ async fn a_device_that_is_refused_free_capacity_is_handed_the_wait_the_service_n
         .expect("the attempt ran")
         .expect_err("a relay that takes no session carries nothing");
     assert_eq!(failure.kind, FailureKind::RelayCapacity);
-    assert_eq!(failure.retry_after_seconds, Some(90));
+    // What a person is told to wait is what is left until the device asks again, which is no more
+    // than the delay the service named and at least a second until that time has passed.
+    let wait = failure.retry_after_seconds.expect("a wait");
+    assert!((1..=90).contains(&wait), "{wait}");
     assert_eq!(told_paths(&failure), STAND_IN_PATHS);
 }
