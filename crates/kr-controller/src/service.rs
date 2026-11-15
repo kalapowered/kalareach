@@ -752,6 +752,11 @@ pub struct Controller {
     /// its claim. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     before_a_door_effect: ReadPause,
+    /// Where this host's own tests stop a pairing or owner-confirmation write once the door has
+    /// decided its caller and before the service that records or answers it is asked, so that the
+    /// local owner's lease can end in the wait. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    after_the_pairing_caller: ReadPause,
     /// Where this host's own tests stop a local write once the route that performs it has
     /// answered, before the answer is told, so that a connection can be withdrawn or a fence set
     /// where the answer is asked what it stands on. Compiled away in every shipped build.
