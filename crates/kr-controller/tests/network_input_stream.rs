@@ -3035,7 +3035,7 @@ async fn send_asking(
     count: u64,
     fenced_report: bool,
 ) -> Sent {
-    let barrier = Some(InputBarrier {
+    let barrier = InputBarrier {
         attachment_id: rig.attachment,
         epoch,
         count: U64::new(count),
@@ -3043,7 +3043,18 @@ async fn send_asking(
             Dependent::Launch => Nullable::some(1),
             Dependent::Release | Dependent::Detach => Nullable::null(),
         },
-    });
+    };
+    send_with(rig, request, barrier, fenced_report).await
+}
+
+/// As [`send_asking`], for a barrier that the case builds itself.
+async fn send_with(
+    rig: &Rig,
+    request: Dependent,
+    barrier: InputBarrier,
+    fenced_report: bool,
+) -> Sent {
+    let barrier = Some(barrier);
     let target = rig.adopted.workers[0].target(rig.adopted.host.environment_id);
     let action = ActionId::new(kr_ipc::new_uuid());
     let before = position_refusals(rig);
@@ -3362,6 +3373,66 @@ async fn a_barrier_is_judged_only_in_the_epoch_the_lane_holds() {
         "the stale epoch's and the two with no lease were forwarded, the short one was not"
     );
     rig.stop().await;
+}
+
+/// A release's or a detach's barrier names the request's own attachment. The host refuses a barrier
+/// that names another, whatever position it counts, before it forwards anything: the answer is an
+/// argument refusal, the stand-in for the worker is sent nothing, and no position check is what
+/// refused it. A request whose barrier names its own attachment is forwarded after it. The rule is
+/// the same for a worker without the lane, whose barrier the host takes out of what it forwards.
+async fn a_barrier_that_names_another_attachment_is_refused(rig: Rig) {
+    let sent = script_dependents(&rig, None);
+    let other = another_attachment();
+    for request in [Dependent::Release, Dependent::Detach] {
+        // A position that is reached and one that is not are refused alike.
+        for count in [0, 3, 9] {
+            let barrier = InputBarrier {
+                attachment_id: other,
+                epoch: rig.epoch,
+                count: U64::new(count),
+                launch: Nullable::null(),
+            };
+            let refused = send_with(&rig, request, barrier, false).await;
+            let error = refused
+                .answer
+                .expect_err("the barrier names another attachment");
+            assert_eq!(
+                error.code,
+                ErrorCode::InvalidArgument,
+                "{request:?} at {count}"
+            );
+            assert_eq!(
+                error.message,
+                kr_worker::input_domain::POSITION_NAMES_ANOTHER
+            );
+        }
+    }
+    assert!(
+        forwarded(&sent).is_empty(),
+        "nothing was forwarded: {:?}",
+        forwarded(&sent)
+    );
+    assert_eq!(position_refusals(&rig), 0, "no position was judged");
+    let own = send_after(&rig, Dependent::Release, rig.epoch, 3).await;
+    assert!(
+        own.answer.is_ok(),
+        "its own barrier is forwarded: {:?}",
+        own.answer
+    );
+    assert_eq!(forwarded(&sent), vec![Method::InputRelease]);
+    rig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_barrier_that_names_another_attachment_is_refused_before_it_is_forwarded() {
+    let (rig, _stream) = typed(3).await;
+    a_barrier_that_names_another_attachment_is_refused(rig).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_barrier_that_names_another_attachment_is_refused_for_a_worker_without_the_lane() {
+    let (rig, _stream) = typed_serial(3).await;
+    a_barrier_that_names_another_attachment_is_refused(rig).await;
 }
 
 /// The host has no record of a stream that never opened, and none of one that ended: the request is

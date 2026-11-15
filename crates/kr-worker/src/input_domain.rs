@@ -80,6 +80,11 @@ use crate::session::{
 };
 use kr_term::lane::DrainBudget;
 
+/// What a release or a detach is refused with when its position names the typing of another
+/// attachment than its own. The control daemon refuses with the same words, before it forwards.
+pub const POSITION_NAMES_ANOTHER: &str =
+    "The typing that this request follows belongs to another attachment.";
+
 /// One entry in a session's queue for the pseudo-terminal.
 #[derive(Debug)]
 pub(crate) enum Queued {
@@ -2353,22 +2358,28 @@ impl InputDomain {
     /// the action makes it again in its own hold, so no frame of the epoch is accepted between the
     /// last check and the action.
     ///
-    /// The position is consulted only while the barrier names the requester, its epoch is the
-    /// current one and its attachment holds the lease. After a takeover the old epoch accepts no
-    /// more frames, so there is nothing left to order and the request goes on to the checks of its
-    /// own.
+    /// The barrier names the requester's own attachment, and a barrier that names another is
+    /// refused whatever its position: a request orders itself after its own typing and no one
+    /// else's. The position is consulted only while its epoch is the current one and its
+    /// attachment holds the lease. After a takeover the old epoch accepts no more frames, so there
+    /// is nothing left to order and the request goes on to the checks of its own.
     ///
     /// # Errors
     ///
-    /// Returns [`WorkerError::PreconditionFailed`] when the epoch is live and fewer frames of it
-    /// have been accepted than the barrier counts.
+    /// Returns [`WorkerError::InvalidArgument`] when the barrier names another attachment, and
+    /// [`WorkerError::PreconditionFailed`] when the epoch is live and fewer frames of it have been
+    /// accepted than the barrier counts.
     pub(crate) fn check_position(
         &self,
         attachment_id: AttachmentId,
         barrier: &InputBarrier,
     ) -> Result<()> {
-        if barrier.attachment_id != attachment_id
-            || barrier.epoch.get() != self.lease.epoch()
+        if barrier.attachment_id != attachment_id {
+            return Err(WorkerError::InvalidArgument(
+                POSITION_NAMES_ANOTHER.to_owned(),
+            ));
+        }
+        if barrier.epoch.get() != self.lease.epoch()
             || self.lease.holder() != Some(barrier.attachment_id)
             || self.lease.next_sequence() >= barrier.count.get()
         {

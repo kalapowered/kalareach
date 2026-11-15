@@ -2246,6 +2246,61 @@ async fn a_release_or_a_detach_beyond_the_position_of_a_live_epoch_applies_nothi
     rig.finish().await;
 }
 
+/// KR-REQ-23.36, C21: a release or a detach whose barrier names another attachment than its own is
+/// a definite refusal with nothing applied, whatever position the barrier counts: a request orders
+/// itself after its own typing and no one else's. The refusal leaves no outcome behind, so the
+/// resend with no position is taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_release_or_a_detach_whose_barrier_names_another_attachment_applies_nothing() {
+    let mut rig = Rig::start().await;
+    let attachment = rig.attach().await;
+    let other = rig.attach().await;
+    let epoch = rig.acquire(attachment).await;
+    let mut lane = rig.lane(attachment).await;
+    typed(&mut lane, &[b"a", b"b", b"c"]).await;
+    rig.received_exactly(b"abc").await;
+
+    // A position that is reached and one that is not are refused alike.
+    for count in [0, 3, 9] {
+        let release = rig
+            .release_with(
+                attachment,
+                epoch,
+                Some(barrier(other, epoch, count, None)),
+                true,
+            )
+            .await
+            .expect_err("the barrier names another attachment");
+        assert_eq!(release.code, ErrorCode::InvalidArgument);
+        assert_eq!(
+            release.message,
+            kr_worker::input_domain::POSITION_NAMES_ANOTHER
+        );
+        let detach = rig
+            .detach_with(attachment, Some(barrier(other, epoch, count, None)), true)
+            .await
+            .expect_err("the barrier names another attachment");
+        assert_eq!(detach.code, ErrorCode::InvalidArgument);
+        assert_eq!(
+            detach.message,
+            kr_worker::input_domain::POSITION_NAMES_ANOTHER
+        );
+    }
+
+    // Nothing was applied: the view still holds the keys and is still attached.
+    typed(&mut lane, &[b"d"]).await;
+    rig.received_exactly(b"abcd").await;
+    rig.release_with(attachment, epoch, None, true)
+        .await
+        .expect("the resend with no position is taken");
+    let detached = rig
+        .detach_with(attachment, None, true)
+        .await
+        .expect("the resend with no position is taken");
+    assert_eq!(detached.attachment_id, attachment);
+    rig.finish().await;
+}
+
 /// KR-REQ-23.36, C21: after a takeover the old epoch accepts no more frames, so there is no
 /// position to wait for. The old view's release is a lost lease, as it is today, and its detach
 /// succeeds whatever position it names.
