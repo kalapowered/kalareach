@@ -669,7 +669,10 @@ mod tests {
         *transport.writer.lock().await = Some(half);
         let failed = transport.send(&request(2, 8)).await;
         assert!(
-            matches!(&failed, Err(ClientError::Ipc(kr_ipc::IpcError::Socket { .. }))),
+            matches!(
+                &failed,
+                Err(ClientError::Ipc(kr_ipc::IpcError::Socket { .. }))
+            ),
             "an error that is not the peer's going: {failed:?}"
         );
         assert!(
