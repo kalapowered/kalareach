@@ -325,7 +325,25 @@ impl Rig {
         Self::start_built(None, false, true).await
     }
 
+    /// A rig whose application keeps what it reads with the suite's own program and not with the
+    /// system's `tee` ([`common::KEEPS_WHAT_IT_READS`] says why), for a case that writes a great
+    /// deal to it at once.
+    async fn start_keeping() -> Self {
+        Self::start_reading_with(common::KEEPS_WHAT_IT_READS, None, false, false).await
+    }
+
     async fn start_built(close_bound: Option<Duration>, fenced: bool, waits: bool) -> Self {
+        Self::start_reading_with("tee", close_bound, fenced, waits).await
+    }
+
+    /// Starts the rig with `reader` as the program that keeps what the application receives in
+    /// the file it is given.
+    async fn start_reading_with(
+        reader: &str,
+        close_bound: Option<Duration>,
+        fenced: bool,
+        waits: bool,
+    ) -> Self {
         let temp = kr_ipc::testing::TempHost::create();
         let environment = temp.environment();
         let environment_id = temp.environment_id();
@@ -352,7 +370,7 @@ impl Rig {
             environment_id,
             display_number: DisplayNumber::new(1),
             shell: kr_worker::testing::posix_script(&format!(
-                "stty raw -echo; printf '\\033[?2004hkr-ready.'; {wait}exec tee {}",
+                "stty raw -echo; printf '\\033[?2004hkr-ready.'; {wait}exec {reader} {}",
                 kr_worker::testing::shell_quoted(&received)
             )),
             shell_mode: if fenced {
@@ -861,11 +879,49 @@ impl Rig {
         .await
         .unwrap_or_else(|_| {
             panic!(
-                "the application received {} bytes, not the {} expected",
+                "the application received {} bytes, not the {} expected; {}",
                 self.received().len(),
-                expected.len()
+                expected.len(),
+                self.what_became_of_the_application()
             )
         });
+    }
+
+    /// What tells a worker that stopped writing from an application that stopped keeping what it
+    /// read, for a failure that finds the application's file short: the total the writer recorded
+    /// as written to the terminal, whether the writer found the terminal gone, the end of the
+    /// session's retained output, where an error of the application shows, the application's
+    /// state and exit, and the free space of the directory its file is in.
+    fn what_became_of_the_application(&self) -> String {
+        let writes = self.runtime.input().terminal_writes();
+        let written: usize = writes.iter().map(|write| write.bytes.len()).sum();
+        let gone = self
+            .runtime
+            .input()
+            .lock()
+            .terminal_gone_latch()
+            .load(std::sync::atomic::Ordering::Acquire);
+        let retained = common::retained(&self.runtime);
+        let end =
+            String::from_utf8_lossy(&retained[retained.len().saturating_sub(400)..]).into_owned();
+        let exit = {
+            let session = self.runtime.session();
+            format!("{:?}, closure {:?}", session.state(), session.closure())
+        };
+        #[cfg(unix)]
+        let free = rustix::fs::statvfs(self._kept.path()).map_or_else(
+            |error| format!("not read: {error}"),
+            |stat| format!("{} bytes", stat.f_bavail.saturating_mul(stat.f_frsize)),
+        );
+        #[cfg(not(unix))]
+        let free = String::from("not read on this platform");
+        format!(
+            "the writer recorded {written} bytes in {} writes to the terminal; the terminal was \
+             {}; the retained output ends {end:?}; the application's state is {exit}; the free \
+             space of the directory its file is in is {free}",
+            writes.len(),
+            if gone { "found gone" } else { "not found gone" },
+        )
     }
 
     /// Waits until the worker holds nothing for the terminal.
@@ -998,7 +1054,7 @@ async fn a_frame_beyond_the_credit_closes_the_lane_and_is_never_written() {
 /// 60,000.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_large_frame_is_charged_its_claim_and_the_credit_given_back_is_the_same() {
-    let mut rig = Rig::start().await;
+    let mut rig = Rig::start_keeping().await;
     let attachment = rig.attach().await;
     let epoch = rig.acquire(attachment).await;
     let mut lane = rig.lane(attachment).await;
