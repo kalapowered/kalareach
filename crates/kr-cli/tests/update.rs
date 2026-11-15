@@ -4055,45 +4055,53 @@ impl Idle {
     /// A live session whose worker is a process that is running and does not answer, which holds an
     /// update: this test's own process stands in for it.
     fn with_a_worker_that_holds_the_update(self) -> Self {
-        use kr_controller::registry::{Registry, WorkerRecord};
-        use kr_protocol::identity::{DesktopBinding, WorkerProfile};
-        use kr_protocol::ids::{ActorId, AuthorityRevision};
-        use kr_protocol::scalars::AuthorisationKey;
-        use kr_protocol::session::SessionState;
-
-        let mut registry = Registry::open(self.registry(), self.temp.environment_id())
-            .expect("the registry opens");
-        let running =
-            kr_ipc::identity::current_process_start_identity().expect("this process's identity");
-        let reservation = reserve_with(
-            &mut registry,
-            &ActorId::new("local:501").expect("a principal"),
-            &running,
-            4,
-            b"intent",
-        );
-        let key = AuthorisationKey::from_bytes([4; 32]);
-        registry
-            .claim_rendezvous(reservation.reservation_id, key)
-            .expect("claims");
-        registry
-            .record_worker(
-                reservation.reservation_id,
-                &WorkerRecord {
-                    session_id: reservation.session_id,
-                    display_number: reservation.display_number,
-                    public_key: key,
-                    process_identity: running,
-                    endpoint: "worker".to_owned(),
-                    profile: WorkerProfile::HeadlessUser,
-                    state: SessionState::Live,
-                    acknowledged_revision: AuthorityRevision::new(0),
-                },
-                &DesktopBinding::none(),
-            )
-            .expect("records the worker");
+        let mut registry =
+            kr_controller::registry::Registry::open(self.registry(), self.temp.environment_id())
+                .expect("the registry opens");
+        hold_the_update(&mut registry);
         drop(registry);
         self
+    }
+
+    /// As [`Self::with_a_worker_that_holds_the_update`], with the record of that worker standing in
+    /// the registry's write-ahead log alone, as a daemon that a signal ended leaves it: the file
+    /// holds none of it.
+    fn with_a_worker_in_the_log_alone(self) -> Self {
+        let mut registry =
+            kr_controller::registry::Registry::open(self.registry(), self.temp.environment_id())
+                .expect("the registry opens");
+        let file_alone = self.records();
+        hold_the_update(&mut registry);
+        // The files as they stand while the connection is open, which is what a process that is
+        // ended leaves: the file as it was at the last checkpoint, and the log.
+        let image = self.temp.root().join("image");
+        std::fs::create_dir_all(&image).expect("a directory");
+        let file = self.registry();
+        let log = Self::beside(&file, "-wal");
+        std::fs::copy(&file, image.join("registry")).expect("copies the file");
+        std::fs::copy(&log, image.join("registry-wal")).expect("copies the log");
+        drop(registry);
+        std::fs::copy(image.join("registry"), &file).expect("puts the file back");
+        std::fs::copy(image.join("registry-wal"), &log).expect("puts the log back");
+        std::fs::remove_dir_all(&image).expect("the image goes");
+        let _ = std::fs::remove_file(Self::beside(&file, "-shm"));
+        assert!(
+            std::fs::metadata(&log).expect("the log").len() > 0,
+            "the record is in the log"
+        );
+        assert_eq!(
+            self.records(),
+            file_alone,
+            "and the file alone does not hold it"
+        );
+        self
+    }
+
+    /// The name of a file beside the registry's, with `suffix` added.
+    fn beside(file: &Path, suffix: &str) -> PathBuf {
+        let mut named = file.as_os_str().to_owned();
+        named.push(suffix);
+        PathBuf::from(named)
     }
 
     /// The registry as an earlier release left it at `version`, between 4 and 6: what each later
@@ -4139,7 +4147,33 @@ impl Idle {
     /// What the registry records, read as the file alone: every column the first schema this suite
     /// forges has, apart from the recorded create request, which a later schema rewrites.
     fn records(&self) -> Vec<Vec<Vec<String>>> {
-        let uri = format!("file:{}?immutable=1", self.registry().display());
+        Self::records_at(&self.registry())
+    }
+
+    /// What the registry records, with what its log holds: read from a copy of the file and its log.
+    fn records_with_its_log(&self) -> Vec<Vec<Vec<String>>> {
+        let directory = self.temp.root().join("read-with-its-log");
+        std::fs::create_dir_all(&directory).expect("a directory");
+        let file = self.registry();
+        let copy = directory.join("registry.sqlite");
+        std::fs::copy(&file, &copy).expect("copies the file");
+        let log = Self::beside(&file, "-wal");
+        if log.is_file() {
+            std::fs::copy(&log, Self::beside(&copy, "-wal")).expect("copies the log");
+        }
+        // Read and closed, so that the log is taken into the copy.
+        let connection = rusqlite::Connection::open(&copy).expect("opens the copy");
+        connection
+            .query_row("SELECT COUNT(*) FROM sqlite_master", [], |_| Ok(()))
+            .expect("reads the copy");
+        drop(connection);
+        let records = Self::records_at(&copy);
+        std::fs::remove_dir_all(&directory).expect("the copy goes");
+        records
+    }
+
+    fn records_at(registry: &Path) -> Vec<Vec<Vec<String>>> {
+        let uri = format!("file:{}?immutable=1", registry.display());
         let connection = rusqlite::Connection::open_with_flags(
             uri,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -4210,6 +4244,46 @@ impl Idle {
     }
 }
 
+/// Records in `registry` a live session whose worker is this test's own process, which runs and
+/// does not answer, so that it holds an update.
+fn hold_the_update(registry: &mut kr_controller::registry::Registry) {
+    use kr_controller::registry::WorkerRecord;
+    use kr_protocol::identity::{DesktopBinding, WorkerProfile};
+    use kr_protocol::ids::{ActorId, AuthorityRevision};
+    use kr_protocol::scalars::AuthorisationKey;
+    use kr_protocol::session::SessionState;
+
+    let running =
+        kr_ipc::identity::current_process_start_identity().expect("this process's identity");
+    let reservation = reserve_with(
+        registry,
+        &ActorId::new("local:501").expect("a principal"),
+        &running,
+        4,
+        b"intent",
+    );
+    let key = AuthorisationKey::from_bytes([4; 32]);
+    registry
+        .claim_rendezvous(reservation.reservation_id, key)
+        .expect("claims");
+    registry
+        .record_worker(
+            reservation.reservation_id,
+            &WorkerRecord {
+                session_id: reservation.session_id,
+                display_number: reservation.display_number,
+                public_key: key,
+                process_identity: running,
+                endpoint: "worker".to_owned(),
+                profile: WorkerProfile::HeadlessUser,
+                state: SessionState::Live,
+                acknowledged_revision: AuthorityRevision::new(0),
+            },
+            &DesktopBinding::none(),
+        )
+        .expect("records the worker");
+}
+
 /// Reserves a launch with the ended process `ended` as its launcher.
 fn reserve_with(
     registry: &mut kr_controller::registry::Registry,
@@ -4277,8 +4351,15 @@ async fn host_to_update() -> (Host, Assembled, Assembled, String) {
 
 /// As [`host_to_update`], with `two` as the newer release.
 async fn host_to_update_to(two: Assembled) -> (Host, Assembled, Assembled, String) {
+    host_to_update_between(Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1), two).await
+}
+
+/// As [`host_to_update`], with `one` as the release installed and `two` as the newer one.
+async fn host_to_update_between(
+    one: Assembled,
+    two: Assembled,
+) -> (Host, Assembled, Assembled, String) {
     let mut host = Host::bare();
-    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
     host.install(&one);
     let controller = host.store.stable(Program::Controller);
     host.start_daemon(&controller).await;
@@ -5137,11 +5218,20 @@ async fn a_rollback_leaves_a_registry_behind_this_release_s_schema_as_it_is() {
     let before = idle.records();
     assert_eq!(idle.version(), 6);
 
-    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    let private = host.scratch("private-temporary");
+    let (output, said) = host.kr_json_with(
+        &[("TMPDIR", private.as_os_str())],
+        &["host", "rollback", "--json"],
+    );
     assert!(
         output.status.success(),
         "kr host rollback: {said} {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        private_copies_in(&private),
+        Vec::<String>::new(),
+        "the copy the registry was classed from is gone"
     );
     assert_eq!(said["target"], one.name().as_str(), "{said}");
     assert_eq!(said["carried"], serde_json::json!([]), "{said}");
@@ -5204,6 +5294,130 @@ async fn a_rollback_classes_a_registry_behind_this_release_s_schema_without_chan
         "the daemon the rollback stopped serves again"
     );
     let _ = one;
+}
+
+/// KR-REQ-26.10: a rollback classes a registry from what its write-ahead log holds as well as from
+/// its file: the worker that a daemon ended by a signal left recorded in the log alone holds the
+/// rollback, the registry is as it was, and the copy it was classed from is gone when the rollback
+/// returns. The release it goes to lists no registry, so no step before the classing takes the log
+/// into the file.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_classes_a_registry_from_what_its_log_holds_and_leaves_no_copy() {
+    let without_a_registry: Vec<ReleaseStore> = release_stores()
+        .into_iter()
+        .filter(|store| store.store != "registry")
+        .collect();
+    let (host, one, two, archive) = host_to_update_between(
+        Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(without_a_registry),
+        Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2),
+    )
+    .await;
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let idle = Idle::new(&host.store).with_a_worker_in_the_log_alone();
+    let before = idle.records_with_its_log();
+
+    let private = host.scratch("private-temporary");
+    let (output, said) = host.kr_json_with(
+        &[("TMPDIR", private.as_os_str())],
+        &["host", "rollback", "--json"],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(9),
+        "{said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        said["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("did not answer its challenge and has not ended"),
+        "{said}"
+    );
+    assert_eq!(
+        private_copies_in(&private),
+        Vec::<String>::new(),
+        "the copy the registry was classed from is gone"
+    );
+    assert_eq!(
+        idle.records_with_its_log(),
+        before,
+        "and what the registry records is as it was"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone()),
+        "nothing was switched"
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", two.name()),
+        "the daemon the rollback stopped serves again"
+    );
+    let _ = one;
+}
+
+/// KR-REQ-26.10: a rollback whose temporary directory cannot take the copy of a registry is
+/// refused, naming the environment, and nothing is changed.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_whose_temporary_directory_cannot_take_the_copy_is_refused_and_changes_nothing()
+{
+    let (host, one, two, archive) = host_to_update().await;
+    let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let idle = Idle::new(&host.store).shaped_as(6);
+    let before = idle.records();
+    // A file where the temporary directory is to be: nothing can be made inside it.
+    let no_room = host.scratch("no-room").join("a-file");
+    std::fs::write(&no_room, b"").expect("a file");
+
+    let (output, said) = host.kr_json_with(
+        &[("TMPDIR", no_room.as_os_str())],
+        &["host", "rollback", "--json"],
+    );
+    assert!(
+        !output.status.success(),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default();
+    assert!(message.contains(&idle.environment_id()), "{said}");
+    assert!(message.contains("could not be copied to be read"), "{said}");
+    assert_eq!(idle.version(), 6, "the registry was not brought forward");
+    assert_eq!(idle.records(), before, "and what it records is as it was");
+    assert!(idle.sidecars().is_empty(), "{:?}", idle.sidecars());
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone()),
+        "nothing was switched"
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", two.name()),
+        "the daemon the rollback stopped serves again"
+    );
+    let _ = one;
+}
+
+/// The private copies of a registry that a rollback made in `directory`, its temporary directory.
+fn private_copies_in(directory: &Path) -> Vec<String> {
+    std::fs::read_dir(directory)
+        .expect("a directory")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("kr-registry-"))
+        .collect()
 }
 
 /// KR-REQ-26.10: a rollback is refused, naming the store, when a store as it stands is at a version
