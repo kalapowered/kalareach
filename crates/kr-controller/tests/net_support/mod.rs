@@ -310,23 +310,30 @@ impl MovedWall {
 /// Both run with the machine's own, as a running host's do: a daemon that restarts finds the wall
 /// clock where the boot clock says it must be, and a wall clock that stood still while the machine
 /// ran would be one that went backwards. The suite adds what it moves them by, as a machine that
-/// slept past the end of a grant reads them.
+/// slept past the end of a grant reads them. [`Moved::standing`] is the exception: its continuous
+/// clock reads only what the suite adds.
 #[derive(Clone, Debug)]
 pub struct Moved {
     wall_ahead_ms: Arc<std::sync::atomic::AtomicU64>,
     continuous_ahead_ns: Arc<std::sync::atomic::AtomicU64>,
 }
 
-/// The machine's continuous clock, taken forward by what a suite adds to it.
+/// A continuous clock taken forward by what a suite adds to it: the machine's own, which counts
+/// the real time that passes as well, or one that stands still and reads only what the suite added.
 #[derive(Debug)]
 struct ContinuousAhead {
-    machine: kr_transport::clock::SystemContinuousClock,
+    machine: Option<kr_transport::clock::SystemContinuousClock>,
     ahead_ns: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl kr_transport::clock::ContinuousClock for ContinuousAhead {
     fn now(&self) -> kr_transport::clock::ContinuousInstant {
-        let now = self.machine.now();
+        let now = match &self.machine {
+            Some(machine) => kr_transport::clock::ContinuousClock::now(machine),
+            None => {
+                kr_transport::clock::ContinuousClock::now(&kr_transport::clock::ManualClock::new())
+            }
+        };
         let ahead = Duration::from_nanos(self.ahead_ns.load(std::sync::atomic::Ordering::Acquire));
         now.checked_add(ahead).unwrap_or(now)
     }
@@ -336,11 +343,26 @@ impl Moved {
     /// Clocks that read the machine's own until they are moved, and the handle that moves them.
     #[must_use]
     pub fn new() -> (Self, Clocks) {
+        Self::on(Some(kr_transport::clock::SystemContinuousClock::new()))
+    }
+
+    /// As [`Self::new`], with a continuous clock that stands still until it is moved: the time it
+    /// counts is exactly what the suite adds to it, however long the machine takes in between. A
+    /// suite whose assertions are about how much time passed uses it, so that a machine that is
+    /// busy cannot add seconds to what the suite moved the clock by. The wall clock still reads
+    /// the machine's own, so a daemon's dealings with what is signed in real time are as they are
+    /// on a running host, and no reading of it decides what the suite asserts.
+    #[must_use]
+    pub fn standing() -> (Self, Clocks) {
+        Self::on(None)
+    }
+
+    fn on(machine: Option<kr_transport::clock::SystemContinuousClock>) -> (Self, Clocks) {
         let wall_ahead_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let continuous_ahead_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let clocks = Clocks {
             continuous: Arc::new(ContinuousAhead {
-                machine: kr_transport::clock::SystemContinuousClock::new(),
+                machine,
                 ahead_ns: Arc::clone(&continuous_ahead_ns),
             }),
             wall: WallClock::from_fn({

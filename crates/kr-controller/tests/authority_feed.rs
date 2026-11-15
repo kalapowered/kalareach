@@ -114,6 +114,14 @@ impl Rig {
         Self::start_on(Clocks::system()).await
     }
 
+    /// As [`Self::start`], on a continuous clock that stands still: a case that asserts the feed
+    /// reads current has the age of what it was read by from the clock it moves, and not from the
+    /// seconds a busy machine takes between two of its steps.
+    async fn start_standing() -> Self {
+        let (_, clocks) = Moved::standing();
+        Self::start_on(clocks).await
+    }
+
     /// As [`Self::start`], on the clocks a test gives the daemon.
     async fn start_on(clocks: Clocks) -> Self {
         let served = serve().await;
@@ -4498,7 +4506,7 @@ fn seconds_since_the_doctor_says_the_feed_was_read(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_feed_whose_carrier_ended_reads_stale_once_its_last_synchronisation_is_past_three_polls()
 {
-    let (moved, clocks) = Moved::new();
+    let (moved, clocks) = Moved::standing();
     let rig = Rig::start_on(clocks).await;
     let shown = rig.shown().await;
     assert!(
@@ -4520,9 +4528,9 @@ async fn a_feed_whose_carrier_ended_reads_stale_once_its_last_synchronisation_is
     assert_eq!(check.status, DoctorStatus::Warning, "{check:?}");
     let seconds = seconds_since_the_doctor_says_the_feed_was_read(&check)
         .expect("the doctor says how long ago the feed was read");
-    assert!(
-        (100..200).contains(&seconds),
-        "the doctor's age is the clock's: {seconds}"
+    assert_eq!(
+        seconds, 100,
+        "the doctor's age is the seconds the clock was moved by: {seconds}"
     );
 }
 
@@ -4530,7 +4538,7 @@ async fn a_feed_whose_carrier_ended_reads_stale_once_its_last_synchronisation_is
 /// polls on and stale a poll and a second after that.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_feed_is_current_two_polls_after_it_was_read_and_stale_past_the_third() {
-    let (moved, clocks) = Moved::new();
+    let (moved, clocks) = Moved::standing();
     let rig = Rig::start_on(clocks).await;
 
     moved.advance(Duration::from_secs(2 * 30));
@@ -4557,7 +4565,7 @@ async fn a_feed_is_current_two_polls_after_it_was_read_and_stale_past_the_third(
 /// clock's, so a recorded time that is later than the wall clock's present changes neither.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_wall_clock_set_back_after_a_synchronisation_does_not_hide_a_dead_feed() {
-    let (moved, clocks) = Moved::new();
+    let (moved, clocks) = Moved::standing();
     let rig = Rig::start_on(clocks).await;
     // The wall clock runs two hours ahead when the feed is read, and is then put right.
     moved.advance_wall(Duration::from_secs(2 * 60 * 60));
@@ -4589,10 +4597,10 @@ async fn a_wall_clock_set_back_after_a_synchronisation_does_not_hide_a_dead_feed
     );
     let check = shown.check.expect("the doctor reports the feed");
     assert_eq!(check.status, DoctorStatus::Warning, "{check:?}");
-    assert!(
-        seconds_since_the_doctor_says_the_feed_was_read(&check)
-            .is_some_and(|seconds| seconds >= 100),
-        "the doctor's age is the continuous clock's: {check:?}"
+    assert_eq!(
+        seconds_since_the_doctor_says_the_feed_was_read(&check),
+        Some(100),
+        "the doctor's age is the continuous clock's, and the wall clock's is not: {check:?}"
     );
 }
 
@@ -4600,7 +4608,7 @@ async fn a_wall_clock_set_back_after_a_synchronisation_does_not_hide_a_dead_feed
 /// clock made stale is current again: no stale stays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_carrier_that_reads_the_feed_again_clears_what_the_clock_said() {
-    let (moved, clocks) = Moved::new();
+    let (moved, clocks) = Moved::standing();
     let rig = Rig::start_on(clocks).await;
     moved.advance(Duration::from_secs(100));
     assert!(
@@ -4649,7 +4657,7 @@ async fn a_look(what: &str, looks: &HeldTimer) -> Arc<tokio::sync::Notify> {
 /// nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_carrier_that_slept_through_its_wait_reads_the_feed_within_five_seconds_of_waking() {
-    let (moved, clocks) = Moved::new();
+    let (moved, clocks) = Moved::standing();
     let rig = Rig::start_on(clocks).await;
     let looks = HeldTimer::held();
     rig.runtime().count_looks_by(Arc::clone(&looks) as _);
@@ -4707,7 +4715,7 @@ async fn a_carrier_that_slept_through_its_wait_reads_the_feed_within_five_second
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_machine_that_slept_after_a_pass_recorded_its_synchronisation_asks_the_feed_within_five_seconds()
  {
-    let (moved, clocks) = Moved::new();
+    let (moved, clocks) = Moved::standing();
     let rig = Rig::start_on(clocks).await;
     let looks = HeldTimer::held();
     rig.runtime().count_looks_by(Arc::clone(&looks) as _);
@@ -4754,7 +4762,7 @@ async fn a_machine_that_slept_after_a_pass_recorded_its_synchronisation_asks_the
 /// within five seconds of waking, and does not wait out what the timer's clock still holds of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_carrier_that_slept_past_a_delay_the_feed_named_reads_the_feed_within_five_seconds() {
-    let (moved, clocks) = Moved::new();
+    let (moved, clocks) = Moved::standing();
     let rig = Rig::start_on(clocks).await;
     let looks = HeldTimer::held();
     rig.runtime().count_looks_by(Arc::clone(&looks) as _);
@@ -4817,7 +4825,7 @@ async fn a_carrier_that_slept_past_a_delay_the_feed_named_reads_the_feed_within_
 /// it: the carrier asks the feed again at once, and not after what the timer's clock still holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_wake_after_a_sleep_past_a_delay_the_feed_named_asks_the_feed_at_once() {
-    let (moved, clocks) = Moved::new();
+    let (moved, clocks) = Moved::standing();
     let rig = Rig::start_on(clocks).await;
     let looks = HeldTimer::held();
     rig.runtime().count_looks_by(Arc::clone(&looks) as _);
@@ -4872,7 +4880,7 @@ async fn a_wake_after_a_sleep_past_a_delay_the_feed_named_asks_the_feed_at_once(
 /// long ago, and not how long since this daemon last read the feed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restored_feed_whose_age_cannot_be_told_reads_stale_and_gives_no_seconds() {
-    let rig = Rig::start().await;
+    let rig = Rig::start_standing().await;
     assert!(
         !rig.shown().await.list.feed_stale,
         "the control: the feed was just read"
@@ -5245,7 +5253,7 @@ async fn a_device_the_configuration_leaves_no_right_to_manage_the_host_has_no_au
 /// not read, and the next pass goes on where it stopped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_feed_longer_than_a_pass_reads_is_not_a_synchronisation_until_it_is_read_through() {
-    let rig = Rig::start().await;
+    let rig = Rig::start_standing().await;
     rig.runtime().read_at_most_pages(1);
     let synchronised = rig.shown().await.list.feed_synchronised_at_ms.0;
     assert!(synchronised.is_some(), "the host has read the feed once");
@@ -5339,7 +5347,7 @@ async fn a_feed_longer_than_a_pass_reads_is_not_a_synchronisation_until_it_is_re
 /// that holds the read open does not hold the device out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_connection_is_served_while_the_feed_holds_the_read_open_past_the_bound() {
-    let rig = Rig::start().await;
+    let rig = Rig::start_standing().await;
     let (phone, record) = rig.pairs(&[ActionRight::SessionView]).await;
     rig.poll().await;
     // The bound is short only from here: the passes the setup asked for have ended, so what ends at
@@ -5421,7 +5429,7 @@ async fn a_removal_the_registry_cannot_take_is_in_force_and_is_written_when_it_c
 /// shown of the feed is stale, as it is when the feed cannot be reached.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pass_this_host_could_not_finish_leaves_what_is_shown_stale() {
-    let rig = Rig::start().await;
+    let rig = Rig::start_standing().await;
     let (_phone, device) = rig.pairs(&[ActionRight::SessionView]).await;
     rig.poll().await;
     assert!(
