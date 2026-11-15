@@ -1225,7 +1225,8 @@ impl InputDomain {
     /// release: one more place and the longest delimiter, as a person's keys do.
     ///
     /// The lane keeps every answer past the allowance, under its own deadline, and the pump gives it
-    /// up when the writer has given room back.
+    /// up when room has come back: the writer gave a debt back, a guard returned its promise, or
+    /// the window of a lane ended.
     pub(crate) fn reply_allowance(&self) -> DrainBudget {
         let held = self.committed();
         let kept = Cost::claimed_by(0);

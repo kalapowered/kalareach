@@ -1064,7 +1064,7 @@ impl SessionRuntime {
                 // it: by the bytes the terminal takes as they are written, and for the rest when
                 // this goes out of scope with the debt it carries, whether the batch was written
                 // whole, dropped as stale or expired, abandoned part way, or the writer ended. The
-                // guard of its write goes at the same moment.
+                // guard of its write goes after the debt, with the batch.
                 let mut debt = carried.debt.take();
                 let batch = &carried.batch;
                 #[cfg(feature = "testing")]
@@ -1127,7 +1127,7 @@ impl SessionRuntime {
                 // the new holder's command line. The host's own answer to a query the application
                 // asked is not a keystroke and is never dropped: nothing else can supply it.
                 if epoch.is_some_and(|epoch| epoch < fence) {
-                    // Only the room is given back, by `owed` as this goes out of scope. The lease's
+                    // Only the room is given back, by `debt` as this goes out of scope. The lease's
                     // own share was taken by the lease change that made these bytes stale, and
                     // reported there as discarded.
                     continue;
@@ -1240,7 +1240,7 @@ impl SessionRuntime {
                     // that has run out, so it is not written. What was delivered is what the
                     // application has, and a takeover reports the remainder as discarded.
                     let remainder = bytes.len().saturating_sub(delivered);
-                    // Counted before the bytes stop being owed, which they do when `owed` goes out of
+                    // Counted before the bytes stop being owed, which they do when `debt` goes out of
                     // scope: a reader of the two counts that sees nothing owed has to see the drop
                     // that settled it.
                     if lane_deadline.is_some() && delivered == 0 {
