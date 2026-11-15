@@ -177,7 +177,7 @@ _kr_artifacts_refuse() {
 # Prints the real path of $1 when it is inside a temporary root; else says why not and returns 1.
 # With a second argument, $1 is a name under the temporary folder $2 for the run's own directory.
 _kr_artifacts_confine() {
-  local _kr_value="$1" _kr_written="$1" _kr_probe _kr_rest="" _kr_real _kr_real_folded _kr_root _kr_inside=0
+  local _kr_value="$1" _kr_written="$1" _kr_prefix="" _kr_probe _kr_rest="" _kr_real _kr_real_folded _kr_root _kr_inside=0
   _kr_value="$(_kr_artifacts_posix "$_kr_value")"
   if [ -z "$_kr_value" ]; then
     _kr_artifacts_refuse "$1" "it is empty" ${2+"$2"}
@@ -202,9 +202,22 @@ _kr_artifacts_confine() {
       return 1
       ;;
   esac
+  # Each run of slashes is one slash, except that on Windows a leading `//` before a name stays: it
+  # is a network path there. The run is cut at its first `//` and not replaced by a pattern
+  # (`${_kr_value//\/\//\/}`), which bash 3.2, the system's own bash on a Mac, reads as a backslash
+  # before the slash, and a Mac's own temporary variable ends with a slash.
+  if _kr_artifacts_windows; then
+    case "$_kr_value" in
+      //[!/]*)
+        _kr_prefix=/
+        _kr_value="${_kr_value#/}"
+        ;;
+    esac
+  fi
   while :; do
-    case "$_kr_value" in *//*) _kr_value="${_kr_value//\/\//\/}" ;; *) break ;; esac
+    case "$_kr_value" in *//*) _kr_value="${_kr_value%%//*}/${_kr_value#*//}" ;; *) break ;; esac
   done
+  _kr_value="$_kr_prefix$_kr_value"
   [ "$_kr_value" = / ] || _kr_value="${_kr_value%/}"
   _kr_probe="$_kr_value"
   while [ -n "$_kr_probe" ] && [ ! -e "$_kr_probe" ]; do
