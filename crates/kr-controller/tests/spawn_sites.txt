@@ -265,6 +265,7 @@ crates/kr-controller/src/service/voice_actions.rs | Controller::voice_change | t
 crates/kr-controller/src/service/voice_actions.rs | Controller::voice_description_of | tokio::task::spawn_blocking | closure{.voice_description} | 1 | joined | - | awaited where it stands
 crates/kr-controller/src/service/voice_close.rs | Controller::voice_close | tokio::spawn | async{.close_remote_session} | 1 | request | - | ends with the request, connection, session or work that started it
 crates/kr-controller/src/service/voice_close.rs | lets_go_at | tokio::spawn | async{tokio::time::sleep} | 1 | request | - | ends with the request, connection, session or work that started it
+crates/kr-controller/src/service/workers.rs | Controller::begin_opening | tokio::spawn | async{super::barrier::while_held} | 1 | supervised-later | 34 | the opening of the daemon's link to one worker, started by a request that may stop waiting and awaited by the next caller; it lives until the worker has decided the presentation (answered or refused it) or the connection ends, which no clock of this code limits, and it is aborted when its owner drops the opening
 crates/kr-controller/src/service/workers.rs | Controller::publish_worker | tokio::spawn | async{.make_worker_known} | 1 | joined | - | awaited where it stands
 crates/kr-controller/src/service/workers.rs | Controller::write_descriptor | tokio::task::spawn_blocking | closure{.wait} | 1 | joined | - | awaited where it stands
 crates/kr-controller/src/service/workflow_sessions.rs | Controller::workflow_session_close | tokio::spawn | .watch_closure | 1 | request | 33 | closure watcher; bounded by the closure watch time-out
@@ -299,6 +300,7 @@ crates/kr-describe/src/testing.rs | JobThreads::start | .spawn | closure{.wait} 
 crates/kr-describe/src/testing.rs | Resident::keep | .spawn | closure{.chunks_mut} | 1 | test | - | compiled in only with the testing feature or a test module
 crates/kr-describe/src/testing.rs | stub_main | std::thread::spawn | closure{std::io::stderr} | 1 | test | - | compiled in only with the testing feature or a test module
 crates/kr-ipc/src/testing.rs | Serving::spawn | tokio::spawn | task | 1 | test | - | compiled in only with the testing feature or a test module
+crates/kr-ipc/src/testing.rs | say_on_the_standard_error | .spawn | closure{.write_all} | 1 | test | - | compiled in only with the testing feature or a test module
 crates/kr-plugin-catalogue/src/trust.rs | verify | tokio::task::spawn_blocking | closure{check_index} | 1 | joined | - | awaited where it stands
 crates/kr-plugin-service/src/client.rs | PluginClient::over | tokio::spawn | read_frames | 1 | request | - | bounded helper of a linked crate: ends with the work that started it
 crates/kr-plugin-service/src/client.rs | PluginClient::over | tokio::spawn | write_offered | 1 | request | - | bounded helper of a linked crate: ends with the work that started it
