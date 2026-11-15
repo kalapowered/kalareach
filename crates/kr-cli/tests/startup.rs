@@ -5575,6 +5575,7 @@ fn kr_host_stop_says_when_no_daemon_runs_and_names_a_holder_that_does_not_answer
             Command::new(&copy)
                 .args(["--ignored", "--exact", HOLD_STILL, "--nocapture"])
                 .env("KR_HOLD_STILL_SECONDS", "600")
+                .current_dir(host.tree.root())
                 .spawn()
         })
         .expect("starts");
@@ -5978,6 +5979,7 @@ fn a_successor_that_holds_the_environment_after_the_stop_reads_as_the_daemons_en
         Command::new(&copy)
             .args(["--ignored", "--exact", HOLD_STILL, "--nocapture"])
             .env("KR_HOLD_STILL_SECONDS", "600")
+            .current_dir(host.tree.root())
             .spawn()
     })
     .expect("starts");
