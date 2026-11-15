@@ -1243,9 +1243,10 @@ async fn a_repeat_of_a_revocation_says_so_when_the_worker_no_longer_holds_the_na
 /// worker's lease goes on renewing.
 ///
 /// The repeat comes straight after the first answer, which lists the worker as pending. The worker
-/// acknowledges at once and its names come a page at a time, each page after the first taking four
-/// seconds. The fourth would begin with three of the ask's fifteen seconds left, inside the page's
-/// own five: an ask that ends with that page on the wire is dropped with the link out, which stops
+/// acknowledges at once and its names come a page at a time, each page after the first taking 3.2
+/// seconds, which leaves 1.8 of the five that a page's own limit gives it. The fifth would begin
+/// with 2.2 of the ask's fifteen seconds left, inside the page's own five: an ask that ends with
+/// that page on the wire is dropped with the link out, which stops
 /// the renewal of the lease of a worker that has acknowledged. The repeat's ask returns what it has
 /// before that page begins, and the repeat is answered with the lease as it was.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -1262,7 +1263,7 @@ async fn a_repeat_of_a_revocation_whose_ask_has_more_pages_than_its_time_leaves_
     worker.limit_evidence_page_for_tests(1);
     worker
         .service
-        .delay_evidence_continuations_for_tests(Duration::from_secs(4));
+        .delay_evidence_continuations_for_tests(Duration::from_millis(3200));
     worker
         .service
         .hold_the_boundary_for_one_announcement_after(0);
@@ -1280,7 +1281,7 @@ async fn a_repeat_of_a_revocation_whose_ask_has_more_pages_than_its_time_leaves_
         "the worker acknowledged, and its renewal stopped when the repeat's ask ended"
     );
     assert!(
-        lasted < Duration::from_secs(14),
+        lasted < Duration::from_millis(14_500),
         "the repeat was answered {lasted:?} after it was made, which is its bound and not a return \
          with what it had"
     );
@@ -1354,8 +1355,9 @@ async fn an_ask_with_more_pages_of_names_than_its_time_holds_is_over_within_its_
 /// and ends, and the worker's lease goes on renewing.
 ///
 /// The worker acknowledges and its names come a page at a time, each page after the first taking
-/// four seconds. The fourth of them would begin with three of the ask's fifteen seconds left,
-/// inside the page's own five, and an ask that ends with the page on the wire is dropped with the
+/// 3.2 seconds, which leaves 1.8 of the five that a page's own limit gives it. The fifth of them
+/// would begin with 2.2 of the ask's fifteen seconds left, inside the page's own five, and an ask
+/// that ends with the page on the wire is dropped with the
 /// link out: a link that goes out of its holder's hand stops the renewal of the worker's lease,
 /// though the worker has acknowledged. The ask returns what it has before that page begins, and
 /// the pass collects the names that are left.
@@ -1373,7 +1375,7 @@ async fn an_ask_with_too_little_time_for_another_page_leaves_the_renewal_of_the_
     worker.seed_undispatched_intents(&device, 6);
     worker
         .service
-        .delay_evidence_continuations_for_tests(Duration::from_secs(4));
+        .delay_evidence_continuations_for_tests(Duration::from_millis(3200));
     worker
         .service
         .hold_the_boundary_for_one_announcement_after(0);
@@ -1415,7 +1417,7 @@ async fn an_ask_with_too_little_time_for_another_page_leaves_the_renewal_of_the_
         "the worker acknowledged, and its renewal stopped when the ask ended"
     );
     assert!(
-        lasted < Duration::from_secs(14),
+        lasted < Duration::from_millis(14_500),
         "the ask ended {lasted:?} after it began, which is its bound and not a return with what \
          it had"
     );
