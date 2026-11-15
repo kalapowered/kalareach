@@ -172,12 +172,77 @@ fn placement_of(error: &ClientError) -> Placement {
         | ErrorCode::UpstreamUnavailable
         | ErrorCode::OutcomeUnknown
         | ErrorCode::ResourceUnavailable => Placement::Later {
-            detail: format!("the mailbox service did not take it yet: {error}"),
+            detail: format!(
+                "the mailbox service did not take it yet: {error}{}",
+                error
+                    .alternatives()
+                    .until_then()
+                    .map_or_else(String::new, |told| format!(" {}", told.as_str()))
+            ),
             after,
             may_have_left: true,
         },
         _ => Placement::Refused {
             detail: format!("the mailbox service would not take it: {error}"),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kr_client::retry::UserAction;
+    use kr_client::services::Alternatives;
+    use kr_protocol::error::ProtocolError;
+
+    use super::*;
+
+    /// A refusal as a service words it when it has no capacity for a new mailbox.
+    fn refused(code: ErrorCode, alternatives: &[&str]) -> ClientError {
+        ClientError::Refused {
+            error: ProtocolError::new(
+                code,
+                "Managed capacity for new mailboxes is not available now.",
+            ),
+            retry_after_seconds: Some(600),
+            action: UserAction::Wait,
+            service_code: Some("SERVICE_UNAVAILABLE"),
+            alternatives: Alternatives::for_test(alternatives),
+        }
+    }
+
+    /// KR-REQ-17.48: a delivery the service has no managed capacity for is told later, with the
+    /// service's own message as written and the alternatives it named after "Until then:", and
+    /// waits the delay it asked for. A refusal that names none says what it said before.
+    #[test]
+    fn kr_req_17_48_a_delivery_with_no_capacity_is_told_later_with_the_alternatives_named() {
+        for code in [ErrorCode::RateLimited, ErrorCode::ServiceCapacity] {
+            let Placement::Later { detail, after, .. } = placement_of(&refused(
+                code,
+                &[
+                    "A mailbox service that you run yourself.",
+                    "A path of its own.",
+                ],
+            )) else {
+                panic!("a delivery with no capacity waits");
+            };
+            assert_eq!(
+                detail,
+                "the mailbox service did not take it yet: Managed capacity for new mailboxes is \
+                 not available now. Until then: A mailbox service that you run yourself. A path \
+                 of its own."
+            );
+            assert_eq!(after, Some(Duration::from_secs(600)));
+        }
+        let Placement::Later { detail, after, .. } =
+            placement_of(&refused(ErrorCode::ServiceCapacity, &[]))
+        else {
+            panic!("a fault waits");
+        };
+        assert_eq!(
+            detail,
+            "the mailbox service did not take it yet: Managed capacity for new mailboxes is not \
+             available now."
+        );
+        assert_eq!(after, Some(Duration::from_secs(600)));
     }
 }
