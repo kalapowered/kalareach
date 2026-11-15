@@ -1591,10 +1591,24 @@ impl HostPolicy {
         now: ContinuousInstant,
         now_ms: u64,
     ) -> LocalOwnerBound {
+        self.local_owner_hold(host_device, now, now_ms).0
+    }
+
+    /// [`Self::local_owner_bound`], and beside it the held bound of the lease that it chose: what
+    /// a reader asks again with no lock, and which a policy commit can end before the lease's own
+    /// time. A host that is not exclusively organisation-managed, and a local owner with no live
+    /// lease, hold none.
+    #[must_use]
+    pub fn local_owner_hold(
+        &self,
+        host_device: DeviceId,
+        now: ContinuousInstant,
+        now_ms: u64,
+    ) -> (LocalOwnerBound, Option<HeldBound>) {
         if !self.exclusively_managed {
-            return LocalOwnerBound::Open;
+            return (LocalOwnerBound::Open, None);
         }
-        let mut latest: Option<(ContinuousInstant, u64)> = None;
+        let mut latest: Option<(ContinuousInstant, u64, HeldBound)> = None;
         for enrolment in self.enrolments.values() {
             let Ok((_, held)) = enrolment.lease_for_device(host_device, now, now_ms) else {
                 continue;
@@ -1605,15 +1619,21 @@ impl HostPolicy {
             ) else {
                 continue;
             };
-            if latest.is_none_or(|(held_continuous, held_utc)| {
-                continuous > held_continuous || (continuous == held_continuous && utc_ms > held_utc)
-            }) {
-                latest = Some((continuous, utc_ms));
+            if latest
+                .as_ref()
+                .is_none_or(|(held_continuous, held_utc, _)| {
+                    continuous > *held_continuous
+                        || (continuous == *held_continuous && utc_ms > *held_utc)
+                })
+            {
+                latest = Some((continuous, utc_ms, held));
             }
         }
         match latest {
-            Some((continuous, utc_ms)) => LocalOwnerBound::Until { continuous, utc_ms },
-            None => LocalOwnerBound::Closed,
+            Some((continuous, utc_ms, held)) => {
+                (LocalOwnerBound::Until { continuous, utc_ms }, Some(held))
+            }
+            None => (LocalOwnerBound::Closed, None),
         }
     }
 
