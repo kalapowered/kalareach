@@ -1349,6 +1349,15 @@ impl Controller {
         self.presentation_in_flight(session_id)
     }
 
+    /// Whether the daemon has stopped renewing the lease of the worker of `session_id`, which is
+    /// what losing the control path to it does, for this host's own tests. It is so from the loss
+    /// until the worker acknowledges the revision in force over a path of the daemon's.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn renewal_stopped_for_tests(&self, session_id: SessionId) -> bool {
+        self.leases.is_fenced(session_id)
+    }
+
     /// The barrier of the revision in force as the daemon holds it now, for this host's own tests.
     ///
     /// # Errors

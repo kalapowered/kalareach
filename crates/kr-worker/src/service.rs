@@ -1464,6 +1464,16 @@ impl WorkerService {
             .insert(revision);
     }
 
+    /// Makes this worker answer for `revision` with the names of that revocation's fence again,
+    /// after [`Self::forget_evidence_for_tests`], for this host's own tests.
+    #[cfg(feature = "testing")]
+    pub fn remember_evidence_for_tests(&self, revision: u64) {
+        self.evidence_forgotten
+            .lock()
+            .expect("the set is not poisoned")
+            .remove(&revision);
+    }
+
     /// How many announcements of an authority revision have been refused so far because the
     /// dispatch boundary was held, for this host's own tests.
     #[cfg(feature = "testing")]
