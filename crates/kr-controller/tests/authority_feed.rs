@@ -95,12 +95,16 @@ struct Rig {
     remote: AuthorityFeedClient,
 }
 
+/// A client of the feed for a publisher or a device, on the long deadlines of [`LONG_FEED_DEADLINES`]
+/// like the daemon's own: a stall of the machine that is shorter than `within` does not turn a
+/// request. A case puts what it asks of such a client inside `within`, so that a request that hangs
+/// fails its case there.
 fn client_for(origin: &str, key: AuthorisationKeyPair) -> AuthorityFeedClient {
     let gateway = GatewayOrigin::new(origin).expect("an origin");
     let http: Arc<dyn ServiceHttp> = Arc::new(
         HttpService::with(
             gateway.clone(),
-            HttpDeadlines::default(),
+            LONG_FEED_DEADLINES,
             managed_response_limits(),
         )
         .expect("a transport"),
@@ -212,10 +216,12 @@ impl Rig {
     /// A request the owner signs and publishes, naming `target`, under a fixed identity.
     async fn owner_publishes(&self, id: u8, target: RevocationTarget) -> RevocationRequest {
         let request = self.signed_by(&self.owner.authorisation, id, target);
-        self.remote
-            .publish(self.feed(), &request, None)
-            .await
-            .expect("the feed stores the request");
+        within(
+            "the feed stores the request",
+            self.remote.publish(self.feed(), &request, None),
+        )
+        .await
+        .expect("the feed stores the request");
         request
     }
 
@@ -397,10 +403,11 @@ async fn within<T>(what: &str, work: impl std::future::Future<Output = T>) -> T 
 }
 
 /// The deadlines the rig gives the feed's client of every daemon it starts, in place of the
-/// product's: longer than `within`, so that a machine that stalls a case while a request is in
-/// flight, or while the case holds one, does not make the client give the request up and the feed
-/// read unreachable. A request that hangs fails its case at `within`, and not here. A case about
-/// the deadlines starts its daemon on the product's own, or on short ones of its own.
+/// product's, and the clients its cases make for a publisher or a device (`client_for`): longer
+/// than `within`, so that a machine that stalls a case while a request is in flight, or while the
+/// case holds one, does not make the client give the request up and the feed read unreachable. A
+/// request that hangs fails its case at `within`, and not here. A case about the deadlines starts
+/// its daemon on the product's own, or on short ones of its own.
 const LONG_FEED_DEADLINES: HttpDeadlines = HttpDeadlines {
     connect: Duration::from_secs(600),
     read: Duration::from_secs(600),
@@ -5280,10 +5287,12 @@ async fn a_feed_longer_than_a_pass_reads_is_not_a_synchronisation_until_it_is_re
             ),
         };
         let request = rig.signed_by(key, id, unknown(id));
-        client
-            .publish(rig.feed(), &request, None)
-            .await
-            .expect("the feed stores the request");
+        within(
+            "the feed stores the request",
+            client.publish(rig.feed(), &request, None),
+        )
+        .await
+        .expect("the feed stores the request");
     }
     // The first pass reads a page and refuses its 64 records; the scan then goes on at once with a
     // second read, which the feed holds open. A connection that asked for a synchronisation is not
@@ -5313,10 +5322,12 @@ async fn a_feed_longer_than_a_pass_reads_is_not_a_synchronisation_until_it_is_re
     );
     assert!(shown.list.feed_stale);
     let last_publisher = client_for(rig.served.origin(), strangers[1].clone());
-    let unread = last_publisher
-        .read(rig.feed(), None, false)
-        .await
-        .expect("the last publisher reads its records");
+    let unread = within(
+        "the last publisher reads its records",
+        last_publisher.read(rig.feed(), None, false),
+    )
+    .await
+    .expect("the last publisher reads its records");
     assert_eq!(unread.records.len(), 6);
     assert!(
         unread
@@ -5328,11 +5339,14 @@ async fn a_feed_longer_than_a_pass_reads_is_not_a_synchronisation_until_it_is_re
 
     // The next pass goes on at the cursor and reads the feed through.
     rig.poll().await;
+    let read_through = within(
+        "the last publisher reads its records",
+        last_publisher.read(rig.feed(), None, false),
+    )
+    .await
+    .expect("the last publisher reads its records");
     assert!(
-        last_publisher
-            .read(rig.feed(), None, false)
-            .await
-            .expect("the last publisher reads its records")
+        read_through
             .records
             .iter()
             .all(|record| record.rejected.0.is_some()),
