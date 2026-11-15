@@ -75,28 +75,31 @@ pub fn confine(value: &Path) -> Result<PathBuf, Refused> {
 }
 
 fn confine_in(value: &Path, roots: &[PathBuf]) -> Result<PathBuf, Refused> {
-    let refuse = |why: &str| refused(value, why, roots);
+    check(value, roots).map_err(|why| refused(value, &why, roots))
+}
+
+/// The real path of `value` when it is inside one of `roots`; else why not.
+fn check(value: &Path, roots: &[PathBuf]) -> Result<PathBuf, String> {
     if value.as_os_str().is_empty() {
-        return Err(refuse("it is empty"));
+        return Err("it is empty".to_owned());
     }
     if !value.is_absolute() {
-        return Err(refuse("it is not an absolute path"));
+        return Err("it is not an absolute path".to_owned());
     }
     if value
         .components()
         .any(|component| component == Component::ParentDir)
     {
-        return Err(refuse("it steps up a directory with `..`"));
+        return Err("it steps up a directory with `..`".to_owned());
     }
-    let real =
-        resolve(value).map_err(|error| refuse(&format!("it cannot be resolved: {error}")))?;
+    let real = resolve(value).map_err(|error| format!("it cannot be resolved: {error}"))?;
     if roots
         .iter()
         .any(|root| real != *root && real.starts_with(root))
     {
         Ok(real)
     } else {
-        Err(refuse("it is not inside a temporary root"))
+        Err("it is not inside a temporary root".to_owned())
     }
 }
 
@@ -111,6 +114,23 @@ fn refused(value: &Path, why: &str, roots: &[PathBuf]) -> Refused {
          absolute path inside one of this platform's temporary roots ({roots}). Set it to a folder \
          under one of them, or leave it unset and the run makes a directory of its own.",
         value.display()
+    ))
+}
+
+/// Why the run's own directory cannot be made under `temporary`: nothing was set, so the words
+/// name the temporary folder and do not tell the caller to leave the variable unset.
+fn refused_own(temporary: &Path, why: &str, roots: &[PathBuf]) -> Refused {
+    let roots = roots
+        .iter()
+        .map(|root| root.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Refused(format!(
+        "no directory of this run's own can be made for its evidence: the temporary folder `{}` is \
+         refused: {why}. It has to be an absolute path to a folder inside one of this platform's \
+         temporary roots ({roots}). Point TMPDIR (on Windows, TEMP or TMP) at such a folder, or set \
+         KR_TEST_ARTIFACTS_DIR to a folder under one of the roots.",
+        temporary.display()
     ))
 }
 
@@ -131,11 +151,12 @@ fn own() -> &'static Path {
 /// folder is checked before the directory is made in it, so that a temporary folder that is no
 /// root is left as it was.
 fn own_in(temporary: &Path, roots: &[PathBuf]) -> PathBuf {
-    confine_in(&temporary.join(OWN_PREFIX), roots).unwrap_or_else(|refused| panic!("{refused}"));
+    let refuse = |why: String| -> PathBuf { panic!("{}", refused_own(temporary, &why, roots)) };
+    check(&temporary.join(OWN_PREFIX), roots).unwrap_or_else(refuse);
     let made = make_own(temporary).unwrap_or_else(|error| {
         panic!("no directory of this run's own can be made for its evidence: {error}")
     });
-    confine_in(&made, roots).unwrap_or_else(|refused| panic!("{refused}"))
+    check(&made, roots).unwrap_or_else(refuse)
 }
 
 /// The start of the name of a run's own directory.
