@@ -216,7 +216,8 @@ jobs:
     # the report's step with the fetch of the applications and the build of the report that open it.
     # Part 2 is every other step of the plan, 92 and 91 minutes on those nights, with the build of
     # the worker that opens the plan in both parts, and the compiling that the workspace's tests did
-    # for it before. A part that fails does not stop the other.
+    # for it before. The run of the two parts on 15 November took 190 minutes for part 1 and 99 for
+    # part 2, of which the report's step took 186 and 95. A part that fails does not stop the other.
     strategy:
       fail-fast: false
       matrix:
@@ -377,9 +378,9 @@ jobs:
       # took in the eleven nights (the disk step, at 3.8 minutes, has 8; the closing report, which
       # also reads the kernel's log for failed writes to the volume, has 4), so the limits of the
       # job's steps add up to 352 of its 355 minutes, under GitHub's six hours. Part 1, the
-      # workspace's tests, took 190 and 196 minutes of the step on 14 and 15 November, so a part
-      # keeps 91 minutes of the 287, more than a quarter of it: a runner a quarter slower than
-      # 15 November's takes 245.
+      # workspace's tests, took 186 minutes of the step and part 2 took 95 in the run of 15
+      # November, so a part keeps 101 minutes of the 287 at the least, more than a quarter of it: a
+      # runner a quarter slower takes 232 minutes for part 1.
       - name: The conformance report
         timeout-minutes: 287
         env:
