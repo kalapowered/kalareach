@@ -278,9 +278,25 @@ async fn an_adoption_after_a_closure_writes_no_row_and_publishes_nothing() {
         .record_closure(&closure_of(world.session_id))
         .expect("the closure is recorded");
     world.forget_the_worker().await;
+    let has_an_opening = || {
+        world
+            .controller
+            .openings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&world.session_id)
+    };
+    assert!(
+        has_an_opening(),
+        "the look that challenged the worker made an opening for its session"
+    );
     adopt(&world, answered)
         .await
         .expect("an adoption that finds the closure has nothing to do");
+    assert!(
+        !has_an_opening(),
+        "a session that closed keeps no opening after a look that began before its closure"
+    );
     assert!(
         world
             .controller
