@@ -533,6 +533,16 @@ pub struct WorkerService {
             std::sync::mpsc::Receiver<()>,
         )>,
     >,
+    /// A pause before the dispatch boundary is taken, at which the next mutation has passed the
+    /// checks of its entry and waits to take the boundary, which this host's own tests arm to change
+    /// the authority it was admitted under there. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    before_the_boundary_pause: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
     /// Whether a connection's loop takes a finished preparation before it reads what its client
     /// has sent, which this host's own tests set to meet the order the loop is free to take at
     /// random. It is compiled away in every shipped build.
@@ -977,6 +987,8 @@ impl WorkerService {
             facts_holds_begun: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "testing")]
             boundary_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            before_the_boundary_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
             prepared_first: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "testing")]
@@ -1605,6 +1617,60 @@ impl WorkerService {
         reason = "it is the shipped form of a method that reads this service's own pause"
     )]
     const fn wait_inside_boundary(&self) {}
+
+    /// Stops the next mutation after the checks of its entry and before it takes the dispatch
+    /// boundary, for this host's own tests: what changes while it waits there is what the
+    /// boundary's own checks meet.
+    ///
+    /// Returns the end that says the mutation has arrived, and the end that lets it go. The pause
+    /// fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_the_boundary(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (arrived, watch) = std::sync::mpsc::sync_channel(1);
+        let (release, go) = std::sync::mpsc::sync_channel(1);
+        *self
+            .before_the_boundary_pause
+            .lock()
+            .expect("the pause is not poisoned") = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Waits at the pause above, where one is armed. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    fn wait_before_the_boundary(&self) {
+        let armed = self
+            .before_the_boundary_pause
+            .lock()
+            .expect("the pause is not poisoned")
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let wait = move || {
+                let _ = go.recv();
+            };
+            let several = tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
+                runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+            });
+            if several {
+                tokio::task::block_in_place(wait);
+            } else {
+                wait();
+            }
+        }
+    }
+
+    /// The same, without the feature: there is no pause.
+    #[cfg(not(feature = "testing"))]
+    #[expect(
+        clippy::unused_self,
+        reason = "it is the shipped form of a method that reads this service's own pause"
+    )]
+    const fn wait_before_the_boundary(&self) {}
 
     /// Stops the next fence of an authority revision after its journal pass, with the session held
     /// and the revision not yet installed, for this host's own tests.
@@ -6487,6 +6553,7 @@ impl WorkerService {
         freshness: Freshness,
     ) -> Result<Answered> {
         let actor_id = caller.actor_id.clone();
+        self.wait_before_the_boundary();
         // Everything from here to the recorded outcome happens inside the barrier. The authority
         // this request was admitted under cannot change underneath it, and two mutations cannot
         // interleave their checks with each other's effects.
