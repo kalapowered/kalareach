@@ -4634,7 +4634,7 @@
           "description": "When the feed answered that this host was removed from it, when it did."
         },
         "stale": {
-          "description": "True when the feed could not be reached, so what is shown is stale.",
+          "description": "True when this host's reading of the revocation feed is not current: its last attempt\nfailed, its last synchronisation is too old, or its age cannot be told. The revocation\nstatus shown may then be stale.",
           "type": "boolean"
         },
         "unacknowledged_records": {
