@@ -5570,8 +5570,14 @@ fn kr_host_stop_says_when_no_daemon_runs_and_names_a_holder_that_does_not_answer
         .expect("takes the lock");
     for (program, named) in [("kr-controller", true), ("a-holder", false)] {
         let copy = host.tree.root().join(program);
-        std::fs::copy("/bin/sleep", &copy).expect("copies sleep");
-        let mut holder = spawning(|| Command::new(&copy).arg("600").spawn()).expect("starts");
+        std::fs::copy(std::env::current_exe().expect("this test"), &copy).expect("copies it");
+        let mut holder = spawning(|| {
+            Command::new(&copy)
+                .args(["--ignored", "--exact", HOLD_STILL, "--nocapture"])
+                .env("KR_HOLD_STILL_SECONDS", "600")
+                .spawn()
+        })
+        .expect("starts");
         std::fs::write(&lock, format!("{}\n", holder.id())).expect("names the holder");
         let output = start(host.kr(&["host", "stop"])).finish("kr host stop");
         let _ = holder.kill();
@@ -5586,6 +5592,22 @@ fn kr_host_stop_says_when_no_daemon_runs_and_names_a_holder_that_does_not_answer
         );
     }
     drop(held);
+}
+
+/// The case below that a copy of this test program runs: a process that a lock file can name under
+/// the name of a program, which a copy of a system binary cannot be on macOS (it is killed there).
+const HOLD_STILL: &str = "a_copy_of_this_program_that_holds_still_for_a_case_that_names_it";
+
+/// Holds still for the seconds that `KR_HOLD_STILL_SECONDS` gives, and at once where it is not set.
+#[test]
+#[ignore = "run only as a copy of this program, by the case that names it"]
+fn a_copy_of_this_program_that_holds_still_for_a_case_that_names_it() {
+    if let Some(seconds) = std::env::var("KR_HOLD_STILL_SECONDS")
+        .ok()
+        .and_then(|text| text.parse().ok())
+    {
+        std::thread::sleep(Duration::from_secs(seconds));
+    }
 }
 
 /// What a test daemon does with a request to stop.
@@ -5644,10 +5666,15 @@ impl TestDaemon {
             privacy: None,
             default_shell_mode: None,
         };
-        let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
+        // The listener belongs to the runtime that serves it: it is bound before this returns, so
+        // that the endpoint exists when the test starts the command, and bound inside the runtime.
+        let runtime = runtime();
+        let listener = {
+            let _inside = runtime.enter();
+            kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint")
+        };
         let socket = PathBuf::from(endpoint.as_text());
         let thread = std::thread::spawn(move || {
-            let runtime = runtime();
             runtime.block_on(async move {
                 loop {
                     if over.load(std::sync::atomic::Ordering::SeqCst) {
