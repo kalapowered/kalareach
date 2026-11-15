@@ -1266,6 +1266,8 @@ impl Controller {
             local_pace: std::sync::Mutex::new(super::local::LocalPace::default()),
             #[cfg(feature = "testing")]
             local_writes_blocked: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "testing")]
+            stop_answer_padding: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             before_the_record: ReadPause::default(),
             #[cfg(any(test, feature = "testing"))]

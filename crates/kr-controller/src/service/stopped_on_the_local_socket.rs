@@ -651,28 +651,23 @@ async fn under_an_owed_fence_the_answer_is_withheld_and_the_daemon_stops_all_the
     daemon.told_to_stop().await;
 }
 
-/// A client that stops reading, with its socket's buffer full, does not keep the daemon from
-/// stopping: the answer's write waits for the peer for its bound and then ends the connection, and
-/// the daemon is told to stop when it has.
+/// A client that stops reading does not keep the daemon from stopping: the answer's write waits for
+/// the peer for its bound and then ends the connection, and the daemon is told to stop when it has.
 ///
-/// The connection is paced to write a keepalive every millisecond and given a send buffer of a few
-/// bytes, so that the daemon's writes fill it while the client reads nothing. The client then sends
-/// the stop and reads one frame at a time until the stop's answer is about to be written, and reads
-/// nothing more. Where the socket takes the answer all the same (Linux accepts a write while the
-/// buffer is below its limit, whatever the size of the write), the answer is written and the daemon
-/// is told to stop; where it does not (macOS), the write waits for its bound. The case holds for
-/// both, and only the second exercises the bound.
+/// The connection is given a send buffer of a few bytes and the answer is padded to many times
+/// that, so that the answer cannot be taken whole by a client that reads nothing, whatever the
+/// platform's own accounting of a buffer: the write has to wait for the client, and nothing but its
+/// bound ends the wait.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_client_that_stops_reading_does_not_keep_the_daemon_from_stopping() {
     let daemon =
         serving_on(|endpoint| Listener::bind_with_send_buffer(endpoint, 1).expect("binds")).await;
-    // The connection's loop writes unasked as fast as the socket takes it and waits long for a peer
-    // that is slow to read; the bound the answer is written under is read when it is written.
-    daemon.controller.pace_local_connections(
-        Duration::from_millis(1),
-        Duration::from_millis(1),
-        LIVENESS,
-    );
+    // Nothing is written unasked, and the answer is written under a short bound.
+    let hour = Duration::from_secs(3_600);
+    daemon
+        .controller
+        .pace_local_connections(hour, hour, Duration::from_millis(200));
+    daemon.controller.pad_the_stop_answer(64 * 1024);
     let mut client = daemon.client().await;
     let stop = client
         .compose(
@@ -684,52 +679,20 @@ async fn a_client_that_stops_reading_does_not_keep_the_daemon_from_stopping() {
         .await
         .expect("composes the stop");
     let (mut reader, mut writer, _acknowledgement) = client.into_halves();
-
-    // The client reads nothing, so the daemon's writes fill the socket and wait.
-    let deadline = std::time::Instant::now() + LIVENESS;
-    while daemon.controller.local_writes_blocked() == 0 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the daemon's writes never waited for the client"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    let hour = Duration::from_secs(3_600);
-    daemon
-        .controller
-        .pace_local_connections(hour, hour, Duration::from_millis(200));
-    let (mut arrived, release) = daemon.controller.pause_before_a_stop_answer_is_written();
     writer
         .write_message(&ControlFrame::Mutation(Box::new(stop)))
         .await
         .expect("the stop is sent");
 
-    // One frame at a time, until the answer to the stop is about to be written.
-    let reading = async {
-        loop {
-            tokio::select! {
-                _ = &mut arrived => break,
-                frame = reader.read_message::<ControlFrame>() => {
-                    frame.expect("the connection stands while the daemon waits for the client");
-                }
-            }
-        }
-    };
-    tokio::time::timeout(LIVENESS, reading)
-        .await
-        .expect("the stop's answer arrives at its write");
-    let blocked = daemon.controller.local_writes_blocked();
-    release.send(()).expect("the write is let go");
-
-    // The client reads nothing now. The answer's write waits for it, and ends at its bound.
+    // The client reads nothing. The answer's write waits for it, and ends at its bound.
     daemon.told_to_stop().await;
-    // Where the write waited for the client, the connection ended at its bound: what is left is read
-    // and then the end. Where the socket took the answer, the connection goes on, as it does for any
-    // client that reads late.
-    if daemon.controller.local_writes_blocked() > blocked {
-        let ended = async { while reader.read_message::<ControlFrame>().await.is_ok() {} };
-        tokio::time::timeout(LIVENESS, ended)
-            .await
-            .expect("the connection ends at the answer's bound");
-    }
+    assert!(
+        daemon.controller.local_writes_blocked() >= 1,
+        "the answer was taken whole by a client that reads nothing"
+    );
+    // The connection ended with the write: what the client was sent is read, and then the end.
+    let ended = async { while reader.read_message::<ControlFrame>().await.is_ok() {} };
+    tokio::time::timeout(LIVENESS, ended)
+        .await
+        .expect("the connection ends at the answer's bound");
 }

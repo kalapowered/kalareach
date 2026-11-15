@@ -645,6 +645,10 @@ pub struct Controller {
     /// away in every shipped build.
     #[cfg(feature = "testing")]
     local_writes_blocked: std::sync::atomic::AtomicUsize,
+    /// How many bytes of padding a test has the answer to a stop request carry, so that it is
+    /// larger than a socket's buffer. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    stop_answer_padding: std::sync::atomic::AtomicUsize,
     /// Where this host's own tests stop a forwarded mutation once its admission has been asked and
     /// before it takes its lease, so that a debt can be published there. Compiled away in every
     /// shipped build.
