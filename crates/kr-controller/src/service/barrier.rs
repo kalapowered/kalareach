@@ -429,8 +429,12 @@ fn refused_for_now(error: &kr_ipc::IpcError) -> bool {
 /// What one ask of a pending worker came to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Asked {
-    /// The worker acknowledged the revision in force.
+    /// The worker acknowledged the revision in force and sent what its fence named.
     Acknowledged,
+    /// The worker acknowledged the revision in force and sent nothing about its fence. It has
+    /// made one of the two statements of an acknowledgement, so it stays pending, and asking it
+    /// again says no more than this ask did.
+    Unevidenced,
     /// The worker answered that its dispatch boundary is held for the moment.
     Refused,
     /// The link could not be opened, or the ask ran out, or it failed.
@@ -460,9 +464,11 @@ const ASK_INTERVAL_LONGEST: std::time::Duration = std::time::Duration::from_secs
 /// first pass that falls five seconds after the ask began. An ask that could not open a link or
 /// ran out costs a link attempt and the whole of its acknowledgement time: the wait before the next
 /// one, counted from its end, doubles from five seconds to a minute at most, and the ask is made
-/// at the first pass after it. An answer of any kind puts the wait back to five seconds. A worker
-/// whose earlier presentation is still waiting at its dispatch boundary is not asked at all. Only
-/// memory: the registry decides each pass who is pending.
+/// at the first pass after it. An acknowledgement that names nothing of the worker's fence is paced
+/// the same way, though the link is good and nothing asks whether the worker has ended. Any other
+/// answer puts the wait back to five seconds. A worker whose earlier presentation is still waiting
+/// at its dispatch boundary is not asked at all. Only memory: the registry decides each pass who
+/// is pending.
 #[derive(Debug, Default)]
 pub(super) struct AskPace {
     workers: BTreeMap<SessionId, Pace>,
@@ -509,7 +515,7 @@ impl AskPace {
                 interval: ASK_INTERVAL,
                 next_at: began + ASK_INTERVAL,
             },
-            Asked::Failed => {
+            Asked::Failed | Asked::Unevidenced => {
                 let interval = self
                     .workers
                     .get(&session_id)

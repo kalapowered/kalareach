@@ -2508,7 +2508,7 @@ impl Controller {
         session_id: kr_protocol::ids::SessionId,
     ) -> Result<()> {
         match self.ask_worker_revision(session_id, None).await? {
-            Asked::Acknowledged => Ok(()),
+            Asked::Acknowledged | Asked::Unevidenced => Ok(()),
             Asked::Refused | Asked::Failed => Err(ControllerError::supervision(
                 "this session's worker has not installed the environment's authority revision",
             )),
@@ -2618,7 +2618,14 @@ impl Controller {
                     self.collect_owed_evidence(session_id, binding, revision, until)
                         .await;
                 }
-                Ok(Asked::Acknowledged)
+                // The worker is reached and answers, so nothing is asked about whether it has
+                // ended. What it left out is not something an ask again changes: it has made one
+                // of the two statements, and it stays pending until it makes the other.
+                if evidenced {
+                    Ok(Asked::Acknowledged)
+                } else {
+                    Ok(Asked::Unevidenced)
+                }
             }
             // Refused for the moment: the worker is there and has recorded what it owes, and what
             // a worker that is not confirmed ended is owed is another ask.
