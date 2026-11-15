@@ -425,6 +425,13 @@ struct Owing {
     owed: usize,
 }
 
+/// What the revocation of [`Owing`] revokes: the share's grant, or the device that holds it.
+#[derive(Clone, Copy)]
+enum Revoked {
+    Grant,
+    Device,
+}
+
 /// How long the whole arrangement of [`Owing`] may take, every attempt's start, its request and its
 /// shutdown included. It ends an arrangement that is stuck and decides nothing.
 const ARRANGEMENT_LIMIT: Duration = Duration::from_secs(180);
@@ -439,11 +446,11 @@ const ARRANGEMENT_LIMIT: Duration = Duration::from_secs(180);
 /// With `behind`, the worker was inside a dispatch transition when an earlier revision was
 /// announced and refused it, and fenced what it owed by itself afterwards: the revocation's
 /// announcement then carries that revision, and the names are filed under it.
-async fn a_revocation_that_left_names_owing(behind: bool) -> Owing {
+async fn a_revocation_that_left_names_owing(behind: bool, by: Revoked) -> Owing {
     let attempts = std::sync::Mutex::new(Vec::new());
     tokio::time::timeout(
         ARRANGEMENT_LIMIT,
-        arrange_until_an_answer_holds(&attempts, behind),
+        arrange_until_an_answer_holds(&attempts, behind, by),
     )
     .await
     .unwrap_or_else(|_| {
@@ -457,6 +464,7 @@ async fn a_revocation_that_left_names_owing(behind: bool) -> Owing {
 async fn arrange_until_an_answer_holds(
     attempts: &std::sync::Mutex<Vec<String>>,
     behind: bool,
+    by: Revoked,
 ) -> Owing {
     loop {
         let started = tokio::time::Instant::now();
@@ -497,17 +505,34 @@ async fn arrange_until_an_answer_holds(
         }
 
         let mut client = host.client().await;
-        let mutation = client
-            .compose(
-                Method::GrantRevoke,
-                kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
-                on_the_host(&host),
-                &kr_protocol::sharing::GrantRevokeParams {
-                    grant_id: granted.grant_id,
-                },
-            )
-            .await
-            .expect("the revocation is composed");
+        let action_id = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+        let mutation = match by {
+            Revoked::Grant => {
+                client
+                    .compose(
+                        Method::GrantRevoke,
+                        action_id,
+                        on_the_host(&host),
+                        &kr_protocol::sharing::GrantRevokeParams {
+                            grant_id: granted.grant_id,
+                        },
+                    )
+                    .await
+            }
+            Revoked::Device => {
+                client
+                    .compose(
+                        Method::DeviceRevoke,
+                        action_id,
+                        on_the_host(&host),
+                        &kr_protocol::sharing::DeviceRevokeParams {
+                            device_id: record.device_id,
+                        },
+                    )
+                    .await
+            }
+        }
+        .expect("the revocation is composed");
         let first: kr_protocol::sharing::RevocationResult = client
             .repeat(&mutation)
             .await
@@ -640,7 +665,21 @@ async fn the_repeat_after_a_restart_carries_every_name(owing: Owing) {
 /// a record of what its entry read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_restarted_daemon_collects_the_names_a_revocation_left_owing() {
-    let owing = a_revocation_that_left_names_owing(false).await;
+    let owing = a_revocation_that_left_names_owing(false, Revoked::Grant).await;
+    assert_eq!(
+        answers_kept_with_a_record(&owing.host),
+        1,
+        "the answer was kept with a record of what its entry read"
+    );
+    the_repeat_after_a_restart_carries_every_name(owing).await;
+}
+
+/// KR-REQ-10.45, 09.13: the answer to the revocation of a device is kept with a record of what the
+/// entries of its barrier read, as a grant's is, so that a repeat of it after a restart carries
+/// every name the worker took back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_restarted_daemon_collects_the_names_a_device_revocation_left_owing() {
+    let owing = a_revocation_that_left_names_owing(false, Revoked::Device).await;
     assert_eq!(
         answers_kept_with_a_record(&owing.host),
         1,
@@ -785,8 +824,10 @@ async fn a_restarted_daemon_collects_the_names_a_transfer_left_owing() {
 /// worker, and the repeat then carries every name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_restarted_daemon_collects_the_names_a_worker_that_was_behind_left_owing() {
-    the_repeat_after_a_restart_carries_every_name(a_revocation_that_left_names_owing(true).await)
-        .await;
+    the_repeat_after_a_restart_carries_every_name(
+        a_revocation_that_left_names_owing(true, Revoked::Grant).await,
+    )
+    .await;
 }
 
 /// KR-REQ-10.45, 09.13: a restarted daemon asks a worker about the newest eight revocations it
