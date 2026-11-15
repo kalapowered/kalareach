@@ -1309,6 +1309,22 @@ async fn endpoint_look(
     .unwrap_or(Endpoint::Unclear)
 }
 
+/// What a failed look at the lock says, in this command's words. The store's start lock, which
+/// stayed held to the look's bound, is said as that: the update commands' sentence for it names a
+/// daemon that is starting, another command to run and a count of seconds, none of which this
+/// command knows. Every other failure of the look keeps its own words: the install lock could not
+/// be tried, the environment's lock could not be taken (outside a store, the same failure of the
+/// lock).
+fn look_failed(store: &std::path::Path, error: &CliError) -> Shown {
+    match error {
+        CliError::UpdateDeferred(_) => shown!(
+            "the start lock of the store at {} was held when the command looked",
+            Shown::root(store)
+        ),
+        other => kr_client::shown::Said::said(other),
+    }
+}
+
 /// How the environment's lock is looked at: under the store's install lock for a release of a
 /// store, whose daemons hold it, shared, while they start, and by the lock itself elsewhere.
 struct Installation {
@@ -1336,7 +1352,7 @@ impl Installation {
         match &self.store {
             Some(store) => handover::held(store, &self.environment, within)
                 .await
-                .map_err(|error| kr_client::shown::Said::said(&error)),
+                .map_err(|error| look_failed(store.root(), &error)),
             None => lock_held(&self.environment.paths),
         }
     }
@@ -1623,5 +1639,43 @@ mod tests {
             "{unknown}"
         );
         assert!(!unknown.contains("was told to stop"), "{unknown}");
+    }
+    /// A failed look at the lock is said in this command's words: the start lock that stayed held
+    /// is said as that, with no daemon that is starting, no other command and no count; any other
+    /// failure keeps its own words.
+    #[test]
+    fn a_failed_look_at_the_lock_is_said_in_this_commands_words() {
+        let store = std::path::Path::new("/store");
+        let held = look_failed(
+            store,
+            &CliError::UpdateDeferred(Shown::said(
+                "a control daemon of the store at /store is starting and has held its start lock \
+                 for more than 0 seconds; run kr host update or kr host rollback again once it \
+                 has started or stopped",
+            )),
+        )
+        .to_string();
+        assert!(
+            held.starts_with("the start lock of the store at "),
+            "{held}"
+        );
+        assert!(
+            held.ends_with(" was held when the command looked"),
+            "{held}"
+        );
+        for other_words in [
+            "is starting",
+            "kr host update",
+            "kr host rollback",
+            "seconds",
+        ] {
+            assert!(!held.contains(other_words), "{held}");
+        }
+        let other = look_failed(
+            store,
+            &CliError::Other(Shown::said("the install lock could not be tried")),
+        )
+        .to_string();
+        assert_eq!(other, "the install lock could not be tried");
     }
 }
