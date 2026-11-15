@@ -76,6 +76,19 @@ pub struct Caller {
     /// and of ending exclusive management and no other
     /// ([`crate::grants::Permitted::confirms_recovery_only`]).
     pub confirms_recovery_only: bool,
+    /// Asks whether the host's local owner has no live lease now, for a local caller the door
+    /// decided as one that is served ([`Self::decided_now`]); none for any other caller.
+    closed_now: Option<ClosedNow>,
+}
+
+/// Whether the host's local owner has no live lease at this moment.
+#[derive(Clone)]
+struct ClosedNow(std::sync::Arc<dyn Fn() -> bool + Send + Sync>);
+
+impl std::fmt::Debug for ClosedNow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ClosedNow")
+    }
 }
 
 impl Caller {
@@ -88,6 +101,7 @@ impl Caller {
             device: None,
             confirms_the_clock_only: false,
             confirms_recovery_only: false,
+            closed_now: None,
         }
     }
 
@@ -100,6 +114,7 @@ impl Caller {
             device: Some(record),
             confirms_the_clock_only: false,
             confirms_recovery_only: false,
+            closed_now: None,
         }
     }
 
@@ -118,6 +133,47 @@ impl Caller {
     pub const fn confirming_recovery_only(mut self, only: bool) -> Self {
         self.confirms_recovery_only = only;
         self
+    }
+
+    /// Marks a local caller as one whose scope is read again where its request is recorded or
+    /// answered: `closed_now` says whether the host's local owner has no live lease at that
+    /// moment ([`Self::decided_now`]).
+    #[must_use]
+    pub fn asking_again_whether_closed(
+        mut self,
+        closed_now: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.closed_now = Some(ClosedNow(std::sync::Arc::new(closed_now)));
+        self
+    }
+
+    /// This caller as the door decides it at this moment. A local caller the door decided as one
+    /// that is served is limited to the recovery set from the moment the host's local owner has no
+    /// live lease on an exclusively organisation-managed host, which it can come to in the waits
+    /// between the door's decision and the record of what the caller asked or answered. Any other
+    /// caller is as it was decided.
+    #[must_use]
+    pub fn decided_now(&self) -> Self {
+        match &self.closed_now {
+            Some(closed) if !self.confirms_recovery_only && (closed.0)() => {
+                self.clone().confirming_recovery_only(true)
+            }
+            _ => self.clone(),
+        }
+    }
+
+    /// What the door tells a caller that may not confirm the subject it asked for or answered.
+    #[must_use]
+    pub fn refusal_to_confirm(&self) -> ControllerError {
+        if self.confirms_the_clock_only {
+            crate::grants::continuity_lost()
+        } else {
+            ControllerError::PermissionDenied {
+                detail: "a device that no membership lease serves confirms only the clock and \
+                         the end of exclusive management"
+                    .to_owned(),
+            }
+        }
     }
 
     /// Whether this caller may be asked for, shown or answer the confirmation `subject` names.
@@ -1024,6 +1080,9 @@ impl OwnerAuthority {
         }
         let mut state = self.state();
         self.sweep(&mut state);
+        // The scope the door decides now: a lease that ended while the lock was waited for limits
+        // what is shown.
+        let caller = caller.decided_now();
         let mut pending: Vec<&Entry> = state
             .entries
             .values()
@@ -1098,16 +1157,18 @@ impl OwnerAuthority {
             ));
         }
         if !caller.may_confirm_display(&entry.display) {
-            return Err(if caller.confirms_the_clock_only {
-                crate::grants::continuity_lost()
-            } else {
-                ControllerError::PermissionDenied {
-                    detail: "a device that no membership lease serves confirms only the clock \
-                             and the end of exclusive management"
-                        .to_owned(),
-                }
-            });
+            return Err(caller.refusal_to_confirm());
         }
+        // The caller's scope is read again where the admission is asked: the lease the door found
+        // can end while the challenges' lock and the record's lock are waited for.
+        let display = entry.display.clone();
+        let admission = || {
+            let now = caller.decided_now();
+            if !now.may_confirm_display(&display) {
+                return Err(now.refusal_to_confirm());
+            }
+            admission()
+        };
         let signer = self.signer_for(caller, proof, entry, enrolment, params)?;
         verify_confirmation(&self.clock, &entry.request, proof, &signer, enrolment)
             .map_err(refusal)?;
@@ -1128,7 +1189,7 @@ impl OwnerAuthority {
                 subject: ActionSubject::Completed(proof.request.confirmation_id),
             },
             kr_ipc::now_ms(),
-            admission,
+            &admission,
         )?;
         if let Some(entry) = state.entries.get_mut(&key) {
             entry.answer = Some(Answer {

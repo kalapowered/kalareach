@@ -12,7 +12,7 @@
 //! is visible to clients, and again whenever the bound changes, until it acknowledges.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use kr_ipc::client::BoundLink;
 use kr_protocol::ids::{DeviceId, SessionId};
@@ -26,7 +26,7 @@ use crate::grants::policy::LocalOwnerBound;
 
 /// The refusal of a method the local owner's membership lease holds, when no lease is live.
 ///
-/// Only [`Controller::local_hold`] makes one: it names no record and no effect, and a held method
+/// Only [`Controller::local_hold`] and [`Controller::lease_is_live_until`] make one: it names no record and no effect, and a held method
 /// is refused before anything is looked for. There is no conversion into it from an error.
 #[derive(Debug)]
 pub(crate) struct LeaseNotLive {
@@ -36,6 +36,18 @@ pub(crate) struct LeaseNotLive {
 impl From<LeaseNotLive> for ControllerError {
     fn from(refusal: LeaseNotLive) -> Self {
         refusal.error
+    }
+}
+
+/// The refusal of a held method while no lease is live: the one text, whichever reading of the
+/// lease makes it.
+fn lease_not_live() -> LeaseNotLive {
+    LeaseNotLive {
+        error: ControllerError::PermissionDenied {
+            detail: "this host is exclusively organisation-managed and its local owner's \
+                     membership lease is not live; present one with `kr organisation present`"
+                .to_owned(),
+        },
     }
 }
 
@@ -258,6 +270,23 @@ impl Controller {
         self.local_owner_bound_now() == LocalOwnerBound::Closed
     }
 
+    /// Whether a lease that [`Self::local_hold`] found live until `end` still is, on the clock now:
+    /// asked again after the locks that a check takes between the reading and the change, so that
+    /// a lease that ends in their wait is not read against a time taken before it. Takes no lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal of a held method when the lease's end has come.
+    pub(crate) fn lease_is_live_until(
+        &self,
+        end: Option<kr_transport::clock::ContinuousInstant>,
+    ) -> std::result::Result<(), LeaseNotLive> {
+        if end.is_some_and(|end| self.clock.now() >= end) {
+            return Err(lease_not_live());
+        }
+        Ok(())
+    }
+
     /// Holds a local caller's use of `method` to the local owner's membership lease, at the
     /// daemon's door.
     ///
@@ -294,14 +323,7 @@ impl Controller {
         drop(policy);
         match bound {
             LocalOwnerBound::Open => Ok(None),
-            LocalOwnerBound::Closed => Err(LeaseNotLive {
-                error: ControllerError::PermissionDenied {
-                    detail: "this host is exclusively organisation-managed and its local owner's \
-                             membership lease is not live; present one with `kr organisation \
-                             present`"
-                        .to_owned(),
-                },
-            }),
+            LocalOwnerBound::Closed => Err(lease_not_live()),
             LocalOwnerBound::Until { continuous, utc_ms } => {
                 let remaining = std::time::Duration::from_millis(utc_ms.saturating_sub(now_ms));
                 let laid = now.checked_add(remaining).unwrap_or(continuous);
@@ -327,12 +349,21 @@ impl Controller {
 
     /// The caller a local request is decided as for pairing and owner confirmation: the host's own
     /// account, limited to the recovery set while the local owner has no live lease.
+    ///
+    /// The caller carries the question again, so that the places that record or answer what it asks
+    /// read the scope at that moment and not only at the door.
     pub(crate) fn local_caller(
-        &self,
+        self: &Arc<Self>,
         actor_id: &kr_protocol::ids::ActorId,
     ) -> super::net::owner::Caller {
+        let controller = Arc::downgrade(self);
         super::net::owner::Caller::local(actor_id.clone())
             .confirming_recovery_only(self.local_owner_is_closed())
+            .asking_again_whether_closed(move || {
+                controller
+                    .upgrade()
+                    .is_none_or(|controller| controller.local_owner_is_closed())
+            })
     }
 
     /// The bound as a worker is told it: the lease's continuous end laid over the machine's own
