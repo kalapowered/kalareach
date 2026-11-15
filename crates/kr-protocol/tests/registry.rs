@@ -467,8 +467,8 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
     // must first stop starting sessions and let the ones it is starting settle, or a worker could
     // start while it is being inventoried. Section 23 names no method for that, so this build adds
     // the one step the updating release asks of the running daemon: close its gate, settle, say how
-    // it was started, and stop. It is the owner's act at this machine, like any change to what the
-    // host runs: served on the local socket alone and asking for host management.
+    // it was started, and stop. It is served on the host account's own local socket and asks for
+    // the right to manage the host, like any change to what the host runs.
     // A stop of the daemon on its local socket is asked the same way and for the same right, which
     // is what restarting it, under an update or by itself, needs.
     let updates = [
@@ -1767,8 +1767,9 @@ fn the_confirmation_of_a_restored_policy_is_the_person_at_the_machines_alone() {
 ///
 /// It asks for no confirmation: the request is the account's own, and the protocol claims no more
 /// than that no device, paired party, plugin or workflow method can send it. It is a method of
-/// recovery, so a host that is exclusively organisation-managed serves it to its local owner whose
-/// lease has lapsed, since a daemon that has to be restarted may be what the lapse left behind.
+/// recovery, so a host that is exclusively organisation-managed serves it on the host account's own
+/// socket while the local owner's membership lease has lapsed, since a daemon that has to be
+/// restarted may be what the lapse left behind.
 #[test]
 fn the_stop_of_a_daemon_is_asked_on_the_local_socket_alone() {
     let entry = lookup("host.stop").expect("host.stop is in the registry");
@@ -1782,7 +1783,8 @@ fn the_stop_of_a_daemon_is_asked_on_the_local_socket_alone() {
     assert_eq!(entry.confirmation, ConfirmationRequirement::None);
     assert!(
         kr_protocol::method::LOCAL_RECOVERY.contains(&Method::HostStop),
-        "a local owner with no live lease can still stop the daemon"
+        "a stop is served on the host account's own socket while the local owner's membership \
+         lease has lapsed"
     );
     assert_eq!(
         kr_protocol::method::local_hold(Method::HostStop),
