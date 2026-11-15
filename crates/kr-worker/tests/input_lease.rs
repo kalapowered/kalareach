@@ -2419,6 +2419,9 @@ async fn the_first_batch_of_the_next_epoch_is_written_after_an_epoch_dropped_one
 /// frame; the frame's authority ends; the application then reads, and the writer abandons the
 /// rest. The batch behind it, under authority that has not run out, is not written either, and the
 /// end of the epoch counts the rest of the frame and the whole of that batch.
+///
+/// The application waits on a named pipe, which a Windows host cannot make this way.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn what_follows_a_batch_the_writer_abandons_part_way_is_not_written() {
     const FRAME: usize = 60_000;
@@ -2454,6 +2457,7 @@ async fn what_follows_a_batch_the_writer_abandons_part_way_is_not_written() {
     let runtime = Arc::new(
         SessionRuntime::start(session, std::sync::Arc::new(clock.clone())).expect("starts"),
     );
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
     retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
     let deadline = kr_ipc::clock::SharedClock::boot_elapsed_ms(&clock) + 1_000;
     let frame = [b'q'; FRAME];
@@ -2526,7 +2530,6 @@ async fn what_follows_a_batch_the_writer_abandons_part_way_is_not_written() {
         !contains(&seen, b"kr-after"),
         "nothing of the epoch after the abandoned batch reaches the pseudo-terminal"
     );
-    runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
 /// The device-status question an application asks, and the answer the host owes it.
@@ -3898,6 +3901,7 @@ async fn a_forwarded_batch_made_of_two_writes_is_dropped_by_the_tighter_deadline
     let runtime = Arc::new(
         SessionRuntime::start(session, std::sync::Arc::new(clock.clone())).expect("starts"),
     );
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
     retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
     let now = kr_ipc::clock::SharedClock::boot_elapsed_ms(&clock);
     let early = now + 1_000;
@@ -3963,8 +3967,6 @@ async fn a_forwarded_batch_made_of_two_writes_is_dropped_by_the_tighter_deadline
         !contains(&seen, PASTE_START),
         "the delimiter the first write's deadline dropped was not written: {seen:?}"
     );
-
-    runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
 /// KR-REQ-08.64, in part.
@@ -4002,6 +4004,7 @@ async fn a_reply_comes_after_the_end_of_a_paste_whose_closing_batch_the_writer_d
     let runtime = Arc::new(
         SessionRuntime::start(session, std::sync::Arc::new(clock.clone())).expect("starts"),
     );
+    let _closing = kr_worker::testing::ClosedOnDrop::of(&runtime);
     retained_within(&runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
     let now = kr_ipc::clock::SharedClock::boot_elapsed_ms(&clock);
 
@@ -4071,8 +4074,6 @@ async fn a_reply_comes_after_the_end_of_a_paste_whose_closing_batch_the_writer_d
         "the paste was ended once: {:?}",
         String::from_utf8_lossy(&seen)
     );
-
-    runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
 // ---------------------------------------------------------------------------------------------
