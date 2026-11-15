@@ -525,7 +525,7 @@ impl RemoteConnection {
             }
             Err(error) => return Err(error.to_protocol_error()),
         };
-        if let Err(refusal) = self.claim_route(mutation, Some(session_id), own_claim) {
+        if let Err(refusal) = self.claim_route(mutation, Some(session_id), validated, own_claim) {
             return Err(refusal.into_error());
         }
         let envelope = self.envelope(acting.grant.grant_id, validated);
@@ -987,10 +987,16 @@ impl RemoteConnection {
     /// The claim is also this host's `(verified actor, action)` uniqueness check. Section 9 makes
     /// a reused identifier carrying a different payload `ID_CONFLICT`, and the digest the route
     /// holds is what a second submission is compared against.
+    ///
+    /// The conflict is read from the route record, and goes back only under the check every answer
+    /// read from a record goes under ([`Self::admitted_to_answer`]), asked with the conflict in
+    /// hand: a device this host owes a fence, or whose registration was withdrawn or replaced, is
+    /// told the outcome is not shown ([`RouteRefusal::not_shown`]) and not the conflict.
     pub(super) fn claim_route(
         &self,
         mutation: &MutationRequest,
         session_id: Option<SessionId>,
+        validated: AuthorityRevision,
         own_claim: &OwnClaim,
     ) -> std::result::Result<(), RouteRefusal> {
         let actor_id = self.device.principal();
@@ -1025,13 +1031,16 @@ impl RemoteConnection {
                 Ok(())
             }
             super::super::devices::ActionRoute::Existing(_) => {
-                Err(RouteRefusal::Conflict(ProtocolError::new(
-                    ErrorCode::IdConflict,
-                    format!(
-                        "action {} was already used with a different request",
-                        mutation.action_id
-                    ),
-                )))
+                Err(match self.admitted_to_answer(validated) {
+                    Ok(()) => RouteRefusal::Conflict(ProtocolError::new(
+                        ErrorCode::IdConflict,
+                        format!(
+                            "action {} was already used with a different request",
+                            mutation.action_id
+                        ),
+                    )),
+                    Err(lapsed) => RouteRefusal::not_shown(lapsed),
+                })
             }
         }
     }
@@ -1081,13 +1090,18 @@ impl RemoteConnection {
                 ))
             })?;
         if routed.payload_digest != Some(digest) {
-            return Err(RouteRefusal::Conflict(ProtocolError::new(
-                ErrorCode::IdConflict,
-                format!(
-                    "action {} was already used with a different request",
-                    mutation.action_id
-                ),
-            )));
+            // The conflict is read from the route record, and goes back under the check every
+            // answer read from a record goes under, asked with it in hand.
+            return Err(match self.admitted_to_answer(validated) {
+                Ok(()) => RouteRefusal::Conflict(ProtocolError::new(
+                    ErrorCode::IdConflict,
+                    format!(
+                        "action {} was already used with a different request",
+                        mutation.action_id
+                    ),
+                )),
+                Err(lapsed) => RouteRefusal::not_shown(lapsed),
+            });
         }
         // An action this host itself owns the receipt of is answered by the daemon or not at all.
         // Asking a worker about it would ask the wrong journal.

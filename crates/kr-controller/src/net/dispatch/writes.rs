@@ -194,7 +194,8 @@ impl RemoteConnection {
         {
             return Err(self.kept_refusal(refused, carried.admitted_revision, decided, asked));
         }
-        if let Err(refusal) = self.claim_route(mutation, None, own_claim) {
+        if let Err(refusal) = self.claim_route(mutation, None, carried.admitted_revision, own_claim)
+        {
             return Err(refusal.into_error());
         }
         let controller = Arc::clone(&self.controller);
