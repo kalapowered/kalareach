@@ -1156,10 +1156,9 @@ async fn kr_req_17_48_a_kept_answer_holds_the_list_and_the_delay_it_named() {
                     panic!("at {probe}s with {delay:?}: {refusal:?}");
                 };
                 assert_eq!(words_of(&alternatives), list, "at {probe}s");
-                assert_eq!(
+                assert!(
                     retry_after_seconds.is_some(),
-                    delay.is_some(),
-                    "at {probe}s with {delay:?}"
+                    "at {probe}s with {delay:?}: a device that waits is told how long"
                 );
             }
         }
@@ -1187,10 +1186,9 @@ async fn kr_req_17_48_an_unavailable_answer_with_no_entry_is_a_fault_and_never_c
             else {
                 panic!("at {probe}s with {delay:?}: {refusal:?}");
             };
-            assert_eq!(
+            assert!(
                 retry_after_seconds.is_some(),
-                delay.is_some(),
-                "at {probe}s with {delay:?}"
+                "at {probe}s with {delay:?}: a device that waits is told how long"
             );
         }
     }
@@ -1204,7 +1202,7 @@ async fn kr_req_17_48_a_refusal_of_the_5xx_class_in_the_envelope_is_a_fault() {
     const SHORT: &str = "Managed capacity for new pairing invitations is not available now.";
     // The same wait, said as unavailable: asked again after a wait of twenty seconds or more at the
     // same moments, so the whole series is equal.
-    for (status, delay) in [(503, None), (500, Some(3600))] {
+    for (status, delay, told) in [(503, None, Some(20)), (500, Some(3600), Some(3600))] {
         let refused = Exact::new(status, &refusal_body("INTERNAL", delay));
         let seen = series(Arc::clone(&refused) as _, || refused.requests()).await;
         let unavailable = Exact::new(200, &unavailable_body(SHORT, &STILL_WORK, delay));
@@ -1218,7 +1216,7 @@ async fn kr_req_17_48_a_refusal_of_the_5xx_class_in_the_envelope_is_a_fault() {
         assert_eq!(
             seen[0].2,
             Some(RelayRefusal::Fault {
-                retry_after_seconds: delay
+                retry_after_seconds: told
             })
         );
     }
@@ -1236,7 +1234,8 @@ async fn kr_req_17_48_a_refusal_of_the_5xx_class_in_the_envelope_is_a_fault() {
             retry_after_seconds: Some(20)
         })
     );
-    // A service that says it is not configured is a fault as well, and is not asked for ten minutes.
+    // A service that says it is not configured is a fault as well, and is not asked for ten
+    // minutes: a device told so waits for the stop, though the service named no delay.
     let refused = Exact::new(501, &refusal_body("NOT_CONFIGURED", None));
     let seen = series(Arc::clone(&refused) as _, || refused.requests()).await;
     assert_eq!(
@@ -1246,7 +1245,7 @@ async fn kr_req_17_48_a_refusal_of_the_5xx_class_in_the_envelope_is_a_fault() {
     assert_eq!(
         seen[0].2,
         Some(RelayRefusal::Fault {
-            retry_after_seconds: None
+            retry_after_seconds: Some(600)
         })
     );
 }
@@ -1306,7 +1305,10 @@ async fn kr_req_17_48_the_wait_handed_on_is_the_wait_until_the_device_asks_again
     // The figures at the 13 dials, by hand from the times of the control: the answer's retry time
     // while asks are left; the end of the ten minutes after the third ask, while they are used up
     // (the count starts again at each ask made ten minutes after the last).
-    let tables: [(Option<u64>, [u64; 13]); 3] = [
+    let tables: [(Option<u64>, [u64; 13]); 4] = [
+        // No delay named: the device still asks again after twenty seconds, or when the ten
+        // minutes after its third ask have passed.
+        (None, [20, 16, 14, 8, 20, 15, 600, 595, 531, 20, 20, 20, 20]),
         (Some(5), [5, 1, 5, 600, 591, 586, 551, 546, 482, 5, 5, 5, 5]),
         (
             Some(3600),
@@ -1334,13 +1336,6 @@ async fn kr_req_17_48_the_wait_handed_on_is_the_wait_until_the_device_asks_again
             assert_eq!(handed, expected.map(Some), "{delay:?} {body}");
         }
     }
-    // None where the service named none, whatever is left until the device asks again.
-    let http = Exact::new(200, &unavailable_body(SHORT, &STILL_WORK, None));
-    let seen = series(Arc::clone(&http) as _, || http.requests()).await;
-    assert!(
-        seen.iter()
-            .all(|(_, _, one)| one.is_some() && handed_on(one).is_none())
-    );
 }
 
 /// KR-REQ-17.48: while every request is stopped, the wait handed on is what is left of the stop, and

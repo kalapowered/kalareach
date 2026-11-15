@@ -709,27 +709,27 @@ impl PairingAdmissions {
                 retry_after_seconds,
                 answered_at,
             } if now < *kept_until || (entry.asks >= MOST_ASKS && !entry.window_passed(now)) => {
-                // What a person is told to wait is what is left until this device asks the service
-                // again, and never less than what is left of the delay the service named: the
-                // answer is kept past its delay while the cache will not ask again, and every try
-                // before then fails in the same way. None where the service named none.
-                let wait = retry_after_seconds.map(|named| {
-                    let asks_again = [
-                        Some(*retry_at),
-                        Some(*answered_at + named_time(named)),
-                        entry
-                            .asked_at
-                            .filter(|_| entry.asks >= MOST_ASKS)
-                            .map(|asked| asked + ASK_WINDOW),
-                        state.suspended_until,
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .max()
-                    .unwrap_or(now);
-                    let left = asks_again.saturating_duration_since(now);
-                    left.as_secs() + u64::from(left.subsec_nanos() > 0)
-                });
+                // What a person is told to wait is the device's own wait: what is left until it asks
+                // the service again (the answer's retry time, the end of the ask window when the asks
+                // are used up, the end of a stop of requests), whether or not the service named a
+                // delay, and never less than what is left of the delay it named. The answer is kept
+                // past its delay while the cache will not ask again, and every try before then fails
+                // in the same way. At most a day, by the cache's own cap on a delay.
+                let asks_again = [
+                    Some(*retry_at),
+                    retry_after_seconds.map(|named| *answered_at + named_time(named)),
+                    entry
+                        .asked_at
+                        .filter(|_| entry.asks >= MOST_ASKS)
+                        .map(|asked| asked + ASK_WINDOW),
+                    state.suspended_until,
+                ]
+                .into_iter()
+                .flatten()
+                .max()
+                .unwrap_or(now);
+                let left = asks_again.saturating_duration_since(now);
+                let wait = Some(left.as_secs() + u64::from(left.subsec_nanos() > 0));
                 Some(if alternatives.is_empty() {
                     RelayRefusal::Fault {
                         retry_after_seconds: wait,
@@ -754,15 +754,17 @@ pub enum RelayRefusal {
     Capacity {
         /// The paths it named, each as it wrote it. At least one has text.
         alternatives: Alternatives,
-        /// Seconds from now until this device asks the service again, and not less than what
-        /// remains of the delay the service named; none when the service named none.
+        /// The device's own wait: seconds from now until it asks the service again, and not less
+        /// than what remains of the delay the service named, when it named one. Always present
+        /// here; at most a day, by the cache's own cap on a delay.
         retry_after_seconds: Option<u64>,
     },
     /// The service failed on its side, and no capacity was refused. An answer that names no path,
     /// and a refusal in its envelope under a status of the 5xx class, are this.
     Fault {
-        /// Seconds from now until this device asks the service again, and not less than what
-        /// remains of the delay the service named; none when the service named none.
+        /// The device's own wait: seconds from now until it asks the service again, and not less
+        /// than what remains of the delay the service named, when it named one. Always present
+        /// here; at most a day, by the cache's own cap on a delay.
         retry_after_seconds: Option<u64>,
     },
 }

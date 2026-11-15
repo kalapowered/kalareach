@@ -5189,7 +5189,9 @@ async fn a_device_that_is_refused_free_capacity_is_told_so_when_it_cannot_pair()
     assert_eq!(failure.kind, FailureKind::RelayCapacity);
     // The failure holds the paths the service named, as it wrote them, and no wait it did not name.
     assert_eq!(told_paths(&failure), STAND_IN_PATHS);
-    assert_eq!(failure.retry_after_seconds, None);
+    // The service named no delay, and the device still asks again after twenty seconds.
+    let wait = failure.retry_after_seconds.expect("a wait");
+    assert!((1..=20).contains(&wait), "{wait}");
 }
 
 /// KR-REQ-10.54: a device that pairs by code and is refused free capacity is told that the managed
@@ -5514,8 +5516,8 @@ async fn a_device_that_is_refused_free_capacity_is_handed_the_wait_the_service_n
         .expect("the attempt ran")
         .expect_err("a relay that takes no session carries nothing");
     assert_eq!(failure.kind, FailureKind::RelayCapacity);
-    // What a person is told to wait is what is left until the device asks again, which is no more
-    // than the delay the service named and at least a second until that time has passed.
+    // What a person is told to wait is the device's own wait, what is left until it asks again,
+    // which is no more than the delay the service named and at least a second until it has passed.
     let wait = failure.retry_after_seconds.expect("a wait");
     assert!((1..=90).contains(&wait), "{wait}");
     assert_eq!(told_paths(&failure), STAND_IN_PATHS);
