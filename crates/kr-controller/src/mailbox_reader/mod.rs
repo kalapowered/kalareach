@@ -323,6 +323,8 @@ impl MailboxReader {
             "; this host still reads its authority feed at the feed's own poll"
         };
         let reads = Sentence::new().stated("this host reads its own mailbox");
+        // What a service with no capacity named ends the line, after the counts.
+        let mut offered = None;
         let (status, detail, remedy): (DoctorStatus, Sentence, Option<&'static str>) =
             match observed.stopped {
                 Some(Stopped::Unreachable) => (
@@ -333,19 +335,19 @@ impl MailboxReader {
                         .stated(feed),
                     Some("This host asks again by itself."),
                 ),
-                Some(Stopped::Capacity(offered)) => (
-                    DoctorStatus::Warning,
-                    crate::capacity::listed(
+                Some(Stopped::Capacity(named)) => {
+                    offered = Some(named);
+                    (
+                        DoctorStatus::Warning,
                         reads
                             .stated(", and ")
                             .stated(crate::capacity::MAILBOXES)
                             .stated("; ")
                             .sentence(&read)
                             .stated(feed),
-                        offered,
-                    ),
-                    Some("This host asks again by itself."),
-                ),
+                        Some("This host asks again by itself."),
+                    )
+                }
                 Some(Stopped::Refused(_)) => (
                     DoctorStatus::Warning,
                     reads
@@ -385,6 +387,10 @@ impl MailboxReader {
             .stated(" ignored, ")
             .number(observed.dropped)
             .stated(" dropped since this daemon started");
+        let detail = match offered {
+            Some(offered) => crate::capacity::listed(detail, offered),
+            None => detail,
+        };
         DoctorCheck::new(
             "mailbox-reader",
             "This host reads its own mailbox",
