@@ -213,6 +213,14 @@ impl ControlTransport for Counted {
     fn close(&self) {
         self.inner.close();
     }
+
+    fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    fn can_send(&self) -> bool {
+        self.inner.can_send()
+    }
 }
 
 /// KR-REQ-23.21 and KR-REQ-14.12: a paired device sends two full chunks and a short one through

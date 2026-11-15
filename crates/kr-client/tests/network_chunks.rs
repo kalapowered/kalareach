@@ -913,6 +913,10 @@ async fn a_transport_with_no_data_streams_is_refused_before_the_probe() {
         }
         fn revoke_streams(&self) {}
         fn close(&self) {}
+
+        fn is_closed(&self) -> bool {
+            false
+        }
     }
 
     let sent = Arc::new(Mutex::new(0));
@@ -1531,6 +1535,14 @@ impl ControlTransport for Counted {
     fn close(&self) {
         self.inner.close();
     }
+
+    fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    fn can_send(&self) -> bool {
+        self.inner.can_send()
+    }
 }
 
 /// A transport whose account can be signed out: once the flag is set it says why this device ended
@@ -1612,6 +1624,14 @@ impl ControlTransport for Ending {
     }
     fn close(&self) {
         self.inner.close();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    fn can_send(&self) -> bool {
+        self.inner.can_send()
     }
 }
 

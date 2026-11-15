@@ -625,7 +625,7 @@ impl LocalInput {
             "input is written as an ordered stream"
         );
         let request_id = RequestId::new(self.next_request_id.fetch_add(1, Ordering::AcqRel));
-        let waiter = register(&self.state, request_id)?;
+        let waiter = register(&*self.transport, &self.state, request_id)?;
         let request = Request {
             request_id,
             method: Method::InputWrite.into(),
@@ -653,9 +653,21 @@ impl LocalInput {
 }
 
 /// Registers a request, so that the reader hands the answer to the call that waits for it.
-fn register(state: &Arc<SessionState>, request_id: RequestId) -> Result<Waiter> {
+///
+/// This is where every call is admitted, and it reads the transport as well as the session: a
+/// connection that has lost its writing side has not ended in the session's record until the read
+/// loop has read to the peer's end, and a call that is registered in that time is refused by the
+/// transport before a byte of it goes and then answered as not known. A call that is refused here
+/// is answered as the session answers for an ended connection, and nothing of it is recorded. The
+/// transport is read with no wait, before the session's lock is taken.
+fn register(
+    transport: &dyn ControlTransport,
+    state: &Arc<SessionState>,
+    request_id: RequestId,
+) -> Result<Waiter> {
+    let can_send = transport.can_send();
     let mut waiters = state.waiters();
-    if waiters.ended {
+    if waiters.ended || !can_send {
         return Err(waiters
             .refusal
             .clone()
@@ -1800,7 +1812,7 @@ impl Session {
     }
 
     fn register(&self, request_id: RequestId) -> Result<Waiter> {
-        register(&self.state, request_id)
+        register(&*self.transport, &self.state, request_id)
     }
 
     fn next_request_id(&self) -> RequestId {

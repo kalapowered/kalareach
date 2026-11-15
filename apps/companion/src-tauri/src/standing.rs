@@ -1671,6 +1671,10 @@ pub(crate) mod tests {
         fn revoke_streams(&self) {}
 
         fn close(&self) {}
+
+        fn is_closed(&self) -> bool {
+            false
+        }
     }
 
     /// A link whose book holds one send that nothing has answered, and the send's identifier.

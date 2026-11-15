@@ -518,6 +518,14 @@ impl ControlTransport for Placed {
             .unwrap_or_else(PoisonError::into_inner)
             .take();
     }
+
+    fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    fn can_send(&self) -> bool {
+        self.inner.can_send()
+    }
 }
 
 impl Drop for Placed {
@@ -575,6 +583,10 @@ mod tests {
         }
         fn revoke_streams(&self) {}
         fn close(&self) {}
+
+        fn is_closed(&self) -> bool {
+            false
+        }
     }
 
     /// The streams of one connection, as far as its place is concerned: they open until the
@@ -684,6 +696,10 @@ mod tests {
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(self.places.held_on(self.host));
             self.revoke_streams();
+        }
+
+        fn is_closed(&self) -> bool {
+            false
         }
     }
 
