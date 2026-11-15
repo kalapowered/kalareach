@@ -158,8 +158,7 @@ impl Client {
     /// How many frames of its epoch the worker's lease has accepted.
     fn workers_count(&self) -> u64 {
         let input = self.worker_input();
-        let count = input.lock().lease().next_sequence.get();
-        count
+        input.lock().lease().next_sequence.get()
     }
 
     /// Whether the worker's lease is held by the client's attachment.
@@ -172,8 +171,7 @@ impl Client {
     /// How many lanes the worker has bound.
     fn workers_lanes(&self) -> usize {
         let input = self.worker_input();
-        let lanes = input.lock().lane_count();
-        lanes
+        input.lock().lane_count()
     }
 
     /// What the worker's terminal took of the lease's typing, in the order it took it.
