@@ -2687,6 +2687,10 @@ async fn an_answer_that_waits_for_room_is_dropped_at_its_deadline_with_nothing_e
         assert_eq!(session.engine().replies_expired(), 0);
     }
 
+    // The pump looks at the lane once more after the pass that left the answer waiting, to learn
+    // the deadline it has to wake at. That look must be over before the clock moves, or it would
+    // find the answer lapsed and drop it, and the wake at the deadline would never be shown.
+    tokio::time::sleep(Duration::from_secs(1)).await;
     // Two seconds and a little more after the answer was offered.
     clock.advance(Duration::from_millis(2_100));
     tokio::time::timeout(Duration::from_secs(10), async {
