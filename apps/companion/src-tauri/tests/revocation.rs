@@ -2782,6 +2782,14 @@ impl kr_client::transport::ControlTransport for TellsNotShown {
     fn close(&self) {
         self.inner.close();
     }
+
+    fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    fn can_send(&self) -> bool {
+        self.inner.can_send()
+    }
 }
 
 /// A connection to the host on this machine over its socket, as the application makes one, that
