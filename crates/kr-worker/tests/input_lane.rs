@@ -340,20 +340,22 @@ impl Rig {
     /// A rig whose worker ends the link of a closed lane queue after `close_bound`, where one is
     /// given, rather than after the five seconds of the shipped worker.
     async fn start_with(close_bound: Option<Duration>) -> Self {
-        Self::start_built(close_bound, false, false).await
+        Self::start_reading_with("tee", close_bound, false, false).await
     }
 
     /// A rig whose session is a managed shell with the root editor's fence machine, its bridge
     /// registered and its hooks live, and no reader in an editor yet: input is accepted as it is
     /// outside an editor, and a launch asked of it is refused by the machine at once.
     async fn start_fenced() -> Self {
-        Self::start_built(None, true, false).await
+        Self::start_reading_with("tee", None, true, false).await
     }
 
     /// A rig whose application does not read its terminal until [`Self::let_the_application_read`]:
-    /// what the worker writes to it waits in the terminal, which holds only a little.
+    /// what the worker writes to it waits in the terminal, which holds only a little. It keeps
+    /// what it reads with the suite's own program and not with the system's `tee`
+    /// ([`common::KEEPS_WHAT_IT_READS`] says why): a late reader is handed a backlog.
     async fn start_unreading() -> Self {
-        Self::start_built(None, false, true).await
+        Self::start_reading_with(common::KEEPS_WHAT_IT_READS, None, false, true).await
     }
 
     /// A rig whose application keeps what it reads with the suite's own program and not with the
@@ -361,10 +363,6 @@ impl Rig {
     /// deal to it at once.
     async fn start_keeping() -> Self {
         Self::start_reading_with(common::KEEPS_WHAT_IT_READS, None, false, false).await
-    }
-
-    async fn start_built(close_bound: Option<Duration>, fenced: bool, waits: bool) -> Self {
-        Self::start_reading_with("tee", close_bound, fenced, waits).await
     }
 
     /// Starts the rig with `reader` as the program that keeps what the application receives in
