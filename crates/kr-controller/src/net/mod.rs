@@ -2518,7 +2518,7 @@ impl Controller {
         self: &Arc<Self>,
         session_id: kr_protocol::ids::SessionId,
     ) -> Result<()> {
-        match self.ask_worker_revision(session_id).await? {
+        match self.ask_worker_revision(session_id, None).await? {
             Asked::Acknowledged => Ok(()),
             Asked::Refused | Asked::Failed => Err(ControllerError::supervision(
                 "this session's worker has not installed the environment's authority revision",
@@ -2533,6 +2533,10 @@ impl Controller {
     /// lease, and the link is good, so it goes back and the next ask meets the worker's own
     /// attempt at its boundary on the same link instead of opening one that waits there.
     ///
+    /// A caller that bounds the whole ask gives the instant its bound ends as `until`, so that the
+    /// collection of the names an acknowledgement leaves does not begin an exchange that the bound
+    /// would cut ([`Self::collect_owed_evidence`]).
+    ///
     /// # Errors
     ///
     /// Returns an error when the registry cannot be read or written, or when the worker is not in
@@ -2540,6 +2544,7 @@ impl Controller {
     pub(crate) async fn ask_worker_revision(
         self: &Arc<Self>,
         session_id: kr_protocol::ids::SessionId,
+        until: Option<tokio::time::Instant>,
     ) -> Result<Asked> {
         // A worker that ends while this exchange is on the wire is held until it is over, so the
         // names its acknowledgement carries still have a record to go to.
@@ -2621,7 +2626,7 @@ impl Controller {
                     // one. The rest of what this worker owes, for this revocation and for any
                     // older one whose pages never finished arriving, is collected here as it is
                     // after the announcement every worker gets.
-                    self.collect_owed_evidence(session_id, binding, revision)
+                    self.collect_owed_evidence(session_id, binding, revision, until)
                         .await;
                 }
                 Ok(Asked::Acknowledged)
