@@ -1195,6 +1195,12 @@ const LIST: &[Listed] = &[
             1,
         )],
     ),
+    // Gives the suites a directory under the run's own temporary folder, for the records that the
+    // script then appends to the directory that the caller named.
+    lines(
+        "scripts/performance.sh",
+        &[(r#"export KR_TEST_ARTIFACTS_DIR="$run_evidence""#, 1)],
+    ),
     // A comment that says where the evidence directory is.
     lines(
         "scripts/run-conformance.sh",
@@ -1304,6 +1310,15 @@ const LIST: &[Listed] = &[
                 "/// A run that has not set `KR_TEST_ARTIFACTS_DIR` keeps the section in a directory of its own under",
                 1,
             ),
+        ],
+    ),
+    // Runs the performance script with a stand-in measurement, with the variable set to a folder
+    // under its temporary folder, or removed.
+    lines(
+        "tests/perf/tests/evidence.rs",
+        &[
+            (r#".env_remove("KR_TEST_ARTIFACTS_DIR");"#, 1),
+            (r#"command.env("KR_TEST_ARTIFACTS_DIR", evidence);"#, 1),
         ],
     ),
     // A comment on where the stress figures are recorded.
