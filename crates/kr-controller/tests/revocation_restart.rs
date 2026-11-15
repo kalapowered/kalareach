@@ -18,7 +18,9 @@ use kr_protocol::method::Method;
 use kr_protocol::sharing::{GrantTransferParams, GrantTransferResult, RoleSelection, SessionRole};
 use net_support::pairing::{self as calls, Signer};
 use net_support::worker::{Adopted, Worker, share};
-use net_support::{Host, delegated, on_the_host, on_the_session, owned_by, recipient};
+use net_support::{
+    Device, Host, RawDevice, delegated, on_the_host, on_the_session, owned_by, recipient,
+};
 
 /// KR-REQ-10.45: a revocation commits its withdrawal and the fence debt it owes in one
 /// transaction, and the revision follows from the debt. When the registry cannot publish the
@@ -419,17 +421,58 @@ const NAMES_A_PAGE_CARRIES: usize = 8;
 struct Owing {
     host: Host,
     workers: Vec<Worker>,
-    /// The revocation, as the local owner sent it: repeating it repeats the action.
+    /// The revocation or the transfer, as the local owner sent it: repeating it repeats the action.
     mutation: kr_protocol::envelope::MutationRequest,
+    by: Revoked,
     session_id: kr_protocol::ids::SessionId,
     owed: usize,
+    /// The devices a transfer's arrangement paired and their connections, which stay open while
+    /// the answers are read.
+    paired: Paired,
 }
 
-/// What the revocation of [`Owing`] revokes: the share's grant, or the device that holds it.
+/// The connections of the devices that a transfer's arrangement paired, and the devices. The
+/// connections come first: they are dropped before the endpoints they dial from.
+#[derive(Default)]
+struct Paired {
+    connections: Vec<RawDevice>,
+    devices: Vec<Device>,
+}
+
+/// What the revocation of [`Owing`] revokes: the share's grant, the device that holds it, or the
+/// grant that a transfer of control takes back from the device that gives it up.
 #[derive(Clone, Copy)]
 enum Revoked {
     Grant,
     Device,
+    Transfer,
+}
+
+/// What the revocation of one arm acts on, once the arm's setup is made.
+enum Aim {
+    Grant(kr_protocol::sharing::GrantRevokeParams),
+    Device(kr_protocol::sharing::DeviceRevokeParams),
+    Transfer(GrantTransferParams),
+}
+
+/// The barrier of the answer to the revocation of `by`: a transfer of control answers with the
+/// revocation of the grant it took back.
+fn the_barrier_of(answer: &kr_protocol::envelope::ParamsValue, by: Revoked) -> RevocationBarrier {
+    match by {
+        Revoked::Grant | Revoked::Device => {
+            answer
+                .to_typed::<kr_protocol::sharing::RevocationResult>()
+                .expect("a revocation result")
+                .barrier
+        }
+        Revoked::Transfer => {
+            answer
+                .to_typed::<GrantTransferResult>()
+                .expect("a transfer result")
+                .revoked
+                .barrier
+        }
+    }
 }
 
 /// How long the whole arrangement of [`Owing`] may take, every attempt's start, its request and its
@@ -446,6 +489,9 @@ const ARRANGEMENT_LIMIT: Duration = Duration::from_secs(180);
 /// With `behind`, the worker was inside a dispatch transition when an earlier revision was
 /// announced and refused it, and fenced what it owed by itself afterwards: the revocation's
 /// announcement then carries that revision, and the names are filed under it.
+///
+/// A transfer of control answers with the revocation of the grant it took back, and its
+/// arrangement is made again in the same way.
 async fn a_revocation_that_left_names_owing(behind: bool, by: Revoked) -> Owing {
     let attempts = std::sync::Mutex::new(Vec::new());
     tokio::time::timeout(
@@ -474,15 +520,54 @@ async fn arrange_until_an_answer_holds(
             workers,
         } = Adopted::start(1).await;
         let session_id = workers[0].session_id;
-        let (device, record) = recipient(&host, &owner).await;
-        let granted = share(
-            &host,
-            session_id,
-            &device,
-            &record,
-            RoleSelection::plain(SessionRole::Controller),
-        )
-        .await;
+        let mut paired = Paired::default();
+        let aim = match by {
+            Revoked::Grant | Revoked::Device => {
+                let (device, record) = recipient(&host, &owner).await;
+                let granted = share(
+                    &host,
+                    session_id,
+                    &device,
+                    &record,
+                    RoleSelection::plain(SessionRole::Controller),
+                )
+                .await;
+                if matches!(by, Revoked::Grant) {
+                    Aim::Grant(kr_protocol::sharing::GrantRevokeParams {
+                        grant_id: granted.grant_id,
+                    })
+                } else {
+                    Aim::Device(kr_protocol::sharing::DeviceRevokeParams {
+                        device_id: record.device_id,
+                    })
+                }
+            }
+            // The device that gives control up holds a grant below its owner's, and the transfer
+            // takes that grant back for a device that has none.
+            Revoked::Transfer => {
+                let (boss, boss_record) = recipient(&host, &owner).await;
+                let (giver, giver_record) = recipient(&host, &owner).await;
+                let (taker, taker_record) = recipient(&host, &owner).await;
+                let (above, above_connection) =
+                    owned_by(&host, session_id, &boss, &boss_record).await;
+                let (held, giving) = delegated(
+                    &host,
+                    session_id,
+                    &above.grant,
+                    &above_connection,
+                    &giver,
+                    &giver_record,
+                )
+                .await;
+                paired.connections.extend([above_connection, giving]);
+                paired.devices.extend([boss, giver, taker]);
+                Aim::Transfer(GrantTransferParams {
+                    session_id,
+                    from_grant_id: held.grant_id,
+                    to_device_id: taker_record.device_id,
+                })
+            }
+        };
         // Two full pages of the worker's evidence and five names more, so that the names an
         // acknowledgement carries are a part of them.
         workers[0].limit_evidence_page_for_tests(NAMES_A_PAGE_CARRIES);
@@ -506,47 +591,54 @@ async fn arrange_until_an_answer_holds(
 
         let mut client = host.client().await;
         let action_id = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
-        let mutation = match by {
-            Revoked::Grant => {
+        let mutation = match aim {
+            Aim::Grant(params) => {
                 client
-                    .compose(
-                        Method::GrantRevoke,
-                        action_id,
-                        on_the_host(&host),
-                        &kr_protocol::sharing::GrantRevokeParams {
-                            grant_id: granted.grant_id,
-                        },
-                    )
+                    .compose(Method::GrantRevoke, action_id, on_the_host(&host), &params)
                     .await
             }
-            Revoked::Device => {
+            Aim::Device(params) => {
+                client
+                    .compose(Method::DeviceRevoke, action_id, on_the_host(&host), &params)
+                    .await
+            }
+            Aim::Transfer(params) => {
+                calls::confirm_subject(
+                    host.environment_id,
+                    &mut client,
+                    ConfirmationSubject::TransferControl(Box::new(TransferControlSubject {
+                        params: params.clone(),
+                        action_id,
+                    })),
+                    &Signer::OwnerDevice(&owner),
+                )
+                .await
+                .expect("the owner confirms the transfer");
                 client
                     .compose(
-                        Method::DeviceRevoke,
+                        Method::GrantTransfer,
                         action_id,
-                        on_the_host(&host),
-                        &kr_protocol::sharing::DeviceRevokeParams {
-                            device_id: record.device_id,
-                        },
+                        on_the_session(&host, session_id),
+                        &params,
                     )
                     .await
             }
         }
         .expect("the revocation is composed");
-        let first: kr_protocol::sharing::RevocationResult = client
-            .repeat(&mutation)
-            .await
-            .expect("the daemon answers")
-            .expect("the revocation is done")
-            .to_typed()
-            .expect("a revocation result");
+        let first = the_barrier_of(
+            &client
+                .repeat(&mutation)
+                .await
+                .expect("the daemon answers")
+                .expect("the revocation is done"),
+            by,
+        );
         let given = first
-            .barrier
             .workers
             .iter()
             .find(|reported| reported.session_id == session_id)
             .expect("the worker is in the barrier");
-        if first.barrier.holds() {
+        if first.holds() {
             assert!(
                 given.names_pending.get() > 0,
                 "the names did not all arrive with the first answer: {given:?}"
@@ -556,8 +648,10 @@ async fn arrange_until_an_answer_holds(
                 host,
                 workers,
                 mutation,
+                by,
                 session_id,
                 owed,
+                paired,
             };
         }
         attempts
@@ -570,6 +664,7 @@ async fn arrange_until_an_answer_holds(
                 given.detail
             ));
         drop(client);
+        drop(paired);
         // The workers first, while the tree they serve is there to be written to.
         for worker in workers {
             worker.stop().await;
@@ -606,14 +701,16 @@ fn answers_kept_with_a_record(host: &Host) -> i64 {
 }
 
 /// Stops the daemon of `owing` with the names still at the worker, starts it again on the same
-/// tree, and repeats the revocation until its answer carries every name.
+/// tree, and repeats the revocation or the transfer until its answer carries every name.
 async fn the_repeat_after_a_restart_carries_every_name(owing: Owing) {
     let Owing {
         host,
         workers,
         mutation,
+        by,
         session_id,
         owed,
+        paired: _paired,
     } = owing;
     let stopped = host.shut_down().await;
     let settings = stopped.settings().clone();
@@ -625,15 +722,15 @@ async fn the_repeat_after_a_restart_carries_every_name(owing: Owing) {
     let mut client = host.client().await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
-        let repeated: kr_protocol::sharing::RevocationResult = client
-            .repeat(&mutation)
-            .await
-            .expect("the daemon answers")
-            .expect("the revocation is answered")
-            .to_typed()
-            .expect("a revocation result");
+        let repeated = the_barrier_of(
+            &client
+                .repeat(&mutation)
+                .await
+                .expect("the daemon answers")
+                .expect("the revocation is answered"),
+            by,
+        );
         let carried = repeated
-            .barrier
             .workers
             .iter()
             .find(|reported| reported.session_id == session_id)
@@ -697,122 +794,13 @@ async fn a_restarted_daemon_collects_the_names_a_device_revocation_left_owing() 
 /// transfer, which performs nothing again, shows them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_restarted_daemon_collects_the_names_a_transfer_left_owing() {
-    let Adopted {
-        host,
-        owner,
-        workers,
-    } = Adopted::start(1).await;
-    let session_id = workers[0].session_id;
-    let (boss, boss_record) = recipient(&host, &owner).await;
-    let (giver, giver_record) = recipient(&host, &owner).await;
-    let (_taker, taker_record) = recipient(&host, &owner).await;
-    let (above, above_connection) = owned_by(&host, session_id, &boss, &boss_record).await;
-    let (held, _giving) = delegated(
-        &host,
-        session_id,
-        &above.grant,
-        &above_connection,
-        &giver,
-        &giver_record,
-    )
-    .await;
-    workers[0].limit_evidence_page_for_tests(NAMES_A_PAGE_CARRIES);
-    let owed = NAMES_A_PAGE_CARRIES * 2 + 5;
-    workers[0].seed_undispatched_intents(&ActorId::new("device:phone").expect("a principal"), owed);
-    host.controller().limit_evidence_pages_for_tests(0);
-
-    let params = GrantTransferParams {
-        session_id,
-        from_grant_id: held.grant_id,
-        to_device_id: taker_record.device_id,
-    };
-    let action = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
-    let mut client = host.client().await;
-    calls::confirm_subject(
-        host.environment_id,
-        &mut client,
-        ConfirmationSubject::TransferControl(Box::new(TransferControlSubject {
-            params: params.clone(),
-            action_id: action,
-        })),
-        &Signer::OwnerDevice(&owner),
-    )
-    .await
-    .expect("the owner confirms the transfer");
-    let transfer = client
-        .compose(
-            Method::GrantTransfer,
-            action,
-            on_the_session(&host, session_id),
-            &params,
-        )
-        .await
-        .expect("the transfer is composed");
-    let first: GrantTransferResult = client
-        .repeat(&transfer)
-        .await
-        .expect("the daemon answers")
-        .expect("the transfer is done")
-        .to_typed()
-        .expect("a transfer result");
-    let given = first
-        .revoked
-        .barrier
-        .workers
-        .iter()
-        .find(|reported| reported.session_id == session_id)
-        .expect("the worker is in the barrier");
-    assert!(
-        first.revoked.barrier.holds() && given.names_pending.get() > 0,
-        "the first answer held with names still to come: {given:?}"
-    );
+    let owing = a_revocation_that_left_names_owing(false, Revoked::Transfer).await;
     assert_eq!(
-        answers_kept_with_a_record(&host),
+        answers_kept_with_a_record(&owing.host),
         1,
         "the transfer's answer was kept with a record of what its entry read"
     );
-    drop(client);
-
-    let stopped = host.shut_down().await;
-    let settings = stopped.settings().clone();
-    let host = stopped.start(settings).await;
-    host.controller()
-        .what_workers_hold_is_read_back_for_tests()
-        .await;
-
-    let mut client = host.client().await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        let repeated: GrantTransferResult = client
-            .repeat(&transfer)
-            .await
-            .expect("the daemon answers")
-            .expect("the transfer is answered from its record")
-            .to_typed()
-            .expect("a transfer result");
-        let carried = repeated
-            .revoked
-            .barrier
-            .workers
-            .iter()
-            .find(|reported| reported.session_id == session_id)
-            .expect("the worker is in the barrier");
-        if carried.names_pending.get() == 0 {
-            assert_eq!(
-                carried.rejected_actions_total.get(),
-                owed as u64,
-                "the repeat carries every name the worker took back: {carried:?}"
-            );
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the repeat never carried the names: {carried:?}"
-        );
-        tokio::task::yield_now().await;
-    }
-    host.stop().await;
-    drop(workers);
+    the_repeat_after_a_restart_carries_every_name(owing).await;
 }
 
 /// KR-REQ-10.45, 09.13: a worker that was behind keeps no count for ever.
