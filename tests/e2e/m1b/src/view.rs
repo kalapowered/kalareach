@@ -417,12 +417,14 @@ impl View {
 
     /// Types `text` under the lease this attachment holds, on the attachment's input lane, and
     /// requires the host to accept it: the lane's first frame under an epoch is sequence zero, and
-    /// the host's acceptance is what this waits for.
+    /// the host's acceptance is what this waits for. The lane's answer carries no count of what the
+    /// worker took, so the [`Writing`] holds the length of what was sent, not a count from the
+    /// worker: a case that needs to know the bytes arrived reads the screen.
     ///
     /// # Errors
     ///
-    /// Returns what stopped the typing (the host's refusal, the end of the lane), that this
-    /// attachment holds no lease, or an acceptance that is not of these bytes.
+    /// Returns what stopped the typing (the host's refusal, the end of the lane) or that this
+    /// attachment holds no lease.
     pub async fn type_text(&mut self, remote: &Remote, text: &str) -> Result<Writing, String> {
         let epoch = self.lease.ok_or("this attachment holds no input lease")?;
         if self.typing.is_none() {
@@ -443,13 +445,6 @@ impl View {
             .type_bytes(epoch, text.as_bytes())
             .await
             .map_err(|error| error.to_string())?;
-        if written.bytes != text.len() {
-            return Err(format!(
-                "input of {} bytes was accepted as a frame of {} bytes",
-                text.len(),
-                written.bytes
-            ));
-        }
         self.acknowledged += 1;
         Ok(written)
     }
