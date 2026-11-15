@@ -65,7 +65,7 @@ async fn local_connection(temp: &kr_ipc::testing::TempHost) -> (FrameWriter, Fra
 /// A daemon on clocks the test moves by hand, exclusively organisation-managed, whose local owner
 /// holds a membership lease that is live for its fifteen minutes, and a local connection to it.
 /// Returns the continuous clock too, which the test moves past the lease's end.
-async fn connected_under_a_lease() -> (
+pub(super) async fn connected_under_a_lease() -> (
     kr_ipc::testing::TempHost,
     Arc<Controller>,
     kr_transport::clock::ManualClock,

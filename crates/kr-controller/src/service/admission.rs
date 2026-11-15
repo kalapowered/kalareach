@@ -1659,7 +1659,7 @@ impl Controller {
         // authoritative deadline, and nothing downstream lengthens this one. The one local
         // authority that ends is the owner of a host that is exclusively organisation-managed, for
         // a method the host holds to its membership lease: the lease's end bounds the work.
-        let authority = self.local_hold(method)?;
+        let authority = self.local_hold(method)?.end;
         self.windows
             .accept_at(
                 &mutation.action_window_id,

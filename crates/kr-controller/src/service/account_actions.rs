@@ -242,7 +242,8 @@ impl Controller {
             // it, with no lock of its own.
             let end = controller
                 .local_hold(method)
-                .map_err(ControllerError::from)?;
+                .map_err(ControllerError::from)?
+                .end;
             #[cfg(feature = "testing")]
             controller.before_the_last_fence_read.wait();
             controller.check_fence()?;

@@ -39,6 +39,17 @@ impl From<LeaseNotLive> for ControllerError {
     }
 }
 
+/// What a local caller's use of a method found of the local owner's lease: where it ends, and the
+/// held bound of the lease that was chosen, which the policy's cell can end before then.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LeaseHeld {
+    /// The earlier of the lease's continuous end and its UTC end laid over the continuous clock;
+    /// none where the method needs no lease.
+    pub(crate) end: Option<kr_transport::clock::ContinuousInstant>,
+    /// The chosen lease's held bound; none where the method needs no lease.
+    pub(crate) bound: Option<crate::grants::policy::HeldBound>,
+}
+
 /// The refusal of a held method while no lease is live: the one text, whichever reading of the
 /// lease makes it.
 pub(super) fn lease_not_live() -> LeaseNotLive {
@@ -302,9 +313,9 @@ impl Controller {
     pub(crate) fn local_hold(
         &self,
         method: kr_protocol::method::Method,
-    ) -> std::result::Result<Option<kr_transport::clock::ContinuousInstant>, LeaseNotLive> {
+    ) -> std::result::Result<LeaseHeld, LeaseNotLive> {
         if kr_protocol::method::local_hold(method) == kr_protocol::method::LocalHold::Free {
-            return Ok(None);
+            return Ok(LeaseHeld::default());
         }
         #[cfg(feature = "testing")]
         self.before_the_policy_lock.wait();
@@ -319,15 +330,18 @@ impl Controller {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = self.clock.now();
         let now_ms = self.settled_utc_now();
-        let bound = policy.local_owner_bound(self.local_owner_device(), now, now_ms);
+        let (bound, held) = policy.local_owner_hold(self.local_owner_device(), now, now_ms);
         drop(policy);
         match bound {
-            LocalOwnerBound::Open => Ok(None),
+            LocalOwnerBound::Open => Ok(LeaseHeld::default()),
             LocalOwnerBound::Closed => Err(lease_not_live()),
             LocalOwnerBound::Until { continuous, utc_ms } => {
                 let remaining = std::time::Duration::from_millis(utc_ms.saturating_sub(now_ms));
                 let laid = now.checked_add(remaining).unwrap_or(continuous);
-                Ok(Some(continuous.min(laid)))
+                Ok(LeaseHeld {
+                    end: Some(continuous.min(laid)),
+                    bound: held,
+                })
             }
         }
     }

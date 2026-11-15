@@ -5,9 +5,14 @@
 //! daemon and read the footing back at the places a barrier is stopped in, so that each member is
 //! shown to change where its writer changes it, and in the order that a reader relies on.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use kr_protocol::method::Method;
+use kr_transport::clock::ContinuousClock;
+
 use super::a_floor_owed_its_record::{daemon, daemon_passing_by_hand, until};
+use super::a_result_the_lease_ended_over::connected_under_a_lease;
 use super::one_barrier_for_every_restriction::{beside, owed, revision};
 use super::the_fence_at_every_effect::{admitted, daemon as daemon_on_clocks};
 use super::{Ask, Lapse, Reach};
@@ -220,4 +225,30 @@ async fn a_start_that_cannot_raise_its_barrier_sets_the_flag_for_the_debt_it_pub
         async || !controller.copies.fence_is_owed() && owed(&controller).is_empty(),
     )
     .await;
+}
+
+/// A held method's reading of the local owner's lease returns the bound of the lease it chose
+/// beside the lease's end, a footing that holds that bound is refused once the lease's time has
+/// come, and a method that needs no lease holds none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_methods_reading_of_the_lease_returns_the_chosen_leases_bound_beside_its_end() {
+    let (_temp, controller, clock, _writer, _reader) = connected_under_a_lease().await;
+
+    let held = controller
+        .local_hold(Method::SessionRead)
+        .expect("the lease is live");
+    let end = held.end.expect("a lease has an end");
+    let footing = super::Footing::untargeted(Arc::clone(&controller.copies)).holding(held.bound);
+    assert_eq!(footing.ask(Ask::SIGN_IN), Ok(()));
+
+    clock.advance(end.saturating_duration_since(clock.now()));
+    assert_eq!(footing.ask(Ask::SIGN_IN), Err(Lapse::LeaseEnded));
+    controller
+        .local_hold(Method::SessionRead)
+        .expect_err("no lease is live now");
+
+    let free = controller
+        .local_hold(Method::GrantList)
+        .expect("a method that needs no lease is served");
+    assert!(free.end.is_none() && free.bound.is_none());
 }

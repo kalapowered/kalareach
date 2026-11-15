@@ -370,7 +370,9 @@ impl Controller {
         // record's check takes locks of its own, so the lease's end that the reading returned is
         // compared with the clock again after them, with no lock of its own.
         let permitted = || {
-            let Some(end) = leased.map_or(Some(None), |method| self.local_hold(method).ok()) else {
+            let Some(end) = leased.map_or(Some(None), |method| {
+                self.local_hold(method).ok().map(|held| held.end)
+            }) else {
                 return false;
             };
             record_stands() && self.lease_is_live_until(end).is_ok()
