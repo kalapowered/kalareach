@@ -80,6 +80,11 @@ use crate::session::{
 };
 use kr_term::lane::DrainBudget;
 
+/// What a release, a detach or a launch is refused with when the typing its position names has not
+/// all been accepted. The control daemon refuses with the same words when its own record of the
+/// stream shows it, before it forwards.
+pub const POSITION_NOT_REACHED: &str = "The typing before this request has not all arrived.";
+
 /// What a release or a detach is refused with when its position names the typing of another
 /// attachment than its own. The control daemon refuses with the same words, before it forwards.
 pub const POSITION_NAMES_ANOTHER: &str =
@@ -2386,7 +2391,7 @@ impl InputDomain {
             return Ok(());
         }
         Err(WorkerError::PreconditionFailed {
-            detail: "The typing before this request has not all arrived.".to_owned(),
+            detail: POSITION_NOT_REACHED.to_owned(),
         })
     }
 

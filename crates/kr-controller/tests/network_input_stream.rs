@@ -3599,14 +3599,23 @@ async fn a_worker_that_states_the_lane_is_served_on_its_lane() {
         typed_at_the_terminal(&input) == b"abc"
     })
     .await;
-    // The host has no record of a stream that has ended, so it judges no position and forwards the
-    // request whole: the position reaches the worker, which refuses what has not all arrived.
+    // While the stream stands the host's record shows the position is not reached, and the host
+    // refuses. Once the stream has ended the host has no record, so it judges no position and
+    // forwards the request whole: the position reaches the worker, which refuses what has not all
+    // arrived. The two refuse with the same words.
+    let by_the_host = send_after(&rig, Dependent::Release, rig.epoch, 4).await;
+    assert!(by_the_host.refused_here, "the host's record is short");
+    let by_the_host = by_the_host.answer.expect_err("the host refuses");
     end_the_stream(&rig, stream).await;
     let beyond = send_after(&rig, Dependent::Release, rig.epoch, 4).await;
     assert!(!beyond.refused_here, "the host has nothing to judge by");
+    let by_the_worker = beyond.answer.expect_err("the worker refuses");
+    assert_eq!(by_the_worker.code, ErrorCode::DraftConflict);
+    assert_eq!(by_the_host.code, by_the_worker.code);
+    assert_eq!(by_the_host.message, by_the_worker.message);
     assert_eq!(
-        beyond.answer.expect_err("the worker refuses").code,
-        ErrorCode::DraftConflict
+        by_the_worker.message,
+        kr_worker::input_domain::POSITION_NOT_REACHED
     );
     // The count is asked for: the answer to a release that is taken carries it.
     let release = send_after(&rig, Dependent::Release, rig.epoch, 3).await;
