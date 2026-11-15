@@ -31,23 +31,44 @@ fn read_whole<T: kr_protocol::wire::WireMessage>(params: &ParamsValue) -> Result
 /// The barrier that `mutation` carries, when it is one of the three requests that can carry one and
 /// it carries one.
 ///
+/// A release's or a detach's barrier names the request's own attachment: the request orders itself
+/// after its own typing. A launch's names the holder of the lease, which only the worker knows. A
+/// detach that names no attachment has no subject here, and the worker, which resolves it, judges
+/// the barrier against the attachment it finds.
+///
 /// # Errors
 ///
 /// Refuses a request of the three methods whose parameters do not decode whole, whatever worker it
-/// is for: the host cannot say what position it names, and it takes nothing out of it.
+/// is for: the host cannot say what position it names, and it takes nothing out of it. Refuses a
+/// release or a detach whose barrier names another attachment than its own, as an argument, with
+/// nothing forwarded and no outcome left uncertain.
 pub(in crate::service::net) fn barrier_of(
     mutation: &MutationRequest,
 ) -> Result<Option<InputBarrier>, ProtocolError> {
-    Ok(match mutation.method.method() {
+    let (barrier, subject) = match mutation.method.method() {
         Some(Method::InputRelease) => {
-            read_whole::<InputReleaseParams>(&mutation.params)?.after_input
+            let params = read_whole::<InputReleaseParams>(&mutation.params)?;
+            (params.after_input, Some(params.attachment_id))
         }
         Some(Method::SessionDetach) => {
-            read_whole::<SessionDetachParams>(&mutation.params)?.after_input
+            let params = read_whole::<SessionDetachParams>(&mutation.params)?;
+            (params.after_input, params.attachment_id.0)
         }
-        Some(Method::ShellLaunch) => read_whole::<ShellLaunchParams>(&mutation.params)?.after_input,
-        _ => None,
-    })
+        Some(Method::ShellLaunch) => (
+            read_whole::<ShellLaunchParams>(&mutation.params)?.after_input,
+            None,
+        ),
+        _ => (None, None),
+    };
+    if let (Some(barrier), Some(subject)) = (&barrier, subject)
+        && barrier.attachment_id != subject
+    {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidArgument,
+            kr_worker::input_domain::POSITION_NAMES_ANOTHER,
+        ));
+    }
+    Ok(barrier)
 }
 
 /// What a request is told when the typing its barrier names has not all been accepted, or can no

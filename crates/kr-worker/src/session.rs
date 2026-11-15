@@ -1087,14 +1087,15 @@ impl Session {
         Ok(Some(outcome))
     }
 
-    /// Refuses a release or a detach of `attachment_id` whose barrier names typing of the live
-    /// epoch that has not all arrived. It changes nothing, so a caller that makes it before the
-    /// request's dispatch marker refuses the request with no effect and no uncertain outcome; the
-    /// action checks again in its own hold.
+    /// Refuses a release or a detach of `attachment_id` whose barrier names another attachment, or
+    /// typing of the live epoch that has not all arrived. It changes nothing, so a caller that makes
+    /// it before the request's dispatch marker refuses the request with no effect and no uncertain
+    /// outcome; the action checks again in its own hold.
     ///
     /// # Errors
     ///
-    /// Returns [`WorkerError::PreconditionFailed`] when the position has not been reached.
+    /// Returns [`WorkerError::InvalidArgument`] when the barrier names another attachment, and
+    /// [`WorkerError::PreconditionFailed`] when the position has not been reached.
     pub fn check_position(
         &self,
         attachment_id: AttachmentId,
