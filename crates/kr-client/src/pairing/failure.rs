@@ -139,10 +139,11 @@ pub struct PairingFailure {
         serialize_with = "as_received"
     )]
     pub alternatives: Alternatives,
-    /// Seconds from now until this device asks the managed relay service again, and not less than
-    /// what remains of the delay the service named, when it named one: the wait after which a new
-    /// attempt is answered afresh. It is as large as the service made it, so an interface caps what
-    /// it says and never makes a timer from it.
+    /// The device's own wait, in seconds: from now until it asks the managed relay service again,
+    /// and not less than what remains of the delay the service named, when it named one. It is the
+    /// wait after which a new attempt is answered afresh, and is present on a failure that the
+    /// service's answer explains. At most a day, by the cache's own cap on a delay; an interface
+    /// caps what it says all the same and never makes a timer from it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_after_seconds: Option<u64>,
     /// What happened, for a log.
