@@ -1758,6 +1758,83 @@ async fn kr_req_12_06_a_rich_answer_stopped_at_its_take_is_refused_with_its_caus
     }
 }
 
+/// KR-REQ-09.09: the binding revision the answer was admitted under is compared again where its
+/// permit is taken, and there alone decides here. The admission compared it before and passed: the
+/// binding moves only after the service has admitted the answer and marked its receipt, at the
+/// pause before the broker's marker, so nothing earlier can refuse. The answer sends nothing, its
+/// receipt is `refused` (nothing was queued, so no outcome is in doubt) and the resource stays
+/// answerable. The control: with the binding where it was the same answer is carried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_09_a_binding_that_moves_after_the_admission_is_refused_at_the_permit() {
+    for moved in [false, true] {
+        let host = host().await;
+        let upstream = Arc::new(CountingUpstream::default());
+        register(&host, None);
+        let resource_id = offer_approval(&host, Arc::clone(&upstream));
+        let mut client = cli(&host).await;
+        let mutation = approval_mutation(&client, &host, 22, resource_id);
+        let action_id = mutation.action_id;
+
+        let (arrived, release) = host.service.broker().pause_before_marker();
+        let sending = tokio::spawn(async move {
+            let outcome = send(&mut client, mutation).await;
+            (outcome, client)
+        });
+        tokio::time::timeout(LIVENESS_DEADLINE, arrived)
+            .await
+            .expect("the answer reached the pause before its marker")
+            .expect("the pause is armed");
+        if moved {
+            host.service
+                .broker()
+                .advance_binding(
+                    instance(),
+                    Some(kr_protocol::ids::AgentThreadId::new("thread-2").expect("a thread")),
+                    TimestampMs::new(5),
+                )
+                .expect("the binding moves");
+        }
+        release.send(()).expect("the answer is let go");
+
+        let (outcome, mut client) = sending.await.expect("the mutation is answered");
+        if moved {
+            let Outcome::Error(error) = outcome else {
+                panic!("an answer whose binding moved after its admission applied: {outcome:?}");
+            };
+            assert_eq!(error.code, ErrorCode::StaleSession);
+            assert_eq!(
+                upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "the rich answer wrote no frame"
+            );
+            assert_eq!(
+                receipt(&mut client, action_id).await.state,
+                ReceiptState::Refused,
+                "a refusal established before any byte was queued"
+            );
+            assert_eq!(
+                host.service
+                    .broker()
+                    .pending(resource_id)
+                    .expect("retained")
+                    .state,
+                kr_protocol::gateway::PendingState::Pending,
+                "the claim was given back"
+            );
+        } else {
+            assert!(
+                matches!(outcome, Outcome::Ok(_)),
+                "the control is carried: {outcome:?}"
+            );
+            assert_eq!(
+                upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the control reached the upstream"
+            );
+        }
+    }
+}
+
 /// Section 9 and KR-REQ-11.27: an approval whose dispatch marker the receipt journal refused
 /// leaves its reservation back where it was.
 ///
