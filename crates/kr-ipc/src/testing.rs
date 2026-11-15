@@ -265,15 +265,15 @@ impl Drop for PrivateTempDir {
     /// go in a moment: a task that was aborted and has not been cancelled yet, a thread that is
     /// joining. So the removal is tried again for as long as it is refused, and for no longer than
     /// `REMOVAL_PATIENCE` (two seconds), and what is not removed at the end is said on the error
-    /// output, outside what a test's capture keeps. It does not fail the case: this directory is made
-    /// by the suites of every platform, and a case that has a holder to wait for, as a host that
-    /// waits for its daemon's lock does, fails on a tree that is left, and one that has a guard of
-    /// its own removes the tree again after this. Elsewhere an open file does not refuse a removal,
-    /// so a refusal is mostly a permission, which time does not change, and the removal is tried
-    /// once.
+    /// output, outside what a test's capture keeps, by a thread that the drop does not wait for (a
+    /// standard error that has stopped draining holds a writer for as long as it stands full, and
+    /// the case that stalls one holds nothing else). It does not fail the case: this directory is
+    /// made by the suites of every platform, and a case that has a holder to wait for, as a host
+    /// that waits for its daemon's lock does, fails on a tree that is left, and one that has a
+    /// guard of its own removes the tree again after this. Elsewhere an open file does not refuse a
+    /// removal, so a refusal is mostly a permission, which time does not change, and the removal is
+    /// tried once.
     fn drop(&mut self) {
-        use std::io::Write as _;
-
         let begun = std::time::Instant::now();
         let patience = if cfg!(windows) {
             REMOVAL_PATIENCE
@@ -284,15 +284,32 @@ impl Drop for PrivateTempDir {
             // The thread of a case is named for the case, so this names the case that left the
             // tree.
             let thread = std::thread::current();
-            let _ = writeln!(
-                std::io::stderr(),
-                "{} is not removed {:?} after its removal was first tried, by {}: {error}",
+            say_on_the_standard_error(format!(
+                "{} is not removed {:?} after its removal was first tried, by {}: {error}\n",
                 self.root.display(),
                 begun.elapsed(),
                 thread.name().unwrap_or("a thread with no name")
-            );
+            ));
         }
     }
+}
+
+/// Says `line` on the standard error from a thread of its own, and does not wait for it.
+///
+/// A write to a standard error that has stopped draining waits for a reader, and the standard
+/// library holds one lock for the whole write, so a thread that writes beside it waits too. A drop
+/// that said its line on the thread that drops would hold that thread for as long as the stream
+/// stands full, and a process whose standard error is full and read by no one, as the one a case
+/// runs to show that a worker goes on, would not end. The line is lost when the process ends
+/// before the thread has written it, or when no thread could be started for it.
+fn say_on_the_standard_error(line: String) {
+    use std::io::Write as _;
+
+    let _ = std::thread::Builder::new()
+        .name("kr-test-support-said".to_owned())
+        .spawn(move || {
+            let _ = std::io::stderr().write_all(line.as_bytes());
+        });
 }
 
 /// A task that serves a fixture and is cancelled when this is dropped.
@@ -731,6 +748,112 @@ mod tests {
             "the removal was refused once, and then tried again"
         );
         assert!(!root.exists(), "{} is left", root.display());
+    }
+
+    /// Set in the environment of the process that the case below runs again, and whose standard
+    /// error it fills.
+    #[cfg(unix)]
+    const STANDARD_ERROR_FULL: &str = "KR_TEST_SUPPORT_STANDARD_ERROR_FULL";
+
+    /// Fills this process's standard error, a pipe, to the last byte, so that the next write to it
+    /// waits for a reader.
+    #[cfg(unix)]
+    fn fill_standard_error() {
+        use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+
+        let standard_error = std::io::stderr();
+        let flags = fcntl_getfl(&standard_error).expect("the flags of the standard error");
+        fcntl_setfl(&standard_error, flags | OFlags::NONBLOCK).expect("a write that does not wait");
+        for chunk in [1024_usize, 1] {
+            let bytes = vec![b'.'; chunk];
+            loop {
+                match rustix::io::write(&standard_error, &bytes) {
+                    Ok(_) => {}
+                    Err(rustix::io::Errno::AGAIN) => break,
+                    Err(error) => panic!("filling the standard error: {error}"),
+                }
+            }
+        }
+        fcntl_setfl(&standard_error, flags).expect("a write that waits again");
+    }
+
+    /// The drop of a directory whose removal is refused says so on the standard error without
+    /// waiting for it: with the standard error full and read by no one, the drop returns and the
+    /// process ends. The removal is refused because the directory's parent does not let it go,
+    /// which time does not change.
+    ///
+    /// The case runs itself again as a process of its own, whose standard error is a pipe that the
+    /// first process holds and never reads. That process ends on its own when the drop returns, and
+    /// it is ended by its pid when it has not ended in `WATCHDOG`, which is a limit on how long a
+    /// failure takes to show and not a claim about how long the drop takes.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_removal_does_not_wait_for_a_standard_error_that_is_full() {
+        const NAME: &str = "a_refused_removal_does_not_wait_for_a_standard_error_that_is_full";
+
+        use std::io::Read as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::{Command, Stdio};
+
+        if std::env::var_os(STANDARD_ERROR_FULL).is_some() {
+            fill_standard_error();
+            let parent = PrivateTempDir::create();
+            let directory = PrivateTempDir::create_in(parent.path());
+            std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o555))
+                .expect("the parent refuses what is taken out of it");
+            drop(directory);
+            std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("the parent lets go again");
+            println!("the drop returned");
+            return;
+        }
+        if rustix::process::getuid().is_root() {
+            // A privileged user removes what a mode refuses to anyone else, so nothing is refused.
+            return;
+        }
+
+        // The name the test program knows this case by: its module path without the crate's name.
+        let name = format!(
+            "{}::{NAME}",
+            module_path!().split_once("::").expect("a module path").1
+        );
+        let mut child = Command::new(std::env::current_exe().expect("this test's program"))
+            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+            .env(STANDARD_ERROR_FULL, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("starts the process");
+        let pid = child.id();
+        let standard_error = child.stderr.take();
+        let mut standard_output = child.stdout.take().expect("its standard output");
+        let (ended, ending) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let status = child.wait();
+            let _ = ended.send(status);
+        });
+
+        let status = match ending.recv_timeout(WATCHDOG) {
+            Ok(status) => status.expect("waits for the process"),
+            Err(_) => {
+                let pid = rustix::process::Pid::from_raw(i32::try_from(pid).expect("a pid"))
+                    .expect("a pid");
+                rustix::process::kill_process(pid, rustix::process::Signal::KILL)
+                    .expect("ends the process by its pid");
+                let _ = ending.recv();
+                panic!("the process did not end in {WATCHDOG:?}: its drop waited for a reader");
+            }
+        };
+        let mut said = String::new();
+        standard_output
+            .read_to_string(&mut said)
+            .expect("reads its standard output");
+        drop(standard_error);
+        assert!(
+            status.success() && said.contains("the drop returned"),
+            "the process ended badly ({status}): {said}"
+        );
     }
 
     /// A removal that stays refused ends at its bound and leaves the directory: the drop does not
