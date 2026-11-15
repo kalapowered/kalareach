@@ -523,9 +523,12 @@ impl SendLimit {
 /// An ordered request's turn, queued behind the typing of a local lane: `turn` sends it under the
 /// bound that the lane gives it, and `refuse` tells its caller that it was never sent.
 struct Work {
-    turn: Box<dyn FnOnce(SendLimit) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>,
+    turn: Turn,
     refuse: Box<dyn FnOnce() + Send>,
 }
+
+/// What sends an ordered request, given the bound that the lane puts on its send stage.
+type Turn = Box<dyn FnOnce(SendLimit) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
 
 enum Entry {
     Frame(Queued),
