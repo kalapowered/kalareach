@@ -1,0 +1,3 @@
+# A repository setting that a build reads. The fetch step must not read it.
+[build]
+target-dir = "/home/kr-legs/work/trap-target"

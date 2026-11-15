@@ -1,0 +1,17 @@
+name = "sandbox-probe-worker"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+[[d1_databases]]
+binding = "PROBE_DB"
+database_name = "sandbox-probe-db"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+[[durable_objects.bindings]]
+name = "PROBE_COUNTER"
+class_name = "ProbeCounter"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["ProbeCounter"]

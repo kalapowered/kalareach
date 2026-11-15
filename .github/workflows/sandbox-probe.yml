@@ -72,3 +72,75 @@ jobs:
       - name: Result
         if: always() && steps.setup.outcome == 'success'
         run: bash scripts/ci/sandbox-probe/summary.sh
+
+  # Real workloads inside the units: core's builds offline after a fetch unit, and core's daemon.
+  # A cold build can pass the 30 minutes of the first job, so the job has 60.
+  workloads-build:
+    name: workloads, core builds (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out the scripts
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+
+      - name: Setup
+        id: setup
+        run: bash scripts/ci/sandbox-probe/k-setup.sh
+
+      - name: K.1, the fetch unit
+        id: fetch
+        if: always() && steps.setup.outcome == 'success'
+        run: bash scripts/ci/sandbox-probe/k-fetch.sh core
+
+      - name: K.1, the four builds
+        id: build
+        if: always() && steps.fetch.outcome == 'success'
+        run: bash scripts/ci/sandbox-probe/k-build.sh
+
+      - name: K.2, core's daemon in a legs unit
+        if: always() && steps.setup.outcome == 'success'
+        run: bash scripts/ci/sandbox-probe/k-daemon.sh
+
+      - name: Teardown
+        if: always() && steps.setup.outcome == 'success'
+        run: sudo -n systemctl stop 'sbx-*' 2>/dev/null || true
+
+      - name: Result
+        if: always() && steps.setup.outcome == 'success'
+        run: bash scripts/ci/sandbox-probe/summary.sh
+
+  # A public Worker under Wrangler on Node 22 in the service's unit, and real clients through the proxy.
+  workloads-worker:
+    name: workloads, Worker and clients (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the scripts
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+
+      - name: Setup
+        id: setup
+        run: bash scripts/ci/sandbox-probe/k-setup.sh
+
+      - name: K.1, the fetch unit (the client's crates)
+        id: fetch
+        if: always() && steps.setup.outcome == 'success'
+        run: bash scripts/ci/sandbox-probe/k-fetch.sh client
+
+      - name: K.3 and K.4, the Worker and the clients
+        if: always() && steps.fetch.outcome == 'success'
+        run: bash scripts/ci/sandbox-probe/k-worker.sh
+
+      - name: Teardown
+        if: always() && steps.setup.outcome == 'success'
+        run: sudo -n systemctl stop 'sbx-*' 2>/dev/null || true
+
+      - name: Result
+        if: always() && steps.setup.outcome == 'success'
+        run: bash scripts/ci/sandbox-probe/summary.sh
