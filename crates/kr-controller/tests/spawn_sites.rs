@@ -20,12 +20,17 @@
 //!   compiles in has this class, and a row of this class has such a start.
 //! * `joined` is held in both directions: a start that is awaited where it stands has this class,
 //!   and a row of this class whose start is not awaited where it stands carries a
-//!   `join(function on name)` marker in its note, which the case checks against the source: that
-//!   function of the same file still awaits that name.
+//!   `join(function on name)` marker in its note, which the case checks against the source: where
+//!   the function is the one that holds the start, the start's own handle (`let name = start(..)`)
+//!   is awaited under that name in the scope where it is bound, by `name.await` or as the future of
+//!   a `select!` branch (not in a branch's handler or precondition, where dropping or aborting it
+//!   waits for nothing); where it is another function, that function awaits that name.
 //! * `request`, `supervised-later`, `other_crate`, the task numbers and the notes are held by a
 //!   person's read alone. The case holds that each start has a row, not what the row says of the
-//!   start's lifetime. A start whose end the request does not bound is not `request`; where the
-//!   code does not show the bound, the row takes the supervisor's class.
+//!   start's lifetime or whether the class of a row is right: no case can know that a task outlives
+//!   its request, so the class of every `request` and `other_crate` row is a person's read of the
+//!   code to the end of the task. A start whose end the request does not bound is not `request`;
+//!   where the code does not show the bound, the row takes the supervisor's class.
 //!
 //! The linked crates `kr-worker` and `kr-describe` keep a row for each start by name, and a list
 //! of the function paths of those two crates that the rest of the daemon's code names
@@ -541,6 +546,104 @@ fn a_helper_is_seen_in_every_form_that_runs_its_parameter() {
 }
 
 #[test]
+fn a_helper_is_seen_through_each_spelling_of_its_parameters_type() {
+    // The type that a task runs is a generic of the enclosing `impl` or `trait`, a bare function
+    // type, a boxed future under its alias, a reference to a trait object, or a trait that turns
+    // into a future.
+    let mut missed = Vec::new();
+    for (source, name) in [
+        (
+            "impl<W: Fn() + Send + 'static> Pool<W> {\n\
+                 fn later(&self, work: W) { std::thread::spawn(move || work()); }\n\
+             }\n",
+            "later",
+        ),
+        (
+            "trait Starter<W: std::future::Future<Output = ()> + Send + 'static> {\n\
+                 fn begin(&self, work: W) { tokio::spawn(work); }\n\
+             }\n",
+            "begin",
+        ),
+        (
+            "fn plain(work: fn()) { std::thread::spawn(work); }\n",
+            "plain",
+        ),
+        (
+            "fn boxed(work: BoxFuture<'static, ()>) { tokio::spawn(work); }\n",
+            "boxed",
+        ),
+        (
+            "fn borrowed(work: &'static dyn Fn()) { std::thread::spawn(move || work()); }\n",
+            "borrowed",
+        ),
+        (
+            "fn turned(work: impl IntoFuture<Output = ()> + Send + 'static) {\n\
+                 tokio::spawn(async move { work.await });\n\
+             }\n",
+            "turned",
+        ),
+    ] {
+        let problems = problems_of(&daemon_with(source), &Roster::default());
+        if !problems
+            .iter()
+            .any(|p| p.contains(&format!("`{name}`")) && p.contains("no helper line"))
+        {
+            missed.push(name);
+        }
+    }
+    assert!(
+        missed.is_empty(),
+        "helpers the scan did not see: {missed:?}"
+    );
+
+    // The twins are not helpers: a generic that no bound makes a closure, and a local that a
+    // parameter made and a later `let` of the same name replaced with something else.
+    for source in [
+        "impl<W> Pool<W> {\n\
+             fn later(&self, work: W) { std::thread::spawn(move || work()); }\n\
+         }\n",
+        "fn shadowed(work: impl FnOnce() + Send + 'static) {\n\
+             let task = work;\n\
+             drop(task);\n\
+             let task = made_elsewhere();\n\
+             std::thread::spawn(task);\n\
+         }\n",
+    ] {
+        assert_eq!(
+            helpers_of(&daemon_with(source), &Roster::default()),
+            Vec::<String>::new(),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn a_method_of_a_helpers_name_is_not_a_call_of_the_helper() {
+    let source = "fn detach(work: impl FnOnce() + Send + 'static) { std::thread::spawn(work); }\n\
+                  fn serve(session: Session) { detach(|| first()); session.detach(10); }\n";
+    let roster = roster_of(
+        "helper | detach | crates/daemon/src/lib.rs | a case\n\
+         crates/daemon/src/lib.rs | detach | std::thread::spawn | work | 1 | request | - | a case\n\
+         crates/daemon/src/lib.rs | serve | detach | closure{first} | 1 | request | - | a case\n",
+    );
+    assert_eq!(
+        problems_of(&daemon_with(source), &roster),
+        Vec::<String>::new()
+    );
+
+    // The twin: where the helper takes `self`, a call by a method is a start.
+    let source = "impl Pool {\n\
+                      fn detach(&self, work: impl FnOnce() + Send + 'static) { std::thread::spawn(work); }\n\
+                      fn serve(&self) { self.detach(|| first()); }\n\
+                  }\n";
+    let found = starts_of(&daemon_with(source), &roster);
+    assert!(
+        found.contains(&".detach closure{first}".to_string()),
+        "{found:?}"
+    );
+}
+
+#[test]
 fn a_helpers_call_is_keyed_by_the_argument_at_the_parameters_place() {
     let source = "\
         fn each<S, T>(listener: &Listener, mut serve: S)\n\
@@ -704,6 +807,116 @@ fn a_join_that_is_removed_or_never_marked_fails() {
 }
 
 #[test]
+fn a_select_branch_that_only_drops_or_aborts_the_handle_is_not_a_join() {
+    let marked = joined_row("joined", "the select waits on it: join(serve on task)");
+    let serving = |branches: &str| {
+        daemon_with(&format!(
+            "async fn serve() {{\n\
+                 let task = tokio::spawn(work());\n\
+                 tokio::select! {{ {branches} }}\n\
+             }}\n"
+        ))
+    };
+
+    // The handle is the future of a branch, with or without a precondition, or a handler awaits it.
+    for branches in [
+        "done = task => done, () = stop() => {}",
+        "done = &mut task, if armed => done, () = stop() => {}",
+        "biased; () = stop() => { task.await; }",
+    ] {
+        assert_eq!(
+            problems_of(&serving(branches), &marked),
+            Vec::<String>::new(),
+            "{branches}"
+        );
+    }
+
+    // A branch whose handler only drops or aborts the handle, or names it in a precondition, does
+    // not wait on it.
+    for branches in [
+        "() = stop() => { drop(task); }",
+        "() = stop() => task.abort(),",
+        "result = tokio::signal::ctrl_c() => { drop(task); result?; }, () = other() => {}",
+        "() = stop(), if task.is_finished() => {}",
+    ] {
+        let problems = problems_of(&serving(branches), &marked);
+        assert_eq!(problems.len(), 1, "{branches}: {problems:?}");
+        assert!(
+            problems[0].contains("does not await it there"),
+            "{branches}: {problems:?}"
+        );
+    }
+}
+
+#[test]
+fn a_handle_of_the_same_name_in_another_scope_is_not_the_join() {
+    let both = roster_of(
+        "crates/daemon/src/lib.rs | serve | tokio::spawn | first | 1 | joined | - | join(serve on task)\n\
+         crates/daemon/src/lib.rs | serve | tokio::spawn | second | 1 | joined | - | join(serve on task)\n",
+    );
+    let scoped = |first: &str, second: &str| {
+        daemon_with(&format!(
+            "async fn serve() {{\n\
+                 {{ let task = tokio::spawn(first()); {first} }}\n\
+                 {{ let task = tokio::spawn(second()); {second} }}\n\
+             }}\n"
+        ))
+    };
+
+    // Each scope awaits its own handle.
+    assert_eq!(
+        problems_of(&scoped("task.await;", "task.await;"), &both),
+        Vec::<String>::new()
+    );
+    // One scope's await does not stand for the other scope's handle.
+    for (first, second, refused) in [
+        ("drop(task);", "task.await;", "first"),
+        ("task.await;", "drop(task);", "second"),
+    ] {
+        let problems = problems_of(&scoped(first, second), &both);
+        assert_eq!(problems.len(), 1, "{first} {second}: {problems:?}");
+        assert!(
+            problems[0].contains(refused),
+            "{first} {second}: {problems:?}"
+        );
+    }
+
+    // A loop's own `task` is not the handle either, and its twin awaits the handle outside the loop.
+    let one = roster_of(
+        "crates/daemon/src/lib.rs | serve | tokio::spawn | first | 1 | joined | - | join(serve on task)\n",
+    );
+    let looped = |awaited: &str| {
+        daemon_with(&format!(
+            "async fn serve() {{\n\
+                 let task = tokio::spawn(first());\n\
+                 {awaited}\n\
+                 for task in rest() {{ task.await; }}\n\
+             }}\n"
+        ))
+    };
+    assert_eq!(problems_of(&looped("task.await;"), &one).len(), 0);
+    assert_eq!(problems_of(&looped(""), &one).len(), 1);
+
+    // A name awaited after the scope that bound it has ended is not that handle.
+    let after = |inside: &str, outside: &str| {
+        daemon_with(&format!(
+            "async fn serve(task: Handle) {{\n\
+                 {{ let task = tokio::spawn(first()); {inside} }}\n\
+                 {outside}\n\
+             }}\n"
+        ))
+    };
+    assert_eq!(
+        problems_of(&after("task.await;", "task.await;"), &one).len(),
+        0
+    );
+    assert_eq!(
+        problems_of(&after("drop(task);", "task.await;"), &one).len(),
+        1
+    );
+}
+
+#[test]
 fn a_start_awaited_inside_a_macro_is_joined() {
     let tree = daemon_with(
         "async fn serve() {\n\
@@ -784,6 +997,52 @@ fn the_function_paths_of_a_watched_crate_that_the_code_names_are_listed_in_both_
     let problems = problems_with(&format!("{listed}names | watched_crate::gone\n"));
     assert_eq!(problems.len(), 1, "{problems:?}");
     assert!(problems[0].contains("no longer names"), "{problems:?}");
+}
+
+#[test]
+fn a_name_that_a_use_renames_is_read_as_the_path_it_stands_for() {
+    let tree = Memory::of(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = []\n[workspace.dependencies]\nwatched-crate = { path = \"crates/watched\" }\n",
+        ),
+        (
+            "crates/daemon/Cargo.toml",
+            "[package]\nname = \"daemon\"\n[[bin]]\nname = \"daemon\"\npath = \"src/main.rs\"\n\
+             [dependencies]\nwatched-crate = { workspace = true }\n",
+        ),
+        ("crates/daemon/src/main.rs", "fn main() {}\n"),
+        (
+            "crates/daemon/src/lib.rs",
+            "use watched_crate::engine as eng;\n\
+             use watched_crate::engine::{self as machinery, start as begin};\n\
+             fn serve() {\n\
+                 eng::go();\n\
+                 machinery::stop();\n\
+                 begin();\n\
+             }\n",
+        ),
+        (
+            "crates/watched/Cargo.toml",
+            "[package]\nname = \"watched-crate\"\n",
+        ),
+        ("crates/watched/src/lib.rs", "pub fn nothing() {}\n"),
+    ]);
+    let found = scan_watching(
+        &tree,
+        "crates/daemon",
+        &Roster::default(),
+        &["watched-crate"],
+    );
+    let named: Vec<&str> = found.named.iter().map(String::as_str).collect();
+    assert_eq!(
+        named,
+        [
+            "watched_crate::engine::go",
+            "watched_crate::engine::start",
+            "watched_crate::engine::stop"
+        ]
+    );
 }
 
 #[test]

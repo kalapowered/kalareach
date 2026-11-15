@@ -14,7 +14,11 @@
 //!
 //! A row of class `joined` whose start is not awaited where it stands carries a marker in its note,
 //! `join(function on name)`: the function of the same file that awaits the handle, and the name the
-//! handle has there. The comparison checks that the source still awaits that name in that function.
+//! handle has there. The comparison checks that the source still awaits it. Where the marker's
+//! function is the one that holds the start, the start's own handle (`let name = start(..)`) must be
+//! the name that is awaited, in the scope where that name is bound, so that a second handle of the
+//! same name in another scope does not stand for it. Where the function is another one, which the
+//! handle is handed to, it checks that the source awaits that name in that function.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -223,10 +227,11 @@ pub fn line_of(key: &Key, count: usize) -> String {
 }
 
 /// What the starts that share one key have in common.
-struct Found {
+struct Found<'a> {
     count: usize,
     all_at_once: bool,
     all_unshipped: bool,
+    starts: Vec<&'a Start>,
 }
 
 /// Everything that makes the roster and a scan disagree, one sentence each. Empty when they agree.
@@ -239,10 +244,12 @@ pub fn disagreements(roster: &Roster, scan: &Scan) -> Vec<String> {
             count: 0,
             all_at_once: true,
             all_unshipped: true,
+            starts: Vec::new(),
         });
         entry.count += 1;
         entry.all_at_once &= start.at_once;
         entry.all_unshipped &= start.unshipped;
+        entry.starts.push(start);
     }
     let listed: BTreeMap<Key, &Row> = roster.rows.iter().map(|row| (row.key(), row)).collect();
 
@@ -285,8 +292,17 @@ pub fn disagreements(roster: &Roster, scan: &Scan) -> Vec<String> {
                     "a row of class joined whose start is not awaited where it stands names where it is joined: add `join(<function> on <name>)` to its note: {describe}"
                 )),
                 Some((function, name)) => {
-                    let awaited = (key.0.clone(), function.clone(), name.clone());
-                    if !scan.awaits.contains(&awaited) {
+                    // Each start that is not awaited where it stands is joined as the marker says.
+                    let joined = start.starts.iter().filter(|each| !each.at_once).all(|each| {
+                        if each.function == *function {
+                            each.handle.as_deref() == Some(name.as_str())
+                                && scan.joined.contains(&each.id)
+                        } else {
+                            scan.awaits
+                                .contains(&(key.0.clone(), function.clone(), name.clone()))
+                        }
+                    });
+                    if !joined {
                         problems.push(format!(
                             "the row says the handle is awaited as `{name}` in {function}, and the source does not await it there: {describe}"
                         ));

@@ -22,9 +22,14 @@
 //! same function changes the key. A start is awaited where it stands when its call is followed by
 //! `.await`, in code or in a macro's tokens.
 //!
-//! The scan also keeps two lists for the roster's checks. The first is what is awaited and where:
-//! `name.await`, and every name inside a `select!` or a `join!`, by file and function, which is
-//! what a `joined` row's marker is checked against. The second is the function paths of watched
+//! The scan also keeps lists for the roster's checks. The first is what is awaited and where:
+//! `name.await`, a name in the future of a `select!` branch (the text between the pattern's `=` and
+//! the `=>`; a name that a handler or a precondition only drops, aborts or tests is not awaited),
+//! and every name inside a `join!`, by file and function. For a start whose handle a `let` holds
+//! (`let task = tokio::spawn(..)`) it also records that the name is awaited in the scope where it
+//! is bound, so that a second handle of the same name in another scope does not stand for it; a
+//! `joined` row's marker is checked against these. A method call by the name of a helper that no
+//! function of that name taking `self` defines is not a call of the helper. The last is the function paths of watched
 //! crates that code outside them names: a path in an expression whose last segment is in lower
 //! case, with a name that a `use` brought in read as the path it stands for, and each glob import
 //! as the glob. A call through another function, and a method called on a value of one of those
@@ -37,7 +42,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
-use proc_macro2::{Delimiter, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, Spacing, TokenStream, TokenTree};
 use quote::ToTokens as _;
 use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
@@ -117,6 +122,13 @@ pub struct Start {
     /// The roster helper (its name and scope) that the start is a call of, until the callee is
     /// read from the argument at the helper's position.
     helper: Option<(String, String)>,
+    /// A number that is the start's own, so that what is awaited can name the start whose handle
+    /// it waits on.
+    pub id: usize,
+    /// The name of the local that holds the start's handle: `let task = tokio::spawn(..)`.
+    pub handle: Option<String>,
+    /// The call that is the start, by its address in the tree being read.
+    call: Option<usize>,
 }
 
 impl Start {
@@ -157,8 +169,12 @@ pub struct Scan {
     /// The files read.
     pub files: BTreeSet<String>,
     /// What is awaited where the handle of a start may be joined: a file, the function, and the
-    /// name of the handle (`name.await`, or a name inside a `select!` or `join!`).
+    /// name of the handle (`name.await`, a name in the future of a `select!` branch, or a name
+    /// inside a `join!`).
     pub awaits: BTreeSet<(String, String, String)>,
+    /// The starts whose handle is awaited under the name that holds it, in the scope of that name
+    /// (`Start::id`).
+    pub joined: BTreeSet<usize>,
     /// The function paths of the watched crates that code outside them names: a path in an
     /// expression whose last segment is in lower case, with a name that a `use` brought in read as
     /// the path it stands for, and each glob import.
@@ -359,6 +375,9 @@ pub fn scan(
         aliases: BTreeMap::new(),
         frames: Vec::new(),
         generics: Vec::new(),
+        bindings: Vec::new(),
+        call: None,
+        next_start: 0,
         scan: Scan::default(),
         error: None,
     };
@@ -370,18 +389,32 @@ pub fn scan(
         return Err(error);
     }
     let mut scan = walker.scan;
-    // A helper's caller hands its work over at the place of the helper's parameter.
+    // A helper's caller hands its work over at the place of the helper's parameter. A call by a
+    // method's form (`.name(..)`) is a call of a helper that takes `self`; where every function of
+    // that name under the scope takes none, it is a call of another function, a method of the same
+    // name, and is not a start.
+    let mut not_calls = BTreeSet::new();
     for start in &mut scan.starts {
         let Some((name, scope)) = start.helper.take() else {
             continue;
         };
-        let shape = scan
+        let method_call = start.form.starts_with('.');
+        let named: Vec<&HelperShape> = scan
             .helper_shapes
             .iter()
-            .find(|shape| shape.name == name && shape.file.starts_with(&scope));
+            .filter(|shape| shape.name == name && shape.file.starts_with(&scope))
+            .collect();
+        let shape = named
+            .iter()
+            .find(|shape| shape.receiver || !method_call)
+            .copied();
+        if shape.is_none() && !named.is_empty() {
+            not_calls.insert(start.id);
+            continue;
+        }
         start.callee = shape
             .and_then(|shape| {
-                let through_a_path = shape.receiver && !start.form.starts_with('.');
+                let through_a_path = shape.receiver && !method_call;
                 start
                     .arguments
                     .get(shape.position + usize::from(through_a_path))
@@ -389,6 +422,7 @@ pub fn scan(
             .cloned()
             .unwrap_or_else(|| "-".to_string());
     }
+    scan.starts.retain(|start| !not_calls.contains(&start.id));
     Ok(scan)
 }
 
@@ -417,8 +451,21 @@ struct Walker<'a> {
     frames: Vec<Frame>,
     /// The generics of the enclosing `impl` and `trait` items.
     generics: Vec<syn::Generics>,
+    /// The names in scope in the function being read, the innermost last, each with the start whose
+    /// handle it holds, if it holds one.
+    bindings: Vec<Binding>,
+    /// The call whose start is being recorded.
+    call: Option<usize>,
+    /// The number the next start takes.
+    next_start: usize,
     scan: Scan,
     error: Option<String>,
+}
+
+/// A name in scope and the start whose handle it holds.
+struct Binding {
+    name: String,
+    handle: Option<usize>,
 }
 
 impl Walker<'_> {
@@ -471,6 +518,8 @@ impl Walker<'_> {
 
     fn push_start(&mut self, start: NewStart) {
         let parameter = self.parameter_used(&start.work);
+        let id = self.next_start;
+        self.next_start += 1;
         self.scan.starts.push(Start {
             file: slashed(&self.file),
             function: self.scope.join("::"),
@@ -481,6 +530,9 @@ impl Walker<'_> {
             arguments: start.arguments,
             parameter,
             helper: start.helper,
+            id,
+            handle: None,
+            call: self.call,
         });
     }
 
@@ -654,11 +706,65 @@ impl Walker<'_> {
         }
     }
 
-    /// Records a name as awaited in the function being read.
+    /// Records a name as awaited in the function being read, and the start whose handle that name
+    /// holds in the scope where the name is awaited.
     fn awaits(&mut self, name: &str) {
         self.scan
             .awaits
             .insert((slashed(&self.file), self.scope.join("::"), name.to_string()));
+        if let Some(handle) = self
+            .bindings
+            .iter()
+            .rev()
+            .find(|binding| binding.name == name)
+            .and_then(|binding| binding.handle)
+        {
+            self.scan.joined.insert(handle);
+        }
+    }
+
+    /// Reads the tokens of a `select!`. What it waits on is the future of each branch, between the
+    /// pattern's `=` and the `=>` (and before the `, if` of a precondition); the handler after the
+    /// `=>` runs when the branch is taken and waits on nothing by being named there, so a name that
+    /// a handler only drops or aborts is not awaited. A branch that does not have this shape
+    /// awaits nothing, which the roster shows as a join that the source does not make.
+    fn scan_select(&mut self, stream: TokenStream) {
+        let trees: Vec<TokenTree> = stream.into_iter().collect();
+        let mut at = 0;
+        while at < trees.len() {
+            let Some(arrow) = (at..trees.len()).find(|&index| is_arrow(&trees, index)) else {
+                self.scan_trees(&trees[at..], false);
+                return;
+            };
+            let head = &trees[at..arrow];
+            let after = arrow + 2;
+            let handler_end = match trees.get(after) {
+                Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Brace => after + 1,
+                _ => (after..trees.len())
+                    .find(|&index| is_punct(trees.get(index), ','))
+                    .unwrap_or(trees.len()),
+            };
+            let equals = (0..head.len()).find(|&index| lone_equals(head, index));
+            match equals {
+                Some(equals) => {
+                    let precondition = (equals + 1..head.len()).find(|&index| {
+                        is_punct(head.get(index), ',')
+                            && matches!(head.get(index + 1), Some(TokenTree::Ident(word)) if word == "if")
+                    });
+                    let future_end = precondition.unwrap_or(head.len());
+                    self.scan_trees(&head[..=equals], false);
+                    self.scan_trees(&head[equals + 1..future_end], true);
+                    self.scan_trees(&head[future_end..], false);
+                }
+                None => self.scan_trees(head, false),
+            }
+            self.scan_trees(&trees[after..handler_end.min(trees.len())], false);
+            at = handler_end + usize::from(is_punct(trees.get(handler_end), ','));
+        }
+    }
+
+    fn scan_trees(&mut self, trees: &[TokenTree], joins: bool) {
+        self.scan_tokens(trees.iter().cloned().collect(), joins);
     }
 
     /// A path written in macro tokens (`name`, `name::next`) that starts at `index`: listed when it
@@ -718,7 +824,9 @@ impl Walker<'_> {
         let function = self.scope.join("::");
         let before = self.scan.starts.len();
         self.frames.push(self.frame_of(signature));
+        let outer = std::mem::take(&mut self.bindings);
         walk(self);
+        self.bindings = outer;
         self.frames.pop();
         self.scope.pop();
         // A function that starts a task and does not await it, running one of its parameters of a
@@ -1040,6 +1148,27 @@ fn call_group(trees: &[TokenTree], mut index: usize) -> Option<(usize, &proc_mac
 
 fn is_punct(tree: Option<&TokenTree>, mark: char) -> bool {
     matches!(tree, Some(TokenTree::Punct(punct)) if punct.as_char() == mark)
+}
+
+/// Whether the tokens have a `=>` at this place.
+fn is_arrow(trees: &[TokenTree], index: usize) -> bool {
+    matches!(trees.get(index), Some(TokenTree::Punct(punct))
+        if punct.as_char() == '=' && punct.spacing() == Spacing::Joint)
+        && is_punct(trees.get(index + 1), '>')
+}
+
+/// Whether the tokens have an `=` of its own at this place: not the end of `==`, `!=`, `<=` or
+/// `>=`, and not the start of `=>` or `==`.
+fn lone_equals(trees: &[TokenTree], index: usize) -> bool {
+    let is_equals = is_punct(trees.get(index), '=');
+    let starts_longer = matches!(trees.get(index), Some(TokenTree::Punct(punct))
+        if punct.spacing() == Spacing::Joint)
+        && (is_punct(trees.get(index + 1), '>') || is_punct(trees.get(index + 1), '='));
+    let ends_longer = index.checked_sub(1).is_some_and(|before| {
+        matches!(trees.get(before), Some(TokenTree::Punct(punct))
+            if punct.spacing() == Spacing::Joint)
+    });
+    is_equals && !starts_longer && !ends_longer
 }
 
 /// The start function as it is written before its call: `.name` for a method, the path for a
@@ -1454,7 +1583,37 @@ impl<'ast> Visit<'ast> for Walker<'_> {
         if test_only(&local.attrs) {
             return;
         }
-        visit::visit_local(self, local);
+        // What a `let` starts is read before the pattern binds its names.
+        let before = self.scan.starts.len();
+        if let Some(init) = &local.init {
+            self.visit_expr(&init.expr);
+            if let Some((_, diverge)) = &init.diverge {
+                self.visit_expr(diverge);
+            }
+        }
+        let mark = self.bindings.len();
+        self.visit_pat(&local.pat);
+        // `let task = tokio::spawn(..)` binds the handle of that start to `task`, for as long as
+        // the name is in scope.
+        if let (syn::Pat::Ident(ident), Some(init)) = (&local.pat, &local.init)
+            && ident.subpat.is_none()
+            && self.bindings.len() == mark + 1
+        {
+            let call = match &*init.expr {
+                Expr::Call(call) => Some(std::ptr::from_ref(call) as usize),
+                Expr::MethodCall(call) => Some(std::ptr::from_ref(call) as usize),
+                _ => None,
+            };
+            if let Some(start) = self.scan.starts[before..]
+                .iter_mut()
+                .find(|start| start.call == call && call.is_some() && !start.at_once)
+            {
+                start.handle = Some(ident.ident.to_string());
+                if let Some(binding) = self.bindings.last_mut() {
+                    binding.handle = Some(start.id);
+                }
+            }
+        }
         // A local made from a parameter that a task can run stands for it from here on.
         let Some(init) = &local.init else {
             return;
@@ -1500,7 +1659,9 @@ impl<'ast> Visit<'ast> for Walker<'_> {
         if test_only(&arm.attrs) {
             return;
         }
+        let mark = self.bindings.len();
         visit::visit_arm(self, arm);
+        self.bindings.truncate(mark);
     }
 
     fn visit_expr(&mut self, expression: &'ast Expr) {
@@ -1586,14 +1747,19 @@ impl<'ast> Visit<'ast> for Walker<'_> {
     }
 
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-        // What a `select!` or a `join!` waits on is awaited, though no `.await` is written.
-        let joins = mac.path.segments.last().is_some_and(|segment| {
-            matches!(
-                segment.ident.to_string().as_str(),
-                "select" | "select_biased" | "join" | "try_join"
-            )
-        });
-        self.scan_tokens(mac.tokens.clone(), joins);
+        // What a `select!` waits on (the future of each branch) or a `join!` is awaited, though no
+        // `.await` is written.
+        let name = mac
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string())
+            .unwrap_or_default();
+        match name.as_str() {
+            "select" | "select_biased" => self.scan_select(mac.tokens.clone()),
+            "join" | "try_join" => self.scan_tokens(mac.tokens.clone(), true),
+            _ => self.scan_tokens(mac.tokens.clone(), false),
+        }
     }
 
     fn visit_expr_await(&mut self, awaited: &'ast syn::ExprAwait) {
@@ -1623,12 +1789,14 @@ impl<'ast> Visit<'ast> for Walker<'_> {
             && let Some(last) = path.path.segments.last()
         {
             let name = last.ident.to_string();
+            self.call = Some(std::ptr::from_ref(call) as usize);
             self.start_in_call(
                 &name,
                 path_text(&path.path),
                 call.args.iter().collect(),
                 at_once,
             );
+            self.call = None;
         }
         visit::visit_expr_call(self, call);
     }
@@ -1636,12 +1804,52 @@ impl<'ast> Visit<'ast> for Walker<'_> {
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         let at_once = self.awaited.remove(&(std::ptr::from_ref(call) as usize));
         let name = call.method.to_string();
+        self.call = Some(std::ptr::from_ref(call) as usize);
         self.start_in_call(
             &name,
             format!(".{name}"),
             call.args.iter().collect(),
             at_once,
         );
+        self.call = None;
         visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_block(&mut self, block: &'ast syn::Block) {
+        let mark = self.bindings.len();
+        visit::visit_block(self, block);
+        self.bindings.truncate(mark);
+    }
+
+    fn visit_expr_closure(&mut self, closure: &'ast syn::ExprClosure) {
+        let mark = self.bindings.len();
+        visit::visit_expr_closure(self, closure);
+        self.bindings.truncate(mark);
+    }
+
+    fn visit_expr_for_loop(&mut self, expression: &'ast syn::ExprForLoop) {
+        let mark = self.bindings.len();
+        visit::visit_expr_for_loop(self, expression);
+        self.bindings.truncate(mark);
+    }
+
+    fn visit_expr_while(&mut self, expression: &'ast syn::ExprWhile) {
+        let mark = self.bindings.len();
+        visit::visit_expr_while(self, expression);
+        self.bindings.truncate(mark);
+    }
+
+    fn visit_expr_if(&mut self, expression: &'ast syn::ExprIf) {
+        let mark = self.bindings.len();
+        visit::visit_expr_if(self, expression);
+        self.bindings.truncate(mark);
+    }
+
+    fn visit_pat_ident(&mut self, ident: &'ast syn::PatIdent) {
+        self.bindings.push(Binding {
+            name: ident.ident.to_string(),
+            handle: None,
+        });
+        visit::visit_pat_ident(self, ident);
     }
 }

@@ -402,7 +402,6 @@ crates/kr-worker/src/service.rs | WorkerService::state_fence | .spawn | async{wr
 crates/kr-worker/src/service.rs | WorkerService::watch_late | tokio::spawn | async{off_the_executor} | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/service.rs | submit_within | tokio::task::spawn_blocking | closure{.submit} | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/service/overtake.rs | Overtaking::open | tokio::spawn | run | 1 | other_crate | - | worker program: linked; the worker runs it
-crates/kr-worker/src/session.rs | Session::detach | .detached | attachment_id | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/testing.rs | keep_one_shell_running | std::thread::spawn | closure{.read_line} | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/windows/conpty.rs | Slave::start | handle::spawn | expr | 1 | other_crate | - | worker program: linked; the worker runs it
 
