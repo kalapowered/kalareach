@@ -43,6 +43,10 @@ struct Heard {
     /// announcement it is sent from now on, in the order they arrive. It answers at once when none
     /// is left.
     delays: std::sync::Mutex<std::collections::VecDeque<Duration>>,
+    /// What an answering worker ([`answering`]) waits for before it answers each announcement it is
+    /// sent from now on, in the order they arrive: the gate opens, or its end is dropped, and the
+    /// worker goes on to its pause. It goes straight to the pause when none is left.
+    gates: std::sync::Mutex<std::collections::VecDeque<tokio::sync::oneshot::Receiver<()>>>,
 }
 
 impl Heard {
@@ -154,12 +158,20 @@ fn answering(
                         let Some(revision) = announced else {
                             continue;
                         };
+                        let gate = heard
+                            .gates
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .pop_front();
                         let pause = heard
                             .delays
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .pop_front()
                             .unwrap_or_default();
+                        if let Some(gate) = gate {
+                            let _ = gate.await;
+                        }
                         tokio::time::sleep(pause).await;
                         let ack = ControlFrame::AuthorityRevisionAck(
                             kr_protocol::worker::AuthorityRevisionAck {
@@ -1672,9 +1684,10 @@ async fn after_barriers_that_need_several_notices(silent: &Silent) {
 }
 
 /// One ask of fifteen seconds, whose first notice begins after another operation has held the
-/// registry for six, is answered after one second, and whose second would be recorded in the
-/// registry only when that operation lets the registry go `release_at` after the ask began. The
-/// worker would answer a second notice four seconds after it was sent. Returns what the ask said.
+/// registry for six. The worker answers that notice only once the case holds the registry again,
+/// so the ask can record the answer, and send a second notice, only when the case lets the registry
+/// go `release_at` after the ask began. The worker would answer a second notice four seconds after
+/// it was sent. Returns what the ask said.
 async fn a_telling_that_waits_for_the_registry_between_its_notices(
     silent: &Silent,
     heard: &Heard,
@@ -1687,9 +1700,15 @@ async fn a_telling_that_waits_for_the_registry_between_its_notices(
             .delays
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        delays.push_back(Duration::from_secs(1));
+        delays.push_back(Duration::ZERO);
         delays.extend(std::iter::repeat_n(Duration::from_secs(4), 8));
     }
+    let (open, gate) = tokio::sync::oneshot::channel();
+    heard
+        .gates
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push_back(gate);
     let began = tokio::time::Instant::now();
     let deadline = began + Duration::from_secs(15);
     let first = controller.registry.lock().await;
@@ -1706,6 +1725,9 @@ async fn a_telling_that_waits_for_the_registry_between_its_notices(
             })
             .await;
             let held = controller.registry.lock().await;
+            // The answer is given only now, so that the ask meets the held registry however late
+            // this task came to it.
+            let _ = open.send(());
             tokio::time::sleep_until(began + release_at).await;
             drop(held);
         },
@@ -1740,9 +1762,10 @@ async fn the_second_notice_was_not_sent(silent: &Silent, heard: &Heard, asked: A
 /// KR-REQ-09.12: the notices of one telling after the first begin only with an exchange's time left
 /// before the ask's deadline, also after a wait for the registry between them.
 ///
-/// The first notice is answered at seven seconds of the ask's fifteen, and the registry is held
-/// until twelve, so the second would begin with three seconds left, inside the five an exchange
-/// takes, and the worker would answer it four seconds later. A deadline that cut it would drop the
+/// The first notice is answered once the case holds the registry, a little after six seconds of the
+/// ask's fifteen, and the ask can record the answer only when the registry is let go at twelve, so
+/// the second would begin with three seconds left, inside the five an exchange takes, and the
+/// worker would answer it four seconds later. A deadline that cut it would drop the
 /// link with the notice on the wire and stop the worker's renewal. So nothing more is sent, and the
 /// link goes back whole.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
