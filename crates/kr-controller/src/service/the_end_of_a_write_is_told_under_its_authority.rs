@@ -856,11 +856,11 @@ async fn a_barrier_of_the_debt_pass_before_the_requests_own_proves_nothing() {
     not_shown(&told);
 }
 
-/// KR-REQ-09.09, 09.12: a fence owed by a restriction that published its debt while the proof was
-/// waiting for the registry is seen, and the result is not shown: the revision and the fence are
-/// read under the registry's lock.
+/// KR-REQ-09.09, 09.12: a fence owed by a restriction that published its debt after the proof was
+/// made and before the telling asks is seen, and the result is not shown: the revision and the
+/// fence are read from memory, so the telling does not wait for the registry that is held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_debt_published_while_the_proof_waits_for_the_registry_stops_the_result() {
+async fn a_debt_published_before_the_proof_is_asked_stops_the_result_without_the_registry() {
     let (_temp, controller, _clock) = daemon().await;
     let (connection_id, _) = admitted(&controller).await;
     let (_barrier, proof) = controller
@@ -872,21 +872,15 @@ async fn a_debt_published_while_the_proof_waits_for_the_registry_stops_the_resul
         .expect("the barrier");
     assert!(proof.is_some(), "its own debt, alone, is the proof");
     let registry = controller.registry.lock().await;
-    let mut telling = std::pin::pin!(told_as(
-        &controller,
-        connection_id,
-        a_result_carrying(proof)
-    ));
-    // One poll takes the telling to the first thing it cannot get past, the registry's lock, so
-    // whatever it checked before that was checked before the fence below is owed.
-    let first = std::future::poll_fn(|cx| {
-        std::task::Poll::Ready(std::future::Future::poll(telling.as_mut(), cx))
-    })
-    .await;
-    assert!(first.is_pending(), "the telling waits for the registry");
     // Another request's restriction publishes its debt while the registry is held, as one does.
     controller.hold_fence(true);
+    let told = tokio::time::timeout(
+        Duration::from_secs(30),
+        told_as(&controller, connection_id, a_result_carrying(proof)),
+    )
+    .await
+    .expect("the telling does not wait for the registry");
+    not_shown(&told);
     drop(registry);
-    not_shown(&telling.await);
     controller.hold_fence(false);
 }
