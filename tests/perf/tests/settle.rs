@@ -101,6 +101,9 @@ fn performance(readings: &[&str], bound: Option<&str>) -> Run {
         )
         .env("TMPDIR", &temporary)
         .env("KR_STAND_IN_STATE", &state)
+        // The script's temporary folder is this case's own: a folder that its caller named for the
+        // evidence is outside it, so it is not handed on.
+        .env_remove("KR_TEST_ARTIFACTS_DIR")
         .env_remove("KR_PERF_SETTLE_LOAD");
     if let Some(bound) = bound {
         command.env("KR_PERF_SETTLE_LOAD", bound);
