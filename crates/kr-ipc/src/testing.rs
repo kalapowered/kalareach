@@ -900,6 +900,26 @@ mod tests {
         }));
     }
 
+    /// How long the thread of [`hold_the_standard_error`] holds the lock: long enough that a drop
+    /// that does not wait for its line returns, and the process ends, before the lock is free.
+    #[cfg(unix)]
+    const STANDARD_ERROR_HELD: Duration = Duration::from_millis(300);
+
+    /// Starts a thread that takes the standard error's lock, holds it for `STANDARD_ERROR_HELD` and
+    /// lets go, and returns once the thread has it. No line can be written to the standard error
+    /// by anyone else in between.
+    #[cfg(unix)]
+    fn hold_the_standard_error() {
+        let (holding, held) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let lock = std::io::stderr().lock();
+            let _ = holding.send(());
+            std::thread::sleep(STANDARD_ERROR_HELD);
+            drop(lock);
+        });
+        held.recv().expect("the thread holds the standard error");
+    }
+
     /// What a process that a case runs again left: how it ended and what it wrote.
     #[cfg(unix)]
     struct Ended {
@@ -965,10 +985,10 @@ mod tests {
         }
     }
 
-    /// The drop of a directory whose removal is refused says so on the standard error without
-    /// waiting for a reader: with the standard error full and read by no one, the drop returns and
-    /// the process ends. The removal is refused because the directory's parent does not let it go,
-    /// which time does not change.
+    /// The drop of a directory whose removal is refused does not wait for a reader of the standard
+    /// error: with the standard error full and read by no one, its line cannot be written, and the
+    /// drop returns when `LINE_WAIT` is up and the process ends. The removal is refused because the
+    /// directory's parent does not let it go, which time does not change.
     ///
     /// The case runs itself again as a process of its own, whose standard error is a pipe that the
     /// first process holds and does not read until that process has ended. A process that has not
@@ -1006,13 +1026,16 @@ mod tests {
         );
     }
 
-    /// A process whose last act is the drop of a directory that is refused still says so on its
-    /// standard error, when that takes the line: the drop waits for the line to be written.
+    /// A process that ends right after the drop of a directory that is refused, and a print of how
+    /// long the drop took, still says so on its standard error: the drop waits for its line to be
+    /// written.
     ///
-    /// The case runs itself again as a process of its own, which ends as the drop returns, and
-    /// reads its standard error. The process says on its standard output how long the drop took,
-    /// which a failure shows, so that a writer that ran late reads differently from a wait that
-    /// was not made.
+    /// The case runs itself again as a process of its own and reads its standard error. In that
+    /// process one more thread takes the standard error's lock before the drop, says that it has
+    /// it, holds it for `STANDARD_ERROR_HELD` and lets go. A drop that waits has its line written
+    /// once the lock is free. A drop that does not wait returns while the lock is held, and the
+    /// process ends before the line is written, whatever the machine's load. The process says on
+    /// its standard output how long the drop took, which a failure shows.
     #[cfg(unix)]
     #[test]
     fn a_process_that_ends_after_a_refused_removal_has_said_so() {
@@ -1020,6 +1043,7 @@ mod tests {
 
         if let Some(directory) = std::env::var_os(REFUSED_DIRECTORY) {
             report_panics_on_the_standard_output();
+            hold_the_standard_error();
             let begun = std::time::Instant::now();
             drop(PrivateTempDir {
                 root: directory.into(),
