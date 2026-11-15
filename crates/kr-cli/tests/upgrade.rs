@@ -37,8 +37,14 @@ mod releases;
 // the control daemon's own network suites make.
 #[path = "upgrade/door.rs"]
 mod door;
+// The one request that a device's connection sends by itself: the client library has no call for it.
+#[path = "upgrade/raw_input.rs"]
+mod raw_input;
+// A device's typing, sent through the client library's input lane as the control daemon's suites send it.
 #[path = "../../kr-controller/tests/net_support/pairing.rs"]
 mod pairing;
+#[path = "../../kr-controller/tests/net_support/typing.rs"]
+mod typing;
 // An organisation's keys, which sign the chain a host enrols from and the policy it applies.
 #[path = "../../kr-controller/tests/organisation_support/mod.rs"]
 mod organisation_support;
@@ -2198,7 +2204,9 @@ async fn a_mutation_of_a_paired_device_is_performed_by_the_worker_of_the_release
 /// KR-REQ-26.06, KR-REQ-08.53, KR-REQ-20.23: a device paired with the updated host types into the
 /// session of the release before through the new daemon. That worker reads the same input as this
 /// build's, so the daemon gives it a bytes write as it is and a write of console key records as it
-/// is, and the session's shell runs the line of each, in the order the writes were numbered.
+/// is, and the session's shell runs the line of each, in the order the writes were numbered. The
+/// bytes go through the device's input lane and the key records, which that lane does not carry,
+/// as the raw request a device of an earlier release sends.
 ///
 /// Each line the shell runs makes a file named by an arithmetic expansion the typed text does not
 /// contain, so a file shows that the line was run and not that it was typed. The files are waited
@@ -2208,11 +2216,12 @@ async fn a_paired_device_types_bytes_and_key_records_into_the_session_of_the_rel
     use kr_protocol::attachment::{
         AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
     };
+    use kr_protocol::envelope::Outcome;
     use kr_protocol::ids::{InputLeaseEpoch, InputSequence};
     use kr_protocol::input::{
         ConsoleKey, InputAcquireParams, InputAcquireResult, InputContent, InputWriteParams,
     };
-    use kr_protocol::scalars::{Bytes, CanonicalSet, DurationMs};
+    use kr_protocol::scalars::{CanonicalSet, DurationMs};
     use kr_protocol::session::Dimensions;
 
     let updated = Updated::on_the_network().await;
@@ -2285,26 +2294,33 @@ async fn a_paired_device_types_bytes_and_key_records_into_the_session_of_the_rel
         .expect("the device takes the input lease")
         .to_typed()
         .expect("a lease");
-    let write = |sequence: u64, input: InputContent| InputWriteParams {
-        session_id,
-        attachment_id,
-        epoch: lease.lease.epoch,
-        sequence: InputSequence::new(sequence),
-        input,
-    };
     let marks = host.scratch("typed");
     // A line that makes the file `<name>-42`, named by an expansion the shell has to run.
-    let typed = |name: &str| InputContent::Bytes {
-        bytes: Bytes::new(format!(": > '{}'/{name}-$((6*7))\n", marks.display()).into_bytes()),
-    };
+    let typed = |name: &str| format!(": > '{}'/{name}-$((6*7))\n", marks.display());
+    let mut input = typing::Typing::open(
+        &owner.session,
+        host.tree.environment_id(),
+        session_id,
+        attachment_id,
+    )
+    .await
+    .expect("the device's input lane opens");
 
-    owner
-        .session
-        .write_input(&write(0, typed("kept")))
+    input
+        .type_bytes(lease.lease.epoch, typed("kept").as_bytes())
         .await
         .expect("the worker of the release before takes the bytes of a paired device");
 
-    // Key records spelling a line the shell has to run: the characters, then the Enter key.
+    input
+        .type_bytes(lease.lease.epoch, typed("after").as_bytes())
+        .await
+        .expect("the write after the first takes the next sequence number");
+
+    // Key records spelling a line the shell has to run: the characters, then the Enter key. The
+    // lane's frames carry bytes only and the client library has no call for key records, so this
+    // request reaches the host as the raw frame a device of an earlier release sends, on the
+    // device's own connection. It names the sequence that the stream of this epoch takes next, and
+    // the worker of the release before, which reads the same input as this build's, takes it.
     let key = |virtual_key: u16, unicode: u16| ConsoleKey {
         virtual_key,
         scan_code: 0,
@@ -2323,16 +2339,22 @@ async fn a_paired_device_types_bytes_and_key_records_into_the_session_of_the_rel
         })
         .collect();
     keys.push(key(0x0d, 0x0d));
-    owner
-        .session
-        .write_input(&write(1, InputContent::ConsoleKeys { keys }))
+    let answered = owner
+        .raw
+        .input_write(&InputWriteParams {
+            session_id,
+            attachment_id,
+            epoch: lease.lease.epoch,
+            sequence: InputSequence::new(2),
+            input: InputContent::ConsoleKeys { keys },
+        })
         .await
-        .expect("the worker of the release before takes the key records of a paired device");
-    owner
-        .session
-        .write_input(&write(2, typed("after")))
-        .await
-        .expect("the write after the key records takes the next sequence number");
+        .expect("the host answers the key records");
+    if let Outcome::Error(refused) = &answered.outcome {
+        panic!(
+            "the worker of the release before takes the key records of a paired device: {refused}"
+        );
+    }
 
     // The shell ran the lines it was given, in order.
     for name in ["kept-42", "keys-42", "after-42"] {
