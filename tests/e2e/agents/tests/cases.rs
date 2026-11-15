@@ -4987,6 +4987,20 @@ impl Watch {
             .unwrap_or_else(|why| panic!("{why}"));
     }
 
+    /// Applies what arrives for `within`, and follows a resynchronisation as [`Watch::wait_for`]
+    /// does: a view that the worker told to resynchronise has stopped, so the watch opens a fresh
+    /// one and goes on with it. A stopped view then cannot hide what the screen shows.
+    fn watch_for(&mut self, stage: &Stage<'_, '_>, session: &Session, within: Duration) {
+        let until = std::time::Instant::now() + within;
+        while std::time::Instant::now() < until {
+            self.pump(stage, Duration::from_millis(200));
+            if self.view.kinds().iter().any(|kind| kind == RESYNC) {
+                let stale = std::mem::replace(self, Self::open(stage, session));
+                stale.close(stage);
+            }
+        }
+    }
+
     /// Waits until the screen shows one of `needles`, and returns which and the screen, as
     /// [`Watch::wait_for`] does for one.
     fn wait_for_any(
@@ -5131,7 +5145,9 @@ const WHOLE_PATH_WATCH: Duration = Duration::from_secs(5);
 
 /// Whether `rows` show `text` whole: on one row, or across consecutive rows where the agent's
 /// composer wrapped it. The blanks and the box-drawing characters at the ends of each row are the
-/// composer's own and are left out.
+/// composer's own and are left out. Any other text that a composer puts at the end of a row that
+/// holds part of the path (a hint, a marker) breaks the join and fails the case with correct code:
+/// the rule has not been tried against a real composer.
 fn shows_whole(rows: &[String], text: &str) -> bool {
     const WRAPPED_ROWS: usize = 4;
     let bare: Vec<&str> = rows
@@ -6407,10 +6423,7 @@ fn forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged
             .unwrap_or_else(|why| {
                 panic!("a view-only device's lane does not open, and the host ends it: {why}")
             });
-        let watched_until = std::time::Instant::now() + VIEW_ONLY_WATCH;
-        while std::time::Instant::now() < watched_until {
-            screen.pump(stage, Duration::from_millis(200));
-        }
+        screen.watch_for(stage, &agent.session, VIEW_ONLY_WATCH);
         let viewer_rows = screen.view.rows();
         assert!(
             !viewer_rows.iter().any(|row| row.contains(shows)),
@@ -6521,7 +6534,7 @@ fn a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer() {
         );
         let whole_by = std::time::Instant::now() + WHOLE_PATH_WATCH;
         while !shows_whole(&rows, &typed) && std::time::Instant::now() < whole_by {
-            screen.pump(stage, Duration::from_millis(200));
+            screen.watch_for(stage, &agent.session, Duration::from_millis(200));
             rows = screen.view.rows();
         }
         assert!(
