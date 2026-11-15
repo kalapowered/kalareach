@@ -11,7 +11,7 @@ use kr_protocol::identity::WorkerProfile;
 use kr_protocol::ids::{SessionEpoch, SessionId};
 use kr_protocol::scalars::{CanonicalSet, Nullable, U64};
 use kr_protocol::session::{
-    ClosureReason, ClosureRecord, SessionCloseParams, SessionCloseResult, SessionState,
+    ClosureReason, ClosureRecord, Durability, SessionCloseParams, SessionCloseResult, SessionState,
 };
 use kr_protocol::worker::ReservationId;
 use kr_transport::window::AcceptedDeadline;
@@ -68,6 +68,56 @@ pub const CLOSE_EXCHANGE: std::time::Duration = std::time::Duration::from_millis
     kr_worker::session::GRACE_PERIOD.as_millis() as u64
         + kr_worker::session::DRAIN_PERIOD.as_millis() as u64,
 );
+
+/// A closure this daemon has been told of, and what it holds of it until its registry does.
+///
+/// The registry is this daemon's disk, and a write to it that does not return must not hold a
+/// close that already has its answer. The answer is kept here before the registry is written, and
+/// a close of the session is answered from it.
+#[derive(Debug)]
+pub(super) struct KnownClosure {
+    /// The close result a close of the session is answered with.
+    answer: SessionCloseResult,
+    /// Whether the record is a worker's volatile one, which its durable record may still replace.
+    /// A provisional record is held and never written: the registry's first record of a closure
+    /// is the one it keeps, so writing a volatile one would hide the durable one that follows.
+    provisional: bool,
+    /// Whether a task of this daemon is writing the record to the registry now.
+    writing: bool,
+}
+
+/// The close result that a closure record answers a close with.
+fn answer_of_record(record: &ClosureRecord) -> SessionCloseResult {
+    SessionCloseResult {
+        session_id: record.session_id,
+        state: SessionState::Closed,
+        durability: record.durability,
+        closure: Nullable::some(record.clone()),
+        session: None,
+    }
+}
+
+/// Where this host's own tests stop the write that records a closure in the registry, as a disk
+/// that does not answer does. Compiled away in every shipped build.
+#[cfg(feature = "testing")]
+#[derive(Debug, Default)]
+pub(super) struct RegistryWriteStall(crate::attention::Pause);
+
+#[cfg(feature = "testing")]
+impl Controller {
+    /// Stops the next write that records a closure in the registry, with the registry's lock held
+    /// as the write holds it. Returns the end that says the write has arrived and the end that lets
+    /// it go.
+    #[must_use]
+    pub fn stall_the_next_closure_write(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.registry_write_stall.0.arm()
+    }
+}
 
 /// A worker's answer to a close, read in the shape of the worker's level and put in this build's:
 /// a close result, which is returned with the answer, or the receipt a retried close is answered
@@ -229,19 +279,37 @@ impl Controller {
         carried: crate::authority::AdmittedMutation,
     ) -> std::result::Result<ParamsValue, Ended> {
         let params: SessionCloseParams = parse(&mutation.params)?;
-        let worker = self.directory.lock().await.get(params.session_id).cloned();
+        // A closure this daemon already knows is the answer, before anything is asked of the
+        // directory, the worker or the registry: the registry is this daemon's disk, and a write
+        // to it that has not returned is no reason to hold a close that has its answer.
+        if self.knows_how_it_ended(params.session_id) {
+            return Err(Ended::Answer(
+                self.answer_from_the_closure(params.session_id).await,
+            ));
+        }
+        // One budget for the whole exchange, started before the first wait of it. Section 7
+        // gives a closure five seconds to stop its processes and two more to drain them, and this
+        // daemon holds one connection per worker: a worker that stops answering would otherwise
+        // hold that connection for every later caller, and the wait for it would be unbounded on
+        // both sides of the handover.
+        let budget = tokio::time::Instant::now() + CLOSE_EXCHANGE;
+        let Ok(directory) = tokio::time::timeout_at(budget, self.directory.lock()).await else {
+            // Nothing was dispatched: whoever holds the directory has held it past what a closure
+            // is allowed to take, and this close never reached the worker.
+            return Err(ControllerError::supervision(
+                "the connection to the worker that owns this session did not come free in time, \
+                 so nothing was closed",
+            )
+            .into());
+        };
+        let worker = directory.get(params.session_id).cloned();
+        drop(directory);
         let Some(worker) = worker else {
             // A duplicate close returns the existing state rather than closing anything again.
             return Err(Ended::Answer(
                 self.answer_from_the_closure(params.session_id).await,
             ));
         };
-        // One budget for the whole exchange, started before the wait for the connection. Section 7
-        // gives a closure five seconds to stop its processes and two more to drain them, and this
-        // daemon holds one connection per worker: a worker that stops answering would otherwise
-        // hold that connection for every later caller, and the wait for it would be unbounded on
-        // both sides of the handover.
-        let budget = tokio::time::Instant::now() + CLOSE_EXCHANGE;
         #[cfg(test)]
         self.before_a_close_asks_for_its_link.wait().await;
         let result = {
@@ -369,7 +437,7 @@ impl Controller {
                 // the caller asked for into a decoding failure.
                 let (answer, closed) = read_close_answer(worker.level, &value)?;
                 if let Some(reply) = closed {
-                    self.settle_close_answer(params.session_id, &reply).await?;
+                    self.settle_close_answer(params.session_id, &reply).await;
                 }
                 Ok(answer)
             }
@@ -387,12 +455,14 @@ impl Controller {
     }
 
     /// The answer to a close of a session this daemon holds no worker for: the closure record, if
-    /// one is recorded. The record is the answer, and no worker is left to describe the session.
+    /// one is known or recorded. The record is the answer, and no worker is left to describe the
+    /// session.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::UnknownSession`] when no closure is recorded, and an error when
-    /// the registry cannot be read.
+    /// Returns [`ControllerError::UnknownSession`] when no closure is known or recorded, and
+    /// [`ControllerError::Uncertain`] when the registry does not answer within the time a close is
+    /// given.
     pub(super) async fn answer_from_the_closure(
         &self,
         session_id: SessionId,
@@ -400,20 +470,137 @@ impl Controller {
         Recorded::read(self.closure_answer(session_id).await)
     }
 
+    /// What a close of `session_id` is answered with where no worker is left to ask: the closure
+    /// this daemon knows, then the registry's, read inside the time a close is given. A registry
+    /// that does not answer in that time has not said that no closure is recorded, so the answer
+    /// is that it is not known, and never that the session is unknown.
     async fn closure_answer(&self, session_id: SessionId) -> Result<ParamsValue> {
-        let closure = self.registry.lock().await.closure(session_id)?;
+        if let Some(known) = self.known_closure(session_id) {
+            return encode(&known);
+        }
+        let read = tokio::time::timeout(CLOSE_EXCHANGE, async {
+            self.registry.lock().await.closure(session_id)
+        })
+        .await;
+        let closure = match read {
+            Ok(Ok(closure)) => closure,
+            Ok(Err(_)) | Err(_) => {
+                return Err(ControllerError::record_unreadable("closed sessions"));
+            }
+        };
         match closure {
-            Some(closure) => encode(&SessionCloseResult {
-                session_id,
-                state: SessionState::Closed,
-                durability: closure.durability,
-                closure: Nullable::some(closure),
-                session: None,
-            }),
+            Some(closure) => encode(&answer_of_record(&closure)),
             None => Err(ControllerError::UnknownSession {
                 session: session_id.to_string(),
             }),
         }
+    }
+
+    /// The closure this daemon knows of `session_id` and its registry may not hold yet.
+    fn known_closure(&self, session_id: SessionId) -> Option<SessionCloseResult> {
+        self.known_closures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&session_id)
+            .map(|known| known.answer.clone())
+    }
+
+    /// Whether this daemon knows how `session_id` ended, finally: a closure that is not a worker's
+    /// volatile record, which a durable one may still replace. Where it does, the write of that
+    /// closure is started if no task of this daemon is writing it, and a close is answered from
+    /// the known closure.
+    pub(crate) fn knows_how_it_ended(self: &Arc<Self>, session_id: SessionId) -> bool {
+        let known = self
+            .known_closures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&session_id)
+            .is_some_and(|known| !known.provisional);
+        if known {
+            self.record_known_closure_soon(session_id);
+        }
+        known
+    }
+
+    /// The volatile record that a worker handed this daemon for `session_id`, which no durable
+    /// record has replaced.
+    fn provisional_closure(&self, session_id: SessionId) -> Option<ClosureRecord> {
+        self.known_closures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&session_id)
+            .filter(|known| known.provisional)
+            .and_then(|known| known.answer.closure.0.clone())
+    }
+
+    /// Keeps `record` as what a close of its session is answered with. A final record is not
+    /// replaced by a provisional one.
+    fn keep_known_closure(&self, record: &ClosureRecord, provisional: bool) {
+        let mut known = self
+            .known_closures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = known.entry(record.session_id).or_insert(KnownClosure {
+            answer: answer_of_record(record),
+            provisional,
+            writing: false,
+        });
+        if entry.provisional || !provisional {
+            entry.answer = answer_of_record(record);
+            entry.provisional = provisional;
+        }
+    }
+
+    /// Forgets what this daemon kept of a closure its registry now holds.
+    fn forget_known_closure(&self, session_id: SessionId) {
+        self.known_closures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&session_id);
+    }
+
+    /// Starts the write of a final closure that this daemon knows and has not recorded, unless a
+    /// task of its own is writing it. A write that fails is tried again by the next close of the
+    /// session, and by the watch over the worker's end.
+    fn record_known_closure_soon(self: &Arc<Self>, session_id: SessionId) {
+        let record = {
+            let mut known = self
+                .known_closures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(entry) = known.get_mut(&session_id) else {
+                return;
+            };
+            if entry.provisional || entry.writing {
+                return;
+            }
+            let Some(record) = entry.answer.closure.0.clone() else {
+                return;
+            };
+            entry.writing = true;
+            record
+        };
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            let written = me.retire(&record).await;
+            if let Some(entry) = me
+                .known_closures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_mut(&record.session_id)
+            {
+                entry.writing = false;
+            }
+            if let Err(error) = written {
+                eprintln!(
+                    "kr-controller: the closure of session {} was answered and could not be \
+                     recorded in full: {error}; it is tried again when the worker ends, when the \
+                     session is closed again and at the next start",
+                    record.session_id
+                );
+                me.watch_closure(record.session_id, record.reason).await;
+            }
+        });
     }
 
     /// The refusal for a request that found no worker for a session: that the session closed,
@@ -440,26 +627,33 @@ impl Controller {
     /// is settled here, before it goes, so none reaches its caller without this daemon knowing
     /// what it said.
     ///
-    /// An answer with the worker's own account of how its session ended is recorded, written
-    /// through the same boundary as every other closure so that nothing this daemon writes
-    /// afterwards can replace it. One without is the worker's acceptance: the session is closing,
-    /// as the worker's description in it says, until its closure is recorded
+    /// An answer with the worker's own account of how its session ended is kept, and its record is
+    /// written on a task of its own, through the same boundary as every other closure so that
+    /// nothing this daemon writes afterwards can replace it: the answer is the worker's, and the
+    /// registry's write is not what the caller waits for. A volatile account is the worker's
+    /// provisional one, which its durable record may still replace: it is kept and not written,
+    /// and the worker stays in the directory with its links until the durable record is
+    /// collected or the worker has ended. One without a closure is the worker's acceptance: the
+    /// session is closing, as the worker's description in it says, until its closure is recorded
     /// ([`Self::close_accepted`]). The answer itself is not changed.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a closure the answer carries cannot be recorded.
     pub(crate) async fn settle_close_answer(
         self: &Arc<Self>,
         session_id: SessionId,
         answer: &SessionCloseResult,
-    ) -> Result<()> {
+    ) {
         match answer.closure.as_ref() {
-            Some(record) => self.retire(record).await,
+            Some(record) if record.durability == Durability::Volatile => {
+                self.keep_known_closure(record, true);
+                self.close_accepted(session_id, answer.session.as_ref())
+                    .await;
+            }
+            Some(record) => {
+                self.keep_known_closure(record, false);
+                self.record_known_closure_soon(session_id);
+            }
             None => {
                 self.close_accepted(session_id, answer.session.as_ref())
                     .await;
-                Ok(())
             }
         }
     }
@@ -914,6 +1108,14 @@ impl Controller {
             self.write_closure(&recovered).await?;
             return Ok(recovered);
         }
+        // The worker ended with no durable record of its own. What it said of its closure before
+        // it ended is its own account, volatile as it gave it, and it stands.
+        if death == Death::Confirmed
+            && let Some(provisional) = self.provisional_closure(session_id)
+        {
+            self.write_closure(&provisional).await?;
+            return Ok(provisional);
+        }
         // Nothing authoritative survived. What is written instead says so: the coverage is
         // incomplete and the root's result is absent rather than invented.
         // A worker this host saw end is terminated; one it did not is not, whatever else is true
@@ -1002,6 +1204,7 @@ impl Controller {
             {
                 // Somebody else recorded this closure first. That it is recorded at all is what
                 // the setting is about, so the look below happens either way.
+                self.forget_known_closure(record.session_id);
                 Ok(())
             } else {
                 self.write_closure(record).await
@@ -1030,8 +1233,14 @@ impl Controller {
     ///
     /// Returns an error when the registry cannot be written.
     pub(super) async fn write_closure(&self, record: &ClosureRecord) -> Result<()> {
+        // Known before the registry is written: a close of this session is answered from what is
+        // kept here while the write stands, and the registry answers once it has the record.
+        self.keep_known_closure(record, false);
         let mut registry = self.registry.lock().await;
+        #[cfg(feature = "testing")]
+        self.registry_write_stall.0.wait();
         registry.record_closure(record)?;
+        self.forget_known_closure(record.session_id);
         // The barrier is told in the section that records the closure, under the registry's lock
         // and before anything is awaited. A worker that has ended satisfies the barrier, and the
         // barrier keeps a participant it has ever heard of: a retired worker left to stay pending

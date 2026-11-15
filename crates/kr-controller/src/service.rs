@@ -1175,6 +1175,15 @@ pub struct Controller {
     /// reconciliation this daemon does on its own both reach that point for the same session, so
     /// the two steps are one transaction.
     finalising: Mutex<()>,
+    /// The closures this daemon has been told of that its registry may not hold yet, by session:
+    /// what a close of that session is answered with while the registry is written, or does not
+    /// answer, and what a worker's volatile record is held as until its durable one is collected.
+    /// Never held across an await.
+    known_closures: std::sync::Mutex<BTreeMap<SessionId, close::KnownClosure>>,
+    /// Where this host's own tests stop, or fail, the write that records a closure in the
+    /// registry. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    registry_write_stall: close::RegistryWriteStall,
     /// Held while the archive removes what the sessions that have ended retained for privacy mode.
     ///
     /// A change to privacy mode removes it before it answers, and the privacy tick removes it on
