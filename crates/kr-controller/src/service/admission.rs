@@ -92,6 +92,9 @@ impl Controller {
         let registered =
             connection.is_some_and(|connection| connection.admitted_revision >= authority_revision);
         let refusal = self.refusal_of_the_feed_for(connection);
+        // The footing of this mutation on the registration the table read found, whose latch the
+        // registration's removal sets: the tail of the check asks it.
+        let footing = connection.map(|connection| self.footing_of(admission, connection));
         drop(admitted);
         admission
             .check(crate::authority::AdmissionContext {
@@ -99,43 +102,21 @@ impl Controller {
                 authority_revision,
                 registered,
             })
-            .map_err(|lapse| match lapse {
-                crate::authority::AdmissionLapse::Expired => ControllerError::WindowExpired {
-                    detail: lapse.to_string(),
-                },
-                crate::authority::AdmissionLapse::Revoked
-                | crate::authority::AdmissionLapse::Deregistered => {
-                    ControllerError::PermissionDenied {
-                        detail: lapse.to_string(),
-                    }
-                }
-            })?;
+            .map_err(super::footing::admission_refusal)?;
         if let Some(refusal) = refusal {
             return Err(refusal);
         }
-        // The feed's check took the connection's shares lock, and a fence that was published while
-        // it waited is read here, after that lock, as the last reading of the check. The fence's
-        // own lock can be waited for too, so the deadline is compared once more after it.
+        // The feed's check took the connection's shares lock, and what lands while it waited is
+        // read here, after that lock, as the last reading of the check: the footing's one question
+        // takes no lock, so nothing can be waited for after it. It asks the fence, the revision,
+        // the registration's latch and the deadline, in that order.
         #[cfg(feature = "testing")]
         self.before_the_last_fence_read.wait();
-        self.check_fence()?;
-        self.check_deadline(admission)
-    }
-
-    /// Refuses a mutation whose accepted deadline has passed on this daemon's clock, read now.
-    ///
-    /// Asked last by [`Self::check_admission`] and [`Self::check_registration_in`], after the
-    /// locks that they take, so the deadline cannot pass in the wait for one of them.
-    fn check_deadline(&self, admission: &crate::authority::AdmittedMutation) -> Result<()> {
-        if admission
-            .deadline
-            .is_some_and(|deadline| self.clock.now() >= deadline)
-        {
-            return Err(ControllerError::WindowExpired {
-                detail: crate::authority::AdmissionLapse::Expired.to_string(),
-            });
-        }
-        Ok(())
+        footing
+            .ok_or_else(|| {
+                super::footing::admission_refusal(crate::authority::AdmissionLapse::Deregistered)
+            })?
+            .stands(super::footing::Ask::MUTATION)
     }
 
     /// The refusal the authority feed puts on remote grants, as an error, when one stands and
@@ -823,31 +804,44 @@ impl Controller {
         admission: &crate::authority::AdmittedMutation,
     ) -> Result<()> {
         self.check_fence()?;
-        let standing = admitted
-            .get(&admission.connection_id)
-            .map(|connection| connection.admitted_revision);
-        let Some(standing) = standing else {
+        let Some(connection) = admitted.get(&admission.connection_id) else {
             return Err(ControllerError::PermissionDenied {
                 detail: crate::authority::AdmissionLapse::Deregistered.to_string(),
             });
         };
-        if standing != admission.admitted_revision {
+        if connection.admitted_revision != admission.admitted_revision {
             return Err(ControllerError::PermissionDenied {
                 detail: crate::authority::AdmissionLapse::Revoked.to_string(),
             });
         }
-        if let Some(refused) = self.refusal_of_the_feed_for(admitted.get(&admission.connection_id))
-        {
+        if let Some(refused) = self.refusal_of_the_feed_for(Some(connection)) {
             return Err(refused);
         }
-        self.check_deadline(admission)?;
-        // The feed's check took the connection's shares lock, and a fence that was published while
-        // it waited is read here, after that lock, as the last reading of the check. The fence's
-        // own lock can be waited for too, so the deadline is compared once more after it.
+        // The feed's check took the connection's shares lock, and what lands while it waited is
+        // read here, after that lock, as the last reading of the check: the footing's one question
+        // takes no lock, so nothing can be waited for after it. It asks the fence, the revision,
+        // the registration's latch and the deadline, in that order.
         #[cfg(feature = "testing")]
         self.before_the_last_fence_read.wait();
-        self.check_fence()?;
-        self.check_deadline(admission)
+        self.footing_of(admission, connection)
+            .stands(super::footing::Ask::MUTATION)
+    }
+
+    /// The footing of `admission` on the registration `connection` that a read of the connection
+    /// table found: the revision and the deadline the mutation was admitted under, and the
+    /// registration's own latch.
+    fn footing_of(
+        &self,
+        admission: &crate::authority::AdmittedMutation,
+        connection: &AdmittedConnection,
+    ) -> super::footing::Footing {
+        super::footing::Footing::admitted(
+            Arc::clone(&self.copies),
+            admission.connection_id,
+            admission.admitted_revision,
+            connection.latch.clone(),
+            admission.deadline,
+        )
     }
 
     /// Returns the authority revision a connection was admitted under.
