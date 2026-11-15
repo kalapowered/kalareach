@@ -59,7 +59,7 @@ use tokio::sync::{Mutex, watch};
 
 use super::BoxFuture;
 use super::paired::PairedHost;
-use crate::services::PairingAdmissions;
+use crate::services::{PairingAdmissions, RelayRefusal};
 use crate::session::Session;
 use crate::shown::{Said, Shown};
 use crate::transport::{ControlTransport, NetworkTransport};
@@ -365,15 +365,20 @@ pub trait HostLink: Send + Sync {
         Box::pin(async { false })
     }
 
-    /// Whether a dial to `endpoint` that failed was held back by the managed service having no free
-    /// capacity to admit this device through the relay the dial addresses.
+    /// What the managed service's answer says a dial to `endpoint` that failed was held back by:
+    /// no free capacity to admit this device through the relay the dial addresses, with the paths
+    /// that still work, or a fault of the service.
     ///
     /// A device that holds no lease with the host asks the managed service for an admission as it
-    /// dials, and a service that has none to give is a reason a person acts on differently from a
-    /// host that is not there. It is asked after a dial has ended, and a link that asks no service
-    /// answers no.
-    fn relay_capacity_refused(&self, _network: &NetworkConfig, _endpoint: &EndpointKey) -> bool {
-        false
+    /// dials, and a service that has none to give, or that failed, is a reason a person acts on
+    /// differently from a host that is not there. It is asked after a dial has ended, and a link
+    /// that asks no service answers none.
+    fn relay_refusal(
+        &self,
+        _network: &NetworkConfig,
+        _endpoint: &EndpointKey,
+    ) -> Option<RelayRefusal> {
+        None
     }
 }
 
@@ -918,10 +923,14 @@ impl HostLink for IrohLink {
         })
     }
 
-    fn relay_capacity_refused(&self, network: &NetworkConfig, endpoint: &EndpointKey) -> bool {
+    fn relay_refusal(
+        &self,
+        network: &NetworkConfig,
+        endpoint: &EndpointKey,
+    ) -> Option<RelayRefusal> {
         self.admissions
             .as_ref()
-            .is_some_and(|admissions| admissions.capacity_refused(network, endpoint))
+            .and_then(|admissions| admissions.refusal(network, endpoint))
     }
 
     fn open_unpaired<'a>(

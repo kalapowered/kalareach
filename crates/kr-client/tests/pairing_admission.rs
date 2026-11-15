@@ -18,7 +18,7 @@ use kr_client::services::admission::RelayAdmissionIssueBody;
 use kr_client::services::{
     AdmissionAnswer, AdmissionClock, AdmissionRequest, LeaseRequest, ManagedPairingAdmission,
     ManagedRelayLeaseService, PairingAdmissionService, PairingAdmissions, RelayDirection,
-    RelayLeaseService, ServiceFuture, ServiceHttp, ServiceHttpAnswer, ServiceSigner,
+    RelayLeaseService, RelayRefusal, ServiceFuture, ServiceHttp, ServiceHttpAnswer, ServiceSigner,
 };
 use kr_client::{ClientError as Error, Result};
 use kr_crypto::keys::AuthorisationKeyPair;
@@ -390,17 +390,18 @@ async fn timeline(body: &str) -> Vec<(u64, usize, bool)> {
         seen.push((
             probe,
             http.requests(),
-            admissions.capacity_refused(&relays, &host),
+            admissions.refusal(&relays, &host).is_some(),
         ));
     }
     seen
 }
 
 /// KR-REQ-17.48: a service that cannot admit a pair for a reason of its own says so with the member
-/// that names the paths that still work present and empty, and the client's reader, which is the
-/// released one, holds it as it holds an answer that names them: the same answer kind, the same
-/// requests at the same moments, the same explanation of a failed dial, with a wait named and
-/// without. An answer that leaves the member out is still not one it reads.
+/// that names the paths that still work present and empty, and the client's reader holds it as it
+/// holds an answer that names them: the same answer kind, the same requests at the same moments, an
+/// explanation of a failed dial for as long, with a wait named and without. What the explanation
+/// says differs, and is told apart in its own case. An answer that leaves the member out is still
+/// not one it reads.
 #[tokio::test]
 async fn kr_req_17_48_an_unavailable_answer_with_an_empty_list_is_held_as_one_with_entries() {
     const FAULT: &str = "The managed relay service could not admit this pairing now.";
@@ -682,7 +683,7 @@ async fn an_answer_that_the_service_is_unable_stands_while_the_cache_will_not_as
             .admissions
             .before_dial(&relays, &host, key(0x22))
             .await;
-        assert!(service.admissions.capacity_refused(&relays, &host));
+        assert!(service.admissions.refusal(&relays, &host).is_some());
         service.clock.advance(Duration::from_secs(25));
     }
     assert_eq!(service.asked().len(), 3);
@@ -696,7 +697,7 @@ async fn an_answer_that_the_service_is_unable_stands_while_the_cache_will_not_as
         .await;
     assert_eq!(service.asked().len(), 3);
     assert!(
-        service.admissions.capacity_refused(&relays, &host),
+        service.admissions.refusal(&relays, &host).is_some(),
         "a refusal with no retry time stopped explaining the failure while nothing asked again"
     );
 
@@ -727,7 +728,7 @@ async fn an_answer_that_the_service_is_unable_explains_a_failed_dial_but_not_for
         .admissions
         .before_dial(&relays, &host, key(0x22))
         .await;
-    assert!(service.admissions.capacity_refused(&relays, &host));
+    assert!(service.admissions.refusal(&relays, &host).is_some());
 
     // Four seconds on, nothing more is asked; six seconds on, it is.
     service.clock.advance(Duration::from_secs(4));
@@ -746,9 +747,9 @@ async fn an_answer_that_the_service_is_unable_explains_a_failed_dial_but_not_for
     // And the answer still stands for the route that asks fifty seconds after it came, though no
     // dial has begun since.
     service.clock.advance(Duration::from_secs(50));
-    assert!(service.admissions.capacity_refused(&relays, &host));
+    assert!(service.admissions.refusal(&relays, &host).is_some());
     service.clock.advance(Duration::from_secs(20));
-    assert!(!service.admissions.capacity_refused(&relays, &host));
+    assert!(service.admissions.refusal(&relays, &host).is_none());
 }
 
 /// KR-REQ-17.40: it is the relay a dial addresses that decides what a failed dial is reported as: the
@@ -775,12 +776,13 @@ async fn the_relay_a_dial_addresses_is_the_one_that_decides() {
     assert!(
         service
             .admissions
-            .capacity_refused(&first_is_unavailable, &host)
+            .refusal(&first_is_unavailable, &host)
+            .is_some()
     );
 
     // The same relays in the other order: the dial addresses the one that admits.
     let first_admits = network(&[second, MANAGED]);
-    assert!(!service.admissions.capacity_refused(&first_admits, &host));
+    assert!(service.admissions.refusal(&first_admits, &host).is_none());
 
     // A pair that holds a lease at the first relay needs no admission there, which is not capacity.
     let other = key(0x33);
@@ -806,9 +808,10 @@ async fn the_relay_a_dial_addresses_is_the_one_that_decides() {
         .before_dial(&network(&[MANAGED]), &other, key(0x44))
         .await;
     assert!(
-        !leased
+        leased
             .admissions
-            .capacity_refused(&network(&[MANAGED]), &other)
+            .refusal(&network(&[MANAGED]), &other)
+            .is_none()
     );
 }
 
@@ -833,14 +836,14 @@ async fn a_service_that_does_not_answer_does_not_hold_up_a_dial() {
     .expect("the dial goes on without the answer");
     assert_eq!(service.asks(), 1);
     assert!(
-        !admissions.capacity_refused(&relays, &host),
+        admissions.refusal(&relays, &host).is_none(),
         "nothing has been said yet"
     );
 
     // The answer arrives after the dial went on, and is kept.
     gate.notify_waiters();
     tokio::time::timeout(Duration::from_secs(30), async {
-        while !admissions.capacity_refused(&relays, &host) {
+        while admissions.refusal(&relays, &host).is_none() {
             tokio::task::yield_now().await;
         }
     })
@@ -873,12 +876,12 @@ async fn a_dial_that_its_route_ends_while_it_waits_leaves_its_request_to_finish(
     .await;
     assert!(ended.is_err(), "the dial was not cut short while it waited");
     assert_eq!(service.asks(), 1);
-    assert!(!admissions.capacity_refused(&relays, &host));
+    assert!(admissions.refusal(&relays, &host).is_none());
 
     // The service answers once the dial has gone, and the answer is kept.
     gate.notify_waiters();
     tokio::time::timeout(Duration::from_secs(30), async {
-        while !admissions.capacity_refused(&relays, &host) {
+        while admissions.refusal(&relays, &host).is_none() {
             tokio::task::yield_now().await;
         }
     })
@@ -905,7 +908,7 @@ async fn a_service_without_the_route_is_left_alone_for_ten_minutes() {
     admissions.before_dial(&relays, &key(0x11), key(0x22)).await;
     assert_eq!(service.asks(), 1);
     assert!(
-        !admissions.capacity_refused(&relays, &key(0x11)),
+        admissions.refusal(&relays, &key(0x11)).is_none(),
         "that is no capacity text"
     );
 
@@ -942,7 +945,7 @@ async fn a_real_not_found_from_the_service_stops_requests_for_ten_minutes() {
         .await;
     assert_eq!(service.web.requests_to("/api/relay/admission"), 1);
     assert!(
-        !service.admissions.capacity_refused(&relays, &key(0x11)),
+        service.admissions.refusal(&relays, &key(0x11)).is_none(),
         "that is no capacity text"
     );
 
@@ -998,9 +1001,12 @@ fn refusal_body(code: &str, delay: Option<u64>) -> String {
     serde_json::json!({ "ok": false, "error": error }).to_string()
 }
 
-/// How many requests the transport had been sent at each of [`PROBES`], and whether a failed dial
-/// would be explained by what the service answered, when `http` answers every request.
-async fn series(http: Arc<dyn ServiceHttp>, sent: impl Fn() -> usize) -> Vec<(u64, usize, bool)> {
+/// How many requests the transport had been sent at each of [`PROBES`], and what a failed dial
+/// would be explained by, when `http` answers every request.
+async fn series(
+    http: Arc<dyn ServiceHttp>,
+    sent: impl Fn() -> usize,
+) -> Vec<(u64, usize, Option<RelayRefusal>)> {
     let clock = AdmissionClock::default();
     let origin = GatewayOrigin::new("https://reach.kala.to").expect("an origin");
     let service = Arc::new(ManagedPairingAdmission::new(
@@ -1018,7 +1024,7 @@ async fn series(http: Arc<dyn ServiceHttp>, sent: impl Fn() -> usize) -> Vec<(u6
         clock.advance(Duration::from_secs(probe - at));
         at = probe;
         admissions.before_dial(&relays, &host, key(0x22)).await;
-        seen.push((probe, sent(), admissions.capacity_refused(&relays, &host)));
+        seen.push((probe, sent(), admissions.refusal(&relays, &host)));
     }
     seen
 }
@@ -1074,4 +1080,193 @@ async fn kr_req_17_48_a_refused_or_unreadable_answer_is_asked_about_again_at_the
     .await;
     let asked: Vec<usize> = seen.iter().map(|(_, asked, _)| *asked).collect();
     assert_eq!(asked, ASKED, "an exchange that ended with no answer");
+}
+
+/// What a service that is not updated and one that is name beside an answer that it is unable, as
+/// words: the paths that still work. Only the first and the last are this build's own texts.
+const OLD_SERVICE_LIST: [&str; 2] = [
+    "A direct connection between the devices, which needs no managed relay.",
+    "A self-hosted relay configured in the service settings.",
+];
+
+/// The delays an answer names, and none.
+const DELAYS: [Option<u64>; 6] = [
+    None,
+    Some(0),
+    Some(5),
+    Some(3600),
+    Some(86_400),
+    Some(200_000),
+];
+
+/// How many requests the service has been sent at each of [`PROBES`] when it answers that it is
+/// unable and names `delay`: the table of the control, typed from a run before the list and the
+/// delay were kept.
+fn control_asked(delay: Option<u64>) -> [usize; 13] {
+    match delay {
+        None => [1, 1, 1, 1, 2, 2, 3, 3, 3, 4, 5, 6, 7],
+        Some(0) => [1, 2, 3, 3, 3, 3, 3, 3, 3, 4, 5, 6, 7],
+        Some(5) => [1, 1, 2, 3, 3, 3, 3, 3, 3, 4, 5, 6, 7],
+        Some(3600) => [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 3],
+        Some(86_400 | 200_000) => [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2],
+        Some(other) => panic!("no control for a delay of {other}"),
+    }
+}
+
+fn asked_at_each_probe(seen: &[(u64, usize, Option<RelayRefusal>)]) -> Vec<usize> {
+    seen.iter().map(|(_, asked, _)| *asked).collect()
+}
+
+/// The paths a failure holds, as words.
+fn words_of(alternatives: &kr_client::services::Alternatives) -> Vec<String> {
+    alternatives
+        .as_given()
+        .iter()
+        .map(|shown| shown.as_str().to_owned())
+        .collect()
+}
+
+/// KR-REQ-17.48: an answer that the service is unable, with a list that has an entry, is kept with
+/// that list and the delay it named, as it wrote them, for as long as it explains a failed dial, and
+/// is asked again at the moments it always was. A service that is not updated, whose list has the
+/// old second item or any other, reads the same way.
+#[tokio::test]
+async fn kr_req_17_48_a_kept_answer_holds_the_list_and_the_delay_it_named() {
+    const SHORT: &str = "Managed capacity for new pairing invitations is not available now.";
+    let lists: [Vec<&str>; 3] = [
+        STILL_WORK.to_vec(),
+        OLD_SERVICE_LIST.to_vec(),
+        vec!["A path that this build has never heard of."],
+    ];
+    for list in lists {
+        for delay in DELAYS {
+            let http = Exact::new(200, &unavailable_body(SHORT, &list, delay));
+            let seen = series(Arc::clone(&http) as _, || http.requests()).await;
+            assert_eq!(
+                asked_at_each_probe(&seen),
+                control_asked(delay),
+                "{delay:?}"
+            );
+            for (probe, _, refusal) in seen {
+                let Some(RelayRefusal::Capacity {
+                    alternatives,
+                    retry_after_seconds,
+                }) = refusal
+                else {
+                    panic!("at {probe}s with {delay:?}: {refusal:?}");
+                };
+                assert_eq!(words_of(&alternatives), list, "at {probe}s");
+                assert_eq!(retry_after_seconds, delay, "at {probe}s");
+            }
+        }
+    }
+}
+
+/// KR-REQ-17.48: an answer that the service is unable, whose list has no entry, is a fault of the
+/// service and never exhausted capacity, with the delay it named when it named one, and is kept and
+/// asked again at the same moments as one with entries.
+#[tokio::test]
+async fn kr_req_17_48_an_unavailable_answer_with_no_entry_is_a_fault_and_never_capacity() {
+    const FAULT: &str = "The managed relay service could not admit this pairing now.";
+    for delay in DELAYS {
+        let http = Exact::new(200, &unavailable_body(FAULT, &[], delay));
+        let seen = series(Arc::clone(&http) as _, || http.requests()).await;
+        assert_eq!(
+            asked_at_each_probe(&seen),
+            control_asked(delay),
+            "{delay:?}"
+        );
+        for (probe, _, refusal) in seen {
+            assert_eq!(
+                refusal,
+                Some(RelayRefusal::Fault {
+                    retry_after_seconds: delay
+                }),
+                "at {probe}s with {delay:?}"
+            );
+        }
+    }
+}
+
+/// KR-REQ-17.48: a refusal in the service's envelope under a status of the 5xx class is a fault of
+/// the service, explained for as long as an answer that it is unable is, with the delay the envelope
+/// named, and is asked again at the moments a refusal always was.
+#[tokio::test]
+async fn kr_req_17_48_a_refusal_of_the_5xx_class_in_the_envelope_is_a_fault() {
+    const SHORT: &str = "Managed capacity for new pairing invitations is not available now.";
+    // The same wait, said as unavailable: asked again after a wait of twenty seconds or more at the
+    // same moments, so the whole series is equal.
+    for (status, delay) in [(503, None), (500, Some(3600))] {
+        let refused = Exact::new(status, &refusal_body("INTERNAL", delay));
+        let seen = series(Arc::clone(&refused) as _, || refused.requests()).await;
+        let unavailable = Exact::new(200, &unavailable_body(SHORT, &STILL_WORK, delay));
+        let baseline = series(Arc::clone(&unavailable) as _, || unavailable.requests()).await;
+        let explained = |seen: &[(u64, usize, Option<RelayRefusal>)]| -> Vec<(u64, usize, bool)> {
+            seen.iter()
+                .map(|(probe, asked, refusal)| (*probe, *asked, refusal.is_some()))
+                .collect()
+        };
+        assert_eq!(explained(&seen), explained(&baseline), "{status} {delay:?}");
+        assert_eq!(
+            seen[0].2,
+            Some(RelayRefusal::Fault {
+                retry_after_seconds: delay
+            })
+        );
+    }
+    // A wait under twenty seconds is still asked again after twenty, as any refusal is.
+    let refused = Exact::new(503, &refusal_body("INTERNAL", Some(5)));
+    let seen = series(Arc::clone(&refused) as _, || refused.requests()).await;
+    assert_eq!(
+        asked_at_each_probe(&seen),
+        [1, 1, 1, 1, 2, 2, 3, 3, 3, 4, 5, 6, 7]
+    );
+    assert_eq!(
+        seen[0].2,
+        Some(RelayRefusal::Fault {
+            retry_after_seconds: Some(5)
+        })
+    );
+    // A service that says it is not configured is a fault as well, and is not asked for ten minutes.
+    let refused = Exact::new(501, &refusal_body("NOT_CONFIGURED", None));
+    let seen = series(Arc::clone(&refused) as _, || refused.requests()).await;
+    assert_eq!(
+        asked_at_each_probe(&seen),
+        [1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 3, 3, 4]
+    );
+    assert_eq!(
+        seen[0].2,
+        Some(RelayRefusal::Fault {
+            retry_after_seconds: None
+        })
+    );
+}
+
+/// KR-REQ-17.48: what is neither exhausted capacity nor a fault of the service explains nothing: an
+/// exchange that ended with no answer, an answer that is not the service's envelope under a status
+/// of the 5xx class, a refusal in the envelope under another status, and a refusal that names no
+/// error.
+#[tokio::test]
+async fn kr_req_17_48_a_transport_failure_and_an_answer_without_the_envelope_are_neither() {
+    let answers: [(u16, String); 5] = [
+        (502, "<html>Bad Gateway</html>".to_owned()),
+        (503, r#"{"ok":false}"#.to_owned()),
+        (503, "not json".to_owned()),
+        (429, refusal_body("RATE_LIMITED", Some(30))),
+        (400, refusal_body("INVALID_REQUEST", None)),
+    ];
+    for (status, body) in answers {
+        let http = Exact::new(status, &body);
+        let seen = series(Arc::clone(&http) as _, || http.requests()).await;
+        assert!(
+            seen.iter().all(|(_, _, refusal)| refusal.is_none()),
+            "{status} {body}: {seen:?}"
+        );
+    }
+    let http = Arc::new(Unreached::default());
+    let seen = series(Arc::clone(&http) as _, || {
+        http.requests.load(Ordering::SeqCst)
+    })
+    .await;
+    assert!(seen.iter().all(|(_, _, refusal)| refusal.is_none()));
 }

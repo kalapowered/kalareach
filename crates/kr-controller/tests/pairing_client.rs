@@ -669,10 +669,14 @@ impl HostLink for WatchedLink {
         })
     }
 
-    fn relay_capacity_refused(&self, network: &NetworkConfig, endpoint: &EndpointKey) -> bool {
+    fn relay_refusal(
+        &self,
+        network: &NetworkConfig,
+        endpoint: &EndpointKey,
+    ) -> Option<kr_client::services::RelayRefusal> {
         match &self.elsewhere {
-            Some((network, endpoint)) => self.inner.relay_capacity_refused(network, endpoint),
-            None => self.inner.relay_capacity_refused(network, endpoint),
+            Some((network, endpoint)) => self.inner.relay_refusal(network, endpoint),
+            None => self.inner.relay_refusal(network, endpoint),
         }
     }
 

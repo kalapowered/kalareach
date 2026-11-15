@@ -853,6 +853,24 @@ impl ManagedRelayLeaseService {
         signing_input: Vec<u8>,
         bearer: Option<&AccountToken>,
     ) -> Result<serde_json::Value> {
+        let answer = self
+            .post_signed(path, method, body, signing_input, bearer)
+            .await?;
+
+        data_of(&answer, method)
+    }
+
+    /// Sends one signed request and returns the answer as the transport read it, status included,
+    /// for a caller that decides something by the status as well as by the envelope. An exchange
+    /// that ended before the service answered is an error here, and no answer has a status.
+    pub(crate) async fn post_signed<T: Serialize>(
+        &self,
+        path: &str,
+        method: &str,
+        body: T,
+        signing_input: Vec<u8>,
+        bearer: Option<&AccountToken>,
+    ) -> Result<ServiceHttpAnswer> {
         let signature = self.credential(
             method,
             Digest256::from_bytes(sha256(&signing_input)),
@@ -874,9 +892,7 @@ impl ManagedRelayLeaseService {
             .map(|value| ("authorization", value))
             .into_iter()
             .collect();
-        let answer = self.http.post_json(&url, &request, &headers).await?;
-
-        data_of(&answer, method)
+        self.http.post_json(&url, &request, &headers).await
     }
 }
 
@@ -998,7 +1014,7 @@ impl RelayLeaseService for ManagedRelayLeaseService {
 /// mistake either: it is a proxy's error page, a truncated answer, or something that is not this
 /// service. [`unreadable`] is what those become, classified by the status that carried them, and a
 /// text that names one member twice anywhere is one of them ([`super::json::read`]).
-fn data_of(answer: &ServiceHttpAnswer, method: &str) -> Result<serde_json::Value> {
+pub(crate) fn data_of(answer: &ServiceHttpAnswer, method: &str) -> Result<serde_json::Value> {
     #[derive(Deserialize)]
     struct Envelope {
         ok: bool,

@@ -27,6 +27,13 @@
 //! ended. Until then a refusal from the service goes on explaining a failed dial, though the minute
 //! it is kept for has passed, because nothing asks again to renew it.
 //!
+//! What a kept answer explains is one of two things, told apart by what the service named. An answer
+//! that names the paths that still work is exhausted capacity, and the list and the delay are kept
+//! with it. An answer that names none, and a refusal in the service's own envelope with a status of
+//! the 5xx class, is a fault of the service: no list, and the delay when one was named. Both are
+//! kept for as long as each other and asked again at the moments a refusal always was; a transport
+//! failure and an answer that is not the service's envelope explain nothing.
+//!
 //! A service that answers that it does not serve the request (it has no such route) or that this
 //! device is not allowed to ask stops every request for ten minutes. Nothing here ever turns that
 //! into a reason a person is told, and nothing here waits for the service past a short bound.
@@ -43,6 +50,7 @@ use kr_protocol::scalars::{EndpointKey, U64};
 use kr_protocol::service::GatewayOrigin;
 use serde::{Deserialize, Serialize};
 
+use super::alternatives::Alternatives;
 use super::matrix::ReleaseGate;
 use super::relay::{ManagedRelayLeaseService, ServiceHttp, ServiceSigner};
 use super::{ServiceFuture, relay};
@@ -172,10 +180,11 @@ enum TaggedAnswer {
 
 /// What an admission request was answered with.
 ///
-/// Four answers, and none is a failure of the request: an admission was issued; the pair needs none
-/// because it holds a lease; the relay is not one the service carries traffic through; or the service
+/// Five answers, and none is a failure of the request: an admission was issued; the pair needs none
+/// because it holds a lease; the relay is not one the service carries traffic through; the service
 /// cannot admit now, which section 17 reports as unavailable managed capacity with the paths that
-/// still work and never as a failure of the host.
+/// still work and never as a failure of the host; or the service failed on its side and said so in
+/// its own envelope.
 #[derive(Clone, PartialEq, Eq)]
 pub enum AdmissionAnswer {
     /// An admission is installed at the relay.
@@ -193,9 +202,19 @@ pub enum AdmissionAnswer {
     Unavailable {
         /// What happened, in English. Safe to display.
         message: String,
-        /// Paths that still work: a direct connection, or a self-hosted relay.
+        /// Paths that still work: a direct connection, or a self-hosted relay. None when the cause
+        /// is the service's own fault.
         alternatives: Vec<String>,
         /// Seconds after which the same request could succeed, when that is known.
+        retry_after_seconds: Option<u64>,
+    },
+    /// The service refused in its own envelope with a status of the 5xx class: it failed on its
+    /// side. An answer that is not its envelope, and an exchange that ended with no answer, are not
+    /// this, because nothing in them says the service was reached.
+    Faulted {
+        /// The code the refusal maps to, which decides whether requests stop for a while.
+        code: ErrorCode,
+        /// Seconds after which the same request could succeed, when the refusal named them.
         retry_after_seconds: Option<u64>,
     },
 }
@@ -208,6 +227,7 @@ impl std::fmt::Debug for AdmissionAnswer {
             Self::NotNeeded => formatter.write_str("AdmissionAnswer::NotNeeded"),
             Self::NotManaged => formatter.write_str("AdmissionAnswer::NotManaged"),
             Self::Unavailable { .. } => formatter.write_str("AdmissionAnswer::Unavailable"),
+            Self::Faulted { .. } => formatter.write_str("AdmissionAnswer::Faulted"),
         }
     }
 }
@@ -279,9 +299,9 @@ impl PairingAdmissionService for ManagedPairingAdmission {
             self.service.when_the_gate_is_open()?;
             let body = RelayAdmissionIssueBody::of(request);
             let signing_input = body.signing_input()?;
-            let data = self
+            let answer = self
                 .service
-                .call(
+                .post_signed(
                     RELAY_ADMISSION_PATH,
                     RELAY_ADMISSION_ISSUE_METHOD,
                     body,
@@ -289,6 +309,22 @@ impl PairingAdmissionService for ManagedPairingAdmission {
                     None,
                 )
                 .await?;
+            let data = match relay::data_of(&answer, RELAY_ADMISSION_ISSUE_METHOD) {
+                Ok(data) => data,
+                // A refusal in the service's envelope under a status of the 5xx class is the
+                // service failing on its side. Only here is the status still known.
+                Err(ClientError::Refused {
+                    error,
+                    retry_after_seconds,
+                    ..
+                }) if (500..600).contains(&answer.status) => {
+                    return Ok(AdmissionAnswer::Faulted {
+                        code: error.code,
+                        retry_after_seconds,
+                    });
+                }
+                Err(error) => return Err(error),
+            };
             serde_json::from_value::<TaggedAnswer>(data)
                 .map(AdmissionAnswer::from)
                 .map_err(|_| {
@@ -331,17 +367,20 @@ struct Key {
 }
 
 /// What the cache holds of one answer.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Held {
     /// Nothing has answered yet.
     Nothing,
     /// An admission is installed until then.
     Admitted { until: Instant },
-    /// The service is unable. `kept_until` is how long the answer explains a failed dial, and
-    /// `retry_at` is when a dial asks again.
+    /// The service is unable, or failed on its side. `kept_until` is how long the answer explains
+    /// a failed dial, and `retry_at` is when a dial asks again. `alternatives` is what the service
+    /// named, with no entry for a fault; `retry_after_seconds` is the delay it named, as it named it.
     Unavailable {
         kept_until: Instant,
         retry_at: Instant,
+        alternatives: Alternatives,
+        retry_after_seconds: Option<u64>,
     },
     /// The pair holds a lease, or the relay is not the service's, until then.
     Needs { until: Instant },
@@ -350,7 +389,7 @@ enum Held {
 }
 
 /// One entry of the cache.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Entry {
     held: Held,
     /// Whether a request for this entry is on its way.
@@ -572,18 +611,20 @@ impl PairingAdmissions {
         let answer = self.service.admit(&request).await;
         let now = self.clock.now();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        match &answer {
-            Err(error)
-                if matches!(
-                    error.code(),
-                    ErrorCode::InvalidArgument
-                        | ErrorCode::HostNotConfigured
-                        | ErrorCode::PermissionDenied
-                ) =>
-            {
-                state.suspended_until = Some(now + SUSPEND);
-            }
-            _ => {}
+        let refused = match &answer {
+            Err(error) => Some(error.code()),
+            Ok(AdmissionAnswer::Faulted { code, .. }) => Some(*code),
+            Ok(_) => None,
+        };
+        if refused.is_some_and(|code| {
+            matches!(
+                code,
+                ErrorCode::InvalidArgument
+                    | ErrorCode::HostNotConfigured
+                    | ErrorCode::PermissionDenied
+            )
+        }) {
+            state.suspended_until = Some(now + SUSPEND);
         }
         let Some(entry) = state.entries.get_mut(&key) else {
             return;
@@ -602,15 +643,26 @@ impl PairingAdmissions {
                 until: now + KEEP_NOT_MANAGED,
             },
             Ok(AdmissionAnswer::Unavailable {
+                alternatives,
                 retry_after_seconds,
                 ..
-            }) => {
-                let named = retry_after_seconds.map(named_time);
-                Held::Unavailable {
-                    kept_until: now + named.unwrap_or_default().max(KEEP_UNAVAILABLE),
-                    retry_at: now + named.unwrap_or(DOUBT_AFTER),
-                }
-            }
+            }) => Held::Unavailable {
+                kept_until: now + kept_for(retry_after_seconds),
+                retry_at: now + retry_after_seconds.map_or(DOUBT_AFTER, named_time),
+                alternatives: Alternatives::named(alternatives),
+                retry_after_seconds,
+            },
+            // Asked again as any other refusal is, and explained for as long as an unavailable
+            // answer is.
+            Ok(AdmissionAnswer::Faulted {
+                retry_after_seconds,
+                ..
+            }) => Held::Unavailable {
+                kept_until: now + kept_for(retry_after_seconds),
+                retry_at: now + after_a_refusal(retry_after_seconds),
+                alternatives: Alternatives::none(),
+                retry_after_seconds,
+            },
             Err(error) => Held::Failed {
                 retry_at: now + retry_delay(&error),
             },
@@ -629,31 +681,62 @@ impl PairingAdmissions {
         }
     }
 
-    /// Whether the service has told this device it has no free capacity to admit it through the
-    /// relay a dial to `host` addresses, and that answer still stands.
+    /// What the service's answer says a dial to `host` that failed was held back by, when it says
+    /// anything and that answer still stands: no free capacity to admit this device through the
+    /// relay the dial addresses, with the paths that still work and the delay it named, or a fault
+    /// of the service itself.
     ///
     /// It decides what a dial that failed is reported as: a managed relay that cannot admit a
     /// device is not a host that cannot be reached.
     #[must_use]
-    pub fn capacity_refused(&self, network: &NetworkConfig, host: &EndpointKey) -> bool {
-        let Some(key) = self.dialled_key(network, host) else {
-            return false;
-        };
+    pub fn refusal(&self, network: &NetworkConfig, host: &EndpointKey) -> Option<RelayRefusal> {
+        let key = self.dialled_key(network, host)?;
         let now = self.clock.now();
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = state.entries.get(&key)?;
         // An answer that the service is unable stands for as long as it explains a failed dial, and
         // for as long as the cache will not ask again (three requests with no connection, until the
         // ten minutes after the last), because nothing renews it while no request is made.
-        state
-            .entries
-            .get(&key)
-            .is_some_and(|entry| match entry.held {
-                Held::Unavailable { kept_until, .. } => {
-                    now < kept_until || (entry.asks >= MOST_ASKS && !entry.window_passed(now))
-                }
-                _ => false,
-            })
+        match &entry.held {
+            Held::Unavailable {
+                kept_until,
+                alternatives,
+                retry_after_seconds,
+                ..
+            } if now < *kept_until || (entry.asks >= MOST_ASKS && !entry.window_passed(now)) => {
+                Some(if alternatives.is_empty() {
+                    RelayRefusal::Fault {
+                        retry_after_seconds: *retry_after_seconds,
+                    }
+                } else {
+                    RelayRefusal::Capacity {
+                        alternatives: alternatives.clone(),
+                        retry_after_seconds: *retry_after_seconds,
+                    }
+                })
+            }
+            _ => None,
+        }
     }
+}
+
+/// What a standing answer of the managed service says a failed dial was held back by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RelayRefusal {
+    /// The service has no managed capacity to admit this device through the relay now, and named
+    /// the paths that still work.
+    Capacity {
+        /// The paths it named, each as it wrote it. Never empty.
+        alternatives: Alternatives,
+        /// Seconds after which the same request could succeed, as the service named them.
+        retry_after_seconds: Option<u64>,
+    },
+    /// The service failed on its side, and no capacity was refused. An answer that names no path,
+    /// and a refusal in its envelope under a status of the 5xx class, are this.
+    Fault {
+        /// Seconds after which the same request could succeed, when the answer named them.
+        retry_after_seconds: Option<u64>,
+    },
 }
 
 /// A relay's URL as the cache compares it: no trailing slash, scheme and host in lower case.
@@ -670,9 +753,24 @@ fn named_time(seconds: u64) -> Duration {
 fn retry_delay(error: &ClientError) -> Duration {
     match error {
         ClientError::Refused {
-            retry_after_seconds: Some(seconds),
+            retry_after_seconds,
             ..
-        } => named_time(*seconds).max(DOUBT_AFTER),
+        } => after_a_refusal(*retry_after_seconds),
         _ => DOUBT_AFTER,
     }
+}
+
+/// How long after a refusal in the service's envelope a dial asks again: the wait it named, and not
+/// less than [`DOUBT_AFTER`].
+fn after_a_refusal(named: Option<u64>) -> Duration {
+    named.map_or(DOUBT_AFTER, |seconds| named_time(seconds).max(DOUBT_AFTER))
+}
+
+/// How long an answer that the service is unable is kept: the delay it named, and at least
+/// [`KEEP_UNAVAILABLE`].
+fn kept_for(named: Option<u64>) -> Duration {
+    named
+        .map(named_time)
+        .unwrap_or_default()
+        .max(KEEP_UNAVAILABLE)
 }
