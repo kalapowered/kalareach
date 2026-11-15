@@ -2762,6 +2762,14 @@ impl kr_client::transport::ControlTransport for Tapped {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.close();
     }
+
+    fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    fn can_send(&self) -> bool {
+        self.inner.can_send()
+    }
 }
 
 impl kr_client::pairing::link::HostLink for ControlledLink {
