@@ -70,7 +70,7 @@ fn not_shown() -> ControlFrame {
 
 /// What a caller is told, in the words of `lapse`, when a request is refused for it.
 fn refused_for(lapse: Lapse) -> ControlFrame {
-    let refusal = lapse.refusal().expect("the member has words of its own");
+    let refusal = lapse.refusal();
     error_reply(REQUEST, refusal.code(), refusal.to_string())
 }
 

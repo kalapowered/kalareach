@@ -24,7 +24,7 @@ use crate::given::{Given, Recorded, Settled};
 
 use super::identifiers::{Arrival, SpendError};
 use super::local_access::LeaseHeld;
-use super::{Controller, Footing, Lapse, error_reply, net, respond};
+use super::{Controller, Footing, Lapse, LeasedLapse, error_reply, net, respond};
 
 /// How often the daemon replaces a live connection's action window.
 ///
@@ -365,8 +365,9 @@ impl Controller {
             #[cfg(feature = "testing")]
             self.after_the_lease_is_read.wait();
             match under.asked_holding(held.bound) {
-                Err(Lapse::BoundMoved) => {}
-                asked => return asked,
+                Err(LeasedLapse::BoundMoved) => {}
+                Err(LeasedLapse::Lapse(lapse)) => return Err(lapse),
+                Ok(()) => return Ok(()),
             }
         }
     }
