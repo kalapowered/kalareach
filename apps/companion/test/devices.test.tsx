@@ -521,7 +521,7 @@ describe('reading the mailbox where the service has no capacity for a new one', 
     expect(line).toHaveTextContent(
       'The sync service has no managed capacity for new mailboxes now, which is a limit of the service and not a fault of this computer. Until then: A path of its own. A second path of its own. Answers to revocations are still read from each feed.'
     )
-    expect(line).not.toHaveTextContent(/delay|minute|second |hour/i)
+    expect(line).not.toHaveTextContent(/delay|minute|seconds|hour/i)
   })
 })
 

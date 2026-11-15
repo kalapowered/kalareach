@@ -3032,11 +3032,20 @@ async fn kr_req_17_48_a_service_with_no_capacity_for_a_new_feed_is_said_as_its_l
                 assert!(!detail.contains("Until then"), "{detail}");
             }
         }
-        let (waited, _release) = within("the carrier waits", rig.timer.next_wait()).await;
-        assert!(
-            waited >= Duration::from_secs(600),
-            "the carrier waits out the delay whichever words are said: {waited:?}"
-        );
+        // The waits of the passes before this one were asked for first; the one the refusal's delay
+        // owes is the first that is longer than the poll interval.
+        within(
+            "the carrier waits out the delay whichever words are said",
+            async {
+                loop {
+                    let (waited, _release) = rig.timer.next_wait().await;
+                    if waited >= Duration::from_secs(600) {
+                        break;
+                    }
+                }
+            },
+        )
+        .await;
     }
 }
 

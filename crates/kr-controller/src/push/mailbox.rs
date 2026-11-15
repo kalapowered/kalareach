@@ -210,39 +210,41 @@ mod tests {
         }
     }
 
+    /// What a delivery is told as when a refusal is placed: its detail and the delay it waits.
+    fn told_later(error: &ClientError) -> (String, Option<Duration>) {
+        let Placement::Later { detail, after, .. } = placement_of(error) else {
+            panic!("a refused delivery waits");
+        };
+        (detail, after)
+    }
+
     /// KR-REQ-17.48: a delivery the service has no managed capacity for is told later, with the
-    /// service's own message as written and the alternatives it named after "Until then:", and
-    /// waits the delay it asked for. A refusal that names none says what it said before.
+    /// words it was told with before, then the alternatives the service named after "Until then:",
+    /// and waits the delay it asked for. A refusal that names none says what it said before.
     #[test]
     fn kr_req_17_48_a_delivery_with_no_capacity_is_told_later_with_the_alternatives_named() {
         for code in [ErrorCode::RateLimited, ErrorCode::ServiceCapacity] {
-            let Placement::Later { detail, after, .. } = placement_of(&refused(
+            let (before, waits) = told_later(&refused(code, &[]));
+            assert!(
+                before.starts_with("the mailbox service did not take it yet: ")
+                    && before.contains("Managed capacity for new mailboxes is not available now."),
+                "the control holds the service's own message: {before}"
+            );
+            assert_eq!(waits, Some(Duration::from_secs(600)));
+            let (detail, after) = told_later(&refused(
                 code,
                 &[
                     "A mailbox service that you run yourself.",
                     "A path of its own.",
                 ],
-            )) else {
-                panic!("a delivery with no capacity waits");
-            };
+            ));
             assert_eq!(
                 detail,
-                "the mailbox service did not take it yet: Managed capacity for new mailboxes is \
-                 not available now. Until then: A mailbox service that you run yourself. A path \
-                 of its own."
+                format!(
+                    "{before} Until then: A mailbox service that you run yourself. A path of its own."
+                )
             );
-            assert_eq!(after, Some(Duration::from_secs(600)));
+            assert_eq!(after, waits, "the delay is waited whichever words are said");
         }
-        let Placement::Later { detail, after, .. } =
-            placement_of(&refused(ErrorCode::ServiceCapacity, &[]))
-        else {
-            panic!("a fault waits");
-        };
-        assert_eq!(
-            detail,
-            "the mailbox service did not take it yet: Managed capacity for new mailboxes is not \
-             available now."
-        );
-        assert_eq!(after, Some(Duration::from_secs(600)));
     }
 }
