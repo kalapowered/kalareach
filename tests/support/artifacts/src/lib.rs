@@ -477,7 +477,10 @@ mod tests {
 
     /// A temporary folder that is no root is left as it was: a run that sets no variable is
     /// refused before the directory of its own is made in it, and the words name that folder. The
-    /// case reads through `directory`, as a program does.
+    /// case reads through `directory`, as a program does. Off Unix there is no such folder: Windows
+    /// makes a relative temporary folder absolute against the working directory, and a folder it
+    /// names is a root.
+    #[cfg(unix)]
     #[test]
     fn nothing_is_made_in_a_temporary_folder_that_is_no_root() {
         let working = temporary();
