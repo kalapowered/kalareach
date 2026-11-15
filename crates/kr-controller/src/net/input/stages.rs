@@ -84,6 +84,9 @@ mod with_seams {
         pub records_peak: u64,
         /// How many times a detach that took effect, or may have, told the streams of an attachment.
         pub detaches: u64,
+        /// How many times the task that ends a stream for a detach asked for the stream's graceful
+        /// end, after its wait for the worker's notice was over.
+        pub detach_ends: u64,
         /// How many times a stream was cut because its lane or its write failed or its worker did
         /// not answer (the bound of acknowledgements the device has not read is not counted).
         pub cuts: u64,
@@ -106,6 +109,7 @@ mod with_seams {
         records: Gauge,
         read: AtomicU64,
         detaches: AtomicU64,
+        detach_ends: AtomicU64,
         cuts: AtomicU64,
         frame_deadline_ms: AtomicU64,
         reads_full: watch::Sender<u64>,
@@ -130,6 +134,7 @@ mod with_seams {
                 records: Gauge::default(),
                 read: AtomicU64::new(0),
                 detaches: AtomicU64::new(0),
+                detach_ends: AtomicU64::new(0),
                 cuts: AtomicU64::new(0),
                 frame_deadline_ms: AtomicU64::new(0),
                 reads_full: watch::channel(0).0,
@@ -228,6 +233,7 @@ mod with_seams {
                 unanswered,
                 unanswered_peak,
                 detaches: self.detaches.load(Ordering::SeqCst),
+                detach_ends: self.detach_ends.load(Ordering::SeqCst),
                 cuts: self.cuts.load(Ordering::SeqCst),
             }
         }
@@ -316,6 +322,10 @@ mod with_seams {
             self.detaches.fetch_add(1, Ordering::SeqCst);
         }
 
+        pub(in crate::service::net) fn detach_end_asked(&self) {
+            self.detach_ends.fetch_add(1, Ordering::SeqCst);
+        }
+
         pub(in crate::service::net) fn stream_cut(&self) {
             self.cuts.fetch_add(1, Ordering::SeqCst);
         }
@@ -399,6 +409,8 @@ mod without_seams {
         pub(in crate::service::net) fn waits_to_drain(&self) {}
 
         pub(in crate::service::net) fn detach_told(&self) {}
+
+        pub(in crate::service::net) fn detach_end_asked(&self) {}
 
         pub(in crate::service::net) fn stream_cut(&self) {}
 
