@@ -289,7 +289,7 @@ struct Authority {
 /// The order of a connection is the number this worker drew when it answered the connection's
 /// hello. For links the daemon opens one after another it is the order of its opens; for links it
 /// opens at the same time, the order in which this worker happened to answer the hellos decides.
-/// The proxy role has no record: its connections form a set, and none replaces another.
+/// The proxy roles have no record: their connections form a set, and none replaces another.
 #[derive(Clone, Copy, Debug, Default)]
 struct AcceptedOrders {
     authority: Option<u64>,
@@ -306,7 +306,7 @@ impl AcceptedOrders {
             ControllerConnectionRole::Attention => self.attention,
             ControllerConnectionRole::Descriptions => self.descriptions,
             ControllerConnectionRole::Checks => self.checks,
-            ControllerConnectionRole::Proxy => None,
+            ControllerConnectionRole::Proxy | ControllerConnectionRole::ProxyInput => None,
         }
     }
 
@@ -317,7 +317,7 @@ impl AcceptedOrders {
             ControllerConnectionRole::Attention => self.attention = Some(order),
             ControllerConnectionRole::Descriptions => self.descriptions = Some(order),
             ControllerConnectionRole::Checks => self.checks = Some(order),
-            ControllerConnectionRole::Proxy => {}
+            ControllerConnectionRole::Proxy | ControllerConnectionRole::ProxyInput => {}
         }
     }
 }
