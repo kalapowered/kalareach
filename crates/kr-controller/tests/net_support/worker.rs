@@ -1123,6 +1123,15 @@ pub async fn revoke(host: &Host, grant_id: kr_protocol::ids::GrantId) {
         .expect("the grant is revoked");
 }
 
+/// A device paired with the host that holds the input lease of an attachment to a session, as the
+/// device types from. The attachment lives as long as the connection does.
+pub struct Typist {
+    pub session: kr_client::session::Session,
+    pub device: super::Device,
+    pub attachment_id: kr_protocol::ids::AttachmentId,
+    pub epoch: kr_protocol::ids::InputLeaseEpoch,
+}
+
 /// Types `text` into the terminal of `session_id` as a device that is paired with the host and may
 /// type does, on the input lane of its attachment. The connection that typed is returned with the
 /// device and the lane: the attachment lives as long as the connection does, and the screen keeps
@@ -1137,6 +1146,27 @@ pub async fn type_into(
     super::Device,
     super::typing::Typing,
 ) {
+    let typist = a_typist(host, owner, session_id).await;
+    // The typing is accepted before the connection is handed back, as the one call that typed here
+    // was done once the host had answered it.
+    let mut input = super::typing::Typing::open(
+        &typist.session,
+        host.environment_id,
+        session_id,
+        typist.attachment_id,
+    )
+    .await
+    .expect("the input lane opens");
+    input
+        .type_bytes(typist.epoch, text.as_bytes())
+        .await
+        .expect("the input is accepted");
+    (typist.session, typist.device, input)
+}
+
+/// Pairs a device that may type with the host, connects it, attaches it to the terminal of
+/// `session_id` and gives its attachment the input lease.
+pub async fn a_typist(host: &Host, owner: &DeviceKeys, session_id: SessionId) -> Typist {
     use kr_protocol::attachment::{
         AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
     };
@@ -1206,17 +1236,12 @@ pub async fn type_into(
         .expect("the lease is settled")
         .to_typed()
         .expect("a lease");
-    // The typing is accepted before the connection is handed back, as the one call that typed here
-    // was done once the host had answered it.
-    let mut input =
-        super::typing::Typing::open(&session, host.environment_id, session_id, attachment_id)
-            .await
-            .expect("the input lane opens");
-    input
-        .type_bytes(acquired.lease.epoch, text.as_bytes())
-        .await
-        .expect("the input is accepted");
-    (session, typist, input)
+    Typist {
+        session,
+        device: typist,
+        attachment_id,
+        epoch: acquired.lease.epoch,
+    }
 }
 
 /// An upstream that takes every prompt and answers it only once it is released, so a prompt stays
