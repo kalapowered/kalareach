@@ -380,6 +380,15 @@ impl Moved {
         );
     }
 
+    /// Takes the continuous clock `by` forward and leaves the wall clock where it is: the clock
+    /// that counts the time a machine sleeps has run on, and nothing else has.
+    pub fn advance_continuous(&self, by: Duration) {
+        self.continuous_ahead_ns.fetch_add(
+            u64::try_from(by.as_nanos()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
     /// Takes the wall clock two days on and leaves the continuous clock where it is: the grant
     /// `proposal` gives a session invitation has run out by UTC, and the deadlines a request was
     /// admitted under, which are counted on the continuous clock, have not.

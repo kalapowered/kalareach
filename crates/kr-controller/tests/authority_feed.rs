@@ -4496,6 +4496,141 @@ async fn a_carrier_that_reads_the_feed_again_clears_what_the_clock_said() {
     assert_eq!(check.status, DoctorStatus::Ok, "{check:?}");
 }
 
+/// As [`within`], for a pass that begins as soon as a look the case released finds the clock past
+/// the end of the wait: a carrier that does not look, or looks and does not begin it, ends the case
+/// here and not at `within`'s limit.
+async fn soon<T>(what: &str, work: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(30), work)
+        .await
+        .unwrap_or_else(|_| panic!("gave up waiting for {what}"))
+}
+
+/// KR-REQ-10.46: a machine that slept through the carrier's wait asks the feed again within five
+/// seconds of waking, with nothing to wake the carrier: the timer a wait is made by does not count
+/// the time a machine sleeps on macOS and Linux, so the wait is also over when the daemon's
+/// continuous clock has passed its end, and the clock is read every five seconds. Before that, the
+/// carrier does not ask early: a look at a clock that has not reached the end of the poll asks
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_carrier_that_slept_through_its_wait_reads_the_feed_within_five_seconds_of_waking() {
+    let (moved, clocks) = Moved::new();
+    let rig = Rig::start_on(clocks).await;
+    let looks = HeldTimer::held();
+    rig.runtime().count_looks_by(Arc::clone(&looks) as _);
+    // The pass that ends here is read by the status, and the wait that follows it is counted by
+    // the case's looks.
+    rig.poll().await;
+    let shown = rig.shown().await;
+    assert!(
+        !shown.list.feed_stale,
+        "the control: the feed was just read, and the timer has most of its thirty seconds left"
+    );
+    let (look, release) = soon("the carrier looks at the clock", looks.next_wait()).await;
+    assert!(
+        look <= Duration::from_secs(5),
+        "the carrier reads the clock at least every five seconds: {look:?}"
+    );
+    let wakes = rig.runtime().wakes();
+    let reads = rig.arrivals("read");
+    let mut passes = rig.runtime().passes();
+    let seen = *passes.borrow_and_update();
+
+    // Twenty seconds on, a look finds the poll's end ahead, and asks nothing.
+    moved.advance_continuous(Duration::from_secs(20));
+    release.notify_one();
+    let (_, release) = soon("the carrier looks again", looks.next_wait()).await;
+    assert_eq!(
+        (rig.arrivals("read"), *passes.borrow()),
+        (reads, seen),
+        "a look at a clock that has not reached the end of the poll begins no pass"
+    );
+
+    // The machine slept five minutes, and the next look begins a pass.
+    moved.advance_continuous(Duration::from_secs(5 * 60));
+    release.notify_one();
+    soon("the pass the sleep owed", async {
+        while rig.arrivals("read") == reads || *passes.borrow_and_update() <= seen {
+            passes.changed().await.expect("the carrier is running");
+        }
+    })
+    .await;
+    assert_eq!(
+        rig.runtime().wakes(),
+        wakes,
+        "nothing woke the carrier: the look did"
+    );
+    let shown = rig.shown().await;
+    assert!(
+        !shown.list.feed_stale,
+        "the pass read the feed, and the status is current after it"
+    );
+    let check = shown.check.expect("the doctor reports the feed");
+    assert_eq!(check.status, DoctorStatus::Ok, "{check:?}");
+}
+
+/// KR-REQ-10.46: the delay a feed named is counted on the timer's clock, which does not count the
+/// time a machine sleeps on macOS and Linux either. A machine that slept past it asks the feed again
+/// within five seconds of waking, and does not wait out what the timer's clock still holds of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_carrier_that_slept_past_a_delay_the_feed_named_reads_the_feed_within_five_seconds() {
+    let (moved, clocks) = Moved::new();
+    let rig = Rig::start_on(clocks).await;
+    let looks = HeldTimer::held();
+    rig.runtime().count_looks_by(Arc::clone(&looks) as _);
+    rig.served.web().fail_with_member(
+        AUTHORITY,
+        "read",
+        1,
+        Moment::Refuse {
+            status: 503,
+            code: "SERVICE_UNAVAILABLE",
+            retry_after_seconds: Some(120),
+        },
+    );
+    rig.poll().await;
+    assert!(
+        rig.shown().await.list.feed_stale,
+        "the control: the pass could not read the feed"
+    );
+    let (look, release) = soon("the carrier looks at the clock", looks.next_wait()).await;
+    assert!(
+        look <= Duration::from_secs(5),
+        "the carrier reads the clock at least every five seconds: {look:?}"
+    );
+    let wakes = rig.runtime().wakes();
+    let reads = rig.arrivals("read");
+    let mut passes = rig.runtime().passes();
+    let seen = *passes.borrow_and_update();
+
+    // A minute on, the delay is not over, and a look asks nothing.
+    moved.advance_continuous(Duration::from_secs(60));
+    release.notify_one();
+    let (_, release) = soon("the carrier looks again", looks.next_wait()).await;
+    assert_eq!(
+        (rig.arrivals("read"), *passes.borrow()),
+        (reads, seen),
+        "a look at a clock that has not counted the delay begins no pass"
+    );
+
+    // The machine slept past it, and the timer's clock still holds all of it.
+    moved.advance_continuous(Duration::from_secs(5 * 60));
+    release.notify_one();
+    soon("the pass the sleep owed", async {
+        while rig.arrivals("read") == reads || *passes.borrow_and_update() <= seen {
+            passes.changed().await.expect("the carrier is running");
+        }
+    })
+    .await;
+    assert_eq!(rig.runtime().wakes(), wakes, "nothing woke the carrier");
+    let shown = rig.shown().await;
+    assert!(
+        !shown.list.feed_stale,
+        "the pass read the feed, and the status is current after it"
+    );
+    let check = shown.check.expect("the doctor reports the feed");
+    assert_eq!(check.status, DoctorStatus::Ok, "{check:?}");
+}
+
 /// KR-REQ-10.46: a host that starts with its feed unreachable knows only the time an earlier run
 /// wrote down. Its age cannot be told, so the device list and the doctor read stale, and the
 /// doctor gives no number of seconds: a count taken from an earlier run's wall clock would say how

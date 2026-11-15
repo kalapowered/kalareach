@@ -21,7 +21,9 @@
 //!   most [`GATE_WAIT`] for it. A feed that does not answer in that time leaves the connection
 //!   served; the status goes stale when the pass that was held ends without an answer, as it does
 //!   for an unreachable feed.
-//! * **Every [`FEED_POLL_INTERVAL_MS`] after that**, while the daemon runs.
+//! * **Every [`FEED_POLL_INTERVAL_MS`] after that**, while the daemon runs. The interval is counted
+//!   on the daemon's continuous clock, which counts the time the machine sleeps, so after a wake
+//!   the next pass begins within five seconds, whether or not anybody reads the status.
 //! * **When an owner is revoked**, so the key it held stops being named as one that may remove the
 //!   feed.
 //! * **When the host finds an announcement in its mailbox** ([`crate::mailbox_reader`]), so a
@@ -69,6 +71,7 @@ use kr_protocol::pairing::{
 };
 use kr_protocol::scalars::{CanonicalSet, KeyId, Signature64, TimestampMs};
 use kr_protocol::service::GatewayOrigin;
+use kr_transport::clock::ContinuousInstant;
 use kr_transport::config::ProxyUrl;
 use kr_transport::reconnect::Backoff;
 use tokio::task::JoinHandle;
@@ -77,7 +80,7 @@ use crate::error::{ControllerError, Result};
 use crate::grants::Refusal;
 use crate::grants::feed::{FEED_POLL_INTERVAL_MS, FeedReading, RetainedRevocation};
 use crate::grants::restored::Target;
-use crate::quiet::{Quiet, Timer};
+use crate::quiet::{Owed, Quiet, Timer};
 use crate::service::remote_revocation::{DrainWhy, Ground, Judged, Replay, StuckDrain, Unverified};
 use crate::service::{Controller, OwedWrite};
 
@@ -91,6 +94,13 @@ pub const FEED_DEADLINES: HttpDeadlines = HttpDeadlines {
 /// The most a connection waits for the synchronisation section 10 asks for before affected remote
 /// access.
 pub const GATE_WAIT: Duration = Duration::from_secs(5);
+
+/// How often the carrier reads the daemon's continuous clock while it waits to ask the feed again.
+///
+/// The timer a wait is made by does not count the time a machine sleeps on every platform, so the
+/// wait is also over when the continuous clock has passed its end. A machine that slept through a
+/// wait therefore asks again within this long of waking.
+const CLOCK_LOOK: Duration = Duration::from_secs(5);
 
 /// The most pages of a feed one pass reads, so a feed that never stops saying there is more cannot
 /// hold the carrier. A pass that stops there has not read the feed through, and the next goes on at
@@ -400,6 +410,10 @@ struct Shared {
     scan_undecided: Mutex<Option<Undecided>>,
     observed: Mutex<Observed>,
     controller: OnceLock<Weak<Controller>>,
+    /// What the carrier counts the time between its looks at the continuous clock by, which is the
+    /// real timer. A build for the test suites uses one that nothing releases, so that a suite that
+    /// holds the carrier's waits is not moved by a look it did not ask for.
+    looks: Mutex<Arc<dyn Timer>>,
     /// How many passes have finished, for whatever waits on one.
     passes: tokio::sync::watch::Sender<u64>,
 }
@@ -601,6 +615,10 @@ impl FeedRuntime {
         timer: Arc<dyn Timer>,
     ) -> Self {
         let own_feed = client.own_feed();
+        #[cfg(feature = "testing")]
+        let looks: Arc<dyn Timer> = crate::testing::HeldTimer::held();
+        #[cfg(not(feature = "testing"))]
+        let looks: Arc<dyn Timer> = Arc::new(crate::quiet::RealTimer);
         Self {
             shared: Arc::new(Shared {
                 client,
@@ -636,6 +654,7 @@ impl FeedRuntime {
                 scan_undecided: Mutex::default(),
                 observed: Mutex::default(),
                 controller: OnceLock::new(),
+                looks: Mutex::new(looks),
                 passes: tokio::sync::watch::channel(0).0,
             }),
             timer,
@@ -729,6 +748,18 @@ impl FeedRuntime {
         {
             task.abort();
         }
+    }
+
+    /// Counts the time between the carrier's looks at the continuous clock by `timer`, from its
+    /// next wait on. A suite that is about a machine that slept holds the looks by a timer of its
+    /// own; every other suite leaves them to a timer nothing releases.
+    #[cfg(feature = "testing")]
+    pub fn count_looks_by(&self, timer: Arc<dyn Timer>) {
+        *self
+            .shared
+            .looks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = timer;
     }
 
     /// Shortens what a connection waits for a synchronisation, for a suite that holds the feed's
@@ -1211,6 +1242,10 @@ async fn drive(shared: Arc<Shared>, timer: Arc<dyn Timer>) {
                 }
             }
         };
+        // The wait is counted on the daemon's continuous clock as well as by the timer, which
+        // does not count the time the machine sleeps on every platform.
+        let began = controller.continuous_now();
+        let owed = shared.quiet.owed();
         drop(controller);
         if chained {
             // The feed holds more than a pass reads. Nothing waits for this pass, because it
@@ -1230,13 +1265,62 @@ async fn drive(shared: Arc<Shared>, timer: Arc<dyn Timer>) {
         }
         match wait {
             Some(duration) => {
+                let looks =
+                    Arc::clone(&shared.looks.lock().unwrap_or_else(PoisonError::into_inner));
+                let wait = Wait {
+                    began,
+                    duration,
+                    owed,
+                };
                 tokio::select! {
                     () = &mut woken => {}
                     () = timer.sleep(duration) => {}
+                    () = until_the_continuous_clock_ends(&shared, looks.as_ref(), wait) => {}
                 }
             }
             None => woken.await,
         }
+    }
+}
+
+/// A wait between two passes, as the daemon's continuous clock counts it.
+struct Wait {
+    /// When the wait began.
+    began: ContinuousInstant,
+    /// How long it is.
+    duration: Duration,
+    /// The delay the service named when it began, if one was owed: it is counted on the timer's
+    /// clock, which does not count the time the machine sleeps on every platform.
+    owed: Option<Owed>,
+}
+
+/// Ends when the daemon's continuous clock has passed the end of `wait`. It reads that clock every
+/// [`CLOCK_LOOK`], counting the time between two reads by `looks`, so that a wait the machine
+/// slept through ends within that long of the wake. It also ends when the daemon is gone, and the
+/// carrier then ends with it.
+///
+/// A delay the service named that the same clock has counted is over, and is ended with the wait:
+/// the carrier asks the feed again without waiting out what the timer's clock still holds of it.
+async fn until_the_continuous_clock_ends(shared: &Shared, looks: &dyn Timer, wait: Wait) {
+    let Some(ends) = wait.began.checked_add(wait.duration) else {
+        return std::future::pending().await;
+    };
+    loop {
+        looks.sleep(CLOCK_LOOK).await;
+        let Some(controller) = shared.controller.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        let now = controller.continuous_now();
+        drop(controller);
+        if now < ends {
+            continue;
+        }
+        if let Some(owed) = wait.owed
+            && now.saturating_duration_since(wait.began) >= owed.left
+        {
+            shared.quiet.passed(owed.until);
+        }
+        return;
     }
 }
 
