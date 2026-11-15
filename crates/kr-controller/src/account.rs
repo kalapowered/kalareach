@@ -169,6 +169,11 @@ impl Service {
     }
 }
 
+/// What a refusal says when the request had already ended the sign-in that was waiting for the
+/// browser: that sign-in is not brought back by the refusal.
+const EARLIER_SIGN_IN_CANCELLED: &str = "The sign-in that was waiting for the browser was cancelled \
+     before this request was refused, and it stays cancelled.";
+
 /// What a finished attempt shows a person's browser.
 const fn page(outcome: AccountAttempt) -> &'static str {
     match outcome {
@@ -774,7 +779,8 @@ impl HostAccount {
     /// [`Self::report`].
     ///
     /// `stands` is asked before the waiting sign-in is ended and again before this one is shown as
-    /// waiting, because the waits between them can outlast the request's authority.
+    /// waiting, because the waits between them can outlast the request's authority. A refusal after
+    /// the waiting sign-in was ended says so ([`EARLIER_SIGN_IN_CANCELLED`]).
     ///
     /// # Errors
     ///
@@ -794,63 +800,77 @@ impl HostAccount {
         }
         self.inner.not_finishing()?;
         self.still_stands(stands).await?;
-        if let Some(older) = running.take() {
-            older.end().await;
-        }
-        let listener = match self.listener().await {
-            Ok(listener) => listener,
-            Err(error) => {
-                let (attempt, detail) = match error {
-                    BindError::Busy => (
-                        AccountAttempt::PortBusy,
-                        "another program holds the loopback address a sign-in comes back to"
-                            .to_owned(),
-                    ),
-                    BindError::Failed(error) => (
-                        AccountAttempt::ListenerFailed,
-                        format!(
-                            "the loopback address a sign-in comes back to could not be opened: \
-                             {error}"
-                        ),
-                    ),
-                };
-                self.inner.state.lock().expect("the sign-in state").last = Some(attempt);
-                return Err(ControllerError::Refused {
-                    code: ErrorCode::ResourceUnavailable,
-                    detail,
-                });
+        let cancelled = match running.take() {
+            Some(older) => {
+                older.end().await;
+                true
             }
+            None => false,
         };
-        self.still_stands(stands).await?;
-        let request = AuthorisationRequest::asking_at_origin(
-            &held.origin,
-            Client::Desktop,
-            Redirect::Loopback,
-            &held.scopes,
-        )
-        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        let url = request.url();
-        let pending = PendingAuthorisation::new(request);
-        let expires_at_ms = kr_ipc::now_ms()
-            .get()
-            .saturating_add(u64::try_from(WAIT.as_millis()).unwrap_or(u64::MAX));
-        self.inner.state.lock().expect("the sign-in state").phase = Phase::Waiting {
-            url,
-            address: listener.local_address().to_string(),
-            expires_at_ms,
-        };
-        let (cancel, cancelled) = watch::channel(false);
-        let inner = Arc::clone(&self.inner);
-        let task = tokio::spawn(async move {
-            inner.attempt(listener, pending, cancelled).await;
-        });
-        *running = Some(Running {
-            owner: Arc::downgrade(&self.inner),
-            cancel,
-            task,
-        });
-        Ok(AccountSignInStarted {
-            expires_at_ms: TimestampMs::new(expires_at_ms),
+        let started: Result<AccountSignInStarted> = async {
+            let listener = match self.listener().await {
+                Ok(listener) => listener,
+                Err(error) => {
+                    let (attempt, detail) = match error {
+                        BindError::Busy => (
+                            AccountAttempt::PortBusy,
+                            "another program holds the loopback address a sign-in comes back to"
+                                .to_owned(),
+                        ),
+                        BindError::Failed(error) => (
+                            AccountAttempt::ListenerFailed,
+                            format!(
+                                "the loopback address a sign-in comes back to could not be opened: \
+                                 {error}"
+                            ),
+                        ),
+                    };
+                    self.inner.state.lock().expect("the sign-in state").last = Some(attempt);
+                    return Err(ControllerError::Refused {
+                        code: ErrorCode::ResourceUnavailable,
+                        detail,
+                    });
+                }
+            };
+            self.still_stands(stands).await?;
+            let request = AuthorisationRequest::asking_at_origin(
+                &held.origin,
+                Client::Desktop,
+                Redirect::Loopback,
+                &held.scopes,
+            )
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+            let url = request.url();
+            let pending = PendingAuthorisation::new(request);
+            let expires_at_ms = kr_ipc::now_ms()
+                .get()
+                .saturating_add(u64::try_from(WAIT.as_millis()).unwrap_or(u64::MAX));
+            self.inner.state.lock().expect("the sign-in state").phase = Phase::Waiting {
+                url,
+                address: listener.local_address().to_string(),
+                expires_at_ms,
+            };
+            let (cancel, cancelled) = watch::channel(false);
+            let inner = Arc::clone(&self.inner);
+            let task = tokio::spawn(async move {
+                inner.attempt(listener, pending, cancelled).await;
+            });
+            *running = Some(Running {
+                owner: Arc::downgrade(&self.inner),
+                cancel,
+                task,
+            });
+            Ok(AccountSignInStarted {
+                expires_at_ms: TimestampMs::new(expires_at_ms),
+            })
+        }
+        .await;
+        started.map_err(|error| {
+            if cancelled {
+                error.after_an_effect(EARLIER_SIGN_IN_CANCELLED)
+            } else {
+                error
+            }
         })
     }
 
@@ -863,7 +883,8 @@ impl HostAccount {
     /// `stands` is asked before the waiting sign-in is ended, again once the account is settled, and
     /// a last time under the account's own hold, immediately before the revocation is queued and the
     /// grant deleted, because each wait between them can outlast the request's authority: a token
-    /// refresh keeps that hold across its request to the service.
+    /// refresh keeps that hold across its request to the service. A refusal after the waiting
+    /// sign-in was ended says so ([`EARLIER_SIGN_IN_CANCELLED`]).
     ///
     /// # Errors
     ///
@@ -880,38 +901,50 @@ impl HostAccount {
         self.inner.not_finishing()?;
         self.still_stands(stands).await?;
         // Only this account's waiting sign-in ends with its sign-out.
-        if running
+        let cancelled = if running
             .as_ref()
             .is_some_and(|older| older.is_of(&self.inner))
             && let Some(older) = running.take()
         {
             older.end().await;
-        }
-        self.inner
-            .recover()
-            .await
-            .map_err(|detail| ControllerError::Storage {
-                operation: "settle this host's account before signing it out",
-                detail,
-            })?;
-        self.still_stands(stands).await?;
-        let _change = self.inner.begin_change()?;
-        // The account's own hold can be kept across a token refresh's request to the service, and
-        // the change waits for it. The last ask is made under that hold, immediately before the
-        // revocation is queued and the grant deleted.
-        let done =
-            held.signed_in
-                .sign_out(stands)
+            true
+        } else {
+            false
+        };
+        // From here the earlier sign-in is ended, and a refusal says so.
+        let signed_out: Result<AccountSignedOut> = async {
+            self.inner
+                .recover()
                 .await
-                .map_err(|error| ControllerError::Storage {
+                .map_err(|detail| ControllerError::Storage {
+                    operation: "settle this host's account before signing it out",
+                    detail,
+                })?;
+            self.still_stands(stands).await?;
+            let _change = self.inner.begin_change()?;
+            // The account's own hold can be kept across a token refresh's request to the service,
+            // and the change waits for it. The last ask is made under that hold, immediately
+            // before the revocation is queued and the grant deleted.
+            let done = held.signed_in.sign_out(stands).await.map_err(|error| {
+                ControllerError::Storage {
                     operation: "sign this host out",
                     detail: error.to_string(),
-                })??;
-        // What came of earlier attempts says nothing about a host with no account.
-        self.inner.state.lock().expect("the sign-in state").last = None;
-        Ok(AccountSignedOut {
-            was_signed_in: done.was_signed_in,
-            service_told: done.service_told,
+                }
+            })??;
+            // What came of earlier attempts says nothing about a host with no account.
+            self.inner.state.lock().expect("the sign-in state").last = None;
+            Ok(AccountSignedOut {
+                was_signed_in: done.was_signed_in,
+                service_told: done.service_told,
+            })
+        }
+        .await;
+        signed_out.map_err(|error| {
+            if cancelled {
+                error.after_an_effect(EARLIER_SIGN_IN_CANCELLED)
+            } else {
+                error
+            }
         })
     }
 

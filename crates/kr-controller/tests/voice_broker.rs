@@ -1595,11 +1595,24 @@ async fn a_sign_out_ends_the_sign_in_that_is_waiting() {
 
 /// A sign-in at the host's local socket, and what the daemon answers.
 async fn try_sign_in(host: &net_support::Host) -> Result<(), ProtocolError> {
-    host.client()
-        .await
+    sign_in_as(host, ActionId::new(kr_ipc::new_uuid())).await
+}
+
+/// Starts the host's own sign-in at its local socket under the action given.
+async fn sign_in_as(host: &net_support::Host, action: ActionId) -> Result<(), ProtocolError> {
+    sign_in_on(&mut host.client().await, host, action).await
+}
+
+/// Starts the host's own sign-in on the connection given, under the action given.
+async fn sign_in_on(
+    client: &mut kr_ipc::client::LocalClient,
+    host: &net_support::Host,
+    action: ActionId,
+) -> Result<(), ProtocolError> {
+    client
         .mutate(
             Method::AccountSignIn,
-            ActionId::new(kr_ipc::new_uuid()),
+            action,
             ActionTarget::environment(host.environment_id),
             &AccountSignInParams {},
         )
@@ -1715,6 +1728,141 @@ async fn a_sign_out_that_meets_a_fence_before_it_removes_the_grant_removes_nothi
     assert!(sign_out(&host).await.was_signed_in);
     assert_eq!(account_report(&host).await.state, AccountState::SignedOut);
     host.stop().await;
+}
+
+/// What a refusal says beside its own words when the request had already ended the sign-in that
+/// was waiting for the browser.
+const EARLIER_SIGN_IN_CANCELLED: &str = "The sign-in that was waiting for the browser was cancelled \
+     before this request was refused, and it stays cancelled.";
+
+/// Which change of the account a case makes.
+#[derive(Clone, Copy)]
+enum Change {
+    SignIn,
+    SignOut,
+}
+
+impl Change {
+    async fn under(
+        self,
+        client: &mut kr_ipc::client::LocalClient,
+        host: &net_support::Host,
+        action: ActionId,
+    ) -> Result<(), ProtocolError> {
+        match self {
+            Self::SignIn => sign_in_on(client, host, action).await,
+            Self::SignOut => sign_out_on(client, host, action).await.map(|_| ()),
+        }
+    }
+}
+
+/// Runs `change` under `action` over a sign-in that waits for the browser, owes this host a fence
+/// at the change's second ask, which ends the sign-in that waits before it refuses, and returns
+/// what the person is told. With `owed_when_told` the fence is still owed when the reply is told;
+/// without it, it is given back before.
+async fn told_of_a_change_refused_after_it_ended_a_waiting_sign_in(
+    host: &net_support::Host,
+    client: &mut kr_ipc::client::LocalClient,
+    change: Change,
+    action: ActionId,
+    owed_when_told: bool,
+) -> ProtocolError {
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+    let account = host.controller().host_account();
+    let (arrived, go) = account.pause_before_it_asks_whether_it_stands();
+    let (reply, go_reply) = host.controller().pause_before_a_reply_is_told();
+    let (told, ()) = tokio::join!(change.under(client, host, action), async {
+        tokio::time::timeout(WAIT, arrived)
+            .await
+            .expect("the change reaches its first ask")
+            .expect("the pause is armed");
+        let (again, go_again) = account.pause_before_it_asks_whether_it_stands();
+        go.send(()).expect("the change goes on");
+        tokio::time::timeout(WAIT, again)
+            .await
+            .expect("the change reaches its second ask")
+            .expect("the pause is armed");
+        host.controller().hold_fence(true);
+        go_again.send(()).expect("the change goes on");
+        tokio::time::timeout(WAIT, reply)
+            .await
+            .expect("the reply is about to be told")
+            .expect("the pause is armed");
+        if !owed_when_told {
+            host.controller().hold_fence(false);
+        }
+        go_reply.send(()).expect("the reply is told");
+    });
+    host.controller().hold_fence(false);
+    told.expect_err("a change under a fence this host owes is refused")
+}
+
+/// KR-REQ-09.09 and 17.54: a sign-in or a sign-out that ended the sign-in waiting for the browser
+/// and is then refused at its second ask says, beside the refusal, that the earlier sign-in was
+/// cancelled and stays cancelled. Where the authority still does not stand when the reply is told,
+/// the person is told the outcome is not shown, which does not say that nothing was done. The
+/// answer kept under the action says the same words on a repeat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_refused_after_it_ended_a_waiting_sign_in_says_so_and_says_it_again_on_a_repeat() {
+    for change in [Change::SignIn, Change::SignOut] {
+        for owed_when_told in [false, true] {
+            let broker = Broker::start().await;
+            let owner = DeviceKeys::generate().expect("owner keys");
+            let host =
+                net_support::Host::start_with_document(&owner, &document_naming(&broker.origin))
+                    .await;
+            listen_for_sign_ins(&host);
+            let _waiting = start_sign_in(&host).await;
+
+            let action = ActionId::new(kr_ipc::new_uuid());
+            let mut client = host.client().await;
+            let told = told_of_a_change_refused_after_it_ended_a_waiting_sign_in(
+                &host,
+                &mut client,
+                change,
+                action,
+                owed_when_told,
+            )
+            .await;
+            assert_eq!(
+                account_report(&host).await.state,
+                AccountState::SignedOut,
+                "the sign-in that waited is ended"
+            );
+            if owed_when_told {
+                assert_eq!(
+                    told.code,
+                    kr_protocol::error::ErrorCode::OutcomeUnknown,
+                    "{told:?}"
+                );
+            } else {
+                assert_eq!(
+                    told.code,
+                    kr_protocol::error::ErrorCode::PermissionDenied,
+                    "{told:?}"
+                );
+                assert!(
+                    told.message.contains(EARLIER_SIGN_IN_CANCELLED),
+                    "the refusal says the earlier sign-in was cancelled: {told:?}"
+                );
+            }
+
+            let repeated = change
+                .under(&mut client, &host, action)
+                .await
+                .expect_err("the repeat is answered from what the first left");
+            assert_eq!(
+                repeated.code,
+                kr_protocol::error::ErrorCode::PermissionDenied,
+                "{repeated:?}"
+            );
+            assert!(
+                repeated.message.contains(EARLIER_SIGN_IN_CANCELLED),
+                "the answer kept under the action says the same: {repeated:?}"
+            );
+            host.stop().await;
+        }
+    }
 }
 
 /// KR-REQ-09.09 and 17.54: a token refresh keeps the account's lock across its request to the

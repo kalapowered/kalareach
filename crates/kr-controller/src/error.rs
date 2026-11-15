@@ -174,6 +174,15 @@ pub enum ControllerError {
     /// The host is not configured for this operation.
     #[error("{0}")]
     NotConfigured(String),
+    /// A refusal of an action that had already changed something, with what was changed said
+    /// after it.
+    #[error("{refusal}. {said}")]
+    AfterAnEffect {
+        /// The refusal, whose code this failure is reported under.
+        refusal: Box<ControllerError>,
+        /// What was done before the refusal.
+        said: &'static str,
+    },
 }
 
 impl ControllerError {
@@ -220,6 +229,18 @@ impl ControllerError {
             detail: "this action may have been carried out, and this host does not report what \
                      became of it in this answer"
                 .to_owned(),
+        }
+    }
+
+    /// This refusal, for an action that had already changed something when it was refused: `said`
+    /// follows the refusal's own words, so the person is told what was done beside what stopped the
+    /// rest, and the door that tells the answer knows that the refusal does not say nothing was
+    /// done ([`crate::given::Given::after_an_effect`]).
+    #[must_use]
+    pub fn after_an_effect(self, said: &'static str) -> Self {
+        Self::AfterAnEffect {
+            refusal: Box::new(self),
+            said,
         }
     }
 
@@ -330,6 +351,7 @@ impl ControllerError {
     #[must_use]
     pub fn code(&self) -> ErrorCode {
         match self {
+            Self::AfterAnEffect { refusal, .. } => refusal.code(),
             Self::RegistryUnavailable { .. } | Self::Storage { .. } => {
                 ErrorCode::StorageUnavailable
             }
