@@ -135,15 +135,20 @@ echo
 # where none is named, one that this run makes under its own temporary folder and says where it is)
 # is read here, before the temporary folder moves; the suites record under the run root; and what
 # they recorded is appended to the files of the directory that the caller named as soon as each
-# measurement ends, so that a run that a time-out or a cancel cuts keeps what it had. The exit trap
-# appends what is left on every other way this script ends, and so does the end of the survivor
-# check, before the run root goes.
+# measurement ends, so that a run that a time-out or a cancel cuts keeps the records of every
+# measurement that had ended. The exit trap appends what the cut one had recorded when the script
+# ends of its own accord or by TERM or INT, and so does the end of the survivor check, before the
+# run root goes. KILL runs no trap, and HUP may not run it under a newer bash, which can end the
+# script first: the cut measurement's records then stay in the run root.
 #
 # The run root is made under the temporary variable as it is written. A written value that holds a
 # backslash or is relative is a mistake that the readers pass over, but this line does not: the run
 # root, and so the children's evidence directory, then stand where their readers refuse them, and
 # each measurement fails with the reader's words and records nothing. A relative value is read from
-# the repository root, where this script runs, and ends it at once where no such folder is there.
+# the repository root, where this script runs, and ends it at once where no such folder is there. A
+# value that names the top of a file system still gets a run root under it, where the account can
+# write there, and the children's readers accept that folder, so their records wait in it until they
+# are copied, and a KILL leaves them there.
 # Nothing is written outside the run root and the caller's directory.
 # shellcheck source=scripts/lib/artifacts-dir.sh
 . "$root/scripts/lib/artifacts-dir.sh"

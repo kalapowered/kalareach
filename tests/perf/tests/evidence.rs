@@ -14,8 +14,10 @@
 //!
 //! A run that a time-out or a cancel ends keeps what its measurements had recorded: each record
 //! reaches the caller's directory as soon as its measurement ends, and the script's exit trap
-//! appends what is left. These checks end a run inside a measurement, by a signal that the trap runs
-//! on and by one that it does not, with a stand-in measurement that stops after it has recorded.
+//! appends what is left when the script ends of its own accord or by TERM or INT; KILL runs no
+//! trap, and HUP may not run it under a newer bash. These checks end a run inside a measurement, by
+//! TERM, which runs the trap, and by KILL, which does not, with a stand-in measurement that stops
+//! after it has recorded.
 //!
 //! Unix only: the script is a Unix shell script.
 
