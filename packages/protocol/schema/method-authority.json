@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 198,
+  "method_count": 199,
   "methods": [
     {
       "capability": "none",
@@ -761,6 +761,39 @@
         "environment"
       ],
       "summary": "Make way for another installed release: close this control daemon's gate to new sessions, let the creates it started settle, say how it was started, and stop when told to. No session stops.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "keyed": {
+          "key": "the daemon keeps no record of the request; asked again it finds the stop under way and is taken the same"
+        }
+      },
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "host.stop",
+      "name": "host.stop",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "host"
+      ],
+      "summary": "Stops this control daemon. It is served on the daemon's local socket alone. It closes the gate to new sessions, waits up to ten seconds for creates that are under way, answers the daemon's process identifier, the count of creates that did not settle and how the daemon was started, and then ends the daemon. No session stops. With `launch_only` set it stops nothing, closes no gate and answers only how the daemon was started. A request states `launch_only`. While the host owes a fence the answer is withheld, and a stop still ends the daemon. It is served while the local owner's membership lease has lapsed, and it keeps no record of the request.",
       "version": 1
     },
     {

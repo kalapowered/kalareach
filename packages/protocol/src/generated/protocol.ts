@@ -2923,6 +2923,8 @@ export interface KalaReachProtocol {
   host_policy_confirm_params?: HostPolicyConfirmParams
   host_policy_confirm_result?: HostPolicyConfirmResult
   host_selection?: HostSelection
+  host_stop_params?: HostStopParams
+  host_stop_result?: HostStopResult
   host_update_handover_params?: HostUpdateHandoverParams
   host_update_handover_result?: HostUpdateHandoverResult
   /**
@@ -18244,6 +18246,69 @@ export interface HostPolicyConfirmResult {
   lifted: boolean
 }
 /**
+ * `host.stop` parameters.
+ */
+export interface HostStopParams {
+  /**
+   * True to ask how the daemon was started and nothing else: the daemon stops nothing, closes
+   * no gate and counts no create. False stops the daemon. A request states it, so one that
+   * leaves it out is refused and stops nothing.
+   */
+  launch_only: boolean
+}
+/**
+ * `host.stop` result: the daemon that took the request, the creates that did not settle before
+ * it stopped, and how it was started.
+ */
+export interface HostStopResult {
+  /**
+   * How the daemon was started, or null where it cannot say: an argument that is not text, a
+   * working directory that no longer exists or a variable whose value is not text.
+   */
+  launch: HostLaunch | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  pid: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  unsettled: string
+}
+/**
+ * How a control daemon was started, as `host.stop` reports it.
+ */
+export interface HostLaunch {
+  /**
+   * The arguments it was started with, its program's own name left out.
+   */
+  arguments: string[]
+  /**
+   * The directory it was started in.
+   */
+  directory: string
+  /**
+   * Each variable that decides where the daemon keeps something
+   * ([`crate::hostinfo::configuration::path_variables`]), with the value it has in the
+   * daemon's process.
+   */
+  variables: HostLaunchVariable[]
+}
+/**
+ * One variable that decides where a daemon keeps something, as the daemon has it.
+ */
+export interface HostLaunchVariable {
+  /**
+   * The variable's name.
+   */
+  name: string
+  /**
+   * Its value in the daemon's process; null where the process has none, which is not the same
+   * as an empty value.
+   */
+  value: string | null
+}
+/**
  * `host.update.handover` parameters.
  */
 export interface HostUpdateHandoverParams {
@@ -19321,6 +19386,7 @@ export interface MethodEntry {
     | 'backup.enable'
     | 'backup.bundle.write'
     | 'host.update.handover'
+    | 'host.stop'
     | 'description.setup'
     | 'description.configure'
     | 'description.download'
@@ -28452,6 +28518,7 @@ export interface ServiceRequestPayload {
     | 'backup.enable'
     | 'backup.bundle.write'
     | 'host.update.handover'
+    | 'host.stop'
     | 'description.setup'
     | 'description.configure'
     | 'description.download'
