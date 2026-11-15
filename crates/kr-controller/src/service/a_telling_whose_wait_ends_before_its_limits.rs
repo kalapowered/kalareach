@@ -235,8 +235,9 @@ async fn acknowledged_in_the_row(
 }
 
 /// What a telling that gave its link back, with nothing on the wire, leaves behind: one notice was
-/// sent, and the worker's lease goes on renewing.
-fn the_renewal_goes_on(silent: &Silent, heard: &Heard) {
+/// sent, the worker's lease goes on renewing, and the link is in its slot, so that no other link was
+/// opened for the next caller.
+async fn the_link_went_back_whole(silent: &Silent, heard: &Heard) {
     let controller = &silent.controller;
     assert_eq!(
         heard.frames.load(Ordering::SeqCst),
@@ -254,13 +255,8 @@ fn the_renewal_goes_on(silent: &Silent, heard: &Heard) {
             .expect("a decision")
             .is_ok()
     );
-}
-
-/// The same, and the link is in its slot: no other link was opened for the next caller.
-async fn the_link_went_back_whole(silent: &Silent, heard: &Heard) {
-    the_renewal_goes_on(silent, heard);
     assert!(
-        slot_holds_a_link(&silent.controller, silent.session_id).await,
+        slot_holds_a_link(controller, silent.session_id).await,
         "the link went back whole"
     );
     assert_eq!(
@@ -320,9 +316,14 @@ async fn a_limit_that_ends_near_the_deadline_finds_the_link_already_given_back()
 /// two before the deadline. The link has gone back by then, and the write is made with the slot still
 /// held, so that the next caller of the link finds it recorded. The ask, which could send no more,
 /// answers `Failed`.
+///
+/// The worker has a row, so it is pending, and the daemon's own pass would ask it too, and send a
+/// notice of its own that the count of frames and the slot would take for this ask's. The pass's
+/// asks are held for the case.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_write_that_finishes_after_the_wait_ended_leaves_the_row_right() {
     let (silent, heard) = answered().await;
+    silent.controller.hold_the_pass_asks_for_tests(true);
     record_the_worker(&silent).await;
     let controller = Arc::clone(&silent.controller);
     let session_id = silent.session_id;
@@ -367,6 +368,6 @@ async fn a_write_that_finishes_after_the_wait_ended_leaves_the_row_right() {
         first,
         "the row records the acknowledgement of the first notice"
     );
-    the_renewal_goes_on(&silent, &heard);
+    the_link_went_back_whole(&silent, &heard).await;
     silent.serving.abort();
 }
