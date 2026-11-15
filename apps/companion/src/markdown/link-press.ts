@@ -37,7 +37,7 @@
  *   end of the handler and at the next press. It has no motion. The click that this handler makes inside
  *   the first one is untrusted and leaves the look as the first one set it.
  * - The open at the click runs the same rule at the press's own point, so for a touch or a pen the link
- *   that a press on plain text names is the link that opens at the release. A layout that moves under a
+ *   that a press on plain text names is the link that opens at the click. A layout that moves under a
  *   held finger with no scroll (an image that loads above the link, text that grows above it) ends
  *   nothing: the click's own check refuses the open. Watching the content's size would end presses
  *   whenever an answer streams below the link, which is the usual state.
@@ -302,7 +302,7 @@ function pressedLink(pane: HTMLElement, event: PointerEvent): { id: HTMLElement;
 }
 
 /**
- * Whether a release now would open the link that the press lit. It asks two things:
+ * Whether a release now would open the link that the press names. It asks two things:
  *
  * - the press's own element: the browser sends its click to the link's element, for every pointer type,
  *   while the point lies in the part of that element that its view leaves (`liesInView`: the element's
@@ -311,14 +311,14 @@ function pressedLink(pane: HTMLElement, event: PointerEvent): { id: HTMLElement;
  *   for a mouse or a trackpad, whose click comes from where the button is released;
  * - the nearest-words rule at the press's first point, for a pointer that `opensByRule` (a touch or a
  *   pen) only: a mouse's click on plain text opens nothing. The page's hit test at that point says what
- *   the click names. Where it names the lit link's own element and the link still opens what it opened at
+ *   the click names. Where it names that link's own element and the link still opens what it opened at
  *   the press, a release opens it (the engine's click) and the press is kept. Where it names plain text of
  *   the pane, the rule decides. Where it names another control, another link or an element outside the
  *   pane, that element takes the click and the press is not kept.
  *
  * Two paths call it: `move`, for a mouse or a trackpad on a link's own element, to light and take off
- * the look as the pointer crosses the element's edge, and `recheck`, at each scroll or resize while a lit
- * press lives, which also ends the press where the answer is no. The other two make the same decision
+ * the look as the pointer crosses the element's edge, and `recheck`, at each scroll or resize while a
+ * press that keeps a record lives, which also ends the press where the answer is no. The other two make the same decision
  * from the event's own target, with no hit test of their own: `pressedLink` at the pointer down and
  * `decide` at the click.
  */
@@ -329,9 +329,9 @@ function releaseOpens(pane: HTMLElement, press: Recorded): boolean {
   if (!by) return false
   const hit = document.elementFromPoint(press.at.x, press.at.y)
   if (hit === null || !pane.contains(hit)) return false
-  // Where a scroll has put the lit link's own element under the point, the engine's click names that element
-  // and opens the link, which is what the press lit: the press keeps its look while the link still opens
-  // what it opened at the press.
+  // Where a scroll has put the named link's own element under the point, the engine's click names that element
+  // and opens the link, which is what the press named: the press is kept while the link still opens what it
+  // opened at the press.
   if (hit.closest('.md-link') === press.start.link && press.start.link.title === press.start.destination) return true
   // Otherwise the rule opens a link only from plain text of the pane, as at the pointer down: where a scroll
   // has put another control or another link under the point, the click is that element's and the rule adds
@@ -427,7 +427,7 @@ const OPEN: Rect = { left: -Infinity, top: -Infinity, right: Infinity, bottom: I
  * and its box (`liesInView`), and returns with no further read where the point lies in it. For a mouse or
  * a trackpad that is all: the rest of the answer is no, with no hit test. For a touch or a pen the answer
  * goes on to the page's hit test at the press's point (no layout read) and returns where the hit lies in
- * the lit link's own element; otherwise a hit on plain text of the pane reads this layout again there. A
+ * the named link's own element; otherwise a hit on plain text of the pane reads this layout again there. A
  * touch's or a pen's move, the release and a cancel read nothing.
  *
  * A message is near when the point lies within the radius of the message's box on the vertical axis

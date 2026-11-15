@@ -43,7 +43,7 @@ function click(over: Partial<Click> = {}): Click {
   return { trusted: true, detail: 1, at: 1300, names: 'neither', point: { x: 60, y: 125 }, ...over }
 }
 
-const STAND = { kind: 'stand' }
+const STAND = { kind: 'stand' } as const
 const OPEN_UPPER = { kind: 'open', link: 'upper' }
 
 describe('a click on plain text near the link a touch pressed', () => {

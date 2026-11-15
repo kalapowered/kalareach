@@ -39,6 +39,7 @@ const rectOf = (box: Box | undefined): DOMRect => {
 }
 
 beforeEach(() => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
   boxes = new WeakMap()
   overflows = new WeakMap()
   styles = new WeakMap()
@@ -101,6 +102,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
   Reflect.deleteProperty(document, 'elementFromPoint')
@@ -178,6 +180,17 @@ function click(target: EventTarget, over: Record<string, unknown> = {}): Event {
 
 const fire = (type: string, event: Event): void => {
   ;(listening.get(type) ?? listening.get(`pane ${type}`))?.(event)
+}
+
+const isLit = (link: HTMLElement | undefined): boolean => link?.hasAttribute('data-pressed') === true
+
+/** Whether a press lives: the listeners that a press registers stand until its end takes them off. */
+const lives = (): boolean => listening.has('pointerup')
+
+/** The release of a touch tap at `at` and the click that the browser sends for it, to `target`. */
+function release(target: EventTarget, at: Record<string, unknown>, over: Record<string, unknown> = {}): void {
+  fire('pointerup', pointer(target, { ...at, timeStamp: 120, ...over }))
+  fire('click', click(target, at))
 }
 
 /** The pane's own client box, as a layout engine has it: the box less a border and a scroll bar's strip. */
@@ -276,28 +289,30 @@ describe('a tap on plain text beside a link, through the handler', () => {
     start(pane)
     clock(100)
     fire('pointerdown', pointer(texts[3], { clientY: y }))
-    expect(links[3]?.[0]?.hasAttribute('data-pressed'), 'the look before the move').toBe(true)
+    expect(isLit(links[3]?.[0]), 'the look at a press on plain text').toBe(false)
+    expect(lives(), 'the press before the move').toBe(true)
     fire('pointermove', pointer(texts[3], { clientY: y - 14 }))
-    expect(links[3]?.[0]?.hasAttribute('data-pressed'), 'the look once the finger is past the slop').toBe(false)
+    expect(lives(), 'the press once the finger is past the slop').toBe(false)
     fire('pointermove', pointer(texts[3], { clientY: y }))
-    expect(links[3]?.[0]?.hasAttribute('data-pressed'), 'the look when the finger is back where it started').toBe(false)
+    expect(lives(), 'the press when the finger is back where it started: a press that ended is not revived').toBe(false)
     fire('pointerup', pointer(texts[3], { clientY: y, timeStamp: 120 }))
     fire('click', click(texts[3], { clientY: y }))
     expect(opened, 'a press that went past the slop is not a tap').toEqual([])
-    expect(links.length).toBe(6)
+    expect(isLit(links[3]?.[0]), 'the look at the click of a press that went past the slop').toBe(false)
   })
 
-  it('opens nothing after a pointer cancel, and the pressed look goes with it', () => {
+  it('opens nothing after a pointer cancel, and the click gets no look', () => {
     const { pane, links, texts } = conversation(6, 3)
     start(pane)
     clock(100)
     fire('pointerdown', pointer(texts[3], { clientY: y }))
-    expect(links[3]?.[0]?.hasAttribute('data-pressed'), 'the pressed look during the press').toBe(true)
+    expect(lives(), 'the press before the cancel').toBe(true)
     fire('pointercancel', pointer(texts[3], { clientY: y }))
-    expect(links[3]?.[0]?.hasAttribute('data-pressed'), 'the pressed look after the cancel').toBe(false)
+    expect(lives(), 'the press after the cancel').toBe(false)
     fire('pointerup', pointer(texts[3], { clientY: y, timeStamp: 120 }))
     fire('click', click(texts[3], { clientY: y }))
     expect(opened).toEqual([])
+    expect(isLit(links[3]?.[0]), 'the look at the click of a cancelled press').toBe(false)
   })
 
   it('opens nothing for a click that no press made', () => {
@@ -348,10 +363,10 @@ describe('a tap between two links, through the handler', () => {
     start(pane)
     clock(100)
     fire('pointerdown', pointer(text, { clientX: 51, clientY: 43 }))
-    expect(links.map((link) => link.hasAttribute('data-pressed')), 'the links lit at the press').toEqual([false, false])
     fire('pointerup', pointer(text, { clientX: 51, clientY: 43, timeStamp: 120 }))
     fire('click', click(text, { clientX: 51, clientY: 43 }))
     expect(opened, 'links opened by the click').toEqual([])
+    expect(links.map((link) => isLit(link)), 'the links lit at the click').toEqual([false, false])
   })
 
   it('reads the links near the press’s point at the click, though the engine reported the click 20 px from it', () => {
@@ -371,10 +386,11 @@ describe('a tap between two links, through the handler', () => {
     start(pane)
     clock(100)
     fire('pointerdown', pointer(text, { clientX: 51, clientY: 43 }))
-    expect(links[0]?.hasAttribute('data-pressed'), 'the link lit at the press').toBe(true)
+    expect(isLit(links[0]), 'the link lit at the press on plain text').toBe(false)
     fire('pointerup', pointer(text, { clientX: 51, clientY: 43, timeStamp: 120 }))
     fire('click', click(text, { clientX: 51, clientY: 43 }))
     expect(opened).toEqual([links[0]])
+    expect(isLit(links[0]), 'the link lit at the click').toBe(true)
   })
 })
 
@@ -439,17 +455,17 @@ describe('where the handler’s listeners stand', () => {
     expect([...listening.keys()], 'visibility listener after the page was hidden').not.toContain('visibilitychange')
   })
 
-  it('registers no listener for a press that lights nothing, and the ends of a press leave none of any press standing', () => {
+  it('registers no listener for a press that keeps no record, and the ends of a press leave none of any press standing', () => {
     viewportOf({ left: 0, top: 0, right: 390, bottom: 844 })
     const { pane } = between({ left: 0, top: 0, right: 8, bottom: 17 })
     start(pane)
     clock(100)
     const permanent = ['click', 'pointerdown']
     const standing = (): string[] => [...listening.keys()].sort()
-    const unlit = { clientX: 300, clientY: 700 }
+    const unrecorded = { clientX: 300, clientY: 700 }
     const ends: [string, () => void][] = [
-      ['a release', () => fire('pointerup', pointer(pane, { ...unlit, timeStamp: 120 }))],
-      ['a cancel', () => fire('pointercancel', pointer(pane, unlit))],
+      ['a release', () => fire('pointerup', pointer(pane, { ...unrecorded, timeStamp: 120 }))],
+      ['a cancel', () => fire('pointercancel', pointer(pane, unrecorded))],
       ['a move past the slop', () => fire('pointermove', pointer(pane, { clientX: 300, clientY: 650 }))],
       ['a lost capture', () => fire('lostpointercapture', pointer(pane))],
       ['a blur', () => fire('window blur', {} as Event)],
@@ -462,18 +478,18 @@ describe('where the handler’s listeners stand', () => {
       ]
     ]
     for (const [end, make] of ends) {
-      fire('pointerdown', pointer(pane, unlit))
-      expect(standing(), `listeners during a press that lit nothing, before ${end}`).toEqual(permanent)
+      fire('pointerdown', pointer(pane, unrecorded))
+      expect(standing(), `listeners during a press that kept no record, before ${end}`).toEqual(permanent)
       make()
-      expect(standing(), `listeners after ${end} of a press that lit nothing`).toEqual(permanent)
+      expect(standing(), `listeners after ${end} of a press that kept no record`).toEqual(permanent)
     }
-    // A mouse press on plain text lights nothing either, and a press that lit a link and is replaced by one that lights nothing leaves no listener.
-    fire('pointerdown', pointer(pane, { ...unlit, pointerType: 'mouse' }))
+    // A mouse press on plain text keeps no record either, and a press that kept one and is replaced by one that keeps none leaves no listener.
+    fire('pointerdown', pointer(pane, { ...unrecorded, pointerType: 'mouse' }))
     expect(standing(), 'listeners during a mouse press on plain text').toEqual(permanent)
     fire('pointerdown', pointer(pane, { clientX: 4, clientY: 25 }))
-    expect(standing(), 'listeners during a press that lit a link').not.toEqual(permanent)
-    fire('pointerdown', pointer(pane, { ...unlit, pointerId: 2 }))
-    expect(standing(), 'listeners after a press that lit nothing replaced a lit one').toEqual(permanent)
+    expect(standing(), 'listeners during a press that kept a record').not.toEqual(permanent)
+    fire('pointerdown', pointer(pane, { ...unrecorded, pointerId: 2 }))
+    expect(standing(), 'listeners after a press that kept no record replaced one that did').toEqual(permanent)
   })
 
   it('opens a link for a tap on the pane’s bare area, where no message lies', () => {
@@ -512,7 +528,11 @@ describe('what a press lights', () => {
     fire('pointerdown', pointer(links[0], { clientX: 120, clientY: 95 }))
     expect(links[0]?.hasAttribute('data-pressed'), 'the link lit by a press 5 px above its words, on its own button').toBe(true)
     fire('pointerup', pointer(links[0], { clientX: 120, clientY: 95, timeStamp: 120 }))
-    expect(links[0]?.hasAttribute('data-pressed'), 'the link lit after the release').toBe(false)
+    expect(isLit(links[0]), 'the link lit at the release of a touch, which is still to get its click').toBe(true)
+    vi.advanceTimersByTime(149)
+    expect(isLit(links[0]), 'the link lit 149 ms after the release that gets no click').toBe(true)
+    vi.advanceTimersByTime(1)
+    expect(isLit(links[0]), 'the link lit 150 ms after the release that gets no click').toBe(false)
   })
 
   it('is no link on plain text that the words’ rectangles do not hold', () => {
@@ -521,7 +541,10 @@ describe('what a press lights', () => {
     start(pane)
     clock(100)
     fire('pointerdown', pointer(text, { clientX: 120, clientY: 95 }))
-    expect(links[0]?.hasAttribute('data-pressed'), 'the link lit by a press on plain text above its words').toBe(false)
+    expect(isLit(links[0]), 'the link lit by a press on plain text above its words').toBe(false)
+    release(text, { clientX: 120, clientY: 95 })
+    expect(opened, 'links opened by the click on plain text above its words').toEqual([])
+    expect(isLit(links[0]), 'the link lit at that click').toBe(false)
   })
 
   it('is nothing for a press on a control of the message', () => {
@@ -531,7 +554,10 @@ describe('what a press lights', () => {
     start(pane)
     clock(100)
     fire('pointerdown', pointer(control, { clientX: 4, clientY: 8 }))
-    expect(links[0]?.hasAttribute('data-pressed'), 'the link lit by a press on a control').toBe(false)
+    expect(isLit(links[0]), 'the link lit by a press on a control').toBe(false)
+    release(control, { clientX: 4, clientY: 8 })
+    expect(opened, 'links opened by the click on a control').toEqual([])
+    expect(isLit(links[0]), 'the link lit at the click on a control').toBe(false)
   })
 })
 
@@ -543,16 +569,17 @@ describe('what the handler takes for the pane', () => {
     start(pane)
     clock(100)
     fire('pointerdown', pointer(pane, { clientX: 372, clientY: 108 }))
-    expect(links[0]?.hasAttribute('data-pressed'), 'the link lit by a press at x 372, inside the client box').toBe(true)
+    expect(isLit(links[0]), 'the link lit by a press at x 372, inside the client box').toBe(false)
     fire('pointerup', pointer(pane, { clientX: 372, clientY: 108, timeStamp: 120 }))
     fire('click', click(pane, { clientX: 372, clientY: 108 }))
     expect(opened).toEqual([links[0]])
+    expect(isLit(links[0]), 'the link lit by the click at x 372').toBe(true)
     opened = []
     fire('pointerdown', pointer(pane, { clientX: 380, clientY: 108 }))
-    expect(links[0]?.hasAttribute('data-pressed'), 'the link lit by a press at x 380, in the scroll bar’s strip').toBe(false)
     fire('pointerup', pointer(pane, { clientX: 380, clientY: 108, timeStamp: 120 }))
     fire('click', click(pane, { clientX: 380, clientY: 108 }))
     expect(opened, 'links opened by a click in the strip').toEqual([])
+    expect(isLit(links[0]), 'the link lit by a click at x 380, in the scroll bar’s strip').toBe(false)
     expect(text.isConnected).toBe(true)
   })
 
@@ -564,10 +591,14 @@ describe('what the handler takes for the pane', () => {
     clock(100)
     // The words start 8 px inside the client box's left edge (x 2): a press at x 1 is on the border.
     fire('pointerdown', pointer(pane, { clientX: 1, clientY: 18 }))
-    expect(links[0]?.hasAttribute('data-pressed'), 'the link lit by a press on the border').toBe(false)
-    fire('pointerup', pointer(pane, { clientX: 1, clientY: 18, timeStamp: 120 }))
+    release(pane, { clientX: 1, clientY: 18 })
+    expect(opened, 'links opened by a click on the border').toEqual([])
+    expect(isLit(links[0]), 'the link lit by a click on the border').toBe(false)
     fire('pointerdown', pointer(pane, { clientX: 3, clientY: 18 }))
-    expect(links[0]?.hasAttribute('data-pressed'), 'the link lit by a press just inside the border').toBe(true)
+    expect(isLit(links[0]), 'the link lit by a press just inside the border').toBe(false)
+    release(pane, { clientX: 3, clientY: 18 })
+    expect(opened, 'links opened by a click just inside the border').toEqual([links[0]])
+    expect(isLit(links[0]), 'the link lit by a click just inside the border').toBe(true)
   })
 })
 
@@ -694,8 +725,6 @@ function scrolledSideways(by: number): void {
   }
 }
 
-const isLit = (link: HTMLElement | undefined): boolean => link?.hasAttribute('data-pressed') === true
-
 describe('a press for a pointer that can open, and the look it gives', () => {
   // The first link of message 3 has its words at x 10 to 26 and y 320 to 337; the tap is 6 px before it.
   const y = 328
@@ -706,20 +735,24 @@ describe('a press for a pointer that can open, and the look it gives', () => {
     clock(100)
     fire('pointerdown', pointer(texts[3], { clientY: y, pointerType: 'mouse' }))
     expect(isLit(links[3]?.[0]), 'the look of a mouse press on plain text beside a link').toBe(false)
+    expect(lives(), 'a mouse press on plain text beside a link').toBe(false)
     fire('pointerup', pointer(texts[3], { clientY: y, pointerType: 'mouse', timeStamp: 120 }))
     fire('click', click(texts[3], { clientY: y }))
     expect(opened).toEqual([])
+    expect(isLit(links[3]?.[0]), 'the look at the click of a mouse press on plain text').toBe(false)
   })
 
-  it('lights the link for a pen press on plain text beside it, and its click opens it', () => {
+  it('lights nothing for a pen press on plain text beside a link, and its click opens the link and lights it', () => {
     const { pane, links, texts } = conversation(6, 3)
     start(pane)
     clock(100)
     fire('pointerdown', pointer(texts[3], { clientY: y, pointerType: 'pen' }))
-    expect(isLit(links[3]?.[0]), 'the look of a pen press').toBe(true)
+    expect(isLit(links[3]?.[0]), 'the look of a pen press').toBe(false)
     fire('pointerup', pointer(texts[3], { clientY: y, pointerType: 'pen', timeStamp: 120 }))
+    expect(isLit(links[3]?.[0]), 'the look at the release of a pen press').toBe(false)
     fire('click', click(texts[3], { clientY: y }))
     expect(opened).toEqual([links[3]?.[0]])
+    expect(isLit(links[3]?.[0]), 'the look at the click of a pen press').toBe(true)
   })
 
   it('lights the link for a mouse press on the link’s own element, where the browser sends its click', () => {
@@ -732,21 +765,21 @@ describe('a press for a pointer that can open, and the look it gives', () => {
     expect(isLit(links[3]?.[0]), 'the look after the release').toBe(false)
   })
 
-  it('ends the look of a press at the next primary press, which lights nothing on plain text far from a link', () => {
+  it('ends the look of a press on a link’s own element at the next primary press, which lights nothing on plain text far from a link', () => {
     const { pane, links, texts } = conversation(6, 3)
     start(pane)
     clock(100)
-    fire('pointerdown', pointer(texts[3], { clientY: y }))
+    fire('pointerdown', pointer(links[3]?.[0], { clientX: 18, clientY: 328 }))
     expect(isLit(links[3]?.[0]), 'the look of the first press').toBe(true)
     fire('pointerdown', pointer(texts[1], { pointerId: 2, clientX: 300, clientY: 150 }))
     expect(isLit(links[3]?.[0]), 'the look after the next press').toBe(false)
   })
 
-  it('ends the look of a press at a next press outside the pane, and lights nothing for it', () => {
-    const { pane, links, texts } = conversation(6, 3)
+  it('ends the look of a press on a link’s own element at a next press outside the pane, and lights nothing for it', () => {
+    const { pane, links } = conversation(6, 3)
     start(pane)
     clock(100)
-    fire('pointerdown', pointer(texts[3], { clientY: y }))
+    fire('pointerdown', pointer(links[3]?.[0], { clientX: 18, clientY: 328 }))
     expect(isLit(links[3]?.[0]), 'the look of the first press').toBe(true)
     fire('pointerdown', pointer(document.body, { pointerId: 2, clientX: 5, clientY: 5 }))
     expect(isLit(links[3]?.[0]), 'the look after a press outside the pane').toBe(false)
@@ -784,9 +817,10 @@ describe('a press for a pointer that can open, and the look it gives', () => {
     clock(100)
     fire('pointerdown', pointer(texts[3], { clientY: y }))
     fire('pointermove', pointer(texts[3], { pointerId: 2, clientY: y - 40 }))
-    expect(isLit(links[3]?.[0]), 'the look after another finger moved').toBe(true)
+    expect(lives(), 'the press after another finger moved').toBe(true)
     fire('pointermove', pointer(texts[3], { clientY: y - 40 }))
-    expect(isLit(links[3]?.[0]), 'the look after its own finger moved').toBe(false)
+    expect(lives(), 'the press after its own finger moved').toBe(false)
+    expect(isLit(links[3]?.[0]), 'the look of a press on plain text').toBe(false)
   })
 
   it('keeps a press for a move of 9 px and ends it for a move of 11 px, the slop being 10', () => {
@@ -795,9 +829,10 @@ describe('a press for a pointer that can open, and the look it gives', () => {
     clock(100)
     fire('pointerdown', pointer(texts[3], { clientY: y }))
     fire('pointermove', pointer(texts[3], { clientY: y - 9 }))
-    expect(isLit(links[3]?.[0]), 'the look after 9 px').toBe(true)
+    expect(lives(), 'the press after 9 px').toBe(true)
     fire('pointermove', pointer(texts[3], { clientY: y - 11 }))
-    expect(isLit(links[3]?.[0]), 'the look after 11 px').toBe(false)
+    expect(lives(), 'the press after 11 px').toBe(false)
+    expect(isLit(links[3]?.[0]), 'the look of a press on plain text').toBe(false)
   })
 })
 
@@ -909,13 +944,15 @@ describe('a scroll under a held press', () => {
     start(pane)
     clock(100)
     fire('pointerdown', pointer(texts[3], { clientY: y }))
-    expect(isLit(links[3]?.[0]), 'the look before the scroll').toBe(true)
+    expect(isLit(links[3]?.[0]), 'the look of a press on plain text').toBe(false)
+    expect(lives(), 'the press before the scroll').toBe(true)
     scrolled(200)
     fire('scroll', {} as Event)
-    expect(isLit(links[3]?.[0]), 'the look after a scroll that moved the link 200 px').toBe(false)
+    expect(lives(), 'the press after a scroll that moved the link 200 px').toBe(false)
     fire('pointerup', pointer(texts[3], { clientY: y, timeStamp: 120 }))
     fire('click', click(texts[3], { clientY: y }))
     expect(opened).toEqual([])
+    expect(isLit(links[3]?.[0]), 'the look at the click').toBe(false)
   })
 
   it('leaves the look and the open where the link still wins the press’s point: 3 px', () => {
@@ -925,22 +962,24 @@ describe('a scroll under a held press', () => {
     fire('pointerdown', pointer(texts[3], { clientY: y }))
     scrolled(3)
     fire('scroll', {} as Event)
-    expect(isLit(links[3]?.[0]), 'the look after a scroll of 3 px').toBe(true)
+    expect(lives(), 'the press after a scroll of 3 px').toBe(true)
     fire('pointerup', pointer(texts[3], { clientY: y, timeStamp: 120 }))
     fire('click', click(texts[3], { clientY: y }))
     expect(opened).toEqual([links[3]?.[0]])
+    expect(isLit(links[3]?.[0]), 'the look at the click').toBe(true)
   })
 
   it('is asked again for the visual viewport’s scroll and for its resize as for a scroll of a box', () => {
     for (const type of ['viewport scroll', 'viewport resize']) {
-      const { pane, links, texts } = conversation(6, 3)
+      const { pane, texts } = conversation(6, 3)
       viewportOf({ left: 0, top: 0, right: 390, bottom: 600 })
       const stop = start(pane)
       clock(100)
       fire('pointerdown', pointer(texts[3], { clientY: y }))
+      expect(lives(), `the press before the ${type}`).toBe(true)
       scrolled(200)
       fire(type, {} as Event)
-      expect(isLit(links[3]?.[0]), `the look after the ${type}`).toBe(false)
+      expect(lives(), `the press after the ${type}`).toBe(false)
       stop()
       document.body.replaceChildren()
       listening.clear()
@@ -1084,31 +1123,33 @@ describe('a scroll under a held press', () => {
       start(pane)
       clock(100)
       fire('pointerdown', pointer(text, press))
-      expect(isLit(links[0]), 'the look of the press on plain text').toBe(true)
+      expect(isLit(links[0]), 'the look of the press on plain text').toBe(false)
+      expect(lives(), 'the press before the scroll').toBe(true)
       scrolled(2)
       fire('scroll', {} as Event)
-      expect(isLit(links[0]), 'the look after a scroll of 2 px: the button still lies below the point').toBe(true)
+      expect(lives(), 'the press after a scroll of 2 px: the button still lies below the point').toBe(true)
       scrolled(2)
       fire('scroll', {} as Event)
       expect(boxes.get(button)?.top, 'the button’s top after 4 px').toBe(93)
-      expect(isLit(links[0]), 'the look after a scroll of 4 px: the button lies under the point').toBe(false)
+      expect(lives(), 'the press after a scroll of 4 px: the button lies under the point').toBe(false)
       fire('pointerup', pointer(button, { ...press, timeStamp: 120 }))
       fire('click', click(button, press))
       expect(opened, 'the click on the button opens no link').toEqual([])
+      expect(isLit(links[0]), 'the look at the click on the button').toBe(false)
     })
 
     it('asks what lies under the press’s first point, not under where the finger has moved to within the slop', () => {
-      const { pane, text, links } = between(words)
+      const { pane, text } = between(words)
       const button = placed(text, 'm-other', beside)
       start(pane)
       clock(100)
       fire('pointerdown', pointer(text, press))
       fire('pointermove', pointer(text, { clientX: 90, clientY: 85 }))
-      expect(isLit(links[0]), 'the look after a move of 9 px, within the slop').toBe(true)
+      expect(lives(), 'the press after a move of 9 px, within the slop').toBe(true)
       scrolled(4)
       fire('scroll', {} as Event)
       expect(boxes.get(button)?.top, 'the button’s top after 4 px').toBe(93)
-      expect(isLit(links[0]), 'the look where the button lies under the first point and not under the finger').toBe(false)
+      expect(lives(), 'the press where the button lies under the first point and not under the finger').toBe(false)
     })
 
     it('keeps the look and the press where the lit link’s own element comes under the point, and the engine’s click on the element opens it once', () => {
@@ -1116,16 +1157,17 @@ describe('a scroll under a held press', () => {
       start(pane)
       clock(100)
       fire('pointerdown', pointer(text, press))
-      expect(isLit(links[0]), 'the look of the press on plain text').toBe(true)
+      expect(isLit(links[0]), 'the look of the press on plain text').toBe(false)
       // The content slides under the finger: the element's box now holds the point, as the page's hit test names it.
       scrolled(8)
       scrolledSideways(11)
       fire('scroll', {} as Event)
       expect(document.elementFromPoint(press.clientX, press.clientY), 'the element under the point').toBe(links[0])
-      expect(isLit(links[0]), 'the look after the scroll that put the lit link’s own element under the point').toBe(true)
+      expect(lives(), 'the press after the scroll that put the named link’s own element under the point').toBe(true)
       fire('pointerup', pointer(links[0], { ...press, timeStamp: 120 }))
       fire('click', click(links[0], press))
       expect(opened, 'the handler adds no click to a click that names the link').toEqual([])
+      expect(isLit(links[0]), 'the look at the click that names the link').toBe(true)
       links[0].click()
       expect(opened, 'the engine’s own click on the element').toEqual([links[0]])
     })
@@ -1136,10 +1178,11 @@ describe('a scroll under a held press', () => {
       clock(100)
       fire('pointerdown', pointer(text, press))
       links[0].title = 'https://example.org/changed'
+      expect(lives(), 'the press before the scroll').toBe(true)
       scrolled(8)
       scrolledSideways(11)
       fire('scroll', {} as Event)
-      expect(isLit(links[0]), 'the look where the link now opens another destination').toBe(false)
+      expect(lives(), 'the press where the link now opens another destination').toBe(false)
     })
 
     it('ends the look where another link of a message, not the lit one, comes under the point', () => {
@@ -1147,26 +1190,27 @@ describe('a scroll under a held press', () => {
       start(pane)
       clock(100)
       fire('pointerdown', pointer(text, press))
-      expect(isLit(links[0]), 'the look of the press: the first link’s words are the nearer').toBe(true)
+      expect(isLit(links[0]), 'the look of the press on plain text').toBe(false)
+      expect(lives(), 'the press: the first link’s words are the nearer').toBe(true)
       scrolled(8)
       scrolledSideways(-40)
       fire('scroll', {} as Event)
       expect(document.elementFromPoint(press.clientX, press.clientY), 'the element under the point').toBe(links[1])
-      expect(isLit(links[0]), 'the look where the other link lies under the point').toBe(false)
+      expect(lives(), 'the press where the other link lies under the point').toBe(false)
     })
 
     it('ends the look where another link comes under the point', () => {
-      const { pane, text, links } = between(words)
+      const { pane, text } = between(words)
       // A link that no message holds, so the rule does not weigh it.
       const other = placed(pane, 'md-link m-other', beside)
       start(pane)
       clock(100)
       fire('pointerdown', pointer(text, press))
-      expect(isLit(links[0]), 'the look of the press').toBe(true)
+      expect(lives(), 'the press before the scroll').toBe(true)
       scrolled(4)
       fire('scroll', {} as Event)
       expect(boxes.get(other)?.top, 'the other link’s top after 4 px').toBe(93)
-      expect(isLit(links[0]), 'the look after a scroll that put another link under the point').toBe(false)
+      expect(lives(), 'the press after a scroll that put another link under the point').toBe(false)
     })
 
     it('ends the look where an element outside the pane comes under the point, since a release there is not the pane’s', () => {
@@ -1175,11 +1219,12 @@ describe('a scroll under a held press', () => {
       start(pane)
       clock(100)
       fire('pointerdown', pointer(text, press))
-      expect(isLit(links[0]), 'the look of the press').toBe(true)
+      expect(lives(), 'the press before the overlay').toBe(true)
       boxes.set(overlay, { left: 0, top: 80, right: 390, bottom: 844 })
       scrolled(2)
       fire('scroll', {} as Event)
-      expect(isLit(links[0]), 'the look after an overlay came under the point').toBe(false)
+      expect(lives(), 'the press after an overlay came under the point').toBe(false)
+      expect(isLit(links[0]), 'the look of a press on plain text').toBe(false)
     })
   })
 })
@@ -1187,13 +1232,13 @@ describe('a scroll under a held press', () => {
 describe('a press whose release can no longer come', () => {
   const y = 328
 
-  /** A touch press on plain text beside the first link of message 3, lit. */
+  /** A touch press on plain text beside the first link of message 3, which keeps a record. */
   function held(): { links: HTMLElement[][]; texts: HTMLElement[] } {
     const { pane, links, texts } = conversation(6, 3)
     start(pane)
     clock(100)
     fire('pointerdown', pointer(texts[3], { clientY: y }))
-    expect(isLit(links[3]?.[0]), 'the look of the press').toBe(true)
+    expect(lives(), 'the press').toBe(true)
     return { links, texts }
   }
 
@@ -1203,34 +1248,37 @@ describe('a press whose release can no longer come', () => {
     fire('click', click(texts[3], { clientY: y }))
   }
 
-  it('ends the look when the pointer’s capture is lost, and opens nothing', () => {
+  it('ends the press when the pointer’s capture is lost, and opens nothing', () => {
     const { links, texts } = held()
     fire('lostpointercapture', pointer(texts[3], { pointerId: 2 }))
-    expect(isLit(links[3]?.[0]), 'the look after another pointer lost its capture').toBe(true)
+    expect(lives(), 'the press after another pointer lost its capture').toBe(true)
     fire('lostpointercapture', pointer(texts[3]))
-    expect(isLit(links[3]?.[0]), 'the look after the press’s own pointer lost its capture').toBe(false)
+    expect(lives(), 'the press after its own pointer lost its capture').toBe(false)
     released(texts)
     expect(opened).toEqual([])
+    expect(isLit(links[3]?.[0]), 'the look at the click').toBe(false)
   })
 
-  it('ends the look when the window loses focus, and opens nothing', () => {
+  it('ends the press when the window loses focus, and opens nothing', () => {
     const { links, texts } = held()
     fire('window blur', {} as Event)
-    expect(isLit(links[3]?.[0]), 'the look after the window’s blur').toBe(false)
+    expect(lives(), 'the press after the window’s blur').toBe(false)
     released(texts)
     expect(opened).toEqual([])
+    expect(isLit(links[3]?.[0]), 'the look at the click').toBe(false)
   })
 
-  it('ends the look when the page is hidden, and leaves it for a change that leaves the page shown', () => {
+  it('ends the press when the page is hidden, and leaves it for a change that leaves the page shown', () => {
     const { links, texts } = held()
     const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(false)
     fire('visibilitychange', {} as Event)
-    expect(isLit(links[3]?.[0]), 'the look after a visibility change that leaves the page shown').toBe(true)
+    expect(lives(), 'the press after a visibility change that leaves the page shown').toBe(true)
     hidden.mockReturnValue(true)
     fire('visibilitychange', {} as Event)
-    expect(isLit(links[3]?.[0]), 'the look after the page was hidden').toBe(false)
+    expect(lives(), 'the press after the page was hidden').toBe(false)
     released(texts)
     expect(opened).toEqual([])
+    expect(isLit(links[3]?.[0]), 'the look at the click').toBe(false)
   })
 })
 
@@ -1241,14 +1289,16 @@ describe('a link’s view: what the boxes that clip it leave of the page', () =>
     start(pane)
     clock(100)
     fire('pointerdown', pointer(text, { clientX: 45, clientY: 145 }))
-    expect(isLit(links[0]), 'the look with no inner box: the tap is in the area').toBe(true)
-    fire('pointerup', pointer(text, { clientX: 45, clientY: 145, timeStamp: 120 }))
+    release(text, { clientX: 45, clientY: 145 })
+    expect(opened, 'the click with no inner box: the tap is in the area').toEqual([links[0]])
+    expect(isLit(links[0]), 'the look at that click').toBe(true)
+    opened = []
     clip(text, { left: 40, top: 100, right: 350, bottom: 160 }, 'hidden')
     fire('pointerdown', pointer(text, { clientX: 45, clientY: 145 }))
-    expect(isLit(links[0]), 'the look with the inner box').toBe(false)
-    fire('pointerup', pointer(text, { clientX: 45, clientY: 145, timeStamp: 120 }))
-    fire('click', click(text, { clientX: 45, clientY: 145 }))
+    expect(isLit(links[0]), 'the look of a press with the inner box: the next press ends the look').toBe(false)
+    release(text, { clientX: 45, clientY: 145 })
     expect(opened).toEqual([])
+    expect(isLit(links[0]), 'the look at the click with the inner box').toBe(false)
   })
 
   it('keeps what an inner box leaves of a link that it cuts: a tap in the visible room lights it, a tap in the cut does not', () => {
@@ -1257,16 +1307,17 @@ describe('a link’s view: what the boxes that clip it leave of the page', () =>
     start(pane)
     clock(100)
     fire('pointerdown', pointer(text, { clientX: 45, clientY: 145 }))
-    expect(isLit(links[0]), 'the look for a tap inside the inner box').toBe(true)
+    expect(isLit(links[0]), 'the look of a press inside the inner box').toBe(false)
     fire('pointerup', pointer(text, { clientX: 45, clientY: 145, timeStamp: 120 }))
     fire('click', click(text, { clientX: 45, clientY: 145 }))
     expect(opened).toEqual([links[0]])
+    expect(isLit(links[0]), 'the look at the click for a tap inside the inner box').toBe(true)
     opened = []
     fire('pointerdown', pointer(text, { clientX: 35, clientY: 128 }))
-    expect(isLit(links[0]), 'the look for a tap left of the inner box').toBe(false)
     fire('pointerup', pointer(text, { clientX: 35, clientY: 128, timeStamp: 120 }))
     fire('click', click(text, { clientX: 35, clientY: 128 }))
     expect(opened).toEqual([])
+    expect(isLit(links[0]), 'the look at the click for a tap left of the inner box').toBe(false)
   })
 
   it('shows no link below an inner box whose bottom lies above the pane’s: the nearest box on each edge clips', () => {
@@ -1275,7 +1326,9 @@ describe('a link’s view: what the boxes that clip it leave of the page', () =>
     start(pane)
     clock(100)
     fire('pointerdown', pointer(text, { clientX: 120, clientY: 178 }))
-    expect(isLit(links[0]), 'the look for a tap under the inner box').toBe(false)
+    release(text, { clientX: 120, clientY: 178 })
+    expect(opened, 'links opened by a tap under the inner box').toEqual([])
+    expect(isLit(links[0]), 'the look at the click for a tap under the inner box').toBe(false)
   })
 
   it('shows no link beyond an inner box’s right edge or above its top edge, where the pane’s own edges lie farther out', () => {
@@ -1288,8 +1341,9 @@ describe('a link’s view: what the boxes that clip it leave of the page', () =>
       start(pane)
       clock(100)
       fire('pointerdown', pointer(text, tap))
-      expect(isLit(links[0]), `the look for a tap beside a link ${name}`).toBe(false)
-      fire('pointerup', pointer(text, { ...tap, timeStamp: 120 }))
+      release(text, tap)
+      expect(opened, `links opened by a tap beside a link ${name}`).toEqual([])
+      expect(isLit(links[0]), `the look at the click for a tap beside a link ${name}`).toBe(false)
       document.body.replaceChildren()
     }
   })
@@ -1300,14 +1354,15 @@ describe('a link’s view: what the boxes that clip it leave of the page', () =>
     start(pane)
     clock(100)
     fire('pointerdown', pointer(text, { clientX: 200, clientY: 108 }))
-    expect(isLit(links[0]), 'the look before the page is zoomed').toBe(true)
-    fire('pointerup', pointer(text, { clientX: 200, clientY: 108, timeStamp: 120 }))
+    release(text, { clientX: 200, clientY: 108 })
+    expect(opened, 'the click before the page is zoomed').toEqual([links[0]])
+    expect(isLit(links[0]), 'the look at that click').toBe(true)
+    opened = []
     viewportOf({ left: 195, top: 0, right: 390, bottom: 422 })
     fire('pointerdown', pointer(text, { clientX: 200, clientY: 108 }))
-    expect(isLit(links[0]), 'the look on the zoomed page').toBe(false)
-    fire('pointerup', pointer(text, { clientX: 200, clientY: 108, timeStamp: 120 }))
-    fire('click', click(text, { clientX: 200, clientY: 108 }))
+    release(text, { clientX: 200, clientY: 108 })
     expect(opened).toEqual([])
+    expect(isLit(links[0]), 'the look at the click on the zoomed page').toBe(false)
   })
 
   it('shows no link below the room of a scroller outside the pane, as the keyboard leaves it', () => {
@@ -1320,10 +1375,14 @@ describe('a link’s view: what the boxes that clip it leave of the page', () =>
     start(pane)
     clock(100)
     fire('pointerdown', pointer(text, { clientX: 120, clientY: 530 }))
-    expect(isLit(links[0]), 'the look for a tap under the hidden link').toBe(false)
-    fire('pointerup', pointer(text, { clientX: 120, clientY: 530, timeStamp: 120 }))
+    release(text, { clientX: 120, clientY: 530 })
+    expect(opened, 'links opened by a tap under the hidden link').toEqual([])
+    expect(isLit(links[0]), 'the look at the click for a tap under the hidden link').toBe(false)
     fire('pointerdown', pointer(text, { clientX: 120, clientY: 495 }))
-    expect(isLit(links[1]), 'the look for a tap under the link in view').toBe(true)
+    release(text, { clientX: 120, clientY: 495 })
+    expect(opened, 'links opened by a tap under the link in view').toEqual([links[1]])
+    expect(isLit(links[1]), 'the look at the click for a tap under the link in view').toBe(true)
+    expect(isLit(links[0]), 'the look of the hidden link').toBe(false)
   })
 
   it('does not take an ancestor that does not clip for a box, and reads each clipping ancestor once in a read', () => {
@@ -1339,7 +1398,8 @@ describe('a link’s view: what the boxes that clip it leave of the page', () =>
     fire('pointerdown', pointer(text, { clientX: 150, clientY: 125 }))
     expect(reads.filter((read) => read === text).length, 'reads of the clipping ancestor for two links').toBe(1)
     expect(reads.filter((read) => read === wrapper).length, 'reads of an ancestor that does not clip').toBe(0)
-    expect(isLit(wrapper.querySelector('.md-link') as HTMLElement)).toBe(true)
+    release(text, { clientX: 150, clientY: 125 })
+    expect(isLit(wrapper.querySelector('.md-link') as HTMLElement), 'the look at the click').toBe(true)
   })
 })
 
@@ -1379,17 +1439,17 @@ describe('a link under a box whose view cannot be measured', () => {
     start(pane)
     clock(100)
     fire('pointerdown', pointer(text, { clientX: 138, clientY: 140 }))
-    expect(isLit(links[0]), 'the look with a box that has no transform').toBe(true)
     fire('pointerup', pointer(text, { clientX: 138, clientY: 140, timeStamp: 120 }))
     fire('click', click(text, { clientX: 138, clientY: 140 }))
     expect(opened, 'opens with a box that has no transform').toEqual([links[0]])
+    expect(isLit(links[0]), 'the look at the click with a box that has no transform').toBe(true)
     opened = []
     styles.set(text, { transform: 'matrix(0.5, 0, 0, 0.5, 0, 0)' })
     fire('pointerdown', pointer(text, { clientX: 138, clientY: 140 }))
-    expect(isLit(links[0]), 'the look under the scaled box').toBe(false)
     fire('pointerup', pointer(text, { clientX: 138, clientY: 140, timeStamp: 120 }))
     fire('click', click(text, { clientX: 138, clientY: 140 }))
     expect(opened, 'opens under the scaled box').toEqual([])
+    expect(isLit(links[0]), 'the look at the click under the scaled box').toBe(false)
   })
 
   for (const [kind, style] of Object.entries(blocking)) {
@@ -1398,14 +1458,15 @@ describe('a link under a box whose view cannot be measured', () => {
       start(pane)
       clock(100)
       fire('pointerdown', pointer(text, tap))
-      expect(isLit(links[0]), `the look with no ${kind}`).toBe(true)
-      fire('pointerup', pointer(text, { ...tap, timeStamp: 120 }))
+      release(text, tap)
+      expect(opened, `opens with no ${kind}`).toEqual([links[0]])
+      expect(isLit(links[0]), `the look at the click with no ${kind}`).toBe(true)
+      opened = []
       styles.set(text.parentElement as HTMLElement, style)
       fire('pointerdown', pointer(text, tap))
-      expect(isLit(links[0]), `the look under ${kind}`).toBe(false)
-      fire('pointerup', pointer(text, { ...tap, timeStamp: 120 }))
-      fire('click', click(text, tap))
+      release(text, tap)
       expect(opened, `opens under ${kind}`).toEqual([])
+      expect(isLit(links[0]), `the look at the click under ${kind}`).toBe(false)
     })
   }
 
@@ -1416,7 +1477,9 @@ describe('a link under a box whose view cannot be measured', () => {
       clock(100)
       styles.set(where === 'the pane' ? pane : document.documentElement, { contain: 'paint' })
       fire('pointerdown', pointer(text, tap))
-      expect(isLit(links[0]), `the look under ${where} with contained paint`).toBe(false)
+      release(text, tap)
+      expect(opened, `opens under ${where} with contained paint`).toEqual([])
+      expect(isLit(links[0]), `the look at the click under ${where} with contained paint`).toBe(false)
       styles.delete(document.documentElement)
       document.body.replaceChildren()
       listening.clear()
@@ -1430,10 +1493,11 @@ describe('a link under a box whose view cannot be measured', () => {
       clock(100)
       styles.set(text.parentElement as HTMLElement, { transform, 'content-visibility': 'visible', contain: 'layout style', scale: 'none', rotate: 'none' })
       fire('pointerdown', pointer(text, tap))
-      expect(isLit(links[0]), `the look under ${transform}`).toBe(true)
+      expect(isLit(links[0]), `the look of a press on plain text under ${transform}`).toBe(false)
       fire('pointerup', pointer(text, { ...tap, timeStamp: 120 }))
       fire('click', click(text, tap))
       expect(opened, `opens under ${transform}`).toEqual([links[0]])
+      expect(isLit(links[0]), `the look at the click under ${transform}`).toBe(true)
       opened = []
       document.body.replaceChildren()
       listening.clear()
@@ -1450,6 +1514,7 @@ describe('a link under a box whose view cannot be measured', () => {
     fire('pointerup', pointer(links[0], { clientX: 26, clientY: 128, timeStamp: 120 }))
     fire('click', click(links[0], { clientX: 26, clientY: 128 }))
     expect(opened, 'the handler’s own opens').toEqual([])
+    expect(isLit(links[0]), 'the look at a click on the link’s own element').toBe(false)
   })
 })
 
@@ -1466,7 +1531,10 @@ describe('a page whose root clips', () => {
       start(pane)
       clock(100)
       fire('pointerdown', pointer(text, { clientX: 150, clientY: 608 }))
-      expect(isLit(links[0]), 'the look of a press beside a link in view of the viewport').toBe(true)
+      expect(isLit(links[0]), 'the look of a press on plain text beside a link in view of the viewport').toBe(false)
+      release(text, { clientX: 150, clientY: 608 })
+      expect(opened, 'the click beside a link in view of the viewport').toEqual([links[0]])
+      expect(isLit(links[0]), 'the look at that click').toBe(true)
     } finally {
       for (const key of ['clientLeft', 'clientTop', 'clientWidth', 'clientHeight']) Reflect.deleteProperty(root, key)
     }
@@ -1482,9 +1550,191 @@ describe('a link in a line wider than its message', () => {
     start(pane)
     clock(100)
     fire('pointerdown', pointer(text, { clientX: 336, clientY: 108 }))
-    expect(isLit(links[0]), 'the look for a tap 6 px after the words').toBe(true)
+    expect(isLit(links[0]), 'the look of a press 6 px after the words').toBe(false)
     fire('pointerup', pointer(text, { clientX: 336, clientY: 108, timeStamp: 120 }))
     fire('click', click(text, { clientX: 336, clientY: 108 }))
     expect(opened).toEqual([links[0]])
+    expect(isLit(links[0]), 'the look at the click for a tap 6 px after the words').toBe(true)
+  })
+})
+
+describe('the look at a click', () => {
+  // The first link of message 3 has its words at x 10 to 26 and y 320 to 337; the tap is 6 px before it.
+  const y = 328
+  const at = { clientY: y }
+
+  it('comes at the click on the link that opens from plain text, and stays 150 ms', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100, 130)
+    fire('pointerdown', pointer(texts[3], at))
+    expect(isLit(links[3]?.[0]), 'the look at the press').toBe(false)
+    fire('pointerup', pointer(texts[3], { ...at, timeStamp: 120 }))
+    expect(isLit(links[3]?.[0]), 'the look at the release, before the click').toBe(false)
+    fire('click', click(texts[3], at))
+    expect(opened).toEqual([links[3]?.[0]])
+    expect(isLit(links[3]?.[0]), 'the look at the click').toBe(true)
+    vi.advanceTimersByTime(149)
+    expect(isLit(links[3]?.[0]), 'the look 149 ms after the click').toBe(true)
+    vi.advanceTimersByTime(1)
+    expect(isLit(links[3]?.[0]), 'the look 150 ms after the click').toBe(false)
+  })
+
+  it('is on the link that a click with a detail of 2 names, and the handler adds no click of its own', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100, 130)
+    fire('pointerdown', pointer(texts[3], at))
+    fire('pointerup', pointer(texts[3], { ...at, timeStamp: 120 }))
+    fire('click', click(links[3]?.[0], { ...at, clientX: 18, detail: 2 }))
+    expect(isLit(links[3]?.[0]), 'the look at a click with a detail of 2').toBe(true)
+    expect(opened, 'links opened by the handler').toEqual([])
+  })
+
+  it('is on the link that a click names after a scroll ended the press, since the pointer’s type outlives the press', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100, 130)
+    fire('pointerdown', pointer(texts[3], at))
+    scrolled(300)
+    fire('scroll', {} as Event)
+    expect(lives(), 'the press after a scroll of 300 px').toBe(false)
+    fire('pointerup', pointer(texts[3], { ...at, timeStamp: 120 }))
+    fire('click', click(links[3]?.[0], { ...at, clientY: y - 300, clientX: 18 }))
+    expect(isLit(links[3]?.[0]), 'the look at the click that follows the scroll').toBe(true)
+    expect(opened, 'links opened by the handler').toEqual([])
+  })
+
+  it('is on the link that a click names 3.2 s after the release, where the handler opens none', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(130, 3400)
+    fire('pointerdown', pointer(texts[3], at))
+    fire('pointerup', pointer(texts[3], { ...at, timeStamp: 120 }))
+    fire('click', click(links[3]?.[0], { ...at, clientX: 18 }))
+    expect(isLit(links[3]?.[0]), 'the look at a click 3.2 s after the release').toBe(true)
+    expect(opened, 'links opened by the handler').toEqual([])
+  })
+
+  it('is none for a click on plain text that the handler does not open, and puts out a look that is lit', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100, 4000)
+    fire('pointerdown', pointer(links[3]?.[0], { clientX: 18, clientY: y }))
+    expect(isLit(links[3]?.[0]), 'the look at a press on the link’s own element').toBe(true)
+    fire('pointerup', pointer(links[3]?.[0], { clientX: 18, clientY: y, timeStamp: 120 }))
+    fire('click', click(texts[3], { clientX: 18, clientY: y }))
+    expect(opened, 'links opened by the click on plain text, 3.9 s after the release').toEqual([])
+    expect(isLit(links[3]?.[0]), 'the look at a click that opens nothing').toBe(false)
+  })
+
+  it('is none for a click on a control, and puts out a look that is lit', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    const control = document.createElement('button')
+    texts[3]?.append(control)
+    start(pane)
+    clock(100, 130)
+    fire('pointerdown', pointer(links[3]?.[0], { clientX: 18, clientY: y }))
+    fire('pointerup', pointer(links[3]?.[0], { clientX: 18, clientY: y, timeStamp: 120 }))
+    fire('click', click(control, { clientX: 18, clientY: y }))
+    expect(isLit(links[3]?.[0]), 'the look at a click on a control').toBe(false)
+  })
+
+  it('is on the link that a click names, though the press went down on another link’s element: one link is lit, the one the click names', () => {
+    const { pane, links } = conversation(6, 3)
+    start(pane)
+    clock(100, 130)
+    fire('pointerdown', pointer(links[3]?.[0], { clientX: 18, clientY: y }))
+    expect(isLit(links[3]?.[0]), 'the first link at the press').toBe(true)
+    fire('pointerup', pointer(links[3]?.[0], { clientX: 18, clientY: y, timeStamp: 120 }))
+    fire('click', click(links[3]?.[1], { clientX: 36, clientY: y }))
+    expect(isLit(links[3]?.[0]), 'the first link at the click').toBe(false)
+    expect(isLit(links[3]?.[1]), 'the second link at the click').toBe(true)
+  })
+
+  it('is none for a click that no touch or pen made: a mouse’s press, a click with a detail of 0, a click with no press in the pane', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100, 130)
+    fire('pointerdown', pointer(links[3]?.[0], { clientX: 18, clientY: y, pointerType: 'mouse' }))
+    fire('pointerup', pointer(links[3]?.[0], { clientX: 18, clientY: y, pointerType: 'mouse', timeStamp: 120 }))
+    fire('click', click(links[3]?.[0], { clientX: 18, clientY: y }))
+    expect(isLit(links[3]?.[0]), 'the look at a mouse’s click on the link').toBe(false)
+    fire('pointerdown', pointer(links[3]?.[0], { clientX: 18, clientY: y }))
+    fire('pointerup', pointer(links[3]?.[0], { clientX: 18, clientY: y, timeStamp: 120 }))
+    expect(isLit(links[3]?.[0]), 'the look of a touch between the release and the click').toBe(true)
+    fire('click', click(links[3]?.[0], { clientX: 18, clientY: y, detail: 0 }))
+    expect(isLit(links[3]?.[0]), 'the look at a click with a detail of 0').toBe(false)
+    fire('pointerdown', pointer(document.body, { clientX: 5, clientY: 5 }))
+    fire('click', click(links[3]?.[0], { clientX: 18, clientY: y }))
+    expect(isLit(links[3]?.[0]), 'the look at a click after a press outside the pane').toBe(false)
+    expect(texts.length).toBe(6)
+  })
+
+  it('is none for a link that cannot be measured', () => {
+    const { pane, text, links } = between({ left: 22, top: 120, right: 30, bottom: 137 })
+    start(pane)
+    clock(100, 130)
+    fire('pointerdown', pointer(text, { clientX: 45, clientY: 145 }))
+    styles.set(text.parentElement as HTMLElement, { transform: 'matrix(0.5, 0, 0, 0.5, 0, 0)' })
+    fire('pointerup', pointer(text, { clientX: 45, clientY: 145, timeStamp: 120 }))
+    fire('click', click(links[0], { clientX: 26, clientY: 128 }))
+    expect(isLit(links[0]), 'the look at a click on a link under a scaled box').toBe(false)
+  })
+
+  it('leaves the look as it is for the click that the handler makes inside the first one, which is not trusted', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100, 130)
+    fire('pointerdown', pointer(texts[3], at))
+    fire('pointerup', pointer(texts[3], { ...at, timeStamp: 120 }))
+    fire('click', click(texts[3], at))
+    expect(isLit(links[3]?.[0]), 'the look at the click').toBe(true)
+    fire('click', click(links[3]?.[0], { ...at, clientX: 18, isTrusted: false }))
+    expect(isLit(links[3]?.[0]), 'the look after the handler’s own click').toBe(true)
+    expect(opened, 'links opened by that second click').toEqual([links[3]?.[0]])
+  })
+
+  it('goes 150 ms after a release that gets no click, and at the next press', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100, 130)
+    fire('pointerdown', pointer(links[3]?.[0], { clientX: 18, clientY: y }))
+    fire('pointerup', pointer(links[3]?.[0], { clientX: 18, clientY: y, timeStamp: 120 }))
+    vi.advanceTimersByTime(150)
+    expect(isLit(links[3]?.[0]), 'the look 150 ms after a release that gets no click').toBe(false)
+    fire('pointerdown', pointer(texts[3], at))
+    fire('pointerup', pointer(texts[3], { ...at, timeStamp: 140 }))
+    fire('click', click(texts[3], at))
+    expect(isLit(links[3]?.[0]), 'the look at the click').toBe(true)
+    fire('pointerdown', pointer(texts[1], { pointerId: 2, clientX: 300, clientY: 150 }))
+    expect(isLit(links[3]?.[0]), 'the look at the next press').toBe(false)
+    expect(vi.getTimerCount(), 'timers standing after the next press').toBe(0)
+  })
+
+  it('goes at once and leaves no timer where the handler ends', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    const stop = start(pane)
+    clock(100, 130)
+    fire('pointerdown', pointer(texts[3], at))
+    fire('pointerup', pointer(texts[3], { ...at, timeStamp: 120 }))
+    fire('click', click(texts[3], at))
+    expect(isLit(links[3]?.[0]), 'the look at the click').toBe(true)
+    stop()
+    expect(isLit(links[3]?.[0]), 'the look after the handler ended').toBe(false)
+    expect(vi.getTimerCount(), 'timers standing after the handler ended').toBe(0)
+  })
+
+  it('keeps the release’s stop: a lost capture after the release does not end the record before the click', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100, 130)
+    fire('pointerdown', pointer(texts[3], at))
+    fire('pointerup', pointer(texts[3], { ...at, timeStamp: 120 }))
+    expect([...listening.keys()], 'listeners after the release').not.toContain('lostpointercapture')
+    fire('lostpointercapture', pointer(texts[3]))
+    fire('click', click(texts[3], at))
+    expect(opened).toEqual([links[3]?.[0]])
+    expect(isLit(links[3]?.[0]), 'the look at the click').toBe(true)
   })
 })
