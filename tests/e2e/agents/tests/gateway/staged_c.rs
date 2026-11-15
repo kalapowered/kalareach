@@ -424,8 +424,8 @@ impl<'a> Typing<'a> {
             .type_text(self.at.remote, &self.ctx.runtime, text)
             .unwrap_or_else(|why| panic!("{why}"));
         bytes_taken(
-            written.forwarded_bytes.get(),
-            written.held_prefix_bytes.get(),
+            u64::try_from(written.bytes).unwrap_or(u64::MAX),
+            0,
             u64::try_from(text.len()).unwrap_or(u64::MAX),
         )
         .unwrap_or_else(|why| panic!("{why}"));

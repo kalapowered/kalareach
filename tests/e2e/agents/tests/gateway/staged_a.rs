@@ -24,9 +24,6 @@ use kr_e2e_agents::observe::{
 };
 use kr_e2e_agents::stage::{Keyboard, events_snapshot};
 use kr_e2e_m1b::run::{ended_within, running, signal};
-use kr_protocol::ids::InputSequence;
-use kr_protocol::input::{InputContent, InputWriteParams};
-use kr_protocol::scalars::Bytes;
 
 /// What the stand-in started by hand says on its first row.
 const BY_HAND: &str = "codex-stand-in: by hand";
@@ -487,7 +484,7 @@ fn gateway_an_agent_on_its_terminal_route_is_advertised_no_typed_capability_and_
         let written = keys
             .type_text(&session.remote, &ctx.runtime, &input)
             .unwrap_or_else(|why| panic!("{why}"));
-        forwarded_whole(written.forwarded_bytes.get(), &input)
+        forwarded_whole(u64::try_from(written.bytes).unwrap_or(u64::MAX), &input)
             .unwrap_or_else(|why| panic!("the input is forwarded: {why}"));
         let _ = session
             .person
@@ -1548,27 +1545,24 @@ fn gateway_forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_u
             // The control: a device with a view-only grant knows the session's identifier and is
             // refused input, where the owner device's grant admits it.
             let mut owner = keyboard(ctx, session, true);
-            let refused = ctx
-                .runtime
-                .block_on(watching.session().write_input(&InputWriteParams {
-                    session_id,
-                    attachment_id: owner.attachment_id(),
-                    epoch: owner.epoch(),
-                    sequence: InputSequence::new(owner.next_sequence()),
-                    input: InputContent::Bytes {
-                        bytes: Bytes::new(harmless(ctx).0.into_bytes()),
-                    },
-                }));
-            let viewer_refusal = match &refused {
-                Err(kr_client::error::ClientError::Host(error))
-                    if error.code == ErrorCode::PermissionDenied =>
-                {
-                    error.to_string()
-                }
-                Err(error) => {
-                    panic!("a view-only device's input is refused as not permitted: {error}")
-                }
-                Ok(written) => panic!("a view-only device's input is refused: {written:?}"),
+            // The view-only device types on the owner device's attachment through the input lane:
+            // the host refuses the lane's open or its first frame as not permitted, whichever it
+            // reads first, and accepts nothing of it.
+            let refused = match ctx.runtime.block_on(kr_e2e_m1b::typing::Typing::open(
+                watching.session(),
+                watching.environment_id(),
+                session_id,
+                owner.attachment_id(),
+            )) {
+                Err(refused) => refused,
+                Ok(mut lane) => ctx
+                    .runtime
+                    .block_on(lane.type_bytes(owner.epoch(), harmless(ctx).0.as_bytes()))
+                    .expect_err("a view-only device's input is refused"),
+            };
+            let viewer_refusal = match refused.code() {
+                Some(ErrorCode::PermissionDenied) => refused.to_string(),
+                _ => panic!("a view-only device's input is refused as not permitted: {refused}"),
             };
             let (input, shows) = harmless(ctx);
             let admitted = owner
@@ -1590,7 +1584,7 @@ fn gateway_forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_u
                     "breaks_property": false,
                     "why_not": "a forgery that changes the host's state needs a registration the host issued, which this host issues to no connector",
                     "viewer": viewer_refusal,
-                    "owner_forwarded_bytes": admitted.forwarded_bytes.get(),
+                    "owner_accepted_bytes": admitted.bytes,
                 },
             })
         },
@@ -1794,8 +1788,9 @@ fn gateway_a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer
         let written = keys
             .type_text(&session.remote, &ctx.runtime, &typed)
             .unwrap_or_else(|why| panic!("{why}"));
-        forwarded_whole(written.forwarded_bytes.get(), &typed)
-            .unwrap_or_else(|why| panic!("every byte of the path is forwarded: {why}"));
+        forwarded_whole(u64::try_from(written.bytes).unwrap_or(u64::MAX), &typed).unwrap_or_else(
+            |why| panic!("every byte of the path is accepted for the terminal: {why}"),
+        );
         let rows = shows_across_rows(&session.person, SHOT);
         // The host announces nothing about the typed path: the instance and its revision as they
         // were before it was typed, and no resource.
@@ -1817,7 +1812,7 @@ fn gateway_a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer
         serde_json::json!({
             "arm": arm(ctx),
             "typed": typed,
-            "forwarded_bytes": written.forwarded_bytes.get(),
+            "accepted_bytes": written.bytes,
             "composer_rows": rows,
             "detection": initial.detection.evidence(),
             "announced": after.detection.evidence(),
