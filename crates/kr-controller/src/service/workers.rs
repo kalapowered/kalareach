@@ -753,7 +753,6 @@ impl Controller {
     /// own tests. It goes on answering after the opening has been taken away, which is when the
     /// task ends if the opening was all that held it.
     #[cfg(feature = "testing")]
-    #[must_use]
     pub fn presentation_task_running_for_tests(
         &self,
         session_id: SessionId,
