@@ -961,3 +961,117 @@ async fn a_real_not_found_from_the_service_stops_requests_for_ten_minutes() {
         .await;
     assert_eq!(service.web.requests_to("/api/relay/admission"), 2);
 }
+
+/// A transport whose exchange ends before the service has said anything: there is no status and no
+/// body to read. It counts the requests it was given.
+#[derive(Debug, Default)]
+struct Unreached {
+    requests: AtomicUsize,
+}
+
+impl ServiceHttp for Unreached {
+    fn post_json<'a>(
+        &'a self,
+        _url: &'a str,
+        _body: &'a [u8],
+        _headers: &'a [(&'a str, &'a str)],
+    ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Err(Error::refusal(
+                ErrorCode::ResourceUnavailable,
+                "the exchange ended".into(),
+            ))
+        })
+    }
+}
+
+/// The service's own envelope for a refusal, with the wait it names when it names one.
+fn refusal_body(code: &str, delay: Option<u64>) -> String {
+    let mut error = serde_json::json!({
+        "code": code,
+        "message": "The service could not do that now.",
+    });
+    if let Some(seconds) = delay {
+        error["retryAfterSeconds"] = serde_json::json!(seconds);
+    }
+    serde_json::json!({ "ok": false, "error": error }).to_string()
+}
+
+/// How many requests the transport had been sent at each of [`PROBES`], and whether a failed dial
+/// would be explained by what the service answered, when `http` answers every request.
+async fn series(http: Arc<dyn ServiceHttp>, sent: impl Fn() -> usize) -> Vec<(u64, usize, bool)> {
+    let clock = AdmissionClock::default();
+    let origin = GatewayOrigin::new("https://reach.kala.to").expect("an origin");
+    let service = Arc::new(ManagedPairingAdmission::new(
+        origin.clone(),
+        http,
+        Installation::new(),
+    ));
+    let admissions = PairingAdmissions::new(service, &origin)
+        .expect("admissions")
+        .on_clock(clock.clone());
+    let (host, relays) = (key(0x11), network(&[MANAGED]));
+    let mut seen = Vec::new();
+    let mut at = 0;
+    for probe in PROBES {
+        clock.advance(Duration::from_secs(probe - at));
+        at = probe;
+        admissions.before_dial(&relays, &host, key(0x22)).await;
+        seen.push((probe, sent(), admissions.capacity_refused(&relays, &host)));
+    }
+    seen
+}
+
+/// KR-REQ-17.48: when a request is asked again does not depend on what the answer to the one before
+/// it let a failed dial be explained by. An answer that is a refusal in the service's envelope, with
+/// a status of the 5xx class or another, an answer that is not the envelope and an exchange that
+/// ended with no answer are each asked about again at the moments they always were.
+#[tokio::test]
+async fn kr_req_17_48_a_refused_or_unreadable_answer_is_asked_about_again_at_the_same_moments() {
+    const ASKED: [usize; 13] = [1, 1, 1, 1, 2, 2, 3, 3, 3, 4, 5, 6, 7];
+    let bodies: [(&str, u16, String, [usize; 13]); 7] = [
+        ("503 internal", 503, refusal_body("INTERNAL", None), ASKED),
+        // A wait under twenty seconds is still asked again after twenty.
+        ("503 delay 5", 503, refusal_body("INTERNAL", Some(5)), ASKED),
+        (
+            "500 delay 3600",
+            500,
+            refusal_body("INTERNAL", Some(3600)),
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 3],
+        ),
+        // A service that says it is not configured stops every request for ten minutes.
+        (
+            "501 not configured",
+            501,
+            refusal_body("NOT_CONFIGURED", None),
+            [1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 3, 3, 4],
+        ),
+        (
+            "429 delay 30",
+            429,
+            refusal_body("RATE_LIMITED", Some(30)),
+            [1, 1, 1, 1, 1, 1, 2, 2, 3, 3, 4, 5, 6],
+        ),
+        (
+            "502 no envelope",
+            502,
+            "<html>Bad Gateway</html>".to_owned(),
+            ASKED,
+        ),
+        ("503 no error", 503, r#"{"ok":false}"#.to_owned(), ASKED),
+    ];
+    for (name, status, body, expected) in bodies {
+        let http = Exact::new(status, &body);
+        let seen = series(Arc::clone(&http) as _, || http.requests()).await;
+        let asked: Vec<usize> = seen.iter().map(|(_, asked, _)| *asked).collect();
+        assert_eq!(asked, expected, "{name}");
+    }
+    let http = Arc::new(Unreached::default());
+    let seen = series(Arc::clone(&http) as _, || {
+        http.requests.load(Ordering::SeqCst)
+    })
+    .await;
+    let asked: Vec<usize> = seen.iter().map(|(_, asked, _)| *asked).collect();
+    assert_eq!(asked, ASKED, "an exchange that ended with no answer");
+}
