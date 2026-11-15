@@ -511,6 +511,18 @@ impl RemoteConnection {
         };
         let proxy = match self.proxy_for(session_id, acting).await {
             Ok(proxy) => proxy,
+            // A session with no worker is refused from the record of its closure, or as unknown
+            // where none is recorded. What the closure record says is a read of a record like any
+            // other, so it is told through the same check, and a device that this host owes a
+            // fence, or whose registration was withdrawn or replaced while the record was read, is
+            // told that the outcome is not shown.
+            Err(error @ ControllerError::SessionClosed { .. }) => {
+                *asked = Some(decided.clone().kept());
+                if self.admitted_to_answer(validated).is_err() {
+                    return Err(outcome_not_shown());
+                }
+                return Err(error.to_protocol_error());
+            }
             Err(error) => return Err(error.to_protocol_error()),
         };
         if let Err(refusal) = self.claim_route(mutation, Some(session_id), own_claim) {
