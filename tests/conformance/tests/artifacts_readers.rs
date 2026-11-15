@@ -151,7 +151,9 @@ impl Reader {
         self.read_in(value, temporary, None)
     }
 
-    /// As [`Reader::read`], with `named` as further variables of the reader's environment.
+    /// As [`Reader::read`], with `named` as further variables of the reader's environment; a
+    /// variable named with an empty value is removed from it (Windows passes an empty one on as a
+    /// value of its own).
     fn read_with(
         self,
         value: Option<&OsStr>,
@@ -223,8 +225,14 @@ impl Reader {
         };
         run.env_remove(VARIABLE)
             .env_remove("RUNNER_TEMP")
-            .env("NO_COLOR", "1")
-            .envs(named.iter().copied());
+            .env("NO_COLOR", "1");
+        for (name, value) in named {
+            if value.is_empty() {
+                run.env_remove(name);
+            } else {
+                run.env(name, value);
+            }
+        }
         if let Some(directory) = directory {
             run.current_dir(directory);
         }
