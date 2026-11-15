@@ -66,7 +66,7 @@ use crate::error::{ControllerError, Result};
 /// opens the other three before it writes the version, at a daemon's start and when an update
 /// brings the file forward alike, so a file that records `N` has all four at the shape `N` stands
 /// for.
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 16;
 
 /// The newest schema version above [`SCHEMA_VERSION`] that this build reads without writing it.
 ///
@@ -76,7 +76,7 @@ pub const SCHEMA_VERSION: i64 = 15;
 /// update reads it. Its own next acceptance records the document at the version it writes, in a
 /// registry that stays at this version. A copy of the accepted document that this build cannot
 /// read stops the daemon's start ([`crate::config::from_record`]).
-pub const READS_THROUGH_SCHEMA_VERSION: i64 = 16;
+pub const READS_THROUGH_SCHEMA_VERSION: i64 = 17;
 
 /// The oldest schema version this build brings forward. A writer that stops handling an older
 /// shape raises this past the last version that wrote it.
@@ -987,6 +987,7 @@ impl Registry {
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
             Some(2) => {
                 self.migrate_2_to_3()?;
@@ -1002,6 +1003,7 @@ impl Registry {
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
             Some(3) => {
                 self.migrate_3_to_4()?;
@@ -1016,6 +1018,7 @@ impl Registry {
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
             Some(4) => {
                 self.migrate_4_to_5()?;
@@ -1029,6 +1032,7 @@ impl Registry {
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
             Some(5) => {
                 self.migrate_5_to_6()?;
@@ -1041,6 +1045,7 @@ impl Registry {
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
             Some(6) => {
                 self.migrate_6_to_7()?;
@@ -1052,6 +1057,7 @@ impl Registry {
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
             Some(7) => {
                 self.migrate_7_to_8()?;
@@ -1062,6 +1068,7 @@ impl Registry {
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
             Some(8) => {
                 self.migrate_8_to_9()?;
@@ -1071,6 +1078,7 @@ impl Registry {
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
             Some(9) => {
                 self.migrate_9_to_10()?;
@@ -1079,6 +1087,7 @@ impl Registry {
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
             Some(10) => {
                 self.migrate_10_to_11()?;
@@ -1086,23 +1095,31 @@ impl Registry {
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
             Some(11) => {
                 self.migrate_11_to_12()?;
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
             Some(12) => {
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
             Some(13) => {
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
-            Some(14) => self.migrate_14_to_15()?,
+            Some(14) => {
+                self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
+            }
+            Some(15) => self.migrate_15_to_16()?,
             Some(version) => {
                 return Err(ControllerError::RegistryUnavailable {
                     detail: format!(
@@ -1515,6 +1532,30 @@ impl Registry {
     fn migrate_14_to_15(&self) -> Result<()> {
         self.connection
             .execute("UPDATE schema_version SET version = 15", [])
+            .map_err(ControllerError::registry)?;
+        Ok(())
+    }
+
+    /// Version 15 to 16: the record of what the entries of a revocation's answer read.
+    ///
+    /// The table of kept action answers gained a nullable `reads` column, written by the statement
+    /// that keeps an answer. The grant store adds the column when it opens the file, which a
+    /// migration does before it writes the version, so this step only writes the version. An answer
+    /// kept without a record, as every answer an earlier release kept is, reads as one whose
+    /// entries' reads are not known.
+    ///
+    /// Three things hold of other releases. A release that reads the registry through 16 opens it as
+    /// found and never names the column, so the rows it writes carry no record, and the statements
+    /// that keep an answer leave an answer that already has one as it is. That release describes 16
+    /// as schema 15 whose copy of the accepted document can be at version 4, with no table or
+    /// column added, which is not what 16 is here: the document's next version takes 17. A release
+    /// that reads 15 only refuses a registry at 16, so a rollback to it is refused.
+    ///
+    /// This migration goes in the first release after every install has opened the registry at
+    /// this version.
+    fn migrate_15_to_16(&self) -> Result<()> {
+        self.connection
+            .execute("UPDATE schema_version SET version = 16", [])
             .map_err(ControllerError::registry)?;
         Ok(())
     }
@@ -4752,6 +4793,133 @@ mod tests {
         }
     }
 
+    /// A registry at version 15 has no column for what the entries of a revocation's answer read.
+    /// It comes forward to 16 with that column added, keeps every answer it held, and reads each of
+    /// them as one whose entries' reads are not known.
+    #[test]
+    fn a_registry_at_version_15_comes_forward_to_16_with_its_answers_and_reads_them_as_not_known() {
+        use crate::grants::{ActionRecord, GrantDirectory};
+        use kr_protocol::ids::{ActionId, ActorId};
+        use kr_protocol::scalars::Digest256;
+
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        drop(Registry::open(&path, environment()).expect("a registry"));
+        let connection = Connection::open(&path).expect("opens");
+        connection
+            .execute_batch(
+                "ALTER TABLE authority_receipts DROP COLUMN reads;
+                 UPDATE schema_version SET version = 15;",
+            )
+            .expect("the shape of version 15");
+        connection
+            .execute(
+                "INSERT INTO authority_receipts
+                     (actor_id, action_id, payload_digest, claimed_at_ms, result, recorded_at_ms)
+                 VALUES ('local:1', ?1, ?2, 1, x'6b657074', 2)",
+                params![[9_u8; 16].as_slice(), [3_u8; 32].as_slice()],
+            )
+            .expect("an answered row");
+        drop(connection);
+
+        let carried = Registry::bring_forward(&path, environment()).expect("brings it forward");
+        assert_eq!(carried, Some(Carried { from: 15, to: 16 }));
+        assert_eq!(recorded(&path), vec![16]);
+        let store = GrantDirectory::open(&path).expect("the grant store opens");
+        assert_eq!(
+            store
+                .recorded_action(
+                    &ActorId::new("local:1").expect("an actor"),
+                    ActionId::new(Uuid::from_bytes([9; 16])),
+                    &Digest256::from_bytes([3; 32]),
+                )
+                .expect("reads"),
+            Some(ActionRecord::Answered {
+                result: b"kept".to_vec(),
+                reads: None
+            }),
+            "the answer is as it was, with nothing read"
+        );
+    }
+
+    /// A build that does not know the column writes a row with no record, and this build writes one
+    /// with a record. Both stand in the one table, each reads as what it holds, and the older
+    /// build's statement that records an answer, guarded as every such statement is by there being
+    /// none yet, cannot put its answer beside the record of another.
+    #[test]
+    fn a_row_a_build_without_the_column_writes_stands_beside_a_row_with_a_record() {
+        use crate::grants::{ActionClaim, ActionRecord, GrantDirectory};
+        use kr_protocol::ids::{ActionId, ActorId};
+        use kr_protocol::scalars::Digest256;
+
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        drop(Registry::open(&path, environment()).expect("a registry"));
+        let store = GrantDirectory::open(&path).expect("the grant store opens");
+        let actor = ActorId::new("local:1").expect("an actor");
+        let digest = Digest256::from_bytes([3; 32]);
+        let with_record = ActionId::new(Uuid::from_bytes([1; 16]));
+        let without = ActionId::new(Uuid::from_bytes([2; 16]));
+
+        let ActionClaim::Claimed { hold } = store
+            .claim_action(&actor, with_record, &digest, 1)
+            .expect("the claim is written")
+        else {
+            panic!("a first claim on an action is this attempt's");
+        };
+        assert!(hold.keep_reads(b"record".to_vec()));
+        store
+            .retain_result(&hold, b"answer", 2)
+            .expect("the answer is kept");
+        // A build without the column names the columns it knows, and so leaves it empty.
+        let connection = Connection::open(&path).expect("opens");
+        connection
+            .execute(
+                "INSERT INTO authority_receipts
+                     (actor_id, action_id, payload_digest, claimed_at_ms)
+                 VALUES ('local:1', ?1, ?2, 1)",
+                params![[2_u8; 16].as_slice(), [3_u8; 32].as_slice()],
+            )
+            .expect("the older claim");
+        let record_answer = |action: u8| {
+            connection
+                .execute(
+                    "UPDATE authority_receipts SET result = x'6f6c64', recorded_at_ms = 3
+                      WHERE actor_id = 'local:1' AND action_id = ?1
+                        AND result IS NULL AND refusal_code IS NULL",
+                    params![[action; 16].as_slice()],
+                )
+                .expect("the older statement")
+        };
+        assert_eq!(record_answer(2), 1, "it answers a claim that has none");
+        assert_eq!(
+            record_answer(1),
+            0,
+            "and cannot put an answer beside another's record"
+        );
+        drop(connection);
+
+        let read = |action: ActionId| {
+            store
+                .recorded_action(&actor, action, &digest)
+                .expect("reads")
+        };
+        assert_eq!(
+            read(with_record),
+            Some(ActionRecord::Answered {
+                result: b"answer".to_vec(),
+                reads: Some(b"record".to_vec()),
+            })
+        );
+        assert_eq!(
+            read(without),
+            Some(ActionRecord::Answered {
+                result: b"old".to_vec(),
+                reads: None,
+            })
+        );
+    }
+
     /// The release before this one kept no table of the times exclusive management was turned off.
     /// A registry of that release comes forward with the table made empty, and the policy the host
     /// held is as it was.
@@ -4917,7 +5085,9 @@ mod tests {
                 .execute_batch(sql)
                 .expect("changes the registry");
         };
-        change("UPDATE schema_version SET version = 16;");
+        change(&format!(
+            "UPDATE schema_version SET version = {READS_THROUGH_SCHEMA_VERSION};"
+        ));
 
         assert_eq!(
             Registry::bring_forward(&path, environment_id).expect("is left"),
@@ -4942,16 +5112,19 @@ mod tests {
         drop(opened);
         assert_eq!(
             recorded(&path),
-            vec![16],
+            vec![READS_THROUGH_SCHEMA_VERSION],
             "and the version is as it was found"
         );
 
-        change("UPDATE schema_version SET version = 17;");
+        change(&format!(
+            "UPDATE schema_version SET version = {};",
+            READS_THROUGH_SCHEMA_VERSION + 1
+        ));
         assert!(Registry::open(&path, environment_id).is_err());
         assert!(Registry::open_to_read(&path, environment_id).is_err());
         assert_eq!(
             recorded(&path),
-            vec![17],
+            vec![READS_THROUGH_SCHEMA_VERSION + 1],
             "and the version is as it was found"
         );
     }

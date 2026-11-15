@@ -527,11 +527,11 @@
           "kind": "sqlite_table",
           "table": "schema_version"
         },
-        "version": 15,
+        "version": 16,
         "migrates_from": 1,
-        "reads_through": 16
+        "reads_through": 17
       },
-      "digest": "f8de9f5850a777557cabce2cdf924857af45baeca98b6affcf1f23d78507cf9a",
+      "digest": "f834674d24152414d4e63c60c48b7c07db2b90ee8bfd9f5e1d0cf58be38e8d2c",
       "kept": [
         "SessionCreateParams",
         "ClosureRecord",
@@ -566,6 +566,7 @@
         "StoredPolicy, StoredFeed, StoredEnrolment, StoredBinding, StoredLeaseRecord, StoredRevocation, StoredRemoval (crates/kr-controller/src/grants/durable.rs)",
         "StoredCommitment (crates/kr-controller/src/net/invitations.rs)",
         "KeyDeclaration (crates/kr-controller/src/net/devices.rs)",
+        "Stored, StoredWorker (crates/kr-controller/src/authority/reads.rs)",
         "words of methods a recorded pairing action names",
         "words of launch phases"
       ]
