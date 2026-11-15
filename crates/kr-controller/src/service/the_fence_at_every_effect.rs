@@ -1767,6 +1767,31 @@ impl Refreshing {
         .expect("the environment is enrolled")
     }
 
+    /// Whether this host's record holds the environment `byte` enrolled.
+    fn is_enrolled(&self, byte: u8) -> bool {
+        let state_dir = self.controller.paths.state_dir().to_path_buf();
+        let environment_id = enrolment_of(byte).environment_id;
+        crate::bridge::store::Store::with_locked(&state_dir, |store| {
+            Ok(store.enrolment(environment_id).is_some())
+        })
+        .expect("the record opens")
+    }
+
+    /// The admission of the rig's connection, with a deadline `within` from now on the daemon's
+    /// clock.
+    fn admitted_within(&self, within: Duration) -> crate::authority::AdmittedMutation {
+        crate::authority::AdmittedMutation {
+            deadline: Some(
+                self.controller
+                    .clock
+                    .now()
+                    .checked_add(within)
+                    .expect("a deadline"),
+            ),
+            ..self.carried
+        }
+    }
+
     /// What this host last recorded of the integration of the environment `byte` enrolled.
     #[cfg(unix)]
     fn recorded_readiness(&self, byte: u8) -> kr_protocol::identity::EnvironmentReadiness {
@@ -1836,6 +1861,112 @@ async fn a_refresh_whose_deadline_passes_while_the_platform_looks_does_not_start
         .await
         .expect("a deadline that stands lets the refresh start the environment");
     assert!(standing.was_started());
+}
+
+/// KR-REQ-09.09: an enrolment or a forgetting that waits for this host's record of its
+/// environments past the deadline it was accepted under changes nothing: the call is refused as
+/// expired and the record is as it was. The refresh holds that record while the platform looks at
+/// an environment, which can take seconds, so the wait can outlast the deadline. The control: the
+/// same changes under a deadline that stands are made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_enrolment_or_a_forgetting_that_waits_for_the_record_past_its_deadline_changes_nothing()
+{
+    use kr_protocol::identity::{EnvironmentEnrolParams, EnvironmentForgetParams};
+    let rig = Refreshing::start().await;
+    let enrol = |byte: u8, within: Duration| {
+        rig.record_change_under(
+            Method::EnvironmentEnrol,
+            mutation_of(
+                &rig.temp,
+                Method::EnvironmentEnrol,
+                ParamsValue::from_typed(&EnvironmentEnrolParams {
+                    enrolment: enrolment_of(byte),
+                })
+                .expect("encodes"),
+            ),
+            rig.admitted_within(within),
+        )
+    };
+    let forget = |byte: u8, within: Duration| {
+        rig.record_change_under(
+            Method::EnvironmentForget,
+            mutation_of(
+                &rig.temp,
+                Method::EnvironmentForget,
+                ParamsValue::from_typed(&EnvironmentForgetParams {
+                    environment_id: enrolment_of(byte).environment_id,
+                })
+                .expect("encodes"),
+            ),
+            rig.admitted_within(within),
+        )
+    };
+    let past_the_deadline = || rig.clock.advance(Duration::from_secs(11));
+
+    let expired = stopped_after_the_environment_record_is_taken(
+        &rig.controller,
+        enrol(4, Duration::from_secs(10)),
+        past_the_deadline,
+    )
+    .await
+    .expect_err("the deadline passed while the enrolment waited for the record");
+    assert!(
+        matches!(expired, crate::error::ControllerError::WindowExpired { .. }),
+        "{expired}"
+    );
+    assert!(!rig.is_enrolled(4), "the enrolment was not made");
+    let expired = stopped_after_the_environment_record_is_taken(
+        &rig.controller,
+        forget(1, Duration::from_secs(10)),
+        past_the_deadline,
+    )
+    .await
+    .expect_err("the deadline passed while the forgetting waited for the record");
+    assert!(
+        matches!(expired, crate::error::ControllerError::WindowExpired { .. }),
+        "{expired}"
+    );
+    assert!(rig.is_enrolled(1), "the environment was not forgotten");
+
+    enrol(4, Duration::from_secs(60))
+        .await
+        .expect("a deadline that stands lets the enrolment be made");
+    assert!(rig.is_enrolled(4));
+    forget(1, Duration::from_secs(60))
+        .await
+        .expect("a deadline that stands lets the forgetting be made");
+    assert!(!rig.is_enrolled(1));
+}
+
+/// KR-REQ-09.09: a refresh that asks for no start and whose deadline passes while the platform
+/// looks at the environment records nothing of what it saw: it is refused as expired and the record
+/// is as it was. The control: a refresh whose deadline stands records what the platform said.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refresh_whose_deadline_passes_while_the_platform_looks_records_nothing() {
+    use kr_protocol::identity::EnvironmentPresence;
+    let rig = Refreshing::start().await;
+    let slow = SteppedPlatform::slow(&rig.controller, &rig.clock, Duration::from_secs(11));
+    rig.controller.ask_instead(slow.clone());
+    let expired = rig
+        .refresh_within(1, false, Duration::from_secs(10))
+        .await
+        .expect_err("the deadline passed before the observation was recorded");
+    assert!(
+        matches!(expired, crate::error::ControllerError::WindowExpired { .. }),
+        "{expired}"
+    );
+    assert!(!slow.was_started());
+    assert_eq!(rig.recorded_status(1), EnvironmentPresence::Stale);
+
+    let standing = SteppedPlatform::slow(&rig.controller, &rig.clock, Duration::from_secs(1));
+    rig.controller.ask_instead(standing);
+    rig.refresh_within(2, false, Duration::from_secs(10))
+        .await
+        .expect("a deadline that stands lets the observation be recorded");
+    assert_eq!(
+        rig.recorded_status(2),
+        EnvironmentPresence::EnvironmentStopped
+    );
 }
 
 /// KR-REQ-09.09: a fence that lands while a refresh starts the environment stops the record, and
