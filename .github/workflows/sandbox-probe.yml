@@ -148,3 +148,31 @@ jobs:
       - name: Result
         if: always() && steps.setup.outcome == 'success'
         run: bash scripts/ci/sandbox-probe/summary.sh
+
+  pairs:
+    name: pairs (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out the scripts
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          sparse-checkout: scripts/ci
+          persist-credentials: false
+
+      - name: Setup
+        id: setup
+        run: bash scripts/ci/sandbox-probe/k-setup.sh
+
+      - name: M, the pairs
+        id: pairs
+        if: always() && steps.setup.outcome == 'success'
+        run: bash scripts/ci/sandbox-probe/m-pairs.sh
+
+      - name: Teardown
+        if: always()
+        run: sudo -n systemctl stop 'sbx-*' 2>/dev/null || true
+
+      - name: Result
+        if: always()
+        run: bash scripts/ci/sandbox-probe/summary.sh
