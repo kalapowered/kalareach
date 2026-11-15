@@ -3914,6 +3914,65 @@ async fn a_worker_without_the_lane_is_sent_none_of_the_new_members() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_with_the_lane_is_sent_the_barrier_and_asked_for_the_count() {
+    let (rig, _stream) = typed(3).await;
+    let sent = script_dependents(&rig, None);
+    for request in [Dependent::Release, Dependent::Detach, Dependent::Launch] {
+        // The device asks for no count, and the host asks for it.
+        let answered = send_asking(&rig, request, rig.epoch, 3, false).await;
+        assert!(
+            !answered.refused_here,
+            "the position is reached: {:?}",
+            answered.answer
+        );
+    }
+    let barrier = |launch| {
+        Some(InputBarrier {
+            attachment_id: rig.attachment,
+            epoch: rig.epoch,
+            count: U64::new(3),
+            launch,
+        })
+    };
+    let release: InputReleaseParams = sent_for(&sent, Method::InputRelease)
+        .to_typed()
+        .expect("release parameters");
+    assert_eq!(release.after_input, barrier(Nullable::null()));
+    assert!(release.fenced_report, "the release asks for the count");
+    let detach: SessionDetachParams = sent_for(&sent, Method::SessionDetach)
+        .to_typed()
+        .expect("detach parameters");
+    assert_eq!(detach.after_input, barrier(Nullable::null()));
+    assert!(detach.fenced_report, "the detach asks for the count");
+    let launch: ShellLaunchParams = sent_for(&sent, Method::ShellLaunch)
+        .to_typed()
+        .expect("launch parameters");
+    assert_eq!(launch.after_input, barrier(Nullable::some(1)));
+    rig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_count_a_worker_gives_reaches_the_device_unchanged() {
+    let (rig, _stream) = typed(3).await;
+    let _sent = script_dependents(&rig, Some(7));
+    let release = send_asking(&rig, Dependent::Release, rig.epoch, 3, false).await;
+    let released: InputLeaseResult = release
+        .answer
+        .expect("the release is answered")
+        .to_typed()
+        .expect("a lease result");
+    assert_eq!(released.fenced_bytes, Some(U64::new(7)));
+    let detach = send_asking(&rig, Dependent::Detach, rig.epoch, 3, false).await;
+    let detached: SessionDetachResult = detach
+        .answer
+        .expect("the detach is answered")
+        .to_typed()
+        .expect("a detach result");
+    assert_eq!(detached.fenced_bytes, Some(U64::new(7)));
+    rig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_that_gives_no_count_is_not_given_one() {
     let (rig, _stream) = typed_serial(3).await;
     let _sent = script_dependents(&rig, None);
