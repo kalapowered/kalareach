@@ -429,6 +429,60 @@ pub fn direct_payload(invited: &PairInviteResult) -> DirectQrPayload {
     *payload
 }
 
+/// How many times a candidate dials again after the transport ended its connection for want of
+/// traffic.
+const REDIALS: u32 = 3;
+
+/// Whether the transport closed `connection` because nothing crossed it for its inactivity
+/// threshold, as it does one that a stall of the test process or of the machine longer than the
+/// threshold leaves standing. A close that the host asked for, or a refusal, is not that.
+fn ended_by_inactivity(connection: &iroh::endpoint::Connection) -> bool {
+    matches!(connection.close_reason(), Some(ConnectionError::TimedOut))
+}
+
+/// Opens the unpaired surface and asks for the challenge, on a new connection each time the
+/// transport ends one by inactivity before the host has answered. The host keeps nothing of a
+/// candidate that has not sent its proof, so asking again changes nothing it holds.
+///
+/// # Panics
+///
+/// Panics when a step fails for any other reason, or after [`REDIALS`] connections that the
+/// transport ended by inactivity.
+async fn until_challenged(
+    device: &Candidate<'_>,
+    payload: &DirectQrPayload,
+) -> (
+    iroh::endpoint::Connection,
+    CandidateConnection,
+    PairRedeemResult,
+) {
+    let mut redials = 0;
+    loop {
+        let connection = dial_until_connected(device.endpoint, host_addr(payload)).await;
+        let asked: std::result::Result<_, (&str, TransportError)> = async {
+            let mut candidate = handshake::connect_unpaired(&connection, device.identity)
+                .await
+                .map_err(|error| ("an unpaired connection", error))?;
+            let challenge: PairRedeemResult = candidate
+                .call(
+                    Method::PairRedeem,
+                    &PairRedeemParams::Challenge {
+                        invitation_id: payload.invitation_id,
+                    },
+                )
+                .await
+                .map_err(|error| ("the host issues a challenge", error))?;
+            Ok((candidate, challenge))
+        }
+        .await;
+        match asked {
+            Ok((candidate, challenge)) => return (connection, candidate, challenge),
+            Err(_) if redials < REDIALS && ended_by_inactivity(&connection) => redials += 1,
+            Err((step, error)) => panic!("{step}: {error:?}"),
+        }
+    }
+}
+
 /// Redeems a direct invitation as `device`, over the unpaired surface an unpaired endpoint reaches.
 ///
 /// Returns the candidate's connection, which it asks about its pairing on afterwards.
@@ -437,19 +491,7 @@ pub async fn redeem(
     invited: &PairInviteResult,
 ) -> (iroh::endpoint::Connection, CandidateConnection, String) {
     let payload = direct_payload(invited);
-    let connection = dial_until_connected(device.endpoint, host_addr(&payload)).await;
-    let mut candidate = handshake::connect_unpaired(&connection, device.identity)
-        .await
-        .expect("an unpaired connection");
-    let challenge: PairRedeemResult = candidate
-        .call(
-            Method::PairRedeem,
-            &PairRedeemParams::Challenge {
-                invitation_id: payload.invitation_id,
-            },
-        )
-        .await
-        .expect("the host issues a challenge");
+    let (connection, mut candidate, challenge) = until_challenged(device, &payload).await;
     let PairRedeemResult::Challenge(challenge) = challenge else {
         panic!("the first redemption step answers with a challenge");
     };
