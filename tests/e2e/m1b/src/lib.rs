@@ -72,8 +72,10 @@ pub mod screen;
 pub mod shells;
 #[cfg(all(unix, feature = "legs"))]
 pub mod site;
-/// The typing of a paired device, sent through the client library's input lane. The one source is
-/// the control daemon's network support, which the suites there and the CLI's upgrade suite share.
+// The typing of a paired device, sent through the client library's input lane. The one source is
+// the control daemon's network support, which the suites there and the CLI's upgrade suite share.
+// This is not a doc comment: the file's own module documentation links to its items, and a link in
+// a module that has both an outer and an inner doc comment is resolved from the parent module.
 #[cfg(all(unix, feature = "legs"))]
 #[path = "../../../../crates/kr-controller/tests/net_support/typing.rs"]
 pub mod typing;
