@@ -277,6 +277,37 @@ async fn until(what: &str, bound: Duration, mut condition: impl FnMut() -> bool)
     }
 }
 
+/// What `read` gives, read on a thread of its own so that a lock of the worker that is held or
+/// poisoned cannot keep a failure from saying what it has to say: the words are "held" when the
+/// read has not come back within the bound, and "poisoned" when it ended in the lock's panic.
+/// The bound decides nothing but how long a failure that finds a lock held takes to say so; the
+/// thread of a held lock is left where it waits.
+fn read_unless_a_lock_is_in_the_way<T: Send + 'static>(
+    read: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    let (done, result) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let _ = done.send(read());
+    });
+    match result.recv_timeout(Duration::from_secs(2)) {
+        Ok(value) => Ok(value),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err("held".to_owned()),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let panic = reader.join().expect_err("the read ended without a value");
+            let text = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("a panic with no words");
+            Err(if text.contains("poisoned") {
+                "poisoned".to_owned()
+            } else {
+                format!("not read: {text}")
+            })
+        }
+    }
+}
+
 /// The error code an answer refused with.
 fn refusal(outcome: &Outcome) -> Option<ErrorCode> {
     match outcome {
@@ -879,22 +910,40 @@ impl Rig {
     /// read, for a failure that finds the application's file short: the total the writer recorded
     /// as written to the terminal, whether the writer found the terminal gone, the end of the
     /// session's retained output, where an error of the application shows, the application's
-    /// state and exit, and the free space of the directory its file is in.
+    /// state and exit, and the free space of the directory its file is in. A lock of the worker
+    /// that is held or poisoned shows as that word in the place of what it keeps, so the words
+    /// always print.
     fn what_became_of_the_application(&self) -> String {
-        let writes = self.runtime.input().terminal_writes();
-        let written: usize = writes.iter().map(|write| write.bytes.len()).sum();
-        let gone = self
-            .runtime
-            .input()
-            .lock()
-            .terminal_gone_latch()
-            .load(std::sync::atomic::Ordering::Acquire);
-        let retained = common::retained(&self.runtime);
-        let end =
-            String::from_utf8_lossy(&retained[retained.len().saturating_sub(400)..]).into_owned();
-        let exit = {
-            let session = self.runtime.session();
-            format!("{:?}, closure {:?}", session.state(), session.closure())
+        let input = Arc::clone(self.runtime.input());
+        let terminal = read_unless_a_lock_is_in_the_way(move || {
+            let writes = input.terminal_writes();
+            let written: usize = writes.iter().map(|write| write.bytes.len()).sum();
+            let gone = input
+                .lock()
+                .terminal_gone_latch()
+                .load(std::sync::atomic::Ordering::Acquire);
+            format!(
+                "the writer recorded {written} bytes in {} writes to the terminal; the terminal \
+                 was {}",
+                writes.len(),
+                if gone { "found gone" } else { "not found gone" },
+            )
+        })
+        .unwrap_or_else(|why| format!("the writer's record of the terminal is {why}"));
+        let runtime = Arc::clone(&self.runtime);
+        let session = read_unless_a_lock_is_in_the_way(move || {
+            let retained = common::retained(&runtime);
+            let end = String::from_utf8_lossy(&retained[retained.len().saturating_sub(400)..])
+                .into_owned();
+            let session = runtime.session();
+            (
+                end,
+                format!("{:?}, closure {:?}", session.state(), session.closure()),
+            )
+        });
+        let (end, exit) = match session {
+            Ok((end, exit)) => (format!("{end:?}"), exit),
+            Err(why) => (why.clone(), why),
         };
         #[cfg(unix)]
         let free = rustix::fs::statvfs(self._kept.path()).map_or_else(
@@ -904,11 +953,8 @@ impl Rig {
         #[cfg(not(unix))]
         let free = String::from("not read on this platform");
         format!(
-            "the writer recorded {written} bytes in {} writes to the terminal; the terminal was \
-             {}; the retained output ends {end:?}; the application's state is {exit}; the free \
-             space of the directory its file is in is {free}",
-            writes.len(),
-            if gone { "found gone" } else { "not found gone" },
+            "{terminal}; the retained output ends {end}; the application's state is {exit}; the \
+             free space of the directory its file is in is {free}"
         )
     }
 
