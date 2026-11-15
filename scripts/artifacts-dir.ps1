@@ -170,7 +170,9 @@ function Confine-Value {
             'kind' { Stop-Refused $Value "it is a Windows path of a kind this reader does not take ($takes)" $Folder }
         }
     } elseif (-not [System.IO.Path]::IsPathFullyQualified($Value)) { Stop-Refused $Value 'it is not an absolute path' $Folder }
-    if ($Value.Split($separators) -contains '..') { Stop-Refused $Value 'it steps up a directory with `..`' $Folder }
+    # PowerShell's own path commands read a backslash as a separator on every platform, so a `..` behind one
+    # climbs out of a folder here too.
+    if ($Value.Split([char[]] @('\', '/')) -contains '..') { Stop-Refused $Value 'it steps up a directory with `..`' $Folder }
     $real = (Get-RealPath (Remove-ExtendedPrefix $Value)).TrimEnd($separators)
     foreach ($root in (Get-TemporaryRoots)) {
         if ($real.StartsWith($root + [System.IO.Path]::DirectorySeparatorChar, $comparison)) { return $real }
