@@ -2176,8 +2176,9 @@ mod tests {
         ]
     }
 
-    /// A refusal as a service words one when a budget is short: the usual members, and a list of
-    /// alternatives inside the error object when it names any.
+    /// A refusal as a service words one when a budget is short: the usual members, a member this
+    /// reader does not know (which a later service may add, and which must not make the refusal
+    /// unreadable), and a list of alternatives inside the error object when it names any.
     fn refusal_naming(
         status: u16,
         code: &str,
@@ -2188,6 +2189,7 @@ mod tests {
             "code": code,
             "message": "Refused.",
             "retryAfterSeconds": retry_after_seconds,
+            "furtherMember": { "of": "a later service" },
         });
         if !alternatives.is_empty() {
             error["alternatives"] = serde_json::json!(alternatives);
