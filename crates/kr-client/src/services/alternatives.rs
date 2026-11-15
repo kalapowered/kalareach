@@ -123,17 +123,20 @@ impl Alternatives {
         Self::named(texts)
     }
 
-    /// The alternatives a refusal named, in the order it named them.
+    /// The alternatives a refusal named, in the order it named them. A list in which no entry has
+    /// text names no path, so it is no list: every entry stays as it was written when one has text.
     pub(crate) fn named(texts: Vec<String>) -> Self {
-        if texts.is_empty() {
+        let items: Box<[ServiceMessage]> = texts
+            .into_iter()
+            .map(ServiceMessage::from_refusal)
+            .collect();
+        if items
+            .iter()
+            .all(|item| Shown::service(item).as_str().trim().is_empty())
+        {
             return Self::none();
         }
-        Self(Some(
-            texts
-                .into_iter()
-                .map(ServiceMessage::from_refusal)
-                .collect(),
-        ))
+        Self(Some(items))
     }
 
     fn items(&self) -> &[ServiceMessage] {
@@ -283,13 +286,6 @@ pub fn told_capacity(
         return None;
     }
     let until_then = alternatives.until_then()?;
-    if alternatives
-        .as_given()
-        .iter()
-        .all(|item| item.as_str().trim().is_empty())
-    {
-        return None;
-    }
     let mut parts = vec![Shown::service(&ServiceMessage::from_refusal(
         message.to_owned(),
     ))];

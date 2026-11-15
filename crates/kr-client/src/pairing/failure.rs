@@ -139,8 +139,10 @@ pub struct PairingFailure {
         serialize_with = "as_received"
     )]
     pub alternatives: Alternatives,
-    /// Seconds after which the same attempt could succeed, as the managed relay service named them,
-    /// when it named a delay.
+    /// Seconds from now until this device asks the managed relay service again, and not less than
+    /// what remains of the delay the service named, when it named one: the wait after which a new
+    /// attempt is answered afresh. It is as large as the service made it, so an interface caps what
+    /// it says and never makes a timer from it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_after_seconds: Option<u64>,
     /// What happened, for a log.
