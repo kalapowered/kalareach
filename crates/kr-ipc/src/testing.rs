@@ -249,15 +249,42 @@ pub const REMOVAL_PATIENCE: std::time::Duration = std::time::Duration::from_secs
 /// stream holds the drop for the whole of it, once.
 const LINE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Whether the wait of the last drop of a [`PrivateTempDir`] that said a line ended with the
-/// writer's word: the thread that writes the line said that the line is written. It is false when
-/// no drop has said a line, and after a drop whose wait was skipped, was of no length or ran out.
+/// What the drop of a [`PrivateTempDir`] knows of the line that it said, as two facts that the
+/// drop itself sets: a stall of the dropping thread or of the process, of any length and at any
+/// point, changes neither.
 ///
-/// A process that a case runs again reads it right after the drop to learn whether the drop
-/// waited, which the line on the standard error cannot say: a process that is stopped for long
-/// enough after a drop that did not wait finds the line written all the same.
-static LINE_WAIT_HAD_THE_WRITERS_WORD: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// `wait` is the length of the wait that the drop gave the writer's word: the time that its
+/// receive was given, set from the same value, whether or not a word came. It is nothing when no
+/// thread could be started, as there was then no wait to give. A wait of no length can still find
+/// the word, since a writer that is quicker than the dropping thread has sent it before the
+/// receive begins; `wait` is what says that the wait had no length.
+///
+/// `written` is true only when the writer's word came in that time and said that its write
+/// returned without an error. It is false for a word that says the write failed, for a wait that
+/// ran out, and for a drop that did not wait for a word.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the cases of this file read the record, and no other code does"
+    )
+)]
+struct LineRecord {
+    wait: std::time::Duration,
+    written: bool,
+}
+
+/// The record of the last drop of a [`PrivateTempDir`] that said a line: both facts are nothing
+/// until a drop has said one.
+///
+/// A process that a case runs again reads it right after the drop to learn how the drop waited and
+/// whether its writer wrote, which the line on the standard error cannot say: a process that is
+/// stopped for long enough after a drop that did not wait finds the line written all the same.
+static LAST_LINE: std::sync::Mutex<LineRecord> = std::sync::Mutex::new(LineRecord {
+    wait: std::time::Duration::ZERO,
+    written: false,
+});
 
 /// Whether the refusal `error` of a removal is one that time can end: any refusal on Windows, and
 /// elsewhere "directory not empty", which means that another thread made a file in the tree while
@@ -338,8 +365,9 @@ impl Drop for PrivateTempDir {
     }
 }
 
-/// Says `line` on the standard error from a thread of its own, and waits for that thread to have
-/// written it for `LINE_WAIT` at most.
+/// Says `line` on the standard error from a thread of its own, and waits for that thread's word
+/// about its write for `LINE_WAIT` at most. The drop keeps what it gave and what it got as
+/// [`LAST_LINE`].
 ///
 /// A write to a standard error that has stopped draining waits for a reader, and the standard
 /// library holds one lock for the whole write, so a thread that writes beside it waits too. A drop
@@ -352,29 +380,41 @@ impl Drop for PrivateTempDir {
 fn say_on_the_standard_error(line: String) {
     use std::io::Write as _;
 
-    let writers_word = say_by(line, LINE_WAIT, |line| {
-        let _ = std::io::stderr().write_all(line.as_bytes());
+    let record = say_by(line, LINE_WAIT, |line| {
+        std::io::stderr().write_all(line.as_bytes())
     });
-    LINE_WAIT_HAD_THE_WRITERS_WORD.store(writers_word, std::sync::atomic::Ordering::SeqCst);
+    *LAST_LINE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = record;
 }
 
 /// [`say_on_the_standard_error`] with the write given, and the time to wait for it, so that a case
-/// can have a write that is slow or one that stalls. It answers whether the wait ended with the
-/// writer's word that the line is written, and not because no thread could be started, or the
-/// wait ran out, or was of no length.
+/// can have a write that is slow, one that stalls or one that fails. The writer sends the result of
+/// its write as its word. The answer is the [`LineRecord`] of the wait: `wait` is the time that the
+/// receive of the word was given, and `written` says that a word came in that time and that it said
+/// the write returned without an error.
 fn say_by(
     line: String,
     wait: std::time::Duration,
-    write: impl FnOnce(String) + Send + 'static,
-) -> bool {
-    let (written, writing) = std::sync::mpsc::channel::<()>();
+    write: impl FnOnce(String) -> std::io::Result<()> + Send + 'static,
+) -> LineRecord {
+    let (word, writing) = std::sync::mpsc::channel::<std::io::Result<()>>();
     let started = std::thread::Builder::new()
         .name("kr-test-support-said".to_owned())
         .spawn(move || {
-            write(line);
-            let _ = written.send(());
+            let _ = word.send(write(line));
         });
-    started.is_ok() && writing.recv_timeout(wait).is_ok()
+    if started.is_err() {
+        return LineRecord {
+            wait: std::time::Duration::ZERO,
+            written: false,
+        };
+    }
+    let heard = writing.recv_timeout(wait);
+    LineRecord {
+        wait,
+        written: matches!(heard, Ok(Ok(()))),
+    }
 }
 
 /// A task that serves a fixture and is asked to end when this is dropped.
@@ -938,10 +978,41 @@ mod tests {
         held.recv().expect("the thread holds the standard error");
     }
 
-    /// The status that the process of the line case ends with when its drop had no word from the
-    /// writer that its line is written.
+    /// The status that a process of a line case ends with when the drop gave its wait a length
+    /// shorter than `STANDARD_ERROR_HELD`, nothing included.
     #[cfg(unix)]
-    const NO_WRITERS_WORD: i32 = 3;
+    const WAIT_TOO_SHORT: i32 = 3;
+
+    /// The status that a process of a line case ends with when the drop's wait had a length and the
+    /// writer's word does not say that its write returned without an error.
+    #[cfg(unix)]
+    const WRITE_NOT_DONE: i32 = 4;
+
+    /// Ends the process of a line case, right after its drop and before it prints anything else,
+    /// with the status that the drop's record gives ([`LineRecord`]): `WAIT_TOO_SHORT` when the
+    /// wait that the drop gave was shorter than `STANDARD_ERROR_HELD`, else `WRITE_NOT_DONE` when
+    /// the writer's word does not say that its write returned without an error, else 0. The two
+    /// facts are read from the record and nothing else, so that no schedule of this process or of
+    /// the drop changes them. What the drop took and the two facts go to the standard output, which
+    /// a failure shows.
+    #[cfg(unix)]
+    fn end_by_the_record_of_the_drop(took: Duration) -> ! {
+        let record = *super::LAST_LINE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        println!(
+            "the drop took {took:?}; it gave its wait {:?}; the writer's word that its write \
+             returned without an error: {}",
+            record.wait, record.written
+        );
+        std::process::exit(if record.wait < STANDARD_ERROR_HELD {
+            WAIT_TOO_SHORT
+        } else if !record.written {
+            WRITE_NOT_DONE
+        } else {
+            0
+        });
+    }
 
     /// What a process that a case runs again left: how it ended and what it wrote.
     #[cfg(unix)]
@@ -955,9 +1026,16 @@ mod tests {
     /// what it wrote when it has ended. The process ends on its own, and it is ended by its pid
     /// when it has not ended in `WATCHDOG`, which is a limit on how long a failure takes to show
     /// and not a claim about how long the process takes. `if_stuck` says what a process that did
-    /// not end was waiting for, as the case that runs it knows it.
+    /// not end was waiting for, as the case that runs it knows it. Its standard error is a pipe
+    /// that this process reads, or `standard_error` when that is given, which this process then
+    /// reads nothing from.
     #[cfg(unix)]
-    fn run_again(name: &str, directory: &std::path::Path, if_stuck: &str) -> Ended {
+    fn run_again(
+        name: &str,
+        directory: &std::path::Path,
+        standard_error: Option<std::fs::File>,
+        if_stuck: &str,
+    ) -> Ended {
         use std::io::Read as _;
         use std::process::{Command, Stdio};
 
@@ -971,12 +1049,12 @@ mod tests {
             .env(REFUSED_DIRECTORY, directory)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(standard_error.map_or_else(Stdio::piped, Stdio::from))
             .spawn()
             .expect("starts the process");
         let pid = child.id();
         let mut standard_output = child.stdout.take().expect("its standard output");
-        let mut standard_error = child.stderr.take().expect("its standard error");
+        let mut standard_error = child.stderr.take();
         let (ended, ending) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = ended.send(child.wait());
@@ -998,9 +1076,11 @@ mod tests {
             panic!("the process did not end in {WATCHDOG:?}: {if_stuck}: {said}");
         };
         let mut written = String::new();
-        standard_error
-            .read_to_string(&mut written)
-            .expect("reads its standard error");
+        if let Some(stream) = standard_error.as_mut() {
+            stream
+                .read_to_string(&mut written)
+                .expect("reads its standard error");
+        }
         Ended {
             status: status.expect("waits for the process"),
             standard_output: said,
@@ -1011,7 +1091,7 @@ mod tests {
     /// The drop of a directory whose removal is refused does not wait for a reader of the standard
     /// error: with the standard error full and read by no one, its line cannot be written, and the
     /// drop returns when `LINE_WAIT` is up and the process ends. The wait ran out, so the drop has
-    /// no word from the writer that its line is written, and its record says so. The removal is
+    /// no word from the writer that its write returned, and its record says so. The removal is
     /// refused because the directory's parent does not let it go, which time does not change.
     ///
     /// The case runs itself again as a process of its own, whose standard error is a pipe that the
@@ -1029,10 +1109,13 @@ mod tests {
                 root: directory.into(),
             });
             println!("the drop returned");
+            let record = *super::LAST_LINE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert!(
-                !super::LINE_WAIT_HAD_THE_WRITERS_WORD.load(std::sync::atomic::Ordering::SeqCst),
-                "the drop had the writer's word that a line is written, which a full standard \
-                 error cannot take"
+                !record.written,
+                "the drop had the writer's word that its write returned without an error, which a \
+                 full standard error cannot take"
             );
             return;
         }
@@ -1044,6 +1127,7 @@ mod tests {
         let ended = run_again(
             NAME,
             &refused.directory,
+            None,
             "its drop waited for a reader of the standard error",
         );
 
@@ -1062,9 +1146,9 @@ mod tests {
     /// error. In that process one more thread takes the standard error's lock before the drop,
     /// says that it has it, holds it for `STANDARD_ERROR_HELD` and lets go. The drop gives its
     /// line to a writer thread and waits for the writer's word that the line is written, and
-    /// records whether the wait ended with that word ([`LINE_WAIT_HAD_THE_WRITERS_WORD`]). The
+    /// records whether the wait ended with that word ([`LineRecord`]). The
     /// process reads the record right after the drop, before it prints anything, and ends with
-    /// `NO_WRITERS_WORD` as its status when the drop had no word; the case fails on that status
+    /// `WAIT_TOO_SHORT` or `WRITE_NOT_DONE` as its status when the drop had no word; the case fails on that status
     /// whatever the standard error holds. The line alone cannot decide it, because a process
     /// that is stopped for long enough after a drop that did not wait finds the line written all
     /// the same. The hold is what lets a drop that waits really wait, and keeps a wait of no
@@ -1082,11 +1166,7 @@ mod tests {
             drop(PrivateTempDir {
                 root: directory.into(),
             });
-            let took = begun.elapsed();
-            let had_the_word =
-                super::LINE_WAIT_HAD_THE_WRITERS_WORD.load(std::sync::atomic::Ordering::SeqCst);
-            println!("the drop took {took:?}");
-            std::process::exit(if had_the_word { 0 } else { NO_WRITERS_WORD });
+            end_by_the_record_of_the_drop(begun.elapsed());
         }
         if a_mode_refuses_nothing_to_this_user() {
             return;
@@ -1096,13 +1176,20 @@ mod tests {
         let ended = run_again(
             NAME,
             &refused.directory,
+            None,
             "what it waited for is not known here, and its output shows whether the drop returned",
         );
 
         assert_ne!(
             ended.status.code(),
-            Some(NO_WRITERS_WORD),
-            "the drop's wait for its line did not end with the writer's word: {}",
+            Some(WAIT_TOO_SHORT),
+            "the drop gave its wait a length shorter than the hold: {}",
+            ended.standard_output
+        );
+        assert_ne!(
+            ended.status.code(),
+            Some(WRITE_NOT_DONE),
+            "the writer's word does not say that its write returned without an error: {}",
             ended.standard_output
         );
         assert!(
@@ -1122,18 +1209,98 @@ mod tests {
         );
     }
 
-    /// The write of a line that is slow is waited for: the line is written when the drop returns,
-    /// not after.
+    /// A drop whose line cannot be written does not record it as written: the standard error of
+    /// the process is a pipe that nothing reads, so its write is refused as a broken pipe, and the
+    /// record has a wait of full length and no word that the write returned without an error.
+    ///
+    /// The case runs itself again as a process of its own whose standard error is a named pipe.
+    /// This process opens the pipe for reading, opens it for writing and lets go of the reading
+    /// end before it starts that process: the end is marked to close when a program is started, so
+    /// no process holds it, and the first write of the process to the pipe is refused whatever the
+    /// schedule. The process ends with `WRITE_NOT_DONE`, and the case fails on any other status: a
+    /// writer that says its write succeeded when it failed makes the drop's record say so, and the
+    /// process ends with 0.
+    #[cfg(unix)]
+    #[test]
+    fn a_line_that_cannot_be_written_is_not_recorded_as_written() {
+        const NAME: &str = "a_line_that_cannot_be_written_is_not_recorded_as_written";
+
+        if let Some(directory) = std::env::var_os(REFUSED_DIRECTORY) {
+            report_panics_on_the_standard_output();
+            let begun = std::time::Instant::now();
+            drop(PrivateTempDir {
+                root: directory.into(),
+            });
+            end_by_the_record_of_the_drop(begun.elapsed());
+        }
+        if a_mode_refuses_nothing_to_this_user() {
+            return;
+        }
+
+        let refused = Refused::new();
+        let pipes = PrivateTempDir::create();
+        let pipe = pipes.path().join("standard-error");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&pipe)
+            .status()
+            .expect("starts mkfifo");
+        assert!(made.success(), "mkfifo ended badly ({made})");
+        let reader = open_a_pipe(&pipe, true);
+        let writer = open_a_pipe(&pipe, false);
+        drop(reader);
+
+        let ended = run_again(
+            NAME,
+            &refused.directory,
+            Some(writer),
+            "what it waited for is not known here, and its output shows whether the drop returned",
+        );
+
+        assert_eq!(
+            ended.status.code(),
+            Some(WRITE_NOT_DONE),
+            "the drop's record does not say that its write failed ({}): {}",
+            ended.status,
+            ended.standard_output
+        );
+    }
+
+    /// Opens the named pipe at `path` for reading without waiting for a writer, or for writing,
+    /// which does not wait when a reader has it open.
+    #[cfg(unix)]
+    fn open_a_pipe(path: &std::path::Path, to_read: bool) -> std::fs::File {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let mut options = std::fs::OpenOptions::new();
+        if to_read {
+            let no_waiting = i32::try_from(rustix::fs::OFlags::NONBLOCK.bits()).expect("a flag");
+            options.read(true).custom_flags(no_waiting);
+        } else {
+            options.write(true);
+        }
+        options.open(path).expect("opens the named pipe")
+    }
+
+    /// The write of a line that is slow is waited for: the drop's word comes when the write is
+    /// done, and the record has the wait that was given.
     #[test]
     fn a_line_is_written_when_the_wait_for_it_ends_even_when_its_write_is_slow() {
         let written = std::sync::Arc::new(std::sync::Mutex::new(None));
         let sink = std::sync::Arc::clone(&written);
 
-        let had_the_word = super::say_by("a line\n".to_owned(), WATCHDOG, move |line| {
+        let record = super::say_by("a line\n".to_owned(), WATCHDOG, move |line| {
             std::thread::sleep(Duration::from_millis(50));
             *sink.lock().expect("the sink") = Some(line);
+            Ok(())
         });
-        assert!(had_the_word, "the wait ended without the writer's word");
+        assert!(
+            record.written,
+            "the wait ended without the writer's word that its write returned"
+        );
+        assert_eq!(
+            record.wait, WATCHDOG,
+            "the record has another wait than was given"
+        );
 
         assert_eq!(
             written.lock().expect("the sink").as_deref(),
