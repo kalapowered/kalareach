@@ -27,10 +27,19 @@
 # case. A relative value, an empty value and a value with a `..` in it are refused, and so is a
 # root itself.
 #
+# On Windows a value, and each temporary variable, is read as Windows writes a full path or as Git
+# Bash does: C:\folder or C:/folder, \\server\share\folder or //server/share/folder, either of
+# those behind \\?\ (with backslashes only), /c/folder and /tmp/folder, with each backslash read as
+# a separator (Git Bash settles a path that holds one by its text, so the `..` check and the root
+# check read the value with each backslash as a slash). Any other spelling is refused, in words that
+# say which are taken: a device path (\\.\), a server with no share, three slashes at the start, a
+# path that depends on the current drive (\folder) or on a drive's current directory (C:folder).
+# Off Windows a backslash is a letter of a name.
+#
 # Where the variable is not set, the run makes a directory of its own under the temporary folder
 # (readable by this account only) and says where it is on standard error. The temporary folder is
-# the one TMPDIR names, else /tmp, and on Windows, where TMPDIR is not set or is /tmp (a login
-# shell's profile exports it so), the one TEMP names.
+# the one TMPDIR names, else /tmp, and on Windows, where TMPDIR is not set or is /tmp or /tmp/ (a
+# login shell's profile exports it so), the one TEMP names.
 #
 # The reader guards a test run against a mistake: for any value of the evidence variable, and any
 # temporary variable as a platform, a runner, one of our scripts or a developer's shell sets it,
@@ -38,9 +47,8 @@
 # it refuses nothing that the run set right. It is no boundary against a process of the same
 # account, which can write wherever the run can and can change a link or a folder while the reader
 # reads. It does not close a case that somebody arranges: a name with a line feed beside a link at
-# the shortened name, or a server named with no share. On Windows the comparison ignores letter
-# case, so a folder made case-sensitive, and a letter that the disk and the reader do not fold
-# alike, are not told apart.
+# the shortened name. On Windows the comparison ignores letter case, so a folder made
+# case-sensitive, and a letter that the disk and the reader do not fold alike, are not told apart.
 #
 # On Windows this reader takes the temporary folder from TEMP and the TypeScript reader takes TEMP
 # first; the Rust reader and the PowerShell reader take TMP first. Where TMP and TEMP differ, only a
@@ -133,7 +141,12 @@ _kr_artifacts_roots() {
   for _kr_candidate in "${_kr_named[@]}"; do
     # The name as it was given: the conversion below drops the line feeds at its end.
     case "$_kr_candidate" in *$'\n'*) continue ;; esac
-    [ "$_kr_windows" = 1 ] && _kr_candidate="$(_kr_artifacts_posix "$_kr_candidate")"
+    if [ "$_kr_windows" = 1 ]; then
+      # A temporary variable in a spelling this reader does not take names no root; the slashes at
+      # its end are not part of the folder, so `/tmp/` is `/tmp`.
+      _kr_candidate="$(_kr_artifacts_posix "$_kr_candidate")" || continue
+      _kr_candidate="$(_kr_artifacts_trim "$_kr_candidate")"
+    fi
     _kr_real="$(_kr_artifacts_resolve "$_kr_candidate")" || continue
     if [ -n "$_kr_real" ] && [ "$_kr_real" != / ]; then
       # A drive's top (/c) is a filesystem root on Windows, as / is elsewhere, and so is any folder
@@ -156,12 +169,69 @@ _kr_artifacts_roots() {
   return 0
 }
 
-# Prints $1 as a path Git Bash reads, when it is written the way Windows writes it (C:\... or C:/...).
+# Prints $1 as the path Git Bash reads, where $1 is written as Windows writes a full path or as Git
+# Bash does, with each backslash read as a separator (Git Bash settles a path that holds one by its
+# text, so a `..` behind a backslash climbs out of the folder before any check could see it):
+#
+#   C:\folder, C:/folder              -> /c/folder
+#   \\server\share\x, //server/share/x -> //server/share/x
+#   \\?\C:\folder, \\?\UNC\server\share\x (backslashes only: Windows reads a slash behind \\?\ as a
+#                                       letter of a name) -> as the two above
+#   /c/folder, /tmp/folder            -> as written, backslashes read as slashes (Git Bash's own)
+#
+# Fails with status 1 for a path that is not absolute (a relative one, \folder, C:folder) and with
+# status 2 for any other Windows spelling: a device path (\\.\ or \\?\ with anything but a drive or
+# UNC behind it, or with a slash), a server with no share, three slashes at the start. Off Windows a
+# path is as it is: a backslash is a letter of a name there.
 _kr_artifacts_posix() {
-  case "$1" in
-    [A-Za-z]:[\\/]*) cygpath -u -- "$1" ;;
-    *) printf '%s\n' "$1" ;;
+  local _kr_v="$1" _kr_after _kr_server _kr_extended='\\?\'
+  if ! _kr_artifacts_windows; then
+    printf '%s\n' "$_kr_v"
+    return 0
+  fi
+  case "$_kr_v" in
+    "$_kr_extended"*)
+      _kr_v="${_kr_v#"$_kr_extended"}"
+      case "$_kr_v" in */*) return 2 ;; esac
+      case "$_kr_v" in
+        [Uu][Nn][Cc]'\'?*) _kr_v='\\'"${_kr_v:4}" ;;
+        [A-Za-z]:'\'*) ;;
+        *) return 2 ;;
+      esac
+      ;;
   esac
+  case "$_kr_v" in
+    [\\/][\\/][.?] | [\\/][\\/][.?][\\/]*) return 2 ;;
+    [\\/][\\/][\\/]*) return 2 ;;
+    [\\/][\\/]*)
+      _kr_after="${_kr_v:2}"
+      _kr_after="${_kr_after//\\//}"
+      _kr_server="${_kr_after%%/*}"
+      case "$_kr_after" in */*) _kr_after="${_kr_after#*/}" ;; *) return 2 ;; esac
+      case "$_kr_after" in '' | /*) return 2 ;; esac
+      printf '//%s/%s\n' "$_kr_server" "$_kr_after"
+      ;;
+    [A-Za-z]:[\\/]*) cygpath -u -- "$_kr_v" ;;
+    [A-Za-z]:* | [\\]*) return 1 ;;
+    /*) printf '%s\n' "${_kr_v//\\//}" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Prints $1 without the slashes at its end (the top of a path, `/`, stays).
+_kr_artifacts_trim() {
+  local _kr_t="$1"
+  while [ "${#_kr_t}" -gt 1 ] && [ "${_kr_t%/}" != "$_kr_t" ]; do
+    _kr_t="${_kr_t%/}"
+  done
+  printf '%s\n' "$_kr_t"
+}
+
+# Prints the spellings that this reader takes on Windows, for the words of a refusal; nothing off
+# Windows.
+_kr_artifacts_takes() {
+  _kr_artifacts_windows || return 0
+  printf '%s' ' (on Windows this reader takes C:\folder or C:/folder, \\server\share\folder or //server/share/folder, and either behind \\?\, as \\?\C:\folder or \\?\UNC\server\share\folder)'
 }
 
 # Prints why $1 is refused, with the variable and the roots named, on standard error. With a third
@@ -169,10 +239,13 @@ _kr_artifacts_posix() {
 # directory, and it is the folder that is refused: nothing was set, so the words do not tell the
 # caller to leave it unset.
 _kr_artifacts_refuse() {
-  local _kr_roots
+  local _kr_roots _kr_what
   _kr_roots="$(_kr_artifacts_roots | awk 'BEGIN { s = "" } { s = s (NR > 1 ? ", " : "") $0 } END { print s }')"
+  [ -n "$_kr_roots" ] || _kr_roots="none: no folder that a temporary variable names exists"
   if [ "$#" -ge 3 ]; then
-    printf '%s\n' "kr-artifacts: no directory of this run's own can be made for its evidence: the temporary folder '$3' is refused: $2. It has to be an absolute path to a folder inside one of this platform's temporary roots (${_kr_roots}). Point TMPDIR (on Windows, TEMP: a TMPDIR that is /tmp is passed over there) at such a folder, or set KR_TEST_ARTIFACTS_DIR to a folder under one of the roots." >&2
+    _kr_what="$2"
+    [ -z "$3" ] || _kr_what="the temporary folder '$3' is refused: $2"
+    printf '%s\n' "kr-artifacts: no directory of this run's own can be made for its evidence: ${_kr_what}. It has to be an absolute path to a folder inside one of this platform's temporary roots (${_kr_roots}). Point TMPDIR (on Windows, TEMP: a TMPDIR that is /tmp, or /tmp/, is passed over there) at such a folder, or set KR_TEST_ARTIFACTS_DIR to a folder under one of the roots." >&2
   else
     printf '%s\n' "kr-artifacts: the evidence directory '$1' (KR_TEST_ARTIFACTS_DIR) is refused: $2. It has to be an absolute path inside one of this platform's temporary roots (${_kr_roots}). Set it to a folder under one of them, or leave it unset and the run makes a directory of its own." >&2
   fi
@@ -182,25 +255,30 @@ _kr_artifacts_refuse() {
 # Prints the real path of $1 when it is inside a temporary root; else says why not and returns 1.
 # With a second argument, $1 is a name under the temporary folder $2 for the run's own directory.
 _kr_artifacts_confine() {
-  local _kr_value="$1" _kr_written="$1" _kr_prefix="" _kr_probe _kr_rest="" _kr_real _kr_real_folded _kr_root _kr_inside=0
-  _kr_value="$(_kr_artifacts_posix "$_kr_value")"
+  local _kr_value="$1" _kr_written="$1" _kr_prefix="" _kr_probe _kr_rest="" _kr_real _kr_real_folded _kr_root _kr_inside=0 _kr_status=0
   if [ -z "$_kr_value" ]; then
     _kr_artifacts_refuse "$1" "it is empty" ${2+"$2"}
     return 1
   fi
-  case "$_kr_value" in
-    /*) ;;
+  _kr_value="$(_kr_artifacts_posix "$_kr_value")" || _kr_status=$?
+  if [ "$_kr_status" = 2 ]; then
+    _kr_artifacts_refuse "$1" "it is a Windows path of a kind this reader does not take$(_kr_artifacts_takes)" ${2+"$2"}
+    return 1
+  fi
+  case "$_kr_status:$_kr_value" in
+    0:/*) ;;
     *)
-      _kr_artifacts_refuse "$1" "it is not an absolute path" ${2+"$2"}
+      _kr_artifacts_refuse "$1" "it is not an absolute path$(_kr_artifacts_takes)" ${2+"$2"}
       return 1
       ;;
   esac
-  # A step up is looked for in the value as it was written: the conversion of a Windows path above
-  # settles a `..` by its text, so the converted value no longer shows it. The line feeds at its end
-  # are dropped as the substitution above dropped them from the converted one, so that a `..` before
-  # them is still the last name.
+  # A step up is looked for in the value as it was written, with each backslash read as a
+  # separator on Windows: Git Bash settles a path that holds a backslash by its text, so a `..`
+  # behind one climbs out of the folder, and the converted value no longer shows it. The line feeds
+  # at its end are dropped as the substitution above dropped them from the converted one, so that a
+  # `..` before them is still the last name.
   _kr_written="$(printf '%s' "$_kr_written")"
-  case "$_kr_written" in [A-Za-z]:[\\/]*) _kr_written="${_kr_written//\\//}" ;; esac
+  if _kr_artifacts_windows; then _kr_written="${_kr_written//\\//}"; fi
   case "/$_kr_written/" in
     */../*)
       _kr_artifacts_refuse "$1" "it steps up a directory with \`..\`" ${2+"$2"}
@@ -259,15 +337,19 @@ _kr_artifacts_confine() {
 }
 
 # Makes a directory of this run's own under the temporary folder and prints its real path. The
-# temporary folder is TMPDIR, else /tmp, and on Windows, where TMPDIR is not set or is /tmp (a login
-# shell's profile exports it so), the folder TEMP names: /tmp there is a folder that TEMP may not
+# temporary folder is TMPDIR, else /tmp, and on Windows, where TMPDIR is not set or is /tmp or /tmp/
+# (a login shell's profile exports it so), the folder TEMP names: /tmp there is a folder that TEMP may not
 # name, and it is no root then. The folder is checked before the directory is made in it, so that a
 # temporary folder that is no root is left as it was.
 _kr_artifacts_own() {
   local _kr_temporary="${TMPDIR:-/tmp}" _kr_made
-  if _kr_artifacts_windows && { [ -z "${TMPDIR:-}" ] || [ "$TMPDIR" = /tmp ]; }; then
+  if _kr_artifacts_windows && { [ -z "${TMPDIR:-}" ] || [ "$(_kr_artifacts_trim "$TMPDIR")" = /tmp ]; }; then
     _kr_temporary="$(_kr_artifacts_windows_temp)" || {
-      _kr_artifacts_refuse "${TEMP:-}" "TEMP names no folder that exists" "${TEMP:-}"
+      if [ -z "${TEMP:-}" ]; then
+        _kr_artifacts_refuse "" "TEMP is not set or is empty, so no temporary folder is named" ""
+      else
+        _kr_artifacts_refuse "$TEMP" "TEMP names no folder that exists" "$TEMP"
+      fi
       return 1
     }
   fi

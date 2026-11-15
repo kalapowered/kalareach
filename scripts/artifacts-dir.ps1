@@ -13,8 +13,11 @@
 #
 # The temporary roots are the folder the system names for the user's temporary files (TMPDIR on
 # Unix, TEMP on Windows), the folder RUNNER_TEMP names, and on Unix /tmp, where each is a fully
-# qualified path to a directory (on Windows C:\..., a UNC path or an extended-length path; a path
-# that depends on the current drive is none of them). A root is resolved through its links as the platform resolves it (/tmp is
+# qualified path to a directory (on Windows C:\... or C:/..., \\server\share\... or //server/share/...,
+# either of those behind \\?\ with backslashes only; any other spelling is none of them, and the
+# refusal's words say which are taken: a device path, a server with no share, three separators at
+# the start, a path that depends on the current drive and one that depends on a drive's current
+# directory). A root is resolved through its links as the platform resolves it (/tmp is
 # /private/tmp on macOS, a short Windows name is its long one), and so is the part of the value
 # that exists, so a link inside a root that leads out of it is refused and a root that is itself
 # behind a link is honoured. A value is compared with a root by path components, never by text:
@@ -30,7 +33,7 @@
 # it refuses nothing that the run set right. It is no boundary against a process of the same
 # account, which can write wherever the run can and can change a link or a folder while the reader
 # reads. It does not close a case that somebody arranges: a link whose target climbs through
-# another link, which this reader settles by the target's text, or a server named with no share.
+# another link, which this reader settles by the target's text.
 # On Windows the comparison ignores letter case, so a folder made case-sensitive, and a letter that
 # the disk and the reader do not fold alike, are not told apart.
 #
@@ -44,6 +47,34 @@ $variable = 'KR_TEST_ARTIFACTS_DIR'
 $windows = [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
 $comparison = if ($windows) { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
 $separators = [char[]] @([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+
+# The spellings of an absolute path that this reader takes on Windows, for the words of a refusal.
+$takes = 'on Windows this reader takes C:\folder or C:/folder, \\server\share\folder or //server/share/folder, and either behind \\?\, as \\?\C:\folder or \\?\UNC\server\share\folder'
+
+# How the Windows path $Path is written: 'taken' for a spelling this reader takes (a drive with a
+# root, or a share with a server and a name, with either separator or both; either one behind \\?\
+# with backslashes only, since Windows reads a slash behind \\?\ as a letter of a name),
+# 'not-absolute' for a relative path, \folder or C:folder, and 'kind' for any other spelling: a
+# device path (\\.\ or \\?\ with anything but a drive or a share behind it), a server with no share,
+# three separators at the start.
+function Get-Spelling {
+    param([string] $Path)
+    if ($Path.StartsWith('\\?\', [System.StringComparison]::Ordinal)) {
+        $rest = $Path.Substring(4)
+        if ($rest.Contains('/')) { return 'kind' }
+        if ($rest -match '^unc\\.') { $Path = '\\' + $rest.Substring(4) }
+        elseif ($rest -match '^[A-Za-z]:\\') { $Path = $rest }
+        else { return 'kind' }
+    }
+    if ($Path -match '^[\\/]{2}[.?]([\\/]|$)') { return 'kind' }
+    if ($Path -match '^[\\/]{3}') { return 'kind' }
+    if ($Path -match '^[\\/]{2}') {
+        if ($Path -match '^[\\/]{2}[^\\/]+[\\/][^\\/]+') { return 'taken' }
+        return 'kind'
+    }
+    if ($Path -match '^[A-Za-z]:[\\/]') { return 'taken' }
+    return 'not-absolute'
+}
 
 # A path in the extended-length form (\\?\C:\... or \\?\UNC\server\share\...) as the ordinary form the
 # platform's temporary folder is given in; any other path as it is.
@@ -93,8 +124,12 @@ function Get-TemporaryRoots {
     $roots = @()
     foreach ($candidate in $named) {
         # A path that depends on the current drive (\folder) or on a drive's current directory
-        # (C:folder) is rooted but names no one place, so it is no root.
-        if ([string]::IsNullOrEmpty($candidate) -or -not [System.IO.Path]::IsPathFullyQualified($candidate)) { continue }
+        # (C:folder) is rooted but names no one place, and a spelling this reader does not take names
+        # none that it reads: neither is a root.
+        if ([string]::IsNullOrEmpty($candidate)) { continue }
+        if ($windows) {
+            if ((Get-Spelling $candidate) -ne 'taken') { continue }
+        } elseif (-not [System.IO.Path]::IsPathFullyQualified($candidate)) { continue }
         $candidate = Remove-ExtendedPrefix $candidate
         if (-not (Test-Path -LiteralPath $candidate -PathType Container)) { continue }
         $found = Get-RealPath $candidate
@@ -117,6 +152,7 @@ function Get-TemporaryRoots {
 function Stop-Refused {
     param([string] $Value, [string] $Why, $Folder)
     $roots = (Get-TemporaryRoots) -join ', '
+    if (-not $roots) { $roots = 'none: no folder that a temporary variable names exists' }
     if ($null -ne $Folder) {
         throw "kr-artifacts: no directory of this run's own can be made for its evidence: the temporary folder '$Folder' is refused: $Why. It has to be an absolute path to a folder inside one of this platform's temporary roots ($roots). Point TMPDIR (on Windows, TMP) at such a folder, or set $variable to a folder under one of the roots."
     }
@@ -128,7 +164,12 @@ function Stop-Refused {
 function Confine-Value {
     param([string] $Value, $Folder)
     if ([string]::IsNullOrEmpty($Value)) { Stop-Refused $Value 'it is empty' $Folder }
-    if (-not [System.IO.Path]::IsPathFullyQualified($Value)) { Stop-Refused $Value 'it is not an absolute path' $Folder }
+    if ($windows) {
+        switch (Get-Spelling $Value) {
+            'not-absolute' { Stop-Refused $Value "it is not an absolute path ($takes)" $Folder }
+            'kind' { Stop-Refused $Value "it is a Windows path of a kind this reader does not take ($takes)" $Folder }
+        }
+    } elseif (-not [System.IO.Path]::IsPathFullyQualified($Value)) { Stop-Refused $Value 'it is not an absolute path' $Folder }
     if ($Value.Split($separators) -contains '..') { Stop-Refused $Value 'it steps up a directory with `..`' $Folder }
     $real = (Get-RealPath (Remove-ExtendedPrefix $Value)).TrimEnd($separators)
     foreach ($root in (Get-TemporaryRoots)) {

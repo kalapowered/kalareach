@@ -17,6 +17,12 @@
  * by text: `/tmpfoo` is not inside `/tmp`. A relative value, an empty value and a value with a
  * `..` in it are refused, and so is a root itself.
  *
+ * On Windows a value, and each temporary variable, is read as Windows writes a full path:
+ * `C:\folder` or `C:/folder`, `\\server\share\folder` or `//server/share/folder`, either of those
+ * behind `\\?\` with backslashes only. Any other spelling is refused, in words that say which are
+ * taken: a device path, a server with no share, three separators at the start, a path that depends
+ * on the current drive and one that depends on a drive's current directory.
+ *
  * Where the variable is not set, the first read makes a directory of its own under the temporary
  * folder, says where it is and sets the variable to it, so the workers the run starts read the
  * same directory.
@@ -47,14 +53,43 @@ const VARIABLE = 'KR_TEST_ARTIFACTS_DIR'
 
 const windows = platform() === 'win32'
 
+/** The spellings of an absolute path that this reader takes on Windows, for the words of a refusal. */
+const TAKES =
+  'on Windows this reader takes C:\\folder or C:/folder, \\\\server\\share\\folder or ' +
+  '//server/share/folder, and either behind \\\\?\\, as \\\\?\\C:\\folder or ' +
+  '\\\\?\\UNC\\server\\share\\folder'
+
+/** How a path is written: whether this reader takes the spelling. */
+export type Spelling = 'taken' | 'not-absolute' | 'kind'
+
 /**
- * Whether `path` names one place whatever the current drive and directory are: `/…` off Windows;
- * on Windows `C:\…`, a UNC path (`\\server\share\…`) or an extended-length path (`\\?\C:\…`). A path
- * that depends on the current drive (`\folder`) or on a drive's current directory (`C:folder`) is
- * rooted or has a drive, but is not fully qualified, and Node's `isAbsolute` accepts the first.
+ * How `path` is written. Off Windows a path is taken when it begins with `/`. On Windows it is
+ * `taken` when it is a drive with a root (`C:\x`, `C:/x`) or a share with a server and a name
+ * (`\\server\share\x`, `//server/share/x`), with either separator or both, or either one behind
+ * `\\?\` with backslashes only (Windows reads a slash behind `\\?\` as a letter of a name);
+ * `not-absolute` when it is relative, `\folder` (the current drive's root) or `C:folder` (a drive's
+ * current directory), which Node's `isAbsolute` accepts the first of; and `kind` for any other
+ * spelling: a device path (`\\.\`, or `\\?\` with anything but a drive or a share behind it), a
+ * server with no share, three separators at the start.
  */
+export function spellingOf(path: string, onWindows: boolean = windows): Spelling {
+  if (!onWindows) return path.startsWith('/') ? 'taken' : 'not-absolute'
+  let rest = path
+  if (path.startsWith('\\\\?\\')) {
+    const behind = path.slice(4)
+    if (behind.includes('/')) return 'kind'
+    if (/^unc\\./i.test(behind)) rest = `\\\\${behind.slice(4)}`
+    else if (/^[A-Za-z]:\\/.test(behind)) rest = behind
+    else return 'kind'
+  }
+  if (/^[\\/]{2}[.?](?:[\\/]|$)/.test(rest) || /^[\\/]{3}/.test(rest)) return 'kind'
+  if (/^[\\/]{2}/.test(rest)) return /^[\\/]{2}[^\\/]+[\\/][^\\/]+/.test(rest) ? 'taken' : 'kind'
+  return /^[A-Za-z]:[\\/]/.test(rest) ? 'taken' : 'not-absolute'
+}
+
+/** Whether `path` names one place whatever the current drive and directory are. */
 export function fullyQualified(path: string, onWindows: boolean = windows): boolean {
-  return onWindows ? /^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/])/.test(path) : path.startsWith('/')
+  return spellingOf(path, onWindows) === 'taken'
 }
 
 /** `path` with every link in it resolved: the part that exists by the system, the rest as written. */
@@ -91,10 +126,17 @@ function roots(): string[] {
   return temporaryRoots([tmpdir(), ...(windows ? [] : ['/tmp']), env['RUNNER_TEMP'] ?? ''])
 }
 
+/** The roots as the refusal's words list them: never an empty list. */
+export function listed(found: readonly string[]): string {
+  return found.length === 0
+    ? 'none: no folder that a temporary variable names exists'
+    : found.join(', ')
+}
+
 function refused(value: string, why: string): Error {
   return new Error(
     `the evidence directory '${value}' (${VARIABLE}) is refused: ${why}. It has to be an absolute ` +
-      `path inside one of this platform's temporary roots (${roots().join(', ')}). Set it to a ` +
+      `path inside one of this platform's temporary roots (${listed(roots())}). Set it to a ` +
       'folder under one of them, or leave it unset and the run makes a directory of its own.'
   )
 }
@@ -107,7 +149,7 @@ function refusedOwn(temporary: string, why: string): Error {
   return new Error(
     `no directory of this run's own can be made for its evidence: the temporary folder ` +
       `'${temporary}' is refused: ${why}. It has to be an absolute path to a folder inside one of ` +
-      `this platform's temporary roots (${roots().join(', ')}). Point TMPDIR (on Windows, TEMP) ` +
+      `this platform's temporary roots (${listed(roots())}). Point TMPDIR (on Windows, TEMP) ` +
       `at such a folder, or set ${VARIABLE} to a folder under one of the roots.`
   )
 }
@@ -132,7 +174,13 @@ export function confine(value: string): string {
 /** As `confine`, with `refuse` making the error for the reason a value is refused. */
 function confineOr(value: string, refuse: (why: string) => Error): string {
   if (value === '') throw refuse('it is empty')
-  if (!fullyQualified(value)) throw refuse('it is not an absolute path')
+  const spelling = spellingOf(value)
+  if (spelling === 'not-absolute') {
+    throw refuse(`it is not an absolute path${windows ? ` (${TAKES})` : ''}`)
+  }
+  if (spelling === 'kind') {
+    throw refuse(`it is a Windows path of a kind this reader does not take (${TAKES})`)
+  }
   if (value.split(/[\\/]/).includes('..')) {
     throw refuse('it steps up a directory with `..`')
   }
