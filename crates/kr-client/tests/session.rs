@@ -3837,6 +3837,13 @@ async fn a_request_the_socket_cannot_take_before_its_time_runs_out_is_cut_off_an
         matches!(withheld, Err(ClientError::Withheld)),
         "the socket held part of the frame and took no more before the time ran out"
     );
+    // The transport says at once that it closed, so the session's end is ready on one poll, before
+    // anything is awaited and before its read loop has run.
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(
+        std::future::Future::poll(std::pin::pin!(session.closed()), &mut context).is_ready(),
+        "the session did not record the end of the connection that the cut closed"
+    );
     assert!(session.submitted_actions().await.is_empty());
 
     // The peer reads now: part of the frame, and then the end of the connection.
