@@ -2444,6 +2444,123 @@ async fn the_first_batch_of_the_next_epoch_is_written_after_an_epoch_dropped_one
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
+/// KR-REQ-08.62 and KR-REQ-08.64, in part.
+///
+/// The fence a drop puts up is the same when the drop is the rest of a batch that the writer was
+/// part way through. The application does not read, so the terminal takes only a little of the
+/// frame; the frame's authority ends; the application then reads, and the writer abandons the
+/// rest. The batch behind it, under authority that has not run out, is not written either, and the
+/// end of the epoch counts the rest of the frame and the whole of that batch.
+#[tokio::test(flavor = "multi_thread")]
+async fn what_follows_a_batch_the_writer_abandons_part_way_is_not_written() {
+    const FRAME: usize = 60_000;
+    let host = kr_ipc::testing::TempHost::create();
+    let kept = tempfile::tempdir().expect("a directory for the pipe");
+    let go = kept.path().join("go");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&go)
+            .status()
+            .expect("mkfifo runs")
+            .success(),
+        "the pipe for the application was made"
+    );
+    let config = configuration(
+        &host,
+        &format!(
+            "stty raw -echo; printf 'kr-ready.'; read go < {}; exec cat",
+            kr_worker::testing::shell_quoted(&go)
+        ),
+    );
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let id = attach(&mut session, &terminal(session_id, Some("xterm-256color")));
+    let epoch = session
+        .acquire_input(id, connection(), None)
+        .expect("the keys")
+        .lease
+        .epoch
+        .get();
+    let clock = kr_ipc::clock::ManualSharedClock::new();
+    let runtime = Arc::new(
+        SessionRuntime::start(session, std::sync::Arc::new(clock.clone())).expect("starts"),
+    );
+    retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
+    let deadline = kr_ipc::clock::SharedClock::boot_elapsed_ms(&clock) + 1_000;
+    let frame = [b'q'; FRAME];
+    {
+        let mut session = runtime.session();
+        session
+            .write_input(id, epoch, 0, &frame, Some(deadline), Instant::now())
+            .expect("accepted");
+        session
+            .write_input(
+                id,
+                epoch,
+                1,
+                b"kr-after",
+                Some(deadline + 60_000),
+                Instant::now(),
+            )
+            .expect("accepted");
+        runtime.flush_input();
+    }
+
+    // The writer is part way through the frame once the lease's count has fallen below the whole.
+    let queued = runtime.input().lock().queued_lease_bytes();
+    let whole = FRAME + b"kr-after".len();
+    tokio::time::timeout(LIVENESS_DEADLINE, async {
+        while queued.load() >= whole {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the terminal took a first piece of the frame");
+    clock.advance(Duration::from_secs(5));
+    let pipe = go.clone();
+    tokio::task::spawn_blocking(move || std::fs::write(pipe, b"go\n"))
+        .await
+        .expect("the write ran")
+        .expect("the application was let go");
+    let room = runtime.input().lock().input_room();
+    until_the_room_holds(&room, kr_worker::input_room::Cost::default()).await;
+
+    let left = u64::try_from(queued.load()).expect("a count");
+    assert!(
+        left > u64::try_from(b"kr-after".len()).expect("a count")
+            && left < u64::try_from(whole).expect("a count"),
+        "the rest of the frame and the batch behind it stay counted: {left}"
+    );
+    let (_, fenced) = runtime
+        .session()
+        .release_input(id, epoch, None)
+        .expect("the holder releases");
+    assert_eq!(fenced, left, "the end of the epoch counts all of it");
+
+    // The next epoch's batch is echoed behind anything of the first that a faulty writer wrote.
+    {
+        let mut session = runtime.session();
+        let next = session
+            .acquire_input(id, connection(), None)
+            .expect("the holder takes the keys again")
+            .lease
+            .epoch
+            .get();
+        let later = kr_ipc::clock::SharedClock::boot_elapsed_ms(&clock) + 60_000;
+        session
+            .write_input(id, next, 0, b"kr-next", Some(later), Instant::now())
+            .expect("accepted");
+        runtime.flush_input();
+    }
+    let seen = retained_within(&runtime, b"kr-next", LIVENESS_DEADLINE).await;
+    assert!(
+        !contains(&seen, b"kr-after"),
+        "nothing of the epoch after the abandoned batch reaches the pseudo-terminal"
+    );
+    runtime.close(ClosureReason::CloseRequested).1.release();
+}
+
 /// The device-status question an application asks, and the answer the host owes it.
 const STATUS_QUESTION: &[u8] = b"\x1b[5n";
 const STATUS_ANSWER: &[u8] = b"\x1b[0n";
