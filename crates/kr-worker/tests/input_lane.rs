@@ -2896,8 +2896,10 @@ async fn the_keyboard_mode_release_counts_what_the_root_editors_machine_holds_in
 }
 
 /// Takes `attachment`'s next frame in the session's own hold: the first four bytes of a bracketed
-/// paste's opener, which the framer holds back as a delimiter prefix. The caller ends the lease in
-/// the same hold, so the prefix is discarded by that end and no timer has forwarded it first.
+/// paste's opener, which the framer holds back as a delimiter prefix. The session's hold does not
+/// stop the recogniser's timer, which takes only the input domain, so the caller pauses the timer
+/// at its deadline first (`SessionRuntime::pause_the_timer_at_its_deadline`) and ends the lease
+/// in the same hold: the prefix is discarded by that end, and no timer forwards it first.
 fn hold_a_delimiter_prefix(
     session: &mut Session,
     attachment: AttachmentId,
@@ -2929,6 +2931,7 @@ async fn the_fenced_count_includes_the_delimiter_prefix_the_framer_dropped_at_ev
     // A release.
     let epoch = rig.acquire(attachment).await;
     let mut lane = rig.lane(attachment).await;
+    let timer = rig.runtime.pause_the_timer_at_its_deadline();
     let (_, fenced) = {
         let mut session = rig.runtime.session();
         hold_a_delimiter_prefix(&mut session, attachment, epoch);
@@ -2936,6 +2939,7 @@ async fn the_fenced_count_includes_the_delimiter_prefix_the_framer_dropped_at_ev
             .release_input(attachment, epoch.get(), None)
             .expect("released")
     };
+    drop(timer);
     assert_eq!(fenced, 4, "the answer counts the dropped prefix");
     assert_eq!(
         next_window(&mut lane)
@@ -2952,6 +2956,7 @@ async fn the_fenced_count_includes_the_delimiter_prefix_the_framer_dropped_at_ev
     // A takeover.
     let epoch = rig.acquire(attachment).await;
     let _ = next_window(&mut lane).await;
+    let timer = rig.runtime.pause_the_timer_at_its_deadline();
     let acquired = {
         let mut session = rig.runtime.session();
         hold_a_delimiter_prefix(&mut session, attachment, epoch);
@@ -2959,6 +2964,7 @@ async fn the_fenced_count_includes_the_delimiter_prefix_the_framer_dropped_at_ev
             .acquire_input(other, taker, None)
             .expect("the other view takes the keys")
     };
+    drop(timer);
     assert_eq!(acquired.discarded_bytes.get(), 4);
     assert_eq!(
         next_window(&mut lane)
@@ -2975,11 +2981,13 @@ async fn the_fenced_count_includes_the_delimiter_prefix_the_framer_dropped_at_ev
     // A detach.
     let epoch = rig.acquire(attachment).await;
     let _ = next_window(&mut lane).await;
+    let timer = rig.runtime.pause_the_timer_at_its_deadline();
     let detached = {
         let mut session = rig.runtime.session();
         hold_a_delimiter_prefix(&mut session, attachment, epoch);
         session.detach(attachment, None).expect("detached")
     };
+    drop(timer);
     assert_eq!(detached.fenced_bytes.map(U64::get), Some(4));
     assert_eq!(
         next_window(&mut lane)

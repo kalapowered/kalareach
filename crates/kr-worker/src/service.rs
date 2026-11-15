@@ -10245,8 +10245,11 @@ impl WorkerService {
                 let attachment_id = Self::detach_subject(session, &params)?;
                 let outcome = session.detach(attachment_id, params.after_input.as_ref());
                 // A position that was not reached refuses the detach before anything was
-                // removed: the attachment is still the session's, the connection keeps naming
-                // it, and the caller may send the detach again without a position.
+                // removed, and the attachment is still the session's, so the connection keeps
+                // naming it. A refusal here comes after the dispatch marker, so it is recorded as
+                // an outcome that nobody can establish, which holds a resend back: the position
+                // check before the marker is what makes a refusal definite. That check has passed
+                // in this same hold of the session, so the product does not reach this branch.
                 let outcome = match outcome {
                     Err(refused) if session.attachment_capabilities(attachment_id).is_some() => {
                         return Err(refused);
