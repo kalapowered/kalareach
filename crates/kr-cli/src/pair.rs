@@ -146,7 +146,9 @@ async fn invite(
     let ceremony = Ceremony::Issue {
         owner: grant_kind == InviteGrantKind::PersonalOwner,
     };
-    let answer = confirmed(&mut client, target, subject, &ceremony, &effect, build_id).await?;
+    let answer = confirmed(&mut client, target, subject, &ceremony, &effect, build_id)
+        .await
+        .map_err(capacity_in_its_own_words)?;
     let invited: PairInviteResult = decode(&answer)?;
     if json {
         output::document(&invitation_document(&invited));
@@ -1309,6 +1311,29 @@ fn decode<T: kr_protocol::wire::WireMessage>(value: &ParamsValue) -> Result<T> {
     })
 }
 
+/// Returns the refusal of an invitation as a person is told it: when the rendezvous service had no
+/// managed capacity for it and named the paths that still work, the host's text already says when to
+/// try again and what to do meanwhile, so the client's one line for that code, which tells a person
+/// to wait a moment, is not added after it. It is added to every other refusal under that code,
+/// which is the service being unavailable, and every other refusal is as it was.
+///
+/// The kind is told by the text itself (`kr_client::services::is_told_capacity`), because the code
+/// is the same for both and the wire carries nothing else.
+fn capacity_in_its_own_words(error: CliError) -> CliError {
+    match error {
+        CliError::Refused(refused)
+            if refused.code == ErrorCode::RendezvousUnavailable
+                && kr_client::services::is_told_capacity(&refused.message) =>
+        {
+            CliError::ServiceRefused {
+                error: refused,
+                action: kr_client::retry::UserAction::Nothing,
+            }
+        }
+        other => other,
+    }
+}
+
 fn refused(code: ErrorCode, message: impl Into<Shown>) -> CliError {
     CliError::refused_in_its_own_words(code, message)
 }
@@ -1930,5 +1955,136 @@ mod tests {
         assert!(!same_value("1a2b3c4e", "1a2b3c4d"));
         assert!(!same_value("\n", ""));
         assert!(!same_value("", "1a2b3c4d"));
+    }
+
+    /// What the daemon sends a command for a failure of the rendezvous reservation: the code and the
+    /// failure's own text, as its pairing refusal makes them.
+    fn the_daemons_refusal(error: kr_pairing::PairingError) -> CliError {
+        // The daemon's `refusal` gives the failure's code and its text, whole, as the refusal's.
+        CliError::Refused(ProtocolError::new(error.code(), error.to_string()))
+    }
+
+    /// The path a capacity text names, typed from what the service writes.
+    const DIRECT_INVITATION: &str = "A direct invitation, which needs no rendezvous service and \
+                                     works where the new device can reach this host directly.";
+
+    /// The command's whole output for a refusal of an invitation.
+    fn output_of(error: &CliError) -> String {
+        error.to_string()
+    }
+
+    /// KR-REQ-17.48: when the rendezvous service had no managed capacity for an invitation and
+    /// named the paths that still work, the command says the host's text and nothing after it: the
+    /// text says when to try again, so the line that tells a person to wait a moment is not added.
+    /// The whole output is the text, for a wait named and not named, at the cap, with one path and
+    /// with several.
+    #[test]
+    fn kr_req_17_48_a_capacity_refusal_is_the_whole_output_of_the_command() {
+        const WORDS: &str = "Managed capacity for new pairing invitations is not available now.";
+        let one = kr_client::services::Alternatives::from_member(Some(serde_json::json!([
+            DIRECT_INVITATION
+        ])));
+        let several = kr_client::services::Alternatives::from_member(Some(serde_json::json!([
+            "First path.",
+            "Second path, with a comma.",
+        ])));
+        for (alternatives, wait, expected) in [
+            (
+                &one,
+                Some(3598),
+                "Managed capacity for new pairing invitations is not available now. Try again in \
+                 about 1 hour. Until then: A direct invitation, which needs no rendezvous service \
+                 and works where the new device can reach this host directly.",
+            ),
+            (
+                &one,
+                None,
+                "Managed capacity for new pairing invitations is not available now. Until then: A \
+                 direct invitation, which needs no rendezvous service and works where the new \
+                 device can reach this host directly.",
+            ),
+            (
+                &one,
+                Some(200_000),
+                "Managed capacity for new pairing invitations is not available now. Try again in \
+                 about 24 hours. Until then: A direct invitation, which needs no rendezvous \
+                 service and works where the new device can reach this host directly.",
+            ),
+            (
+                &several,
+                Some(5),
+                "Managed capacity for new pairing invitations is not available now. Try again in \
+                 about 5 seconds. Until then: First path. Second path, with a comma.",
+            ),
+        ] {
+            let told = kr_client::services::told_capacity(WORDS, wait, alternatives).expect("told");
+            let error = capacity_in_its_own_words(the_daemons_refusal(
+                kr_pairing::PairingError::RendezvousCapacity {
+                    told,
+                    retry_after_seconds: wait,
+                },
+            ));
+            assert_eq!(output_of(&error), expected, "{wait:?}");
+            assert!(
+                matches!(
+                    error,
+                    CliError::ServiceRefused {
+                        action: kr_client::retry::UserAction::Nothing,
+                        ..
+                    }
+                ),
+                "{wait:?}"
+            );
+            assert_eq!(error.code(), ErrorCode::RendezvousUnavailable);
+            assert_eq!(
+                error.machine_message().as_str(),
+                format!("RENDEZVOUS_UNAVAILABLE: {expected}"),
+                "--json carries the same words under the same code"
+            );
+        }
+    }
+
+    /// KR-REQ-17.48: a failure of the rendezvous service that is not a capacity answer keeps its
+    /// line, whatever its reason says: the whole output is the failure's text and the line that
+    /// tells a person to wait a moment. The reasons are the shapes the host makes, and one in which a
+    /// service put the capacity text's own lead-in where a code goes, which the host says as an
+    /// unnamed code.
+    #[test]
+    fn kr_req_17_48_a_fault_of_the_rendezvous_service_keeps_its_line() {
+        let address = "https://rendezvous.example/api/pair/locator/reserve";
+        for reason in [
+            format!("{address} answered RATE_LIMITED"),
+            format!("{address} answered SERVICE_UNAVAILABLE"),
+            format!("{address} answered INTERNAL"),
+            format!("{address} answered 502 without the service's envelope"),
+            format!("{address} answered an unnamed code"),
+            "https://rendezvous.example/api/pair/locator/reserve could not be reached: the \
+             exchange ended while the connection was being established"
+                .to_owned(),
+            "no locator could be reserved".to_owned(),
+            "the request could not be written: a message".to_owned(),
+            String::new(),
+        ] {
+            let error = capacity_in_its_own_words(the_daemons_refusal(
+                kr_pairing::PairingError::RendezvousUnavailable {
+                    reason: reason.clone(),
+                },
+            ));
+            assert!(matches!(error, CliError::Refused(_)), "{reason}");
+            assert_eq!(
+                output_of(&error),
+                format!(
+                    "the rendezvous service is unavailable: {reason}\nWait a moment and try \
+                     again."
+                ),
+                "{reason}"
+            );
+        }
+        // Other refusals are as they were, whatever code they carry.
+        let other = capacity_in_its_own_words(CliError::Refused(ProtocolError::new(
+            ErrorCode::PermissionDenied,
+            "Managed. Until then: A path.",
+        )));
+        assert!(matches!(other, CliError::Refused(_)));
     }
 }
