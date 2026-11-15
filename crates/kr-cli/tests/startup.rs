@@ -5619,6 +5619,9 @@ enum OnStop {
     Cut,
     /// Refuses it as a daemon that does not list the method does.
     Refuse,
+    /// Takes no notice of `host.info`, the command's first request, until the test lets it go, so
+    /// that the command is held before its request to stop has left.
+    HoldTheLook,
 }
 
 /// A daemon of this test's own that answers `host.info` and the probe the level documents, and
@@ -5721,6 +5724,13 @@ impl TestDaemon {
                             ControlFrame::Request(request) => {
                                 let method = request.method.as_str().to_owned();
                                 heard.lock().expect("the record").push(method.clone());
+                                if matches!(on_stop, OnStop::HoldTheLook)
+                                    && request.method.method() == Some(Method::HostInfo)
+                                {
+                                    while !released.load(std::sync::atomic::Ordering::SeqCst) {
+                                        tokio::time::sleep(Duration::from_millis(20)).await;
+                                    }
+                                }
                                 let outcome = match request.method.method() {
                                     Some(Method::HostInfo) => Outcome::Ok(
                                         ParamsValue::from_typed(&info).expect("encodes"),
@@ -5747,15 +5757,17 @@ impl TestDaemon {
                                     .push(mutation.method.as_str().to_owned());
                                 match &on_stop {
                                     OnStop::Cut => break,
-                                    OnStop::Refuse => ControlFrame::Response(Response {
-                                        request_id: mutation.request_id,
-                                        outcome: Outcome::Error(kr_client::error::refusal(
-                                            kr_protocol::error::ErrorCode::PermissionDenied,
-                                            kr_client::shown::Shown::said(
-                                                "this method is not in this host's registry",
-                                            ),
-                                        )),
-                                    }),
+                                    OnStop::Refuse | OnStop::HoldTheLook => {
+                                        ControlFrame::Response(Response {
+                                            request_id: mutation.request_id,
+                                            outcome: Outcome::Error(kr_client::error::refusal(
+                                                kr_protocol::error::ErrorCode::PermissionDenied,
+                                                kr_client::shown::Shown::said(
+                                                    "this method is not in this host's registry",
+                                                ),
+                                            )),
+                                        })
+                                    }
                                     OnStop::HoldThenAnswer(pid) => {
                                         while !released.load(std::sync::atomic::Ordering::SeqCst) {
                                             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -5922,6 +5934,75 @@ fn an_interrupt_after_the_request_has_left_says_what_may_be_so_and_the_record_st
     // A reader of the words that no daemon runs gives a record and removes none.
     let again = start(host.kr(&["host", "stop"])).finish("kr host stop");
     assert!(again.status.success());
+}
+
+/// An interrupt before the request to stop has left says that nothing was asked and nothing was
+/// stopped, and the command leaves no record: the daemon had received only the command's look.
+#[test]
+fn an_interrupt_before_the_request_says_that_nothing_was_asked_and_leaves_no_record() {
+    let host = Standalone::create();
+    let mut daemon = TestDaemon::serve(&host, "kr-controller/9.9.9", OnStop::HoldTheLook, true);
+    let running = start(host.kr(&["host", "stop"]));
+    daemon.until_it_received("host.info");
+    signal("INT", running.child.as_ref().expect("the child").id());
+    let output = running.finish("kr host stop");
+    assert_eq!(output.status.code(), Some(1));
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        said.contains("was interrupted before it asked the control daemon"),
+        "{said}"
+    );
+    assert!(said.contains("Nothing was stopped."), "{said}");
+    assert!(
+        !daemon.received().iter().any(|method| method == "host.stop"),
+        "no request to stop left: {:?}",
+        daemon.received()
+    );
+    assert!(attempts(&host).is_empty(), "no record stands");
+    daemon.let_go();
+    daemon.end();
+}
+
+/// A daemon that ends and is replaced before the command sees the end reads as ended, with the
+/// words that something started it again: the old process is gone, and another holds the lock.
+#[test]
+fn a_successor_that_holds_the_environment_after_the_stop_reads_as_the_daemons_end() {
+    let host = Standalone::create();
+    let lock = host.tree.environment().singleton_lock();
+    let successor =
+        kr_controller::singleton::SingletonLock::hold(&lock, host.tree.environment_id())
+            .expect("takes the lock");
+    let copy = host.tree.root().join("kr-controller");
+    std::fs::copy(std::env::current_exe().expect("this test"), &copy).expect("copies it");
+    let mut old = spawning(|| {
+        Command::new(&copy)
+            .args(["--ignored", "--exact", HOLD_STILL, "--nocapture"])
+            .env("KR_HOLD_STILL_SECONDS", "600")
+            .spawn()
+    })
+    .expect("starts");
+    std::fs::write(&lock, format!("{}\n", old.id())).expect("names the old daemon");
+    let mut daemon = TestDaemon::serve(
+        &host,
+        "kr-controller/9.9.9",
+        OnStop::HoldThenAnswer(old.id()),
+        true,
+    );
+    let running = start(host.kr(&["host", "stop"]));
+    daemon.until_it_received("host.stop");
+    // The old daemon ends, and the lock is held again by the one that replaces it.
+    old.kill().expect("ends the old daemon");
+    old.wait().expect("collects it");
+    std::fs::write(&lock, format!("{}\n", std::process::id())).expect("names the successor");
+    daemon.let_go();
+    let output = running.finish("kr host stop");
+    assert!(output.status.success(), "{output:?}");
+    let said = String::from_utf8_lossy(&output.stdout);
+    assert!(said.contains("now holds environment"), "{said}");
+    assert!(said.contains("so something started it again"), "{said}");
+    assert!(attempts(&host).is_empty(), "the command removed its record");
+    drop(successor);
+    daemon.end();
 }
 
 /// KR-REQ-07.12 (a reader never removes): `kr new` with no start chosen says that no daemon runs and
