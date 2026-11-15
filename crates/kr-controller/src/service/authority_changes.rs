@@ -361,7 +361,7 @@ impl Controller {
                 async move {
                     let _ = tokio::time::timeout(
                         super::barrier::PASS_ASK_BOUND,
-                        controller.ask_worker_revision(session_id),
+                        controller.ask_worker_revision(session_id, None),
                     )
                     .await;
                 }

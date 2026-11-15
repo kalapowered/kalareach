@@ -262,7 +262,7 @@ async fn a_request_for_evidence_dropped_part_way_gives_up_its_link() {
     ));
     abandoned_part_way(&heard, 1, async move {
         controller
-            .collect_owed_evidence(session_id, binding, revision)
+            .collect_owed_evidence(session_id, binding, revision, None)
             .await;
     })
     .await;
@@ -1077,7 +1077,7 @@ async fn a_request_for_evidence_whose_wait_for_the_link_runs_out_gives_nothing_u
         .await
         .expect("the daemon opens its link to the worker");
     controller
-        .collect_owed_evidence(session_id, binding, revision)
+        .collect_owed_evidence(session_id, binding, revision, None)
         .await;
     nothing_given_up_by_a_wait_that_ran_out(&silent, elsewhere).await;
     silent.serving.abort();

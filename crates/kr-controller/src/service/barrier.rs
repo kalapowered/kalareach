@@ -62,6 +62,19 @@ const PAGE_RETRY_LONGEST_PAUSE: std::time::Duration = std::time::Duration::from_
 struct EvidenceBudget {
     /// How many more page exchanges it may make.
     pages: usize,
+    /// When the collection must be over, for a caller that bounds the whole of it, as an ask of a
+    /// pending worker is bounded ([`PASS_ASK_BOUND`]).
+    until: Option<tokio::time::Instant>,
+}
+
+impl EvidenceBudget {
+    /// Whether one more exchange, which takes [`WORKER_EXCHANGE`] at most, ends before the
+    /// collection must be over.
+    fn has_time_for_an_exchange(&self) -> bool {
+        self.until.is_none_or(|until| {
+            until.saturating_duration_since(tokio::time::Instant::now()) >= WORKER_EXCHANGE
+        })
+    }
 }
 
 /// How many more times an announcement may ask again for a page a worker refused for now, and how
@@ -831,7 +844,7 @@ impl Controller {
         // cost the time of each.
         let mut retries = Retries::for_an_announcement();
         for (session_id, binding) in acknowledged {
-            self.collect_owed_evidence_within(session_id, binding, revision, &mut retries)
+            self.collect_owed_evidence_within(session_id, binding, revision, &mut retries, None)
                 .await;
         }
         // The report is taken inside one section of the registry, which is also where a closure is
@@ -926,17 +939,23 @@ impl Controller {
     /// asked for again, and section 9 requires the actions a fence could not take back to be named
     /// in *that* revocation's result. Every page in the whole sequence comes out of one budget, so
     /// a worker with several unfinished revocations cannot make one announcement unbounded.
+    ///
+    /// A caller that bounds the whole of its work gives the instant it ends as `until`. No page
+    /// is asked for with less than one exchange's time left before it: the collection returns
+    /// with the link given back, and the pass that collects names asks for the rest.
     pub(super) async fn collect_owed_evidence(
         &self,
         session_id: SessionId,
         binding: kr_transport::lease::WorkerBinding,
         revision: AuthorityRevision,
+        until: Option<tokio::time::Instant>,
     ) {
         self.collect_owed_evidence_within(
             session_id,
             binding,
             revision,
             &mut Retries::for_an_announcement(),
+            until,
         )
         .await;
     }
@@ -949,8 +968,9 @@ impl Controller {
         binding: kr_transport::lease::WorkerBinding,
         revision: AuthorityRevision,
         retries: &mut Retries,
+        until: Option<tokio::time::Instant>,
     ) {
-        let mut budget = self.evidence_budget();
+        let mut budget = self.evidence_budget(until);
         self.collect_fence_evidence(session_id, binding, revision, &mut budget, retries, false)
             .await;
         // The revisions announced to the worker that a result it holds a report for reads and the
@@ -974,8 +994,9 @@ impl Controller {
         }
     }
 
-    /// What one announcement may spend collecting a worker's fence evidence.
-    fn evidence_budget(&self) -> EvidenceBudget {
+    /// What one announcement may spend collecting a worker's fence evidence, until `until` when
+    /// the caller bounds the whole of its work.
+    fn evidence_budget(&self, until: Option<tokio::time::Instant>) -> EvidenceBudget {
         #[cfg(feature = "testing")]
         let pages = MAX_EVIDENCE_PAGES.min(
             self.evidence_pages_limit
@@ -983,7 +1004,7 @@ impl Controller {
         );
         #[cfg(not(feature = "testing"))]
         let pages = MAX_EVIDENCE_PAGES;
-        EvidenceBudget { pages }
+        EvidenceBudget { pages, until }
     }
 
     /// Tells a worker the revisions it has not fenced, over the link the caller holds, oldest
@@ -1101,6 +1122,14 @@ impl Controller {
                 else {
                     return;
                 };
+                // An exchange that the bound of the whole ask cut would be dropped with the page on
+                // the wire, and the link with it, which stops the renewal of the lease of a worker
+                // that has acknowledged. Nothing has been sent yet, so the link goes back whole
+                // and the pass that collects names asks for what is left.
+                if !budget.has_time_for_an_exchange() {
+                    link.give_back();
+                    return;
+                }
                 #[cfg(feature = "testing")]
                 if !retries.by_the_pass {
                     self.record_announcement(session_id, &notice);
@@ -1782,7 +1811,10 @@ impl Controller {
                     continue;
                 }
                 // One exchange for the first page; the pages that follow are the pass's.
-                let mut budget = EvidenceBudget { pages: 1 };
+                let mut budget = EvidenceBudget {
+                    pages: 1,
+                    until: None,
+                };
                 self.collect_fence_evidence(
                     *session_id,
                     binding,
@@ -1827,7 +1859,7 @@ impl Controller {
             let Ok(Some(binding)) = self.binding_or_bind(session_id).await else {
                 continue;
             };
-            self.collect_owed_evidence_within(session_id, binding, revision, &mut retries)
+            self.collect_owed_evidence_within(session_id, binding, revision, &mut retries, None)
                 .await;
         }
     }
@@ -1912,10 +1944,13 @@ impl Controller {
                 // The whole ask is bounded, the exchange and what follows an answer: the names an
                 // acknowledgement leaves are asked for by the pass beside it when it is cut, so
                 // what is cut is never lost.
-                let asked =
-                    tokio::time::timeout(PASS_ASK_BOUND, self.ask_worker_revision(session_id))
-                        .await
-                        .map_or(Asked::Failed, |asked| asked.unwrap_or(Asked::Failed));
+                let deadline = began + PASS_ASK_BOUND;
+                let asked = tokio::time::timeout_at(
+                    deadline,
+                    self.ask_worker_revision(session_id, Some(deadline)),
+                )
+                .await
+                .map_or(Asked::Failed, |asked| asked.unwrap_or(Asked::Failed));
                 (session_id, asked, began, tokio::time::Instant::now())
             });
             for (session_id, asked, began, ended) in all_at_once(asks).await {
