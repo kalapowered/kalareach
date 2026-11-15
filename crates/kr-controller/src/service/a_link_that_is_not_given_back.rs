@@ -1661,6 +1661,9 @@ async fn after_barriers_that_need_several_notices(silent: &Silent) {
             >= 2,
         "the worker is told in several notices"
     );
+    // The worker has acknowledged the revision in force as far as the lease issuer knows, so that
+    // its lease renews until something stops it.
+    world::acknowledged(controller, session_id);
     controller
         .directory
         .lock()

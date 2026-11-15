@@ -2535,9 +2535,11 @@ impl Controller {
     ///
     /// A caller that bounds the whole ask gives the instant its bound ends as `until`, so that no
     /// exchange of the ask begins that the bound would cut: neither the first, which the waits
-    /// before it count against, nor those of the names an acknowledgement leaves
+    /// before it count against, nor a later notice of the same telling, which comes after a wait
+    /// for the registry, nor those of the names an acknowledgement leaves
     /// ([`Self::collect_owed_evidence`]). Each begins only with an exchange's time left, and its own
-    /// limit ends at or before `until`.
+    /// limit is an instant, taken as it begins, that is at or before `until`. A caller with no
+    /// bound gives none: one limit covers the wait for the link and the whole telling.
     ///
     /// # Errors
     ///
@@ -2582,30 +2584,33 @@ impl Controller {
                 session: session_id.to_string(),
             }
         })?;
-        // The bound covers the whole exchange, including waiting for this worker's connection:
-        // another operation may be holding it, and a wait that only started once it was free would
-        // not be a bound at all. The waits above have counted against a caller's bound already, so
-        // the exchange's own limit ends at or before the instant that bound ends.
-        let limit = tokio::time::Instant::now() + ACKNOWLEDGEMENT_TIMEOUT;
-        let limit = until.map_or(limit, |until| limit.min(until));
+        // What covers the wait for this worker's connection, which another operation may be
+        // holding, and the exchange. A caller with no deadline has one limit for all of it, taken
+        // here. A caller with a deadline has that deadline, which ends the wait and every wait
+        // after it, and each notice has a limit of its own that is taken as the notice begins and
+        // ends by the deadline ([`NoticeLimit::Before`]): the time the waits took is not taken
+        // from an exchange that begins, and one that could not have a whole exchange's time does
+        // not begin.
+        let (limit, notices) = until.map_or_else(
+            || {
+                (
+                    tokio::time::Instant::now() + ACKNOWLEDGEMENT_TIMEOUT,
+                    super::barrier::NoticeLimit::Caller,
+                )
+            },
+            |until| (until, super::barrier::NoticeLimit::Before(until)),
+        );
         let exchange = async {
             // The link is taken out of the shared slot for the exchange and goes back only when it
             // ended in an answer. A cancelled exchange, this one running out of time, would
             // otherwise leave a connection in the slot with an acknowledgement still on the wire,
             // and the next caller would read somebody else's answer as its own.
             let mut link = self.worker_client(&worker).await?;
-            // An announcement that the caller's bound would cut is dropped with the link, which
-            // stops the renewal of the lease of a worker that has acknowledged before. Nothing has
-            // been sent yet, so with less than an exchange's time left the link goes back whole:
-            // the ask has run out, as it does when the bound cuts a wait.
-            if !super::barrier::has_time_for_an_exchange(until) {
-                link.give_back();
-                return Ok(Told::Failed);
-            }
             // The first page of whatever its fence named: this worker has said nothing about this
-            // revocation yet, so there is nothing to continue from.
+            // revocation yet, so there is nothing to continue from. A telling that sent nothing
+            // for want of time has given the link back itself.
             let told = self
-                .tell_revisions(session_id, binding, &mut link, revision, held, None)
+                .tell_revisions(session_id, binding, &mut link, revision, held, notices)
                 .await;
             if !matches!(told, Told::Failed) {
                 link.give_back();
