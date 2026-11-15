@@ -734,6 +734,8 @@ enum Asked {
     Unknown(Shown),
     /// The daemon refused, and its word is that nothing was done.
     Refused(ProtocolError),
+    /// The request could not be made: nothing was sent.
+    NotComposed(Shown),
 }
 
 /// Sends the request, says that it left, and waits for its answer.
@@ -757,7 +759,7 @@ async fn ask(
         .await;
     let mutation = match composed {
         Ok(mutation) => mutation,
-        Err(error) => return Asked::Unknown(Shown::ipc(&error)),
+        Err(error) => return Asked::NotComposed(Shown::ipc(&error)),
     };
     // Set before the request is written: an interrupt from here on may find it taken.
     progress.enter(Stage::Asked);
@@ -873,6 +875,20 @@ async fn stop_the_daemon(
             // The request may have left; the daemon is waited for as one that took it.
             progress.enter(Stage::Asked);
             (Knows::MaybeAsked, None, None, Some(said))
+        }
+        Asked::NotComposed(why) => {
+            // The request was never made, so nothing left: there is no end to wait for.
+            progress.remove_marker();
+            return failed(
+                CliError::HostUnavailable(shown!(
+                    "kr host stop could not make its request for the control daemon of \
+                     environment {}: {}. Nothing was sent, and nothing was stopped.",
+                    id,
+                    why
+                )),
+                &none,
+                json,
+            );
         }
         Asked::Refused(error) => {
             // Nothing was taken, so an interrupt from here on has nothing to say but that.

@@ -5648,6 +5648,9 @@ enum OnStop {
     /// Takes no notice of `host.info`, the command's first request, until the test lets it go, so
     /// that the command is held before its request to stop has left.
     HoldTheLook,
+    /// Answers `host.info` and then closes the connection, so that the command cannot make its
+    /// request to stop.
+    CloseAfterTheLook,
 }
 
 /// A daemon of this test's own that answers `host.info` and the probe the level documents, and
@@ -5730,6 +5733,7 @@ impl TestDaemon {
                     let connection_id = kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid());
                     while let Ok(frame) = reader.read_message::<ControlFrame>().await {
                         let mut then_end = false;
+                        let mut then_close = false;
                         let answer = match frame {
                             ControlFrame::Hello(_) => ControlFrame::HelloAck(Box::new(
                                 kr_protocol::local::LocalHelloAck {
@@ -5776,6 +5780,8 @@ impl TestDaemon {
                                         tokio::time::sleep(Duration::from_millis(20)).await;
                                     }
                                 }
+                                then_close = matches!(on_stop, OnStop::CloseAfterTheLook)
+                                    && request.method.method() == Some(Method::HostInfo);
                                 let outcome = match request.method.method() {
                                     Some(Method::HostInfo) => Outcome::Ok(
                                         ParamsValue::from_typed(&info).expect("encodes"),
@@ -5807,6 +5813,7 @@ impl TestDaemon {
                                     }
                                     OnStop::Refuse
                                     | OnStop::HoldTheLook
+                                    | OnStop::CloseAfterTheLook
                                     | OnStop::RefuseAndHoldTheProbe => {
                                         ControlFrame::Response(Response {
                                             request_id: mutation.request_id,
@@ -5854,6 +5861,9 @@ impl TestDaemon {
                         }
                         if then_end {
                             over.store(true, std::sync::atomic::Ordering::SeqCst);
+                            break;
+                        }
+                        if then_close {
                             break;
                         }
                     }
@@ -6552,5 +6562,42 @@ fn an_unknown_answer_followed_by_a_failed_lock_check_does_not_say_the_daemon_was
         message.ends_with("Run kr host stop again in a moment."),
         "{message}"
     );
+    daemon.end();
+}
+
+/// KR-REQ-07.12 (a request that could not be made): a daemon that answers the look and closes the
+/// connection leaves the command unable to make its request. Nothing was sent, so the result is
+/// `not_asked`, with the text of its own, no wait for an end and no record; the exit is the
+/// failure's (3).
+#[test]
+fn a_request_that_could_not_be_made_is_not_asked_and_nothing_is_waited_for() {
+    let host = Standalone::create();
+    let mut daemon = TestDaemon::serve(
+        &host,
+        "kr-controller/9.9.9",
+        OnStop::CloseAfterTheLook,
+        true,
+    );
+    let output = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
+    let said = document(&output, "kr host stop");
+    assert_eq!(output.status.code(), Some(3), "{said}");
+    assert_eq!(stop_of(&said), "not_asked", "{said}");
+    let message = said["message"].as_str().expect("a message");
+    assert!(
+        message.starts_with(
+            "kr host stop could not make its request for the control daemon of environment "
+        ),
+        "{message}"
+    );
+    assert!(
+        message.ends_with(". Nothing was sent, and nothing was stopped."),
+        "{message}"
+    );
+    assert!(
+        !daemon.received().iter().any(|method| method == "host.stop"),
+        "no request to stop left: {:?}",
+        daemon.received()
+    );
+    assert!(attempts(&host).is_empty(), "no record stands");
     daemon.end();
 }
