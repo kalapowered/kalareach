@@ -6,7 +6,7 @@
  * code, the service or the host may be wrong, and saying which would be a guess.
  */
 
-import type { FailureKind, PairingFailure, PairingSources } from '../host/port'
+import type { PairingFailure, PairingSources } from '../host/port'
 
 /** What the person can do next, after an attempt ends. */
 export type NextAction =
@@ -43,20 +43,20 @@ function bringItInAgain(reading: Reading): string {
   }
 }
 /**
- * The words and the next action for one failure kind of an attempt made in `mode`. `service` is
- * the host name of the service a code attempt went through.
+ * The words and the next action for one failure of an attempt made in `mode`. `service` is the
+ * host name of the service a code attempt went through.
  */
 export function failureWords(
-  kind: FailureKind,
+  failure: Pick<PairingFailure, 'kind' | 'retry_after_seconds'>,
   service: string,
   mode: AttemptMode = 'code',
   reading: Reading = 'pasteboard'
 ): { readonly sentence: string; readonly action: NextAction } {
-  const words = codeWords(kind, service, reading)
+  const words = codeWords(failure, service, reading)
   if (mode === 'code') return words
   // A direct invitation reaches no service and holds no code, and native code lets it go once the
   // attempt ends: it is tried again only by bringing it in again.
-  switch (kind) {
+  switch (failure.kind) {
     case 'not_authenticated':
       return {
         sentence: 'The invitation did not work. Ask the host for a new one.',
@@ -72,13 +72,13 @@ export function failureWords(
   }
 }
 
-/** The words and the next action for one failure kind of a code attempt through `service`. */
+/** The words and the next action for one failure of a code attempt through `service`. */
 function codeWords(
-  kind: FailureKind,
+  failure: Pick<PairingFailure, 'kind' | 'retry_after_seconds'>,
   service: string,
   reading: Reading
 ): { readonly sentence: string; readonly action: NextAction } {
-  switch (kind) {
+  switch (failure.kind) {
     case 'malformed':
       return {
         sentence: 'A code has ten characters, and never contains 0, O, I or l.',
@@ -148,8 +148,12 @@ function codeWords(
       return {
         // The managed relay is the product's own, so the failure is not the host's, and it is said
         // to be neither. The way round it that fits both ways of pairing is the host's own network.
-        sentence:
-          "The managed relay could not take this pairing now. Try again shortly, or bring this device onto the host's network.",
+        sentence: `The managed relay could not take this pairing now. Try again in about ${waitInWords(failure.retry_after_seconds)}, or bring this device onto the host's network.`,
+        action: 'try_again'
+      }
+    case 'relay_fault':
+      return {
+        sentence: `The managed relay service could not admit this pairing now. This is not a fault of the host. Try again in about ${waitInWords(failure.retry_after_seconds)}, or bring this device onto the host's network.`,
         action: 'try_again'
       }
     case 'host_mismatch':
@@ -211,6 +215,43 @@ function codeWords(
   }
 }
 
+/** The longest wait the page says: a wait above it is said as this one. */
+const LONGEST_SAID_SECONDS = 24 * 60 * 60
+
+/**
+ * How long a wait of `seconds` is said to be, in the one unit that fits it and rounded up, so that
+ * a person is never told to try again before this device would. It is said as the host's own line
+ * says it: a figure of 0 is "1 second", and one above a day is "24 hours". A figure that is no
+ * finite number is said as the longest wait, never as a shorter one.
+ */
+export function waitInWords(seconds: number | undefined): string {
+  const said =
+    seconds !== undefined && Number.isFinite(seconds)
+      ? Math.min(Math.max(Math.ceil(seconds), 1), LONGEST_SAID_SECONDS)
+      : LONGEST_SAID_SECONDS
+  const minutes = Math.ceil(said / 60)
+  if (said === 1) return '1 second'
+  if (said < 60) return `${said} seconds`
+  if (minutes === 1) return '1 minute'
+  if (minutes < 60) return `${minutes} minutes`
+  const hours = Math.ceil(minutes / 60)
+  return hours === 1 ? '1 hour' : `${hours} hours`
+}
+
+/** What the screen says once before the paths a failure names. */
+export const UNTIL_THEN = 'Until then:'
+
+/**
+ * The paths that still work, each exactly as the managed relay service wrote it and in the order it
+ * wrote them. Only a failure for want of capacity has any, and only when the service named at
+ * least one: the kind decides, so a failure of any other kind shows none, whatever else it holds.
+ */
+export function failureAlternatives(
+  failure: Pick<PairingFailure, 'kind' | 'alternatives'>
+): readonly string[] {
+  return failure.kind === 'relay_capacity' ? (failure.alternatives ?? []) : []
+}
+
 /** The whole sentence for a failure, with the tries line whenever the attempt was charged. */
 export function failureSentence(
   failure: PairingFailure,
@@ -218,7 +259,7 @@ export function failureSentence(
   mode: AttemptMode = 'code',
   reading: Reading = 'pasteboard'
 ): string {
-  const { sentence } = failureWords(failure.kind, service, mode, reading)
+  const { sentence } = failureWords(failure, service, mode, reading)
   if (failure.tries_left === null) return sentence
   const tries = failure.tries_left === 1 ? '1 try' : `${failure.tries_left} tries`
   return `${sentence} ${tries} left on this device.`
