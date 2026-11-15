@@ -5528,9 +5528,10 @@ fn kr_host_stop_is_refused_inside_a_session_and_goes_on_where_a_worker_cannot_sa
 
 /// KR-REQ-07.12 (two stops at once): one daemon has ended, and each command says something true.
 /// A command may see the daemon end, or find no daemon, or meet a holder that does not answer
-/// (the listener has closed and the lock is not yet free) and ask nothing, or find the connection
-/// closed before it can make its request (exit 3, nothing sent); none says that something started
-/// the daemon again, and at least one saw the end.
+/// (the listener has closed and the lock is not yet free) and ask nothing; none says that something
+/// started the daemon again, and at least one saw the end. A command that finds the connection
+/// closed before it can make its request meets a daemon that ends, and ends with the end's result
+/// too.
 #[test]
 fn two_kr_host_stops_at_once_each_say_what_is_true_and_one_daemon_ends() {
     let (host, _session_id, _created, _daemon) = a_host_with_a_session();
@@ -5550,18 +5551,8 @@ fn two_kr_host_stops_at_once_each_say_what_is_true_and_one_daemon_ends() {
             saw_the_end |= out.contains("Stopped the control daemon for environment");
             assert!(
                 out.contains("Stopped the control daemon for environment")
-                    || out.contains("No control daemon runs for environment"),
-                "{out} {err}"
-            );
-        } else if output.status.code() == Some(3) {
-            // The daemon was already stopping for the other command: this one met the closed
-            // connection before it could make its request, which left nothing.
-            assert!(
-                err.contains("could not make its request for the control daemon"),
-                "{out} {err}"
-            );
-            assert!(
-                err.contains("Nothing was sent, and nothing was stopped."),
+                    || out.contains("No control daemon runs for environment")
+                    || out.contains("This command sent nothing."),
                 "{out} {err}"
             );
         } else {
@@ -5663,6 +5654,9 @@ enum OnStop {
     /// Answers `host.info` and, in the same write, sends a frame that cannot be read, and then
     /// closes the connection, so that the command cannot make its request to stop.
     CloseAfterTheLook,
+    /// Answers `host.info`, closes the connection and stops listening, as a daemon whose stop has
+    /// taken effect does: the command cannot make its request, and the daemon has ended.
+    CloseAfterTheLookAndEnd,
 }
 
 /// A daemon of this test's own that answers `host.info` and the probe the level documents, and
@@ -5792,8 +5786,10 @@ impl TestDaemon {
                                         tokio::time::sleep(Duration::from_millis(20)).await;
                                     }
                                 }
-                                then_close = matches!(on_stop, OnStop::CloseAfterTheLook)
-                                    && request.method.method() == Some(Method::HostInfo);
+                                then_close = matches!(
+                                    on_stop,
+                                    OnStop::CloseAfterTheLook | OnStop::CloseAfterTheLookAndEnd
+                                ) && request.method.method() == Some(Method::HostInfo);
                                 let outcome = match request.method.method() {
                                     Some(Method::HostInfo) => Outcome::Ok(
                                         ParamsValue::from_typed(&info).expect("encodes"),
@@ -5826,6 +5822,7 @@ impl TestDaemon {
                                     OnStop::Refuse
                                     | OnStop::HoldTheLook
                                     | OnStop::CloseAfterTheLook
+                                    | OnStop::CloseAfterTheLookAndEnd
                                     | OnStop::RefuseAndHoldTheProbe => {
                                         ControlFrame::Response(Response {
                                             request_id: mutation.request_id,
@@ -5876,7 +5873,9 @@ impl TestDaemon {
                                 kr_protocol::frame::StreamKind::Control,
                             );
                             let mut bytes = codec.encode_message(&answer).expect("encodes");
-                            bytes.extend(codec.encode(&[0xff, 0xff]).expect("frames"));
+                            if !matches!(on_stop, OnStop::CloseAfterTheLookAndEnd) {
+                                bytes.extend(codec.encode(&[0xff, 0xff]).expect("frames"));
+                            }
                             writer.write_frame(&bytes).await
                         } else {
                             writer.write_message(&answer).await
@@ -5889,6 +5888,9 @@ impl TestDaemon {
                             break;
                         }
                         if then_close {
+                            if matches!(on_stop, OnStop::CloseAfterTheLookAndEnd) {
+                                over.store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
                             break;
                         }
                     }
@@ -6597,7 +6599,8 @@ fn an_unknown_answer_followed_by_a_failed_lock_check_does_not_say_the_daemon_was
 /// KR-REQ-07.12 (a request that could not be made): a daemon that answers the look and closes the
 /// connection leaves the command unable to make its request. Nothing was sent, so the result is
 /// `not_asked`, with the text of its own, no wait for an end and no record; the exit is the
-/// failure's (3).
+/// failure's (3). The daemon here stays and answers at its endpoint, which is what tells it from
+/// one that has ended.
 #[test]
 fn a_request_that_could_not_be_made_is_not_asked_and_nothing_is_waited_for() {
     let host = Standalone::create();
@@ -6628,5 +6631,64 @@ fn a_request_that_could_not_be_made_is_not_asked_and_nothing_is_waited_for() {
         daemon.received()
     );
     assert!(attempts(&host).is_empty(), "no record stands");
+    daemon.end();
+}
+
+/// KR-REQ-07.12 (a request that could not be made because the daemon ended): a daemon that answers
+/// the look, closes the connection and stops listening has ended when the command comes to make
+/// its request, as one does whose stop another command has taken. The result is the end's: exit 0,
+/// `ended`, a sentence that says it ended and that this command sent nothing, no request sent and
+/// no record.
+#[test]
+fn a_request_that_could_not_be_made_because_the_daemon_ended_is_the_daemons_end() {
+    let host = Standalone::create();
+    let mut daemon = TestDaemon::serve(
+        &host,
+        "kr-controller/9.9.9",
+        OnStop::CloseAfterTheLookAndEnd,
+        true,
+    );
+    let output = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
+    let said = document(&output, "kr host stop");
+    assert_eq!(output.status.code(), Some(0), "{said}");
+    assert_eq!(stop_of(&said), "ended", "{said}");
+    assert!(said["unsettled"].is_null(), "{said}");
+    let text = start(host.kr(&["host", "stop"])).finish("kr host stop");
+    assert!(text.status.success(), "no daemon runs now");
+    assert!(
+        !daemon.received().iter().any(|method| method == "host.stop"),
+        "no request to stop left: {:?}",
+        daemon.received()
+    );
+    assert!(attempts(&host).is_empty(), "no record stands");
+    daemon.end();
+}
+
+/// The text of the same result, without `--json`: the daemon ended, why the request could not be
+/// made, and that this command sent nothing.
+#[test]
+fn the_end_of_a_daemon_that_closed_before_the_request_says_that_nothing_was_sent() {
+    let host = Standalone::create();
+    let mut daemon = TestDaemon::serve(
+        &host,
+        "kr-controller/9.9.9",
+        OnStop::CloseAfterTheLookAndEnd,
+        true,
+    );
+    let output = start(host.kr(&["host", "stop"])).finish("kr host stop");
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{out}");
+    assert!(
+        out.starts_with("The control daemon for environment "),
+        "{out}"
+    );
+    assert!(
+        out.contains(" ended, and this command could not make its request for it: "),
+        "{out}"
+    );
+    assert!(
+        out.trim_end().ends_with("This command sent nothing."),
+        "{out}"
+    );
     daemon.end();
 }
