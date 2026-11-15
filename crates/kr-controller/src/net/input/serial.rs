@@ -191,7 +191,8 @@ async fn carry(
         handle,
         version,
         resets,
-        door.remote.decide_an_input_frame(session),
+        flow.stages
+            .counted_while_it_waits(door.remote.decide_an_input_frame(session)),
     )
     .await
     else {

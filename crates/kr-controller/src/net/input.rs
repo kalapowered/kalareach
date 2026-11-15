@@ -1428,6 +1428,11 @@ async fn run(
             () = handle.revoked() => return,
         }
     }
+    // A decision that was kept across the loop's turns waits for the registry, and its one await is
+    // that wait. It is let go here, before the wait below, which does not poll it: a lock that
+    // hands its place on to a waiter that nothing polls keeps the registry from every other caller
+    // until the waiter is dropped, and the wait below lasts as long as the device is slow to read.
+    drop(deciding);
     if flow.ended() == Some(End::Graceful) {
         // The stream task has read all it will. What the device is owed is written, and the
         // writing half finishes, before the pending read is let go. A write that the device does
@@ -1482,7 +1487,11 @@ async fn forward(
 ) {
     let epoch = frame.epoch;
     let sequence = frame.sequence.get();
-    let decision = match door.remote.decide_an_input_frame(session).await {
+    let decision = match flow
+        .stages
+        .counted_while_it_waits(door.remote.decide_an_input_frame(session))
+        .await
+    {
         Ok(decision) => decision,
         Err(error) => {
             flow.refuse(epoch, sequence, error);
