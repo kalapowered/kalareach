@@ -186,8 +186,8 @@ async fn a_refusal_on_a_live_link_is_asked_again_at_each_pass_and_no_sooner() {
 
 /// KR-REQ-09.12: an ask that timed out doubles its interval, from five seconds towards a minute.
 ///
-/// The worker's one connection is held by the case, so each ask waits for it for its whole
-/// acknowledgement time and ends without an answer. The interval is counted from the end of the
+/// The worker's one connection is held by the case, so each ask waits for it for the whole of its
+/// bound, fifteen seconds, and ends without an answer. The interval is counted from the end of the
 /// ask: the second ask comes ten seconds after the first one ended, the third twenty after the
 /// second.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -221,15 +221,15 @@ async fn an_ask_that_timed_out_doubles_its_interval() {
     )
     .await;
     let asks = asks_of(host.controller(), session_id);
-    // Ten seconds for the ask to give up, then the interval.
+    // Fifteen seconds for the ask to give up, then the interval.
     assert!(
         asks[1] - asks[0] >= Duration::from_secs(19),
-        "the second ask came {:?} after the first, which gave up after 10 s and waits 10 s more",
+        "the second ask came {:?} after the first, which gave up after 15 s and waits 10 s more",
         asks[1] - asks[0]
     );
     assert!(
         asks[2] - asks[1] >= Duration::from_secs(29),
-        "the third ask came {:?} after the second, which gave up after 10 s and waits 20 s more",
+        "the third ask came {:?} after the second, which gave up after 15 s and waits 20 s more",
         asks[2] - asks[1]
     );
     drop(link);
@@ -272,7 +272,8 @@ async fn an_answer_puts_the_interval_back_to_five_seconds() {
     )
     .await;
     let held = worker.hold_the_dispatch_boundary().await;
-    // The first ask gives up after ten seconds; the connection goes back after it did.
+    // The first ask may wait for the connection for fifteen seconds; the case gives it back after
+    // eleven.
     tokio::time::sleep(Duration::from_secs(11)).await;
     drop(link);
 
