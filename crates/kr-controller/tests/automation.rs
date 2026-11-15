@@ -7026,9 +7026,12 @@ async fn a_created_session_is_kept_when_its_node_is_asked_to_stop_after_its_admi
 
 /// A test that ends while its daemon has recorded a worker and not yet written the worker's
 /// descriptor still ends the worker. The descriptor is renamed within its directory, where nothing
-/// lists it, when the case ends, and renamed back once the teardown has read the directory and found
-/// the worker unnamed, as a daemon slow to write it would leave it; the teardown waits for it, asks
-/// the worker to close, and the worker ends.
+/// lists it, and the case ends its own host: a thread renames the descriptor back once the teardown
+/// has read the directory and found the worker unnamed, as a daemon slow to write it would leave
+/// it, and the teardown waits for it, asks the worker to close, and the worker ends. The case
+/// fails if the teardown never said it had looked, so a descriptor that came back by any other
+/// order does not pass it; a teardown that did not wait fails with its own account of a worker it
+/// did not ask.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_worker_whose_descriptor_is_written_after_the_teardown_began_is_still_closed() {
     let host = working_host().await;
@@ -7077,13 +7080,165 @@ async fn a_worker_whose_descriptor_is_written_after_the_teardown_began_is_still_
     let held = published.with_extension("held");
     std::fs::rename(&published, &held).expect("the descriptor is renamed out of the listing");
     host.clients.abort();
-    std::thread::spawn(move || {
-        teardown::wait_until_a_worker_is_found_unnamed(
-            &environment,
-            std::time::Duration::from_secs(120),
-        );
-        let _ = std::fs::rename(&held, &published);
-    });
+    // The thread gives the descriptor back only once the teardown says it looked and found the
+    // worker unnamed, and says whether that came. It stops when the teardown is over, which is
+    // read before each wait so that a signal set before then is never missed.
+    let teardown_over = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let restoring = {
+        let teardown_over = Arc::clone(&teardown_over);
+        std::thread::spawn(move || {
+            loop {
+                let over = teardown_over.load(std::sync::atomic::Ordering::SeqCst);
+                if teardown::wait_until_a_worker_is_found_unnamed(
+                    &environment,
+                    std::time::Duration::from_millis(100),
+                ) {
+                    return Some(std::fs::rename(&held, &published));
+                }
+                if over {
+                    return None;
+                }
+            }
+        })
+    };
+    // The teardown runs here, in the case, so that what the thread saw decides the result and not
+    // only what the teardown did. Its own failure is kept and given back after the thread's.
+    let torn_down = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(host)));
+    teardown_over.store(true, std::sync::atomic::Ordering::SeqCst);
+    let restored = restoring
+        .join()
+        .expect("the thread that gives the descriptor back did not panic");
+    let teardown_said = match &torn_down {
+        Ok(()) => "the teardown ended without a failure".to_owned(),
+        Err(payload) => payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .map_or_else(
+                || "the teardown failed".to_owned(),
+                |said| format!("the teardown failed: {said}"),
+            ),
+    };
+    match restored {
+        None => panic!(
+            "the teardown never said that it had read the descriptors and found the worker unnamed, \
+             so the descriptor was held back for all of it and this case did not show that the \
+             teardown waits for one; {teardown_said}"
+        ),
+        Some(Err(error)) => panic!(
+            "the descriptor could not be given back after the teardown found the worker unnamed: \
+             {error}; {teardown_said}"
+        ),
+        Some(Ok(())) => {}
+    }
+    if let Err(payload) = torn_down {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+/// A reading of the descriptor directory that fails after one that succeeded does not lose the
+/// worker the first one named: the worker is still asked, and the failure is part of what is said
+/// of the workers no descriptor named. The directory is made readable by others once the teardown
+/// has read it and found a worker unnamed, which the directory's reader refuses, as a listing
+/// that fails on a loaded machine would; the worker it named is this test's own process, whose
+/// endpoint nothing listens on, so the ask fails at its first step and is still an ask.
+#[cfg(unix)]
+#[test]
+fn a_listing_that_fails_after_one_that_succeeded_still_asks_the_worker_the_first_named() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// A process of this case's own that goes with the case.
+    struct Sleeper(std::process::Child);
+    impl Drop for Sleeper {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let host = kr_ipc::testing::TempHost::create();
+    let environment = host.environment();
+    let named = kr_ipc::identity::current_process_start_identity()
+        .expect("this process's identity is readable");
+    kr_ipc::descriptor::publish(
+        &environment,
+        &kr_protocol::worker::WorkerDescriptor {
+            session_id: kr_protocol::ids::SessionId::new(Uuid::from_bytes([1; 16])),
+            session_epoch: kr_protocol::ids::SessionEpoch::V1,
+            environment_id: host.environment_id(),
+            display_number: kr_protocol::session::DisplayNumber::new(1),
+            boot_identity: kr_ipc::identity::boot_identity().expect("the boot is readable"),
+            process_start_identity: named.clone(),
+            protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+            endpoint: host.root().join("no-worker.sock").display().to_string(),
+            worker_public_key: kr_protocol::scalars::AuthorisationKey::from_bytes([1; 32]),
+            worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+            published_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+        },
+    )
+    .expect("the descriptor is published");
+    let unnamed = Sleeper(
+        std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("a process that no descriptor names starts"),
+    );
+    let unnamed_identity = kr_ipc::identity::process_start_identity(unnamed.0.id())
+        .expect("the child's identity is readable");
+    let breaking = {
+        let environment = host.environment();
+        std::thread::spawn(move || {
+            let looked = teardown::wait_until_a_worker_is_found_unnamed(
+                &environment,
+                std::time::Duration::from_secs(60),
+            );
+            if looked {
+                std::fs::set_permissions(
+                    environment.descriptors_dir(),
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .expect("the descriptor directory is opened to others");
+            }
+            looked
+        })
+    };
+    let asked = teardown::ask_to_close(
+        &environment,
+        &[
+            (named.clone(), "the named worker".to_owned()),
+            (unnamed_identity.clone(), "the unnamed worker".to_owned()),
+        ],
+    );
+    assert!(
+        breaking
+            .join()
+            .expect("the thread that breaks the listing did not panic"),
+        "the first listing found the unnamed worker, so the directory was made unreadable after it"
+    );
+    let outcome = asked
+        .workers
+        .iter()
+        .find(|(identity, _)| *identity == named)
+        .map(|(_, outcome)| outcome);
+    assert!(
+        matches!(outcome, Some(teardown::Outcome::Failed(_))),
+        "the worker the first listing named was asked and the ask failed at its first step; \
+         asked: {} workers, said of the others: {}",
+        asked.workers.len(),
+        asked.not_asked
+    );
+    assert!(
+        asked
+            .workers
+            .iter()
+            .all(|(identity, _)| *identity != unnamed_identity),
+        "the worker no descriptor named was not asked"
+    );
+    assert!(
+        asked.not_asked.contains("could not be listed again"),
+        "the failed listing is part of what is said of the others: {}",
+        asked.not_asked
+    );
 }
 
 /// A daemon with real sessions whose configuration document names `suites` (a name, its command,

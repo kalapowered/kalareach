@@ -563,16 +563,16 @@ fn running_or_unknown(identity: &ProcessStartIdentity) -> bool {
 
 /// How asking the workers of an environment to close ended.
 #[derive(Default)]
-struct Asked {
+pub struct Asked {
     /// Each worker that had a running, readable descriptor, with how asking it ended.
-    workers: Vec<(ProcessStartIdentity, Outcome)>,
+    pub workers: Vec<(ProcessStartIdentity, Outcome)>,
     /// What to say of a worker that is not among `workers`: it was not asked.
-    not_asked: String,
+    pub not_asked: String,
 }
 
 /// How asking one worker to close ended.
 #[derive(Clone)]
-enum Outcome {
+pub enum Outcome {
     /// The worker accepted the close.
     Accepted,
     /// The worker was asked and did not accept: the step that failed, how, and how long each step
@@ -588,6 +588,36 @@ enum Outcome {
 /// one that waits, so that an answer that has come is not lost when the waiting ends.
 type Answers = Arc<Mutex<Vec<(ProcessStartIdentity, Outcome)>>>;
 
+/// What one reading of the descriptor directory held.
+#[derive(Default)]
+struct Scan {
+    /// The descriptors of workers that are running, or that the kernel will not say have ended.
+    workers: Vec<kr_protocol::worker::WorkerDescriptor>,
+    /// How many readable descriptors named a worker that had ended.
+    ended: usize,
+    /// The files that could not be read, each with why.
+    unreadable: Vec<String>,
+}
+
+impl Scan {
+    /// What to say of a worker that is not among this reading's `workers`, and why the waiting for
+    /// one ended.
+    fn account(&self, why: &str) -> String {
+        let mut account = format!(
+            "{why}; readable descriptors of workers that had ended: {}",
+            self.ended
+        );
+        if !self.unreadable.is_empty() {
+            account.push_str(&format!(
+                ", and {} could not be read ({})",
+                self.unreadable.len(),
+                self.unreadable.join("; ")
+            ));
+        }
+        account
+    }
+}
+
 /// Asks every running worker that published a descriptor in this environment to close its session,
 /// through its own endpoint, and says how each one answered.
 ///
@@ -596,44 +626,57 @@ type Answers = Arc<Mutex<Vec<(ProcessStartIdentity, Outcome)>>>;
 /// the disk twice. A test that ends in between has a worker that is running and recorded and that
 /// no descriptor names yet. So the descriptors are read again, for at most [`DESCRIPTOR_BOUND`],
 /// until a readable one names each of the `started` workers that is still running, and only then
-/// are the workers asked. A worker no descriptor names by then is not asked, and says so.
+/// are the workers asked. A worker no descriptor names by then is not asked, and says so. A reading
+/// that fails after one that succeeded ends the waiting: the workers the last good reading named
+/// are asked, and the failure is part of what is said of the others.
 ///
 /// Each worker is first made to prove that it is the one its descriptor names, so a request reaches
 /// no process but that worker, which then ends itself: nothing here names a process by its number.
 /// The workers are asked together, on a runtime on a thread of its own because this runs inside a
 /// drop, and none of it is waited for longer than [`ASKING_BOUND`].
-fn ask_to_close(
+pub fn ask_to_close(
     environment: &EnvironmentPaths,
     started: &[(ProcessStartIdentity, String)],
 ) -> Asked {
     let deadline = Instant::now() + DESCRIPTOR_BOUND;
+    let mut last: Option<Scan> = None;
     let (workers, not_asked) = loop {
         let entries = match kr_ipc::descriptor::read_all(environment) {
             Ok(entries) => entries,
             Err(error) => {
-                return Asked {
-                    not_asked: format!(
-                        "the descriptors of this environment could not be listed: {error}"
-                    ),
-                    ..Asked::default()
+                // A listing that fails after one that succeeded loses nothing: the workers the
+                // last listing named are asked, and no more is waited for.
+                let Some(scan) = last else {
+                    return Asked {
+                        not_asked: format!(
+                            "the descriptors of this environment could not be listed: {error}"
+                        ),
+                        ..Asked::default()
+                    };
                 };
+                let why = format!(
+                    "the descriptors of this environment could not be listed again ({error}), so the workers the last listing named were asked and no other was waited for"
+                );
+                let account = scan.account(&why);
+                break (scan.workers, account);
             }
         };
-        let mut unreadable = Vec::new();
-        let mut ended = 0_usize;
-        let mut workers = Vec::new();
+        let mut scan = Scan::default();
         for entry in entries {
             match entry.descriptor {
-                Err(error) => unreadable.push(format!("{}: {error}", entry.path.display())),
+                Err(error) => scan
+                    .unreadable
+                    .push(format!("{}: {error}", entry.path.display())),
                 Ok(descriptor) if running_or_unknown(&descriptor.process_start_identity) => {
-                    workers.push(descriptor);
+                    scan.workers.push(descriptor);
                 }
-                Ok(_) => ended += 1,
+                Ok(_) => scan.ended += 1,
             }
         }
         let unnamed = started.iter().any(|(identity, _)| {
             running_or_unknown(identity)
-                && !workers
+                && !scan
+                    .workers
                     .iter()
                     .any(|worker| worker.process_start_identity == *identity)
         });
@@ -646,18 +689,13 @@ fn ask_to_close(
             UNNAMED_WORKERS.1.notify_all();
         }
         if !unnamed || Instant::now() >= deadline {
-            let mut not_asked = format!(
-                "no readable descriptor of a running worker named it within {DESCRIPTOR_BOUND:?}; readable descriptors of workers that had ended: {ended}"
+            let why = format!(
+                "no readable descriptor of a running worker named it within {DESCRIPTOR_BOUND:?}"
             );
-            if !unreadable.is_empty() {
-                not_asked.push_str(&format!(
-                    ", and {} could not be read ({})",
-                    unreadable.len(),
-                    unreadable.join("; ")
-                ));
-            }
-            break (workers, not_asked);
+            let account = scan.account(&why);
+            break (scan.workers, account);
         }
+        last = Some(scan);
         std::thread::sleep(Duration::from_millis(50));
     };
     if workers.is_empty() {
