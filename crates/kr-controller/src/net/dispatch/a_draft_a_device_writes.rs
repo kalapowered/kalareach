@@ -361,7 +361,7 @@ async fn a_draft_bound_to_a_session_is_written_only_by_a_request_that_names_that
 /// was in both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_refusal_from_a_stored_subject_at_the_network_door_is_not_shown_when_a_fence_lands_after_the_read()
-{
+ {
     for owed in [false, true] {
         let world = fake::fake_worker(None).await;
         let controller = &world.controller;
