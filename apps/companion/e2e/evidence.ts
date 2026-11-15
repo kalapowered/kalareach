@@ -21,6 +21,16 @@
  * folder, says where it is and sets the variable to it, so the workers the run starts read the
  * same directory.
  *
+ * The reader guards a test run against a mistake: for any value of the evidence variable, and any
+ * temporary variable as a platform, a runner, one of our scripts or a developer's shell sets it,
+ * with folders and links as tools make them, it returns a folder inside the roots or refuses, and
+ * it refuses nothing that the run set right. It is no boundary against a process of the same
+ * account, which can write wherever the run can and can change a link or a folder while the reader
+ * reads. It does not close a case that somebody arranges: a name with a line feed beside a link at
+ * the shortened name, a link whose target climbs through another link, or a server named with no
+ * share. On Windows the comparison ignores letter case, so a folder made case-sensitive, and a
+ * letter that the disk and the reader do not fold alike, are not told apart.
+ *
  * Declared against `node:process` for the same reason `served.ts` is: the browser tests are
  * type-checked with the interface's own settings, which carry no Node types.
  */

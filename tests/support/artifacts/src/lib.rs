@@ -17,6 +17,16 @@
 //! Where the variable is not set, the first read makes a directory of this run's own under the
 //! temporary folder, says where it is on standard error, and every later read of the same process
 //! returns the same directory.
+//!
+//! The reader guards a test run against a mistake: for any value of the evidence variable, and any
+//! temporary variable as a platform, a runner, one of our scripts or a developer's shell sets it,
+//! with folders and links as tools make them, it returns a folder inside the roots or refuses, and
+//! it refuses nothing that the run set right. It is no boundary against a process of the same
+//! account, which can write wherever the run can and can change a link or a folder while the reader
+//! reads. It does not close a case that somebody arranges: a name with a line feed beside a link at
+//! the shortened name, a link whose target climbs through another link, or a server named with no
+//! share. On Windows the system resolves both paths before they are compared and the reader folds
+//! no letter itself, so a folder made case-sensitive is told apart.
 
 use std::collections::hash_map::RandomState;
 use std::ffi::OsStr;
