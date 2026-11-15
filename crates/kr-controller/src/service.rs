@@ -672,6 +672,10 @@ pub struct Controller {
     /// this host's own tests. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     pending_asks: std::sync::Mutex<Vec<(SessionId, tokio::time::Instant)>>,
+    /// Whether the daemon's own pass is held from asking the workers that are pending, for this
+    /// host's own tests. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pass_asks_held: std::sync::atomic::AtomicBool,
     /// Every time this daemon has asked whether a worker has ended, by the worker's session, for
     /// this host's own tests. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -1290,6 +1294,17 @@ impl Controller {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Holds the asks the daemon's own pass makes of the workers that are pending while `held` is
+    /// true, for this host's own tests. The pass asks such a worker with the announcement's own
+    /// first exchange, so an ask it makes while a test reads the record of the announcements, or
+    /// counts what a worker refused, is taken for the announcement's. What the pass does besides
+    /// asking (the names it collects, the workers it reconciles, the fence it settles) goes on.
+    #[cfg(feature = "testing")]
+    pub fn hold_the_pass_asks_for_tests(&self, held: bool) {
+        self.pass_asks_held
+            .store(held, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// How many times this daemon has asked whether the worker of `session_id` has ended, for this

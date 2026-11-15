@@ -1948,6 +1948,13 @@ async fn hosted_daemon() -> HostedDaemon {
     })
     .await
     .expect("the daemon starts");
+    // The cases of this file read the record of what the daemon announced to a worker, or count
+    // what a worker refused, over a window in which a worker is pending. The daemon's own pass asks
+    // a pending worker with the announcement's own first exchange, and an ask it makes inside such
+    // a window would be read as the announcement's: another first ask, a first ask after a page, an
+    // ask more than the bound. No case here is about the pass's asks, so the pass does not make
+    // them for these daemons.
+    controller.hold_the_pass_asks_for_tests(true);
     let client_endpoint = environment.controller_endpoint().expect("an endpoint");
     tokio::spawn(
         Arc::clone(&controller)
@@ -3235,6 +3242,11 @@ async fn a_refused_page_uses_none_of_the_pages_an_announcement_may_collect() {
 /// a page. A daemon that asked for a worker's pages as soon as that worker had acknowledged would
 /// put one worker's page before the other's acknowledgement in that announcement, so the case
 /// cannot end without meeting the order it is there to refuse.
+///
+/// What it holds is the order inside one announcement, and only that: the daemon does not keep
+/// this order across everything that asks a worker, and its own pass, which asks a pending worker
+/// with a first exchange of its own, is held for this daemon so that what the record shows is the
+/// announcements'.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_announcement_asks_every_worker_for_its_acknowledgement_before_it_asks_for_any_page() {
     let daemon = hosted_daemon().await;

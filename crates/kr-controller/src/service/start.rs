@@ -1249,6 +1249,8 @@ impl Controller {
             #[cfg(feature = "testing")]
             pending_asks: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "testing")]
+            pass_asks_held: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "testing")]
             reconciliations: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "testing")]
             before_the_leases_adopt: crate::attention::Pause::default(),

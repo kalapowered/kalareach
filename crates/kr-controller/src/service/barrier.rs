@@ -2034,6 +2034,13 @@ impl Controller {
                     due.push(session_id);
                 }
             }
+            #[cfg(feature = "testing")]
+            if self
+                .pass_asks_held
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                due.clear();
+            }
             let asks = due.into_iter().map(|session_id| async move {
                 let began = tokio::time::Instant::now();
                 #[cfg(feature = "testing")]

@@ -211,6 +211,9 @@ async fn a_daemon_restarted_after_a_worker_fenced_alone(
         owner: _,
         workers,
     } = Adopted::start(1).await;
+    // The case reads whether anything asked the worker again before the stop, and the daemon's own
+    // pass asks a pending worker with the announcement's own first exchange, so it does not ask.
+    host.controller().hold_the_pass_asks_for_tests(true);
     let worker = &workers[0];
     let mut acknowledged = 0;
     if first_acknowledged {
