@@ -24,8 +24,16 @@
 # /tmpfoo is not inside /tmp. A relative value, an empty value and a value with a `..` in it are
 # refused, and so is a root itself.
 #
+# Off Windows a value that holds a backslash is refused, in words that say that a backslash is not
+# taken in the folder's path on this platform, before any other read of it, and a temporary
+# variable that holds one is passed over as a root: PowerShell's own path commands read a backslash
+# as a separator on every platform, so a folder whose name holds one cannot be kept as written
+# by every reader and by the scripts that use the path they return, and a value that the four
+# readers cannot read as one folder is refused by all four.
+#
 # Where the variable is not set, the script makes a directory of its own under the temporary folder
-# and says where it is on the error stream.
+# (the folder the system names for it, and /tmp where that holds a backslash off Windows) and says
+# where it is on the error stream.
 #
 # The reader guards a test run against a mistake: for any value of the evidence variable, and any
 # temporary variable as a platform, a runner, one of our scripts or a developer's shell sets it,
@@ -46,7 +54,10 @@ $ErrorActionPreference = 'Stop'
 $variable = 'KR_TEST_ARTIFACTS_DIR'
 $windows = [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
 $comparison = if ($windows) { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
-$separators = [char[]] @([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+# Both separators on every platform: PowerShell's own path commands (Join-Path, Test-Path, Get-Item)
+# read a backslash as a separator off Windows too, so a walk that split on the slash alone would
+# read a path another way than the commands it then joins it with.
+$separators = [char[]] @('\', '/')
 
 # The spellings of an absolute path that this reader takes on Windows, for the words of a refusal.
 $takes = 'on Windows this reader takes C:\folder or C:/folder, \\server\share\folder or //server/share/folder, and either behind \\?\, as \\?\C:\folder or \\?\UNC\server\share\folder'
@@ -127,6 +138,8 @@ function Get-TemporaryRoots {
         # (C:folder) is rooted but names no one place, and a spelling this reader does not take names
         # none that it reads: neither is a root.
         if ([string]::IsNullOrEmpty($candidate)) { continue }
+        # Off Windows a temporary variable that holds a backslash names no root.
+        if (-not $windows -and $candidate.Contains('\')) { continue }
         if ($windows) {
             if ((Get-Spelling $candidate) -ne 'taken') { continue }
         } elseif (-not [System.IO.Path]::IsPathFullyQualified($candidate)) { continue }
@@ -164,6 +177,7 @@ function Stop-Refused {
 function Confine-Value {
     param([string] $Value, $Folder)
     if ([string]::IsNullOrEmpty($Value)) { Stop-Refused $Value 'it is empty' $Folder }
+    if (-not $windows -and $Value.Contains('\')) { Stop-Refused $Value "it holds a backslash, and a backslash is not taken in the folder's path on this platform" $Folder }
     if ($windows) {
         switch (Get-Spelling $Value) {
             'not-absolute' { Stop-Refused $Value "it is not an absolute path ($takes)" $Folder }
@@ -185,6 +199,8 @@ if ($null -ne $named) {
     $directory = Confine-Value $named
 } else {
     $temporary = [System.IO.Path]::GetTempPath()
+    # Off Windows a temporary folder that holds a backslash is passed over: the directory goes under /tmp.
+    if (-not $windows -and $temporary.Contains('\')) { $temporary = '/tmp' }
     $made = Join-Path $temporary ('kr-test-artifacts-' + [System.Guid]::NewGuid().ToString('N'))
     # The folder is checked before the directory is made in it, so that a temporary folder that is
     # no root is left as it was.

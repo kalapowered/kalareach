@@ -23,9 +23,16 @@
  * taken: a device path, a server with no share, three separators at the start, a path that depends
  * on the current drive and one that depends on a drive's current directory.
  *
+ * Off Windows a value that holds a backslash is refused, in words that say that a backslash is not
+ * taken in the folder's path on this platform, before any other read of it, and a temporary
+ * variable that holds one is passed over as a root: PowerShell's own path commands read a
+ * backslash as a separator on every platform, so a folder whose name holds one cannot be kept as
+ * written by every reader and by the scripts that use the path they return, and a value that the
+ * four readers cannot read as one folder is refused by all four.
+ *
  * Where the variable is not set, the first read makes a directory of its own under the temporary
- * folder, says where it is and sets the variable to it, so the workers the run starts read the
- * same directory.
+ * folder (and under `/tmp` where that holds a backslash off Windows), says where it is and sets
+ * the variable to it, so the workers the run starts read the same directory.
  *
  * The reader guards a test run against a mistake: for any value of the evidence variable, and any
  * temporary variable as a platform, a runner, one of our scripts or a developer's shell sets it,
@@ -53,6 +60,10 @@ const VARIABLE = 'KR_TEST_ARTIFACTS_DIR'
 
 const windows = platform() === 'win32'
 
+/** Why a path that holds a backslash is refused off Windows. */
+const BACKSLASH_WHY =
+  "it holds a backslash, and a backslash is not taken in the folder's path on this platform"
+
 /** The spellings of an absolute path that this reader takes on Windows, for the words of a refusal. */
 const TAKES =
   'on Windows this reader takes C:\\folder or C:/folder, \\\\server\\share\\folder or ' +
@@ -60,10 +71,11 @@ const TAKES =
   '\\\\?\\UNC\\server\\share\\folder'
 
 /** How a path is written: whether this reader takes the spelling. */
-export type Spelling = 'taken' | 'not-absolute' | 'kind'
+export type Spelling = 'taken' | 'not-absolute' | 'kind' | 'backslash'
 
 /**
- * How `path` is written. Off Windows a path is taken when it begins with `/`. On Windows it is
+ * How `path` is written. Off Windows a path is taken when it begins with `/` and holds no
+ * backslash; one that holds a backslash is `backslash`, whatever else it is. On Windows it is
  * `taken` when it is a drive with a root (`C:\x`, `C:/x`) or a share with a server and a name
  * (`\\server\share\x`, `//server/share/x`), with either separator or both, or either one behind
  * `\\?\` with backslashes only (Windows reads a slash behind `\\?\` as a letter of a name);
@@ -73,7 +85,10 @@ export type Spelling = 'taken' | 'not-absolute' | 'kind'
  * server with no share, three separators at the start.
  */
 export function spellingOf(path: string, onWindows: boolean = windows): Spelling {
-  if (!onWindows) return path.startsWith('/') ? 'taken' : 'not-absolute'
+  if (!onWindows) {
+    if (path.includes('\\')) return 'backslash'
+    return path.startsWith('/') ? 'taken' : 'not-absolute'
+  }
   let rest = path
   if (path.startsWith('\\\\?\\')) {
     const behind = path.slice(4)
@@ -175,6 +190,7 @@ export function confine(value: string): string {
 function confineOr(value: string, refuse: (why: string) => Error): string {
   if (value === '') throw refuse('it is empty')
   const spelling = spellingOf(value)
+  if (spelling === 'backslash') throw refuse(BACKSLASH_WHY)
   if (spelling === 'not-absolute') {
     throw refuse(`it is not an absolute path${windows ? ` (${TAKES})` : ''}`)
   }
@@ -203,11 +219,20 @@ export function ownDirectory(temporary: string): string {
   return confineOr(mkdtempSync(join(temporary, prefix)), refuse)
 }
 
+/**
+ * The folder the run's own directory goes under: `os.tmpdir()`, and `/tmp` where that holds a
+ * backslash off Windows, which is passed over as a root.
+ */
+function temporaryFolder(): string {
+  const named = tmpdir()
+  return !windows && named.includes('\\') ? '/tmp' : named
+}
+
 /** The directory this run keeps its artefacts in. */
 export function artefactsDirectory(): string {
   const named = env[VARIABLE]
   if (named !== undefined) return confine(named)
-  const own = ownDirectory(tmpdir())
+  const own = ownDirectory(temporaryFolder())
   // The variable now names it, for this process's later reads and for the workers it starts.
   env[VARIABLE] = own
   console.error(`${VARIABLE} is not set: this run keeps its evidence in ${own}`)
