@@ -5866,12 +5866,12 @@ mod tests {
         };
         use kr_protocol::root::{
             CwdRevision, EditorBufferRevision, EditorKeymap, EditorLeaveReason, EditorState,
-            PendingReaderInput, PromptGeneration, ReaderContext, ReaderRevision,
+            KeyQueueSnapshot, PendingReaderInput, PromptGeneration, ReaderContext, ReaderRevision,
             RootEditorEnterParams, RootEditorLeaveParams,
         };
         use kr_protocol::scalars::{CanonicalSet, Nullable};
         use kr_protocol::session::{Dimensions, DisplayNumber, LaunchProfile, ShellMode};
-        use kr_shell_integration::contract::events::{BridgeEvent, HooksActivated};
+        use kr_shell_integration::contract::events::{BridgeEvent, HooksActivated, ReaderIdle};
         use kr_shell_integration::contract::fence::LeaseView;
         use kr_shell_integration::contract::qualification::ShellKind;
 
@@ -5880,6 +5880,15 @@ mod tests {
 
         /// The application asks for the device status, and the answer is the host's to give.
         const QUESTION: &[u8] = b"\x1b[5n";
+
+        fn editor_state() -> EditorState {
+            EditorState {
+                buffer_empty: true,
+                buffer_revision: EditorBufferRevision::new(1),
+                keymap: EditorKeymap::Emacs,
+                pending: PendingReaderInput::NONE,
+            }
+        }
 
         /// A managed session with a PowerShell root, on a lane clock the case moves.
         struct Prompt {
@@ -5982,12 +5991,21 @@ mod tests {
                     prompt_generation: PromptGeneration::new(1),
                     reader_revision: ReaderRevision::new(1),
                     reader_context: ReaderContext::Primary,
-                    editor: EditorState {
-                        buffer_empty: true,
-                        buffer_revision: EditorBufferRevision::new(1),
-                        keymap: EditorKeymap::Emacs,
-                        pending: PendingReaderInput::NONE,
-                    },
+                    editor: editor_state(),
+                    cwd_revision: CwdRevision::new(1),
+                }));
+            }
+
+            /// The root editor reports itself idle, which it does once it is reading keys. It is
+            /// owed no cursor report any more, and none came.
+            fn editor_idles(&mut self) {
+                self.editor_reports(BridgeEvent::ReaderIdle(ReaderIdle {
+                    session_id: self.session_id,
+                    prompt_generation: PromptGeneration::new(1),
+                    reader_revision: ReaderRevision::new(1),
+                    reader_context: ReaderContext::Primary,
+                    snapshot: KeyQueueSnapshot::drained(),
+                    editor: editor_state(),
                     cwd_revision: CwdRevision::new(1),
                 }));
             }
@@ -6024,16 +6042,13 @@ mod tests {
         #[test]
         fn the_pass_that_ends_a_hold_behind_an_open_paste_publishes_the_answers_deadline() {
             let mut prompt = Prompt::new();
+            let mut seen = Vec::new();
             prompt.editor_enters();
             let _ = prompt.session.ingest_output(b"\x1b[?2004h");
             let offered_at = prompt.clock.boot_elapsed_ms();
             let _ = prompt.session.ingest_output(QUESTION);
             assert!(prompt.session.engine.replies_pending());
-            assert_eq!(
-                prompt.published(),
-                None,
-                "the hold keeps the answer from ageing"
-            );
+            seen.push(prompt.published());
 
             prompt.clock.advance(Duration::from_millis(100));
             prompt
@@ -6047,20 +6062,18 @@ mod tests {
                     Instant::now(),
                 )
                 .expect("the paste opens");
-            assert_eq!(
-                prompt.published(),
-                None,
-                "the editor is still owed its report"
-            );
+            seen.push(prompt.published());
 
             prompt.clock.advance(Duration::from_millis(400));
             prompt.editor_leaves();
             assert!(prompt.session.engine.replies_pending());
             assert_eq!(prompt.session.engine.replies_expired(), 0);
+            seen.push(prompt.published());
             assert_eq!(
-                prompt.published(),
-                Some(offered_at + 2_000),
-                "the answer ages again with the deadline it had, and the pump is told it"
+                seen,
+                vec![None, None, Some(offered_at + 2_000)],
+                "the hold keeps the answer from ageing, and the pass that ends it tells the pump \
+                 the deadline the answer had"
             );
         }
 
@@ -6072,6 +6085,7 @@ mod tests {
         #[test]
         fn the_pass_that_ends_a_hold_with_no_room_publishes_the_answers_deadline() {
             let mut prompt = Prompt::new();
+            let mut seen = Vec::new();
             let _ = prompt.session.ingest_output(&QUESTION.repeat(256));
             // The lane's rate limit is per second: the answer after these is a second later.
             prompt.clock.advance(Duration::from_secs(1));
@@ -6079,23 +6093,21 @@ mod tests {
             let offered_at = prompt.clock.boot_elapsed_ms();
             let _ = prompt.session.ingest_output(QUESTION);
             assert!(prompt.session.engine.replies_pending());
-            assert_eq!(
-                prompt.published(),
-                None,
-                "the hold keeps the answer from ageing"
-            );
+            seen.push(prompt.published());
 
             prompt.clock.advance(Duration::from_millis(500));
-            prompt.editor_leaves();
+            prompt.editor_idles();
             assert!(
                 prompt.session.engine.replies_pending(),
                 "there is no room for it"
             );
             assert_eq!(prompt.session.engine.replies_expired(), 0);
+            seen.push(prompt.published());
             assert_eq!(
-                prompt.published(),
-                Some(offered_at + 2_000),
-                "the answer ages again with the deadline it had, and the pump is told it"
+                seen,
+                vec![None, Some(offered_at + 2_000)],
+                "the hold keeps the answer from ageing, and the pass that ends it tells the pump \
+                 the deadline the answer had"
             );
         }
     }
