@@ -621,7 +621,7 @@ async fn a_sign_in_ends_a_waiting_sign_in_of_either_account_and_never_a_grant() 
     };
 
     managed_account
-        .sign_in(&|| Ok(()))
+        .sign_in(&|| Ok(()), std::sync::Arc::new(|| Ok(())))
         .await
         .expect("the managed sign-in starts");
     let (address, managed_url) = address_of(managed_account);
@@ -629,7 +629,7 @@ async fn a_sign_in_ends_a_waiting_sign_in_of_either_account_and_never_a_grant() 
     // can bind only if the managed attempt has let it go.
     storage_account.listen_on(address.parse().expect("the address the daemon bound"));
     storage_account
-        .sign_in(&|| Ok(()))
+        .sign_in(&|| Ok(()), std::sync::Arc::new(|| Ok(())))
         .await
         .expect("the storage sign-in starts and takes the address");
     let managed_report = managed_account.report();
@@ -650,7 +650,7 @@ async fn a_sign_in_ends_a_waiting_sign_in_of_either_account_and_never_a_grant() 
     // The other way: a managed sign-in ends the storage one.
     managed_account.listen_on(address.parse().expect("the address the daemon bound"));
     managed_account
-        .sign_in(&|| Ok(()))
+        .sign_in(&|| Ok(()), std::sync::Arc::new(|| Ok(())))
         .await
         .expect("the managed sign-in starts again and takes the address");
     assert_eq!(
@@ -662,7 +662,7 @@ async fn a_sign_in_ends_a_waiting_sign_in_of_either_account_and_never_a_grant() 
 
     // A second sign-in of the same account replaces the first.
     managed_account
-        .sign_in(&|| Ok(()))
+        .sign_in(&|| Ok(()), std::sync::Arc::new(|| Ok(())))
         .await
         .expect("a third managed sign-in starts");
     assert_eq!(
