@@ -4647,12 +4647,90 @@ async fn soon<T>(what: &str, work: impl std::future::Future<Output = T>) -> T {
         .unwrap_or_else(|_| panic!("gave up waiting for {what}"))
 }
 
+/// The timer a case counts the carrier's looks at the continuous clock by: every look is held until
+/// the case ends it, so a look is exactly as long as the carrier asked for.
+///
+/// A look that the carrier asked for and then gave up, because a wake ended its wait first, is
+/// still in the list and nothing will ever end it. A machine that is busy between the end of a pass
+/// and the next wait makes that happen to a case that wakes the carrier at that moment, so the case
+/// takes only a look that the carrier is still waiting on.
+#[derive(Debug, Default)]
+struct Looks {
+    asked: std::sync::Mutex<Vec<Look>>,
+    arrived: tokio::sync::Notify,
+}
+
+/// One look the carrier asked for.
+#[derive(Debug)]
+struct Look {
+    length: Duration,
+    release: Arc<tokio::sync::Notify>,
+    /// Held by the wait the carrier makes: the carrier has given the look up when only the list
+    /// holds it.
+    waited_on: Arc<()>,
+    taken: bool,
+}
+
+impl Looks {
+    fn held() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// The next look that the carrier is waiting on and the case has not taken, with the means to
+    /// end it.
+    async fn next(&self) -> (Duration, Arc<tokio::sync::Notify>) {
+        loop {
+            let arrived = self.arrived.notified();
+            if let Some(look) = self
+                .asked
+                .lock()
+                .expect("the looks")
+                .iter_mut()
+                .find(|look| !look.taken && Arc::strong_count(&look.waited_on) > 1)
+            {
+                look.taken = true;
+                return (look.length, Arc::clone(&look.release));
+            }
+            arrived.await;
+        }
+    }
+}
+
+impl kr_controller::quiet::Timer for Looks {
+    fn sleep(
+        &self,
+        duration: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let waited_on = Arc::new(());
+        self.asked.lock().expect("the looks").push(Look {
+            length: duration,
+            release: Arc::clone(&release),
+            waited_on: Arc::clone(&waited_on),
+            taken: false,
+        });
+        self.arrived.notify_one();
+        Box::pin(async move {
+            release.notified().await;
+            drop(waited_on);
+        })
+    }
+
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
+    fn unix_ms(&self) -> u64 {
+        kr_ipc::now_ms().get()
+    }
+}
+
 /// The next look the carrier takes at the continuous clock, with the means to end it. The case
 /// counts the looks by a timer of its own, so a look is exactly as long as the carrier asked for:
 /// five seconds. A longer look asks the feed late after a wake, and a look of no length is a spin,
 /// so every look that a case takes is checked from above and from below.
-async fn a_look(what: &str, looks: &HeldTimer) -> Arc<tokio::sync::Notify> {
-    let (length, release) = soon(what, looks.next_wait()).await;
+async fn a_look(what: &str, looks: &Looks) -> Arc<tokio::sync::Notify> {
+    let (length, release) = soon(what, looks.next()).await;
     assert_eq!(
         length,
         Duration::from_secs(5),
@@ -4671,7 +4749,7 @@ async fn a_look(what: &str, looks: &HeldTimer) -> Arc<tokio::sync::Notify> {
 async fn a_carrier_that_slept_through_its_wait_reads_the_feed_within_five_seconds_of_waking() {
     let (moved, clocks) = Moved::standing();
     let rig = Rig::start_on(clocks).await;
-    let looks = HeldTimer::held();
+    let looks = Looks::held();
     rig.runtime().count_looks_by(Arc::clone(&looks) as _);
     // The pass that ends here is read by the status, and the wait that follows it is counted by
     // the case's looks.
@@ -4729,7 +4807,7 @@ async fn a_machine_that_slept_after_a_pass_recorded_its_synchronisation_asks_the
  {
     let (moved, clocks) = Moved::standing();
     let rig = Rig::start_on(clocks).await;
-    let looks = HeldTimer::held();
+    let looks = Looks::held();
     rig.runtime().count_looks_by(Arc::clone(&looks) as _);
     // The machine sleeps five minutes between the pass's record and the carrier's wait.
     rig.runtime().after_the_next_record({
@@ -4776,7 +4854,7 @@ async fn a_machine_that_slept_after_a_pass_recorded_its_synchronisation_asks_the
 async fn a_carrier_that_slept_past_a_delay_the_feed_named_reads_the_feed_within_five_seconds() {
     let (moved, clocks) = Moved::standing();
     let rig = Rig::start_on(clocks).await;
-    let looks = HeldTimer::held();
+    let looks = Looks::held();
     rig.runtime().count_looks_by(Arc::clone(&looks) as _);
     rig.served.web().fail_with_member(
         AUTHORITY,
@@ -4839,7 +4917,7 @@ async fn a_carrier_that_slept_past_a_delay_the_feed_named_reads_the_feed_within_
 async fn a_wake_after_a_sleep_past_a_delay_the_feed_named_asks_the_feed_at_once() {
     let (moved, clocks) = Moved::standing();
     let rig = Rig::start_on(clocks).await;
-    let looks = HeldTimer::held();
+    let looks = Looks::held();
     rig.runtime().count_looks_by(Arc::clone(&looks) as _);
     rig.served.web().fail_with_member(
         AUTHORITY,
