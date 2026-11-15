@@ -42,14 +42,28 @@ struct Reading {
     /// `\\server\share`); `None` for PowerShell and wherever the shell has no `cygpath`.
     #[cfg_attr(not(windows), allow(dead_code))]
     slash_tmp: Option<PathBuf>,
+    /// Whether the shell's `nocasematch` option was set once the reader had run; `None` for
+    /// PowerShell and where the reader ended the shell.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    caseless_after: Option<bool>,
     /// Everything the reader said on its error stream.
     words: String,
 }
 
 #[derive(Clone, Copy, Debug)]
 enum Reader {
+    /// The first bash of the search path (on Windows, Git's own `bash.exe`).
     Shell,
+    /// The system's own bash, `/bin/bash`, which is bash 3.2 on a Mac and the first bash of a
+    /// hosted macOS runner's search path, where a developer's Mac usually has a newer one first.
+    SystemShell,
     PowerShell,
+}
+
+impl Reader {
+    fn is_shell(self) -> bool {
+        !matches!(self, Reader::PowerShell)
+    }
 }
 
 /// The program that runs PowerShell here, or `None` where none is installed and the run is not a
@@ -98,6 +112,14 @@ fn shell() -> Option<PathBuf> {
     found
 }
 
+/// The system's own bash (`/bin/bash`), where the system has one. A script that starts with
+/// `#!/usr/bin/env bash` gets it wherever it is the first bash of the search path, as on a hosted
+/// macOS runner; this Mac's own first bash is a newer one.
+fn system_shell() -> Option<PathBuf> {
+    let path = PathBuf::from("/bin/bash");
+    (cfg!(unix) && path.is_file()).then_some(path)
+}
+
 /// A path Git Bash printed (`/c/Users/x`) as Windows writes it (`C:\Users\x`); a path of any other
 /// form, and every path off Windows, as it is.
 fn from_bash(text: &str) -> PathBuf {
@@ -121,7 +143,7 @@ fn spelled_for(reader: Reader, path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
     let bytes = text.as_bytes();
     if cfg!(windows)
-        && matches!(reader, Reader::Shell)
+        && reader.is_shell()
         && bytes.len() >= 3
         && bytes[1] == b':'
         && bytes[0].is_ascii_alphabetic()
@@ -142,6 +164,24 @@ fn readers() -> Vec<Reader> {
         readers.push(Reader::PowerShell);
     }
     readers
+}
+
+/// The readers of [`readers`], and the shell reader run by the system's own bash where there is
+/// one, for the cases that bash 3.2 and a newer bash may read differently.
+fn readers_and_system_shell() -> Vec<Reader> {
+    let mut readers = readers();
+    if system_shell().is_some() {
+        readers.push(Reader::SystemShell);
+    }
+    readers
+}
+
+/// `folder` as a platform may set a temporary variable: with a separator at its end, as macOS sets
+/// `TMPDIR` (`/var/folders/…/T/`).
+fn with_final_separator(folder: &Path) -> PathBuf {
+    let mut text = folder.as_os_str().to_owned();
+    text.push(std::path::MAIN_SEPARATOR_STR);
+    PathBuf::from(text)
 }
 
 impl Reader {
@@ -184,15 +224,20 @@ impl Reader {
     ) -> Reading {
         let root = repository();
         let mut run = match self {
-            Reader::Shell => {
-                let mut run = Command::new(shell().expect("a shell is installed"));
+            Reader::Shell | Reader::SystemShell => {
+                let program = match self {
+                    Reader::SystemShell => system_shell().expect("the system has a bash"),
+                    _ => shell().expect("a shell is installed"),
+                };
+                let mut run = Command::new(program);
                 run.args([
                     "-c",
                     r#". "$1"
                     [ -z "${KR_READER_CALLER_OPTION:-}" ] || shopt -s "$KR_READER_CALLER_OPTION"
                     printf 'slash_tmp=%s\n' "$(cygpath -w /tmp 2>/dev/null)"
                     kr_artifacts_dir
-                    printf 'directory=%s\nexported=%s\n' "$kr_artifacts" "$(printenv KR_TEST_ARTIFACTS_DIR)""#,
+                    printf 'directory=%s\nexported=%s\n' "$kr_artifacts" "$(printenv KR_TEST_ARTIFACTS_DIR)"
+                    printf 'nocasematch=%s\n' "$(shopt -q nocasematch && echo on || echo off)""#,
                     "bash",
                 ])
                 // With forward slashes, which Git Bash reads and a Windows path's backslashes it
@@ -245,7 +290,8 @@ impl Reader {
                 .env("TMP", temporary);
         }
         #[cfg(windows)]
-        let _alone = matches!(self, Reader::Shell)
+        let _alone = self
+            .is_shell()
             .then(|| ONE_GIT_BASH.lock().unwrap_or_else(|held| held.into_inner()));
         let output = run.output().expect("runs the reader");
         let text = String::from_utf8_lossy(&output.stdout);
@@ -253,8 +299,8 @@ impl Reader {
             text.lines()
                 .find_map(|line| line.strip_prefix(&format!("{name}=")))
                 .map(|rest| match self {
-                    Reader::Shell => from_bash(rest.trim()),
                     Reader::PowerShell => PathBuf::from(rest.trim()),
+                    _ => from_bash(rest.trim()),
                 })
         };
         Reading {
@@ -262,6 +308,10 @@ impl Reader {
             directory: line("directory"),
             exported: line("exported"),
             slash_tmp: line("slash_tmp").filter(|path| !path.as_os_str().is_empty()),
+            caseless_after: text
+                .lines()
+                .find_map(|line| line.strip_prefix("nocasematch="))
+                .map(|state| state.trim() == "on"),
             words: String::from_utf8_lossy(&output.stderr).into_owned(),
         }
     }
@@ -351,44 +401,81 @@ fn a_value_inside_a_root_is_accepted_and_handed_on_resolved() {
     }
 }
 
+/// The temporary variable is written as a platform writes it, with the separator at its end
+/// (macOS's `TMPDIR`) and without, and the shell reader is run by the system's own bash as well as
+/// by the first bash of the search path.
 #[test]
 fn a_run_without_the_variable_gets_a_directory_of_its_own_that_exists() {
-    for reader in readers() {
+    for reader in readers_and_system_shell() {
         // The temporary folder is named here, with one folder for TMPDIR, TEMP and TMP, so that the
         // case does not depend on how the machine's own variables stand to each other.
         let temporary = tempfile::tempdir().expect("a temporary folder");
-        let reading = reader.read(None, Some(temporary.path()));
-        assert!(reading.succeeded, "{reader:?}: {reading:?}");
-        let directory = reading.directory.clone().expect("a directory");
-        assert!(directory.is_dir(), "{reader:?}: {}", directory.display());
+        for named in [
+            temporary.path().to_owned(),
+            with_final_separator(temporary.path()),
+        ] {
+            let reading = reader.read(None, Some(&named));
+            assert!(reading.succeeded, "{reader:?} with {named:?}: {reading:?}");
+            let directory = reading.directory.clone().expect("a directory");
+            assert!(directory.is_dir(), "{reader:?}: {}", directory.display());
+            assert!(
+                same(
+                    directory.parent().expect("a parent"),
+                    &real(temporary.path())
+                ),
+                "{reader:?} with {named:?}: the directory is made under the temporary folder: {}",
+                directory.display()
+            );
+            assert!(
+                same(&real(&directory), &directory),
+                "{reader:?}: the directory is given resolved: {}",
+                directory.display()
+            );
+            assert!(
+                reading
+                    .exported
+                    .as_deref()
+                    .is_some_and(|exported| same(exported, &directory)),
+                "{reader:?}: {reading:?}"
+            );
+            // By its own name: Git Bash writes the rest of the path as `/c/Users/...`.
+            let name = directory.file_name().expect("a name").to_string_lossy();
+            assert!(
+                reading.words.contains(&*name),
+                "{reader:?} does not say where the directory is: {}",
+                reading.words
+            );
+            std::fs::remove_dir(&directory).expect("removes the directory the run made");
+        }
+    }
+}
+
+/// A value written under a temporary variable that ends with a separator, as a script writes it
+/// (`$TMPDIR/evidence` has two slashes in a row), names the folder under that temporary folder,
+/// whatever bash reads it.
+#[test]
+fn a_value_under_a_temporary_folder_that_ends_with_a_separator_is_read_as_that_folder() {
+    for reader in readers_and_system_shell() {
+        let temporary = tempfile::tempdir().expect("a temporary folder");
+        let folder = with_final_separator(temporary.path());
+        let written = PathBuf::from(format!("{}/evidence", folder.display()));
+        let value = spelled_for(reader, &written);
+        let reading = reader.read(Some(value.as_os_str()), Some(&folder));
         assert!(
-            same(
-                directory.parent().expect("a parent"),
-                &real(temporary.path())
-            ),
-            "{reader:?}: the directory is made under the temporary folder: {}",
-            directory.display()
+            reading.succeeded,
+            "{reader:?} refused {value:?} under {folder:?}: {reading:?}"
         );
+        let expected = real(temporary.path()).join("evidence");
+        let directory = reading.directory.as_deref().expect("a directory");
         assert!(
-            same(&real(&directory), &directory),
-            "{reader:?}: the directory is given resolved: {}",
-            directory.display()
+            same(directory, &expected),
+            "{reader:?}: {directory:?}, not {expected:?}"
         );
+        let exported = reading.exported.as_deref().expect("an exported value");
         assert!(
-            reading
-                .exported
-                .as_deref()
-                .is_some_and(|exported| same(exported, &directory)),
-            "{reader:?}: {reading:?}"
+            same(exported, &expected),
+            "{reader:?}: {exported:?}, not {expected:?}"
         );
-        // By its own name: Git Bash writes the rest of the path as `/c/Users/...`.
-        let name = directory.file_name().expect("a name").to_string_lossy();
-        assert!(
-            reading.words.contains(&*name),
-            "{reader:?} does not say where the directory is: {}",
-            reading.words
-        );
-        std::fs::remove_dir(&directory).expect("removes the directory the run made");
     }
 }
 
@@ -442,10 +529,11 @@ fn a_step_up_is_refused_even_when_it_ends_inside_a_root() {
 }
 
 /// The top of a drive, or of the file system, is no evidence folder: a value that is one is
-/// refused by the shell reader and by PowerShell, spelled with one slash or with two.
+/// refused by the shell reader (run by either bash) and by PowerShell, spelled with one slash or
+/// with two.
 #[test]
 fn a_filesystem_root_as_the_value_is_refused() {
-    for reader in readers() {
+    for reader in readers_and_system_shell() {
         let tops: &[&str] = if cfg!(windows) {
             &[r"C:\", "C:/"]
         } else {
@@ -714,6 +802,8 @@ fn a_report_that_only_looks_makes_nothing_where_the_variable_is_not_set() {
 
 /// The store script's device leg keeps its output under the store's own folder, which is outside
 /// every temporary root, and runs the release check with an evidence folder its reader accepts.
+/// The temporary folder ends with a separator, as macOS's does, and the system's own bash runs the
+/// helper.
 #[cfg(unix)]
 #[test]
 fn the_store_legs_release_check_keeps_its_evidence_under_the_temporary_folder() {
@@ -744,7 +834,7 @@ printf '%s\n' "$KR_RELEASE_APK" >"$kr_artifacts/release-tls-android/run.log"
     .expect("writes the check");
     let leg = outside.path().join("device").join("leg");
     std::fs::create_dir_all(&leg).expect("makes the leg");
-    let run = Command::new("bash")
+    let run = Command::new(system_shell().unwrap_or_else(|| PathBuf::from("bash")))
         .args([
             "-c",
             r#". "$1"; kr_store_release_tls "$2" "$3" "$4""#,
@@ -757,7 +847,7 @@ printf '%s\n' "$KR_RELEASE_APK" >"$kr_artifacts/release-tls-android/run.log"
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", case.path())
-        .env("TMPDIR", &scratch)
+        .env("TMPDIR", with_final_separator(&scratch))
         .output()
         .expect("runs the helper");
     let log = std::fs::read_to_string(leg.join("e2e-release.log")).unwrap_or_default();
@@ -947,21 +1037,38 @@ fn a_leading_double_slash_is_read_as_the_folder_it_names() {
     }
 }
 
-/// The shell reader compares by exact letters whatever options its caller set: with `nocasematch`
-/// a `case` takes /ROOT for /root. The two folders differ in case alone, so a disk that keeps them
-/// as one (the Mac's usual one) cannot show it, and the case says so.
+/// The shell reader compares by exact letters whatever options its caller set, and puts the
+/// caller's `nocasematch` back as it was. The second holds on every disk, and the case checks it
+/// there. The first needs two folders that differ in case alone, so a disk that keeps them as one
+/// (the Mac's usual one) cannot show it, and the case says so.
 #[cfg(unix)]
 #[test]
 fn the_shell_reader_compares_exact_letters_whatever_the_callers_nocasematch_is() {
-    if shell().is_none() {
-        return;
-    }
     let parent = beside_the_build();
     let root = parent.path().join("root");
     std::fs::create_dir(&root).expect("a folder");
+    let inside = root.join("evidence");
+    for reader in readers_and_system_shell()
+        .into_iter()
+        .filter(|reader| reader.is_shell())
+    {
+        for option in ["", "nocasematch"] {
+            let named = [
+                ("RUNNER_TEMP", root.as_os_str()),
+                ("KR_READER_CALLER_OPTION", OsStr::new(option)),
+            ];
+            let reading = reader.read_with(Some(inside.as_os_str()), None, &named);
+            assert!(reading.succeeded, "{reader:?} with {option:?}: {reading:?}");
+            assert_eq!(
+                reading.caseless_after,
+                Some(option == "nocasematch"),
+                "{reader:?} left the caller's nocasematch as it was not set ({option:?})"
+            );
+        }
+    }
     if parent.path().join("ROOT").exists() {
         eprintln!(
-            "the disk under {} keeps /root and /ROOT as one folder: the case says nothing here",
+            "the disk under {} keeps /root and /ROOT as one folder: the letters are not compared here",
             parent.path().display()
         );
         return;
@@ -981,9 +1088,41 @@ fn the_shell_reader_compares_exact_letters_whatever_the_callers_nocasematch_is()
             &format!("a folder that differs from the root in letter case alone ({option:?})"),
             OUTSIDE,
         );
-        let inside = root.join("evidence");
-        let reading = Reader::Shell.read_with(Some(inside.as_os_str()), None, &named);
-        assert!(reading.succeeded, "{option:?}: {reading:?}");
+    }
+}
+
+/// Two temporary roots that differ in letter case alone are two roots where the disk keeps them
+/// apart, and a value under the second is inside a root. A disk that keeps them as one (the Mac's
+/// usual one) cannot show it, and the case says so.
+#[cfg(unix)]
+#[test]
+fn a_second_root_that_differs_in_letter_case_alone_is_a_root_where_the_disk_tells_them_apart() {
+    let parent = beside_the_build();
+    let lower = parent.path().join("tmp");
+    std::fs::create_dir(&lower).expect("a folder");
+    if parent.path().join("TMP").exists() {
+        eprintln!(
+            "the disk under {} keeps /tmp and /TMP as one folder: the case says nothing here",
+            parent.path().display()
+        );
+        return;
+    }
+    let upper = parent.path().join("TMP");
+    std::fs::create_dir(&upper).expect("the folder that differs in letter case alone");
+    let value = upper.join("evidence");
+    let expected = real(&upper).join("evidence");
+    for reader in readers_and_system_shell() {
+        let reading = reader.read_with(
+            Some(value.as_os_str()),
+            Some(&lower),
+            &[("RUNNER_TEMP", upper.as_os_str())],
+        );
+        assert!(
+            reading.succeeded,
+            "{reader:?} refused a value under a root that differs from the other in letter case alone: {reading:?}"
+        );
+        let directory = reading.directory.as_deref().expect("a directory");
+        assert!(same(directory, &expected), "{reader:?}: {directory:?}");
     }
 }
 
