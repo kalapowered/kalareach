@@ -37,8 +37,14 @@ mod releases;
 // the control daemon's own network suites make.
 #[path = "upgrade/door.rs"]
 mod door;
+// The one request that a device's connection sends by itself: the client library has no call for it.
+#[path = "upgrade/raw_input.rs"]
+mod raw_input;
+// A device's typing, sent through the client library's input lane as the control daemon's suites send it.
 #[path = "../../kr-controller/tests/net_support/pairing.rs"]
 mod pairing;
+#[path = "../../kr-controller/tests/net_support/typing.rs"]
+mod typing;
 // An organisation's keys, which sign the chain a host enrols from and the policy it applies.
 #[path = "../../kr-controller/tests/organisation_support/mod.rs"]
 mod organisation_support;
@@ -2238,12 +2244,13 @@ async fn a_paired_device_types_bytes_into_the_session_of_the_release_before_and_
     use kr_protocol::attachment::{
         AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
     };
+    use kr_protocol::envelope::Outcome;
     use kr_protocol::error::ErrorCode;
     use kr_protocol::ids::{InputLeaseEpoch, InputSequence};
     use kr_protocol::input::{
         ConsoleKey, InputAcquireParams, InputAcquireResult, InputContent, InputWriteParams,
     };
-    use kr_protocol::scalars::{Bytes, CanonicalSet, DurationMs};
+    use kr_protocol::scalars::{CanonicalSet, DurationMs};
     use kr_protocol::session::Dimensions;
 
     let updated = Updated::on_the_network().await;
@@ -2316,27 +2323,28 @@ async fn a_paired_device_types_bytes_into_the_session_of_the_release_before_and_
         .expect("the device takes the input lease")
         .to_typed()
         .expect("a lease");
-    let write = |sequence: u64, input: InputContent| InputWriteParams {
-        session_id,
-        attachment_id,
-        epoch: lease.lease.epoch,
-        sequence: InputSequence::new(sequence),
-        input,
-    };
     let marks = host.scratch("typed");
     // A line that makes the file `<name>-42`, named by an expansion the shell has to run.
-    let typed = |name: &str| InputContent::Bytes {
-        bytes: Bytes::new(format!(": > '{}'/{name}-$((6*7))\n", marks.display()).into_bytes()),
-    };
+    let typed = |name: &str| format!(": > '{}'/{name}-$((6*7))\n", marks.display());
+    let mut input = typing::Typing::open(
+        &owner.session,
+        host.tree.environment_id(),
+        session_id,
+        attachment_id,
+    )
+    .await
+    .expect("the device's input lane opens");
 
-    owner
-        .session
-        .write_input(&write(0, typed("kept")))
+    input
+        .type_bytes(lease.lease.epoch, typed("kept").as_bytes())
         .await
         .expect("the worker of the release before takes the bytes of a paired device");
 
     // Key records spelling a line the shell must not run. The refusal is the daemon's: a worker of
-    // the release before would answer with an invalid argument.
+    // the release before would answer with an invalid argument. The lane's frames carry bytes only
+    // and the client library has no call for key records, so this request reaches the host as the
+    // raw frame a device of an earlier release sends, on the device's own connection. It names the
+    // sequence that the stream of this epoch takes next.
     let keys = format!(": > '{}'/refused-$((6*7))\n", marks.display())
         .chars()
         .map(|character| ConsoleKey {
@@ -2348,19 +2356,27 @@ async fn a_paired_device_types_bytes_into_the_session_of_the_release_before_and_
             repeat: 1,
         })
         .collect();
-    let refused = owner
-        .session
-        .write_input(&write(1, InputContent::ConsoleKeys { keys }))
+    let answered = owner
+        .raw
+        .input_write(&InputWriteParams {
+            session_id,
+            attachment_id,
+            epoch: lease.lease.epoch,
+            sequence: InputSequence::new(1),
+            input: InputContent::ConsoleKeys { keys },
+        })
         .await
-        .expect_err("the daemon has no way to give key records to that worker");
-    assert_eq!(
-        refused.code(),
-        ErrorCode::UnsupportedCapability,
-        "{refused}"
+        .expect("the host answers the key records");
+    let Outcome::Error(refused) = answered.outcome else {
+        panic!("the daemon has no way to give key records to that worker, and took them");
+    };
+    assert_eq!(refused.code, ErrorCode::UnsupportedCapability, "{refused}");
+    assert!(
+        refused.message.contains("bytes only"),
+        "the refusal says that the worker takes bytes only: {refused}"
     );
-    owner
-        .session
-        .write_input(&write(1, typed("after")))
+    input
+        .type_bytes(lease.lease.epoch, typed("after").as_bytes())
         .await
         .expect("the refused write spent no sequence number");
 
