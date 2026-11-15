@@ -218,9 +218,13 @@ impl Controller {
             return self.answered_from_the_barrier(marker).await;
         }
         match self.answer_without_fence(actor_id, mutation, &record) {
-            Some(Ok(answer)) if matches!(record, crate::grants::ActionRecord::Answered { .. }) => {
-                self.revocation_read_again(actor_id, mutation, answer).await
-            }
+            Some(Ok(answer)) => match &record {
+                crate::grants::ActionRecord::Answered { reads, .. } => {
+                    self.revocation_read_again(actor_id, mutation, answer, reads.as_deref())
+                        .await
+                }
+                _ => Ok(answer),
+            },
             Some(answer) => answer,
             None => self.revocation_on_record(actor_id, mutation).await,
         }
@@ -237,12 +241,20 @@ impl Controller {
     /// entry says nothing of it, which is not a worker with no names. So a worker the daemon no
     /// longer holds a report of keeps the answer it was given, and so does a repeat whose live
     /// barrier cannot be read.
+    ///
+    /// `reads` is what the entries of the answer read when it was made, as it was kept with it
+    /// ([`crate::authority::KeptReads`]); an answer kept without it, or with one this build cannot
+    /// read, is read as one whose entries' reads are not known.
     async fn revocation_read_again(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
         answer: ParamsValue,
+        reads: Option<&[u8]>,
     ) -> Result<ParamsValue> {
+        let kept = reads
+            .and_then(crate::authority::KeptReads::decode)
+            .unwrap_or_default();
         // A worker that was pending in the answer is owed a look too: it may have acknowledged
         // since, and its entry then names what it took back.
         let owes = |result: &kr_protocol::sharing::RevocationResult| {
@@ -268,7 +280,7 @@ impl Controller {
                     _ => None,
                 };
                 let Some(barrier) = self
-                    .with_the_names_since(Audience::of(actor_id), named, &given)
+                    .with_the_names_since(Audience::of(actor_id), named, &given, &kept)
                     .await
                 else {
                     return Ok(answer);
@@ -290,7 +302,7 @@ impl Controller {
                     return Ok(answer);
                 }
                 let Some(barrier) = self
-                    .with_the_names_since(Audience::Host, None, &given.revoked)
+                    .with_the_names_since(Audience::Host, None, &given.revoked, &kept)
                     .await
                 else {
                     return Ok(answer);
@@ -317,16 +329,23 @@ impl Controller {
     /// when that is an answer (the revision acknowledged, or installed with no names held for it),
     /// with the names of `given` kept, and the worker's ending when the registry holds its
     /// closure.
+    ///
+    /// The entry of the barrier as it stands also reads the revisions that `kept` says the answer's
+    /// entry for the worker read, which a daemon that started since does not carry in memory: a
+    /// derived read, in which nothing the announcements recorded changes
+    /// ([`crate::authority::AuthorityBarrier`]). With it the entry can be the authority on what it
+    /// lacks ([`daemon_is_the_authority`]).
     async fn with_the_names_since(
         &self,
         audience: Audience,
         named: Option<kr_protocol::ids::GrantId>,
         given: &kr_protocol::sharing::RevocationResult,
+        kept: &crate::authority::KeptReads,
     ) -> Option<kr_protocol::action::RevocationBarrier> {
         let pending = given.barrier.pending();
         self.ask_again(&pending).await;
-        let live = self
-            .barrier_as_it_stands(given.authority_revision)
+        let (live, now_reads) = self
+            .barrier_as_it_stands_reading(given.authority_revision, &kept.through())
             .await
             .ok()?;
         let live = self.barrier_for(audience, named, live).ok()?;
@@ -343,8 +362,13 @@ impl Controller {
             })
             .collect();
         drop(registry);
-        let this_run = self.leases.made_by_this_run(given.authority_revision);
-        Some(barrier_read_again(&given.barrier, &live, &closed, this_run))
+        Some(barrier_read_again(
+            &given.barrier,
+            &live,
+            &closed,
+            kept,
+            &now_reads,
+        ))
     }
 
     /// Asks each of `sessions` for its acknowledgement of the revision in force, together, each
@@ -389,7 +413,7 @@ impl Controller {
     ) -> Option<Result<ParamsValue>> {
         match record {
             // A result this host kept and cannot read back leaves open what the change came to.
-            crate::grants::ActionRecord::Answered { result } => Some(
+            crate::grants::ActionRecord::Answered { result, .. } => Some(
                 decoded(result)
                     .map_err(|_| ControllerError::record_unreadable("authority changes")),
             ),
@@ -510,6 +534,7 @@ impl Controller {
                         *replacement,
                         withdrawn.into_iter().collect(),
                         self.publish_debts(&[]),
+                        None,
                     )
                     .await?,
             ),
@@ -520,6 +545,7 @@ impl Controller {
                         named,
                         withdrawn.into_iter().collect(),
                         self.publish_debts(&[]),
+                        None,
                     )
                     .await?,
             ),
@@ -3544,14 +3570,15 @@ fn open_number(
 /// holding is not taken for pending, so after a restart the repeat can hold where the barrier as
 /// it stands does not yet.
 ///
-/// `this_run` says that this run of the daemon made the kept answer. Only then can the daemon's
-/// own counts stand for the names the answer owed or had lost: after a restart it cannot know what
-/// they were.
+/// `kept` is what the answer's entries read when it was made and `now_reads` what the entries of
+/// the barrier as it stands read; [`daemon_is_the_authority`] decides from them, for both of those
+/// two paths, whether the daemon's entry is the authority on the names its worker has not given.
 fn barrier_read_again(
     given: &kr_protocol::action::RevocationBarrier,
     live: &kr_protocol::action::RevocationBarrier,
     closed: &std::collections::BTreeSet<SessionId>,
-    this_run: bool,
+    kept: &crate::authority::KeptReads,
+    now_reads: &std::collections::BTreeMap<SessionId, crate::authority::Reads>,
 ) -> kr_protocol::action::RevocationBarrier {
     let mut barrier = given.clone();
     for worker in &mut barrier.workers {
@@ -3559,10 +3586,11 @@ fn barrier_read_again(
             .workers
             .iter()
             .find(|now| now.session_id == worker.session_id);
+        let authority = daemon_is_the_authority(kept, now_reads, worker.session_id);
         if !worker.state.holds() {
             match now {
                 Some(now) if now.state.holds() || now.acknowledged_revision.0.is_some() => {
-                    *worker = with_the_names_of(now, worker, this_run);
+                    *worker = with_the_names_of(now, worker, authority);
                 }
                 None if closed.contains(&worker.session_id) => {
                     *worker = crate::authority::ended_since(worker);
@@ -3573,9 +3601,9 @@ fn barrier_read_again(
         }
         if worker.names_pending.get() > 0
             && let Some(now) = now
-            && carries_what_was_given(now, worker, this_run)
+            && carries_what_was_given(now, worker, authority)
         {
-            *worker = now.clone();
+            *worker = with_the_larger_totals(now, worker);
         }
     }
     for now in live.workers.iter().filter(|now| !now.state.holds()) {
@@ -3592,34 +3620,54 @@ fn barrier_read_again(
     barrier
 }
 
+/// Whether the daemon's entry for a worker is the authority on the names that its worker has not
+/// given, so that the repeat of a kept answer takes what it says of them. ONE rule, for the entry
+/// of a worker that was pending in the answer and for the entry of one that held, in one run of the
+/// daemon and after a restart.
+///
+/// It is, when the answer kept a record of what its entry read and the daemon's entry has one, and
+/// the daemon's entry accounts for every report that the answer's entry accounted for and reads
+/// every revision that it named ([`crate::authority::Reads::covered_by`]). Every name the answer's
+/// numbers held then belongs to a report that the daemon's numbers hold, so a name the answer lacked
+/// is one the daemon's entry lists or says it lacks, and what it says is missing is what is. Where
+/// either record is missing, or the daemon's entry has not read a report the answer's entry
+/// accounted for, it cannot be known which names the two entries lack have been given since, and
+/// the strict rule holds.
+fn daemon_is_the_authority(
+    kept: &crate::authority::KeptReads,
+    now_reads: &std::collections::BTreeMap<SessionId, crate::authority::Reads>,
+    session_id: SessionId,
+) -> bool {
+    kept.of_worker(session_id)
+        .zip(now_reads.get(&session_id))
+        .is_some_and(|(kept, now)| kept.covered_by(now))
+}
+
 /// The daemon's entry for a worker with every name `given` held of it that the entry lacks, so that
 /// no name of either is dropped and the state is the daemon's.
 ///
 /// Every name `given` listed is listed, and each total is at least `given`'s. What the entry says
-/// is missing depends on who can know it:
+/// is missing depends on `authority` ([`daemon_is_the_authority`]):
 ///
-/// - In one run of the daemon (`this_run`), when the daemon's entry accounts for what the kept
-///   answer did and does not say that it holds no names under the revision
-///   ([`accounts_for_what_was_given`]), the entry is the authority on what it lacks, by its own
-///   counts and sentences. A name `given` listed that it has lost is listed again, and still
-///   counted as no longer held: the count is over by such names and never under.
-/// - Otherwise, after a restart or where the run is not known, the daemon cannot know what the
-///   names the kept answer owed or had lost were. They are counted together with the names the
-///   daemon's entry lacks, with no overflow, and a sentence says that up to that many may not be
-///   named, because the two counts need not describe the same names and nothing in either entry says
-///   which of one's missing names the other lists; no name is taken off the figure. What `given`
-///   said of the revisions the worker had not said what its fence named for stays unless the
-///   daemon's own entry shows that the worker has said some since.
+/// - Where the daemon's entry is the authority, it is by its own counts and sentences, which say
+///   what is so now: nothing is added to them and no sentence of `given`'s stays. A name `given`
+///   listed that the entry has lost is listed again, and still counted as no longer held: the count
+///   is over by such names and never under.
+/// - Otherwise the daemon cannot know what the names the kept answer owed or had lost were. They are
+///   counted together with the names the daemon's entry lacks, with no overflow, and a sentence says
+///   that up to that many may not be named, because the two counts need not describe the same names
+///   and nothing in either entry says which of one's missing names the other lists; no name is taken
+///   off the figure. What `given` said of the revisions the worker had not said what its fence named
+///   for stays unless the daemon's own entry shows that the worker has said some since.
 ///
 /// The sentence that this daemon holds no names under the revision goes only when names of `given`
 /// go into the entry.
 fn with_the_names_of(
     now: &kr_protocol::action::WorkerBarrier,
     given: &kr_protocol::action::WorkerBarrier,
-    this_run: bool,
+    authority: bool,
 ) -> kr_protocol::action::WorkerBarrier {
-    let in_one_run = this_run && crate::authority::accounts_for_what_was_given(now, given);
-    if stands_in_for(now, given, in_one_run) {
+    if stands_in_for(now, given, authority) {
         return now.clone();
     }
     let mut merged = now.clone();
@@ -3652,7 +3700,8 @@ fn with_the_names_of(
             .max(given.possibly_executed_total.get())
             .max(merged.possibly_executed.len() as u64),
     );
-    if in_one_run {
+    if authority {
+        merged.detail = crate::authority::detail_beside_the_names_of(now, given, brought, None);
         return merged;
     }
     // The names `given` still owed and the ones it had lost, beside the ones the daemon's entry
@@ -3664,7 +3713,7 @@ fn with_the_names_of(
         .saturating_add(given.names_pending.get());
     merged.omitted_actions =
         kr_protocol::scalars::U64::new(now.omitted_actions.get().saturating_add(owed));
-    merged.detail = crate::authority::detail_beside_the_names_of(now, given, brought, owed);
+    merged.detail = crate::authority::detail_beside_the_names_of(now, given, brought, Some(owed));
     merged
 }
 
@@ -3684,59 +3733,81 @@ fn keeps_the_names(
         })
 }
 
+/// Whether the daemon's entry for a worker has totals not below the ones an answer was given with.
+fn totals_hold(
+    now: &kr_protocol::action::WorkerBarrier,
+    given: &kr_protocol::action::WorkerBarrier,
+) -> bool {
+    now.rejected_actions_total.get() >= given.rejected_actions_total.get()
+        && now.possibly_executed_total.get() >= given.possibly_executed_total.get()
+}
+
 /// Whether the daemon's entry for a worker says at least as much as the one an answer was given
-/// with, so that it stands for it as it is. It lists every name the answer listed, and:
+/// with, so that it stands for it as it is. It lists every name the answer listed, its totals are
+/// not below the answer's, and:
 ///
-/// - in one run, where the entry is the authority on what it lacks ([`with_the_names_of`]), that
-///   is all;
-/// - otherwise the answer owed nothing and had lost nothing, its totals are not above the entry's,
-///   and no sentence of the answer on revisions the worker has not said, cannot say or whose fences
-///   are not read would be lost. An entry that lists every name of an empty list says nothing of
-///   what the answer owed.
+/// - where it is the authority on what it lacks ([`daemon_is_the_authority`]), that is all;
+/// - otherwise the answer owed nothing and had lost nothing, and no sentence of the answer on
+///   revisions the worker has not said, cannot say or whose fences are not read would be lost. An
+///   entry that lists every name of an empty list says nothing of what the answer owed.
 fn stands_in_for(
     now: &kr_protocol::action::WorkerBarrier,
     given: &kr_protocol::action::WorkerBarrier,
-    in_one_run: bool,
+    authority: bool,
 ) -> bool {
-    if !keeps_the_names(now, given) {
+    if !keeps_the_names(now, given) || !totals_hold(now, given) {
         return false;
     }
-    if in_one_run {
-        return true;
-    }
-    given.omitted_actions.get() == 0
-        && given.names_pending.get() == 0
-        && now.rejected_actions_total.get() >= given.rejected_actions_total.get()
-        && now.possibly_executed_total.get() >= given.possibly_executed_total.get()
-        && crate::authority::kept_sentences_beside(now, given).is_empty()
+    authority
+        || (given.omitted_actions.get() == 0
+            && given.names_pending.get() == 0
+            && crate::authority::kept_sentences_beside(now, given).is_empty())
 }
 
 /// Whether the daemon's entry for a worker now can stand in for the one an answer was given with:
-/// the barrier holds for it, fewer names are still to come or the worker has ended since and none
-/// can be asked for, every name the answer gave is in it with no more gone than there were, and
-/// this run of the daemon made the answer and the entry accounts for what the answer did
-/// ([`accounts_for_what_was_given`]).
+/// the barrier holds for it, the daemon's entry is the authority on what it lacks
+/// ([`daemon_is_the_authority`]), fewer names are still to come or the worker has ended since and
+/// none can be asked for, and every name the answer gave is in it with no more gone than there were.
 ///
 /// The totals alone do not say it. The result of a revision also reads the reports of the revisions
 /// its announcement carried, and when one of those goes the names it gave go from the entry while
-/// the entry's own totals go on rising as its pages arrive. After a restart the daemon cannot know
-/// that the names an answer still owed are the ones its entry holds, so the answer keeps its count;
-/// so it does where the entry has lost the revision's report and says nothing of it, as it does
-/// where a frame cut has emptied the answer's own list.
+/// the entry's own totals go on rising as its pages arrive. The record of what the answer's entry
+/// read says which reports its count was made of, so the count is replaced only by an entry that
+/// reads every one of them. Where it does not, as where the entry has lost the revision's own
+/// report, the answer keeps its count, as it does where a frame cut has emptied the answer's own
+/// list.
 fn carries_what_was_given(
     now: &kr_protocol::action::WorkerBarrier,
     given: &kr_protocol::action::WorkerBarrier,
-    this_run: bool,
+    authority: bool,
 ) -> bool {
     let ended_since = now.state == kr_protocol::action::BarrierState::Ended
         && given.state != kr_protocol::action::BarrierState::Ended
         && now.names_pending.get() <= given.names_pending.get();
     now.state.holds()
-        && this_run
-        && crate::authority::accounts_for_what_was_given(now, given)
+        && authority
         && (now.names_pending.get() < given.names_pending.get() || ended_since)
         && now.omitted_actions.get() <= given.omitted_actions.get()
         && keeps_the_names(now, given)
+}
+
+/// The daemon's entry for a worker, with each total the larger of its own and the answer's.
+fn with_the_larger_totals(
+    now: &kr_protocol::action::WorkerBarrier,
+    given: &kr_protocol::action::WorkerBarrier,
+) -> kr_protocol::action::WorkerBarrier {
+    let mut taken = now.clone();
+    taken.rejected_actions_total = kr_protocol::scalars::U64::new(
+        now.rejected_actions_total
+            .get()
+            .max(given.rejected_actions_total.get()),
+    );
+    taken.possibly_executed_total = kr_protocol::scalars::U64::new(
+        now.possibly_executed_total
+            .get()
+            .max(given.possibly_executed_total.get()),
+    );
+    taken
 }
 
 #[cfg(test)]
@@ -4355,7 +4426,7 @@ mod tests {
             ],
         );
 
-        let read = barrier_read_again(&given, &live, &std::collections::BTreeSet::new(), false);
+        let read = read_again_strictly(&given, &live, &std::collections::BTreeSet::new());
         assert!(
             !read.holds(),
             "the worker the kept answer left out is still pending: {read:?}"
@@ -4407,7 +4478,13 @@ mod tests {
         );
         let nobody = std::collections::BTreeSet::new();
 
-        let read = barrier_read_again(&given, &lost_one, &nobody, true);
+        let read = read_again(
+            &given,
+            &lost_one,
+            &nobody,
+            Some(&reads(&[], &[5])),
+            Some(&reads(&[5], &[])),
+        );
         assert_eq!(
             read.workers[0].state,
             BarrierState::Acknowledged,
@@ -4427,7 +4504,13 @@ mod tests {
         assert_eq!(names, every, "no name of either entry is dropped: {read:?}");
         assert_eq!(read.workers[0].rejected_actions_total.get(), 3);
         assert!(read.holds(), "{read:?}");
-        let read = barrier_read_again(&given, &kept_all, &nobody, true);
+        let read = read_again(
+            &given,
+            &kept_all,
+            &nobody,
+            Some(&reads(&[], &[5])),
+            Some(&reads(&[5], &[])),
+        );
         assert_eq!(
             read.workers[0], kept_all.workers[0],
             "an entry that carries every name it gave is taken as it is"
@@ -4455,7 +4538,7 @@ mod tests {
             vec![worker_entry(1, BarrierState::Acknowledged, &[], 0)],
         );
 
-        let read = barrier_read_again(&given, &live, &std::collections::BTreeSet::new(), false);
+        let read = read_again_strictly(&given, &live, &std::collections::BTreeSet::new());
         assert!(read.holds(), "{read:?}");
         assert_eq!(
             read.workers[0].rejected_actions,
@@ -4465,12 +4548,7 @@ mod tests {
             revision,
             vec![worker_entry(1, BarrierState::Pending, &[], 0)],
         );
-        let read = barrier_read_again(
-            &given,
-            &pending_live,
-            &std::collections::BTreeSet::new(),
-            false,
-        );
+        let read = read_again_strictly(&given, &pending_live, &std::collections::BTreeSet::new());
         assert!(
             !read.holds(),
             "a worker that has not acknowledged is never read as holding: {read:?}"
@@ -4494,7 +4572,7 @@ mod tests {
         let live = RevocationBarrier::new(revision, Vec::new());
         let closed: std::collections::BTreeSet<_> = [given.workers[0].session_id].into();
 
-        let read = barrier_read_again(&given, &live, &closed, false);
+        let read = read_again_strictly(&given, &live, &closed);
         assert_eq!(read.workers[0].state, BarrierState::Ended, "{read:?}");
         assert_eq!(
             read.workers[0].rejected_actions, given.workers[0].rejected_actions,
@@ -4502,7 +4580,7 @@ mod tests {
         );
         assert!(read.holds(), "{read:?}");
 
-        let read = barrier_read_again(&given, &live, &std::collections::BTreeSet::new(), false);
+        let read = read_again_strictly(&given, &live, &std::collections::BTreeSet::new());
         assert_eq!(
             read.workers[0].state,
             BarrierState::Pending,
@@ -4543,7 +4621,7 @@ mod tests {
             .to_owned();
         let live = RevocationBarrier::new(revision, vec![restarted]);
 
-        let read = barrier_read_again(&given, &live, &std::collections::BTreeSet::new(), false);
+        let read = read_again_strictly(&given, &live, &std::collections::BTreeSet::new());
         let worker = &read.workers[0];
         assert!(read.holds(), "the worker acknowledged: {read:?}");
         assert_eq!(
@@ -4590,7 +4668,7 @@ mod tests {
         installed.acknowledged_revision = Nullable::some(revision);
         let live = RevocationBarrier::new(revision, vec![installed]);
 
-        let read = barrier_read_again(&given, &live, &std::collections::BTreeSet::new(), false);
+        let read = read_again_strictly(&given, &live, &std::collections::BTreeSet::new());
         assert!(
             !read.holds(),
             "a worker that did not report its fence is never read as holding: {read:?}"
@@ -4631,7 +4709,7 @@ mod tests {
         now.possibly_executed_total = U64::new(1);
         let live = RevocationBarrier::new(revision, vec![now]);
 
-        let read = barrier_read_again(&given, &live, &std::collections::BTreeSet::new(), false);
+        let read = read_again_strictly(&given, &live, &std::collections::BTreeSet::new());
         let worker = &read.workers[0];
         assert!(read.holds(), "{read:?}");
         assert!(
@@ -4665,7 +4743,7 @@ mod tests {
         let live = RevocationBarrier::new(revision, Vec::new());
         let closed: std::collections::BTreeSet<_> = [given.workers[0].session_id].into();
 
-        let read = barrier_read_again(&given, &live, &closed, false);
+        let read = read_again_strictly(&given, &live, &closed);
         let worker = &read.workers[0];
         assert_eq!(worker.state, BarrierState::Ended, "{read:?}");
         assert!(
@@ -4687,21 +4765,84 @@ mod tests {
         );
     }
 
+    /// What an entry read, for the cases that say what each entry read: the revisions whose
+    /// reports its numbers account for, and the ones it only names.
+    fn reads(accounted: &[u64], named: &[u64]) -> crate::authority::Reads {
+        crate::authority::Reads::new(
+            accounted
+                .iter()
+                .map(|r| AuthorityRevision::new(*r))
+                .collect(),
+            named.iter().map(|r| AuthorityRevision::new(*r)).collect(),
+        )
+        .expect("a few revisions")
+    }
+
+    /// A repeat's read of `given` with `live` as the barrier as it stands, where the kept answer's
+    /// entries read `kept` and the daemon's entries read `now`, for every worker; `None` is a record
+    /// that is not known.
+    fn read_again(
+        given: &kr_protocol::action::RevocationBarrier,
+        live: &kr_protocol::action::RevocationBarrier,
+        closed: &std::collections::BTreeSet<kr_protocol::ids::SessionId>,
+        kept: Option<&crate::authority::Reads>,
+        now: Option<&crate::authority::Reads>,
+    ) -> kr_protocol::action::RevocationBarrier {
+        let every = |barrier: &kr_protocol::action::RevocationBarrier,
+                     reads: Option<&crate::authority::Reads>| {
+            barrier
+                .workers
+                .iter()
+                .filter_map(|worker| reads.map(|reads| (worker.session_id, reads.clone())))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        barrier_read_again(
+            given,
+            live,
+            closed,
+            &crate::authority::KeptReads::of(given, &every(given, kept)),
+            &every(live, now),
+        )
+    }
+
+    /// A repeat's read where no record of what the kept answer's entries read is known.
+    fn read_again_strictly(
+        given: &kr_protocol::action::RevocationBarrier,
+        live: &kr_protocol::action::RevocationBarrier,
+        closed: &std::collections::BTreeSet<kr_protocol::ids::SessionId>,
+    ) -> kr_protocol::action::RevocationBarrier {
+        read_again(given, live, closed, None, None)
+    }
+
     /// The entry a repeat reads for the one worker of `given`, with `now` the barrier's own entry,
-    /// where `this_run` says that the daemon's own run made the kept answer.
+    /// where `authority` says that the daemon's entry reads every revision the kept answer's read:
+    /// both read revision 5 alone, and account for it. Otherwise no record is known.
     fn read_worker(
         given: kr_protocol::action::WorkerBarrier,
         now: kr_protocol::action::WorkerBarrier,
-        this_run: bool,
+        authority: bool,
+    ) -> kr_protocol::action::WorkerBarrier {
+        let own = reads(&[5], &[]);
+        let records = authority.then_some(&own);
+        read_worker_with(given, now, records, records)
+    }
+
+    /// As [`read_worker`], with the record of what each entry read.
+    fn read_worker_with(
+        given: kr_protocol::action::WorkerBarrier,
+        now: kr_protocol::action::WorkerBarrier,
+        kept: Option<&crate::authority::Reads>,
+        now_reads: Option<&crate::authority::Reads>,
     ) -> kr_protocol::action::WorkerBarrier {
         use kr_protocol::action::RevocationBarrier;
 
         let revision = AuthorityRevision::new(5);
-        let read = barrier_read_again(
+        let read = read_again(
             &RevocationBarrier::new(revision, vec![given]),
             &RevocationBarrier::new(revision, vec![now]),
             &std::collections::BTreeSet::new(),
-            this_run,
+            kept,
+            now_reads,
         );
         read.workers
             .into_iter()
@@ -4806,7 +4947,7 @@ mod tests {
             "the figure is not worded as a lower one: {worker:?}"
         );
 
-        // In one run the daemon's own count stands: it counted the earlier report's name as lost
+        // Where the daemon's entry is the authority its own count stands: it counted the earlier report's name as lost
         // when the report went, and the name the earlier answer listed is listed again, still
         // counted as no longer held.
         let worker = read_worker(given, now.clone(), true);
@@ -4831,11 +4972,21 @@ mod tests {
         now.acknowledged_revision = Nullable::some(AuthorityRevision::new(7));
         now.detail = HOLDS_NO_NAMES.to_owned();
 
-        for this_run in [false, true] {
-            let worker = read_worker(given.clone(), now.clone(), this_run);
+        // No record is known, or the daemon's entry reads the revision alone and not the two the
+        // kept sentence is about.
+        for (kept, now_reads) in [
+            (None, None),
+            (Some(reads(&[], &[3, 4, 5])), Some(reads(&[], &[5]))),
+        ] {
+            let worker = read_worker_with(
+                given.clone(),
+                now.clone(),
+                kept.as_ref(),
+                now_reads.as_ref(),
+            );
             assert!(
                 worker.detail.contains(NOT_SAID_TWO),
-                "the kept sentence stays (run {this_run}): {worker:?}"
+                "the kept sentence stays: {worker:?}"
             );
             assert!(
                 worker
@@ -5055,10 +5206,10 @@ mod tests {
         assert!(worker.detail.contains(NOT_READ), "{worker:?}");
     }
 
-    /// KR-REQ-09.12, KR-REQ-10.45: owed names that the daemon's entry does not read are counted
-    /// though every name the kept answer listed is in the daemon's list. The kept answer lists
-    /// three names of one revision and owes two of an earlier one's report; the daemon reads the
-    /// later revision alone.
+    /// KR-REQ-09.12, KR-REQ-10.45: owed names of a revision that the daemon's entry does not read
+    /// are counted though every name the kept answer listed is in the daemon's list. The kept
+    /// answer lists three names and owes two of an earlier revision's report, which its entry read;
+    /// the daemon reads the later revision alone, or the answer has no record of what it read.
     #[test]
     fn owed_names_of_a_revision_the_daemon_does_not_read_are_counted() {
         use kr_protocol::action::BarrierState;
@@ -5066,28 +5217,31 @@ mod tests {
         let given = worker_entry(1, BarrierState::Pending, &[1, 2, 3], 2);
         let now = worker_entry(1, BarrierState::Acknowledged, &[1, 2, 3], 0);
 
-        // After a restart the daemon cannot know what the owed names were.
-        let worker = read_worker(given.clone(), now.clone(), false);
-        assert_eq!(missing(&worker), 2, "{worker:?}");
-        assert!(
-            worker.detail.contains("up to 2 of the actions"),
-            "{worker:?}"
-        );
-        // In one run its entry accounts for 3 names where the kept answer accounted for 5, so it
-        // is not the authority either.
-        let worker = read_worker(given, now, true);
-        assert_eq!(missing(&worker), 2, "{worker:?}");
-        assert!(
-            worker.detail.contains("up to 2 of the actions"),
-            "{worker:?}"
-        );
+        for (kept, now_reads) in [
+            (Some(reads(&[4, 5], &[])), Some(reads(&[5], &[]))),
+            (None, Some(reads(&[4, 5], &[]))),
+            (Some(reads(&[4, 5], &[])), None),
+        ] {
+            let worker = read_worker_with(
+                given.clone(),
+                now.clone(),
+                kept.as_ref(),
+                now_reads.as_ref(),
+            );
+            assert_eq!(missing(&worker), 2, "{worker:?}");
+            assert!(
+                worker.detail.contains("up to 2 of the actions"),
+                "{worker:?}"
+            );
+        }
     }
 
-    /// KR-REQ-09.12, KR-REQ-10.45: in one run a repeat shows progress. The names the kept answer
-    /// owed have arrived, so the repeat lists them and says that nothing is missing; after a restart
-    /// the daemon cannot know that they are the owed ones, and the repeat says up to two.
+    /// KR-REQ-09.12, KR-REQ-10.45: a repeat shows progress where the daemon's entry reads every
+    /// revision the kept answer's read. The names the kept answer owed have arrived, so the repeat
+    /// lists them and says that nothing is missing, and the kept sentence goes: the daemon's own
+    /// words say what is so now. Where the answer's reads are not known the figure stays.
     #[test]
-    fn in_one_run_a_repeat_whose_owed_names_have_arrived_says_that_nothing_is_missing() {
+    fn a_repeat_shows_progress_where_the_daemon_reads_every_revision_the_kept_answer_did() {
         use kr_protocol::action::BarrierState;
 
         let mut given = worker_entry(1, BarrierState::Pending, &[1, 2, 3], 2);
@@ -5112,11 +5266,11 @@ mod tests {
         assert!(worker.detail.contains(NOT_SAID_TWO), "{worker:?}");
     }
 
-    /// KR-REQ-09.12, KR-REQ-10.45: in one run the daemon's entry for a revision whose own report
-    /// it let go for room says nothing of it, and is not the authority on what is missing. The
-    /// kept answer lists eight names and owes forty-four.
+    /// KR-REQ-09.12, KR-REQ-10.45: the daemon's entry for a revision whose own report it let go for
+    /// room accounts for nothing of it, so it is not the authority on what is missing, whatever
+    /// else it says. The kept answer lists eight names and owes forty-four.
     #[test]
-    fn in_one_run_an_entry_for_a_revision_whose_report_has_gone_is_not_the_authority() {
+    fn an_entry_for_a_revision_whose_report_has_gone_is_not_the_authority() {
         use kr_protocol::action::BarrierState;
 
         let given = worker_entry(1, BarrierState::Pending, &[1, 2, 3, 4, 5, 6, 7, 8], 44);
@@ -5126,7 +5280,12 @@ mod tests {
         let blank = worker_entry(1, BarrierState::Acknowledged, &[], 0);
 
         for now in [marked, blank] {
-            let worker = read_worker(given.clone(), now, true);
+            let worker = read_worker_with(
+                given.clone(),
+                now,
+                Some(&reads(&[5], &[])),
+                Some(&reads(&[], &[5])),
+            );
             assert_eq!(worker.rejected_actions.len(), 8, "{worker:?}");
             assert_eq!(missing(&worker), 44, "{worker:?}");
             assert!(
@@ -5140,31 +5299,58 @@ mod tests {
         }
     }
 
-    /// KR-REQ-09.12: the daemon's entry that says it holds no names under the revision is not the
-    /// authority in one run either, though it accounts for as many names as the kept answer did.
+    /// KR-REQ-09.12: a kept record that names a revision which the daemon's entry neither accounts
+    /// for nor names does not let the daemon's entry replace the kept answer's sentence on it; once
+    /// the daemon's entry reads the revision, if only to say that it names nothing of it, it does.
     #[test]
-    fn in_one_run_an_entry_that_holds_no_names_does_not_replace_a_kept_sentence() {
+    fn a_kept_record_that_names_a_revision_the_daemon_does_not_read_keeps_its_sentence() {
+        use kr_protocol::action::BarrierState;
+
+        let mut given = worker_entry(1, BarrierState::Pending, &[], 0);
+        given.detail = format!("this worker has not acknowledged revision 5; {NOT_SAID_TWO}");
+        let now = worker_entry(1, BarrierState::Acknowledged, &[], 0);
+        let kept = reads(&[], &[3, 4, 5]);
+
+        let worker = read_worker_with(
+            given.clone(),
+            now.clone(),
+            Some(&kept),
+            Some(&reads(&[], &[5])),
+        );
+        assert!(worker.detail.contains(NOT_SAID_TWO), "{worker:?}");
+
+        let worker = read_worker_with(given, now, Some(&kept), Some(&reads(&[4], &[3, 5])));
+        assert!(!worker.detail.contains(NOT_SAID_TWO), "{worker:?}");
+    }
+
+    /// KR-REQ-09.12: an entry that accounted for its own revision's report is not replaced by one
+    /// that says the daemon holds no names under the revision, which names the revision without a
+    /// report: the kept sentence stays.
+    #[test]
+    fn an_entry_that_holds_no_names_does_not_replace_what_the_kept_answer_accounted_for() {
         use kr_protocol::action::BarrierState;
 
         let mut given = worker_entry(1, BarrierState::Pending, &[], 0);
         given.detail = format!("this worker has not acknowledged revision 5; {NOT_SAID_TWO}");
         let mut now = worker_entry(1, BarrierState::Acknowledged, &[], 0);
         now.detail = HOLDS_NO_NAMES.to_owned();
-        let worker = read_worker(given.clone(), now, true);
+        let worker = read_worker_with(
+            given.clone(),
+            now,
+            Some(&reads(&[5], &[])),
+            Some(&reads(&[], &[5])),
+        );
         assert!(worker.detail.contains(NOT_SAID_TWO), "{worker:?}");
-
-        // Without that sentence the daemon's entry is the authority, and the kept sentence goes.
-        let now = worker_entry(1, BarrierState::Acknowledged, &[], 0);
-        let worker = read_worker(given, now, true);
-        assert!(!worker.detail.contains(NOT_SAID_TWO), "{worker:?}");
     }
 
-    /// KR-REQ-09.12, KR-REQ-10.45: a kept entry that holds, whose list a frame cut emptied and
-    /// that has names still to come, keeps its count in a repeat after a restart, and in one run
-    /// when the daemon's entry has lost the revision's report; in one run, once the names have
-    /// arrived, it shows that none is still to come.
+    /// KR-REQ-09.12, KR-REQ-10.45: a kept entry that holds, whose list a frame cut emptied and that
+    /// has names still to come, keeps its count where the daemon's entry is not the authority (no
+    /// record, or the revision's report lost), and shows that none is still to come once the daemon
+    /// reads every revision the answer's entry read and the names have arrived. Each total is the
+    /// larger of the two entries', so a daemon's list that has since been cut does not lower the
+    /// answer's.
     #[test]
-    fn a_frame_cut_holding_entry_keeps_its_count_unless_the_names_have_arrived_in_one_run() {
+    fn a_frame_cut_holding_entry_keeps_its_count_unless_the_daemon_is_the_authority() {
         use kr_protocol::action::BarrierState;
         use kr_protocol::scalars::U64;
 
@@ -5174,13 +5360,51 @@ mod tests {
         let mut arrived = worker_entry(1, BarrierState::Acknowledged, &[1, 2], 0);
         arrived.rejected_actions_total = U64::new(43);
 
-        for (now, this_run) in [(&blank, false), (&blank, true), (&arrived, false)] {
-            let worker = read_worker(given.clone(), now.clone(), this_run);
+        for (now, kept, now_reads) in [
+            (&blank, None, None),
+            (&blank, Some(reads(&[5], &[])), Some(reads(&[], &[5]))),
+            (&arrived, None, Some(reads(&[5], &[]))),
+            (&arrived, Some(reads(&[4, 5], &[])), Some(reads(&[5], &[]))),
+        ] {
+            let worker = read_worker_with(
+                given.clone(),
+                now.clone(),
+                kept.as_ref(),
+                now_reads.as_ref(),
+            );
             assert_eq!(worker.names_pending.get(), 3, "{worker:?}");
             assert_eq!(worker.rejected_actions_total.get(), 40, "{worker:?}");
         }
-        let worker = read_worker(given, arrived, true);
+        let own = reads(&[5], &[]);
+        let worker = read_worker_with(given.clone(), arrived, Some(&own), Some(&own));
         assert_eq!(worker.names_pending.get(), 0, "{worker:?}");
         assert_eq!(worker.rejected_actions_total.get(), 43, "{worker:?}");
+        let worker = read_worker_with(given, blank, Some(&own), Some(&own));
+        assert_eq!(worker.names_pending.get(), 0, "{worker:?}");
+        assert_eq!(
+            worker.rejected_actions_total.get(),
+            40,
+            "the answer's total is not lowered by the daemon's: {worker:?}"
+        );
+    }
+
+    /// KR-REQ-09.12, KR-REQ-10.45: where the daemon's entry is the authority, a pending entry's
+    /// repeat keeps each total at the larger of the two entries', as it keeps every name, and adds
+    /// no figure of its own to the daemon's words.
+    #[test]
+    fn where_the_daemon_is_the_authority_each_total_is_the_larger() {
+        use kr_protocol::action::BarrierState;
+        use kr_protocol::scalars::U64;
+
+        let mut given = worker_entry(1, BarrierState::Pending, &[], 3);
+        given.rejected_actions_total = U64::new(40);
+        given.possibly_executed_total = U64::new(2);
+        let now = worker_entry(1, BarrierState::Acknowledged, &[], 0);
+
+        let worker = read_worker(given, now, true);
+        assert_eq!(worker.rejected_actions_total.get(), 40, "{worker:?}");
+        assert_eq!(worker.possibly_executed_total.get(), 2, "{worker:?}");
+        assert_eq!(missing(&worker), 0, "{worker:?}");
+        assert_eq!(worker.detail, "", "{worker:?}");
     }
 }

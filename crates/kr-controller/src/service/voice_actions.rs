@@ -886,7 +886,7 @@ impl Controller {
         record: crate::grants::ActionRecord,
     ) -> Result<ParamsValue> {
         match record {
-            crate::grants::ActionRecord::Answered { result }
+            crate::grants::ActionRecord::Answered { result, .. }
                 if mutation.method.method() == Some(Method::VoiceDelegate) =>
             {
                 self.delegation_again(actor_id, mutation, &result).await
@@ -956,7 +956,7 @@ impl Controller {
     /// start would be a second metered call.
     fn recorded_voice_action(record: crate::grants::ActionRecord) -> Result<ParamsValue> {
         match record {
-            crate::grants::ActionRecord::Answered { result } => {
+            crate::grants::ActionRecord::Answered { result, .. } => {
                 decoded(&result).map_err(|_| unreadable_voice_record())
             }
             crate::grants::ActionRecord::Refused { code, detail } => {

@@ -16,6 +16,12 @@ use crate::error::{ControllerError, Result};
 use super::Controller;
 use super::workers::WORKER_EXCHANGE;
 
+/// A barrier and what each of its entries read, taken together.
+pub(crate) type Announced = (
+    RevocationBarrier,
+    BTreeMap<SessionId, crate::authority::Reads>,
+);
+
 /// How many pages of one worker's fence evidence this daemon collects in one announcement.
 ///
 /// The names are in the worker's journal, so there is no bound on how many a busy session can
@@ -993,6 +999,16 @@ impl Controller {
     ///
     /// Returns an error when the registry cannot be read or written.
     pub async fn announce_authority_revision(&self) -> Result<RevocationBarrier> {
+        self.announce_reading().await.map(|(barrier, _)| barrier)
+    }
+
+    /// As [`Self::announce_authority_revision`], with what each entry of the barrier read, taken
+    /// with it ([`crate::authority::Reads`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read or written.
+    pub(crate) async fn announce_reading(&self) -> Result<Announced> {
         // Taken before anything is read, so a worker that ends while this runs is held until it is
         // over, whatever happens to it, and the revision is recorded in the section that reads it.
         let round = self.leases.begin_round();
@@ -1169,7 +1185,8 @@ impl Controller {
                 covered.push(session_id);
             }
         }
-        let report = round.report(revision, covered);
+        let (report, reads) =
+            round.report_with_reads(revision, covered, &std::collections::BTreeMap::new());
         // The one place a fence debt is settled. Every worker has acknowledged this revision or is
         // confirmed ended, which is the whole of what a completed revocation is; nothing else -
         // not an effect that succeeded, not a restart, not a document that stopped being usable -
@@ -1177,7 +1194,7 @@ impl Controller {
         if report.holds() {
             registry.settle_fence(revision)?;
         }
-        Ok(report)
+        Ok((report, reads))
     }
 
     /// The barrier of one revision as the daemon holds it now, without asking a worker anything.
@@ -1193,6 +1210,24 @@ impl Controller {
         &self,
         revision: AuthorityRevision,
     ) -> Result<RevocationBarrier> {
+        self.barrier_as_it_stands_reading(revision, &BTreeMap::new())
+            .await
+            .map(|(barrier, _)| barrier)
+    }
+
+    /// As [`Self::barrier_as_it_stands`], with what each entry read, and with the entries of the
+    /// workers named in `through` also reading those revisions: a repeat's own read of the
+    /// revisions that the answer it repeats had read ([`crate::authority::AuthorityBarrier`]'s
+    /// `report_reading`). The announcement's own state does not change.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read.
+    pub(super) async fn barrier_as_it_stands_reading(
+        &self,
+        revision: AuthorityRevision,
+        through: &BTreeMap<SessionId, Vec<AuthorityRevision>>,
+    ) -> Result<Announced> {
         let round = self.leases.begin_round();
         round.at(revision);
         let registry = self.registry.lock().await;
@@ -1202,7 +1237,7 @@ impl Controller {
                 covered.push(worker.session_id);
             }
         }
-        Ok(round.report(revision, covered))
+        Ok(round.report_with_reads(revision, covered, through))
     }
 
     /// Establishes a worker's control path, unless its session has closed.
@@ -1723,6 +1758,21 @@ impl Controller {
         &self,
         own: OwnBarrier,
     ) -> Result<(RevocationBarrier, Option<HostWithdrawal>)> {
+        self.barrier_proving_reading(own)
+            .await
+            .map(|((barrier, _), proof)| (barrier, proof))
+    }
+
+    /// As [`Self::barrier_proving`], with what each entry of the barrier read, for the record an
+    /// answer is kept with.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::barrier`].
+    pub(crate) async fn barrier_proving_reading(
+        &self,
+        own: OwnBarrier,
+    ) -> Result<(Announced, Option<HostWithdrawal>)> {
         let withdrawn = self.withdraw(Capture::Every, &own.debts).await;
         let proof = withdrawn
             .as_ref()
@@ -1731,8 +1781,8 @@ impl Controller {
             .and_then(|withdrawn| withdrawn.proof_for(&own.debts, own.advanced_at_publication));
         drop(own);
         match withdrawn? {
-            Some(withdrawn) => Ok((self.tell(&withdrawn.debts()).await?, proof)),
-            None => Ok((self.announce_authority_revision().await?, None)),
+            Some(withdrawn) => Ok((self.tell_reading(&withdrawn.debts()).await?, proof)),
+            None => Ok((self.announce_reading().await?, None)),
         }
     }
 
@@ -2091,9 +2141,16 @@ impl Controller {
     /// because that is the record that their barrier finished. A row this cannot delete stays on
     /// disk, and the next start raises one more barrier for it.
     async fn tell(&self, captured: &[crate::grants::store::DebtId]) -> Result<RevocationBarrier> {
+        self.tell_reading(captured)
+            .await
+            .map(|(barrier, _)| barrier)
+    }
+
+    /// As [`Self::tell`], with what each entry of the barrier read.
+    async fn tell_reading(&self, captured: &[crate::grants::store::DebtId]) -> Result<Announced> {
         #[cfg(any(test, feature = "testing"))]
         self.before_a_barrier_tells.wait().await;
-        let barrier = self.announce_authority_revision().await?;
+        let (barrier, reads) = self.announce_reading().await?;
         self.update_policy(|policy| {
             policy.advance_authority_revision(barrier.authority_revision);
         })?;
@@ -2116,7 +2173,7 @@ impl Controller {
                  the next start raises one more barrier for them: {error}"
             ),
         }
-        Ok(barrier)
+        Ok((barrier, reads))
     }
 
     /// Raises the registry to the revision the authority feed holds for this host, in one barrier
