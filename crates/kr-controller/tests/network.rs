@@ -5563,22 +5563,45 @@ async fn a_reconnect_opens_a_new_input_stream_and_replays_no_input() {
     );
     let session = Session::resume(Arc::new(second), carried.cursors).expect("a resumed session");
 
-    // A client that replayed would send each command again exactly as it went, under the old
-    // connection's attachment, lease and sequence. Neither is carried on this connection.
+    // The new connection attaches first. The attach fixes the connection's route to the worker, which
+    // a stream's admission waits for, so a stream opened after it is let in and what it carries
+    // reaches the decision on the old lease.
+    let attached = attach(&session, environment_id, session_id).await;
+
+    // A client that replayed would send each command again exactly as it went, on a lane of this
+    // connection for the old attachment, under the old connection's lease and the first sequence of
+    // it. Neither is carried on this connection. Only the host turning the frame away passes: its
+    // refusal, or its cut of the stream while the connection stands. A lane that does not open, or
+    // a frame that nothing answered within the bound, never put the old lease to a decision.
     for command in [MARKER_COMMAND, UNCERTAIN_COMMAND] {
-        let refused = match Typing::open(&session, environment_id, session_id, old_attachment).await
-        {
-            Err(refused) => refused,
-            Ok(mut replayed) => replayed
-                .type_bytes(old.lease.epoch, command.as_bytes())
-                .await
-                .expect_err("the old connection's input stream is not carried across a reconnect"),
+        let mut replayed = Typing::open(&session, environment_id, session_id, old_attachment)
+            .await
+            .unwrap_or_else(|why| {
+                panic!(
+                    "the lane for the old attachment did not open on the new connection, so the \
+                     replay of {command:?} was never put to a decision on the old lease: {why}"
+                )
+            });
+        let refused = replayed
+            .type_bytes(old.lease.epoch, command.as_bytes())
+            .await
+            .expect_err("the old connection's input stream is not carried across a reconnect");
+        println!("the replay of {command:?} was refused with: {refused}");
+        let decided = match &refused {
+            typing::NotTyped::Refused(error) => error.code != ErrorCode::OutcomeUnknown,
+            typing::NotTyped::LeaseEnded(_) => true,
+            // The host cut the stream while the connection stood, without accepting the frame: it
+            // does that for a worker's refusal that it cannot tell as one given before acceptance.
+            typing::NotTyped::Ended(kr_client::input::EndCause::Reset) => true,
+            _ => false,
         };
-        assert_ne!(refused.code(), Some(ErrorCode::OutcomeUnknown), "{refused}");
+        assert!(
+            decided,
+            "the replay of {command:?} was not turned away on the old lease by the host: {refused}"
+        );
     }
 
     // A new attachment's lease is a new input stream, and it starts at sequence zero.
-    let attached = attach(&session, environment_id, session_id).await;
     let new = acquire(&session, environment_id, session_id, attached.typing).await;
     assert!(
         new.lease.epoch > old.lease.epoch,
