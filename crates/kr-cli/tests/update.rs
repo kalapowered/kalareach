@@ -6519,7 +6519,7 @@ async fn an_update_to_a_fixed_release_is_not_held_by_a_daemon_of_the_one_that_fa
         said["message"]
             .as_str()
             .unwrap_or_default()
-            .contains(&format!("kill {}", std::process::id())),
+            .contains(&format!("kill -KILL {}", std::process::id())),
         "the process that holds the environment is named: {said}"
     );
     assert_eq!(
@@ -7575,7 +7575,7 @@ async fn a_rollback_names_the_process_that_holds_the_environment_and_starts_noth
         said["message"]
             .as_str()
             .unwrap_or_default()
-            .contains(&format!("kill {}", std::process::id())),
+            .contains(&format!("kill -KILL {}", std::process::id())),
         "the process that holds the environment is named: {said}"
     );
     assert!(
