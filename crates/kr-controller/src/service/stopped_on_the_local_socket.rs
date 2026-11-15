@@ -13,7 +13,9 @@ use std::time::Duration;
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::paths::Endpoint;
-use kr_protocol::envelope::{ControlFrame, ParamsValue};
+#[cfg(unix)]
+use kr_protocol::envelope::ControlFrame;
+use kr_protocol::envelope::ParamsValue;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ActionId, ActorId, BuildId, EnvironmentId};
 use kr_protocol::local::{BridgeOrigin, LocalClientKind};
@@ -658,6 +660,9 @@ async fn under_an_owed_fence_the_answer_is_withheld_and_the_daemon_stops_all_the
 /// that, so that the answer cannot be taken whole by a client that reads nothing, whatever the
 /// platform's own accounting of a buffer: the write has to wait for the client, and nothing but its
 /// bound ends the wait.
+///
+/// It runs on Unix alone, where a listener can be given a send buffer.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_client_that_stops_reading_does_not_keep_the_daemon_from_stopping() {
     let daemon =
