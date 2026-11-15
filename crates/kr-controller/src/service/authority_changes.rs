@@ -347,8 +347,10 @@ impl Controller {
     }
 
     /// Asks each of `sessions` for its acknowledgement of the revision in force, together, each
-    /// bounded as the pass's asks are. A worker whose earlier presentation has not been decided is
-    /// not asked: another link would only leave a second presentation behind it.
+    /// bounded as the pass's asks are ([`Controller::ask_within_the_bound`]): one deadline for the
+    /// whole ask, so that none ends with an exchange on the wire. A worker whose earlier
+    /// presentation has not been decided is not asked: another link would only leave a second
+    /// presentation behind it.
     async fn ask_again(&self, sessions: &[kr_protocol::ids::SessionId]) {
         let Some(controller) = self.me.upgrade() else {
             return;
@@ -360,11 +362,9 @@ impl Controller {
             .map(|session_id| {
                 let controller = std::sync::Arc::clone(&controller);
                 async move {
-                    let _ = tokio::time::timeout(
-                        super::barrier::PASS_ASK_BOUND,
-                        controller.ask_worker_revision(session_id, None),
-                    )
-                    .await;
+                    let _ = controller
+                        .ask_within_the_bound(session_id, tokio::time::Instant::now())
+                        .await;
                 }
             });
         super::barrier::all_at_once(asks).await;

@@ -672,6 +672,15 @@ impl WorkerFences {
     ///
     /// A worker is asked only about revisions older than one it acknowledged, which it has fenced.
     fn unasked(&self, before: AuthorityRevision) -> Vec<AuthorityRevision> {
+        self.carried_and_unasked()
+            .into_iter()
+            .filter(|carried| *carried < before)
+            .collect()
+    }
+
+    /// Every revision the results this worker has reports for read and the worker has not been
+    /// asked about.
+    fn carried_and_unasked(&self) -> BTreeSet<AuthorityRevision> {
         let mut unasked = BTreeSet::new();
         for (revision, carries) in &self.carries {
             if self.at(*revision).is_none() {
@@ -680,10 +689,18 @@ impl WorkerFences {
             unasked.extend(
                 self.selection(carries)
                     .into_iter()
-                    .filter(|carried| *carried < before && self.at(*carried).is_none()),
+                    .filter(|carried| self.at(*carried).is_none()),
             );
         }
-        unasked.into_iter().collect()
+        unasked
+    }
+
+    /// Whether this worker still owes names of some revocation: a report whose pages have not all
+    /// come, or a revision that a result it holds reads and the worker has not been asked about,
+    /// whose first report is yet to come.
+    fn owes_names(&self) -> bool {
+        self.reports.iter().any(|report| report.remaining > 0)
+            || !self.carried_and_unasked().is_empty()
     }
 }
 
@@ -1012,7 +1029,10 @@ impl AuthorityBarrier {
     }
 
     /// Returns the workers that still owe names of some revocation and are not ended, in session
-    /// order: the ones whose pages the daemon goes on asking for apart from any announcement.
+    /// order: the ones whose pages the daemon goes on asking for apart from any announcement. A
+    /// worker whose report of a revision the results read has not come is one of them, as one whose
+    /// report names pages still to come is: a collection that gave the link back before its first
+    /// exchange left nothing else to ask for them.
     ///
     /// An ended worker cannot supply them, and what it named is in its report whatever happens.
     #[must_use]
@@ -1022,8 +1042,7 @@ impl AuthorityBarrier {
         let mut owing: Vec<SessionId> = fences
             .iter()
             .filter(|(session_id, held)| {
-                !roster.retired.contains_key(session_id)
-                    && held.reports.iter().any(|report| report.remaining > 0)
+                !roster.retired.contains_key(session_id) && held.owes_names()
             })
             .map(|(session_id, _)| *session_id)
             .collect();

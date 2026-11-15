@@ -25,7 +25,7 @@ use kr_protocol::scalars::U64;
 use kr_transport::lease::WorkerBinding;
 
 use super::a_close_a_worker_never_answers::{self as world, Silent};
-use super::barrier::Asked;
+use super::barrier::{Asked, PASS_ASK_BOUND};
 use crate::service::Controller;
 
 /// How long a test waits for something it waits for by condition, and fails after. Nothing is
@@ -1403,6 +1403,53 @@ async fn a_give_back_before_an_older_revisions_first_exchange_leaves_the_worker_
         heard.frames(),
         1,
         "the pass asked the worker for the older revision"
+    );
+    silent.serving.abort();
+}
+
+/// KR-REQ-09.12: an ask whose wait runs past its bound ends at the bound, with no link out, and
+/// the names stay owed.
+///
+/// Another operation holds the registry across the whole of the ask's time, which the ask reads
+/// before it sends anything. The bound is all that ends the wait: the ask has run out, so the pass
+/// paces it as a failed ask, the worker's link was never taken, and its lease goes on renewing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ask_whose_wait_runs_past_its_bound_ends_at_it_with_no_link_out() {
+    let (silent, heard) = stalled().await;
+    let controller = Arc::clone(&silent.controller);
+    let session_id = silent.session_id;
+    let revision = controller.leases.authority_revision();
+    let binding = controller.leases.binding(session_id);
+    assert!(
+        controller
+            .leases
+            .acknowledge(session_id, binding, revision, Some(evidence(3)))
+    );
+    let registry = controller.registry.lock().await;
+    let began = tokio::time::Instant::now();
+    let asked = tokio::time::timeout(
+        PASS_ASK_BOUND + Duration::from_secs(5),
+        controller.ask_within_the_bound(session_id, began),
+    )
+    .await
+    .expect("the ask was still waiting five seconds after its bound");
+    let lasted = began.elapsed();
+    drop(registry);
+    assert_eq!(asked, Asked::Failed, "an ask that ran out is a failed ask");
+    assert!(
+        lasted >= PASS_ASK_BOUND && lasted < PASS_ASK_BOUND + Duration::from_secs(2),
+        "the ask ended {lasted:?} after it began, which is its bound and no other time"
+    );
+    assert_eq!(heard.frames(), 0, "nothing went to the worker");
+    assert!(
+        !controller.leases.is_fenced(session_id),
+        "no link was out, so none was given up"
+    );
+    assert!(leases(&controller, session_id));
+    assert_eq!(
+        controller.leases.owing_names(),
+        vec![session_id],
+        "the names stay owed for the pass's collection"
     );
     silent.serving.abort();
 }
