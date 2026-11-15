@@ -11,20 +11,39 @@
 use std::path::Path;
 use std::process::Command;
 
+/// Whether `folder` is outside `/tmp`, which every reader takes as a root. The two are compared by
+/// their real paths: `/tmp` is a link on macOS and can be one elsewhere, so neither `/tmp` nor
+/// `/private/tmp` is the name to compare with.
+fn is_outside_tmp(folder: &Path) -> bool {
+    let physical = std::fs::canonicalize(folder).expect("resolves");
+    match std::fs::canonicalize("/tmp") {
+        Ok(temporary) => !physical.starts_with(temporary),
+        Err(_) => true,
+    }
+}
+
 /// Runs `case` of the calling test program in a program of its own, as a caller runs it that sets
-/// its temporary folder and the evidence directory under it. The folder is outside `/tmp` and
-/// outside the temporary folder that the helper's own folders are made under, so the script's
-/// reader refuses the caller's directory if the helper passes it on.
+/// its temporary folder and the evidence directory under it. The caller's folder is a folder of its
+/// own in the build folder, or in `/var/tmp` where the build folder is under `/tmp`, so that it is
+/// outside `/tmp`. The evidence directory stands beside the folder that the case gives the script as
+/// its temporary folder, not inside it, so the script's reader refuses the directory if the helper
+/// passes it on.
 pub fn run_as_a_caller_with_an_evidence_folder(case: &str) {
-    let caller = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("a caller's folder");
-    let physical = std::fs::canonicalize(caller.path()).expect("resolves");
+    let build = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let parent = if is_outside_tmp(build) {
+        build
+    } else {
+        Path::new("/var/tmp")
+    };
+    let caller = tempfile::tempdir_in(parent)
+        .unwrap_or_else(|error| panic!("a caller's folder in {}: {error}", parent.display()));
     assert!(
-        !["/tmp", "/private/tmp"]
-            .iter()
-            .any(|root| physical.starts_with(Path::new(root))),
-        "this case needs a build folder outside /tmp, and {} is inside it",
-        physical.display()
+        is_outside_tmp(caller.path()),
+        "this case needs a folder outside /tmp, and neither the build folder nor /var/tmp is \
+         one: {} is inside it",
+        caller.path().display()
     );
+    let physical = std::fs::canonicalize(caller.path()).expect("resolves");
     let output = Command::new(std::env::current_exe().expect("this program"))
         .args([case, "--exact", "--test-threads=1"])
         .env("TMPDIR", &physical)
