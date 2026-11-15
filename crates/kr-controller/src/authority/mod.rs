@@ -882,37 +882,117 @@ pub(crate) fn ended_since(given: &WorkerBarrier) -> WorkerBarrier {
     }
 }
 
-/// The detail of the entry that stands for `given` when the daemon's own entry `now` lacks names
-/// that `given` held, and the merged entry carries them.
+/// The count a sentence of the kind `prefix` carries, when it is one.
+fn count_after(sentence: &str, prefix: &str) -> Option<u64> {
+    let rest = sentence.strip_prefix(prefix)?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// Whether the daemon's own sentences show that the worker has since said what its fence named for
+/// some of the revisions that `kept`, a sentence of `given`'s detail, says it had not: the daemon's
+/// entry for the same revocation has a sentence of the same kind with a lower count.
+fn said_since(kept: &str, now_sentences: &[&str]) -> bool {
+    [NOT_SAID, CANNOT_SAY].into_iter().any(|prefix| {
+        count_after(kept, prefix).is_some_and(|kept_count| {
+            now_sentences
+                .iter()
+                .any(|now| count_after(now, prefix).is_some_and(|count| count < kept_count))
+        })
+    })
+}
+
+/// The names an entry accounts for: those it lists by its totals, those it says it lost and those
+/// it says are still to come.
+fn names_accounted_for(worker: &WorkerBarrier) -> u64 {
+    worker
+        .rejected_actions_total
+        .get()
+        .saturating_add(worker.possibly_executed_total.get())
+        .saturating_add(worker.omitted_actions.get())
+        .saturating_add(worker.names_pending.get())
+}
+
+/// Whether the daemon's entry `now` accounts for at least the names the answer `given`, made by
+/// this run of the daemon, accounted for, so that the entry is the authority on what its worker's
+/// evidence lacks.
+///
+/// In one run a worker's names only move: from still to come to listed, and, when a report goes
+/// for room, from listed or still to come to lost, all of them charged to the results that carried
+/// the report. What an entry accounts for therefore does not fall. An entry that does has lost the
+/// revision's own report, and says nothing of it; so does one that says the daemon holds no names
+/// under the revision.
+#[must_use]
+pub(crate) fn accounts_for_what_was_given(now: &WorkerBarrier, given: &WorkerBarrier) -> bool {
+    names_accounted_for(now) >= names_accounted_for(given)
+        && !now
+            .detail
+            .split("; ")
+            .any(|sentence| sentence.starts_with(NO_NAMES_HELD))
+}
+
+/// The sentences of `given`'s detail on the revisions its worker has not said what its fence named
+/// for, cannot say, or whose fences are not read, that `now`, the daemon's own entry for the same
+/// worker, does not already say and does not show to be out of date ([`said_since`]).
+///
+/// An entry with no such sentence reads the same whether the worker has said everything or this
+/// daemon holds nothing of those revisions, as it does after a restart, so a sentence stays unless
+/// the daemon's own sentence of its kind shows it out of date.
+#[must_use]
+pub(crate) fn kept_sentences_beside(now: &WorkerBarrier, given: &WorkerBarrier) -> Vec<String> {
+    let now_sentences: Vec<&str> = now.detail.split("; ").collect();
+    what_the_worker_has_not_said(given, now.state == BarrierState::Ended)
+        .into_iter()
+        .filter(|kept| !now_sentences.contains(&kept.as_str()) && !said_since(kept, &now_sentences))
+        .collect()
+}
+
+/// The detail of the entry that stands for `given` when the daemon's own entry `now` lacks what
+/// `given` held, and the merged entry carries it.
 ///
 /// The entry says what `now` says, except that this daemon holds no names under the revision,
-/// which is not so for the merged entry; it says how many names the answer `given` owed or had lost
-/// that no entry names now (`left_out`, when `now` does not already count that many); and it keeps
-/// what `given` said of the revisions its worker had not said what its fence named for.
+/// which is not so for the merged entry once `brought` says that names of `given` went into it. When
+/// `given` owed or had lost `owed` names it adds a sentence that up to as many of the actions the
+/// fence named may not be named here, and it keeps what `given` said of the revisions its worker had
+/// not said what its fence named for ([`kept_sentences_beside`]).
+///
+/// The figure is an upper one because the names `now` lacks and the names `given` lacked need not be
+/// the same, and nothing in either entry says which of one's missing names the other lists. Where
+/// `now` lacks names too the figure is for both and the sentence says so, so that a person does not
+/// add it to `now`'s own sentence beside it.
 #[must_use]
 pub(crate) fn detail_beside_the_names_of(
     now: &WorkerBarrier,
     given: &WorkerBarrier,
-    left_out: u64,
+    brought: bool,
+    owed: u64,
 ) -> String {
     let mut sentences: Vec<String> = now
         .detail
         .split("; ")
-        .filter(|sentence| !sentence.is_empty() && !sentence.starts_with(NO_NAMES_HELD))
+        .filter(|sentence| {
+            !sentence.is_empty() && !(brought && sentence.starts_with(NO_NAMES_HELD))
+        })
         .map(str::to_owned)
         .collect();
-    if left_out > 0 {
+    let lacks = now
+        .omitted_actions
+        .get()
+        .saturating_add(now.names_pending.get());
+    if owed > 0 && lacks > 0 {
         sentences.push(format!(
-            "at least {left_out} of the actions its fence named are not named here, which an \
-             earlier answer to this revocation gave as still to come or no longer held, so this \
-             names what is held rather than everything the fence found"
+            "in all, up to {} of the actions its fence named may not be named here: an earlier \
+             answer to this revocation gave some as still to come or no longer held, this daemon \
+             lacks some, and the two counts may include the same actions",
+            owed.saturating_add(lacks)
+        ));
+    } else if owed > 0 {
+        sentences.push(format!(
+            "up to {owed} of the actions its fence named may not be named here: an earlier answer \
+             to this revocation gave them as still to come or no longer held"
         ));
     }
-    for sentence in what_the_worker_has_not_said(given, now.state == BarrierState::Ended) {
-        if !sentences.contains(&sentence) {
-            sentences.push(sentence);
-        }
-    }
+    sentences.extend(kept_sentences_beside(now, given));
     sentences.join("; ")
 }
 
@@ -931,6 +1011,9 @@ pub(crate) fn detail_beside_the_names_of(
 /// or comes after and creates nothing.
 #[derive(Debug)]
 pub struct AuthorityBarrier {
+    /// The authority revision in force when this barrier was made: every revision above it was
+    /// raised by the run of the daemon that owns the barrier ([`Self::made_by_this_run`]).
+    begun_at: AuthorityRevision,
     leases: LeaseIssuer,
     order: Mutex<Roster>,
     fences: Mutex<HashMap<SessionId, WorkerFences>>,
@@ -943,6 +1026,7 @@ impl AuthorityBarrier {
     #[must_use]
     pub fn new(generation: ControllerGeneration, authority_revision: AuthorityRevision) -> Self {
         Self {
+            begun_at: authority_revision,
             leases: LeaseIssuer::with_maximum_validity(generation, authority_revision),
             order: Mutex::new(Roster::default()),
             fences: Mutex::new(HashMap::new()),
@@ -959,6 +1043,16 @@ impl AuthorityBarrier {
     #[must_use]
     pub fn authority_revision(&self) -> AuthorityRevision {
         self.leases.authority_revision()
+    }
+
+    /// Whether this run of the daemon raised `revision`, and so announced it and holds in memory
+    /// what its workers said of it. A revision at or below the one in force when this barrier was
+    /// made was raised by an earlier run, and a revision raised by no run at all, as an answer to a
+    /// revocation that changed nothing is, is read as one: the daemon is not the authority on
+    /// what it lacks of either.
+    #[must_use]
+    pub(crate) fn made_by_this_run(&self, revision: AuthorityRevision) -> bool {
+        revision > self.begun_at
     }
 
     /// Takes the next ticket for a round or an exchange that is about to run.
@@ -4028,5 +4122,15 @@ mod tests {
             "{:?}",
             report.workers[0].detail
         );
+    }
+
+    /// A revision above the one in force when the barrier was made was raised by this run of the
+    /// daemon; the one in force then and every one before it was raised by an earlier run.
+    #[test]
+    fn only_a_revision_above_the_one_the_barrier_began_at_was_raised_by_this_run() {
+        let barrier = AuthorityBarrier::new(ControllerGeneration::new(7), revision(3));
+        assert!(!barrier.made_by_this_run(revision(2)));
+        assert!(!barrier.made_by_this_run(revision(3)));
+        assert!(barrier.made_by_this_run(revision(4)));
     }
 }
