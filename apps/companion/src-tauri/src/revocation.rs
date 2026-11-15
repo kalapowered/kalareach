@@ -171,7 +171,8 @@ pub struct HostView {
     pub listed_at_ms: Option<u64>,
     /// When the host says it last read its feed, in UTC milliseconds.
     pub host_synchronised_at_ms: Option<u64>,
-    /// Whether the host says it could not reach its feed at its last attempt.
+    /// Whether the host says that its reading of the feed is not current: its last attempt
+    /// failed, its last synchronisation is older than the bound, or its age cannot be told.
     pub host_feed_stale: bool,
     /// The host's devices.
     pub devices: Vec<DeviceView>,

@@ -965,7 +965,10 @@ export interface RevocationHost {
   readonly listed_at_ms: number | null
   /** When the host says it last read its feed, in UTC milliseconds. */
   readonly host_synchronised_at_ms: number | null
-  /** Whether the host says it could not reach its feed at its last attempt. */
+  /**
+   * Whether the host says that its reading of the feed is not current: its last attempt failed,
+   * its last synchronisation is older than the bound, or its age cannot be told.
+   */
   readonly host_feed_stale: boolean
   readonly devices: readonly RevocationDevice[]
   /** The host's feed, for a host reached through one. */

@@ -2116,7 +2116,8 @@ re-arm has committed, and `workflow.read` shows them.
 
 `kr device list [--include-revoked]` lists the devices paired with this host: each one's
 identifier, whether it is revoked, an owner device or paired, and its name. It ends with the
-authority revision in force, and says when the revocation feed is unreachable or was removed.
+authority revision in force, and says when this host's reading of the revocation feed is not
+current or the feed was removed.
 `--json` also gives each device's platform, when its pairing ends, whether the host finds the
 pairing run out and whether the pairing opens every session, with the same feed state. A host that
 cannot read the feed cannot apply a revocation it has not received, and the feed state is how you

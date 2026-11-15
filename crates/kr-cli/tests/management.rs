@@ -2144,6 +2144,58 @@ async fn a_revocation_a_worker_has_not_fenced_is_pending_and_not_a_success() {
     serving.abort();
 }
 
+/// KR-REQ-10.46: a list shown while the host's reading of the revocation feed is not current says
+/// that the reading is not current and that the list may be stale, whatever made it so, and a list
+/// shown while it is current says nothing of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_list_says_when_the_hosts_reading_of_the_feed_is_not_current() {
+    use kr_protocol::sharing::DeviceListResult;
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let listing = |stale: bool| {
+        ParamsValue::from_typed(&DeviceListResult {
+            devices: Vec::new(),
+            authority_revision: AuthorityRevision::new(1),
+            feed_synchronised_at_ms: Nullable::null(),
+            feed_stale: stale,
+            feed_removed: false,
+        })
+        .expect("a listing")
+    };
+    let (current, stale) = (listing(false), listing(true));
+    let answers = Arc::new(Mutex::new(true));
+    let answering = answers.clone();
+    let (_asked, serving) = scripted_daemon(
+        &temp,
+        Box::new(move |method, _| match method {
+            "device.list" if *answering.lock().expect("the switch") => Ok(stale.clone()),
+            "device.list" => Ok(current.clone()),
+            other => Err(ProtocolError::new(
+                ErrorCode::InvalidArgument,
+                format!("this daemon answers no {other}"),
+            )),
+        }),
+    );
+    let output = run_kr(&temp, &["device", "list"]);
+    assert_eq!(output.status.code(), Some(0));
+    let said = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        said.contains("reading of the revocation feed is not current")
+            && said.contains("what is shown may be stale"),
+        "{said}"
+    );
+
+    *answers.lock().expect("the switch") = false;
+    let output = run_kr(&temp, &["device", "list"]);
+    assert_eq!(output.status.code(), Some(0));
+    let said = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !said.contains("not current") && !said.contains("stale"),
+        "{said}"
+    );
+    serving.abort();
+}
+
 /// KR-REQ-23.24, the client's half: a person is shown the earlier result of an action the host
 /// could not establish the outcome of. An agent action's receipt is the usual such receipt, kept by
 /// a session's worker with an upstream interface behind it, which this suite has no session for, so
