@@ -1422,6 +1422,12 @@ const LIST: &[Listed] = &[
             (r#"command.env("KR_TEST_ARTIFACTS_DIR", evidence);"#, 1),
         ],
     ),
+    // Runs the performance script with the evidence variable removed: its temporary folder is the
+    // case's own.
+    lines(
+        "tests/perf/tests/settle.rs",
+        &[(r#".env_remove("KR_TEST_ARTIFACTS_DIR")"#, 1)],
+    ),
     // A comment on where the stress figures are recorded.
     lines(
         "tests/perf/tests/stress.rs",
@@ -1438,6 +1444,12 @@ const LIST: &[Listed] = &[
             r#".env("KR_TEST_ARTIFACTS_DIR", physical.join("evidence"))"#,
             1,
         )],
+    ),
+    // Runs the performance script with the evidence variable removed: its temporary folder is the
+    // case's own.
+    lines(
+        "tests/perf/tests/survivors.rs",
+        &[(r#".env_remove("KR_TEST_ARTIFACTS_DIR")"#, 1)],
     ),
     // Reader: the one reader of the variable for Rust.
     reader("tests/support/artifacts/src/lib.rs"),
