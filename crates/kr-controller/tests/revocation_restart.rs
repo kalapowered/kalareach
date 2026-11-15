@@ -12,11 +12,13 @@ mod net_support;
 use std::time::Duration;
 
 use kr_protocol::action::RevocationBarrier;
+use kr_protocol::confirmation::{ConfirmationSubject, TransferControlSubject};
 use kr_protocol::ids::ActorId;
 use kr_protocol::method::Method;
-use kr_protocol::sharing::{RoleSelection, SessionRole};
+use kr_protocol::sharing::{GrantTransferParams, GrantTransferResult, RoleSelection, SessionRole};
+use net_support::pairing::{self as calls, Signer};
 use net_support::worker::{Adopted, Worker, share};
-use net_support::{Host, on_the_host, recipient};
+use net_support::{Host, delegated, on_the_host, on_the_session, owned_by, recipient};
 
 /// KR-REQ-10.45: a revocation commits its withdrawal and the fence debt it owes in one
 /// transaction, and the revision follows from the debt. When the registry cannot publish the
@@ -148,6 +150,13 @@ async fn a_revocation_whose_revision_could_not_be_published_is_finished_by_the_n
         fenced.acknowledged_revision.0,
         Some(answered.authority_revision),
         "the worker fenced the revision the start advanced to: {fenced:?}"
+    );
+    // The answer was rebuilt from the rows the withdrawal wrote, not from an answer kept when
+    // it was made, so no record of what the entries of a barrier read is kept beside the claim.
+    assert_eq!(
+        records_beside_the_claims_of_withdrawals(&host),
+        vec![None],
+        "an answer rebuilt from the rows of a withdrawal has no record of what its entries read"
     );
     host.stop().await;
     drop(workers);
@@ -426,19 +435,29 @@ const ARRANGEMENT_LIMIT: Duration = Duration::from_secs(180);
 /// arrangement is made again on a new daemon and a new worker, after the daemon and the worker of
 /// the attempt have been stopped, until an answer holds. One limit bounds the attempts, and a
 /// failure says what each attempt answered.
-async fn a_revocation_that_left_names_owing() -> Owing {
+///
+/// With `behind`, the worker was inside a dispatch transition when an earlier revision was
+/// announced and refused it, and fenced what it owed by itself afterwards: the revocation's
+/// announcement then carries that revision, and the names are filed under it.
+async fn a_revocation_that_left_names_owing(behind: bool) -> Owing {
     let attempts = std::sync::Mutex::new(Vec::new());
-    tokio::time::timeout(ARRANGEMENT_LIMIT, arrange_until_an_answer_holds(&attempts))
-        .await
-        .unwrap_or_else(|_| {
-            panic!(
-                "no answer to a revocation held within {ARRANGEMENT_LIMIT:?}: {:#?}",
-                attempts.lock().expect("the attempts are listed")
-            )
-        })
+    tokio::time::timeout(
+        ARRANGEMENT_LIMIT,
+        arrange_until_an_answer_holds(&attempts, behind),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "no answer to a revocation held within {ARRANGEMENT_LIMIT:?}: {:#?}",
+            attempts.lock().expect("the attempts are listed")
+        )
+    })
 }
 
-async fn arrange_until_an_answer_holds(attempts: &std::sync::Mutex<Vec<String>>) -> Owing {
+async fn arrange_until_an_answer_holds(
+    attempts: &std::sync::Mutex<Vec<String>>,
+    behind: bool,
+) -> Owing {
     loop {
         let started = tokio::time::Instant::now();
         let Adopted {
@@ -463,6 +482,19 @@ async fn arrange_until_an_answer_holds(attempts: &std::sync::Mutex<Vec<String>>)
         workers[0]
             .seed_undispatched_intents(&ActorId::new("device:phone").expect("a principal"), owed);
         host.controller().limit_evidence_pages_for_tests(0);
+        if behind {
+            let boundary = workers[0].hold_the_dispatch_boundary().await;
+            let refused = tokio::time::timeout(
+                Duration::from_secs(60),
+                host.controller().revoke_authority(),
+            )
+            .await
+            .expect("the revocation reports")
+            .expect("the revocation is recorded");
+            assert_eq!(refused.pending(), vec![session_id], "{refused:?}");
+            boundary.release();
+            workers[0].service.fence_what_is_owed_for_tests();
+        }
 
         let mut client = host.client().await;
         let mutation = client
@@ -521,22 +553,43 @@ async fn arrange_until_an_answer_holds(attempts: &std::sync::Mutex<Vec<String>>)
     }
 }
 
-/// KR-REQ-10.45, 09.13: a restarted daemon collects the names a revocation left owing, which the
-/// repeat of that revocation then carries.
-///
-/// The daemon is stopped with most of the names still at the worker, as a revocation with more
-/// names than one announcement collects leaves them. The worker keeps them for the daemon that
-/// took none, and the new daemon asks for them again once it has started.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_restarted_daemon_collects_the_names_a_revocation_left_owing() {
+/// The record kept beside the claim of each action that withdrew something.
+fn records_beside_the_claims_of_withdrawals(host: &Host) -> Vec<Option<Vec<u8>>> {
+    let registry = rusqlite::Connection::open(host.tree().environment().registry_database())
+        .expect("the registry opens");
+    let mut rows = registry
+        .prepare("SELECT reads FROM authority_receipts WHERE withdrawn IS NOT NULL")
+        .expect("the receipts are read");
+    rows.query_map([], |row| row.get(0))
+        .expect("the receipts are read")
+        .collect::<Result<_, _>>()
+        .expect("the records are read")
+}
+
+/// The answers the daemon keeps with a record of what the entries of their barrier read.
+fn answers_kept_with_a_record(host: &Host) -> i64 {
+    let registry = rusqlite::Connection::open(host.tree().environment().registry_database())
+        .expect("the registry opens");
+    registry
+        .query_row(
+            "SELECT COUNT(*) FROM authority_receipts
+             WHERE result IS NOT NULL AND reads IS NOT NULL AND length(reads) > 0",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the receipts are counted")
+}
+
+/// Stops the daemon of `owing` with the names still at the worker, starts it again on the same
+/// tree, and repeats the revocation until its answer carries every name.
+async fn the_repeat_after_a_restart_carries_every_name(owing: Owing) {
     let Owing {
         host,
         workers,
         mutation,
         session_id,
         owed,
-    } = a_revocation_that_left_names_owing().await;
-
+    } = owing;
     let stopped = host.shut_down().await;
     let settings = stopped.settings().clone();
     let host = stopped.start(settings).await;
@@ -576,6 +629,164 @@ async fn a_restarted_daemon_collects_the_names_a_revocation_left_owing() {
     }
     host.stop().await;
     drop(workers);
+}
+
+/// KR-REQ-10.45, 09.13: a restarted daemon collects the names a revocation left owing, which the
+/// repeat of that revocation then carries.
+///
+/// The daemon is stopped with most of the names still at the worker, as a revocation with more
+/// names than one announcement collects leaves them. The worker keeps them for the daemon that
+/// took none, and the new daemon asks for them again once it has started. The answer was kept with
+/// a record of what its entry read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_restarted_daemon_collects_the_names_a_revocation_left_owing() {
+    let owing = a_revocation_that_left_names_owing(false).await;
+    assert_eq!(
+        answers_kept_with_a_record(&owing.host),
+        1,
+        "the answer was kept with a record of what its entry read"
+    );
+    the_repeat_after_a_restart_carries_every_name(owing).await;
+}
+
+/// KR-REQ-10.45, 09.13, 18.03: the answer to a transfer of control is kept with a record of what
+/// the entries of its barrier read, as a revocation's is, so that a repeat of it after a restart
+/// reads through it and carries every name the worker took back.
+///
+/// The giving device's grant is revoked through the barrier while the worker holds more names than
+/// one acknowledgement carries. The restarted daemon asks for them again, and the repeat of the
+/// transfer, which performs nothing again, shows them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_restarted_daemon_collects_the_names_a_transfer_left_owing() {
+    let Adopted {
+        host,
+        owner,
+        workers,
+    } = Adopted::start(1).await;
+    let session_id = workers[0].session_id;
+    let (boss, boss_record) = recipient(&host, &owner).await;
+    let (giver, giver_record) = recipient(&host, &owner).await;
+    let (_taker, taker_record) = recipient(&host, &owner).await;
+    let (above, above_connection) = owned_by(&host, session_id, &boss, &boss_record).await;
+    let (held, _giving) = delegated(
+        &host,
+        session_id,
+        &above.grant,
+        &above_connection,
+        &giver,
+        &giver_record,
+    )
+    .await;
+    workers[0].limit_evidence_page_for_tests(NAMES_A_PAGE_CARRIES);
+    let owed = NAMES_A_PAGE_CARRIES * 2 + 5;
+    workers[0].seed_undispatched_intents(&ActorId::new("device:phone").expect("a principal"), owed);
+    host.controller().limit_evidence_pages_for_tests(0);
+
+    let params = GrantTransferParams {
+        session_id,
+        from_grant_id: held.grant_id,
+        to_device_id: taker_record.device_id,
+    };
+    let action = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+    let mut client = host.client().await;
+    calls::confirm_subject(
+        host.environment_id,
+        &mut client,
+        ConfirmationSubject::TransferControl(Box::new(TransferControlSubject {
+            params: params.clone(),
+            action_id: action,
+        })),
+        &Signer::OwnerDevice(&owner),
+    )
+    .await
+    .expect("the owner confirms the transfer");
+    let transfer = client
+        .compose(
+            Method::GrantTransfer,
+            action,
+            on_the_session(&host, session_id),
+            &params,
+        )
+        .await
+        .expect("the transfer is composed");
+    let first: GrantTransferResult = client
+        .repeat(&transfer)
+        .await
+        .expect("the daemon answers")
+        .expect("the transfer is done")
+        .to_typed()
+        .expect("a transfer result");
+    assert!(
+        first
+            .revoked
+            .barrier
+            .workers
+            .iter()
+            .any(|reported| reported.session_id == session_id),
+        "the worker is in the barrier: {first:?}"
+    );
+    assert_eq!(
+        answers_kept_with_a_record(&host),
+        1,
+        "the transfer's answer was kept with a record of what its entry read"
+    );
+    drop(client);
+
+    let stopped = host.shut_down().await;
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+    host.controller()
+        .what_workers_hold_is_read_back_for_tests()
+        .await;
+
+    let mut client = host.client().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let repeated: GrantTransferResult = client
+            .repeat(&transfer)
+            .await
+            .expect("the daemon answers")
+            .expect("the transfer is answered from its record")
+            .to_typed()
+            .expect("a transfer result");
+        let carried = repeated
+            .revoked
+            .barrier
+            .workers
+            .iter()
+            .find(|reported| reported.session_id == session_id)
+            .expect("the worker is in the barrier");
+        if carried.names_pending.get() == 0 {
+            assert_eq!(
+                carried.rejected_actions_total.get(),
+                owed as u64,
+                "the repeat carries every name the worker took back: {carried:?}"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the repeat never carried the names: {carried:?}"
+        );
+        tokio::task::yield_now().await;
+    }
+    host.stop().await;
+    drop(workers);
+}
+
+/// KR-REQ-10.45, 09.13: a worker that was behind keeps no count for ever.
+///
+/// The worker refused the announcement of one revision, and the announcement of the revocation
+/// after it carried that revision: the answer's entry for the worker read both reports, and the
+/// names are filed under the first. The registry holds the worker at the revocation's revision, so
+/// the restarted daemon tells it that revision alone and its own entry for the revocation reads the
+/// revocation's report alone, unless the repeat reads through what the kept answer read. It is the
+/// repeat that does: the daemon holds the report of the earlier revision once it has asked the
+/// worker, and the repeat then carries every name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_restarted_daemon_collects_the_names_a_worker_that_was_behind_left_owing() {
+    the_repeat_after_a_restart_carries_every_name(a_revocation_that_left_names_owing(true).await)
+        .await;
 }
 
 /// KR-REQ-10.45, 09.13: a restarted daemon asks a worker about the newest eight revocations it
