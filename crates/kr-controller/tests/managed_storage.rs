@@ -1455,6 +1455,35 @@ async fn kr_req_17_48_a_service_with_no_capacity_for_a_new_collection_is_said_as
     }
 }
 
+/// KR-REQ-17.48: when a line holds the service's limit twice, for a pass that was held back and for
+/// a question that was turned back, and more clauses follow either, the alternatives it named end
+/// the whole line, once, and no clause starts after a full stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_17_48_the_alternatives_end_the_storage_checks_whole_line_once() {
+    const OWN: &str = "A backup storage service that you run yourself.";
+    const LIMIT: &str = "the service has no managed capacity for new backup collections now, which is a limit of the service and not a fault of this host";
+    let timer = HeldTimer::held();
+    let rig = Rig::start(Arrangement::NORMAL, Arc::clone(&timer)).await;
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    // The pass is held back with no delay, so that the check asks the service again: it asks
+    // nothing of a service that asked to be left alone.
+    web.fail(
+        CREATE,
+        1,
+        short_budget(503, "SERVICE_UNAVAILABLE", 0, &[OWN]),
+    );
+    rig.admit(1, &[(1, plaintext(2048))]);
+    within("the pass is held back", timer.next_wait()).await;
+    web.fail(STATUS, 1, short_budget(429, "RATE_LIMITED", 600, &[OWN]));
+    let (_, detail) = rig.storage_check().await;
+    assert_eq!(detail.matches(LIMIT).count(), 2, "{detail}");
+    assert!(detail.contains("the last pass took"), "{detail}");
+    assert_eq!(detail.matches("Until then").count(), 1, "{detail}");
+    assert!(detail.ends_with(&format!("Until then: {OWN}")), "{detail}");
+    assert!(!detail.contains(".;"), "{detail}");
+}
+
 /// A pass was held back by a fault that passes by itself, and then a question to the service is
 /// turned back with something only a person can mend: whether the answer in hand says storage is on
 /// or off, the doctor tells the person what to mend and not that the host asks again by itself.
