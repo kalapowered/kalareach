@@ -5590,16 +5590,8 @@ fn kr_host_stop_says_when_no_daemon_runs_and_names_a_holder_that_does_not_answer
     let held = kr_controller::singleton::SingletonLock::hold(&lock, host.tree.environment_id())
         .expect("takes the lock");
     for (program, named) in [("kr-controller", true), ("a-holder", false)] {
-        let copy = host.tree.root().join(program);
-        std::fs::copy(std::env::current_exe().expect("this test"), &copy).expect("copies it");
-        let mut holder = spawning(|| {
-            Command::new(&copy)
-                .args(["--ignored", "--exact", HOLD_STILL, "--nocapture"])
-                .env("KR_HOLD_STILL_SECONDS", "600")
-                .current_dir(host.tree.root())
-                .spawn()
-        })
-        .expect("starts");
+        let mut holder =
+            start_a_copy_that_holds_still(host.tree.root(), &host.tree.root().join(program));
         std::fs::write(&lock, format!("{}\n", holder.id())).expect("names the holder");
         let output = start(host.kr(&["host", "stop"])).finish("kr host stop");
         let _ = holder.kill();
@@ -6069,16 +6061,48 @@ fn an_interrupt_before_the_request_says_that_nothing_was_asked_and_leaves_no_rec
 fn a_process_named_kr_controller(host: &Standalone, folder: &str) -> Child {
     let directory = host.tree.root().join(folder);
     std::fs::create_dir_all(&directory).expect("a folder");
-    let copy = directory.join("kr-controller");
-    std::fs::copy(std::env::current_exe().expect("this test"), &copy).expect("copies it");
+    start_a_copy_that_holds_still(host.tree.root(), &directory.join("kr-controller"))
+}
+
+/// How long a start of a program this test has just written is tried again while the system says
+/// the file is busy.
+const BUSY_FILE_BOUND: Duration = Duration::from_secs(10);
+
+/// Places a copy of this test program at `copy` and starts it, holding still, with `working` as its
+/// working directory.
+///
+/// A program that a case writes and then starts can meet "Text file busy": the system refuses to
+/// run a file that some process still holds open for writing, and a process that another thread of
+/// this test forks while the copy is being written inherits that descriptor until it has run its
+/// program. So the copy is written under another name, closed and renamed into place, all while no
+/// other thread starts a process, and a start that still meets the error is tried again, inside a
+/// short bound.
+fn start_a_copy_that_holds_still(working: &Path, copy: &Path) -> Child {
+    let staging = copy.with_extension("new");
     spawning(|| {
-        Command::new(&copy)
-            .args(["--ignored", "--exact", HOLD_STILL, "--nocapture"])
-            .env("KR_HOLD_STILL_SECONDS", "600")
-            .current_dir(host.tree.root())
-            .spawn()
-    })
-    .expect("starts")
+        std::fs::copy(std::env::current_exe().expect("this test"), &staging).expect("copies it");
+        std::fs::rename(&staging, copy).expect("places it");
+    });
+    let deadline = Instant::now() + BUSY_FILE_BOUND;
+    loop {
+        let started = spawning(|| {
+            Command::new(copy)
+                .args(["--ignored", "--exact", HOLD_STILL, "--nocapture"])
+                .env("KR_HOLD_STILL_SECONDS", "600")
+                .current_dir(working)
+                .spawn()
+        });
+        match started {
+            Ok(child) => return child,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("starts: {error}"),
+        }
+    }
 }
 
 /// A daemon that ends and is replaced before the command sees the end reads as ended, with the
