@@ -19,8 +19,8 @@ use crate::authority::AdmissionLapse;
 use crate::error::ControllerError;
 use crate::grants::policy::HeldBound;
 use crate::service::{
-    Ask, Controller, EnvelopeRefused, Footing, HostWithdrawal, Lapse, LeaseNotLive, SpendFailed,
-    Unauthorised, error_reply, respond,
+    Ask, Controller, EnvelopeRefused, Footing, HostWithdrawal, Lapse, LeaseNotLive, LeasedLapse,
+    SpendFailed, Unauthorised, error_reply, respond,
 };
 
 /// What the local door answers a mutation with, and so how the answer is written.
@@ -130,9 +130,12 @@ impl WrittenUnder {
     ///
     /// # Errors
     ///
-    /// Returns the member that refuses.
-    pub(crate) fn asked_holding(&self, bound: Option<HeldBound>) -> Result<(), Lapse> {
-        self.footing.clone().holding(bound).ask(self.ask)
+    /// Returns the member that refuses, and a bound that moved as itself.
+    pub(crate) fn asked_holding(&self, bound: Option<HeldBound>) -> Result<(), LeasedLapse> {
+        match bound {
+            Some(bound) => self.footing.clone().holding(bound).ask(self.ask),
+            None => Ok(self.footing.ask(self.ask)?),
+        }
     }
 
     /// What is written in place of a frame that the last question stopped, for the member `lapse`
@@ -166,11 +169,7 @@ impl WrittenUnder {
 /// the door asks, which is the reply's own except for a reply read from a record, whose check is
 /// the kept answer's.
 fn refusal_of(footing: &Footing, words: Words, lapse: Lapse) -> ControllerError {
-    let registration_gone = || {
-        Lapse::Withdrawn
-            .refusal()
-            .expect("a withdrawn authority has words")
-    };
+    let registration_gone = || Lapse::Withdrawn.refusal();
     match lapse {
         Lapse::Admission(AdmissionLapse::Deregistered)
             if !matches!(words, Words::Record { .. }) || footing.connection_id().is_none() =>
@@ -182,7 +181,7 @@ fn refusal_of(footing: &Footing, words: Words, lapse: Lapse) -> ControllerError 
         {
             registration_gone()
         }
-        lapse => lapse.refusal().unwrap_or_else(registration_gone),
+        lapse => lapse.refusal(),
     }
 }
 

@@ -15,7 +15,7 @@ use super::a_floor_owed_its_record::{daemon, daemon_passing_by_hand, until};
 use super::a_result_the_lease_ended_over::connected_under_a_lease;
 use super::one_barrier_for_every_restriction::{beside, owed, revision};
 use super::the_fence_at_every_effect::{admitted, daemon as daemon_on_clocks};
-use super::{Ask, Lapse, Reach};
+use super::{Ask, Lapse, LeasedLapse, Reach};
 use crate::authority::AdmissionLapse;
 
 /// Waits until a change says it has reached the place it is stopped at, and fails the test when it
@@ -238,11 +238,15 @@ async fn a_held_methods_reading_of_the_lease_returns_the_chosen_leases_bound_bes
         .local_hold(Method::SessionRead)
         .expect("the lease is live");
     let end = held.end.expect("a lease has an end");
-    let footing = super::Footing::untargeted(Arc::clone(&controller.copies)).holding(held.bound);
+    let footing = super::Footing::untargeted(Arc::clone(&controller.copies))
+        .holding(held.bound.expect("a lease has a bound"));
     assert_eq!(footing.ask(Ask::SIGN_IN), Ok(()));
 
     clock.advance(end.saturating_duration_since(clock.now()));
-    assert_eq!(footing.ask(Ask::SIGN_IN), Err(Lapse::LeaseEnded));
+    assert_eq!(
+        footing.ask(Ask::SIGN_IN),
+        Err(LeasedLapse::Lapse(Lapse::LeaseEnded))
+    );
     controller
         .local_hold(Method::SessionRead)
         .expect_err("no lease is live now");

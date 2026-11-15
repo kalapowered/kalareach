@@ -13,7 +13,9 @@
 //! * the request's absolute **deadline**, and the **exact target** it was admitted for: the
 //!   connection, the revision and the latch of that registration;
 //! * for a method held to the local owner's lease, the lease's **held bound**
-//!   ([`crate::grants::policy::HeldBound`]), whose cell a policy commit ends.
+//!   ([`crate::grants::policy::HeldBound`]), whose cell a policy commit ends. A footing that holds
+//!   a bound is a type of its own ([`LeasedFooting`]), whose question alone says that the bound's
+//!   cell has moved: there is no plain reading of it that gives yes or a refusal.
 //!
 //! The question ([`Footing::ask`]) reads those copies and the clocks and nothing else: it takes no
 //! lock, awaits nothing and writes nothing, so it can be asked immediately before the landing
@@ -135,8 +137,16 @@ pub(crate) struct Footing {
     target: Option<Target>,
     /// The accepted deadline, absolute on the continuous clock.
     deadline: Option<ContinuousInstant>,
-    /// The held bound of the local owner's lease that the request's method is held to.
-    bound: Option<HeldBound>,
+}
+
+/// A [`Footing`] that also holds the held bound of the local owner's lease that the request's
+/// method is held to. Its question is [`Self::ask`] alone: a bound whose cell moved to another
+/// lineage is neither a lease that holds nor one that ended, so it reaches the caller as
+/// [`LeasedLapse::BoundMoved`] and is never turned into a refusal or a pass.
+#[derive(Clone)]
+pub(crate) struct LeasedFooting {
+    footing: Footing,
+    bound: HeldBound,
 }
 
 impl std::fmt::Debug for Footing {
@@ -276,27 +286,38 @@ pub(crate) enum Lapse {
     Withdrawn,
     /// The local owner's lease has ended: its bound's cell ended it, or its time has come.
     LeaseEnded,
-    /// The bound's cell published another lineage: the lease was ended and established again,
-    /// which is neither a lease that holds nor one that ended. The value only reports it; what a
-    /// landing does with it is that landing's own decision, so it has no refusal here.
-    BoundMoved,
 }
 
 impl Lapse {
-    /// The refusal this lapse is told as, in the words of the door's own check for that condition;
-    /// none for a bound that moved, which a landing decides for itself.
-    pub(crate) fn refusal(self) -> Option<ControllerError> {
+    /// The refusal this lapse is told as, in the words of the door's own check for that condition.
+    pub(crate) fn refusal(self) -> ControllerError {
         match self {
-            Self::FenceOwed => Some(super::barrier::fence_owed_refusal()),
-            Self::Admission(lapse) => Some(admission_refusal(lapse)),
-            Self::Withdrawn => Some(ControllerError::PermissionDenied {
+            Self::FenceOwed => super::barrier::fence_owed_refusal(),
+            Self::Admission(lapse) => admission_refusal(lapse),
+            Self::Withdrawn => ControllerError::PermissionDenied {
                 detail: "the authority this connection was admitted under has been withdrawn; \
                          open a new connection"
                     .to_owned(),
-            }),
-            Self::LeaseEnded => Some(super::local_access::lease_not_live().into()),
-            Self::BoundMoved => None,
+            },
+            Self::LeaseEnded => super::local_access::lease_not_live().into(),
         }
+    }
+}
+
+/// What the question of a [`LeasedFooting`] answers when it does not let the request through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LeasedLapse {
+    /// A member refused.
+    Lapse(Lapse),
+    /// The bound's cell published another lineage: the lease was ended and established again,
+    /// which is neither a lease that holds nor one that ended. It has no refusal: what a landing
+    /// does with it is that landing's own decision.
+    BoundMoved,
+}
+
+impl From<Lapse> for LeasedLapse {
+    fn from(lapse: Lapse) -> Self {
+        Self::Lapse(lapse)
     }
 }
 
@@ -332,7 +353,6 @@ impl Footing {
                 latch,
             }),
             deadline,
-            bound: None,
         }
     }
 
@@ -343,16 +363,17 @@ impl Footing {
             copies,
             target: None,
             deadline: None,
-            bound: None,
         }
     }
 
     /// This standing, with the held bound of the local owner's lease that the request's method is
     /// held to.
     #[must_use]
-    pub(crate) fn holding(mut self, bound: Option<HeldBound>) -> Self {
-        self.bound = bound;
-        self
+    pub(crate) fn holding(self, bound: HeldBound) -> LeasedFooting {
+        LeasedFooting {
+            footing: self,
+            bound,
+        }
     }
 
     /// The connection the request arrived on, when it has one.
@@ -365,33 +386,22 @@ impl Footing {
         self.target.as_ref().map(|target| target.admitted_revision)
     }
 
-    /// The question: whether the request still stands at this moment, for the members `ask` reads.
+    /// The question: whether the request still stands at this moment, for the members `ask` reads,
+    /// the bound excepted: this footing holds none, whatever the `ask` says of it.
     ///
-    /// **Before the first read:** the bound's cell is loaded once and its snapshot copied out
-    /// (`HeldBound::published`), because loading a cell can allocate (the first use of a thread)
-    /// and lets go of a reference. **After the first read** (the flag, the revision or the latch;
-    /// a clock) nothing allocates, frees, takes a lock or waits: the leaves are
-    /// `Copies::fence_is_owed` and `Copies::revision` (atomic loads), `AtomicBool::load` of the
-    /// registration's latch, `ContinuousClock::now` (the daemon's continuous clock),
-    /// `Copies::settled_utc_now` (the wall clock and `UtcFloor::observe`, an atomic raise of the
-    /// floor that never waits) and `HeldBound::stands_in` (comparisons of the copy). Nothing is
-    /// written but the floor's own raise.
+    /// **Every leaf this calls, and nothing else:** `Copies::fence_is_owed` and `Copies::revision`
+    /// (atomic loads), `AtomicBool::load` of the registration's latch and `ContinuousClock::now`
+    /// (the daemon's continuous clock). Nothing is allocated or freed, no lock is taken, nothing is
+    /// awaited and nothing is written.
     ///
-    /// The order is the flag, the revision, the latch, the deadline and the bound. The first three
-    /// are read in the order the barrier's writes make true: a reader that finds the flag clear
-    /// after a barrier finds the revision raised and the latches of the registrations it removed
-    /// set.
+    /// The order is the flag, the revision, the latch and the deadline. The first three are read
+    /// in the order the barrier's writes make true: a reader that finds the flag clear after a
+    /// barrier finds the revision raised and the latches of the registrations it removed set.
     ///
     /// # Errors
     ///
     /// Returns the first member that refuses.
     pub(crate) fn ask(&self, ask: Ask) -> Result<(), Lapse> {
-        // Everything the bound's comparison needs is taken before the first read below.
-        let bound = self
-            .bound
-            .as_ref()
-            .filter(|_| ask.bound)
-            .map(|bound| (bound, bound.published()));
         if ask.flag && self.copies.fence_is_owed() {
             return Err(Lapse::FenceOwed);
         }
@@ -429,35 +439,55 @@ impl Footing {
         {
             return Err(Lapse::Admission(AdmissionLapse::Expired));
         }
-        if let Some((bound, published)) = &bound {
-            // The continuous clock first and the wall clock after it, as every reader of a bound
-            // reads them.
-            let now = self.copies.now();
-            let utc_ms = self.copies.settled_utc_now();
-            match bound.stands_in(published, now, utc_ms) {
-                Stands::Holds => {}
-                Stands::Moved => return Err(Lapse::BoundMoved),
-                Stands::EndedOnTheContinuousClock | Stands::EndedInUtc => {
-                    return Err(Lapse::LeaseEnded);
-                }
-            }
-        }
         Ok(())
     }
 
-    /// [`Self::ask`], for a footing that holds no bound, with the refusal told as the door's own.
-    /// A footing that holds a bound is asked with [`Self::ask`], since a bound that moved has no
-    /// refusal of its own.
+    /// [`Self::ask`], with the refusal told as the door's own. A footing that holds a bound has no
+    /// such reading ([`LeasedFooting::ask`]).
     ///
     /// # Errors
     ///
     /// Returns the refusal of the first member that refuses.
     pub(crate) fn stands(&self, ask: Ask) -> crate::error::Result<()> {
-        self.ask(ask).map_err(|lapse| {
-            lapse
-                .refusal()
-                .unwrap_or_else(|| admission_refusal(AdmissionLapse::Revoked))
-        })
+        self.ask(ask).map_err(Lapse::refusal)
+    }
+}
+
+impl LeasedFooting {
+    /// The question: [`Footing::ask`] and then the bound, for the members `ask` reads.
+    ///
+    /// **Before the first read:** the bound's cell is loaded once and its snapshot copied out
+    /// (`HeldBound::published`), because loading a cell can allocate (the first use of a thread)
+    /// and lets go of a reference. **After the first read** (the flag, the revision or the latch;
+    /// a clock) nothing allocates, frees, takes a lock or waits: the leaves are those of
+    /// [`Footing::ask`], `ContinuousClock::now`, `Copies::settled_utc_now` (the wall clock and
+    /// `UtcFloor::observe`, an atomic raise of the floor that never waits) and
+    /// `HeldBound::stands_in` (comparisons of the copy). Nothing is written but the floor's own
+    /// raise.
+    ///
+    /// The order is the flag, the revision, the latch, the deadline and the bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first member that refuses, and the bound that moved as itself.
+    pub(crate) fn ask(&self, ask: Ask) -> Result<(), LeasedLapse> {
+        // Everything the bound's comparison needs is taken before the first read below.
+        let published = ask.bound.then(|| self.bound.published());
+        self.footing.ask(ask)?;
+        if let Some(published) = &published {
+            // The continuous clock first and the wall clock after it, as every reader of a bound
+            // reads them.
+            let now = self.footing.copies.now();
+            let utc_ms = self.footing.copies.settled_utc_now();
+            match self.bound.stands_in(published, now, utc_ms) {
+                Stands::Holds => {}
+                Stands::Moved => return Err(LeasedLapse::BoundMoved),
+                Stands::EndedOnTheContinuousClock | Stands::EndedInUtc => {
+                    return Err(LeasedLapse::Lapse(Lapse::LeaseEnded));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -479,7 +509,12 @@ mod tests {
         clock: ManualClock,
         latch: Arc<AtomicBool>,
         cell: Arc<BoundCell>,
-        footing: Footing,
+        footing: LeasedFooting,
+    }
+
+    /// The refusal of the member `lapse`, as the leased question gives it.
+    fn refused(lapse: Lapse) -> Result<(), LeasedLapse> {
+        Err(LeasedLapse::Lapse(lapse))
     }
 
     fn rig() -> Rig {
@@ -505,7 +540,7 @@ mod tests {
             Some(Arc::clone(&latch)),
             deadline,
         )
-        .holding(Some(HeldBound::load(&cell)));
+        .holding(HeldBound::load(&cell));
         Rig {
             copies,
             clock,
@@ -547,7 +582,7 @@ mod tests {
     fn a_latch_that_is_set_alone_refuses_the_variants_that_ask_the_registration() {
         let rig = rig();
         rig.latch.store(true, Ordering::Release);
-        let deregistered = Err(Lapse::Admission(AdmissionLapse::Deregistered));
+        let deregistered = refused(Lapse::Admission(AdmissionLapse::Deregistered));
         for ask in [
             Ask::MUTATION,
             Ask::KEPT_ANSWER,
@@ -576,12 +611,12 @@ mod tests {
             Ask::LOCAL_CLOSE,
             Ask::SIGN_IN,
         ] {
-            assert_eq!(rig.footing.ask(ask), Err(Lapse::FenceOwed), "{ask:?}");
+            assert_eq!(rig.footing.ask(ask), refused(Lapse::FenceOwed), "{ask:?}");
         }
         assert_eq!(
             rig.footing
                 .ask(Ask::own_withdrawal(AuthorityRevision::new(3))),
-            Err(Lapse::FenceOwed)
+            refused(Lapse::FenceOwed)
         );
         // A read asks no fence, and the network close's claim asks the latch alone.
         assert_eq!(rig.footing.ask(Ask::READ), Ok(()));
@@ -594,7 +629,7 @@ mod tests {
     fn a_revision_that_is_raised_alone_refuses_the_variants_that_hold_the_revision() {
         let rig = rig();
         rig.copies.raise_revision(AuthorityRevision::new(4));
-        let revoked = Err(Lapse::Admission(AdmissionLapse::Revoked));
+        let revoked = refused(Lapse::Admission(AdmissionLapse::Revoked));
         for ask in [Ask::MUTATION, Ask::KEPT_ANSWER, Ask::LOCAL_CLOSE] {
             assert_eq!(rig.footing.ask(ask), revoked, "{ask:?}");
         }
@@ -610,7 +645,7 @@ mod tests {
         assert_eq!(
             rig.footing
                 .ask(Ask::own_withdrawal(AuthorityRevision::new(3))),
-            Err(Lapse::Withdrawn)
+            refused(Lapse::Withdrawn)
         );
         // The revision in memory is never lowered.
         rig.copies.raise_revision(AuthorityRevision::new(2));
@@ -623,7 +658,7 @@ mod tests {
         rig.clock.advance(Duration::from_secs(61));
         assert_eq!(
             rig.footing.ask(Ask::MUTATION),
-            Err(Lapse::Admission(AdmissionLapse::Expired))
+            refused(Lapse::Admission(AdmissionLapse::Expired))
         );
         for ask in [
             Ask::KEPT_ANSWER,
@@ -641,7 +676,7 @@ mod tests {
         let rig = rig();
         rig.cell.end();
         for ask in [Ask::MUTATION, Ask::KEPT_ANSWER, Ask::READ, Ask::SIGN_IN] {
-            assert_eq!(rig.footing.ask(ask), Err(Lapse::LeaseEnded), "{ask:?}");
+            assert_eq!(rig.footing.ask(ask), refused(Lapse::LeaseEnded), "{ask:?}");
         }
         for ask in [Ask::LOCAL_CLOSE, Ask::NETWORK_CLOSE_CLAIM] {
             assert_eq!(rig.footing.ask(ask), Ok(()), "{ask:?}");
@@ -656,7 +691,11 @@ mod tests {
         rig.cell
             .publish(BoundIdentity::Unbounded, None, None, false, false);
         for ask in [Ask::MUTATION, Ask::KEPT_ANSWER, Ask::READ, Ask::SIGN_IN] {
-            assert_eq!(rig.footing.ask(ask), Err(Lapse::BoundMoved), "{ask:?}");
+            assert_eq!(
+                rig.footing.ask(ask),
+                Err(LeasedLapse::BoundMoved),
+                "{ask:?}"
+            );
         }
         assert_eq!(rig.footing.ask(Ask::LOCAL_CLOSE), Ok(()));
     }
@@ -669,9 +708,9 @@ mod tests {
         // no deadline, names the lease.
         assert_eq!(
             rig.footing.ask(Ask::MUTATION),
-            Err(Lapse::Admission(AdmissionLapse::Expired))
+            refused(Lapse::Admission(AdmissionLapse::Expired))
         );
-        assert_eq!(rig.footing.ask(Ask::READ), Err(Lapse::LeaseEnded));
+        assert_eq!(rig.footing.ask(Ask::READ), refused(Lapse::LeaseEnded));
     }
 
     #[test]
@@ -681,38 +720,33 @@ mod tests {
         rig.clock.advance(Duration::from_secs(3601));
         assert_eq!(
             rig.footing.ask(Ask::MUTATION),
-            Err(Lapse::Admission(AdmissionLapse::Deregistered))
+            refused(Lapse::Admission(AdmissionLapse::Deregistered))
         );
         rig.copies.raise_revision(AuthorityRevision::new(4));
         assert_eq!(
             rig.footing.ask(Ask::MUTATION),
-            Err(Lapse::Admission(AdmissionLapse::Revoked))
+            refused(Lapse::Admission(AdmissionLapse::Revoked))
         );
         rig.copies.note_debts(true);
-        assert_eq!(rig.footing.ask(Ask::MUTATION), Err(Lapse::FenceOwed));
+        assert_eq!(rig.footing.ask(Ask::MUTATION), refused(Lapse::FenceOwed));
     }
 
     #[test]
     fn a_refused_member_is_told_in_the_words_of_the_doors_own_check() {
-        let revoked = Lapse::Admission(AdmissionLapse::Revoked)
-            .refusal()
-            .expect("a refusal");
+        let revoked = Lapse::Admission(AdmissionLapse::Revoked).refusal();
         assert!(
             matches!(revoked, ControllerError::PermissionDenied { ref detail }
             if *detail == AdmissionLapse::Revoked.to_string())
         );
-        let expired = Lapse::Admission(AdmissionLapse::Expired)
-            .refusal()
-            .expect("a refusal");
+        let expired = Lapse::Admission(AdmissionLapse::Expired).refusal();
         assert!(
             matches!(expired, ControllerError::WindowExpired { ref detail }
             if *detail == AdmissionLapse::Expired.to_string())
         );
         assert!(matches!(
             Lapse::LeaseEnded.refusal(),
-            Some(ControllerError::PermissionDenied { .. })
+            ControllerError::PermissionDenied { .. }
         ));
-        assert!(Lapse::BoundMoved.refusal().is_none());
     }
 
     /// A clock that ends a lease's bound at its first reading, as a policy commit on another
@@ -752,12 +786,12 @@ mod tests {
             WallClock::from_fn(|| 1_000),
             Arc::new(UtcFloor::default()),
         ));
-        let footing = Footing::untargeted(copies).holding(Some(HeldBound::load(&cell)));
+        let footing = Footing::untargeted(copies).holding(HeldBound::load(&cell));
         // The cell ends while the question reads the clock, after its first read: that question
         // goes by the bound it took before, and does not load the cell again. The next one finds
         // the end.
         assert_eq!(footing.ask(Ask::SIGN_IN), Ok(()));
-        assert_eq!(footing.ask(Ask::SIGN_IN), Err(Lapse::LeaseEnded));
+        assert_eq!(footing.ask(Ask::SIGN_IN), refused(Lapse::LeaseEnded));
     }
 
     #[test]
