@@ -1098,9 +1098,14 @@ impl Session {
                     event.attachment_id,
                     crate::output::OutputDelivery::EditorBusy(event),
                 ),
-                Step::RemoveAttachment(attachment_id) => {
-                    // A detach the reader asked for removes exactly the attachment the fence named.
-                    let _ = self.detach(attachment_id, None);
+                Step::RemoveAttachment {
+                    attachment,
+                    discarded,
+                } => {
+                    // A detach the reader asked for removes exactly the attachment the fence named,
+                    // and the keys the machine dropped with it are part of what its lease's end
+                    // discarded.
+                    let _ = self.detach_counting(attachment, None, discarded);
                 }
                 Step::Interrupt(_) => {
                     self.interrupt_failed = self
@@ -2545,6 +2550,18 @@ impl Session {
         attachment_id: AttachmentId,
         after: Option<&InputBarrier>,
     ) -> Result<SessionDetachResult> {
+        self.detach_counting(attachment_id, after, 0)
+    }
+
+    /// Removes an attachment as [`Self::detach`] does. `departed` is what the root editor's
+    /// machine discarded of the attachment's held keys before this call, when the removal is the
+    /// machine's own order: the lease's end counts it, and the carried count already holds it.
+    fn detach_counting(
+        &mut self,
+        attachment_id: AttachmentId,
+        after: Option<&InputBarrier>,
+        departed: u64,
+    ) -> Result<SessionDetachResult> {
         let shared = Arc::clone(&self.input);
         let mut input = shared.lock();
         // The position is checked first, in the hold that does the removals, so a refusal has no
@@ -2567,9 +2584,11 @@ impl Session {
             let framing = input.close_framing_for_takeover();
             let prefix = framing.discarded_prefix.len() as u64;
             let ended = self.end_lease(&mut input, discarded_queue.saturating_add(prefix));
+            input.count_in_ending(departed);
             fenced = discarded_queue
                 .saturating_add(prefix)
-                .saturating_add(ended.left);
+                .saturating_add(ended.left)
+                .saturating_add(departed);
             // The source of this input has gone, which is the loss section 8 asks to be reported.
             // The attachment that is leaving has no answer left to read it in, so it is carried to
             // whoever takes the keys next.
@@ -2583,11 +2602,18 @@ impl Session {
             self.note_lease_holder(&mut input);
         }
         // The machine discards whatever it was holding for this attachment, invalidates a fence
-        // that named it, and ends the reader's wait for a key that can never arrive.
+        // that named it, and ends the reader's wait for a key that can never arrive. What it holds
+        // for the holder is dropped here and no lease change acknowledges it, so it is counted in
+        // the end of the lease that this call has just begun.
         let mut owed = Vec::new();
+        let mut dropped = 0;
         if let Some(driver) = input.fence_mut() {
             let effects = driver.attachment_removed(attachment_id);
-            owed = input.apply_effects(effects).owed;
+            dropped = effects.unacknowledged_discard();
+            owed = input.apply_effects_at_an_end(effects).owed;
+        }
+        if held {
+            fenced = fenced.saturating_add(dropped);
         }
         let mut input = if owed.is_empty() {
             input
@@ -5192,7 +5218,7 @@ impl Session {
                 let mut owed = Vec::new();
                 if let Some(driver) = input.fence_mut() {
                     let effects = driver.session_closing();
-                    owed.extend(input.apply_effects(effects).owed);
+                    owed.extend(input.apply_effects_at_an_end(effects).owed);
                 }
                 drop(input);
                 // Nothing new is started inside a closing session, so no backend waits for one.
