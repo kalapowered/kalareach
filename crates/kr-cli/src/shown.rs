@@ -1147,6 +1147,13 @@ mod tests {
                 "the rendezvous service is unavailable",
             ),
             (
+                PairingError::RendezvousCapacity {
+                    told: MARKER.to_owned(),
+                    retry_after_seconds: None,
+                },
+                "the pairing failed",
+            ),
+            (
                 PairingError::RendezvousConfiguration {
                     reason: MARKER.to_owned(),
                 },
