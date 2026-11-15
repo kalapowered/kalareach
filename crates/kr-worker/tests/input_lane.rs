@@ -2200,11 +2200,19 @@ async fn a_release_or_a_detach_beyond_the_position_of_a_live_epoch_applies_nothi
         .await
         .expect_err("the position was not reached");
     assert_eq!(release.code, ErrorCode::DraftConflict);
+    assert_eq!(
+        release.message,
+        kr_worker::input_domain::POSITION_NOT_REACHED
+    );
     let detach = rig
         .detach_with(attachment, Some(barrier(attachment, epoch, 4, None)), true)
         .await
         .expect_err("the position was not reached");
     assert_eq!(detach.code, ErrorCode::DraftConflict);
+    assert_eq!(
+        detach.message,
+        kr_worker::input_domain::POSITION_NOT_REACHED
+    );
 
     // Nothing was applied: the view still holds the keys and is still attached.
     typed(&mut lane, &[b"d"]).await;

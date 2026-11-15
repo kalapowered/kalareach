@@ -78,7 +78,7 @@ pub(in crate::service::net) fn barrier_of(
 pub(in crate::service::net) fn not_reached() -> ProtocolError {
     ProtocolError::new(
         ErrorCode::DraftConflict,
-        "the typing before this request has not all arrived",
+        kr_worker::input_domain::POSITION_NOT_REACHED,
     )
 }
 
