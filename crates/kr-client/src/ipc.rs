@@ -525,4 +525,211 @@ mod tests {
         const fn takes_a_transport<T: ControlTransport>() {}
         takes_a_transport::<IpcTransport>();
     }
+
+    use kr_protocol::envelope::{Outcome, ParamsValue, Request, Response};
+    use kr_protocol::error::{ErrorCode, ProtocolError};
+    use kr_protocol::ids::RequestId;
+    use kr_protocol::method::Method;
+    use std::time::Duration;
+
+    /// A transport over one end of a raw local connection, and the other end, which the case plays.
+    /// There is no handshake: what these cases look at is the writing half.
+    async fn over_a_raw_connection() -> (
+        IpcTransport,
+        FrameReader,
+        FrameWriter,
+        kr_ipc::testing::TempHost,
+    ) {
+        let tree = kr_ipc::testing::TempHost::create();
+        let endpoint = tree
+            .paths()
+            .environment(tree.environment_id())
+            .controller_endpoint()
+            .expect("a controller endpoint");
+        let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("a local endpoint");
+        let accepting = tokio::spawn(async move {
+            let (connection, _) = listener.accept().await.expect("accepts");
+            (connection, listener)
+        });
+        let client = kr_ipc::endpoint::Connection::connect(&endpoint)
+            .await
+            .expect("connects");
+        let (served, _listener) = accepting.await.expect("the accepting task");
+        let (reader, writer) = kr_ipc::framed::split(client, StreamKind::Control);
+        let (peer_reader, peer_writer) = kr_ipc::framed::split(served, StreamKind::Control);
+        let connection_id = ConnectionId::new(kr_protocol::scalars::Uuid::from_bytes([3; 16]));
+        let transport = IpcTransport {
+            connection_id,
+            limits: ReceiveLimits::default(),
+            initial_action_window: ActionWindow {
+                action_window_id: kr_protocol::ids::ActionWindowId::new("window-1")
+                    .expect("a window identifier"),
+                connection_id,
+                boot_epoch: kr_protocol::ids::BootEpoch::new(1),
+                issued_at_ms: kr_protocol::scalars::TimestampMs::new(0),
+                valid_for_ms: kr_protocol::scalars::DurationMs::new(60_000),
+            },
+            context: LocalContext {
+                role: LocalRole::Controller,
+                environment_id: EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16])),
+                boot_identity: kr_protocol::identity::BootIdentity {
+                    source: kr_protocol::identity::BootIdentitySource::BootTime,
+                    value: kr_protocol::scalars::Bytes::new(vec![1]),
+                },
+                peer: LocalPeer {
+                    uid: kr_protocol::scalars::U64::new(501),
+                    gid: kr_protocol::scalars::U64::new(20),
+                    pid: kr_protocol::scalars::Nullable::null(),
+                },
+            },
+            turn: Mutex::new(()),
+            writer: Mutex::new(Some(writer)),
+            reader: Mutex::new(Some(reader)),
+            closed: AtomicBool::new(false),
+            write_lost: AtomicBool::new(false),
+            ending: tokio::sync::Notify::new(),
+            claimed: AtomicBool::new(false),
+        };
+        (transport, peer_reader, peer_writer, tree)
+    }
+
+    /// A request frame with `padding` bytes in its params.
+    fn request(id: u64, padding: usize) -> ControlFrame {
+        ControlFrame::Request(Request {
+            request_id: RequestId::new(id),
+            method: Method::SessionList.into(),
+            method_version: Method::SessionList.entry().version,
+            params: ParamsValue::from_typed(&"x".repeat(padding)).expect("params"),
+        })
+    }
+
+    fn answer(id: u64, outcome: Outcome) -> ControlFrame {
+        ControlFrame::Response(Response {
+            request_id: RequestId::new(id),
+            outcome,
+        })
+    }
+
+    fn request_id_of(frame: &ControlFrame) -> RequestId {
+        match frame {
+            ControlFrame::Request(request) => request.request_id,
+            ControlFrame::Response(response) => response.request_id,
+            other => panic!("a frame that these cases never send: {other:?}"),
+        }
+    }
+
+    /// A write that is dropped after its frame went whole leaves the connection standing: the
+    /// peer holds the whole of the frame, nothing is cut, and the half goes back to its slot for
+    /// the next frame.
+    #[tokio::test]
+    async fn a_write_dropped_after_its_frame_went_whole_leaves_the_connection_standing() {
+        let (transport, mut peer_reader, _peer_writer, _tree) = over_a_raw_connection().await;
+        let mut half = transport.writer.lock().await.take().expect("the half");
+        half.write_message(&request(1, 8)).await.expect("whole");
+        assert!(half.has_sent_any() && !half.is_mid_frame());
+        drop(Lent {
+            transport: &transport,
+            half: Some(half),
+        });
+        assert!(
+            !transport.is_closed() && transport.can_send(),
+            "a frame that went whole is not a reason to close the connection"
+        );
+        transport
+            .send(&request(2, 8))
+            .await
+            .expect("the next frame is written");
+        for id in [1, 2] {
+            let frame = tokio::time::timeout(
+                Duration::from_secs(8),
+                peer_reader.read_message::<ControlFrame>(),
+            )
+            .await
+            .expect("the peer reads the frame")
+            .expect("a frame");
+            assert_eq!(request_id_of(&frame), RequestId::new(id));
+        }
+    }
+
+    /// A failed write with part of a frame sent whose error does not say that the peer has gone
+    /// closes the connection: it holds the start of a frame and nothing else would end it. The
+    /// failure is made by writing on a writer that already holds part of a frame, which a write
+    /// never leaves behind and which the frame writer refuses with an error of its own.
+    #[tokio::test]
+    async fn a_failed_write_that_does_not_say_the_peer_has_gone_closes_the_connection() {
+        let (transport, _peer_reader, _peer_writer, _tree) = over_a_raw_connection().await;
+        let mut half = transport.writer.lock().await.take().expect("the half");
+        let framed =
+            FrameWriter::encode(StreamKind::Control, &request(1, 900_000)).expect("encodes");
+        half.begin_frame(&framed).expect("begins");
+        assert!(
+            half.is_mid_frame() && half.has_sent_any(),
+            "the socket of a peer that reads nothing takes part of the frame"
+        );
+        *transport.writer.lock().await = Some(half);
+        let failed = transport.send(&request(2, 8)).await;
+        assert!(
+            matches!(&failed, Err(ClientError::Ipc(kr_ipc::IpcError::Socket { .. }))),
+            "an error that is not the peer's going: {failed:?}"
+        );
+        assert!(
+            transport.is_closed() && !transport.can_send(),
+            "the connection holds the start of a frame, so it is closed"
+        );
+    }
+
+    /// A failed write with part of a frame sent whose error says that the peer has gone does not
+    /// close the connection: the peer wrote its last frames before it went, and every one of them
+    /// is read, then the end. No frame can be written from then on.
+    #[tokio::test]
+    async fn a_failed_write_to_a_peer_that_has_gone_leaves_what_it_sent_to_be_read() {
+        let (transport, peer_reader, mut peer_writer, _tree) = over_a_raw_connection().await;
+        let transport = std::sync::Arc::new(transport);
+        let big = request(1, 900_000);
+        let sending = tokio::spawn({
+            let transport = std::sync::Arc::clone(&transport);
+            async move { transport.send(&big).await }
+        });
+        // The peer reads nothing, so part of the frame goes and the write waits for room.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!sending.is_finished(), "the frame did not fit the socket");
+        peer_writer
+            .write_message(&answer(7, Outcome::Ok(ParamsValue::empty())))
+            .await
+            .expect("the answer");
+        peer_writer
+            .write_message(&answer(
+                0,
+                Outcome::Error(ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "this connection is refused",
+                )),
+            ))
+            .await
+            .expect("the refusal");
+        // The peer goes with part of the frame unread.
+        drop((peer_reader, peer_writer));
+        let failed = tokio::time::timeout(Duration::from_secs(8), sending)
+            .await
+            .expect("the write ended")
+            .expect("the task");
+        assert!(
+            matches!(&failed, Err(ClientError::Ipc(kr_ipc::IpcError::PeerClosed))),
+            "{failed:?}"
+        );
+        assert!(
+            !transport.is_closed(),
+            "the connection stands, for its reader to read to the peer's end"
+        );
+        assert!(!transport.can_send(), "nothing can be written any more");
+        let mut read = Vec::new();
+        while let Some(frame) = transport.recv().await.expect("a read") {
+            read.push(request_id_of(&frame));
+        }
+        assert_eq!(
+            read,
+            [RequestId::new(7), RequestId::new(0)],
+            "every frame the peer sent before it went is read"
+        );
+    }
 }
