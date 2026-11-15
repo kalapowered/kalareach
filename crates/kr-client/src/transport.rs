@@ -445,6 +445,17 @@ impl ControlTransport for NetworkTransport {
             Some(ConnectionError::LocallyClosed)
         )
     }
+
+    /// Whether a frame can still be written: true only while the library records no close of
+    /// either side. After the host's close, a reset, an idle timeout or a protocol error the
+    /// library refuses every write before a byte goes, and the session's read loop may not have
+    /// read to the end yet, so a call admitted in that time would be registered and answered as not
+    /// known. This is a different question from [`ControlTransport::is_closed`], which is true for
+    /// this side's close alone. A send that is cut short resets its stream and leaves the
+    /// connection open, so this does not answer for that.
+    fn can_send(&self) -> bool {
+        self.connection.close_reason().is_none()
+    }
 }
 
 /// A send-only handle on a control stream.

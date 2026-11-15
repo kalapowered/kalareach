@@ -597,10 +597,11 @@ async fn one_connection_carries_one_session() {
     serving.abort();
 }
 
-/// The paired transport answers "closed" for this side's close alone. A host that closes the
-/// connection is not this side closing it: the session's read loop reads what the host sent first,
-/// a refusal included, and ends the session after it, so a send that fails on such a connection
-/// must not record the end ahead of that.
+/// The paired transport answers "closed" for this side's close alone, and "can send" for neither
+/// side's close. A host that closes the connection is not this side closing it: the session's read
+/// loop reads what the host sent first, a refusal included, and ends the session after it, so a
+/// send that fails on such a connection must not record the end ahead of that. Nothing can be
+/// written on that connection all the same, and a call is not admitted on it.
 #[tokio::test]
 async fn a_connection_that_the_host_closed_is_not_one_that_this_side_closed() {
     let host = side(1, true).await;
@@ -629,6 +630,10 @@ async fn a_connection_that_the_host_closed_is_not_one_that_this_side_closed() {
         !kr_client::transport::ControlTransport::is_closed(&closed_by_the_host),
         "the host closed the connection and this side did not"
     );
+    assert!(
+        !kr_client::transport::ControlTransport::can_send(&closed_by_the_host),
+        "nothing can be written on a connection that the host closed"
+    );
 
     script.closes_when_told.store(false, Ordering::Release);
     let standing = dial(&client, &host).await;
@@ -636,11 +641,146 @@ async fn a_connection_that_the_host_closed_is_not_one_that_this_side_closed() {
         !kr_client::transport::ControlTransport::is_closed(&standing),
         "a connection that stands has not been closed"
     );
+    assert!(
+        kr_client::transport::ControlTransport::can_send(&standing),
+        "a frame can be written on a connection that stands"
+    );
     kr_client::transport::ControlTransport::close(&standing);
     assert!(
         kr_client::transport::ControlTransport::is_closed(&standing),
         "this side closed the connection"
     );
+    assert!(
+        !kr_client::transport::ControlTransport::can_send(&standing),
+        "nothing can be written after this side closed the connection"
+    );
+    serving.abort();
+}
+
+/// The paired transport over a real connection, with its reader held until it is released: the
+/// time between the library recording the host's close and the session's read loop reading to the
+/// end of the control stream.
+#[derive(Debug)]
+struct HeldReader {
+    inner: NetworkTransport,
+    /// Lets the held reader read.
+    release_reader: tokio::sync::Notify,
+}
+
+impl kr_client::transport::ControlTransport for HeldReader {
+    fn connection_id(&self) -> kr_protocol::ids::ConnectionId {
+        self.inner.connection_id()
+    }
+
+    fn limits(&self) -> kr_protocol::hello::ReceiveLimits {
+        self.inner.limits()
+    }
+
+    fn initial_action_window(&self) -> kr_protocol::hello::ActionWindow {
+        self.inner.initial_action_window()
+    }
+
+    fn ended_by_this_device(&self) -> Option<ProtocolError> {
+        self.inner.ended_by_this_device()
+    }
+
+    fn send<'a>(
+        &'a self,
+        frame: &'a ControlFrame,
+    ) -> kr_client::transport::TransportFuture<'a, ()> {
+        self.inner.send(frame)
+    }
+
+    fn send_before<'a>(
+        &'a self,
+        frame: &'a ControlFrame,
+        not_after: tokio::time::Instant,
+        wanted: &'a (dyn Fn() -> bool + Send + Sync),
+    ) -> kr_client::transport::TransportFuture<'a, bool> {
+        self.inner.send_before(frame, not_after, wanted)
+    }
+
+    fn claim_receiver(&self) -> kr_client::error::Result<()> {
+        self.inner.claim_receiver()
+    }
+
+    fn recv(&self) -> kr_client::transport::TransportFuture<'_, Option<ControlFrame>> {
+        Box::pin(async move {
+            self.release_reader.notified().await;
+            self.inner.recv().await
+        })
+    }
+
+    fn stream_opener(&self) -> Option<Arc<dyn kr_client::transport::StreamOpener>> {
+        self.inner.stream_opener()
+    }
+
+    fn revoke_streams(&self) {
+        self.inner.revoke_streams();
+    }
+
+    fn close(&self) {
+        self.inner.close();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    fn can_send(&self) -> bool {
+        self.inner.can_send()
+    }
+}
+
+/// A call made after the host closed the connection, and before the session's read loop has read
+/// to its end, is refused as not sent: the library refuses every write once it records the close,
+/// so a call that was registered would be answered as not known. Nothing of the call is on the
+/// book, the refusal records no end of the session, and the read loop still records it.
+#[tokio::test]
+async fn a_call_made_after_the_host_closed_the_connection_is_refused_as_not_sent() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    script.closes_when_told.store(true, Ordering::Release);
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+
+    let transport = Arc::new(HeldReader {
+        inner: dial(&client, &host).await,
+        release_reader: tokio::sync::Notify::new(),
+    });
+    let session = Session::start(transport.clone()).expect("a session");
+    let composed = padded_request(&session, 0x73, 16).await;
+
+    script.close_now.notify_one();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while kr_client::transport::ControlTransport::can_send(transport.as_ref()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the host's close reaches the client");
+
+    let refused = session.send(&composed).await;
+    assert!(
+        matches!(refused, Err(ClientError::ConnectionEnded)),
+        "a call made after the host closed the connection is refused as not sent: {refused:?}"
+    );
+    assert!(
+        session.submitted_actions().await.is_empty(),
+        "nothing of the refused call is on the book"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), session.closed())
+            .await
+            .is_err(),
+        "the refusal at admission records no end of the session"
+    );
+
+    transport.release_reader.notify_one();
+    tokio::time::timeout(Duration::from_secs(30), session.closed())
+        .await
+        .expect("the read loop records the end");
+    session.close();
     serving.abort();
 }
 
