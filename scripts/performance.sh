@@ -134,8 +134,17 @@ echo
 # THEIR temporary folder, and that is now the run root. So the directory that the caller named (or,
 # where none is named, one that this run makes under its own temporary folder and says where it is)
 # is read here, before the temporary folder moves; the suites record under the run root; and what
-# they recorded is appended to the files of the directory that the caller named, on every way this
-# script ends and before the run root goes.
+# they recorded is appended to the files of the directory that the caller named as soon as each
+# measurement ends, so that a run that a time-out or a cancel cuts keeps what it had. The exit trap
+# appends what is left on every other way this script ends, and so does the end of the survivor
+# check, before the run root goes.
+#
+# The run root is made under the temporary variable as it is written. A written value that holds a
+# backslash or is relative is a mistake that the readers pass over, but this line does not: the run
+# root, and so the children's evidence directory, then stand where their readers refuse them, and
+# each measurement fails with the reader's words and records nothing. A relative value is read from
+# the repository root, where this script runs, and ends it at once where no such folder is there.
+# Nothing is written outside the run root and the caller's directory.
 # shellcheck source=scripts/lib/artifacts-dir.sh
 . "$root/scripts/lib/artifacts-dir.sh"
 kr_artifacts_dir
@@ -147,7 +156,8 @@ export KR_TEST_ARTIFACTS_DIR="$run_evidence"
 
 # Appends each record file that the suites made under the run root to the file of the same name in
 # the directory that the caller named, and removes it from the run root, so that a second call
-# keeps nothing twice. The suites write flat files of Markdown.
+# keeps nothing twice. The suites write flat files of Markdown. A name from the glob holds no
+# separator, so each write goes to a file directly inside the caller's directory.
 keep_evidence() {
   local file
   [ -d "$run_evidence" ] || return 0
@@ -223,17 +233,22 @@ measurement_in() {
   # The load at each edge of the measurement, so a figure can be read against what else the machine
   # was doing while it was taken.
   echo "  load average entering this measurement: $(load_average)"
-  local output
+  local output status=0 kept=0
   # The measurement prints its own conditions. `--nocapture` is what lets them reach this log.
-  if ! output="$(CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo test --release -p kr-worker \
-    "$target_flag" "$target" -- --ignored --exact --nocapture "$name" 2>&1)"; then
-    echo "$output"
-    echo "  load average leaving this measurement: $(load_average)"
+  output="$(CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo test --release -p kr-worker \
+    "$target_flag" "$target" -- --ignored --exact --nocapture "$name" 2>&1)" || status=$?
+  # Its records go to the caller's directory now, before anything else is done with its result.
+  keep_evidence || kept=1
+  echo "$output"
+  echo "  load average leaving this measurement: $(load_average)"
+  if [ "$status" -ne 0 ]; then
     echo "FAILED: $name failed: its own message above says why"
     return 1
   fi
-  echo "$output"
-  echo "  load average leaving this measurement: $(load_average)"
+  if [ "$kept" -ne 0 ]; then
+    echo "FAILED: the records of $name were not kept in $evidence"
+    return 1
+  fi
   if ! grep -q "measurement" <<<"$output"; then
     echo "FAILED: $name produced no measurement"
     return 1
