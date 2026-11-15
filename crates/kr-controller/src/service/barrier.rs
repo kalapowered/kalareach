@@ -778,6 +778,71 @@ impl TaskHolds {
     }
 }
 
+/// What a test has armed a [`TaskPause`] with.
+#[cfg(test)]
+struct Armed {
+    task: tokio::task::Id,
+    arrived: Box<dyn FnOnce() + Send>,
+    go: std::sync::mpsc::Receiver<()>,
+}
+
+/// A point in a task's run that holds the daemon through [`while_held`], where a test stops one
+/// named task: between the two counts of its look at whether it is the daemon's last holder, or
+/// after its work is over and before it leaves the count.
+///
+/// The task says there that it has arrived and waits until the test lets it go. The wait holds
+/// the thread, because the look holds the task count there and cannot await. A test that stops a
+/// task here therefore does not wait on the runtime's timers while the task stands: the thread it
+/// holds may be the one that drives them. Armed for one task and for one arrival, so no other
+/// task is stopped by it, whichever of them gets there first.
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct TaskPause(std::sync::Mutex<Option<Armed>>);
+
+#[cfg(test)]
+impl TaskPause {
+    /// Arms the pause for `task`'s next arrival. `arrived` is called when the task is there.
+    /// Returns the end that lets the task go on.
+    pub(super) fn arm_for(
+        &self,
+        task: tokio::task::Id,
+        arrived: impl FnOnce() + Send + 'static,
+    ) -> std::sync::mpsc::SyncSender<()> {
+        let (release, go) = std::sync::mpsc::sync_channel(1);
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Armed {
+            task,
+            arrived: Box::new(arrived),
+            go,
+        });
+        release
+    }
+
+    /// Waits here when the pause is armed for the task that has arrived.
+    fn wait(&self) {
+        let armed = {
+            let mut slot = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot
+                .as_ref()
+                .is_some_and(|armed| tokio::task::try_id() == Some(armed.task))
+            {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(armed) = armed {
+            (armed.arrived)();
+            let _ = armed.go.recv();
+        }
+    }
+}
+
 /// One task's place in [`TaskHolds`], given up before the task lets go of the daemon.
 struct TaskHold(Arc<TaskHolds>);
 
@@ -815,12 +880,22 @@ pub(super) async fn while_held<T>(
     looks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
-            done = &mut working => return Some(done),
+            done = &mut working => {
+                #[cfg(test)]
+                controller.before_a_task_leaves_the_count.wait();
+                return Some(done);
+            }
             _ = looks.tick() => {
-                // The count is taken first and kept while the daemon's own is read, so that a task
-                // that begins in between waits for this look to end.
+                // The count is taken first, so that a task that begins in between can only make
+                // this look see more holders than tasks: it takes the daemon before it counts
+                // itself. The count's guard is kept while the daemon's own count is read, for a
+                // task that ENDS in between: it takes itself out of the count first and lets go
+                // of the daemon after. Read without the guard, the count would still include that
+                // task while the daemon's no longer does, and the look would take the owner for
+                // one of the tasks. Kept, the ending task waits at the guard until this look has
+                // read both.
                 let tasks = controller.task_holds.count();
-                #[cfg(any(test, feature = "testing"))]
+                #[cfg(test)]
                 controller.between_the_task_counts.wait();
                 if Arc::strong_count(&controller) <= *tasks {
                     return None;
