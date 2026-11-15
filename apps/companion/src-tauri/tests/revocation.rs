@@ -34,7 +34,7 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{AuthorisationKey, Nullable, Signature64, TimestampMs, Uuid};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 use kr_protocol::sharing::{DeviceListResult, DeviceSummary};
-use kr_service_stand_in::{Moment, Served, serve};
+use kr_service_stand_in::{Moment, Served, serve, short_budget};
 use net_support::{Device, Host, pair_with, proposal};
 use serde_json::{Value, json};
 use support::{Companion, LinkControl, StubIntake, govern};
@@ -1383,6 +1383,50 @@ async fn a_record_that_cannot_be_used_is_left_as_found_and_nothing_is_acknowledg
     }
 }
 
+/// KR-REQ-17.48: a service with no managed capacity for a new mailbox says so with the delay it asks
+/// for and the alternatives that still work. The screen is told it is a stop for want of capacity,
+/// with every alternative as the service wrote it, and it stays one for as long as the delay is
+/// owed, by every look, which sends nothing meanwhile. A refusal that names none is a wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_17_48_a_service_with_no_capacity_for_a_new_mailbox_is_a_stop_for_capacity() {
+    let rig = Rig::start_reading_the_mailbox().await;
+    let named = [
+        "A mailbox service that you run yourself.",
+        "A path this version has never heard of.",
+    ];
+    rig.served.web().fail(
+        "/api/mailbox/read",
+        1,
+        short_budget(429, "RATE_LIMITED", 120, &named),
+    );
+
+    let first = mailbox_after_a_look(&rig).await;
+    assert_eq!(first["stopped"], json!("capacity"));
+    assert_eq!(first["alternatives"], json!(named));
+    let asked = rig.served.web().requests_to("/api/mailbox/read");
+
+    let second = mailbox_after_a_look(&rig).await;
+    assert_eq!(second["stopped"], json!("capacity"));
+    assert_eq!(second["alternatives"], json!(named));
+    assert_eq!(
+        rig.served.web().requests_to("/api/mailbox/read"),
+        asked,
+        "nothing was sent while the service asked to be left alone"
+    );
+
+    // A refusal that names none is a wait, and says no alternatives.
+    let elsewhere = serve().await;
+    elsewhere.web().fail(
+        "/api/mailbox/read",
+        1,
+        short_budget(503, "SERVICE_UNAVAILABLE", 120, &[]),
+    );
+    rig.sync_service_is(elsewhere.origin());
+    let wait = mailbox_after_a_look(&rig).await;
+    assert_eq!(wait["stopped"], json!("waiting"));
+    assert_eq!(wait["alternatives"], json!([]));
+}
+
 /// A service that asks to be left alone is left alone for as long as it asked, by every look, and
 /// the screen says so, from the look that was told. Each service is held to its own delay: one that
 /// asked this computer to wait is not asked while another service is read and this computer comes
@@ -2489,6 +2533,7 @@ fn the_view_native_code_gives_the_screen_is_the_view_the_page_reads() {
             last_read_ms: Some(1_700_000_000_000),
             announcements: 2,
             stopped: Some(companion_tauri::mailbox::Stopped::Unreachable),
+            alternatives: Vec::new(),
         },
         hosts: vec![here, studio, attic],
     };

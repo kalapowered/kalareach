@@ -1200,7 +1200,7 @@ export function fakeHost(
   let revocation: RevocationView = {
     ceremony: 'touch_id',
     feed_origin: 'reach.kala.to',
-    mailbox: { last_read_ms: null, announcements: 0, stopped: null },
+    mailbox: { last_read_ms: null, announcements: 0, stopped: null, alternatives: [] },
     hosts: []
   }
   const revocationAsked: string[] = []

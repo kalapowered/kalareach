@@ -68,7 +68,12 @@ function view(hosts: readonly RevocationHost[], over: Partial<RevocationView> = 
   return {
     ceremony: 'touch_id',
     feed_origin: 'reach.kala.to',
-    mailbox: { last_read_ms: Date.UTC(2026, 9, 18, 9, 32), announcements: 0, stopped: null },
+    mailbox: {
+      last_read_ms: Date.UTC(2026, 9, 18, 9, 32),
+      announcements: 0,
+      stopped: null,
+      alternatives: [],
+    },
     hosts,
     ...over
   }
@@ -477,7 +482,9 @@ describe('reading the mailbox where hosts announce', () => {
 
     act(() => {
       controls.revocation.change(
-        view([host()], { mailbox: { last_read_ms: null, announcements: 0, stopped: 'unreachable' } })
+        view([host()], {
+          mailbox: { last_read_ms: null, announcements: 0, stopped: 'unreachable', alternatives: [] },
+        })
       )
     })
     await userEvent.setup().click(screen.getByTestId('devices-refresh'))
@@ -489,6 +496,32 @@ describe('reading the mailbox where hosts announce', () => {
     await waitFor(() => {
       expect(screen.getByTestId('devices-heard')).toHaveTextContent('could not read its mailbox')
     })
+  })
+})
+
+describe('reading the mailbox where the service has no capacity for a new one', () => {
+  it('says it is a limit of the service, then the alternatives as the service wrote them, and no delay', async () => {
+    const { controls } = screenOf(view([host()]))
+    await rowOf('the-phone')
+
+    act(() => {
+      controls.revocation.change(
+        view([host()], {
+          mailbox: {
+            last_read_ms: null,
+            announcements: 0,
+            stopped: 'capacity',
+            alternatives: ['A path of its own.', 'A second path of its own.'],
+          },
+        })
+      )
+    })
+    await userEvent.setup().click(screen.getByTestId('devices-refresh'))
+    const line = await screen.findByTestId('devices-mailbox')
+    expect(line).toHaveTextContent(
+      'The sync service has no managed capacity for new mailboxes now, which is a limit of the service and not a fault of this computer. Until then: A path of its own. A second path of its own. Answers to revocations are still read from each feed.'
+    )
+    expect(line).not.toHaveTextContent(/delay|minute|second |hour/i)
   })
 })
 
