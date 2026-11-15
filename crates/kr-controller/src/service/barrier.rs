@@ -1151,10 +1151,13 @@ impl Controller {
     ///
     /// Under [`NoticeLimit::Before`], a deadline, a notice begins only when a whole exchange's time is
     /// left before it, and ends by it: that is asked as each begins, the first and each after the
-    /// wait for the registry that follows an earlier acknowledgement, which the deadline ends too.
-    /// Where a notice cannot begin, nothing more is sent and the link goes back whole, here, since
-    /// what was sent before was answered to its end. The answer is [`Told::Failed`], and the caller
-    /// does not put the link back again.
+    /// wait for the registry that follows an earlier acknowledgement. That wait ends a whole
+    /// exchange's time before the deadline, the last instant a notice could begin after it, and
+    /// the link goes back there; the write it waits for may finish, with the slot still held,
+    /// until the deadline. Where a notice cannot
+    /// begin, nothing more is sent and the link goes back whole, here, since what was sent before
+    /// was answered to its end. The answer is [`Told::Failed`], and the caller does not put the
+    /// link back again.
     ///
     /// Each is a revision of its own, acknowledged as one ([`Self::note_earlier_acknowledgement`]).
     /// All are recorded as announced before any is sent, and with them what the result of each reads
@@ -1200,8 +1203,21 @@ impl Controller {
             let noted = self.note_earlier_acknowledgement(session_id, binding, ack);
             match limit {
                 NoticeLimit::Before(until) => {
-                    if tokio::time::timeout_at(until, noted).await.is_err() {
+                    // The telling's own limit and the bound of the ask end at `until` too. The
+                    // link goes back here, a whole exchange's time before it, where no notice can
+                    // begin any more: no frame is on the wire, and which of those timers the
+                    // runtime sees first decides nothing. The write of the row may still finish,
+                    // with the slot held, until `until`.
+                    let mut noted = std::pin::pin!(noted);
+                    let no_notice_after = until
+                        .checked_sub(WORKER_EXCHANGE)
+                        .unwrap_or_else(tokio::time::Instant::now);
+                    if tokio::time::timeout_at(no_notice_after, &mut noted)
+                        .await
+                        .is_err()
+                    {
                         link.give_back();
+                        let _ = tokio::time::timeout_at(until, &mut noted).await;
                         return Told::Failed;
                     }
                 }

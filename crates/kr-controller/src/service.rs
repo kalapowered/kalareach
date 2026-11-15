@@ -1794,6 +1794,10 @@ mod a_result_the_lease_ended_over;
 #[cfg(test)]
 mod a_link_that_is_not_given_back;
 
+/// A telling's wait for the registry between two notices, which ends before the limits around it.
+#[cfg(test)]
+mod a_telling_whose_wait_ends_before_its_limits;
+
 /// A dispatch lease that runs out while its action waits at a real worker.
 #[cfg(test)]
 mod a_lease_that_runs_out_at_a_worker;
