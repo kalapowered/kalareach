@@ -12245,6 +12245,20 @@ impl UpstreamHandoff {
         self.broker.abandon(&self.admitted);
     }
 
+    /// The broker's checks, to be asked on the thread that makes the transport's call, immediately
+    /// before it.
+    fn rechecked_before_submit(
+        &self,
+    ) -> impl FnOnce(
+        &crate::broker::UpstreamRequest,
+    ) -> std::result::Result<(), crate::broker::BrokerError>
+    + Send
+    + 'static {
+        let broker = Arc::clone(&self.broker);
+        let against = self.admitted.admitted_against();
+        move |request| broker.recheck_before_submit(&against, request)
+    }
+
     /// Carries the admitted operation to its upstream and encodes what the upstream did, or stops
     /// waiting at `deadline`.
     ///
@@ -12280,7 +12294,12 @@ impl UpstreamHandoff {
         match self.kind {
             UpstreamKind::Mutation => {
                 let taken = self.broker.take_mutation(&self.admitted)?;
-                let pending = submit_within(taken.transmission(), deadline).await?;
+                let pending = submit_within(
+                    taken.transmission(),
+                    deadline,
+                    self.rechecked_before_submit(),
+                )
+                .await?;
                 *late = pending.late_handle();
                 let flight = taken.submitted(pending);
                 encode(&within(deadline, flight.settled()).await??)
@@ -12291,7 +12310,12 @@ impl UpstreamHandoff {
             }
             UpstreamKind::PluginAction => {
                 let taken = self.broker.take_plugin_action(&self.admitted)?;
-                let pending = submit_within(taken.transmission(), deadline).await?;
+                let pending = submit_within(
+                    taken.transmission(),
+                    deadline,
+                    self.rechecked_before_submit(),
+                )
+                .await?;
                 *late = pending.late_handle();
                 let flight = taken.submitted(pending);
                 encode(&within(deadline, flight.settled()).await??)
@@ -12310,7 +12334,7 @@ impl UpstreamHandoff {
 /// Carries one admitted answer to its upstream, settling its resource with what the transport
 /// says, or as uncertain when `deadline` passes first.
 async fn answer_within(
-    broker: &crate::broker::Broker,
+    broker: &Arc<crate::broker::Broker>,
     admitted: &crate::broker::MutationAdmission,
     now: kr_protocol::scalars::TimestampMs,
     deadline: tokio::time::Instant,
@@ -12319,7 +12343,14 @@ async fn answer_within(
     let marked = broker.mark_approval(admitted, now)?;
     // On a refusal or at the deadline `marked` is dropped here, which leaves the resource
     // uncertain before the caller is told anything.
-    let pending = match submit_within(marked.transmission(), deadline).await {
+    let against = admitted.admitted_against();
+    let rechecked = {
+        let broker = Arc::clone(broker);
+        move |request: &crate::broker::UpstreamRequest| {
+            broker.recheck_before_submit(&against, request)
+        }
+    };
+    let pending = match submit_within(marked.transmission(), deadline, rechecked).await {
         Ok(pending) => pending,
         Err(error) => {
             drop(marked);
@@ -12343,8 +12374,18 @@ async fn submit_within(
         crate::broker::UpstreamRequest,
     ),
     deadline: tokio::time::Instant,
+    recheck: impl FnOnce(
+        &crate::broker::UpstreamRequest,
+    ) -> std::result::Result<(), crate::broker::BrokerError>
+    + Send
+    + 'static,
 ) -> Result<crate::broker::PendingTransmission> {
-    let submitting = tokio::task::spawn_blocking(move || dispatch.submit(&request));
+    // The broker's checks are asked once more on the thread that makes the call, with nothing but
+    // the call after them: the hop to this thread waits for the blocking pool.
+    let submitting = tokio::task::spawn_blocking(move || {
+        recheck(&request)?;
+        dispatch.submit(&request)
+    });
     match tokio::time::timeout_at(deadline, submitting).await {
         Ok(Ok(submitted)) => Ok(submitted?),
         Ok(Err(_)) => Err(WorkerError::Broker(

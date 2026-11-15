@@ -147,9 +147,10 @@ pub use crate::broker::listener::{
     BridgeHello, ListenerAddress, Registration, reject_browser_origin,
 };
 pub use crate::broker::methods::{
-    ActionInFlight, AnswerInFlight, Caller, MarkedAnswer, MutationAdmission, MutationInFlight,
-    PendingTransmission, RegisteredAction, Responsible, SnapshotPart, TakenAction, TakenMutation,
-    UpstreamBody, UpstreamDispatch, UpstreamOutcome, UpstreamRequest, command, subject,
+    ActionInFlight, AdmittedAgainst, AnswerInFlight, Caller, MarkedAnswer, MutationAdmission,
+    MutationInFlight, PendingTransmission, RegisteredAction, Responsible, SnapshotPart,
+    TakenAction, TakenMutation, UpstreamBody, UpstreamDispatch, UpstreamOutcome, UpstreamRequest,
+    command, subject,
 };
 pub use crate::broker::process::{
     BrokerTransport, Credential, ManagedProcess, SourceFrame, TransportHandle,
@@ -1041,6 +1042,11 @@ pub struct Broker {
     /// host's own tests.
     #[cfg(feature = "testing")]
     marker_pause: Mutex<Option<channels::WritePause>>,
+    /// Where this host's own tests stop the transport's call that takes an operation, on the thread
+    /// that makes it, before the broker's checks are asked once more. Compiled away in every shipped
+    /// build.
+    #[cfg(feature = "testing")]
+    submit_pause: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 /// The two ends of one armed pause: what says the recovery arrived, and what lets it go on.
@@ -1190,6 +1196,8 @@ impl Broker {
             channel_write_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
             marker_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            submit_pause: Mutex::new(None),
         })
     }
 
@@ -2516,6 +2524,39 @@ impl Broker {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
         (watch, release)
+    }
+
+    /// Stops the next call that takes an operation at the transport, on the thread that makes it,
+    /// before the broker's checks are asked once more, for this host's own tests: the operation is
+    /// admitted, its permit is taken and nothing has gone.
+    ///
+    /// Returns the end that says the call has arrived there and the end that lets it go on. It is
+    /// compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_submit(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (arrived, watch) = std::sync::mpsc::channel();
+        let (release, go) = std::sync::mpsc::channel();
+        *self
+            .submit_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Waits, blocking this thread, at an armed pause before the transport's call.
+    #[cfg(feature = "testing")]
+    pub(crate) fn at_submit_pause(&self) {
+        let armed = self
+            .submit_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.recv();
+        }
     }
 
     /// Waits at an armed pause before an answer's dispatch marker, for this host's own tests.
