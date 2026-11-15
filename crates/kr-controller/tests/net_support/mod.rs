@@ -15,6 +15,7 @@ pub mod environment;
 pub mod lane;
 pub mod pairing;
 pub mod room;
+pub mod typing;
 pub mod worker;
 
 use std::path::{Path, PathBuf};
