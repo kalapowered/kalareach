@@ -552,7 +552,10 @@ const fn attempt_words(attempt: AccountAttempt) -> &'static str {
         }
         AccountAttempt::PortBusy => "another program held the loopback address",
         AccountAttempt::TimedOut => "nothing came back in time",
-        AccountAttempt::NotKept => "this host's secret store failed, so it could not keep it",
+        AccountAttempt::NotKept => {
+            "this host did not keep it: its secret store failed, or its authority for the sign-in \
+             ended"
+        }
         AccountAttempt::Unreachable => "the service could not be reached",
         AccountAttempt::Superseded => "a newer attempt ended it",
         AccountAttempt::ListenerFailed => "the loopback address could not be opened",
