@@ -773,6 +773,8 @@ impl InputDomain {
     }
 
     /// Takes the lease for an attachment, and returns what the ending lease had queued.
+    ///
+    /// The caller holds the session's guard, as for every change of the lease.
     pub(crate) fn acquire(
         &mut self,
         attachment_id: AttachmentId,
@@ -783,11 +785,15 @@ impl InputDomain {
 
     /// Releases the lease held by an attachment at an epoch, and returns what it had queued, or
     /// nothing when the caller does not hold it.
+    ///
+    /// The caller holds the session's guard, as for every change of the lease.
     pub(crate) fn release(&mut self, attachment_id: AttachmentId, epoch: u64) -> Option<u64> {
         self.lease.release(attachment_id, epoch)
     }
 
     /// Releases the lease when the attachment holds it, and returns what it had queued.
+    ///
+    /// The caller holds the session's guard, as for every change of the lease.
     pub(crate) fn release_attachment(&mut self, attachment_id: AttachmentId) -> u64 {
         self.lease.release_attachment(attachment_id)
     }
@@ -817,6 +823,8 @@ impl InputDomain {
     /// release took and the delimiter prefix the framer dropped. The window ends here and its
     /// lane is told at [`Self::settle_ending`], which adds what the root editor's machine held,
     /// so the notice carries the whole count.
+    ///
+    /// The caller holds the session's guard, as for every change of the lease.
     pub(crate) fn end_lease(&mut self, base: u64) -> LeaseEnded {
         // An ending an earlier hold kept open is told as it stands: its count cannot grow now.
         if let Some(stale) = self.ending.take() {
@@ -1799,14 +1807,12 @@ impl InputDomain {
             .held_input_bytes
             .saturating_add(effects.held_added)
             .saturating_sub(effects.held_removed);
-        if effects.discarded_bytes > 0 && effects.lease_acknowledged.is_none() {
+        let unacknowledged = effects.unacknowledged_discard();
+        if unacknowledged > 0 {
             // Input this session accepted and never delivered, with no answer to report it in. It
             // is carried until an acquire has somewhere to put it. A lease change *does* have an
             // answer, and its own acknowledgement carries the total, so it is not counted twice.
-            self.interrupted.bytes = self
-                .interrupted
-                .bytes
-                .saturating_add(effects.discarded_bytes);
+            self.carry_bytes(unacknowledged);
         }
         let mut applied = Applied {
             outcome: FenceOutcome {
@@ -1829,13 +1835,36 @@ impl InputDomain {
                 behind_a_session_step = !matches!(step, Step::EditorBusy(_));
                 // An attachment that is going is not typed at from this moment, whoever else takes
                 // the domain before the session removes it.
-                if let Step::RemoveAttachment(attachment_id) = &step {
-                    self.capabilities.remove(attachment_id);
+                if let Step::RemoveAttachment { attachment, .. } = &step {
+                    self.capabilities.remove(attachment);
                 }
                 applied.owed.push(step);
             }
         }
         applied
+    }
+
+    /// Carries out what the machine did when the holder's lease ended with the holder's removal
+    /// or the session's close, and tells the ending that the lease began what the machine
+    /// discarded.
+    ///
+    /// The machine drops the keys it held for that holder without a lease change to acknowledge
+    /// them, so [`Self::apply_effects`] only carries them to the next acquire. They are part of
+    /// what the end discarded all the same: the end's count has them once, here, and the carried
+    /// count has them once, there.
+    pub(crate) fn apply_effects_at_an_end(&mut self, effects: Effects) -> Applied {
+        let discarded = effects.unacknowledged_discard();
+        let applied = self.apply_effects(effects);
+        self.count_in_ending(discarded);
+        applied
+    }
+
+    /// Adds to the ending that this hold began what the machine discarded of the ended lease's
+    /// keys, which the carried count already holds.
+    pub(crate) fn count_in_ending(&mut self, discarded: u64) {
+        if let Some(ending) = self.ending.as_mut() {
+            ending.fenced = ending.fenced.saturating_add(discarded);
+        }
     }
 
     /// Counts what a step the session will carry out later holds, from now.
@@ -1885,7 +1914,7 @@ impl InputDomain {
             }
             Step::Send(frame) => self.send(frame),
             step @ (Step::EditorBusy(_)
-            | Step::RemoveAttachment(_)
+            | Step::RemoveAttachment { .. }
             | Step::Interrupt(_)
             | Step::CommandHook(..)) => return Err(step),
         }
@@ -2315,7 +2344,10 @@ mod tests {
         let effects = Effects {
             steps: vec![
                 Step::Write(Carried::plain(batch(b"before"))),
-                Step::RemoveAttachment(removed),
+                Step::RemoveAttachment {
+                    attachment: removed,
+                    discarded: 0,
+                },
                 Step::Write(Carried::plain(batch(b"after"))),
                 Step::Interrupt(kr_protocol::input::InterruptAction::NativeInterrupt),
             ],
@@ -2333,7 +2365,7 @@ mod tests {
             .owed
             .iter()
             .map(|step| match step {
-                Step::RemoveAttachment(_) => "remove",
+                Step::RemoveAttachment { .. } => "remove",
                 Step::Write(_) => "write",
                 Step::Interrupt(_) => "interrupt",
                 _ => "other",
@@ -2663,7 +2695,10 @@ mod tests {
         let effects = Effects {
             steps: vec![
                 editor_busy(removed),
-                Step::RemoveAttachment(removed),
+                Step::RemoveAttachment {
+                    attachment: removed,
+                    discarded: 0,
+                },
                 Step::Write(Carried::plain(batch(b"after"))),
             ],
             ..Effects::default()
@@ -2680,7 +2715,7 @@ mod tests {
                 applied.owed.as_slice(),
                 [
                     Step::EditorBusy(_),
-                    Step::RemoveAttachment(_),
+                    Step::RemoveAttachment { .. },
                     Step::Write(_)
                 ]
             ),
@@ -2700,7 +2735,10 @@ mod tests {
         assert!(input.capabilities(removed).is_some());
 
         let applied = input.apply_effects(Effects {
-            steps: vec![Step::RemoveAttachment(removed)],
+            steps: vec![Step::RemoveAttachment {
+                attachment: removed,
+                discarded: 0,
+            }],
             ..Effects::default()
         });
 
