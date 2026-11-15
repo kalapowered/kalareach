@@ -9661,9 +9661,15 @@ impl WorkerService {
     /// with the read and reaches back that far, and otherwise the rest of the read, which is
     /// metadata, is served without it. The daemon narrows a paired device's own read by the same
     /// rule.
+    ///
+    /// The session is taken for no longer than [`crate::published::TAKE_BOUND`]. A session that is
+    /// held longer, by a call that waits for a disk, is answered by
+    /// [`Self::session_read_while_held`].
     fn session_read(&self, params: &ParamsValue, caller: &Caller) -> Result<ParamsValue> {
         let params: SessionReadParams = parse(params)?;
-        let session = self.runtime.session();
+        let Some(session) = self.runtime.session_within(crate::published::TAKE_BOUND) else {
+            return self.session_read_while_held(&params);
+        };
         Self::check_session(&session, params.session_id)?;
         let running = session.state().is_running();
         let filter = caller.history_filter(Method::SessionRead.entry());
@@ -9692,6 +9698,27 @@ impl WorkerService {
                 &self.metrics_of(&session),
             ))
             .filter(|counted| !counted.is_empty()),
+        })
+    }
+
+    /// Answers `session.read` for a session that something else holds.
+    ///
+    /// The answer is the summary the session published, with the lifecycle state read from the
+    /// input domain and not from the summary: the summary is set a moment after a close is
+    /// admitted, and a read that copied its state could say that a session is live while it is
+    /// closing. It carries no session content, so a caller gets no more than the read that takes
+    /// the session would give it.
+    fn session_read_while_held(&self, params: &SessionReadParams) -> Result<ParamsValue> {
+        let summary = self.runtime.published().answer(self.runtime.input());
+        Self::check_owned_session(summary.session_id, params.session_id)?;
+        let running = summary.state.is_running();
+        encode(&SessionReadResult {
+            session: summary,
+            endpoint: Nullable(running.then(|| self.endpoint.as_text())),
+            launch_profile: Nullable::null(),
+            last_command_block: Nullable::null(),
+            outstanding_launches: Nullable::null(),
+            metrics: None,
         })
     }
 
@@ -10319,7 +10346,14 @@ impl WorkerService {
     ) -> Result<ParamsValue> {
         let actor_id = &caller.actor_id;
         let params: kr_protocol::receipt::ActionReadParams = parse(params)?;
-        let mut session = self.runtime.session();
+        // A receipt is read from the journal under the session. When the session is held for
+        // longer than a read waits, the journal is not reachable now, and the answer says so.
+        let Some(mut session) = self.runtime.session_within(crate::published::TAKE_BOUND) else {
+            return Err(WorkerError::JournalUnavailable {
+                detail: "the session did not answer in time, so no receipt could be read"
+                    .to_owned(),
+            });
+        };
         // A worker serves the receipts of the one session it owns. A read that names a session
         // names this one, as every other state recovery read does.
         if let Some(named) = params.session_id {

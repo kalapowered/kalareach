@@ -345,6 +345,9 @@ pub struct Session {
     /// Behind a lock of its own, which is taken after this session and never before it, so that what
     /// holds the session for as long as a disk call takes does not hold a keystroke.
     input: Arc<InputShared>,
+    /// The session's summary as it was last published, which a read that cannot take this session
+    /// answers from.
+    published: Arc<crate::published::PublishedSummary>,
     history: OutputHistory,
     hub: OutputHub,
     journal: Option<Journal>,
@@ -447,6 +450,11 @@ pub struct Session {
     /// When the first request to stop was made, for this host's own tests.
     #[cfg(feature = "testing")]
     stop_requested: Option<std::time::Instant>,
+    /// Where this host's own tests hold the session in the part of a close that follows its
+    /// admission, which is where the calls of the close that can wait for a disk are. Compiled
+    /// away in every shipped build.
+    #[cfg(feature = "testing")]
+    close_tail_stall: crate::testing::Stall,
     /// The session's live agent instances, and how many announcements it has made about them.
     agent_instances: AgentInstances,
     /// Why the last interrupt this session tried did not reach the foreground group.
@@ -719,9 +727,10 @@ impl Session {
             privacy.is_enabled() || unresolved,
             privacy.generation(),
         );
-        Ok(Self {
+        let session = Self {
             attachments: AttachmentTable::new(config.dimensions),
             input: InputShared::new(InputDomain::new(config.session_id)),
+            published: Arc::default(),
             pty,
             shell: None,
             history,
@@ -774,6 +783,8 @@ impl Session {
             foreground_reads: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "testing")]
             stop_requested: None,
+            #[cfg(feature = "testing")]
+            close_tail_stall: crate::testing::Stall::default(),
             agent_instances: AgentInstances::default(),
             interrupt_failed: None,
             reconsidered_at: (0, 0),
@@ -781,7 +792,9 @@ impl Session {
             projections: crate::snapshot::Bases::new(),
             trace: crate::trace::LockTrace::shared(),
             config,
-        })
+        };
+        session.publish_summary();
+        Ok(session)
     }
 
     /// Stops the next write of the session's output to its spool, for this host's own tests.
@@ -887,7 +900,7 @@ impl Session {
                 // What the session is, written where a reader can find it after this worker is
                 // gone. Without it a closed session is only a closure record, and the shell it ran,
                 // the directory it ran in and when it started are lost with the process.
-                let summary = self.summary();
+                let summary = self.publish_summary();
                 if let Some(journal) = self.journal.as_mut()
                     && let Err(error) = journal.record_session(&summary)
                 {
@@ -1654,7 +1667,7 @@ impl Session {
             && let Some(bound) = self.desktop.bound_binding()
         {
             self.config.desktop = bound;
-            let summary = self.summary();
+            let summary = self.publish_summary();
             if let Some(journal) = self.journal.as_mut()
                 && let Err(error) = journal.record_session(&summary)
             {
@@ -1742,7 +1755,7 @@ impl Session {
             return;
         }
         self.application = application;
-        let summary = self.summary();
+        let summary = self.publish_summary();
         if let Some(journal) = self.journal.as_mut()
             && let Err(error) = journal.record_session(&summary)
         {
@@ -1760,6 +1773,22 @@ impl Session {
         }
         self.application_state = state;
         true
+    }
+
+    /// Returns the summary this session last published outside its own lock, which a read that
+    /// cannot take the session answers from.
+    #[must_use]
+    pub fn published(&self) -> Arc<crate::published::PublishedSummary> {
+        Arc::clone(&self.published)
+    }
+
+    /// Renders the session for the wire and publishes what it rendered, so a read that cannot
+    /// take the session has it. Every place that builds the session's record again goes through
+    /// here.
+    fn publish_summary(&self) -> SessionSummary {
+        let summary = self.summary();
+        self.published.set(summary.clone());
+        summary
     }
 
     /// Renders the session for the wire.
@@ -4099,6 +4128,21 @@ impl Session {
         self.idle_sweep = interval;
     }
 
+    /// Holds the session in the next close, after the close has been admitted and before the
+    /// calls that follow the admission, until the second end returned is used or dropped, for
+    /// this host's own tests. The first end says that the close has arrived there. The wait
+    /// blocks its thread, as a call that waits for a disk does.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_next_close_tail_blocking(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.close_tail_stall.arm_blocking()
+    }
+
     /// Returns the process group the terminal has in the foreground, for the adoption watch: all a
     /// look reads while the root shell has the terminal.
     ///
@@ -5092,6 +5136,8 @@ impl Session {
                     owed.extend(input.apply_effects(effects).owed);
                 }
                 drop(input);
+                #[cfg(feature = "testing")]
+                self.close_tail_stall.stand();
                 // Nothing new is started inside a closing session, so no backend waits for one.
                 // The instances it is ending are announced as ended now, while every view is still
                 // attached, so no list this session keeps names a program it is ending. Retiring a
@@ -5107,6 +5153,10 @@ impl Session {
                 }
                 self.carry_out(owed, &mut FenceOutcome::default());
                 self.pump_replies();
+                // The admission is published last, after the calls above that can wait for a disk:
+                // until then the published summary is older than the domain's state, which a read
+                // that cannot take the session takes its answer's state from.
+                self.publish_summary();
                 CloseAcceptance {
                     state: SessionState::Closing,
                     durability: self.durability(),
@@ -5390,6 +5440,7 @@ impl Session {
         self.application_state = None;
         self.application = None;
         self.closure = Some(record.clone());
+        self.publish_summary();
         // Every attachment is told, behind whatever output it was still owed, and one that has not
         // subscribed yet is owed it until it does or leaves. This is the only place a session
         // becomes closed, so every closure reaches every attachment through here; and nothing is
