@@ -236,11 +236,13 @@ impl Controller {
                     .ok_or_else(|| ControllerError::PermissionDenied {
                         detail: "this host is stopping".to_owned(),
                     })?;
-            controller.check_fence()?;
+            // The lease is read first: reading it waits for the policy lock, which a policy commit
+            // holds across its storage writes, and the fence is read after that wait.
             controller
                 .local_hold(method)
                 .map(|_| ())
-                .map_err(ControllerError::from)
+                .map_err(ControllerError::from)?;
+            controller.check_fence()
         })
     }
 

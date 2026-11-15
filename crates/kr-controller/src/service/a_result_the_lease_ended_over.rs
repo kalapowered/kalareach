@@ -267,3 +267,133 @@ async fn a_reply_read_from_a_record_is_not_written_whole_when_a_fence_is_owed_be
         }
     }
 }
+
+/// KR-REQ-09.09, KR-REQ-17.54: a reply read from a record is asked the standing it passed under
+/// after the last lock that its check takes. The reading of the local owner's lease waits for the
+/// policy lock, which a policy commit holds across its storage writes, and a fence this host comes
+/// to owe in that wait stops the reply before the transport takes it, so the stored answer is
+/// never written: the caller is told the outcome is not shown. The control: with no fence the
+/// whole answer is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reply_read_from_a_record_is_not_written_when_a_fence_is_owed_while_the_lease_is_read() {
+    use kr_protocol::ids::{ActorId, ConnectionId};
+
+    for owed in [false, true] {
+        let (_temp, controller, mut writer, mut reader) = connected(false).await;
+        let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+        let revision = controller.policy().authority_revision();
+        controller.admitted_write().insert(
+            connection_id,
+            crate::service::AdmittedConnection::new(
+                ActorId::new("owner").expect("a principal"),
+                revision,
+            ),
+        );
+        let (arrived, go) = controller.pause_before_the_policy_lock();
+        let writing = {
+            let controller = Arc::clone(&controller);
+            tokio::spawn(async move {
+                let stood = controller
+                    .write_answer(
+                        &mut writer,
+                        StreamKind::Control,
+                        &result(),
+                        Some(Method::PrivacySet),
+                        REQUEST,
+                        Some(crate::given::local_door::FromARecord::for_a_case(
+                            connection_id,
+                            revision,
+                        )),
+                    )
+                    .await;
+                drop(writer);
+                stood
+            })
+        };
+        // The lease's reading has arrived at the policy lock, which is where it waits for a commit.
+        tokio::task::spawn_blocking(move || {
+            arrived.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await
+        .expect("the wait ends")
+        .expect("the lease is read for the reply");
+        controller.hold_fence(owed);
+        go.send(()).expect("the reading goes on");
+        let read = tokio::time::timeout(std::time::Duration::from_secs(30), reader.read_message())
+            .await
+            .expect("the daemon wrote or ended the connection");
+        controller.hold_fence(false);
+        writing.await.expect("the write ends");
+        if owed {
+            let Ok(ControlFrame::Response(response)) = read else {
+                panic!("the caller is told the outcome is not shown: {read:?}");
+            };
+            let Outcome::Error(told) = response.outcome else {
+                panic!("the stored answer reached the caller");
+            };
+            assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{told:?}");
+        } else {
+            assert_eq!(read.expect("the answer reads"), result(), "the control");
+        }
+    }
+}
+
+/// KR-REQ-09.09: a reply that says another request spent the identifier is told by the local door
+/// as it is while its standing holds, and is written under that standing, as a copy of a record
+/// is. A fence this host comes to owe between the telling and the write stops it, and the caller
+/// is told the refusal of the check that failed: the request had no effect of its own, so that is
+/// true, and an unknown outcome is not. The control: with no fence the conflict is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_conflict_the_local_door_told_is_written_as_the_checks_refusal_when_a_fence_is_owed() {
+    use crate::given::local_door::{ReplySink, Standing, told};
+    use crate::given::{Given, Settled};
+    use kr_protocol::ids::{ActorId, ConnectionId};
+
+    for owed in [false, true] {
+        let (_temp, controller, mut writer, mut reader) = connected(false).await;
+        let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+        let revision = controller.policy().authority_revision();
+        controller.admitted_write().insert(
+            connection_id,
+            crate::service::AdmittedConnection::new(
+                ActorId::new("owner").expect("a principal"),
+                revision,
+            ),
+        );
+        let conflict = ControlFrame::Response(Response {
+            request_id: REQUEST,
+            outcome: Outcome::Error(kr_protocol::error::ProtocolError::new(
+                ErrorCode::IdConflict,
+                "the identifier was used with another request",
+            )),
+        });
+        let reply = told(
+            Settled::of(Given::fresh(conflict.clone())),
+            &Standing::new(&controller, connection_id, Some(revision), REQUEST),
+        )
+        .await;
+        controller.hold_fence(owed);
+        assert!(
+            ReplySink::new(&mut writer, StreamKind::Control)
+                .write(&controller, reply, Some(Method::PrivacySet))
+                .await,
+            "the connection goes on"
+        );
+        controller.hold_fence(false);
+        let read = tokio::time::timeout(std::time::Duration::from_secs(30), reader.read_message())
+            .await
+            .expect("the daemon wrote an answer")
+            .expect("the answer reads");
+        if owed {
+            let ControlFrame::Response(response) = read else {
+                panic!("a response");
+            };
+            let Outcome::Error(told) = response.outcome else {
+                panic!("the stored conflict reached the caller");
+            };
+            assert_eq!(told.code, ErrorCode::PermissionDenied, "{told:?}");
+        } else {
+            assert_eq!(read, conflict, "the control");
+        }
+    }
+}
