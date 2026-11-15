@@ -94,6 +94,7 @@ pub mod plugin_runtime;
 pub mod privacy;
 pub mod projection;
 pub mod pty;
+pub mod published;
 pub mod questions;
 pub mod recovery;
 pub mod render;
