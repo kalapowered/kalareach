@@ -1191,13 +1191,15 @@ async fn a_repeat_of_a_revocation_says_so_when_the_worker_no_longer_holds_the_na
     drop(workers);
 }
 
-/// KR-REQ-09.12: a whole ask is cut at its bound, however long the names step after an
+/// KR-REQ-09.12: a whole ask is over by its bound, however long the names step after an
 /// acknowledgement takes.
 ///
 /// The worker acknowledges at once, and every page of names after the first takes four seconds,
 /// inside the page's own bound, so the pages that follow could take as long as there are pages. The
-/// ask ends at fifteen seconds, and the pass, which settles the fence when its asks have ended,
-/// settles it then.
+/// ask is over by fifteen seconds, and the pass, which settles the fence when its asks have ended,
+/// settles it then. The ask ends by returning before a page that does not fit in what is left of
+/// its time, which the next case reads; the bound itself is the backstop for the waits that no
+/// page's exchange covers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_whole_ask_ends_at_its_bound_though_the_pages_after_the_acknowledgement_go_on() {
     let Adopted {
