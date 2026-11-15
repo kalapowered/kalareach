@@ -1238,6 +1238,34 @@ fn a_temporary_variable_with_a_backslash_is_passed_over_as_a_root_off_windows() 
     }
 }
 
+/// A backslash in a link's target is a separator to PowerShell's own path commands off Windows, and
+/// the walk of its reader splits on it as they do. The value holds no backslash, `R/l` is a link
+/// to `out\y`, and `R/out` is a link out of the root, so PowerShell reaches `/etc/y/kr-evidence`
+/// and the reader refuses the value. A walk that read the target's backslash as a letter of a name
+/// would take `out\y` for one folder and return a path inside the root that PowerShell reads as a
+/// folder behind the link.
+#[cfg(unix)]
+#[test]
+fn the_powershell_walk_reads_a_backslash_in_a_links_target_as_a_separator() {
+    if powershell().is_none() {
+        return;
+    }
+    let temporary = tempfile::tempdir().expect("a temporary folder");
+    let root = real(temporary.path());
+    std::os::unix::fs::symlink("/etc", root.join("out")).expect("a link out of the root");
+    std::os::unix::fs::symlink(r"out\y", root.join("l"))
+        .expect("a link whose target holds a backslash");
+    let value = root.join("l").join("kr-evidence");
+    let reading = Reader::PowerShell.read(Some(value.as_os_str()), None);
+    assert_refused(
+        Reader::PowerShell,
+        &reading,
+        "a path through a link whose target holds a backslash",
+        OUTSIDE,
+    );
+    assert!(!Path::new("/etc/y/kr-evidence").exists());
+}
+
 /// Stands in for `uname` and `cygpath` so that the shell reader takes the branch that Git Bash runs,
 /// on a machine that has no Windows: `uname` says Git Bash, and `cygpath` maps `C:\x` to a folder
 /// under `$KR_FAKE_DRIVES/c` and back. The folder it returns is a stub's folder, so the case shows
