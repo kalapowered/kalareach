@@ -2767,6 +2767,36 @@ async fn the_remainder_of_a_batch_the_writer_abandons_at_its_deadline_is_counted
     rig.finish().await;
 }
 
+/// The service's dispatch boundary, held on a thread of its own: the guard is taken on one thread
+/// and has to be dropped on it, and a case's own thread is held up by awaits in between.
+struct DispatchHold {
+    release: std::sync::mpsc::Sender<()>,
+    holder: std::thread::JoinHandle<()>,
+}
+
+impl DispatchHold {
+    /// Takes the boundary and returns once it is held.
+    fn take(service: &Arc<WorkerService>) -> Self {
+        let (taken, held) = std::sync::mpsc::channel();
+        let (release, go) = std::sync::mpsc::channel::<()>();
+        let service = Arc::clone(service);
+        let holder = std::thread::spawn(move || {
+            let _boundary = service.hold_the_dispatch_boundary();
+            taken.send(()).expect("the case waits for the boundary");
+            let _ = go.recv();
+        });
+        held.recv_timeout(WAIT)
+            .expect("the dispatch boundary was taken");
+        Self { release, holder }
+    }
+
+    /// Lets the boundary go.
+    fn release(self) {
+        self.release.send(()).expect("the holder is waiting");
+        self.holder.join().expect("the holder ended");
+    }
+}
+
 /// KR-REQ-23.36: a host's answer never goes into a paste that a dropped batch was to close. The
 /// writer is part way through a paste when the authority behind it ends: the delivered part is
 /// what the application has, and the closing delimiter that the view sent after it, which the
@@ -2795,7 +2825,7 @@ async fn the_writer_ends_the_paste_it_abandons_part_way_before_a_reply_is_writte
     // The frame that closes the paste is accepted too, and the writer will not write it.
     lane.send(b"\x1b[201~").await;
     lane.accepted().await;
-    let boundary = rig.service.hold_the_dispatch_boundary();
+    let boundary = DispatchHold::take(&rig.service);
     until("the opening frame's authority ended", WAIT, || {
         kr_ipc::clock::boot_elapsed_ms() >= deadline
     })
@@ -2822,7 +2852,7 @@ async fn the_writer_ends_the_paste_it_abandons_part_way_before_a_reply_is_writte
             String::from_utf8_lossy(&rig.received()[rig.received().len().saturating_sub(24)..])
         )
     });
-    drop(boundary);
+    boundary.release();
 
     let notice = the_notice_after_the_room_came_back(&rig, &mut lane).await;
     let ended = notice.ended.0.expect("the notice says an epoch ended");
