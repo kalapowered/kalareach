@@ -264,8 +264,8 @@ fn about(seconds: u64) -> Shown {
 /// answer names one, then "Until then:" and each alternative as it wrote it.
 ///
 /// A line that has no service's words to say, or no alternative to list, is not this one, so this
-/// returns nothing for an answer that carries no alternative and for one with no words. The wait is
-/// said as at most a day, whatever the service named.
+/// returns nothing for an answer that carries no alternative with text and for one with no words.
+/// The wait is said as at most a day, whatever the service named.
 ///
 /// The three parts are the whole of what an answer gives a person, so no refusal as a whole is
 /// handed to this, and the guard on [`ServiceMessage`] stays with this crate's own readers.
@@ -279,6 +279,13 @@ pub fn told_capacity(
         return None;
     }
     let until_then = alternatives.until_then()?;
+    if alternatives
+        .as_given()
+        .iter()
+        .all(|item| item.as_str().trim().is_empty())
+    {
+        return None;
+    }
     let mut parts = vec![Shown::service(&ServiceMessage::from_refusal(
         message.to_owned(),
     ))];
@@ -515,7 +522,8 @@ mod tests {
 
     /// KR-REQ-17.48: what composes a capacity text and what recognises one agree: every text made
     /// from an answer with a list is recognised, whatever the wait and however many alternatives it
-    /// names, and a text that was not made from one is not. The lead-in is one constant.
+    /// names, and a text that was not made from one is not. An answer whose list has no entry with
+    /// text is not told at all. The lead-in is one constant.
     #[test]
     fn kr_req_17_48_every_capacity_text_that_is_composed_is_recognised_and_no_other_text_is() {
         let one = Alternatives::from_member(Some(serde_json::json!([DIRECT_INVITATION])));
@@ -543,6 +551,26 @@ mod tests {
         // The words of the service may be anything, a sentence of several lines included.
         let told = told_capacity("Two\nlines.", None, &one).expect("told");
         assert!(is_told_capacity(&told), "{told}");
+        // A list in which no entry has text names nothing a person can do, so the answer is not
+        // told as a capacity answer, whatever the wait; one entry with text is enough.
+        for no_text in [
+            serde_json::json!([""]),
+            serde_json::json!(["  "]),
+            serde_json::json!(["", " \t\n"]),
+        ] {
+            let blank = Alternatives::from_member(Some(no_text));
+            for wait in [None, Some(3600)] {
+                assert_eq!(told_capacity(WORDS, wait, &blank), None, "{wait:?}");
+            }
+        }
+        for mixed in [
+            serde_json::json!(["", "A path."]),
+            serde_json::json!(["A path.", " "]),
+        ] {
+            let mixed = Alternatives::from_member(Some(mixed));
+            let told = told_capacity(WORDS, Some(3600), &mixed).expect("told");
+            assert!(is_told_capacity(&told), "{told}");
+        }
 
         for not_composed in [
             "",
