@@ -912,7 +912,7 @@ fn deduplication_is_keyed_by_the_verified_actor_and_the_action_with_its_digest()
     assert_eq!(journal.len().expect("reads"), 2);
 }
 
-/// KR-REQ-09.08, KR-ACC-009 (the worker's half): a restart turns a dispatch marker with no
+/// KR-REQ-09.08, KR-REQ-09.09, KR-ACC-009 (the worker's half): a restart turns a dispatch marker with no
 /// authoritative outcome into `unknown`, and that identifier is never dispatched again.
 #[test]
 fn a_restart_turns_a_dispatch_marker_without_an_outcome_into_unknown_and_never_redispatches() {
@@ -4824,6 +4824,158 @@ fn recovery_rejects_an_accepted_intent_and_frees_what_it_held() {
         .expect("a receipt");
     assert_eq!(rejected.state, ReceiptState::Rejected);
     assert_eq!(rejected.reason.as_ref(), Some(&RejectionReason::Expired));
+}
+
+/// A journal in an environment of its own that a worker has not opened yet, with `prepare`'s
+/// records in it, and the worker's session as it opens the journal again.
+fn session_over_a_journal_prepared_by(
+    temp: &kr_ipc::testing::TempHost,
+    prepare: impl FnOnce(&mut Journal),
+) -> Session {
+    let environment = temp.environment();
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let path = environment.journal_database(session_id);
+    std::fs::create_dir_all(path.parent().expect("a parent")).expect("the journal directory");
+    {
+        let mut journal = Journal::open(&path).expect("a journal");
+        prepare(&mut journal);
+    }
+    Session::open(session_config(&environment, session_id)).expect("the worker opens its session")
+}
+
+/// KR-REQ-09.09: an accepted intent with no dispatch marker is rejected when the worker opens its
+/// session again, through the start itself and not through the journal's own call: the freshness it
+/// was admitted under cannot be proved after a restart, and the rejection is not undone later.
+#[test]
+fn a_worker_that_opens_its_session_again_rejects_an_accepted_intent_with_no_dispatch_marker() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let caller = actor("device:phone");
+    let mut session = session_over_a_journal_prepared_by(&temp, |journal| {
+        journal
+            .accept(&fresh(60, 60, 60))
+            .expect("an accepted intent with no marker");
+    });
+    let journal = session.journal_mut().expect("a journal");
+    let rejected = journal
+        .read(caller.clone(), action(60))
+        .expect("reads")
+        .expect("a receipt");
+    assert_eq!(rejected.state, ReceiptState::Rejected);
+    assert_eq!(rejected.reason.as_ref(), Some(&RejectionReason::Expired));
+    assert!(
+        journal
+            .mark_dispatching(caller, action(60), kr_ipc::now_ms())
+            .is_err(),
+        "a rejected identifier is never dispatched"
+    );
+}
+
+/// KR-REQ-09.09: a dispatch marker with no confirmed outcome reads as unknown when the worker opens
+/// its session again, and a repeat of the action dispatches nothing: it is answered with the
+/// receipt as it stands, and the journal refuses a second marker for the identifier.
+#[test]
+fn a_worker_that_opens_its_session_again_reads_a_marker_with_no_outcome_as_unknown_and_a_repeat_dispatches_nothing()
+ {
+    let temp = kr_ipc::testing::TempHost::create();
+    let caller = actor("device:phone");
+    let mut session = session_over_a_journal_prepared_by(&temp, |journal| {
+        journal
+            .accept(&fresh(61, 61, 61))
+            .expect("an accepted intent");
+        journal
+            .mark_dispatching(actor("device:phone"), action(61), kr_ipc::now_ms())
+            .expect("the marker is committed before the effect");
+    });
+    let journal = session.journal_mut().expect("a journal");
+    let unknown = journal
+        .read(caller.clone(), action(61))
+        .expect("reads")
+        .expect("a receipt");
+    assert_eq!(unknown.state, ReceiptState::Unknown);
+    assert_eq!(
+        unknown.error.as_ref().map(|error| error.code),
+        Some(ErrorCode::OutcomeUnknown)
+    );
+
+    let repeated = journal
+        .accept(&fresh(61, 61, 61))
+        .expect("a repeat of the action is a submission the journal knows");
+    assert!(
+        repeated.deduplicated,
+        "the repeat finds the action's receipt"
+    );
+    let still = journal
+        .read(caller.clone(), action(61))
+        .expect("reads")
+        .expect("a receipt");
+    assert_eq!(
+        still.state,
+        ReceiptState::Unknown,
+        "the repeat changed nothing"
+    );
+    assert!(
+        journal
+            .mark_dispatching(caller, action(61), kr_ipc::now_ms())
+            .is_err(),
+        "and the journal refuses a second marker for the identifier"
+    );
+}
+
+/// KR-REQ-09.09: a connection that is fenced after its mutation passed the entry check and before
+/// the mutation takes the dispatch barrier is refused by the barrier's own check of current
+/// authority, and nothing is carried out. The entry check cannot be what refuses it: it ran while
+/// the connection stood.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_fenced_after_its_mutations_entry_check_and_before_the_dispatch_barrier_is_refused_at_the_barrier()
+ {
+    let host = host().await;
+    let mut fenced = controller_client(&host).await;
+    let mutation = close_mutation(
+        &fenced,
+        &host,
+        DEFAULT_MUTATION_TTL.get(),
+        ParamsValue::empty(),
+    );
+    let (inside, release) = host.service.pause_before_the_boundary();
+    let sending = tokio::spawn(async move {
+        fenced
+            .send(&ControlFrame::Mutation(Box::new(mutation)))
+            .await
+            .expect("writes the mutation");
+        // The worker may end a fenced connection before it answers on it.
+        loop {
+            match fenced.recv().await {
+                Ok(ControlFrame::Response(response)) => return Some(response.outcome),
+                Ok(_) => {}
+                Err(_) => return None,
+            }
+        }
+    });
+    assert!(
+        tokio::task::spawn_blocking(move || {
+            inside
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .is_ok()
+        })
+        .await
+        .expect("the wait ends"),
+        "the mutation passed its entry check and waits for the barrier"
+    );
+    // A later connection of the same generation takes the authority, which fences this one.
+    let _current = controller_client(&host).await;
+    release.send(()).expect("the mutation goes on");
+    match sending.await.expect("the mutation ends") {
+        Some(Outcome::Ok(accepted)) => {
+            panic!("a connection fenced before the barrier cannot dispatch: {accepted:?}")
+        }
+        Some(Outcome::Error(error)) => assert_eq!(error.code, ErrorCode::PermissionDenied),
+        None => {}
+    }
+    assert_eq!(
+        host.service.runtime().state().as_str(),
+        "live",
+        "the close was not carried out"
+    );
 }
 
 /// A caller holding the outstanding limit can still cancel and still stop the session, because
