@@ -881,6 +881,84 @@ fn a_select_branch_that_only_drops_or_aborts_the_handle_is_not_a_join() {
 }
 
 #[test]
+fn a_name_that_a_select_handler_or_branch_binds_is_not_the_handle() {
+    let marked = joined_row("joined", "the select waits on it: join(serve on task)");
+    let serving = |branches: &str| {
+        daemon_with(&format!(
+            "async fn serve() {{\n\
+                 let task = tokio::spawn(work());\n\
+                 tokio::select! {{ {branches} }}\n\
+             }}\n"
+        ))
+    };
+
+    // A local of the handle's name that a branch's pattern or its handler binds is not the handle:
+    // awaiting it joins nothing, whatever else the handler does with the handle.
+    for branches in [
+        // The review's probe: the handler drops the handle and awaits a local of its name.
+        "result = tokio::signal::ctrl_c() => { drop(task); let task = async { result }; task.await?; }, () = other() => {}",
+        "Some(task) = jobs() => { task.await; }, () = other() => {}",
+        "() = stop() => { let task = jobs(); task.await; }",
+        "() = stop() => { let (first, task) = pair(); task.await; }",
+        "() = stop() => { let task: Handle = jobs(); task.await; }",
+        "() = stop() => { if let Some(task) = jobs() { task.await; } }",
+        "() = stop() => { while let Some(task) = jobs() { task.await; } }",
+        "() = stop() => { for task in jobs() { task.await; } }",
+        "() = stop() => { match jobs() { Some(task) => { task.await; } None => {} } }",
+        "() = stop() => { match jobs() { Some(task) => task.await, None => () } }",
+    ] {
+        let problems = problems_of(&serving(branches), &marked);
+        assert_eq!(problems.len(), 1, "{branches}: {problems:?}");
+        assert!(
+            problems[0].contains("does not await it there"),
+            "{branches}: {problems:?}"
+        );
+    }
+
+    // The handle is awaited where the name is not shadowed: before the local is made, in the
+    // `let` that makes it, after its scope has ended, in another arm, or under a guard that only
+    // mentions it.
+    for branches in [
+        "() = stop() => { task.await; let task = jobs(); drop(task); }",
+        "() = stop() => { let task = task.await; drop(task); }",
+        "() = stop() => { { let task = jobs(); drop(task); } task.await; }",
+        "() = stop() => { if let Some(task) = jobs() { drop(task); } task.await; }",
+        "() = stop() => { for task in jobs() { drop(task); } task.await; }",
+        "() = stop() => { match jobs() { Some(task) => drop(task), None => task.await } }",
+        "() = stop() => { match jobs() { Some(other) if task.is_finished() => { task.await; } _ => {} } }",
+        "Some(other) = jobs() => { task.await; }, () = stop() => {}",
+        "done = task => done, Some(task) = jobs() => { drop(task); }",
+    ] {
+        assert_eq!(
+            problems_of(&serving(branches), &marked),
+            Vec::<String>::new(),
+            "{branches}"
+        );
+    }
+
+    // A handle handed to another function: a local of the parameter's name is not the parameter.
+    let elsewhere = |branches: &str| {
+        daemon_with(&format!(
+            "async fn serve() {{ let task = tokio::spawn(work()); drive(task).await; }}\n\
+             async fn drive(task: Handle) {{ tokio::select! {{ {branches} }} }}\n"
+        ))
+    };
+    let marked = joined_row("joined", "awaited elsewhere: join(drive on task)");
+    assert_eq!(
+        problems_of(
+            &elsewhere("done = task => done, () = stop() => {}"),
+            &marked
+        ),
+        Vec::<String>::new()
+    );
+    let problems = problems_of(
+        &elsewhere("() = stop() => { let task = jobs(); task.await; }"),
+        &marked,
+    );
+    assert_eq!(problems.len(), 1, "{problems:?}");
+}
+
+#[test]
 fn a_handle_of_the_same_name_in_another_scope_is_not_the_join() {
     let both = roster_of(
         "crates/daemon/src/lib.rs | serve | tokio::spawn | first | 1 | joined | - | join(serve on task)\n\

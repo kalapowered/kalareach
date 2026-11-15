@@ -29,7 +29,18 @@
 //! (`let task = tokio::spawn(..)`) it also records that the name is awaited in the scope where it
 //! is bound, so that a second handle of the same name in another scope does not stand for it; a
 //! `joined` row's marker is checked against these. A method call by the name of a helper that no
-//! function of that name taking `self` defines is not a call of the helper. The last is the function paths of watched
+//! function of that name taking `self` defines is not a call of the helper.
+//!
+//! The names that a macro's tokens bind have their scopes as far as tokens show them, so that a
+//! local of the handle's name is not the handle: a `select!` branch's pattern binds for its handler;
+//! a `let` binds from the end of its statement to the end of its group; `if let`, `while let` and
+//! `for` bind in their block; a `match` arm's pattern binds in its arm. Awaiting a name bound so
+//! awaits neither the handle nor the parameter of that name. Every lower-case word of a pattern
+//! counts as a binding (a field's name too), which can hide a join from the roster's check and never
+//! invents one. What a macro's tokens still hide is a stated limit and no more: the parameters of a
+//! closure; a name that a nested macro or a `macro_rules!` expansion binds; an item (`fn`, `use`,
+//! `const`) that shadows a name; and a closure or a branch that nothing calls or takes, whose
+//! `.await` counts as awaited. The last is the function paths of watched
 //! crates that code outside them names: a path in an expression whose last segment is in lower
 //! case, with a name that a `use` brought in read as the path it stands for, and each glob import
 //! as the glob. A call through another function, and a method called on a value of one of those
@@ -466,6 +477,16 @@ struct Walker<'a> {
 struct Binding {
     name: String,
     handle: Option<usize>,
+    /// Whether a macro's tokens bind the name (a local of its own, never a handle or a parameter).
+    in_tokens: bool,
+}
+
+/// Names that tokens bind: the index of the token before which they come into scope, the names, and
+/// the index where their scope ends (none: at the end of the tokens' own group).
+struct Binder {
+    at: usize,
+    names: Vec<String>,
+    end: Option<usize>,
 }
 
 impl Walker<'_> {
@@ -666,11 +687,48 @@ impl Walker<'_> {
 
     fn scan_tokens(&mut self, stream: TokenStream, joins: bool) {
         let trees: Vec<TokenTree> = stream.into_iter().collect();
+        // The names that these tokens bind, from where a binder says to where its scope ends, or to
+        // the end of the tokens.
+        let level = self.bindings.len();
+        let mut binders: Vec<Binder> = Vec::new();
+        let mut scopes: Vec<(usize, usize)> = Vec::new();
         for (index, tree) in trees.iter().enumerate() {
+            while let Some(&(end, mark)) = scopes.last()
+                && index >= end
+            {
+                self.bindings.truncate(mark);
+                scopes.pop();
+            }
+            for binder in binders.iter().filter(|binder| binder.at == index) {
+                let mark = self.bindings.len();
+                for name in &binder.names {
+                    self.bindings.push(Binding {
+                        name: name.clone(),
+                        handle: None,
+                        in_tokens: true,
+                    });
+                }
+                if let Some(end) = binder.end {
+                    scopes.push((end, mark));
+                }
+            }
+            if is_arrow(&trees, index) {
+                binders.extend(arm_binder(&trees, index));
+            }
             match tree {
                 TokenTree::Group(group) => self.scan_tokens(group.stream(), joins),
                 TokenTree::Ident(ident) => {
                     let name = ident.to_string();
+                    if !is_punct(
+                        index.checked_sub(1).and_then(|before| trees.get(before)),
+                        '.',
+                    ) {
+                        match name.as_str() {
+                            "let" => binders.extend(let_binder(&trees, index)),
+                            "for" => binders.extend(for_binder(&trees, index)),
+                            _ => {}
+                        }
+                    }
                     if joins {
                         self.awaits(&name);
                     }
@@ -704,21 +762,27 @@ impl Walker<'_> {
                 _ => {}
             }
         }
+        self.bindings.truncate(level);
     }
 
     /// Records a name as awaited in the function being read, and the start whose handle that name
     /// holds in the scope where the name is awaited.
     fn awaits(&mut self, name: &str) {
-        self.scan
-            .awaits
-            .insert((slashed(&self.file), self.scope.join("::"), name.to_string()));
-        if let Some(handle) = self
+        let binding = self
             .bindings
             .iter()
             .rev()
-            .find(|binding| binding.name == name)
-            .and_then(|binding| binding.handle)
-        {
+            .find(|binding| binding.name == name);
+        // A name that a macro's tokens bind is a local of its own: awaiting it awaits neither the
+        // handle nor the parameter of that name.
+        if binding.is_some_and(|binding| binding.in_tokens) {
+            return;
+        }
+        let handle = binding.and_then(|binding| binding.handle);
+        self.scan
+            .awaits
+            .insert((slashed(&self.file), self.scope.join("::"), name.to_string()));
+        if let Some(handle) = handle {
             self.scan.joined.insert(handle);
         }
     }
@@ -758,7 +822,20 @@ impl Walker<'_> {
                 }
                 None => self.scan_trees(head, false),
             }
+            // The branch's pattern binds names for its handler, not for its future or its
+            // precondition.
+            let mark = self.bindings.len();
+            if let Some(equals) = equals {
+                for name in pattern_names(&head[..equals]) {
+                    self.bindings.push(Binding {
+                        name,
+                        handle: None,
+                        in_tokens: true,
+                    });
+                }
+            }
             self.scan_trees(&trees[after..handler_end.min(trees.len())], false);
+            self.bindings.truncate(mark);
             at = handler_end + usize::from(is_punct(trees.get(handler_end), ','));
         }
     }
@@ -1027,6 +1104,136 @@ fn flatten_use(
 }
 
 /// The names in tokens that are not a method or a field: an identifier not after a `.`.
+fn is_brace(tree: Option<&TokenTree>) -> bool {
+    matches!(tree, Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Brace)
+}
+
+fn is_word(tree: Option<&TokenTree>, word: &str) -> bool {
+    matches!(tree, Some(TokenTree::Ident(ident)) if ident == word)
+}
+
+/// Whether the tokens have a `:` of its own at this place, not part of a `::`.
+fn single_colon(trees: &[TokenTree], index: usize) -> bool {
+    is_punct(trees.get(index), ':')
+        && !is_punct(trees.get(index + 1), ':')
+        && !index
+            .checked_sub(1)
+            .is_some_and(|before| is_punct(trees.get(before), ':'))
+}
+
+/// The names that a pattern written as tokens binds: every lower-case word that is not a path's
+/// segment, a keyword of patterns or the `_`. This reads a field's name in a struct pattern as a
+/// binding too, which can only hide a join from the roster's check and never invent one.
+fn pattern_names(trees: &[TokenTree]) -> Vec<String> {
+    let mut names = Vec::new();
+    for (index, tree) in trees.iter().enumerate() {
+        match tree {
+            TokenTree::Group(group) => {
+                let inner: Vec<TokenTree> = group.stream().into_iter().collect();
+                names.extend(pattern_names(&inner));
+            }
+            TokenTree::Ident(ident) => {
+                let name = ident.to_string();
+                let after_path = index
+                    .checked_sub(1)
+                    .is_some_and(|before| is_punct(trees.get(before), ':'));
+                let before_path =
+                    is_punct(trees.get(index + 1), ':') && is_punct(trees.get(index + 2), ':');
+                let lower = name
+                    .chars()
+                    .next()
+                    .is_some_and(|first| first.is_lowercase() || first == '_');
+                if lower
+                    && !after_path
+                    && !before_path
+                    && !matches!(name.as_str(), "_" | "mut" | "ref" | "box" | "in" | "if")
+                {
+                    names.push(name);
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// The names that a `let` at `index` binds. A statement's names come into scope at the `;` that
+/// ends it and stay to the end of the tokens' group; the names of an `if let`, a `while let` or a
+/// `let` in a chain come into scope in the block that follows and stay in it.
+fn let_binder(trees: &[TokenTree], index: usize) -> Option<Binder> {
+    let before = index.checked_sub(1).and_then(|before| trees.get(before));
+    let conditional = is_word(before, "if") || is_word(before, "while") || is_punct(before, '&');
+    let ends = (index + 1..trees.len())
+        .find(|&at| lone_equals(trees, at) || is_punct(trees.get(at), ';'))
+        .unwrap_or(trees.len());
+    let pattern_end = (index + 1..ends)
+        .find(|&at| single_colon(trees, at))
+        .unwrap_or(ends);
+    let names = pattern_names(&trees[index + 1..pattern_end]);
+    if conditional {
+        let block = (ends..trees.len()).find(|&at| is_brace(trees.get(at)))?;
+        Some(Binder {
+            at: block,
+            names,
+            end: Some(block + 1),
+        })
+    } else {
+        let stop = (ends..trees.len())
+            .find(|&at| is_punct(trees.get(at), ';'))
+            .unwrap_or(trees.len());
+        Some(Binder {
+            at: stop,
+            names,
+            end: None,
+        })
+    }
+}
+
+/// The names that a `for` at `index` binds, in the block of its loop.
+fn for_binder(trees: &[TokenTree], index: usize) -> Option<Binder> {
+    if is_punct(trees.get(index + 1), '<') {
+        return None;
+    }
+    let block = (index + 1..trees.len()).find(|&at| is_brace(trees.get(at)))?;
+    let within = (index + 1..block).find(|&at| is_word(trees.get(at), "in"))?;
+    Some(Binder {
+        at: block,
+        names: pattern_names(&trees[index + 1..within]),
+        end: Some(block + 1),
+    })
+}
+
+/// The names that the pattern before the `=>` at `arrow` binds, in the arm that follows: a block, or
+/// what runs to the next `,`. A guard (`if ..`) is not part of the pattern.
+fn arm_binder(trees: &[TokenTree], arrow: usize) -> Option<Binder> {
+    let start = (0..arrow)
+        .rev()
+        .find(|&at| {
+            is_punct(trees.get(at), ',')
+                || (is_brace(trees.get(at))
+                    && at >= 2
+                    && is_punct(trees.get(at - 1), '>')
+                    && is_arrow(trees, at - 2))
+        })
+        .map_or(0, |at| at + 1);
+    let guard = (start..arrow)
+        .find(|&at| is_word(trees.get(at), "if"))
+        .unwrap_or(arrow);
+    let body = arrow + 2;
+    let end = if is_brace(trees.get(body)) {
+        body + 1
+    } else {
+        (body..trees.len())
+            .find(|&at| is_punct(trees.get(at), ','))
+            .unwrap_or(trees.len())
+    };
+    Some(Binder {
+        at: body,
+        names: pattern_names(&trees[start..guard]),
+        end: Some(end),
+    })
+}
+
 fn bare_names(stream: TokenStream) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     collect_names(stream, &mut names);
@@ -1849,6 +2056,7 @@ impl<'ast> Visit<'ast> for Walker<'_> {
         self.bindings.push(Binding {
             name: ident.ident.to_string(),
             handle: None,
+            in_tokens: false,
         });
         visit::visit_pat_ident(self, ident);
     }
