@@ -174,6 +174,47 @@ impl Service {
 const EARLIER_SIGN_IN_CANCELLED: &str = "The sign-in that was waiting for the browser was cancelled \
      before this request was refused, and it stays cancelled.";
 
+/// What the browser shows when the person completes a sign-in whose authority ended while it
+/// waited: nothing was signed in, and the service's issue is revoked (queued before it is sent, so
+/// the page does not say it was).
+const AUTHORITY_ENDED_PAGE: &str = "This host's authority for this sign-in ended while the sign-in \
+     waited for you. Nothing was signed in. The host revokes what the account service issued. To \
+     sign in, start again on the host.";
+
+/// What a waiting sign-in came to.
+#[derive(Clone, Copy)]
+enum Outcome {
+    /// One of the outcomes a report names.
+    Attempt(AccountAttempt),
+    /// The host's authority for the sign-in ended while it waited, so no grant was kept. It is
+    /// reported as a grant that was not kept ([`AccountAttempt::NotKept`]); the browser is told why.
+    AuthorityEnded,
+}
+
+impl Outcome {
+    /// What the account's report names.
+    const fn attempt(self) -> AccountAttempt {
+        match self {
+            Self::Attempt(attempt) => attempt,
+            Self::AuthorityEnded => AccountAttempt::NotKept,
+        }
+    }
+
+    /// What the browser is shown.
+    const fn page(self) -> &'static str {
+        match self {
+            Self::Attempt(attempt) => page(attempt),
+            Self::AuthorityEnded => AUTHORITY_ENDED_PAGE,
+        }
+    }
+}
+
+/// Whether the authority a sign-in was started under still stands, asked when the person completes
+/// it, after the request that started it has answered and its connection has ended. It asks the
+/// fence this host owes and the local owner's membership lease, and neither the request's deadline
+/// nor its connection.
+pub type Lasting = Arc<dyn Fn() -> Result<()> + Send + Sync>;
+
 /// What a finished attempt shows a person's browser.
 const fn page(outcome: AccountAttempt) -> &'static str {
     match outcome {
@@ -787,7 +828,11 @@ impl HostAccount {
     /// Returns why no sign-in can start: this host presents its account to no service, a sign-in is
     /// finishing, a managed call is open, another program holds the loopback address, or the request
     /// no longer stands.
-    pub async fn sign_in(&self, stands: Stands<'_>) -> Result<AccountSignInStarted> {
+    pub async fn sign_in(
+        &self,
+        stands: Stands<'_>,
+        lasting: Lasting,
+    ) -> Result<AccountSignInStarted> {
         let held = self.inner.presenting()?;
         if self.inner.a_call_is_open_after_settling().await {
             return Err(Inner::call_is_open());
@@ -853,7 +898,7 @@ impl HostAccount {
             let (cancel, cancelled) = watch::channel(false);
             let inner = Arc::clone(&self.inner);
             let task = tokio::spawn(async move {
-                inner.attempt(listener, pending, cancelled).await;
+                inner.attempt(listener, pending, cancelled, lasting).await;
             });
             *running = Some(Running {
                 owner: Arc::downgrade(&self.inner),
@@ -1241,13 +1286,14 @@ impl Inner {
         listener: Listener,
         mut pending: PendingAuthorisation,
         mut cancel: watch::Receiver<bool>,
+        lasting: Lasting,
     ) {
         let (outcome, reply) = tokio::select! {
             biased;
-            () = ended(&mut cancel) => (AccountAttempt::Superseded, None),
-            () = tokio::time::sleep(WAIT) => (AccountAttempt::TimedOut, None),
+            () = ended(&mut cancel) => (Outcome::Attempt(AccountAttempt::Superseded), None),
+            () = tokio::time::sleep(WAIT) => (Outcome::Attempt(AccountAttempt::TimedOut), None),
             (answer, callback) = listener.answered(&mut pending) => {
-                (self.answered(answer).await, Some(callback))
+                (self.answered(answer, &lasting).await, Some(callback))
             }
         };
         // The state is settled before the browser is told, so a page that says the sign-in ended
@@ -1255,40 +1301,42 @@ impl Inner {
         {
             let mut state = self.state.lock().expect("the sign-in state");
             state.phase = Phase::Idle;
-            state.last = Some(outcome);
+            state.last = Some(outcome.attempt());
         }
         if let Some(reply) = reply {
-            reply.finish(page(outcome)).await;
+            reply.finish(outcome.page()).await;
         }
     }
 
-    async fn answered(&self, answer: Answer) -> AccountAttempt {
+    async fn answered(&self, answer: Answer, lasting: &Lasting) -> Outcome {
         match answer {
             Answer::Granted(grant) => {
                 self.state.lock().expect("the sign-in state").phase = Phase::Finishing;
-                self.finish(&grant).await
+                self.finish(&grant, lasting).await
             }
-            Answer::Refused => AccountAttempt::Refused,
+            Answer::Refused => Outcome::Attempt(AccountAttempt::Refused),
             Answer::Failed(AnswerFault::ServiceFailure | AnswerFault::NoCode) => {
-                AccountAttempt::ServiceRefused
+                Outcome::Attempt(AccountAttempt::ServiceRefused)
             }
-            Answer::Failed(_) | Answer::Dropped(_) => AccountAttempt::NotForThisAttempt,
+            Answer::Failed(_) | Answer::Dropped(_) => {
+                Outcome::Attempt(AccountAttempt::NotForThisAttempt)
+            }
         }
     }
 
     /// Exchanges the code and keeps the grant.
-    async fn finish(&self, grant: &AuthorisationGrant) -> AccountAttempt {
+    async fn finish(&self, grant: &AuthorisationGrant, lasting: &Lasting) -> Outcome {
         let Ok(held) = self.presenting() else {
-            return AccountAttempt::Unreachable;
+            return Outcome::Attempt(AccountAttempt::Unreachable);
         };
         // A call closes under the account it started under. One that opened while the person was
         // in the browser ends this attempt before the code is spent, and the code expires unused.
         if self.a_call_is_open_after_settling().await {
-            return AccountAttempt::CallOpen;
+            return Outcome::Attempt(AccountAttempt::CallOpen);
         }
         if let Err(error) = self.recover().await {
             eprintln!("kr-controller: {error}");
-            return AccountAttempt::NotKept;
+            return Outcome::Attempt(AccountAttempt::NotKept);
         }
         match held.account.exchange(grant).await {
             Ok(Exchanged::Issued(issued)) => {
@@ -1306,8 +1354,23 @@ impl Inner {
                              the store failed: {error}"
                         );
                     }
-                    return AccountAttempt::CallOpen;
+                    return Outcome::Attempt(AccountAttempt::CallOpen);
                 };
+                // The sign-in waited for the person, up to the end of its time, and the authority
+                // it was started under can have ended in that wait: the fence this host owes and,
+                // on a host that is exclusively organisation-managed, the owner's lease. Where it
+                // no longer stands no grant is kept, and what the service issued is revoked, as a
+                // sign-out revokes it. The attempt holds the issue (the tokens the service gave
+                // for the spent code) and the account's gate here.
+                if lasting().is_err() {
+                    if let Err(error) = held.signed_in.revoke_unkept(refresh).await {
+                        eprintln!(
+                            "kr-controller: a sign-in's token was sent to the service, but the \
+                             store failed: {error}"
+                        );
+                    }
+                    return Outcome::AuthorityEnded;
+                }
                 match held.signed_in.keep(issued, grant.nonce()).await {
                     Ok(Commit::Kept) => {}
                     Ok(Commit::Unsettled) => {
@@ -1322,29 +1385,29 @@ impl Inner {
                              kept; the host is signed out, or the account is settled at its next \
                              start, sign-out or sign-in"
                         );
-                        return AccountAttempt::NotKept;
+                        return Outcome::Attempt(AccountAttempt::NotKept);
                     }
                     Err(error) => {
                         // The grant is not kept, so its token was ended: queued where the store
                         // allows, and sent once where it does not.
                         eprintln!("kr-controller: a host sign-in could not be kept: {error}");
-                        return AccountAttempt::NotKept;
+                        return Outcome::Attempt(AccountAttempt::NotKept);
                     }
                 }
                 if let Ok(IdentityRead::Disagreed) = held.signed_in.complete_identity().await {
-                    return AccountAttempt::NotForThisAttempt;
+                    return Outcome::Attempt(AccountAttempt::NotForThisAttempt);
                 }
-                AccountAttempt::SignedIn
+                Outcome::Attempt(AccountAttempt::SignedIn)
             }
             Ok(Exchanged::Refused { leftover }) => {
                 if let Some(leftover) = leftover {
                     let _ = held.signed_in.revoke_unkept(leftover).await;
                 }
-                AccountAttempt::ServiceRefused
+                Outcome::Attempt(AccountAttempt::ServiceRefused)
             }
             Err(error) => {
                 eprintln!("kr-controller: a host sign-in's code could not be exchanged: {error}");
-                AccountAttempt::Unreachable
+                Outcome::Attempt(AccountAttempt::Unreachable)
             }
         }
     }
