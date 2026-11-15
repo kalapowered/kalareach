@@ -131,13 +131,16 @@ impl Rig {
         let timer = HeldTimer::held();
         let owner = DeviceKeys::generate().expect("owner keys");
         let host_keys = DeviceKeys::generate().expect("host keys");
-        let host = Host::start_with_feed_keys(
-            &owner,
-            &host_keys,
-            served.origin(),
-            Arc::clone(&timer) as _,
-            clocks,
-            Some(LONG_FEED_DEADLINES),
+        let host = within(
+            "the host starts",
+            Host::start_with_feed_keys(
+                &owner,
+                &host_keys,
+                served.origin(),
+                Arc::clone(&timer) as _,
+                clocks,
+                Some(LONG_FEED_DEADLINES),
+            ),
         )
         .await;
         wait_for_the_passes(&host);
@@ -256,7 +259,11 @@ impl Rig {
         rights: &[ActionRight],
     ) -> (Device, kr_controller::service::net::devices::DeviceRecord) {
         let device = Device::create().await;
-        let record = pair_with(&self.host, &device, &self.owner, proposal(rights)).await;
+        let record = within(
+            "the device pairs",
+            pair_with(&self.host, &device, &self.owner, proposal(rights)),
+        )
+        .await;
         (device, record)
     }
 
@@ -298,10 +305,14 @@ impl Rig {
                 );
             }
         }
-        let stopped = host.shut_down().await;
+        let stopped = within("the daemon stops", host.shut_down()).await;
         edit(stopped.tree());
         let timer = HeldTimer::held();
-        let host = stopped.start_with_timer(Arc::clone(&timer) as _).await;
+        let host = within(
+            "the daemon starts again",
+            stopped.start_with_timer(Arc::clone(&timer) as _),
+        )
+        .await;
         wait_for_the_passes(&host);
         Self {
             host,
