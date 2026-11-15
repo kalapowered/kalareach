@@ -52,6 +52,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
 use kr_client::error::ClientError;
+use kr_client::services::Offered;
 use kr_client::services::authority::{
     AuthorityFeedClient, AuthorityFeedRecord, AuthorityFeedState, FeedAnnouncement, RejectionReason,
 };
@@ -60,6 +61,7 @@ use kr_client::services::{
 };
 use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
 use kr_crypto::sign::{SigningTranscript, sign};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::hostinfo::export::Sentence;
 use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus};
 use kr_protocol::ids::{AuthorityRevision, DeviceId, GrantId, RevocationRequestId};
@@ -142,6 +144,10 @@ enum Stopped {
     Unreachable,
     /// The feed turned a request back.
     Refused,
+    /// The service has no managed capacity for a new feed now and named the alternatives that
+    /// still work. That is a limit of the service. The carrier waits as it does for any delay, and
+    /// this only decides what it says.
+    Capacity(Offered),
     /// This host could not carry a request out or read its own records. The feed is not at fault.
     Local,
 }
@@ -164,7 +170,15 @@ impl Stopped {
                 if let Some(seconds) = retry_after_seconds {
                     quiet.owe(Duration::from_secs(*seconds));
                 }
-                Self::Refused
+                if matches!(
+                    error.code(),
+                    ErrorCode::RateLimited | ErrorCode::ServiceCapacity
+                ) && !error.alternatives().is_empty()
+                {
+                    Self::Capacity(error.alternatives().offered())
+                } else {
+                    Self::Refused
+                }
             }
             _ => Self::Unreachable,
         }
@@ -834,19 +848,41 @@ impl FeedRuntime {
                     ),
                 )
             } else if let Some(stopped) = observed.stopped {
-                let why = match stopped {
-                    Stopped::Unreachable => ", which could not be reached",
-                    Stopped::Refused => ", which turned a request back",
-                    Stopped::Local => ", which this host could not finish reading",
+                let waits = |why: &'static str| {
+                    (
+                        DoctorStatus::Warning,
+                        reads
+                            .clone()
+                            .stated(why)
+                            .stated("; ")
+                            .sentence(&synchronised),
+                        Some(
+                            "This host asks again by itself. Until the feed answers, what is \
+                             shown of remote revocations is stale.",
+                        ),
+                    )
                 };
-                (
-                    DoctorStatus::Warning,
-                    reads.stated(why).stated("; ").sentence(&synchronised),
-                    Some(
-                        "This host asks again by itself. Until the feed answers, what is shown \
-                         of remote revocations is stale.",
+                match stopped {
+                    Stopped::Capacity(offered) => (
+                        DoctorStatus::Warning,
+                        crate::capacity::listed(
+                            reads
+                                .clone()
+                                .stated(", and ")
+                                .stated(crate::capacity::AUTHORITY_FEEDS)
+                                .stated("; ")
+                                .sentence(&synchronised),
+                            offered,
+                        ),
+                        Some(
+                            "This host asks again by itself. What is shown of remote revocations \
+                             is stale until the feed answers.",
+                        ),
                     ),
-                )
+                    Stopped::Unreachable => waits(", which could not be reached"),
+                    Stopped::Refused => waits(", which turned a request back"),
+                    Stopped::Local => waits(", which this host could not finish reading"),
+                }
             } else if status.stale {
                 (
                     DoctorStatus::Warning,
@@ -882,7 +918,7 @@ impl FeedRuntime {
         } else if observed.catching_up
             && !matches!(
                 observed.stopped,
-                Some(Stopped::Unreachable | Stopped::Refused)
+                Some(Stopped::Unreachable | Stopped::Refused | Stopped::Capacity(_))
             )
         {
             // The registry is the likely cause only when the pass was not stopped by the feed.

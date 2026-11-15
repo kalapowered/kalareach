@@ -460,10 +460,12 @@ impl Shared {
                         (Some(retry_after), _) => Some(Hold {
                             code: ErrorCode::ServiceCapacity,
                             retry_after: Some(retry_after),
+                            offered: report.hold.map(|hold| hold.offered).unwrap_or_default(),
                         }),
                         (None, Some(owed)) if report.hold.is_some() => Some(Hold {
                             code: ErrorCode::ServiceCapacity,
                             retry_after: Some(owed.left),
+                            offered: report.hold.map(|hold| hold.offered).unwrap_or_default(),
                         }),
                         (None, Some(_)) => observed.pass_hold,
                         (None, None) => None,
@@ -1192,6 +1194,12 @@ fn hold_sentence(detail: Sentence, hold: Hold, writer: KeyId) -> Sentence {
         ErrorCode::HostNotConfigured => {
             detail.stated("the service is not configured for backup storage")
         }
+        ErrorCode::RateLimited | ErrorCode::ServiceCapacity if !hold.offered.is_empty() => {
+            crate::capacity::listed(
+                detail.stated(crate::capacity::BACKUP_COLLECTIONS),
+                hold.offered,
+            )
+        }
         ErrorCode::RateLimited | ErrorCode::ServiceCapacity | ErrorCode::UpstreamUnavailable => {
             detail.stated("the service is busy or unreachable, and this host asks again")
         }
@@ -1211,6 +1219,9 @@ const fn remedy_for(hold: Hold) -> &'static str {
         }
         ErrorCode::HostNotConfigured => {
             "Tell the service's operator that backup storage is not configured."
+        }
+        ErrorCode::RateLimited | ErrorCode::ServiceCapacity if !hold.offered.is_empty() => {
+            "This host asks again by itself."
         }
         _ => "This host asks again by itself. Check that the service is reachable.",
     }

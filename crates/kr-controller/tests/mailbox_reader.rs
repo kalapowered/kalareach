@@ -42,7 +42,7 @@ use kr_protocol::scalars::{
     Uuid,
 };
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
-use kr_service_stand_in::{Moment, Served, serve};
+use kr_service_stand_in::{Moment, Served, serve, short_budget};
 use net_support::{Device, Host, MovedWall, connect, pair_with, proposal};
 
 const ACKNOWLEDGE: &str = "/api/mailbox/acknowledge";
@@ -1025,6 +1025,88 @@ async fn a_mailbox_that_cannot_be_reached_is_shown_and_read_again() {
     .await;
     rig.the_reader_has_passed_since(seen).await;
     assert_eq!(rig.check().await.status, DoctorStatus::Ok);
+}
+
+/// KR-REQ-17.48: a service with no managed capacity for a new mailbox says so with the delay it
+/// asks for and the alternatives that still work, and `kr doctor` says it as a limit of the
+/// service and not a fault of this host, in each of the three forms a list takes: every
+/// alternative recognised, some, and none. A refusal for a fault, which names none, keeps the
+/// fault's words. The reader waits as it does for any delay, whichever words are said.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_17_48_a_service_with_no_capacity_for_a_new_mailbox_is_said_as_its_limit() {
+    const OWN: &str = "A mailbox service that you run yourself.";
+    const LIMIT: &str = "the service has no managed capacity for new mailboxes now, which is a limit of the service and not a fault of this host";
+    for (status, code, alternatives, ending) in [
+        (
+            429,
+            "RATE_LIMITED",
+            vec![OWN],
+            Some(format!("Until then: {OWN}")),
+        ),
+        (
+            503,
+            "SERVICE_UNAVAILABLE",
+            vec![OWN, "A path this version has never heard of."],
+            Some(format!(
+                "Until then: {OWN} The service named 1 more that this version cannot show."
+            )),
+        ),
+        (
+            503,
+            "SERVICE_UNAVAILABLE",
+            vec!["A path of its own.", "A second path of its own."],
+            Some("The service named 2 that this version cannot show.".to_owned()),
+        ),
+        (503, "SERVICE_UNAVAILABLE", Vec::new(), None),
+    ] {
+        let rig = Rig::start().await;
+        rig.mailbox
+            .deliver(
+                rig.host_key(),
+                &rig.announcement_from(&rig.owner.stored_envelope, 0xd1)
+                    .envelope,
+            )
+            .await
+            .expect("the service takes the announcement");
+        rig.served.web().fail(
+            "/api/mailbox/read",
+            1,
+            short_budget(status, code, 600, &alternatives),
+        );
+        rig.the_reader_reads().await;
+        let shown = rig.check().await;
+        let detail = shown.detail().to_owned();
+        assert_eq!(shown.status, DoctorStatus::Warning, "{detail}");
+        assert_eq!(rig.items_held(), 1, "nothing was removed");
+        assert!(
+            rig.timer
+                .asked_for()
+                .contains(&std::time::Duration::from_secs(600)),
+            "the reader waits out the delay whichever words are said"
+        );
+        assert_eq!(
+            shown.remedy(),
+            Some("This host asks again by itself."),
+            "{detail}"
+        );
+        match ending {
+            Some(ending) => {
+                assert!(detail.contains(LIMIT), "{detail}");
+                assert!(detail.ends_with(&ending), "{detail}");
+                assert_eq!(
+                    detail.contains("Until then"),
+                    ending.starts_with("Until then"),
+                    "{detail}"
+                );
+                assert!(!detail.contains("could not be reached"), "{detail}");
+            }
+            None => {
+                assert!(detail.contains("could not be reached"), "{detail}");
+                assert!(!detail.contains(LIMIT), "{detail}");
+                assert!(!detail.contains("Until then"), "{detail}");
+            }
+        }
+    }
 }
 
 /// A mailbox of more than one page is read through in one pass: every page is handled and

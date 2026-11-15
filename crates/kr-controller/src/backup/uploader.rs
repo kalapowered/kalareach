@@ -123,6 +123,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kr_client::error::ClientError;
+use kr_client::services::Offered;
 use kr_client::services::{
     ArchiveAnswer, BackupManifestService, BackupState, Dispatched, NewUpload, PartTable,
     ServiceFuture, StorageService, StorageStatus, UploadId, UploadProgress, upload_parts,
@@ -438,6 +439,9 @@ pub struct Hold {
     /// How long the service asked to be left alone, when it said. [`Quiet`] holds it to
     /// [`crate::quiet::LONGEST_DELAY`] when it records it.
     pub retry_after: Option<Duration>,
+    /// The alternatives the service named when it had no managed capacity for a new name. They
+    /// decide what a check says and nothing the carrier does.
+    pub offered: Offered,
 }
 
 impl Hold {
@@ -451,9 +455,16 @@ impl Hold {
             } => retry_after_seconds.map(Duration::from_secs),
             _ => None,
         };
+        let code = error.code();
+        let offered = if matches!(code, ErrorCode::RateLimited | ErrorCode::ServiceCapacity) {
+            error.alternatives().offered()
+        } else {
+            Offered::default()
+        };
         Self {
-            code: error.code(),
+            code,
             retry_after,
+            offered,
         }
     }
 
@@ -467,9 +478,17 @@ impl Hold {
         } else {
             self.code
         };
+        // What was named beside the refusal that decides the code is what a check lists.
+        let offered = [self, other]
+            .into_iter()
+            .filter(|hold| hold.code == code && !hold.offered.is_empty())
+            .map(|hold| hold.offered)
+            .next()
+            .unwrap_or_default();
         Self {
             code,
             retry_after: self.retry_after.max(other.retry_after),
+            offered,
         }
     }
 
@@ -1473,6 +1492,7 @@ impl Uploader {
             let hold = hold.unwrap_or(Hold {
                 code: ErrorCode::ServiceCapacity,
                 retry_after: None,
+                offered: Offered::default(),
             });
             turn.deferred = Some(turn.deferred.map_or(hold, |earlier| earlier.and(hold)));
         }
