@@ -594,7 +594,7 @@ impl Registry {
         )?;
         connection
             .execute("VACUUM INTO ?1", [named])
-            .map_err(ControllerError::registry)?;
+            .map_err(|error| ControllerError::registry(kr_flush::release::describe(&error)))?;
         Ok(())
     }
 

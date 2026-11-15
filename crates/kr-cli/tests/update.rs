@@ -4078,11 +4078,11 @@ impl Idle {
         std::fs::create_dir_all(&image).expect("a directory");
         let file = self.registry();
         let log = Self::beside(&file, "-wal");
-        std::fs::copy(&file, image.join("registry")).expect("copies the file");
-        std::fs::copy(&log, image.join("registry-wal")).expect("copies the log");
+        copy_the_bytes(&file, &image.join("registry"));
+        copy_the_bytes(&log, &image.join("registry-wal"));
         drop(registry);
-        std::fs::copy(image.join("registry"), &file).expect("puts the file back");
-        std::fs::copy(image.join("registry-wal"), &log).expect("puts the log back");
+        copy_the_bytes(&image.join("registry"), &file);
+        copy_the_bytes(&image.join("registry-wal"), &log);
         std::fs::remove_dir_all(&image).expect("the image goes");
         let _ = std::fs::remove_file(Self::beside(&file, "-shm"));
         assert!(
@@ -4156,10 +4156,10 @@ impl Idle {
         std::fs::create_dir_all(&directory).expect("a directory");
         let file = self.registry();
         let copy = directory.join("registry.sqlite");
-        std::fs::copy(&file, &copy).expect("copies the file");
+        copy_the_bytes(&file, &copy);
         let log = Self::beside(&file, "-wal");
         if log.is_file() {
-            std::fs::copy(&log, Self::beside(&copy, "-wal")).expect("copies the log");
+            copy_the_bytes(&log, &Self::beside(&copy, "-wal"));
         }
         // Read and closed, so that the log is taken into the copy.
         let connection = rusqlite::Connection::open(&copy).expect("opens the copy");
@@ -4242,6 +4242,14 @@ impl Idle {
         }
         found
     }
+}
+
+/// Gives `to` the bytes of `from`, read and written, never cloned: a registry or its log that a
+/// case goes on to write to, on a file system that clones a copied file, would share its blocks
+/// with the file it came from.
+fn copy_the_bytes(from: &Path, to: &Path) {
+    let bytes = std::fs::read(from).unwrap_or_else(|error| panic!("{}: {error}", from.display()));
+    std::fs::write(to, bytes).unwrap_or_else(|error| panic!("{}: {error}", to.display()));
 }
 
 /// Records in `registry` a live session whose worker is this test's own process, which runs and
