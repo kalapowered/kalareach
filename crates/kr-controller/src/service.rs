@@ -231,6 +231,44 @@ impl ReadPause {
     }
 }
 
+/// A point in a step that blocks its thread, which this host's own tests can stop it at: the step
+/// says it has arrived and waits there, on its thread, until the test lets it go. Armed once, it
+/// fires once. The wait uses the standard library's channels, so it can stop a step that runs
+/// inside a task.
+#[cfg(feature = "testing")]
+#[derive(Debug, Default)]
+pub(crate) struct ThreadPause(
+    std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+);
+
+#[cfg(feature = "testing")]
+impl ThreadPause {
+    /// Arms the pause. Returns the end that says the step has arrived, and the end that lets it
+    /// go.
+    pub(crate) fn arm(&self) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (arrived, arrival) = std::sync::mpsc::channel();
+        let (go, going) = std::sync::mpsc::channel();
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, going));
+        (arrival, go)
+    }
+
+    /// Waits here, blocking this thread, when the pause is armed.
+    pub(crate) fn wait(&self) {
+        let armed = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.recv();
+        }
+    }
+}
+
 /// Where this host's own tests hold the withdrawal of network connections: every deregistration
 /// that reaches it once it is armed waits there, and the first that announces itself says it has
 /// arrived. They go when the test sets the end it was given to `true` or drops it.
@@ -747,6 +785,16 @@ pub struct Controller {
     /// before the daemon is told to stop for it. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     before_a_stop_answer_is_written: ReadPause,
+    /// Where this host's own tests stop a reading of the local owner's lease just before it takes
+    /// the policy lock, which a policy commit holds across its storage writes, so that a fence can
+    /// be owed in that wait. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    before_the_policy_lock: ThreadPause,
+    /// Where this host's own tests stop the authority feed's check of a network connection just
+    /// before it takes the connection's shares lock, so that a fence can be owed in that wait.
+    /// Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    before_the_shares_lock: ThreadPause,
     /// Each reply the local door's sink consumed, with the request it answers, in the order they
     /// were written: what a test reads to hold that a caller is given the reply that was made and
     /// no other. Compiled away in every shipped build.
