@@ -2401,3 +2401,128 @@ async fn a_revocation_stopped_by_the_fence_of_making_the_host_exclusive_succeeds
     drop(client);
     fixture.host.stop().await;
 }
+
+/// KR-REQ-09.09, KR-REQ-17.54: on a host that is exclusively organisation-managed the owner's own
+/// lease bounds the deadline an environment change is accepted under, so a forgetting that is
+/// accepted while the lease runs and reaches the record after the lease has ended changes nothing:
+/// the record keeps the environment. The control: the same forgetting while the lease runs is made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_environment_forgetting_that_reaches_the_record_after_the_owners_lease_ended_changes_nothing()
+ {
+    use kr_protocol::identity::{
+        EnvironmentAccess, EnvironmentEnrolParams, EnvironmentEnrolResult, EnvironmentEnrolment,
+        EnvironmentForgetParams, EnvironmentForgetResult,
+    };
+    use kr_protocol::scalars::{TimestampMs, Uuid};
+
+    let fixture = Fixture::start().await;
+    let environment = fixture.host.environment_id;
+    let enrolment = |byte: u8| EnvironmentEnrolment {
+        environment_id: kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([byte; 16])),
+        access: EnvironmentAccess::WslDistribution,
+        label: "ubuntu".to_owned(),
+        target: "ubuntu-target".to_owned(),
+        os_user: "kala".to_owned(),
+        helper_path: "/usr/local/bin/kr".to_owned(),
+        clipboard_destination: Nullable::null(),
+        approved_at_ms: TimestampMs::new(0),
+    };
+    let mut client = fixture.host.client().await;
+    for byte in [1, 2] {
+        calls::mutate_as::<_, EnvironmentEnrolResult>(
+            environment,
+            &mut client,
+            ActionId::new(kr_ipc::new_uuid()),
+            Method::EnvironmentEnrol,
+            &EnvironmentEnrolParams {
+                enrolment: enrolment(byte),
+            },
+        )
+        .await
+        .expect("the owner enrols an environment");
+    }
+    fixture
+        .set_exclusive(&mut client, ActionId::new(kr_ipc::new_uuid()), true)
+        .await
+        .expect("the owner makes the host exclusive");
+    // The change withdrew the connection it was made on.
+    drop(client);
+    let mut client = fixture.host.client().await;
+    // A lease that lasts ten seconds, which is shorter than the lifetime a request asks for.
+    let listed = fixture.listed().await;
+    let lease = fixture.organisation.sign(
+        2,
+        fixture.organisation.payload(
+            2,
+            &organisation_support::member("owner"),
+            listed.host_device.authorisation_key,
+            fixture.now(),
+            10_000,
+            &[ActionRight::SessionView],
+        ),
+    );
+    calls::mutate_as::<_, kr_protocol::organisation::MembershipPresentResult>(
+        environment,
+        &mut client,
+        ActionId::new(kr_ipc::new_uuid()),
+        Method::MembershipPresent,
+        &MembershipPresentParams {
+            lease,
+            authority: Nullable::null(),
+        },
+    )
+    .await
+    .expect("the host takes the lease for its local owner");
+
+    let controller = fixture.host.controller();
+    let recorded = |byte: u8| {
+        let id = enrolment(byte).environment_id;
+        kr_controller::bridge::store::Store::with_locked(controller.paths().state_dir(), |store| {
+            Ok(store.enrolment(id).is_some())
+        })
+        .expect("the record opens")
+    };
+    let forget = |byte: u8| EnvironmentForgetParams {
+        environment_id: enrolment(byte).environment_id,
+    };
+    // The control: while the lease runs, the forgetting is made.
+    calls::mutate_as::<_, EnvironmentForgetResult>(
+        environment,
+        &mut client,
+        ActionId::new(kr_ipc::new_uuid()),
+        Method::EnvironmentForget,
+        &forget(2),
+    )
+    .await
+    .expect("a forgetting made while the lease runs lands");
+    assert!(!recorded(2));
+
+    // The forgetting is accepted while the lease runs and stops where it holds the record; the
+    // lease ends there.
+    let (arrived, go) = controller.pause_after_the_environment_record_is_taken();
+    let params = forget(1);
+    let forgetting = tokio::spawn(async move {
+        let answer = calls::mutate_as::<_, EnvironmentForgetResult>(
+            environment,
+            &mut client,
+            ActionId::new(kr_ipc::new_uuid()),
+            Method::EnvironmentForget,
+            &params,
+        )
+        .await;
+        (client, answer)
+    });
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30)))
+        .await
+        .expect("the wait ends")
+        .expect("the forgetting reaches the record");
+    fixture.pass(Duration::from_secs(11));
+    go.send(()).expect("the forgetting goes on");
+    let (_client, answer) = forgetting.await.expect("the forgetting is answered");
+    answer.expect_err("a forgetting that reaches the record after the lease ended is not told");
+    assert!(
+        recorded(1),
+        "the forgetting that met the end of the lease changed nothing"
+    );
+    fixture.host.stop().await;
+}
