@@ -474,6 +474,7 @@ fn a_helper_that_runs_its_parameter_is_named_and_its_calls_are_starts() {
 fn a_helper_is_seen_in_every_form_that_runs_its_parameter() {
     // Each of these starts something other than the bare parameter: a block that awaits it, a
     // closure that calls it, and a local that was made from it.
+    let mut missed = Vec::new();
     for (source, name) in [
         (
             "fn detach(work: impl std::future::Future<Output = ()> + Send + 'static) {\n\
@@ -505,13 +506,17 @@ fn a_helper_is_seen_in_every_form_that_runs_its_parameter() {
     ] {
         let tree = daemon_with(source);
         let problems = problems_of(&tree, &Roster::default());
-        assert!(
-            problems
-                .iter()
-                .any(|p| p.contains(&format!("`{name}`")) && p.contains("no helper line")),
-            "{name}: {problems:?}"
-        );
+        if !problems
+            .iter()
+            .any(|p| p.contains(&format!("`{name}`")) && p.contains("no helper line"))
+        {
+            missed.push(name);
+        }
     }
+    assert!(
+        missed.is_empty(),
+        "helpers the scan did not see: {missed:?}"
+    );
 
     // The twins start the same way and are not helpers: a parameter that is data, a local that is
     // what a closure returned, and a start that is awaited where it stands.
