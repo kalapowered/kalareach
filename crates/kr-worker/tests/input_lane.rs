@@ -867,11 +867,49 @@ impl Rig {
         .await
         .unwrap_or_else(|_| {
             panic!(
-                "the application received {} bytes, not the {} expected",
+                "the application received {} bytes, not the {} expected; {}",
                 self.received().len(),
-                expected.len()
+                expected.len(),
+                self.what_became_of_the_application()
             )
         });
+    }
+
+    /// What tells a worker that stopped writing from an application that stopped keeping what it
+    /// read, for a failure that finds the application's file short: the total the writer recorded
+    /// as written to the terminal, whether the writer found the terminal gone, the end of the
+    /// session's retained output, where an error of the application shows, the application's
+    /// state and exit, and the free space of the directory its file is in.
+    fn what_became_of_the_application(&self) -> String {
+        let writes = self.runtime.input().terminal_writes();
+        let written: usize = writes.iter().map(|write| write.bytes.len()).sum();
+        let gone = self
+            .runtime
+            .input()
+            .lock()
+            .terminal_gone_latch()
+            .load(std::sync::atomic::Ordering::Acquire);
+        let retained = common::retained(&self.runtime);
+        let end =
+            String::from_utf8_lossy(&retained[retained.len().saturating_sub(400)..]).into_owned();
+        let exit = {
+            let session = self.runtime.session();
+            format!("{:?}, closure {:?}", session.state(), session.closure())
+        };
+        #[cfg(unix)]
+        let free = rustix::fs::statvfs(self._kept.path()).map_or_else(
+            |error| format!("not read: {error}"),
+            |stat| format!("{} bytes", stat.f_bavail.saturating_mul(stat.f_frsize)),
+        );
+        #[cfg(not(unix))]
+        let free = String::from("not read on this platform");
+        format!(
+            "the writer recorded {written} bytes in {} writes to the terminal; the terminal was \
+             {}; the retained output ends {end:?}; the application's state is {exit}; the free \
+             space of the directory its file is in is {free}",
+            writes.len(),
+            if gone { "found gone" } else { "not found gone" },
+        )
     }
 
     /// Waits until the worker holds nothing for the terminal.
