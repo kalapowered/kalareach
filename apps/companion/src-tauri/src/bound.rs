@@ -278,6 +278,14 @@ impl ControlTransport for BoundTransport {
         self.over.notify_one();
         self.binding.inner.close();
     }
+
+    fn is_closed(&self) -> bool {
+        self.binding.inner.is_closed()
+    }
+
+    fn can_send(&self) -> bool {
+        self.binding.inner.can_send()
+    }
 }
 
 /// The data streams of a bound connection: one opens only while the sign-in the connection was
@@ -357,6 +365,10 @@ mod tests {
 
         fn close(&self) {
             self.0.store(true, Ordering::SeqCst);
+        }
+
+        fn is_closed(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
         }
     }
 

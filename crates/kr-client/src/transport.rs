@@ -181,10 +181,22 @@ pub trait ControlTransport: Send + Sync + std::fmt::Debug {
 
     /// Whether this side has ended the connection, which a send that cut a frame short does. It is
     /// read at once and never waits, so a caller that has just seen a send stop learns from it,
-    /// before the control stream's own end is read, whether the connection went with it. A
-    /// transport that cannot say reports no.
-    fn is_closed(&self) -> bool {
-        false
+    /// before the control stream's own end is read, whether the connection went with it. Every
+    /// transport answers; a transport that wraps another forwards the question.
+    fn is_closed(&self) -> bool;
+
+    /// Whether a frame can still be written on this connection. It is false once this side has
+    /// ended the connection, and for a transport that can lose its writing half while the
+    /// connection stands, from the moment that it has: a write that failed because the peer has
+    /// gone leaves the connection open, so that what the peer sent before it went is still read,
+    /// and leaves nothing to write with.
+    ///
+    /// It is read at once and never waits. A call is admitted only while it is true, so that a
+    /// call made after the writing side was lost is refused as not sent, and not registered and
+    /// answered with an outcome that is not known. A transport that wraps another forwards the
+    /// question.
+    fn can_send(&self) -> bool {
+        !self.is_closed()
     }
 }
 
@@ -394,6 +406,13 @@ impl ControlTransport for NetworkTransport {
         self.streams.revoke_all();
         self.connection
             .close(CLIENT_CLOSED.into(), b"the client closed the connection");
+    }
+
+    /// The connection's own record: it has a reason once it is closed, by this side or by the
+    /// peer. A send that is cut short resets its stream and leaves the connection open, so this
+    /// does not answer for that.
+    fn is_closed(&self) -> bool {
+        self.connection.close_reason().is_some()
     }
 }
 

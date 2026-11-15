@@ -449,6 +449,10 @@ mod tests {
         fn revoke_streams(&self) {}
 
         fn close(&self) {}
+
+        fn is_closed(&self) -> bool {
+            false
+        }
     }
 
     fn wire_over(refusal: Option<ProtocolError>) -> Wire {

@@ -3483,6 +3483,10 @@ impl kr_client::transport::ControlTransport for HeldWrite {
     fn revoke_streams(&self) {}
 
     fn close(&self) {}
+
+    fn is_closed(&self) -> bool {
+        false
+    }
 }
 
 /// Starts a session over a transport whose first write is held, makes `call` on it, and, with the
@@ -3911,6 +3915,52 @@ async fn a_send_dropped_inside_a_frame_ends_the_connection() {
         script.actions.lock().await.is_empty(),
         "the peer read no request: the frame it was given stops short"
     );
+    serving.abort();
+}
+
+/// A call that is made at once after a send was dropped inside a frame, with no wait for the
+/// session's end, is refused as not sent: the transport lost its writing side with the drop, and
+/// the session's own record of the end has not been made yet. The call is not registered, nothing
+/// of it is on the book, and its caller is told what the session tells for an ended connection,
+/// not that what became of it is not known.
+#[tokio::test]
+async fn a_call_made_at_once_after_a_send_was_dropped_inside_a_frame_is_refused_as_not_sent() {
+    let tree = kr_ipc::testing::TempHost::create();
+    let endpoint = tree
+        .paths()
+        .environment(tree.environment_id())
+        .controller_endpoint()
+        .expect("a controller endpoint");
+    let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("a local endpoint");
+    let script = Arc::new(HostScript::default());
+    script.unread.store(true, Ordering::Release);
+    let serving = spawn_local_host(listener, Arc::clone(&script));
+    let transport = kr_client::ipc::IpcTransport::connect(&endpoint, kr_cli_build_id())
+        .await
+        .expect("a local connection");
+    let session = Session::start(transport.shared()).expect("a session");
+
+    // Both requests are composed before the first is sent, so that nothing is awaited between the
+    // drop of the first and the call of the second.
+    let first = padded_request(&session, 0x71, 900_000).await;
+    let second = padded_request(&session, 0x72, 16).await;
+    let waited = tokio::time::timeout(Duration::from_millis(300), session.send(&first)).await;
+    assert!(
+        waited.is_err(),
+        "the frame does not fit the socket of a peer that reads nothing, so its send was still going when the caller stopped waiting"
+    );
+    let refused = session.send(&second).await;
+    assert!(
+        matches!(refused, Err(ClientError::ConnectionEnded)),
+        "a call made after the writing side was lost is refused as not sent: {refused:?}"
+    );
+    let book = session.submitted_actions().await;
+    assert!(
+        book.iter()
+            .all(|action| action.action_id == first.action_id()),
+        "nothing of the refused call is on the book"
+    );
+    session.close();
     serving.abort();
 }
 
