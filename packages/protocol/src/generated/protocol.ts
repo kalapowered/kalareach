@@ -13815,7 +13815,9 @@ export interface DeviceListResult {
    */
   feed_removed: boolean
   /**
-   * True when the feed is unreachable, so the revocation status shown is stale.
+   * True when this host's reading of the revocation feed is not current: its last attempt
+   * failed, its last synchronisation is too old, or its age cannot be told. The revocation
+   * status shown may then be stale.
    */
   feed_stale: boolean
   /**
