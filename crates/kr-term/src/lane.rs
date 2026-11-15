@@ -442,7 +442,7 @@ impl ResponseLane {
     ) -> Vec<Response> {
         // Before the gate is read: a reply ages behind an open paste or a held frame as it does
         // anywhere else, and the gate decides what is written, not what is dropped.
-        self.drop_lapsed(now_ms, gate.cursor_report_first);
+        self.drop_lapsed(now_ms);
         if !gate.allows_write() {
             return Vec::new();
         }
@@ -475,15 +475,16 @@ impl ResponseLane {
     /// queue and whatever the room for it.
     ///
     /// A drain stops at the first reply that does not fit, so a reply behind it would otherwise
-    /// stand past its deadline until the drain got that far. While a hold is in force
-    /// (`hold_in_force`), a reply it keeps does not age and is left alone.
+    /// stand past its deadline until the drain got that far. A reply that the cursor hold keeps
+    /// (`held_since`) does not age and is left alone, whatever gate this drain is handed: the hold
+    /// is the lane's own state, and a pass that parses without answering knows nothing of it.
     ///
     /// A reply that this removes is gone, so a reading later than a reply's deadline is always
     /// followed by its removal at the next drain, and [`Self::next_expiry_ms`], read after a drain,
     /// is a deadline that the next drain acts on.
-    fn drop_lapsed(&mut self, now_ms: u64, hold_in_force: bool) {
+    fn drop_lapsed(&mut self, now_ms: u64) {
         self.queue.retain(|reply| {
-            let kept = (hold_in_force && reply.held_since.is_some()) || !reply.lapsed(now_ms);
+            let kept = reply.held_since.is_some() || !reply.lapsed(now_ms);
             if !kept {
                 self.queued_bytes -= reply.bytes.len();
                 self.degradation.expired += 1;
