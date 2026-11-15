@@ -1029,7 +1029,7 @@ impl Controller {
                     Some(_) => match self.authorised(connection_id) {
                         Ok(_) => match self.host_stop(mutation).await {
                             Ok(stopped) => {
-                                let answered = unrecorded_write(request_id, Ok(stopped.answer));
+                                let answered = unrecorded_write(request_id, stopped.answer);
                                 if stopped.then_stops {
                                     answered.stopping_after_the_answer()
                                 } else {
