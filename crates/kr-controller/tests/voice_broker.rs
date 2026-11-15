@@ -1717,6 +1717,92 @@ async fn a_sign_out_that_meets_a_fence_before_it_removes_the_grant_removes_nothi
     host.stop().await;
 }
 
+/// KR-REQ-09.09 and 17.54: a token refresh keeps the account's lock across its request to the
+/// service, and a sign-out that has passed its early asks waits for it. A fence this host comes to
+/// owe while it waits stops the sign-out where the grant would go: the grant stays and no revocation
+/// is queued or sent. The control: with no fence the same sign-out removes the grant it finds when
+/// the lock is free and revokes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_out_that_waits_for_a_token_refresh_and_meets_a_fence_removes_nothing() {
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    // Tokens that last 20 seconds are always inside the margin the host replaces them in, so every
+    // request for one is a refresh.
+    sign_in_with(&host, broker.issue_grant(20)).await;
+    let account = Arc::clone(host.controller().host_account());
+    let mark = account
+        .mark_at(&broker.origin)
+        .expect("the host is signed in");
+
+    // A refresh holds the account's lock while the service has not answered it.
+    let at_the_service = broker.hold("/auth/oauth2/token");
+    let refreshing = {
+        let tokens = account.tokens_fixed_to(&broker.origin, mark);
+        tokio::spawn(async move { tokens.token("voice").await.map(|_| ()) })
+    };
+    tokio::time::timeout(WAIT, at_the_service.reached())
+        .await
+        .expect("the refresh reaches the service");
+
+    let (arrived, go) = account.pause_before_it_asks_whether_it_stands();
+    let (answered, ()) = tokio::join!(
+        sign_out_as(&host, ActionId::new(kr_ipc::new_uuid())),
+        async {
+            tokio::time::timeout(WAIT, arrived)
+                .await
+                .expect("the sign-out reaches its first ask")
+                .expect("the pause is armed");
+            let (again, go_again) = account.pause_before_it_asks_whether_it_stands();
+            go.send(()).expect("the sign-out goes on");
+            tokio::time::timeout(WAIT, again)
+                .await
+                .expect("the sign-out reaches its second ask")
+                .expect("the pause is armed");
+            go_again.send(()).expect("the sign-out goes on");
+            // The change has begun once the second ask is past, and the sign-out then waits for the
+            // lock the refresh keeps; the refresh is let go only after the fence is owed.
+            tokio::time::timeout(WAIT, async {
+                while !account.is_being_changed() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the sign-out begins its change");
+            host.controller().hold_fence(true);
+            at_the_service.release();
+        }
+    );
+    host.controller().hold_fence(false);
+    let refused = answered.expect_err("a sign-out whose request no longer stands is refused");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "{refused:?}"
+    );
+    refreshing
+        .await
+        .expect("the refresh task ends")
+        .expect("the refresh finishes");
+    let state = account_report(&host).await.state;
+    assert!(
+        matches!(state, AccountState::SignedIn { .. }),
+        "the grant is still held: {state:?}"
+    );
+    assert!(
+        broker.revoked().is_empty(),
+        "no revocation was queued or sent: {:?}",
+        broker.revoked()
+    );
+
+    assert!(sign_out(&host).await.was_signed_in);
+    assert_eq!(account_report(&host).await.state, AccountState::SignedOut);
+    assert_eq!(broker.revoked().len(), 1, "{:?}", broker.revoked());
+    host.stop().await;
+}
+
 /// KR-REQ-09.09: a sign-in asks the admission it carries again before it ends the sign-in that
 /// waits. A fence this host comes to owe in the wait stops it: the earlier sign-in is not ended and
 /// the new one does not start. The control: with no fence the new sign-in takes the earlier one's

@@ -105,6 +105,9 @@ struct AccountServer {
     origin: String,
     seen: Arc<Mutex<Vec<Seen>>>,
     state: Arc<Mutex<State>>,
+    /// A refresh the service has been given waits here, after it is recorded, while a case holds
+    /// the lock.
+    gate: Arc<tokio::sync::Mutex<()>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -125,12 +128,14 @@ impl AccountServer {
             issuer: issuer_of(&origin),
             ..State::default()
         }));
-        let (record, held) = (Arc::clone(&seen), Arc::clone(&state));
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let (record, held, gated) = (Arc::clone(&seen), Arc::clone(&state), Arc::clone(&gate));
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let (record, held) = (Arc::clone(&record), Arc::clone(&held));
+                let (record, held, gated) =
+                    (Arc::clone(&record), Arc::clone(&held), Arc::clone(&gated));
                 tokio::spawn(async move {
-                    answer(stream, &record, &held).await;
+                    answer(stream, &record, &held, &gated).await;
                 });
             }
         });
@@ -138,6 +143,7 @@ impl AccountServer {
             origin,
             seen,
             state,
+            gate,
             task,
         }
     }
@@ -170,7 +176,12 @@ impl AccountServer {
 }
 
 /// Reads one request and answers it as the account system does.
-async fn answer(mut stream: TcpStream, record: &Mutex<Vec<Seen>>, state: &Mutex<State>) {
+async fn answer(
+    mut stream: TcpStream,
+    record: &Mutex<Vec<Seen>>,
+    state: &Mutex<State>,
+    gate: &tokio::sync::Mutex<()>,
+) {
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 4096];
     let (head_end, length) = loop {
@@ -216,6 +227,9 @@ async fn answer(mut stream: TcpStream, record: &Mutex<Vec<Seen>>, state: &Mutex<
         path: path.clone(),
         form: form.clone(),
     });
+    if form.get("grant_type").map(String::as_str) == Some("refresh_token") {
+        drop(gate.lock().await);
+    }
     let (status, body) = account_answer(state, &path, authorization.as_deref(), &form);
     let body = serde_json::to_vec(&body).expect("json");
     let mut out = format!(
@@ -673,6 +687,128 @@ async fn a_storage_sign_in_is_kept_and_ended_at_the_storage_service_and_leaves_t
     .to_typed()
     .expect("a sign-out answer");
     assert!(!fresh.was_signed_in, "{fresh:?}");
+    host.stop().await;
+}
+
+/// KR-REQ-09.09 and 17.54: a token refresh keeps the storage account's lock across its request to
+/// the storage service, and a sign-out that has passed its early asks waits for it. A fence this
+/// host comes to owe while it waits stops the sign-out where the grant would go: the grant stays and
+/// no revocation is queued or sent. The control: with no fence the same sign-out removes the grant
+/// and revokes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_storage_sign_out_that_waits_for_a_token_refresh_and_meets_a_fence_removes_nothing() {
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+    let managed = AccountServer::start().await;
+    let storage = AccountServer::start().await;
+    let host = host_over(
+        &document(Some(&managed.origin), None, Some(&storage.origin)),
+        &managed,
+    )
+    .await;
+    // A grant whose token is at its end, and the refresh token the service accepts for it.
+    {
+        let mut state = storage.state.lock().expect("the state");
+        state.refresh = "the-storage-refresh-token".to_owned();
+        state.scope = "backup.write".to_owned();
+    }
+    let account = Arc::clone(host.controller().storage_account());
+    account
+        .keep_for_test(IssuedGrant {
+            access_token: AccountToken::new("the-storage-access-token").expect("a token"),
+            expires_in_seconds: 0,
+            refresh_token: RefreshToken::new("the-storage-refresh-token").expect("a token"),
+            scopes: vec!["backup.write".to_owned()],
+            subject: "account-s".to_owned(),
+        })
+        .await;
+    let mark = account
+        .mark_at(&storage.origin)
+        .expect("the storage account is signed in");
+
+    // A refresh holds the account's lock while the service has not answered it.
+    let service_holds = storage.gate.lock().await;
+    let refreshing = {
+        let tokens = account.tokens_fixed_to(&storage.origin, mark);
+        tokio::spawn(async move { tokens.token("backup.write").await.map(|_| ()) })
+    };
+    tokio::time::timeout(WAIT, async {
+        while !storage
+            .seen()
+            .iter()
+            .any(|seen| seen.form.get("grant_type").map(String::as_str) == Some("refresh_token"))
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the refresh reaches the service");
+
+    let (arrived, go) = account.pause_before_it_asks_whether_it_stands();
+    let (answered, ()) = tokio::join!(
+        mutate(
+            &host,
+            Method::AccountStorageSignOut,
+            ActionId::new(kr_ipc::new_uuid())
+        ),
+        async {
+            tokio::time::timeout(WAIT, arrived)
+                .await
+                .expect("the sign-out reaches its first ask")
+                .expect("the pause is armed");
+            let (again, go_again) = account.pause_before_it_asks_whether_it_stands();
+            go.send(()).expect("the sign-out goes on");
+            tokio::time::timeout(WAIT, again)
+                .await
+                .expect("the sign-out reaches its second ask")
+                .expect("the pause is armed");
+            go_again.send(()).expect("the sign-out goes on");
+            // The change has begun once the second ask is past, and the sign-out then waits for the
+            // lock the refresh keeps; the refresh is let go only after the fence is owed.
+            tokio::time::timeout(WAIT, async {
+                while !account.is_being_changed() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the sign-out begins its change");
+            host.controller().hold_fence(true);
+            drop(service_holds);
+        }
+    );
+    host.controller().hold_fence(false);
+    let refused = answered.expect_err("a sign-out whose request no longer stands is refused");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    refreshing
+        .await
+        .expect("the refresh task ends")
+        .expect("the refresh finishes");
+    assert!(
+        matches!(
+            report(&host, Method::AccountStorageStatus)
+                .await
+                .expect("the status reads")
+                .state,
+            AccountState::SignedIn { .. }
+        ),
+        "the grant is still held"
+    );
+    assert!(
+        storage.revoked().is_empty(),
+        "no revocation was queued or sent: {:?}",
+        storage.revoked()
+    );
+
+    let done: AccountSignedOut = mutate(
+        &host,
+        Method::AccountStorageSignOut,
+        ActionId::new(kr_ipc::new_uuid()),
+    )
+    .await
+    .expect("with no fence the sign-out is answered")
+    .to_typed()
+    .expect("a sign-out answer");
+    assert!(done.was_signed_in && done.service_told, "{done:?}");
+    assert_eq!(storage.revoked().len(), 1, "{:?}", storage.revoked());
     host.stop().await;
 }
 
