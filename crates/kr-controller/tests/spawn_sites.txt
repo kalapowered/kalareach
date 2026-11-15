@@ -54,6 +54,7 @@ helper | read_within | crates/kr-controller/src/catalogue/mod.rs | runs the call
 helper | serve_each | crates/kr-controller/src/ | serves each connection that a listener accepts on a task of its own, running the caller's closure for it
 helper | start_thread | crates/kr-describe/src/supervise.rs | starts a named thread for the caller's closure
 helper | detached | crates/kr-worker/src/ | starts a task for the caller's future and returns its handle
+helper | say_by | crates/kr-ipc/src/testing.rs | starts a named thread that runs the caller's write and sends its result, and waits for that result for a bound
 
 crates/kr-client/src/chunks.rs | LocalCarrier::connect | tokio::spawn | read_lane | 1 | request | - | bound(guard at crates/kr-client/src/chunks.rs:637); the carrier owns the lane's reader task and its Drop aborts it, so whatever owns the carrier ends the task
 crates/kr-client/src/pairing/candidate.rs | start_in_room_waiting | tokio::task::spawn_blocking | closure{start} | 1 | joined | - | awaited where it stands
@@ -235,7 +236,7 @@ crates/kr-controller/src/service/host.rs | Controller::command_integration_repor
 crates/kr-controller/src/service/host.rs | Controller::environment_change | tokio::task::spawn_blocking | closure{crate::bridge::store::Store::with_locked} | 4 | joined | - | awaited where it stands
 crates/kr-controller/src/service/host.rs | Controller::environment_inventory | tokio::task::spawn_blocking | closure{crate::bridge::store::Store::with_locked} | 1 | joined | - | awaited where it stands
 crates/kr-controller/src/service/host.rs | Controller::launch_probe_report | tokio::task::spawn_blocking | closure{.read} | 1 | supervised-later | 36 | the launch probes' report, on a blocking thread that runs the admitted packages one at a time, each probe given five seconds and then ended and collected; the doctor waits 30 seconds and drops the handle, and the thread goes on through every package that declares a probe, since the report is cut to its limit only after the loop
-crates/kr-controller/src/service/host.rs | Controller::measurements | .spawn | async{.read_from_worker_within} | 1 | request | - | bound(owned-set at crates/kr-controller/src/service/host.rs:1043); the reading future's join set holds the asking tasks, joins them, and aborts any that are left when the future is dropped
+crates/kr-controller/src/service/host.rs | Controller::measurements | .spawn | async{.read_from_worker_within} | 1 | request | - | bound(owned-set at crates/kr-controller/src/service/host.rs:1047); the reading future's join set holds the asking tasks, joins them, and aborts any that are left when the future is dropped
 crates/kr-controller/src/service/host.rs | Controller::record_outcome | tokio::task::spawn_blocking | closure{crate::bridge::store::Store::with_locked} | 1 | joined | - | awaited where it stands
 crates/kr-controller/src/service/identifiers.rs | Controller::spend_the_identifier | tokio::task::spawn_blocking | closure{.holds} | 1 | joined | - | awaited where it stands
 crates/kr-controller/src/service/inhibition.rs | Controller::demand | tokio::spawn | async{.reconcile} | 1 | supervised-later | 36 | reconciles one dead worker's session, on a task of its own started from the power scan for each worker that did not answer and whose process has ended; it runs for one crash flight, about seven seconds of fence waits plus the registry writes, after the request or review that started it, and it keeps the daemon alive meanwhile
@@ -321,7 +322,8 @@ crates/kr-describe/src/testing.rs | JobThreads::start | .spawn | closure{.wait} 
 crates/kr-describe/src/testing.rs | Resident::keep | .spawn | closure{.chunks_mut} | 1 | test | - | compiled in only with the testing feature or a test module
 crates/kr-describe/src/testing.rs | stub_main | std::thread::spawn | closure{std::io::stderr} | 1 | test | - | compiled in only with the testing feature or a test module
 crates/kr-ipc/src/testing.rs | Serving::spawn | tokio::spawn | task | 1 | test | - | compiled in only with the testing feature or a test module
-crates/kr-ipc/src/testing.rs | say_on_the_standard_error | .spawn | closure{.write_all} | 1 | test | - | compiled in only with the testing feature or a test module
+crates/kr-ipc/src/testing.rs | say_on_the_standard_error | say_by | closure{.write_all} | 1 | test | - | compiled in only with the testing feature or a test module
+crates/kr-ipc/src/testing.rs | say_by | .spawn | closure{.send} | 1 | test | - | compiled in only with the testing feature or a test module
 crates/kr-plugin-catalogue/src/trust.rs | verify | tokio::task::spawn_blocking | closure{check_index} | 1 | joined | - | awaited where it stands
 crates/kr-plugin-service/src/client.rs | PluginClient::over | tokio::spawn | read_frames | 1 | request | - | bound(guard at crates/kr-plugin-service/src/client.rs:1422); the client owns the task and its Drop aborts it
 crates/kr-plugin-service/src/client.rs | PluginClient::over | tokio::spawn | write_offered | 1 | request | - | bound(guard at crates/kr-plugin-service/src/client.rs:1422); the client owns the task and its Drop aborts it
