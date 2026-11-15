@@ -2195,6 +2195,10 @@ async fn a_receipt_lookup_waiting_for_the_workers_link_is_refused_once_a_feed_re
                 .claim_route(
                     &close,
                     Some(world.session_id),
+                    connection
+                        .admitted_at()
+                        .await
+                        .expect("the registration stands"),
                     &super::forwarding::OwnClaim::none()
                 )
                 .is_ok(),
@@ -2652,11 +2656,16 @@ async fn a_device_that_reads_a_closed_session_is_told_it_closed_and_not_that_it_
     // The route of an action the device performed in the session, which a read of that action
     // follows to the session.
     let close = fake::close_request(controller.paths().environment_id(), world.session_id);
+    let claiming = super::RemoteConnection::for_test(controller, device.clone());
     assert!(
-        super::RemoteConnection::for_test(controller, device.clone())
+        claiming
             .claim_route(
                 &close,
                 Some(world.session_id),
+                claiming
+                    .admitted_at()
+                    .await
+                    .expect("the registration stands"),
                 &super::forwarding::OwnClaim::none()
             )
             .is_ok(),
@@ -2729,6 +2738,10 @@ async fn a_replacement_daemon_settles_a_devices_retried_close_from_the_workers_r
             .claim_route(
                 &close,
                 Some(world.session_id),
+                connection
+                    .admitted_at()
+                    .await
+                    .expect("the registration stands"),
                 &super::forwarding::OwnClaim::none()
             )
             .is_ok(),
@@ -5221,6 +5234,10 @@ async fn kr_req_10_49_a_retried_close_is_answered_and_the_kept_answer_is_settled
             .claim_route(
                 &close,
                 Some(world.session_id),
+                connection
+                    .admitted_at()
+                    .await
+                    .expect("the registration stands"),
                 &super::forwarding::OwnClaim::none()
             )
             .is_ok(),
@@ -5280,6 +5297,10 @@ async fn kr_req_10_49_a_kept_close_result_that_does_not_read_is_not_passed_on() 
             .claim_route(
                 &close,
                 Some(world.session_id),
+                connection
+                    .admitted_at()
+                    .await
+                    .expect("the registration stands"),
                 &super::forwarding::OwnClaim::none()
             )
             .is_ok(),
@@ -5388,6 +5409,10 @@ async fn kr_req_10_49_a_kept_result_is_not_shown_to_a_device() {
             .claim_route(
                 &prompt,
                 Some(world.session_id),
+                connection
+                    .admitted_at()
+                    .await
+                    .expect("the registration stands"),
                 &super::forwarding::OwnClaim::none()
             )
             .is_ok(),
@@ -5455,6 +5480,10 @@ async fn kr_req_10_49_a_kept_answer_that_does_not_read_in_the_workers_level_is_n
                 .claim_route(
                     &prompt,
                     Some(world.session_id),
+                    connection
+                        .admitted_at()
+                        .await
+                        .expect("the registration stands"),
                     &super::forwarding::OwnClaim::none()
                 )
                 .is_ok(),
@@ -5588,6 +5617,10 @@ async fn kr_req_23_34_a_close_is_made_for_a_caller_that_may_not_read_its_receipt
                 .claim_route(
                     &close,
                     Some(world.session_id),
+                    connection
+                        .admitted_at()
+                        .await
+                        .expect("the registration stands"),
                     &super::forwarding::OwnClaim::none()
                 )
                 .is_ok(),
@@ -5861,6 +5894,10 @@ async fn kr_req_23_34_an_action_read_by_identifier_is_about_the_session_its_rout
             .claim_route(
                 &close,
                 Some(world.session_id),
+                connection
+                    .admitted_at()
+                    .await
+                    .expect("the registration stands"),
                 &super::forwarding::OwnClaim::none()
             )
             .is_ok(),
@@ -5912,6 +5949,10 @@ async fn kr_req_23_34_a_retry_of_an_action_other_than_a_close_is_not_answered_to
             .claim_route(
                 &prompt,
                 Some(world.session_id),
+                connection
+                    .admitted_at()
+                    .await
+                    .expect("the registration stands"),
                 &super::forwarding::OwnClaim::none()
             )
             .is_ok(),
@@ -6143,6 +6184,10 @@ async fn a_retry_answered_from_the_workers_receipt_is_not_answered_when_a_fence_
             .claim_route(
                 &close,
                 Some(world.session_id),
+                connection
+                    .admitted_at()
+                    .await
+                    .expect("the registration stands"),
                 &super::forwarding::OwnClaim::none()
             )
             .is_ok(),
@@ -6585,7 +6630,15 @@ async fn a_mutation_refused(
         let session = to_its_session.then_some(world.session_id);
         assert!(
             connection
-                .claim_route(&mutation, session, &super::forwarding::OwnClaim::none())
+                .claim_route(
+                    &mutation,
+                    session,
+                    connection
+                        .admitted_at()
+                        .await
+                        .expect("the registration stands"),
+                    &super::forwarding::OwnClaim::none()
+                )
                 .is_ok(),
             "the route of the action is on record"
         );
@@ -6806,6 +6859,10 @@ async fn a_copy_that_claimed_the_route_while_this_one_waited_for_the_link_makes_
                             .claim_route(
                                 &prompt,
                                 Some(world.session_id),
+                                connection
+                                    .admitted_at()
+                                    .await
+                                    .expect("the registration stands"),
                                 &super::forwarding::OwnClaim::none()
                             )
                             .is_ok(),
@@ -6936,6 +6993,10 @@ async fn a_request_refused_after_a_copy_of_it_claimed_the_route_is_told_the_outc
                             .claim_route(
                                 sent,
                                 Some(world.session_id),
+                                connection
+                                    .admitted_at()
+                                    .await
+                                    .expect("the registration stands"),
                                 &super::forwarding::OwnClaim::none()
                             )
                             .is_ok(),
@@ -7087,6 +7148,10 @@ async fn a_call_leaves_those_that_have_not_claimed_once_it_has_its_route() {
                             .claim_route(
                                 &prompt,
                                 Some(world.session_id),
+                                connection
+                                    .admitted_at()
+                                    .await
+                                    .expect("the registration stands"),
                                 &super::forwarding::OwnClaim::none()
                             )
                             .is_ok(),
@@ -7359,6 +7424,7 @@ async fn a_conflicting_route_does_not_hide_a_close_that_went_on_without_a_route(
                 .claim_route(
                     &other,
                     Some(world.session_id),
+                    first.admitted_at().await.expect("the registration stands"),
                     &super::forwarding::OwnClaim::none()
                 )
                 .is_ok(),
@@ -7598,6 +7664,10 @@ async fn a_reused_identifier_is_refused_as_one_though_a_copy_of_the_request_is_q
             .claim_route(
                 &held,
                 Some(world.session_id),
+                connection
+                    .admitted_at()
+                    .await
+                    .expect("the registration stands"),
                 &super::forwarding::OwnClaim::none()
             )
             .is_ok(),
@@ -7626,6 +7696,104 @@ async fn a_reused_identifier_is_refused_as_one_though_a_copy_of_the_request_is_q
     );
     drop(queued);
     world.serving.abort();
+}
+
+/// KR-REQ-09.09: a reused identifier is read from the route record, and goes back only under the
+/// check every answer read from a record goes under, asked with it in hand: a device whose host
+/// owes a fence is told the outcome is not shown, and not the conflict. The record is found when a
+/// retained answer is looked up (the route names a session, or none) and, where a copy of the
+/// request claims the route after that lookup found none, when the claim is made. The control: with
+/// no fence owed the device is told the conflict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reused_identifier_found_in_the_route_record_is_not_shown_while_a_fence_is_owed() {
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::session::SessionCloseParams;
+
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    for (routed_to_a_session, claimed_meanwhile) in [(true, false), (false, false), (true, true)] {
+        for owed in [false, true] {
+            let script = Scripted::new();
+            let world = scripted::scripted(&script).await;
+            let controller = &world.controller;
+            let connection = super::RemoteConnection::for_test(
+                controller,
+                paired_with_every_right(controller, 93),
+            );
+            let held = device_mutation(
+                &world,
+                &connection,
+                Method::AgentPromptSubmit,
+                107,
+                ParamsValue::empty(),
+            );
+            let claim_the_held_route = || async {
+                connection
+                    .claim_route(
+                        &held,
+                        routed_to_a_session.then_some(world.session_id),
+                        connection
+                            .admitted_at()
+                            .await
+                            .expect("the registration stands"),
+                        &super::forwarding::OwnClaim::none(),
+                    )
+                    .is_ok()
+            };
+            let mut reused = held.clone();
+            reused.request_id = RequestId::new(108);
+            reused.params = ParamsValue::from_typed(&SessionCloseParams {
+                session_id: world.session_id,
+            })
+            .expect("encodes");
+
+            let told = if claimed_meanwhile {
+                // The request finds no route, and is stopped before its effect; a copy claims the
+                // route under the same identifier meanwhile.
+                let (arrived, go) = controller.before_the_effect.arm();
+                let (told, ()) = tokio::join!(
+                    connection.answer_now(ControlFrame::Mutation(Box::new(reused))),
+                    async {
+                        tokio::time::timeout(std::time::Duration::from_secs(30), arrived)
+                            .await
+                            .expect("the request reaches the place it is stopped at")
+                            .expect("the pause is armed");
+                        assert!(
+                            claim_the_held_route().await,
+                            "a copy claims the route of the identifier"
+                        );
+                        controller.hold_fence(owed);
+                        go.send(()).expect("the request goes on");
+                    }
+                );
+                told
+            } else {
+                assert!(
+                    claim_the_held_route().await,
+                    "the route holds the first request"
+                );
+                controller.hold_fence(owed);
+                connection
+                    .answer_now(ControlFrame::Mutation(Box::new(reused)))
+                    .await
+            }
+            .expect("the request is answered");
+            let error = error_of(told.frame());
+            let expected = if owed {
+                ErrorCode::OutcomeUnknown
+            } else {
+                ErrorCode::IdConflict
+            };
+            assert_eq!(
+                error.code, expected,
+                "a route to a session: {routed_to_a_session}, claimed meanwhile: \
+                 {claimed_meanwhile}, a fence owed: {owed}: {error:?}"
+            );
+            controller.hold_fence(false);
+            world.serving.abort();
+        }
+    }
 }
 
 /// KR-REQ-09.09: a voice delegation under an identifier whose route holds another request and
@@ -7661,6 +7829,10 @@ async fn a_voice_delegation_under_an_identifier_a_session_holds_is_refused_thoug
                 .claim_route(
                     &held,
                     held_by_a_session.then_some(world.session_id),
+                    connection
+                        .admitted_at()
+                        .await
+                        .expect("the registration stands"),
                     &super::forwarding::OwnClaim::none()
                 )
                 .is_ok(),
