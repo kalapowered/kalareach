@@ -83,24 +83,32 @@ impl Alternative {
 /// What a refusal's list of alternatives said, as the service wrote it.
 ///
 /// Empty when the refusal carried no list, which is every refusal for a fault and every refusal
-/// from a service that does not name alternatives.
+/// from a service that does not name alternatives. A refusal is returned by value from most of
+/// this client, so an empty list is one pointer and a list is held apart from it.
 #[derive(Clone, PartialEq, Eq, Default)]
-pub struct Alternatives(Vec<ServiceMessage>);
+pub struct Alternatives(Option<Box<[ServiceMessage]>>);
 
 impl Alternatives {
     /// A refusal that named no alternatives.
     pub(crate) const fn none() -> Self {
-        Self(Vec::new())
+        Self(None)
     }
 
     /// The alternatives a refusal named, in the order it named them.
     pub(crate) fn named(texts: Vec<String>) -> Self {
-        Self(
+        if texts.is_empty() {
+            return Self::none();
+        }
+        Self(Some(
             texts
                 .into_iter()
                 .map(ServiceMessage::from_refusal)
                 .collect(),
-        )
+        ))
+    }
+
+    fn items(&self) -> &[ServiceMessage] {
+        self.0.as_deref().unwrap_or(&[])
     }
 
     /// The alternatives a test names, as a refusal from a service would have named them.
@@ -113,13 +121,13 @@ impl Alternatives {
     /// Whether the refusal named none.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.items().is_empty()
     }
 
     /// Every alternative as the service wrote it, for a line that carries a service's text.
     #[must_use]
     pub fn as_given(&self) -> Vec<Shown> {
-        self.0.iter().map(Shown::service).collect()
+        self.items().iter().map(Shown::service).collect()
     }
 
     /// "Until then:" and every alternative as the service wrote it, each on its own, for a line
@@ -140,7 +148,7 @@ impl Alternatives {
     #[must_use]
     pub fn offered(&self) -> Offered {
         let mut offered = Offered::default();
-        for (index, text) in self.0.iter().enumerate() {
+        for (index, text) in self.items().iter().enumerate() {
             let recognised = (index < MOST)
                 .then(|| Alternative::recognised(Shown::service(text).as_str()))
                 .flatten();
@@ -158,7 +166,7 @@ impl fmt::Debug for Alternatives {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Alternatives")
-            .field("named", &self.0.len())
+            .field("named", &self.items().len())
             .finish()
     }
 }
