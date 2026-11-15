@@ -505,11 +505,9 @@ impl Earlier {
     /// `--json` the records are in that document; otherwise they were said at the start. A record
     /// that was not put out stays for the next command to say.
     fn remove_those_put_out(&self, json: bool) {
-        let put_out = if json {
-            output::unwritten_output().is_none()
-        } else {
-            self.written
-        };
+        // The result is the document or the result line on standard output, and under text the
+        // lines at the start went to standard error as well: none of them may have been refused.
+        let put_out = output::unwritten_output().is_none() && (json || self.written);
         if !put_out {
             return;
         }
