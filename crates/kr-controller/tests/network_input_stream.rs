@@ -749,8 +749,10 @@ async fn a_worker_that_does_not_answer_is_cut_at_the_frames_deadline() {
 }
 
 /// A frame keeps the deadline it was given when it was passed on: waiting for the lane's writer does
-/// not renew it. A frame that the writer is held at past its deadline is cut, not written. The
-/// deadline is shortened for the case, and the hold lasts longer than it.
+/// not renew it. The lane's reader cuts the stream at the deadline of the oldest frame the worker
+/// has not answered, so a frame that the writer is held at past its deadline is cut by the reader
+/// and never reaches the worker. The deadline is shortened for the case, and the hold lasts longer
+/// than it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_frame_that_waits_for_the_writer_past_its_deadline_is_cut_and_not_written() {
     let rig = Rig::start().await;
@@ -773,6 +775,56 @@ async fn a_frame_that_waits_for_the_writer_past_its_deadline_is_cut_and_not_writ
         }
     };
     assert!(ended.is_err(), "the stream is reset: {ended:?}");
+    assert!(
+        rig.lane.frames().is_empty(),
+        "the worker was never given the frame"
+    );
+    rig.stop().await;
+}
+
+/// The lane's writer does not give the worker a frame whose own deadline has passed, whatever it
+/// waited for: the check is made at the write, so it holds with the lane's reader, whose timer is
+/// the other cut, held where it cannot run. The reader is held at an event while no frame is
+/// outstanding, so it has no deadline to cut at; the frame passes its deadline while the writer is
+/// held after the host's decision; the stream is cut, the device reads a reset and no accepted
+/// acknowledgement, and the lane holds no frame. The sleep only lets time pass: the frame's
+/// deadline, 20 ms after it was passed on, is behind the moment the writer is let go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_past_its_deadline_when_the_writer_goes_on_is_cut_and_never_written() {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    let stages = rig.adopted.host.network().input_stages();
+    let (at_answer, go_answer) = stages.hold_before_a_lane_answer();
+    rig.lane.send_credit(rig.epoch.get(), 1, 1);
+    arrived(at_answer).await;
+
+    stages.set_frame_deadline(Duration::from_millis(20));
+    let (at_write, go_write) = stages.hold_before_a_lane_write();
+    stream
+        .write_message(&rig.frame(0, b"a"))
+        .await
+        .expect("the frame is written");
+    arrived(at_write).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let _ = go_write.send(());
+
+    until("the stream was cut or the lane was given the frame", || {
+        stages.counts().cuts == 1 || !rig.lane.frames().is_empty()
+    })
+    .await;
+    assert!(
+        rig.lane.frames().is_empty(),
+        "the worker was given a frame past its deadline"
+    );
+    let ended = loop {
+        match next_or_reset(&mut stream).await {
+            Ok(Some(InputAck::Accepted { .. })) => panic!("a frame past its deadline was accepted"),
+            Ok(Some(_)) => {}
+            other => break other,
+        }
+    };
+    assert!(ended.is_err(), "the stream is reset: {ended:?}");
+    drop(go_answer);
     rig.stop().await;
 }
 
