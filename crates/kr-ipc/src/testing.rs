@@ -224,10 +224,11 @@ impl PrivateTempDir {
 /// How long the removal of a [`PrivateTempDir`] is tried again while it is refused.
 ///
 /// It covers a holder that is ending: a task that was aborted and is cancelled at the runtime's
-/// next turn, a thread that is joining. A holder that keeps a file longer than this is a fixture
-/// that did not end it, which the line the drop prints names by its case, and the directory is
-/// left to the cleanup of the temporary folder. A case that needs the tree gone, as one that starts
-/// a daemon whose own sweep holds a file for up to thirty seconds does, waits for it itself.
+/// next turn, a thread that is joining. A holder that keeps a file longer than this has not let go
+/// yet: a fixture that does not end it, or a blocking thread or a shell's teardown that a loaded
+/// host is slow to finish. The line the drop prints names the case, and the directory is left to the
+/// cleanup of the temporary folder. A case that needs the tree gone, as one that starts a daemon
+/// whose own sweep holds a file for up to thirty seconds does, waits for it itself.
 pub const REMOVAL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Removes `root` and what is in it. A removal that is refused is tried again for no longer than
