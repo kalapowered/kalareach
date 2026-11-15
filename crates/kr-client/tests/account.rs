@@ -1489,6 +1489,11 @@ struct FaultyStore {
     session_reads: Mutex<VecDeque<bool>>,
     /// Whether the next write of the revocation queue lands and then reports a failure.
     queue_lands: std::sync::atomic::AtomicBool,
+    /// A standing that ends once the next write of the revocation queue has landed: what the
+    /// caller's authority is while the store takes its time.
+    ends_after_queue_write: Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
+    /// A standing that ends once the next read of the session item has returned.
+    ends_after_session_read: Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
 }
 
 impl FaultyStore {
@@ -1499,7 +1504,19 @@ impl FaultyStore {
             queue_plan: Mutex::new(VecDeque::new()),
             session_reads: Mutex::new(VecDeque::new()),
             queue_lands: std::sync::atomic::AtomicBool::new(false),
+            ends_after_queue_write: Mutex::new(None),
+            ends_after_session_read: Mutex::new(None),
         }
+    }
+
+    /// Ends `standing` once the next write of the revocation queue has landed.
+    fn standing_ends_after_the_queue_write(&self, standing: &Arc<std::sync::atomic::AtomicBool>) {
+        *self.ends_after_queue_write.lock().expect("the plan") = Some(Arc::clone(standing));
+    }
+
+    /// Ends `standing` once the next read of the session item has returned.
+    fn standing_ends_after_the_session_read(&self, standing: &Arc<std::sync::atomic::AtomicBool>) {
+        *self.ends_after_session_read.lock().expect("the plan") = Some(Arc::clone(standing));
     }
 
     /// Has the next write of the revocation queue install its contents and then report a failure.
@@ -1564,7 +1581,13 @@ impl SecretStore for FaultyStore {
             self.inner.set(name, secret)?;
             return Err(refused());
         }
-        self.inner.set(name, secret)
+        self.inner.set(name, secret)?;
+        if name.as_str().ends_with("account/revoke")
+            && let Some(standing) = self.ends_after_queue_write.lock().expect("the plan").take()
+        {
+            standing.store(false, Ordering::SeqCst);
+        }
+        Ok(())
     }
 
     fn get(&self, name: &SecretName) -> kr_crypto::Result<Option<kr_crypto::secret::SecretVec>> {
@@ -1578,7 +1601,17 @@ impl SecretStore for FaultyStore {
         {
             return Err(refused());
         }
-        self.inner.get(name)
+        let read = self.inner.get(name);
+        if name.as_str().ends_with("account/session")
+            && let Some(standing) = self
+                .ends_after_session_read
+                .lock()
+                .expect("the plan")
+                .take()
+        {
+            standing.store(false, Ordering::SeqCst);
+        }
+        read
     }
 
     fn delete(&self, name: &SecretName) -> kr_crypto::Result<()> {
@@ -1671,6 +1704,190 @@ async fn a_commit_whose_standing_ended_writes_nothing_and_a_keep_ends_its_tokens
     assert_eq!(kept, Commit::Kept);
     assert_eq!(stored_refresh(&store).as_deref(), Some("grant-d"));
     assert_eq!(stub.revoked(), ["grant-c", "grant-a"]);
+}
+
+/// The caller's standing is asked a second time, immediately before the grant is written and after
+/// every read of the store and the queue's write for the grant it replaces: where it ended while
+/// the store took its time, nothing of the new grant is written or sent, the queue is put back as it
+/// was found, the grant that was held stays, and a keep ends the tokens the grant came with. The
+/// control: where it holds, the same calls replace the grant.
+#[tokio::test]
+async fn a_keep_whose_standing_ends_while_the_store_works_writes_no_grant_and_puts_the_queue_back()
+{
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
+    signed_in
+        .commit(
+            issued_for("account-1", "grant-a", &["openid"]),
+            "a-nonce",
+            || true,
+        )
+        .await
+        .expect("A");
+    assert_eq!(queue_text(&store), None, "nothing is queued before");
+
+    let standing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    store.standing_ends_after_the_queue_write(&standing);
+    let withheld = signed_in
+        .commit(
+            issued_for("account-1", "grant-b", &["openid"]),
+            "b-nonce",
+            || standing.load(Ordering::SeqCst),
+        )
+        .await
+        .expect("a commit");
+    assert!(
+        !standing.load(Ordering::SeqCst),
+        "the standing ended in the store's wait"
+    );
+    assert_eq!(withheld, Commit::Withheld);
+    assert_eq!(stored_refresh(&store.inner).as_deref(), Some("grant-a"));
+    assert_eq!(queue_text(&store), None, "the queue is as it was found");
+    assert!(stub.revoked().is_empty(), "nothing was sent");
+
+    standing.store(true, Ordering::SeqCst);
+    store.standing_ends_after_the_queue_write(&standing);
+    let withheld = signed_in
+        .keep(
+            issued_for("account-1", "grant-c", &["openid"]),
+            "c-nonce",
+            || standing.load(Ordering::SeqCst),
+        )
+        .await
+        .expect("a keep");
+    assert_eq!(withheld, Commit::Withheld);
+    assert_eq!(stored_refresh(&store.inner).as_deref(), Some("grant-a"));
+    assert_eq!(
+        stub.revoked(),
+        ["grant-c"],
+        "the tokens the grant came with are ended, and the grant that was held is not"
+    );
+
+    let kept = signed_in
+        .keep(
+            issued_for("account-1", "grant-d", &["openid"]),
+            "d-nonce",
+            || true,
+        )
+        .await
+        .expect("a keep");
+    assert_eq!(kept, Commit::Kept);
+    assert_eq!(stored_refresh(&store.inner).as_deref(), Some("grant-d"));
+    assert_eq!(stub.revoked(), ["grant-c", "grant-a"]);
+}
+
+/// Where the standing ended in the store's wait and the queue cannot be put back, the outcome is
+/// the one a grant that cannot be written has: an error, no grant of the new sign-in, its tokens
+/// ended, and the grant that was held with its own revocation queued, which the next recovery
+/// removes.
+#[tokio::test]
+async fn a_keep_whose_standing_ends_while_the_store_works_and_whose_queue_cannot_be_put_back_fails()
+{
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
+    signed_in
+        .commit(
+            issued_for("account-1", "grant-a", &["openid"]),
+            "a-nonce",
+            || true,
+        )
+        .await
+        .expect("A");
+
+    let standing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    store.standing_ends_after_the_queue_write(&standing);
+    // The queue takes the entry of the grant that is replaced and refuses to be put back.
+    store.queue_writes(&[false, true]);
+    signed_in
+        .keep(
+            issued_for("account-1", "grant-b", &["openid"]),
+            "b-nonce",
+            || standing.load(Ordering::SeqCst),
+        )
+        .await
+        .expect_err("the queue cannot be put back");
+    assert!(
+        !standing.load(Ordering::SeqCst),
+        "the standing ended in the store's wait"
+    );
+    assert_eq!(
+        stub.revoked(),
+        ["grant-b"],
+        "the new sign-in's tokens are ended"
+    );
+    assert_eq!(stored_refresh(&store.inner).as_deref(), Some("grant-a"));
+    assert!(
+        queue_text(&store).is_some_and(|queue| queue.contains("grant-a")),
+        "the grant that is held has its own revocation queued"
+    );
+
+    assert_eq!(
+        signed_in.recover().await.expect("a recovery"),
+        0,
+        "nothing is left waiting"
+    );
+    assert_eq!(
+        stored_refresh(&store.inner),
+        None,
+        "the next recovery removes the grant that was held"
+    );
+    assert_eq!(stub.revoked(), ["grant-b", "grant-a"]);
+}
+
+/// A sign-out asks whether the caller's standing holds after it has read the grant and the queue
+/// and immediately before it changes either: where it ended in the store's wait, the grant is still
+/// held and nothing is queued or sent. The control: where it holds, the grant goes and its
+/// revocation is sent.
+#[tokio::test]
+async fn a_sign_out_whose_standing_ends_while_the_store_is_read_removes_and_queues_nothing() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
+    signed_in
+        .commit(
+            issued_for("account-1", "grant-a", &["openid"]),
+            "a-nonce",
+            || true,
+        )
+        .await
+        .expect("A");
+
+    let standing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    store.standing_ends_after_the_session_read(&standing);
+    let refused = signed_in
+        .sign_out(|| {
+            if standing.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err("the standing ended")
+            }
+        })
+        .await
+        .expect("the store works");
+    assert!(
+        matches!(refused, Err("the standing ended")),
+        "the sign-out is refused"
+    );
+    assert_eq!(stored_refresh(&store.inner).as_deref(), Some("grant-a"));
+    assert_eq!(queue_text(&store), None, "no revocation was queued");
+    assert!(stub.revoked().is_empty(), "nothing was sent");
+
+    let signed_out = signed_in
+        .sign_out(|| Ok::<(), &str>(()))
+        .await
+        .expect("the store works")
+        .expect("the standing holds");
+    assert!(signed_out.was_signed_in);
+    assert_eq!(stored_refresh(&store.inner), None);
+    assert_eq!(stub.revoked(), ["grant-a"]);
 }
 
 /// A commit that cannot write the new grant leaves the old one whole, and owes it no revocation: the
