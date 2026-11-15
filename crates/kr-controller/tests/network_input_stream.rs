@@ -17,18 +17,20 @@ use kr_controller::service::net::devices::DeviceRecord;
 use kr_protocol::attachment::{
     AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult, SessionDetachParams,
 };
-use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Response};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::{StreamHeader, StreamKind, StreamResource};
 use kr_protocol::ids::{
     ActionId, AttachmentId, InputLeaseEpoch, InputSequence, RequestId, SessionId,
 };
 use kr_protocol::input::{
-    InputAck, InputAcquireParams, InputAcquireResult, InputFrame, input_claim,
+    InputAck, InputAcquireParams, InputAcquireResult, InputBarrier, InputFrame, InputReleaseParams,
+    input_claim,
 };
 use kr_protocol::local::{InputLaneReady, LaneEnded, LaneLaunch, LaneWindow};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
+use kr_protocol::root::{EditorBufferRevision, LaunchCommand, PromptGeneration, ShellLaunchParams};
 use kr_protocol::scalars::{Bytes, Nullable, U64};
 use kr_protocol::session::Dimensions;
 use kr_transport::streams::DataStream;
@@ -2986,4 +2988,338 @@ async fn an_input_stream_ends_when_the_control_stream_is_finished_and_the_connec
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_input_stream_ends_when_the_control_stream_is_reset_and_the_connection_stands() {
     the_control_stream_ends_while_the_connection_stands(true).await;
+}
+
+// The position check: a release, a detach or a launch that carries a barrier is read against the
+// host's own record of the stream before it is forwarded.
+
+/// The three requests that can carry a barrier.
+#[derive(Clone, Copy, Debug)]
+enum Dependent {
+    Release,
+    Detach,
+    Launch,
+}
+
+/// What the host answered a request that carried a barrier, and whether the position check is what
+/// refused it: the count of its refusals moved while the request was in service.
+struct Sent {
+    answer: Result<ParamsValue, ProtocolError>,
+    refused_here: bool,
+}
+
+/// Sends `request` as the device does, with a barrier that names `epoch` and `count` of the typing
+/// it follows. A refusal by the position check is asserted to be the conflict that it gives.
+async fn send_after(rig: &Rig, request: Dependent, epoch: InputLeaseEpoch, count: u64) -> Sent {
+    let barrier = Some(InputBarrier {
+        attachment_id: rig.attachment,
+        epoch,
+        count: U64::new(count),
+        launch: match request {
+            Dependent::Launch => Nullable::some(1),
+            Dependent::Release | Dependent::Detach => Nullable::null(),
+        },
+    });
+    let target = rig.adopted.workers[0].target(rig.adopted.host.environment_id);
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let before = position_refusals(rig);
+    let answer = match request {
+        Dependent::Release => {
+            rig.device
+                .mutate(
+                    Method::InputRelease,
+                    action,
+                    target,
+                    &InputReleaseParams {
+                        session_id: rig.session,
+                        attachment_id: rig.attachment,
+                        epoch: rig.epoch,
+                        after_input: barrier,
+                        fenced_report: false,
+                    },
+                )
+                .await
+        }
+        Dependent::Detach => {
+            rig.device
+                .mutate(
+                    Method::SessionDetach,
+                    action,
+                    target,
+                    &SessionDetachParams {
+                        attachment_id: Nullable::some(rig.attachment),
+                        line_token: Nullable::null(),
+                        after_input: barrier,
+                        fenced_report: false,
+                    },
+                )
+                .await
+        }
+        Dependent::Launch => {
+            rig.device
+                .mutate(
+                    Method::ShellLaunch,
+                    action,
+                    target,
+                    &ShellLaunchParams {
+                        session_id: rig.session,
+                        command: LaunchCommand::Arguments(vec!["true".to_owned()]),
+                        expected_prompt_generation: PromptGeneration(U64::new(0)),
+                        expected_buffer_revision: EditorBufferRevision(U64::new(0)),
+                        after_input: barrier,
+                    },
+                )
+                .await
+        }
+    };
+    let refused_here = position_refusals(rig) > before;
+    if refused_here {
+        assert!(
+            matches!(&answer, Err(error) if error.code == ErrorCode::DraftConflict),
+            "the position check gives a conflict: {answer:?}"
+        );
+    }
+    Sent {
+        answer,
+        refused_here,
+    }
+}
+
+/// How many requests the position check has refused.
+fn position_refusals(rig: &Rig) -> u64 {
+    rig.adopted
+        .host
+        .network()
+        .input_stages()
+        .counts()
+        .position_refusals
+}
+
+/// A rig with a stream open and `accepted` frames of one byte typed and accepted.
+async fn typed(accepted: u64) -> (Rig, DataStream) {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    for sequence in 0..accepted {
+        type_and_wait(&rig, &mut stream, sequence, b"k").await;
+    }
+    (rig, stream)
+}
+
+/// A request whose barrier names exactly the typing the worker has accepted, or less, is forwarded:
+/// the host refuses nothing, and a release or a detach is taken by the worker.
+async fn a_reached_barrier_is_forwarded(request: Dependent) {
+    let (rig, _stream) = typed(3).await;
+    let epoch = rig.epoch;
+    let below = send_after(&rig, Dependent::Launch, epoch, 2).await;
+    assert!(
+        !below.refused_here,
+        "a barrier below the count: {:?}",
+        below.answer
+    );
+    let at = send_after(&rig, request, epoch, 3).await;
+    assert!(!at.refused_here, "a barrier at the count: {:?}", at.answer);
+    if !matches!(request, Dependent::Launch) {
+        assert!(
+            at.answer.is_ok(),
+            "the worker was to take it: {:?}",
+            at.answer
+        );
+    }
+    assert_eq!(position_refusals(&rig), 0);
+    rig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_release_whose_barrier_is_reached_is_forwarded() {
+    a_reached_barrier_is_forwarded(Dependent::Release).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detach_whose_barrier_is_reached_is_forwarded() {
+    a_reached_barrier_is_forwarded(Dependent::Detach).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_whose_barrier_is_reached_is_forwarded() {
+    a_reached_barrier_is_forwarded(Dependent::Launch).await;
+}
+
+/// A request whose barrier names more typing than the worker has accepted is refused by the host
+/// with nothing forwarded and nothing applied, and the refusal changes nothing that a later request
+/// reads: the lease is still held (a release is taken after it), the attachment is still attached,
+/// the stream still takes typing, and the record still counts what the worker accepts, so the same
+/// barrier is forwarded once the worker has accepted the typing it names.
+async fn an_unreached_barrier_is_refused_and_changes_nothing(request: Dependent) {
+    let (rig, mut stream) = typed(3).await;
+    let epoch = rig.epoch;
+    let refused = send_after(&rig, request, epoch, 4).await;
+    assert!(
+        refused.refused_here,
+        "the host was to refuse: {:?}",
+        refused.answer
+    );
+    assert_eq!(
+        rig.adopted.workers[0].attachments(),
+        1,
+        "nothing was applied: the attachment stands"
+    );
+    type_and_wait(&rig, &mut stream, 3, b"k").await;
+    let again = send_after(&rig, request, epoch, 4).await;
+    assert!(
+        !again.refused_here,
+        "the barrier is reached once the typing is accepted: {:?}",
+        again.answer
+    );
+    if !matches!(request, Dependent::Launch) {
+        assert!(
+            again.answer.is_ok(),
+            "the worker takes it: the lease and the attachment were not touched: {:?}",
+            again.answer
+        );
+    }
+    assert_eq!(
+        position_refusals(&rig),
+        1,
+        "only the first request was refused"
+    );
+    rig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_release_whose_barrier_is_not_reached_is_refused_and_changes_nothing() {
+    an_unreached_barrier_is_refused_and_changes_nothing(Dependent::Release).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detach_whose_barrier_is_not_reached_is_refused_and_changes_nothing() {
+    an_unreached_barrier_is_refused_and_changes_nothing(Dependent::Detach).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_whose_barrier_is_not_reached_is_refused_and_changes_nothing() {
+    an_unreached_barrier_is_refused_and_changes_nothing(Dependent::Launch).await;
+}
+
+/// A barrier is consulted only while its epoch is the epoch of the lease the stream's attachment
+/// holds. The lane moves to a newer epoch that has accepted nothing: a barrier of that epoch is
+/// short, and the older epoch's accepted count does not stand for it; a barrier of the older epoch
+/// is forwarded, whatever its count, as the worker treats a stale one. When the lane's attachment
+/// holds no lease, no barrier is judged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_barrier_is_judged_only_in_the_epoch_the_lane_holds() {
+    let (rig, mut stream) = typed(3).await;
+    let older = rig.epoch;
+    let newer = older.get() + 1;
+    rig.lane.send_window(LaneWindow {
+        ended: Nullable::some(LaneEnded {
+            epoch: older,
+            fenced_bytes: U64::new(0),
+        }),
+        ..holding(newer)
+    });
+    assert!(
+        matches!(
+            next(&mut stream).await,
+            Some(InputAck::EpochEnded { epoch, .. }) if epoch == older
+        ),
+        "the window of the newer epoch is applied"
+    );
+    // The newer epoch has accepted nothing, and three frames of the older epoch were accepted.
+    let short = send_after(&rig, Dependent::Detach, InputLeaseEpoch::new(newer), 1).await;
+    assert!(
+        short.refused_here,
+        "the newer epoch is short: {:?}",
+        short.answer
+    );
+    // The older epoch is stale: forwarded, though its count is far above what was accepted.
+    let stale = send_after(&rig, Dependent::Launch, older, 99).await;
+    assert!(
+        !stale.refused_here,
+        "a stale epoch is forwarded: {:?}",
+        stale.answer
+    );
+    // The attachment holds no lease after the lease moved on: nothing is judged.
+    rig.lane.send_window(moved_on(newer));
+    assert!(
+        matches!(
+            next(&mut stream).await,
+            Some(InputAck::EpochEnded { epoch, .. }) if epoch.get() == newer
+        ),
+        "the end of the newer lease is told"
+    );
+    for epoch in [newer, newer + 1] {
+        let none = send_after(&rig, Dependent::Launch, InputLeaseEpoch::new(epoch), 99).await;
+        assert!(!none.refused_here, "no lease is held: {:?}", none.answer);
+    }
+    assert_eq!(
+        position_refusals(&rig),
+        1,
+        "only the newer epoch's was refused"
+    );
+    rig.stop().await;
+}
+
+/// The host has no record of a stream that never opened, and none of one that ended: the request is
+/// forwarded and the worker decides.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_with_no_record_of_a_stream_is_forwarded() {
+    let rig = Rig::start().await;
+    let never_opened = send_after(&rig, Dependent::Launch, rig.epoch, 5).await;
+    assert!(
+        !never_opened.refused_here,
+        "no stream: {:?}",
+        never_opened.answer
+    );
+
+    let mut ended = rig.adopted.host.network().input_tasks_ended();
+    let stream = rig.open().await;
+    let (mut reader, writer) = stream.split();
+    drop(writer);
+    while let Some(_ack) = tokio::time::timeout(WAIT, reader.read_message::<InputAck>())
+        .await
+        .expect("the stream ends in time")
+        .expect("the stream is not reset")
+    {}
+    tokio::time::timeout(WAIT, ended.changed())
+        .await
+        .expect("the stream task ends")
+        .expect("the count stands");
+    let after_the_end = send_after(&rig, Dependent::Release, rig.epoch, 5).await;
+    assert!(
+        !after_the_end.refused_here && after_the_end.answer.is_ok(),
+        "the worker was to take the release: {:?}",
+        after_the_end.answer
+    );
+    assert_eq!(position_refusals(&rig), 0);
+    rig.stop().await;
+}
+
+/// A release after 1,000 distinct keys: the worker has accepted all of them, in order, and the
+/// release whose barrier names them is forwarded and taken; a barrier that names one key more is
+/// refused by the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_release_after_a_thousand_distinct_keys_is_forwarded_and_one_key_more_is_refused() {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    let keys = counters(1000);
+    send_all(&rig, &mut stream, &keys).await;
+    assert_eq!(
+        rig.lane.bytes(),
+        keys.concat(),
+        "the worker has every key, in order"
+    );
+    let over = send_after(&rig, Dependent::Release, rig.epoch, 1001).await;
+    assert!(
+        over.refused_here,
+        "one key more is not reached: {:?}",
+        over.answer
+    );
+    let released = send_after(&rig, Dependent::Release, rig.epoch, 1000).await;
+    assert!(
+        !released.refused_here && released.answer.is_ok(),
+        "the release is taken: {:?}",
+        released.answer
+    );
+    assert_eq!(position_refusals(&rig), 1);
+    rig.stop().await;
 }

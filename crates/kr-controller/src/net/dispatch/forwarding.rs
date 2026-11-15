@@ -542,6 +542,19 @@ impl RemoteConnection {
                 "this mutation names the session it acts on",
             ));
         };
+        // A release, a detach or a launch may follow typing that its sender wrote on its input
+        // stream. When this host's own record of that stream shows the typing has not all been
+        // accepted, the request is refused here: nothing is forwarded, claimed or applied, so
+        // nothing a later request reads has changed. The check is advisory: where the host has no
+        // record, or the barrier is of another epoch than the stream's lease, the request goes on
+        // and the worker decides.
+        if let Some(barrier) = super::super::input::barrier::barrier_of(mutation)
+            && self
+                .inputs
+                .position_not_reached(self.connection_id(), &barrier)
+        {
+            return Err(super::super::input::barrier::not_reached());
+        }
         let proxy = match self.proxy_for(session_id, acting).await {
             Ok(proxy) => proxy,
             Err(error) => return Err(error.to_protocol_error()),
