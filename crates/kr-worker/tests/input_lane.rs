@@ -2660,6 +2660,54 @@ async fn the_remainder_of_a_batch_the_writer_abandons_at_its_deadline_is_counted
     rig.finish().await;
 }
 
+/// KR-REQ-23.36: a host's answer never goes into a paste that a dropped batch was to close. The
+/// writer is part way through a paste when the authority behind it ends: the delivered part is
+/// what the application has, and the closing delimiter that the view sent after it, which the
+/// writer will not write, is already in the stream that the response lane reads. The writer ends
+/// the application's open paste when it abandons the batch, so that the answer to the question the
+/// application asks next comes after the end of the paste and not inside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_writer_ends_the_paste_it_abandons_part_way_before_a_reply_is_written() {
+    const BODY: usize = 60_000;
+    let mut rig = Rig::start_unreading().await;
+    let attachment = rig.attach().await;
+    let epoch = rig.acquire(attachment).await;
+    let mut lane = rig.lane(attachment).await;
+
+    let deadline = kr_ipc::clock::boot_elapsed_ms() + 5_000;
+    let mut opening = b"\x1b[200~".to_vec();
+    opening.extend_from_slice(&[b'q'; BODY]);
+    let id = lane.send_before(&opening, deadline).await;
+    assert_eq!(lane.accepted().await, id, "the paste is accepted in time");
+    // The frame that closes the paste is accepted too, and the writer will not write it.
+    lane.send(b"\x1b[201~").await;
+    lane.accepted().await;
+    until("the opening frame's authority ended", WAIT, || {
+        kr_ipc::clock::boot_elapsed_ms() >= deadline
+    })
+    .await;
+    // The accepted stream says the paste is closed, so the answer is let out behind the frames.
+    rig.runtime.session().ingest_output(b"\x1b[5n");
+    rig.runtime.flush_input();
+    rig.let_the_application_read().await;
+
+    let notice = the_notice_after_the_room_came_back(&rig, &mut lane).await;
+    let ended = notice.ended.0.expect("the notice says an epoch ended");
+    assert_eq!(ended.epoch, epoch);
+    let fenced = usize::try_from(ended.fenced_bytes.get()).expect("a count");
+    let sent = 6 + BODY + 6;
+    assert!(
+        fenced > 6 && fenced < sent,
+        "the writer was part way through the paste: {fenced} of {sent} bytes were not written"
+    );
+    // What the application has: the part of the paste that was written, the end of the paste that
+    // the writer wrote in its place, and then the answer.
+    let mut expected = opening[..sent - fenced].to_vec();
+    expected.extend_from_slice(b"\x1b[201~\x1b[0n");
+    rig.received_exactly(&expected).await;
+    rig.finish().await;
+}
+
 /// KR-REQ-23.36: what the root editor's machine holds for a lease that ends is part of the fenced
 /// count, in the answer of a release and in the notice. The reader has not answered the fence it
 /// was asked for, so the machine holds the two bytes that the session accepted.
@@ -2851,6 +2899,141 @@ async fn the_roots_end_counts_what_the_machine_dropped_with_the_attachment_in_th
     );
 
     // The launch waits for its reader's word, which the close gives up on.
+    rig.runtime.close(ClosureReason::CloseRequested).1.release();
+    let (_proxy, answer) = tokio::time::timeout(WAIT, launching)
+        .await
+        .expect("the close answers the launch")
+        .expect("the launch's task ran");
+    assert!(
+        answer.is_err(),
+        "nothing was installed for a view that left"
+    );
+}
+
+/// Ends the view of `attachment` by the root editor's own gesture, with the recogniser's timer
+/// stopped at its deadline and the session's carry-out stopped before the removal, as it is
+/// between the machine's stimulus and the session's removal: the input domain is let go there, so
+/// the timer can forward a delimiter prefix in that gap. The timer is let go when the removal has
+/// arrived, and the removal when the carried count has `carried` bytes, which says that the
+/// stimulus and the timer have both done what they do.
+///
+/// Returns what the lane's notice counts for the epoch and what the next acquire would report.
+async fn the_roots_end_with_the_timer_let_go_in_the_gap(
+    rig: &mut Rig,
+    lane: &mut Lane,
+    epoch: InputLeaseEpoch,
+    fence_id: kr_protocol::root::FenceId,
+    timer: (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ),
+    carried: u64,
+) -> (u64, u64) {
+    let (at_its_deadline, let_the_timer_go) = timer;
+    tokio::time::timeout(WAIT, at_its_deadline)
+        .await
+        .expect("the timer reached the deadline of the held prefix")
+        .expect("the timer is waiting");
+    let (at_the_removal, go_on) = rig.runtime.session().pause_before_a_removal();
+    let runtime = Arc::clone(&rig.runtime);
+    let session_id = rig.session_id;
+    let detaching = tokio::task::spawn_blocking(move || {
+        runtime.session().stimulate_fence(|driver| {
+            driver.bridge_event(
+                RequestId::new(3),
+                &BridgeEvent::EofDetach(RootEofDetachParams {
+                    session_id,
+                    fence_id,
+                    prompt_generation: PromptGeneration::new(1),
+                    input_epoch: epoch,
+                }),
+            )
+        })
+    });
+    tokio::time::timeout(WAIT, at_the_removal)
+        .await
+        .expect("the stimulus reached the removal")
+        .expect("the removal is waiting");
+    let_the_timer_go.send(()).expect("lets the timer go on");
+    let input = rig.runtime.input();
+    until(
+        "the carried count has the stimulus's and the timer's",
+        WAIT,
+        || input.lock().interrupted_input().bytes == carried,
+    )
+    .await;
+    go_on.send(()).expect("lets the removal go on");
+    detaching
+        .await
+        .expect("the stimulus ends")
+        .expect("the session has a fence machine");
+    let ended = next_window(lane).await.ended.0.expect("an epoch ended");
+    assert_eq!(ended.epoch, epoch);
+    (
+        ended.fenced_bytes.get(),
+        rig.runtime.session().interrupted_input().bytes,
+    )
+}
+
+/// KR-REQ-23.36: a delimiter prefix that the worker accepted and the recogniser holds when the
+/// root editor ends the view is part of that end. The recogniser's timer can come due between the
+/// machine's stimulus and the session's removal; the prefix is taken in the stimulus's hold, so
+/// the notice counts it and the next acquire reports it once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_prefix_held_when_the_root_ends_the_view_is_counted_in_its_notice() {
+    let mut rig = Rig::start_fenced().await;
+    let attachment = rig.attach().await;
+    let epoch = rig.acquire(attachment).await;
+    let mut lane = rig.lane(attachment).await;
+    let fence_id = rig.at_a_prompt();
+    let timer = rig.runtime.pause_the_timer_at_its_deadline();
+    typed(&mut lane, &[b"\x1b"]).await;
+
+    let (notice, carried) = the_roots_end_with_the_timer_let_go_in_the_gap(
+        &mut rig, &mut lane, epoch, fence_id, timer, 1,
+    )
+    .await;
+    assert_eq!(
+        notice, 1,
+        "the notice counts the Escape the recogniser held"
+    );
+    assert_eq!(
+        carried, 1,
+        "the same byte is carried to the next acquire, once"
+    );
+    rig.finish().await;
+}
+
+/// KR-REQ-23.36: the same end with keys held behind a reserved launch as well: the machine's two
+/// keys and the recogniser's prefix are three bytes in the notice and three in the carried count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_prefix_and_the_keys_behind_a_launch_are_counted_together_when_the_root_ends_the_view() {
+    let mut rig = Rig::start_fenced().await;
+    let attachment = rig.attach().await;
+    let epoch = rig.acquire(attachment).await;
+    let mut lane = rig.lane(attachment).await;
+    let fence_id = rig.at_a_prompt();
+    let launching = rig.launching(Some(barrier(attachment, epoch, 0, Some(5))));
+    match lane.next_event().await {
+        Some(Seen::Launch(marker)) => assert_eq!(marker.launch, 5),
+        other => panic!("the launch's marker did not come: {other:?}"),
+    }
+    let timer = rig.runtime.pause_the_timer_at_its_deadline();
+    typed(&mut lane, &[b"x", b"y", b"\x1b"]).await;
+
+    let (notice, carried) = the_roots_end_with_the_timer_let_go_in_the_gap(
+        &mut rig, &mut lane, epoch, fence_id, timer, 3,
+    )
+    .await;
+    assert_eq!(
+        notice, 3,
+        "the notice counts the two keys the machine dropped and the Escape the recogniser held"
+    );
+    assert_eq!(
+        carried, 3,
+        "the same three bytes are carried to the next acquire, once"
+    );
+
     rig.runtime.close(ClosureReason::CloseRequested).1.release();
     let (_proxy, answer) = tokio::time::timeout(WAIT, launching)
         .await
