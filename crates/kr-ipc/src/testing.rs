@@ -915,14 +915,17 @@ mod tests {
         }));
     }
 
-    /// How long the thread of [`hold_the_standard_error`] holds the lock: long enough that a drop
-    /// that does not wait for its line returns, and the process ends, before the lock is free.
+    /// How long the thread of [`hold_the_standard_error`] holds the lock. It is not what decides
+    /// the case: the drop's own word does. The hold is for the drop that waits and the wait of no
+    /// length. A drop that waits has to wait for the lock, since its writer cannot write before
+    /// it is free; and with the lock held, a wait of no length cannot find the line already
+    /// written, which a free lock could let a fast writer do before the wait begins.
     #[cfg(unix)]
     const STANDARD_ERROR_HELD: Duration = Duration::from_millis(300);
 
     /// Starts a thread that takes the standard error's lock, holds it for `STANDARD_ERROR_HELD` and
-    /// lets go, and returns once the thread has it. No line can be written to the standard error
-    /// by anyone else in between.
+    /// lets go, and returns once the thread has it. No other thread can write through
+    /// `std::io::stderr()` in between.
     #[cfg(unix)]
     fn hold_the_standard_error() {
         let (holding, held) = std::sync::mpsc::channel();
