@@ -25,9 +25,9 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use kr_protocol::envelope::{Outcome, Response};
+use kr_protocol::envelope::{Outcome, Request, Response};
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::{AttachmentId, SessionId};
+use kr_protocol::ids::{AttachmentId, RequestId, SessionId};
 use kr_protocol::input::InputFrame;
 use kr_transport::streams::{DataReader, StreamHandle};
 use tokio::sync::{oneshot, watch};
@@ -84,6 +84,18 @@ const fn precedes_acceptance(code: ErrorCode) -> bool {
             | ErrorCode::ResourceUnavailable
             | ErrorCode::PermissionDenied
     )
+}
+
+/// The `input.write` that carries `frame` to the worker, or the refusal when the frame cannot be
+/// encoded.
+fn request_for(
+    request_id: RequestId,
+    session: SessionId,
+    attachment: AttachmentId,
+    frame: InputFrame,
+) -> Result<Request, ProtocolError> {
+    write_request(request_id, session, attachment, frame)
+        .ok_or_else(|| refusal("this typing could not be encoded"))
 }
 
 /// Reads the stream and carries each frame to the worker in turn. Returns when the stream ends.
@@ -180,9 +192,12 @@ async fn carry(
         }
     };
     let request_id = flow.next_request_id();
-    let Some(request) = write_request(request_id, session, attachment, frame) else {
-        flow.refuse(epoch, sequence, refusal("this typing could not be encoded"));
-        return;
+    let request = match request_for(request_id, session, attachment, frame) {
+        Ok(request) => request,
+        Err(error) => {
+            flow.refuse(epoch, sequence, error);
+            return;
+        }
     };
     flow.stages.before_a_serial_call().await;
     {
@@ -250,5 +265,67 @@ async fn carry(
             flow.end(End::Graceful);
         }
         Class::Uncertain => flow.end(End::Cut),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kr_cbor::CanonicalValue;
+    use kr_protocol::ids::InputLeaseEpoch;
+    use kr_protocol::input::{InputContent, InputWriteParams};
+    use kr_protocol::retained::{Level, RETAINED};
+    use kr_protocol::scalars::{Bytes, Uuid};
+
+    use super::*;
+
+    fn written() -> Request {
+        let frame = InputFrame {
+            epoch: InputLeaseEpoch::new(3),
+            sequence: kr_protocol::ids::InputSequence::new(0),
+            bytes: Bytes::new(b"ls\r".to_vec()),
+        };
+        request_for(
+            RequestId::new(1),
+            SessionId::new(Uuid::from_bytes([1; 16])),
+            AttachmentId::new(Uuid::from_bytes([2; 16])),
+            frame,
+        )
+        .expect("the frame is written")
+    }
+
+    fn member<'a>(request: &'a Request, name: &str) -> Option<&'a CanonicalValue> {
+        match request.params.as_value() {
+            CanonicalValue::Map(map) => map.get(name),
+            _ => panic!("the parameters of a write are a map"),
+        }
+    }
+
+    /// Every worker the host serves reads the `input` union, so a frame is written as it is: the
+    /// bytes inside the union, and no bytes at the top of the parameters.
+    #[test]
+    fn a_frame_is_written_as_the_input_union() {
+        let request = written();
+        assert!(
+            member(&request, "input").is_some(),
+            "this level reads the union"
+        );
+        assert!(member(&request, "bytes").is_none(), "no bytes at the top");
+    }
+
+    /// A worker of the retained level reads the frame as the bytes of the union: that level's own
+    /// surface decodes the parameters, and what it reads is the bytes the device sent.
+    #[test]
+    fn a_worker_of_the_retained_level_reads_the_frame_as_bytes_in_the_union() {
+        let request = written();
+        let read: InputWriteParams = Level::retained(&RETAINED[0])
+            .decode_value(&request.params)
+            .expect("the retained level reads the parameters");
+        assert_eq!(
+            read.input,
+            InputContent::Bytes {
+                bytes: Bytes::new(b"ls\r".to_vec())
+            },
+            "the retained level reads the bytes of the union"
+        );
     }
 }
