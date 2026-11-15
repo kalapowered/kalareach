@@ -904,12 +904,24 @@ impl InputDomain {
     /// Leaving it would put an ended actor's authority on the next actor's first keystrokes: the
     /// bytes it belonged to have been discarded, and the deadline is a fact about those bytes.
     pub(crate) fn close_framing_for_takeover(&mut self) -> TakeoverFraming {
+        self.forget_the_held_prefix_authority();
+        self.framer.close_for_takeover()
+    }
+
+    /// Takes the delimiter prefix the recogniser holds for the lease's holder, with its deadlines,
+    /// and returns how many bytes it was. An open paste is left for the end of the lease to close.
+    fn take_held_prefix(&mut self) -> u64 {
+        self.forget_the_held_prefix_authority();
+        self.framer.discard_held_prefix() as u64
+    }
+
+    /// Forgets the authority and the claim of the prefix that is being discarded.
+    fn forget_the_held_prefix_authority(&mut self) {
         self.held_input_deadline = None;
         self.held_input_utc_deadline = None;
         // The prefix goes, so the claim that paid for its later entry has nothing left to pay for.
         // Dropping the guard takes no lock; the end of this hold carries out the top-up it asks for.
         self.held_guard = None;
-        self.framer.close_for_takeover()
     }
 
     /// Ends the lease that was in force and returns what it left the writer holding.
@@ -2000,17 +2012,38 @@ impl InputDomain {
         // Set by the first step that later steps must wait for.
         let mut behind_a_session_step = false;
         for step in effects.steps {
-            if behind_a_session_step {
-                applied.owed.push(self.counted(step));
-            } else if let Err(step) = self.carry_out_step(step, &mut applied.outcome) {
-                behind_a_session_step = !matches!(step, Step::EditorBusy(_));
-                // An attachment that is going is not typed at from this moment, whoever else takes
-                // the domain before the session removes it.
-                if let Step::RemoveAttachment { attachment, .. } = &step {
-                    self.capabilities.remove(attachment);
+            let mut step = if behind_a_session_step {
+                self.counted(step)
+            } else {
+                match self.carry_out_step(step, &mut applied.outcome) {
+                    Ok(()) => continue,
+                    Err(step) => {
+                        behind_a_session_step = !matches!(step, Step::EditorBusy(_));
+                        step
+                    }
                 }
-                applied.owed.push(step);
+            };
+            if let Step::RemoveAttachment {
+                attachment,
+                discarded,
+            } = &mut step
+            {
+                // An attachment that is going is not typed at from this moment, whoever else
+                // takes the domain before the session removes it.
+                self.capabilities.remove(attachment);
+                // The delimiter prefix the recogniser holds for the holder is taken in this hold,
+                // with the keys the machine dropped, so that the recogniser's timer cannot
+                // forward it before the session removes the attachment: the machine would discard
+                // it as an old lease's key and the end's notice would leave it out. It is the
+                // removal's share and, as the machine's share is, carried to the next acquire
+                // once.
+                if self.lease.holder() == Some(*attachment) {
+                    let prefix = self.take_held_prefix();
+                    self.carry_bytes(prefix);
+                    *discarded = discarded.saturating_add(prefix);
+                }
             }
+            applied.owed.push(step);
         }
         applied
     }
