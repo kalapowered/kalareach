@@ -87,6 +87,9 @@ if [ "$form" != none ]; then
   # The proxy's own namespaces, by the host's view.
   psvc=$(sudo -n systemctl show -p MainPID --value sbx-proxy.service sbx-proxy2.service 2>/dev/null | grep -v '^0$' | head -1)
   [ -n "$psvc" ] && printf '%s\n' "proxy service pid sits in namespace $(sudo -n stat -L -c %i "/proc/$psvc/ns/net" 2>/dev/null) (service's is $svc_ino)" | sed -e 's/^/info | /'
+  # Control for the half-close: the same request straight to the service, from inside its namespace.
+  ctl=$(sudo -n ip netns exec sbx-svc /usr/bin/python3 "$TOOLS/echo.py" eof 8443 NONCE-CTL | tr '\n' ';')
+  ok D.4c "control, half-close straight to the service without the proxy: $ctl"
   unit_legs sbx-d-p3 -- /usr/bin/python3 "$TOOLS/echo.py" eof 8443 NONCE-EOF
   if has sbx-d-p3 '^RESULT reply svc-8443 eof NONCE-EOF bytes=' && has sbx-d-p3 '^RESULT end closed$'; then
     ok D.4 "half-close: the service saw the end of the request, answered, and the stream then ended"
@@ -142,8 +145,8 @@ has sbx-d-g2 '^RESULT dns:github.com blocked' && ok D.10 "a library lookup of gi
 
 # Every socket the unit can see: none but its own.
 UNIT_MAX=60 unit_legs sbx-d-s1 -- /usr/bin/find / -path /proc -prune -o -type s -print
-others=$(grep -v -E '^(/home/kr-legs/|/tmp/|/dev/shm/)' "$SBX_LOGS/sbx-d-s1.log" | grep -c . || true)
-[ "$others" -eq 0 ] && ok D.11 "find / -type s in a unit lists no socket outside the account's own folders" || fail D.11 "find / -type s lists $others sockets: $(grep -v -E '^(/home/kr-legs/|/tmp/|/dev/shm/)' "$SBX_LOGS/sbx-d-s1.log" | tr '\n' ' ' | cut -c1-300)"
+others=$(grep -v -E '^(/home/kr-legs/|/tmp/|/dev/shm/|/usr/bin/find:)' "$SBX_LOGS/sbx-d-s1.log" | grep -c . || true)
+[ "$others" -eq 0 ] && ok D.11 "find / -type s in a unit lists no socket outside the account's own folders" || fail D.11 "find / -type s lists $others sockets: $(grep -v -E '^(/home/kr-legs/|/tmp/|/dev/shm/|/usr/bin/find:)' "$SBX_LOGS/sbx-d-s1.log" | tr '\n' ' ' | cut -c1-300)"
 
 if [ "$form" != none ]; then
   wait "$idle_pid"

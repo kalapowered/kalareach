@@ -29,10 +29,11 @@ for ((i = 0; i < ${#args[@]}; i += 2)); do
     echo "${prefix} | (no regular file to replay)"
     continue
   fi
-  # At most 4 MiB a file. "sed '$a\'" ends a last line that has no newline, so the next
-  # line, and the closing token, always start a line of their own.
+  # At most 4 MiB a file. The last sed command ("$a\" with no text) ends a last line that has
+  # no newline, so the next line, and the closing token, always start a line of their own. It
+  # must come last: GNU sed reads the next -e as the text to append.
   LC_ALL=C head -c 4194304 -- "$file" |
     LC_ALL=C tr -c '\12\40-\176' '?' |
-    LC_ALL=C sed -e '$a\' -e "s/^/${prefix} | /"
+    LC_ALL=C sed -e "s/^/${prefix} | /" -e '$a\'
 done
 printf '::%s::\n' "$token"

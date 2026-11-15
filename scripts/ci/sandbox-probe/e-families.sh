@@ -24,8 +24,8 @@ if has sbx-e2 '^RESULT uring EPERM$'; then ok E.3 "io_uring_setup returns EPERM 
 
 # The 32-bit table: the control first (the runner), then the unit.
 if [ -x /usr/local/lib/sandbox-probe/ia32 ]; then
-  g=$(/usr/local/lib/sandbox-probe/ia32 getpid 2>&1; echo "exit=$?")
-  v=$(/usr/local/lib/sandbox-probe/ia32 vsock 2>&1; echo "exit=$?")
+  g=$( ( /usr/local/lib/sandbox-probe/ia32 getpid; echo "exit=$?" ) 2>&1 || true )
+  v=$( ( /usr/local/lib/sandbox-probe/ia32 vsock; echo "exit=$?" ) 2>&1 || true )
   ok E.4a "control, the runner: int 0x80 getpid: $(printf '%s' "$g" | tr '\n' ' '); socket(AF_VSOCK): $(printf '%s' "$v" | tr '\n' ' ')"
   UNIT_MAX=60 unit_legs sbx-e3 -- /usr/local/lib/sandbox-probe/ia32 vsock
   rc=$?

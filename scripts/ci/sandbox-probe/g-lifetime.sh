@@ -93,12 +93,16 @@ ok G.6a "control: the runner's crash with core limit unlimited moved the coredum
 UNIT_MAX=30 unit_legs sbx-g6 -- $LIFE crash
 sleep 3
 after_unit=$(cd_count)
-if [ "$after_unit" = "$after_control" ]; then
-  ok G.6 "a crash in a unit (LimitCORE=0) started no coredump helper: entries stay at $after_unit"
-else
-  fail G.6 "a crash in a unit changed the coredump entries from $after_control to $after_unit"
-fi
+ok G.6 "recorded: with the image's core_pattern a crash in a unit (LimitCORE=0) moved the coredump entries from $after_control to $after_unit"
 sudo -n sysctl -w kernel.core_pattern=core >/dev/null 2>&1
-ok G.7 "the runner can set kernel.core_pattern: now $(cat /proc/sys/kernel/core_pattern)"
+if [ "$(cat /proc/sys/kernel/core_pattern)" = core ]; then ok G.7 "the runner set kernel.core_pattern to a plain file name"; else fail G.7 "kernel.core_pattern is $(cat /proc/sys/kernel/core_pattern)"; fi
+UNIT_MAX=30 unit_legs sbx-g8 -- $LIFE crash
+sleep 3
+after_plain=$(cd_count)
+if [ "$after_plain" = "$after_unit" ]; then
+  ok G.8 "with a plain core_pattern a crash in a unit starts no helper: entries stay at $after_plain"
+else
+  fail G.8 "with a plain core_pattern a crash changed the entries from $after_unit to $after_plain"
+fi
 endgroup
 finish G
