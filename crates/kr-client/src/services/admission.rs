@@ -375,12 +375,14 @@ enum Held {
     Admitted { until: Instant },
     /// The service is unable, or failed on its side. `kept_until` is how long the answer explains
     /// a failed dial, and `retry_at` is when a dial asks again. `alternatives` is what the service
-    /// named, with no entry for a fault; `retry_after_seconds` is the delay it named, as it named it.
+    /// named, with no entry for a fault; `retry_after_seconds` is the delay it named, as it named it,
+    /// and `answered_at` is when the answer was read.
     Unavailable {
         kept_until: Instant,
         retry_at: Instant,
         alternatives: Alternatives,
         retry_after_seconds: Option<u64>,
+        answered_at: Instant,
     },
     /// The pair holds a lease, or the relay is not the service's, until then.
     Needs { until: Instant },
@@ -651,6 +653,7 @@ impl PairingAdmissions {
                 retry_at: now + retry_after_seconds.map_or(DOUBT_AFTER, named_time),
                 alternatives: Alternatives::named(alternatives),
                 retry_after_seconds,
+                answered_at: now,
             },
             // Asked again as any other refusal is, and explained for as long as an unavailable
             // answer is.
@@ -662,6 +665,7 @@ impl PairingAdmissions {
                 retry_at: now + after_a_refusal(retry_after_seconds),
                 alternatives: Alternatives::none(),
                 retry_after_seconds,
+                answered_at: now,
             },
             Err(error) => Held::Failed {
                 retry_at: now + retry_delay(&error),
@@ -700,18 +704,40 @@ impl PairingAdmissions {
         match &entry.held {
             Held::Unavailable {
                 kept_until,
+                retry_at,
                 alternatives,
                 retry_after_seconds,
-                ..
+                answered_at,
             } if now < *kept_until || (entry.asks >= MOST_ASKS && !entry.window_passed(now)) => {
+                // What a person is told to wait is what is left until this device asks the service
+                // again, and never less than what is left of the delay the service named: the
+                // answer is kept past its delay while the cache will not ask again, and every try
+                // before then fails in the same way. None where the service named none.
+                let wait = retry_after_seconds.map(|named| {
+                    let asks_again = [
+                        Some(*retry_at),
+                        Some(*answered_at + named_time(named)),
+                        entry
+                            .asked_at
+                            .filter(|_| entry.asks >= MOST_ASKS)
+                            .map(|asked| asked + ASK_WINDOW),
+                        state.suspended_until,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .max()
+                    .unwrap_or(now);
+                    let left = asks_again.saturating_duration_since(now);
+                    left.as_secs() + u64::from(left.subsec_nanos() > 0)
+                });
                 Some(if alternatives.is_empty() {
                     RelayRefusal::Fault {
-                        retry_after_seconds: *retry_after_seconds,
+                        retry_after_seconds: wait,
                     }
                 } else {
                     RelayRefusal::Capacity {
                         alternatives: alternatives.clone(),
-                        retry_after_seconds: *retry_after_seconds,
+                        retry_after_seconds: wait,
                     }
                 })
             }
@@ -726,15 +752,17 @@ pub enum RelayRefusal {
     /// The service has no managed capacity to admit this device through the relay now, and named
     /// the paths that still work.
     Capacity {
-        /// The paths it named, each as it wrote it. Never empty.
+        /// The paths it named, each as it wrote it. At least one has text.
         alternatives: Alternatives,
-        /// Seconds after which the same request could succeed, as the service named them.
+        /// Seconds from now until this device asks the service again, and not less than what
+        /// remains of the delay the service named; none when the service named none.
         retry_after_seconds: Option<u64>,
     },
     /// The service failed on its side, and no capacity was refused. An answer that names no path,
     /// and a refusal in its envelope under a status of the 5xx class, are this.
     Fault {
-        /// Seconds after which the same request could succeed, when the answer named them.
+        /// Seconds from now until this device asks the service again, and not less than what
+        /// remains of the delay the service named; none when the service named none.
         retry_after_seconds: Option<u64>,
     },
 }

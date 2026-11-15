@@ -1156,7 +1156,11 @@ async fn kr_req_17_48_a_kept_answer_holds_the_list_and_the_delay_it_named() {
                     panic!("at {probe}s with {delay:?}: {refusal:?}");
                 };
                 assert_eq!(words_of(&alternatives), list, "at {probe}s");
-                assert_eq!(retry_after_seconds, delay, "at {probe}s");
+                assert_eq!(
+                    retry_after_seconds.is_some(),
+                    delay.is_some(),
+                    "at {probe}s with {delay:?}"
+                );
             }
         }
     }
@@ -1177,11 +1181,15 @@ async fn kr_req_17_48_an_unavailable_answer_with_no_entry_is_a_fault_and_never_c
             "{delay:?}"
         );
         for (probe, _, refusal) in seen {
+            let Some(RelayRefusal::Fault {
+                retry_after_seconds,
+            }) = refusal
+            else {
+                panic!("at {probe}s with {delay:?}: {refusal:?}");
+            };
             assert_eq!(
-                refusal,
-                Some(RelayRefusal::Fault {
-                    retry_after_seconds: delay
-                }),
+                retry_after_seconds.is_some(),
+                delay.is_some(),
                 "at {probe}s with {delay:?}"
             );
         }
@@ -1221,10 +1229,11 @@ async fn kr_req_17_48_a_refusal_of_the_5xx_class_in_the_envelope_is_a_fault() {
         asked_at_each_probe(&seen),
         [1, 1, 1, 1, 2, 2, 3, 3, 3, 4, 5, 6, 7]
     );
+    // And is told so: the wait is until the device asks again, which is twenty seconds.
     assert_eq!(
         seen[0].2,
         Some(RelayRefusal::Fault {
-            retry_after_seconds: Some(5)
+            retry_after_seconds: Some(20)
         })
     );
     // A service that says it is not configured is a fault as well, and is not asked for ten minutes.
@@ -1269,4 +1278,116 @@ async fn kr_req_17_48_a_transport_failure_and_an_answer_without_the_envelope_are
     })
     .await;
     assert!(seen.iter().all(|(_, _, refusal)| refusal.is_none()));
+}
+
+/// The wait a standing refusal hands on, of either kind.
+fn handed_on(refusal: &Option<RelayRefusal>) -> Option<u64> {
+    match refusal {
+        Some(
+            RelayRefusal::Capacity {
+                retry_after_seconds,
+                ..
+            }
+            | RelayRefusal::Fault {
+                retry_after_seconds,
+            },
+        ) => *retry_after_seconds,
+        None => None,
+    }
+}
+
+/// KR-REQ-17.48: what a failed dial hands on as the wait is the seconds from now until this device
+/// asks the service again, and never less than what is left of the delay the service named: not the
+/// delay as it was named when the answer was read, which is kept past itself while no request is
+/// made. Rounded up, and none where the service named none.
+#[tokio::test]
+async fn kr_req_17_48_the_wait_handed_on_is_the_wait_until_the_device_asks_again() {
+    const SHORT: &str = "Managed capacity for new pairing invitations is not available now.";
+    // The figures at the 13 dials, by hand from the times of the control: the answer's retry time
+    // while asks are left; the end of the ten minutes after the third ask, while they are used up
+    // (the count starts again at each ask made ten minutes after the last).
+    let tables: [(Option<u64>, [u64; 13]); 3] = [
+        (Some(5), [5, 1, 5, 600, 591, 586, 551, 546, 482, 5, 5, 5, 5]),
+        (
+            Some(3600),
+            [
+                3600, 3596, 3594, 3588, 3579, 3574, 3539, 3534, 3470, 2900, 3600, 3501, 3600,
+            ],
+        ),
+        (
+            Some(0),
+            [0, 0, 600, 594, 585, 580, 545, 540, 476, 0, 0, 0, 0],
+        ),
+    ];
+    for (delay, expected) in tables {
+        for body in [
+            unavailable_body(SHORT, &STILL_WORK, delay),
+            unavailable_body(
+                "The managed relay service could not admit this pairing now.",
+                &[],
+                delay,
+            ),
+        ] {
+            let http = Exact::new(200, &body);
+            let seen = series(Arc::clone(&http) as _, || http.requests()).await;
+            let handed: Vec<Option<u64>> = seen.iter().map(|(_, _, one)| handed_on(one)).collect();
+            assert_eq!(handed, expected.map(Some), "{delay:?} {body}");
+        }
+    }
+    // None where the service named none, whatever is left until the device asks again.
+    let http = Exact::new(200, &unavailable_body(SHORT, &STILL_WORK, None));
+    let seen = series(Arc::clone(&http) as _, || http.requests()).await;
+    assert!(
+        seen.iter()
+            .all(|(_, _, one)| one.is_some() && handed_on(one).is_none())
+    );
+}
+
+/// KR-REQ-17.48: while every request is stopped, the wait handed on is what is left of the stop, and
+/// not the delay the service named: a service that says it is not configured stops requests for ten
+/// minutes.
+#[tokio::test]
+async fn kr_req_17_48_the_wait_handed_on_runs_to_the_end_of_a_stop_of_requests() {
+    let http = Exact::new(501, &refusal_body("NOT_CONFIGURED", Some(30)));
+    let seen = series(Arc::clone(&http) as _, || http.requests()).await;
+    let handed: Vec<Option<u64>> = seen
+        .iter()
+        .take(6)
+        .map(|(_, _, one)| handed_on(one))
+        .collect();
+    // The dials at 0, 4, 6, 12, 21 and 26 seconds.
+    assert_eq!(
+        handed,
+        [
+            Some(600),
+            Some(596),
+            Some(594),
+            Some(588),
+            Some(579),
+            Some(574)
+        ]
+    );
+}
+
+/// KR-REQ-17.48: a list in which no entry has text names no path, so the answer is a fault and
+/// carries no list; a list in which one entry has text is kept as it was written.
+#[tokio::test]
+async fn kr_req_17_48_a_list_with_no_text_is_no_list() {
+    const WORDS: &str = "Managed capacity for new pairing invitations is not available now.";
+    for blank in [vec![""], vec!["  ", ""], vec![" \t "]] {
+        let http = Exact::new(200, &unavailable_body(WORDS, &blank, Some(30)));
+        let seen = series(Arc::clone(&http) as _, || http.requests()).await;
+        assert!(
+            matches!(seen[0].2, Some(RelayRefusal::Fault { .. })),
+            "{blank:?}: {:?}",
+            seen[0].2
+        );
+    }
+    let mixed = ["", "A path that this build has never heard of."];
+    let http = Exact::new(200, &unavailable_body(WORDS, &mixed, None));
+    let seen = series(Arc::clone(&http) as _, || http.requests()).await;
+    let Some(RelayRefusal::Capacity { alternatives, .. }) = &seen[0].2 else {
+        panic!("{:?}", seen[0].2);
+    };
+    assert_eq!(words_of(alternatives), mixed);
 }
