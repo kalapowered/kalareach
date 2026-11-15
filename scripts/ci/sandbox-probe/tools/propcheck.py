@@ -8,6 +8,7 @@ Prints one tab-separated line per property: ok|FAIL, the name, the detail. A lis
 matches when its words are the same set (after the manager's own spelling, such as the time
 properties' names and the address filter's prefix lengths).
 """
+import errno
 import re
 import sys
 
@@ -64,6 +65,10 @@ def main():
         got = shown[key]
         if name in TIME_ALIAS:
             good = micros(got) == int(want[0]) * 10**6
+        elif name == "StandardOutput" and want[0].startswith("append:"):
+            good = got == "append"  # the path is not part of the echoed value
+        elif name == "SystemCallErrorNumber":
+            good = got == str(getattr(errno, want[0], want[0]))
         elif name in LIST:
             wanted = set()
             for v in want:

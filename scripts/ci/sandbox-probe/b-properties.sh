@@ -34,7 +34,7 @@ for _ in $(seq 1 20); do
 done
 if [ "$state" = active ]; then ok B.3 "the unit with the whole list is active"; else fail B.3 "the unit with the whole list is $state"; fi
 
-sudo -n systemctl show sbx-b1.service --no-pager >"$SBX_LOGS/../b-shown.txt" 2>&1
+sudo -n systemctl show --all sbx-b1.service --no-pager >"$SBX_LOGS/../b-shown.txt" 2>&1
 j=10
 while IFS="$(printf '\t')" read -r verdict name detail; do
   j=$((j + 1))
