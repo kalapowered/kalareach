@@ -60,6 +60,29 @@ peak() {
   grep -i -E 'memory peak|service runtime|cpu time' "$SBX_LOGS/$1.systemd" 2>/dev/null | sed -e 's/^ *//' | tr '\n' ';' | cut -c1-200
 }
 
+# watch_mem NAME: samples the unit's control group once a second until the file NAME.done appears
+# in the log folder, and leaves the highest memory.peak (bytes) in NAME.mem. The manager's own end
+# text gave a few hundred KiB for a build that used 56 CPU seconds, so it is not the figure used.
+# Start it in the background before the unit; call stop_mem NAME after the unit has ended.
+watch_mem() {
+  local name=$1 cg="/sys/fs/cgroup/system.slice/$1.service" max=0 v f
+  while [ ! -e "$SBX_LOGS/$name.done" ]; do
+    for f in memory.peak memory.current; do
+      v=$(cat "$cg/$f" 2>/dev/null)
+      case $v in '' | *[!0-9]*) ;; *) [ "$v" -gt "$max" ] && max=$v ;; esac
+    done
+    sleep 1
+  done
+  printf '%s\n' "$max" >"$SBX_LOGS/$name.mem"
+}
+stop_mem() {
+  : >"$SBX_LOGS/$1.done"
+  local i
+  for i in $(seq 1 10); do [ -s "$SBX_LOGS/$1.mem" ] && break; sleep 0.5; done
+}
+# mem_peak NAME: the sampled peak in MiB.
+mem_peak() { awk -v b="$(cat "$SBX_LOGS/$1.mem" 2>/dev/null || echo 0)" 'BEGIN { printf "%.0f MiB (sampled)", b / 1048576 }'; }
+
 # The byte proxy: a socket in the legs' namespace and a proxy service in the service's namespace.
 # (Form 1 of the reach group.) usage: start_proxy PORT SERVICE_NAMESPACE_INODE
 start_proxy() {
