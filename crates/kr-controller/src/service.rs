@@ -62,6 +62,7 @@ mod clients;
 mod close;
 mod configuration;
 mod create;
+mod footing;
 mod host;
 mod identifiers;
 mod inhibition;
@@ -100,6 +101,7 @@ pub(crate) use barrier::{Asked, Told};
 pub use capabilities::{CAPABILITY_REVISION_FILE, DESKTOP_REREAD_INTERVAL};
 pub use close::{CLOSE_EXCHANGE, CLOSURE_WATCH_TIMEOUT};
 pub use create::{CREATE_WAIT, RENDEZVOUS_TIMEOUT};
+pub(crate) use footing::{Ask, Footing, Lapse};
 pub(crate) use identifiers::SpendFailed;
 pub use inhibition::{DEMAND_BUDGET, DEMAND_PATIENCE, POWER_REVIEW_INTERVAL};
 pub(crate) use local::serve_each;
@@ -631,6 +633,10 @@ pub struct Controller {
     /// restriction whose barrier has not run stops every admission and forward rather than being
     /// reported and passed over ([`Self::check_fence`]).
     debts: Arc<std::sync::Mutex<Debts>>,
+    /// The copies of this daemon's authority that a reader reads with no lock: whether a fence is
+    /// owed, the authority revision in force and the clocks ([`Footing`]). Each is written under
+    /// the lock that orders it: the flag under `debts`, the revision under the registry's.
+    copies: Arc<footing::Copies>,
     /// Wakes the debt pass for a debt left to it ([`OwnBarrier`]).
     debt_pass: Arc<tokio::sync::Notify>,
     /// Wakes the watch over paired devices ([`Controller::start_device_watch`]), which an expiry
@@ -1834,6 +1840,10 @@ mod a_change_that_waits_for_its_store;
 /// What the local door asks again where a retained answer goes back and where a mutation lands.
 #[cfg(test)]
 mod the_fence_at_every_effect;
+
+/// What a request's footing reads of a barrier, a fence and a registration without taking a lock.
+#[cfg(test)]
+mod a_footing_over_a_barrier;
 
 /// The walks over the method table that hold the local door's routes.
 #[cfg(test)]

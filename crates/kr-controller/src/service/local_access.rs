@@ -41,7 +41,7 @@ impl From<LeaseNotLive> for ControllerError {
 
 /// The refusal of a held method while no lease is live: the one text, whichever reading of the
 /// lease makes it.
-fn lease_not_live() -> LeaseNotLive {
+pub(super) fn lease_not_live() -> LeaseNotLive {
     LeaseNotLive {
         error: ControllerError::PermissionDenied {
             detail: "this host is exclusively organisation-managed and its local owner's \

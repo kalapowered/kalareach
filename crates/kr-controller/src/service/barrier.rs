@@ -200,6 +200,11 @@ pub(crate) enum Reach {
 #[derive(Debug, Default)]
 pub(super) struct Debts {
     pending: BTreeMap<crate::grants::store::DebtId, Reach>,
+    /// The debts a fence is owed for. What is in here changes at four places, and each sets the
+    /// flag that readers read in place of this lock ([`super::footing::Copies::note_debts`]) to
+    /// whether any is left, before it lets this go: [`Controller::publish_debts`], the barrier's
+    /// removal in [`Controller::withdraw`], the publication of what a start finds on disk, and
+    /// the test seam [`Controller::hold_fence`].
     pub(super) published: BTreeMap<crate::grants::store::DebtId, Published>,
     pub(super) retiring: std::collections::BTreeSet<crate::grants::store::DebtId>,
     /// What each of the latest revisions withdrew, by revision, for the announcement of it: the
@@ -247,6 +252,16 @@ impl Named {
 /// cause by a revocation of its own. A worker further behind than this is fenced as the whole
 /// host's, which is safe.
 const KEPT_REVISION_REACHES: usize = 256;
+
+/// The refusal that a fence this host owes gives, whichever check asks.
+pub(super) fn fence_owed_refusal() -> ControllerError {
+    ControllerError::PermissionDenied {
+        detail: "this host withdrew authority and the fence that withdrawal owes could not be \
+                 raised yet, so nothing admitted under it is dispatched; run kr doctor to see \
+                 what stopped it"
+            .to_owned(),
+    }
+}
 
 /// One published debt ([`Debts`]).
 #[derive(Clone, Debug)]
@@ -1434,6 +1449,9 @@ impl Controller {
                 },
             );
         }
+        // Set before the mutex is let go, so a reader of the flag that sees it clear has seen no
+        // debt of this change published.
+        self.copies.note_debts(!held.published.is_empty());
         drop(held);
         OwnBarrier {
             debts: debts.iter().map(|(debt, _)| *debt).collect(),
@@ -1883,11 +1901,17 @@ impl Controller {
                 #[cfg(feature = "testing")]
                 self.before_the_leases_adopt.wait();
                 self.leases.revoke(revision);
+                // The registrations that this revision withdrew have set their latches and the
+                // issuer has adopted it: the revision in memory follows them, and the flag is
+                // cleared last, so a reader that finds the flag clear finds the revision raised
+                // and those latches set ([`Footing::ask`]).
+                self.copies.raise_revision(revision);
                 let mut debts = self.debts();
                 for debt in captured.keys() {
                     debts.published.remove(debt);
                     debts.retiring.insert(*debt);
                 }
+                self.copies.note_debts(!debts.published.is_empty());
                 debts.reaches.insert(revision.get(), reach);
                 while debts.reaches.len() > KEPT_REVISION_REACHES {
                     debts.reaches.pop_first();
@@ -2302,13 +2326,8 @@ impl Controller {
         // admitted; refusing here is what keeps work admitted under withdrawn authority from being
         // dispatched while the withdrawal is still owed. A pending debt refuses nothing: its
         // restriction is not in force yet.
-        if !self.debts().published.is_empty() {
-            return Err(ControllerError::PermissionDenied {
-                detail: "this host withdrew authority and the fence that withdrawal owes could \
-                         not be raised yet, so nothing admitted under it is dispatched; run kr \
-                         doctor to see what stopped it"
-                    .to_owned(),
-            });
+        if self.copies.fence_is_owed() {
+            return Err(fence_owed_refusal());
         }
         Ok(())
     }
@@ -2329,6 +2348,7 @@ impl Controller {
         } else {
             debts.published.clear();
         }
+        self.copies.note_debts(!debts.published.is_empty());
     }
 
     /// Reads the fence this environment owes, and why it could not be read when it could not.

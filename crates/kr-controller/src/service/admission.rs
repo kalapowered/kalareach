@@ -868,6 +868,35 @@ impl Controller {
         )
     }
 
+    /// The footing of a request that arrived on `connection_id`: the registration as it stands,
+    /// its revision and its latch, with the `deadline` the request was accepted under. It is read
+    /// under the connection table's read lock once, here, and every later question of the footing
+    /// reads atomics and clocks alone.
+    ///
+    /// A connection that is not registered has been withdrawn, and the registration's own words
+    /// refuse it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal of a connection whose authority was withdrawn.
+    pub(super) fn footing_on(
+        &self,
+        connection_id: ConnectionId,
+        deadline: Option<kr_transport::clock::ContinuousInstant>,
+    ) -> Result<super::footing::Footing> {
+        let admitted = self.admitted_read();
+        let connection = admitted.get(&connection_id).ok_or_else(|| {
+            super::footing::admission_refusal(crate::authority::AdmissionLapse::Deregistered)
+        })?;
+        Ok(super::footing::Footing::admitted(
+            Arc::clone(&self.copies),
+            connection_id,
+            connection.admitted_revision,
+            connection.latch.clone(),
+            deadline,
+        ))
+    }
+
     /// Records that a connection decides a request under `grant_id`, so that a revocation of it
     /// reaches this connection. Returns whether the connection is still registered: one that is
     /// not has been withdrawn and acts under nothing.
@@ -1748,7 +1777,9 @@ pub(super) struct AdmittedConnection {
     pub(super) actor_id: ActorId,
     /// The authority revision in force when the connection was registered.
     pub(super) admitted_revision: kr_protocol::ids::AuthorityRevision,
-    /// The latch of the write boundary this registration lets write, when it has one.
+    /// The latch of this registration, when it has one: a local registration has its own from the
+    /// start, and a network registration is given the latch of its write boundary when the first
+    /// boundary is built.
     latch: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// The shares a network connection has decided a request under, noted before the share's
     /// record is read for it. A revocation that reaches a grant withdraws the connections that
@@ -1876,7 +1907,10 @@ impl AdmittedConnection {
 
     /// A registration of `actor_id`, admitted under `admitted_revision`, of a local client that
     /// declared itself `kind`.
-    pub(super) const fn local(
+    ///
+    /// It holds its latch from the start, which the removal of the registration sets: a request on
+    /// a local connection stands on it ([`Controller::footing_on`]).
+    pub(super) fn local(
         actor_id: ActorId,
         admitted_revision: kr_protocol::ids::AuthorityRevision,
         kind: kr_protocol::local::LocalClientKind,
@@ -1884,7 +1918,7 @@ impl AdmittedConnection {
         Self {
             actor_id,
             admitted_revision,
-            latch: None,
+            latch: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
             acting: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             door: Door::Local(kind),
             grant: None,
