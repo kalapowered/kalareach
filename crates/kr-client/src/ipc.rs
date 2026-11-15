@@ -71,6 +71,9 @@ pub struct IpcTransport {
     writer: Mutex<Option<FrameWriter>>,
     reader: Mutex<Option<FrameReader>>,
     closed: AtomicBool,
+    /// Set when a write failed because the peer has gone and the write half was dropped with it,
+    /// with the connection left open for the read loop to read what the peer sent before it went.
+    write_lost: AtomicBool,
     /// Notified when this connection is closed, so an active read or write stops waiting.
     ending: tokio::sync::Notify,
     /// Set once a session has claimed the receive side.
@@ -139,6 +142,7 @@ impl IpcTransport {
             writer: Mutex::new(Some(writer)),
             reader: Mutex::new(Some(reader)),
             closed: AtomicBool::new(false),
+            write_lost: AtomicBool::new(false),
             ending: tokio::sync::Notify::new(),
             claimed: AtomicBool::new(false),
         }
@@ -271,17 +275,28 @@ impl IpcTransport {
             // may never read again.
             () = closing => return Err(ClientError::ConnectionEnded),
         };
-        // A failed write leaves the half to `Lent`, which closes the connection when part of the
-        // frame went. A cut frame ends the connection here, and so does a close that arrived while
-        // this write was in progress: the half goes rather than going back.
-        let written = match outcome? {
-            Written::Cut => {
+        // A cut frame ends the connection here, and so does a close that arrived while this write
+        // was in progress: the half goes rather than going back.
+        let written = match outcome {
+            Ok(Written::Cut) => {
                 lent.half.take();
                 self.close();
                 return Ok(false);
             }
-            Written::Whole => true,
-            Written::Withdrawn => false,
+            Ok(Written::Whole) => true,
+            Ok(Written::Withdrawn) => false,
+            // The peer has gone. The connection is not closed: what the peer sent before it went
+            // (an answer, the last output, a refusal that names no request) is still in the socket
+            // for the read loop, which reads to the peer's end and ends the session there. The half
+            // is dropped with the failed write, and from this moment no frame can be written.
+            Err(error) if says_the_peer_has_gone(&error) => {
+                self.write_lost.store(true, Ordering::Release);
+                lent.half.take();
+                return Err(error);
+            }
+            // Any other failure is left to `Lent`, which closes the connection when part of the
+            // frame went: nothing else would end a connection that holds the start of a frame.
+            Err(error) => return Err(error),
         };
         let mut held = self.writer.lock().await;
         if !self.has_closed() {
@@ -289,6 +304,20 @@ impl IpcTransport {
         }
         Ok(written)
     }
+}
+
+/// Whether a failed write says that the peer has gone, which is the one failure after which the
+/// connection is left open for its read loop to read to the peer's end, and not closed.
+///
+/// `kr_ipc` reads the system's answer to a write (and to a read) with one rule,
+/// [`kr_ipc::error::peer_has_gone`], and reports it as [`kr_ipc::IpcError::PeerClosed`]: a broken
+/// pipe, a reset and "not connected" on a Unix socket, and the broken-pipe and no-data errors of a
+/// Windows named pipe, which the standard library reports as a broken pipe; and a write that took
+/// no byte of a frame that has bytes. Every other failure of a write is not a peer that has gone,
+/// and a connection that holds the start of a frame is closed rather than left with nothing to
+/// end it.
+const fn says_the_peer_has_gone(error: &ClientError) -> bool {
+    matches!(error, ClientError::Ipc(kr_ipc::IpcError::PeerClosed))
 }
 
 /// The write half while one frame is put on it, and what becomes of it when the write does not
@@ -443,6 +472,10 @@ impl ControlTransport for IpcTransport {
 
     fn is_closed(&self) -> bool {
         self.has_closed()
+    }
+
+    fn can_send(&self) -> bool {
+        !self.has_closed() && !self.write_lost.load(Ordering::Acquire)
     }
 }
 

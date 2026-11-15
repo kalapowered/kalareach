@@ -138,6 +138,14 @@ impl ControlTransport for SilentHost {
     fn close(&self) {
         self.inner.close();
     }
+
+    fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    fn can_send(&self) -> bool {
+        self.inner.can_send()
+    }
 }
 
 /// The record a paired device keeps of its host, for a connection this suite assembles by hand. It
