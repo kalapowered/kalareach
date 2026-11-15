@@ -3129,25 +3129,84 @@ async fn typed(accepted: u64) -> (Rig, DataStream) {
     (rig, stream)
 }
 
+/// How many frames of its epoch the real worker's lease has accepted.
+fn workers_count(rig: &Rig) -> u64 {
+    let input = rig.worker_input();
+    let count = input.lock().lease().next_sequence.get();
+    count
+}
+
+/// Whether the real worker's lease is held by the rig's attachment.
+fn the_rig_holds_the_lease(rig: &Rig) -> bool {
+    let input = rig.worker_input();
+    let holder = input.lock().lease().holder.0;
+    holder == Some(rig.attachment)
+}
+
+/// A rig on the real worker's own lane with a stream open and `accepted` frames of one byte typed
+/// and accepted. The host's record of the stream and the worker's count of the typing are the same
+/// number.
+async fn typed_on_the_workers_lane(accepted: u64) -> (Rig, DataStream) {
+    let rig = Rig::start_on_the_workers_lane().await;
+    let mut stream = rig.open().await;
+    for sequence in 0..accepted {
+        type_and_wait(&rig, &mut stream, sequence, b"k").await;
+    }
+    assert_eq!(
+        workers_count(&rig),
+        accepted,
+        "the worker has accepted what the host's record counts"
+    );
+    (rig, stream)
+}
+
+/// The real worker's session runs a stock shell, so it refuses a launch that the host forwards for
+/// that, before it reads the launch's position. The answer shows that the launch reached the worker
+/// and that the worker did not refuse it for its position or its lease.
+fn the_worker_refused_the_launch_for_its_shell(sent: &Sent) {
+    assert!(
+        !sent.refused_here,
+        "the host forwards it: {:?}",
+        sent.answer
+    );
+    assert!(
+        matches!(&sent.answer, Err(error) if error.code == ErrorCode::ShellIntegrationUnsupported),
+        "the worker was reached and refused the launch for its shell: {:?}",
+        sent.answer
+    );
+}
+
 /// A request whose barrier names exactly the typing the worker has accepted, or less, is forwarded:
-/// the host refuses nothing, and a release or a detach is taken by the worker.
+/// the host refuses nothing, and a release or a detach is taken by the worker, whose own count of
+/// the typing is the host's record. The typing goes through the host to the worker's lane, and a
+/// launch is answered by the worker, which reads it and refuses it for what its session runs.
 async fn a_reached_barrier_is_forwarded(request: Dependent) {
-    let (rig, _stream) = typed(3).await;
+    let (rig, _stream) = typed_on_the_workers_lane(3).await;
     let epoch = rig.epoch;
     let below = send_after(&rig, Dependent::Launch, epoch, 2).await;
-    assert!(
-        !below.refused_here,
-        "a barrier below the count: {:?}",
-        below.answer
-    );
+    the_worker_refused_the_launch_for_its_shell(&below);
     let at = send_after(&rig, request, epoch, 3).await;
-    assert!(!at.refused_here, "a barrier at the count: {:?}", at.answer);
-    if !matches!(request, Dependent::Launch) {
-        assert!(
-            at.answer.is_ok(),
-            "the worker was to take it: {:?}",
-            at.answer
-        );
+    match request {
+        Dependent::Launch => the_worker_refused_the_launch_for_its_shell(&at),
+        Dependent::Release | Dependent::Detach => {
+            assert!(!at.refused_here, "a barrier at the count: {:?}", at.answer);
+            assert!(
+                at.answer.is_ok(),
+                "the worker was to take it: {:?}",
+                at.answer
+            );
+            match request {
+                Dependent::Release => assert!(
+                    !the_rig_holds_the_lease(&rig),
+                    "the release ended the lease"
+                ),
+                _ => assert_eq!(
+                    rig.adopted.workers[0].attachments(),
+                    0,
+                    "the detach removed the attachment"
+                ),
+            }
+        }
     }
     assert_eq!(position_refusals(&rig), 0);
     rig.stop().await;
@@ -3172,9 +3231,10 @@ async fn a_launch_whose_barrier_is_reached_is_forwarded() {
 /// with nothing forwarded and nothing applied, and the refusal changes nothing that a later request
 /// reads: the lease is still held (a release is taken after it), the attachment is still attached,
 /// the stream still takes typing, and the record still counts what the worker accepts, so the same
-/// barrier is forwarded once the worker has accepted the typing it names.
+/// barrier is forwarded once the worker has accepted the typing it names. The worker's own count
+/// of the typing stays what it was, and it takes the request then.
 async fn an_unreached_barrier_is_refused_and_changes_nothing(request: Dependent) {
-    let (rig, mut stream) = typed(3).await;
+    let (rig, mut stream) = typed_on_the_workers_lane(3).await;
     let epoch = rig.epoch;
     let refused = send_after(&rig, request, epoch, 4).await;
     assert!(
@@ -3187,19 +3247,28 @@ async fn an_unreached_barrier_is_refused_and_changes_nothing(request: Dependent)
         1,
         "nothing was applied: the attachment stands"
     );
-    type_and_wait(&rig, &mut stream, 3, b"k").await;
-    let again = send_after(&rig, request, epoch, 4).await;
     assert!(
-        !again.refused_here,
-        "the barrier is reached once the typing is accepted: {:?}",
-        again.answer
+        the_rig_holds_the_lease(&rig),
+        "nothing was applied: the lease is held"
     );
-    if !matches!(request, Dependent::Launch) {
-        assert!(
-            again.answer.is_ok(),
-            "the worker takes it: the lease and the attachment were not touched: {:?}",
-            again.answer
-        );
+    assert_eq!(workers_count(&rig), 3, "the worker was sent nothing");
+    type_and_wait(&rig, &mut stream, 3, b"k").await;
+    assert_eq!(workers_count(&rig), 4);
+    let again = send_after(&rig, request, epoch, 4).await;
+    match request {
+        Dependent::Launch => the_worker_refused_the_launch_for_its_shell(&again),
+        Dependent::Release | Dependent::Detach => {
+            assert!(
+                !again.refused_here,
+                "the barrier is reached once the typing is accepted: {:?}",
+                again.answer
+            );
+            assert!(
+                again.answer.is_ok(),
+                "the worker takes it: the lease and the attachment were not touched: {:?}",
+                again.answer
+            );
+        }
     }
     assert_eq!(
         position_refusals(&rig),
@@ -3228,12 +3297,19 @@ async fn a_launch_whose_barrier_is_not_reached_is_refused_and_changes_nothing() 
 /// holds. The lane moves to a newer epoch that has accepted nothing: a barrier of that epoch is
 /// short, and the older epoch's accepted count does not stand for it; a barrier of the older epoch
 /// is forwarded, whatever its count, as the worker treats a stale one. When the lane's attachment
-/// holds no lease, no barrier is judged.
+/// holds no lease, no barrier is judged. The scripted lane moves the lease to a newer epoch, which
+/// the real worker's lease never does here, so the requests that the host forwards go to a stand-in
+/// for the worker that records them: the case holds what the host forwards and what it refuses, and
+/// no worker's check of a position stands behind it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_barrier_is_judged_only_in_the_epoch_the_lane_holds() {
     let (rig, mut stream) = typed(3).await;
+    let sent = script_dependents(&rig, None);
     let older = rig.epoch;
     let newer = older.get() + 1;
+    // One window ends the older epoch and holds the newer one together. A worker sends the end
+    // first and the new holder's window after, as two windows; they are one here so that the host
+    // has applied both when the end's acknowledgement is read, with nothing to wait for after it.
     rig.lane.send_window(LaneWindow {
         ended: Nullable::some(LaneEnded {
             epoch: older,
@@ -3280,35 +3356,56 @@ async fn a_barrier_is_judged_only_in_the_epoch_the_lane_holds() {
         1,
         "only the newer epoch's was refused"
     );
+    assert_eq!(
+        forwarded(&sent),
+        vec![Method::ShellLaunch; 3],
+        "the stale epoch's and the two with no lease were forwarded, the short one was not"
+    );
     rig.stop().await;
 }
 
 /// The host has no record of a stream that never opened, and none of one that ended: the request is
-/// forwarded and the worker decides.
+/// forwarded and the worker decides, by its own count of the typing. A position that the worker has
+/// not reached is refused by the worker with the words of the host's own refusal, and one that it
+/// has reached is taken.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_request_with_no_record_of_a_stream_is_forwarded() {
-    let rig = Rig::start().await;
-    let never_opened = send_after(&rig, Dependent::Launch, rig.epoch, 5).await;
+    let rig = Rig::start_on_the_workers_lane().await;
+    let never_opened = send_after(&rig, Dependent::Release, rig.epoch, 5).await;
     assert!(
         !never_opened.refused_here,
         "no stream: {:?}",
         never_opened.answer
     );
+    assert_eq!(
+        never_opened
+            .answer
+            .expect_err("the worker has accepted nothing")
+            .code,
+        ErrorCode::DraftConflict
+    );
+    let launch = send_after(&rig, Dependent::Launch, rig.epoch, 5).await;
+    the_worker_refused_the_launch_for_its_shell(&launch);
 
-    let mut ended = rig.adopted.host.network().input_tasks_ended();
-    let stream = rig.open().await;
-    let (mut reader, writer) = stream.split();
-    drop(writer);
-    while let Some(_ack) = tokio::time::timeout(WAIT, reader.read_message::<InputAck>())
-        .await
-        .expect("the stream ends in time")
-        .expect("the stream is not reset")
-    {}
-    tokio::time::timeout(WAIT, ended.changed())
-        .await
-        .expect("the stream task ends")
-        .expect("the count stands");
-    let after_the_end = send_after(&rig, Dependent::Release, rig.epoch, 5).await;
+    let mut stream = rig.open().await;
+    for sequence in 0..3 {
+        type_and_wait(&rig, &mut stream, sequence, b"k").await;
+    }
+    end_the_stream(&rig, stream).await;
+    let beyond = send_after(&rig, Dependent::Release, rig.epoch, 4).await;
+    assert!(
+        !beyond.refused_here,
+        "the stream ended: {:?}",
+        beyond.answer
+    );
+    assert_eq!(
+        beyond
+            .answer
+            .expect_err("the worker has accepted three frames")
+            .code,
+        ErrorCode::DraftConflict
+    );
+    let after_the_end = send_after(&rig, Dependent::Release, rig.epoch, 3).await;
     assert!(
         !after_the_end.refused_here && after_the_end.answer.is_ok(),
         "the worker was to take the release: {:?}",
@@ -3318,20 +3415,24 @@ async fn a_request_with_no_record_of_a_stream_is_forwarded() {
     rig.stop().await;
 }
 
-/// A release after 1,000 distinct keys: the worker has accepted all of them, in order, and the
-/// release whose barrier names them is forwarded and taken; a barrier that names one key more is
-/// refused by the host.
+/// A release after 1,000 distinct keys on the worker's own lane: the worker has accepted all of them,
+/// in order, and the release whose barrier names them is forwarded and taken; a barrier that names
+/// one key more is refused by the host. The keys are printable, since the worker's terminal is a
+/// real one: a control byte can end it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_release_after_a_thousand_distinct_keys_is_forwarded_and_one_key_more_is_refused() {
-    let rig = Rig::start().await;
+    let rig = Rig::start_on_the_workers_lane().await;
     let mut stream = rig.open().await;
-    let keys = counters(1000);
+    let keys: Vec<Vec<u8>> = (0..1000)
+        .map(|index| format!("{index:04}").into_bytes())
+        .collect();
     send_all(&rig, &mut stream, &keys).await;
-    assert_eq!(
-        rig.lane.bytes(),
-        keys.concat(),
-        "the worker has every key, in order"
-    );
+    assert_eq!(workers_count(&rig), 1000, "the worker has every frame");
+    let input = rig.worker_input();
+    until("the worker's terminal took every key, in order", || {
+        typed_at_the_terminal(&input) == keys.concat()
+    })
+    .await;
     let over = send_after(&rig, Dependent::Release, rig.epoch, 1001).await;
     assert!(
         over.refused_here,
