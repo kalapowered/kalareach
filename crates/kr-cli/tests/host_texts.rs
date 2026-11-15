@@ -1,8 +1,13 @@
 //! What the program and its guides tell a person to type: each `kr host` command a text names is
 //! one the program has, and each command that ends a process by force is the forced one.
 //!
-//! The scan reads the product's own strings and the guides. It does not judge whether a remedy
-//! works; a remedy's accuracy is read in review.
+//! The scan reads the product's own strings, the `///` lines that become a command's help, and the
+//! guides. It does not judge whether a remedy works; a remedy's accuracy is read in review.
+//!
+//! Its limits: it stops at a source file's test module, so a text after that module is not read;
+//! it skips the `tests` folders and every comment that is not help; and it reads every guide under
+//! `docs` except the conformance document, which lists the words of a source check and gives no
+//! person an instruction.
 
 use std::path::{Path, PathBuf};
 
@@ -35,18 +40,64 @@ fn files(root: &Path, extensions: &[&str], found: &mut Vec<PathBuf>) {
     }
 }
 
-/// The texts under scan: the crates' sources and the guides.
+/// Whether a source file defines command-line arguments by derive, so that the `///` lines of its
+/// items are the help a person reads.
+fn makes_help(source: &str) -> bool {
+    source.lines().any(|line| {
+        line.contains("derive(")
+            && ["Parser", "Subcommand", "Args", "ValueEnum"]
+                .iter()
+                .any(|name| line.contains(name))
+    })
+}
+
+/// What a source file tells a person: its strings, and its `///` lines where they become help.
+/// The file's test module is left out, since a test runs processes of its own (`kill -0` asks
+/// whether one lives) and tells nobody anything; so is every other comment line.
+fn product_part(source: &str) -> String {
+    let product = source
+        .split("\n#[cfg(test)]\nmod ")
+        .next()
+        .unwrap_or(source);
+    let help = makes_help(product);
+    product
+        .lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            !line.starts_with("//") || (help && line.starts_with("///"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The texts under scan: the crates' sources outside their `tests` folders, and the guides under
+/// `docs`. Limits: the scan stops at a source file's test module, so a text after that module is
+/// not read. It reads every guide except the conformance document, which lists the words of a
+/// source check and gives no person an instruction.
 fn texts() -> Vec<(PathBuf, String)> {
-    let mut paths = Vec::new();
-    files(&repository().join("crates"), &["rs"], &mut paths);
-    files(&repository().join("docs"), &["md"], &mut paths);
-    paths
+    let mut sources = Vec::new();
+    files(&repository().join("crates"), &["rs"], &mut sources);
+    let mut guides = Vec::new();
+    files(&repository().join("docs"), &["md"], &mut guides);
+    let in_folder = |path: &Path, folder: &str| {
+        path.components()
+            .any(|component| component.as_os_str() == folder)
+    };
+    let sources = sources
         .into_iter()
+        .filter(|path| !in_folder(path, "tests"))
+        .filter_map(|path| {
+            let text = product_part(&std::fs::read_to_string(&path).ok()?);
+            Some((path, text))
+        });
+    let guides = guides
+        .into_iter()
+        .filter(|path| !in_folder(path, "conformance"))
         .filter_map(|path| {
             let text = std::fs::read_to_string(&path).ok()?;
             Some((path, text))
-        })
-        .collect()
+        });
+    sources.chain(guides).collect()
 }
 
 /// The words after `prefix` in `text`: the letters and hyphens that follow it.
