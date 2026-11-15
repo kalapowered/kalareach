@@ -162,7 +162,7 @@ struct Exception {
 
 /// Every place outside `HOME` that reads a code or words or handles a refused connection, and why it
 /// does not decide what a connection that was not opened means.
-const EXCEPTIONS: [Exception; 67] = [
+const EXCEPTIONS: [Exception; 66] = [
     Exception {
         file: "account/mod.rs",
         function: "usage",
