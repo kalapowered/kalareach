@@ -38,6 +38,7 @@
 pub mod account;
 pub mod agent_tools;
 pub mod archive;
+pub mod attempt;
 pub mod attention;
 pub mod authority;
 pub mod authority_feed;

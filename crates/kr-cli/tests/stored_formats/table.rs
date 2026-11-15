@@ -1595,6 +1595,11 @@ pub fn named() -> Vec<Named> {
             "controller-identity",
             "a marker that the controller's keys were made, which names the kind of key store; read as absent when it cannot be read",
         ),
+        content(
+            StoreScope::Environment,
+            "host-attempts",
+            "the record that each attempt of a command that ends the control daemon keeps, one small JSON file named with the attempt's identity: the command, its phase, its process with that process's start identity, the time of the phase and the daemon it stops; a file that cannot be read or parsed is read as none, and a control daemon right after it has bound its endpoints removes every file that does not name it as the daemon to stop",
+        ),
         leaf(
             StoreScope::Environment,
             "controller.lock",

@@ -310,6 +310,12 @@ async fn run(
     // A 1 MiB attachment chunk does not fit a control frame, so transfer chunks have their own
     // endpoint, framed at the attachment bound and served by the same admission path.
     let chunks = kr_controller::transfer::bind_chunk_endpoint(&environment)?;
+    // The endpoints are bound, so this daemon serves: a command's record of an attempt to stop
+    // another daemon is of no use to anyone now, and only a record that names this daemon as the
+    // one to stop is left.
+    if let Ok(own) = kr_ipc::identity::current_process_start_identity() {
+        kr_controller::attempt::remove_those_that_stop_another_daemon(&environment, &own);
+    }
     println!(
         "kr-controller: environment {environment_id} generation {}",
         controller.generation()
