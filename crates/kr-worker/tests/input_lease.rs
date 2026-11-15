@@ -2804,8 +2804,9 @@ async fn a_prefix_made_only_of_the_newer_bytes_keeps_the_newer_deadline() {
     let early = now + 1_000;
     let late = now + 600_000;
 
-    // One boundary for all of it: the recogniser's own timer takes the same lock, so it cannot
-    // release the held byte before this test has said what the clock reads.
+    // The recogniser's timer waits at its deadline until this test lets it go, so that it cannot
+    // release the held byte before the clock has moved.
+    let (reached, go) = runtime.pause_the_timer_at_its_deadline();
     {
         let mut session = runtime.session();
         let accepted = session
@@ -2821,23 +2822,24 @@ async fn a_prefix_made_only_of_the_newer_bytes_keeps_the_newer_deadline() {
             (6, 1),
             "the delimiter goes and one byte of the next one is held"
         );
-        // The first write's authority runs out. The delimiter it completed goes with it; the byte
-        // still held is not its byte.
-        clock.advance(Duration::from_secs(5));
-        let released =
-            session.expire_paste_prefix(Instant::now() + std::time::Duration::from_secs(1));
-        assert_eq!(released, 1, "the held byte is released by its own deadline");
         runtime.flush_input();
     }
-    let seen = retained_within(&runtime, b"kr-ready.\x1b", Duration::from_secs(10)).await;
+    // The first write's authority stands while the delimiter it completed is written, so the
+    // writer has it before the clock moves. An epoch that dropped a batch writes nothing more, so
+    // the held byte is only shown to be the second write's if nothing was dropped before it.
+    retained_within(&runtime, b"kr-ready.\x1b[200~", Duration::from_secs(10)).await;
+    tokio::time::timeout(LIVENESS_DEADLINE, reached)
+        .await
+        .expect("the timer reached the deadline")
+        .expect("the timer is waiting");
+    // The first write's authority runs out. The byte still held is not its byte.
+    clock.advance(Duration::from_secs(5));
+    go.send(()).expect("lets the timer go on");
+    let seen = retained_within(&runtime, b"kr-ready.\x1b[200~\x1b", Duration::from_secs(10)).await;
     assert!(
-        contains(&seen, b"kr-ready.\x1b"),
+        contains(&seen, b"kr-ready.\x1b[200~\x1b"),
         "a prefix made of the second write's bytes is admitted by the second write's \
-         authority: {seen:?}"
-    );
-    assert!(
-        !contains(&seen, PASTE_START),
-        "and the delimiter the first write's authority admitted is not: {seen:?}"
+         authority, though the first write's has run out: {seen:?}"
     );
 
     runtime.close(ClosureReason::CloseRequested).1.release();
