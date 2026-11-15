@@ -1226,7 +1226,14 @@ impl FenceDriver {
             .iter()
             .any(|action| matches!(action, Action::IgnoreStale(StaleMessage::ReaderEvent)));
         for action in &outcome.actions {
-            let produced = self.carry_out(action, context, outcome.state);
+            let mut produced = self.carry_out(action, context, outcome.state);
+            // The machine drops a departing attachment's held input just before it orders the
+            // removal, so what the actions before it discarded is that removal's share.
+            for step in &mut produced.steps {
+                if let Step::RemoveAttachment { discarded, .. } = step {
+                    *discarded = effects.discarded_bytes;
+                }
+            }
             effects.merge(produced);
         }
         if matches!(outcome.state, FenceState::Outside | FenceState::Closing) {
@@ -1356,11 +1363,11 @@ impl FenceDriver {
                 effects.lease_acknowledged = Some(acknowledgement.clone());
             }
             Action::RemoveAttachment(attachment) => {
-                // The machine drops a departing attachment's held input just before it orders the
-                // removal, in the same stimulus, so what has been discarded so far is its share.
+                // The share is filled in by `apply`, which knows what the actions before this one
+                // discarded.
                 effects.steps.push(Step::RemoveAttachment {
                     attachment: *attachment,
-                    discarded: effects.discarded_bytes,
+                    discarded: 0,
                 });
             }
             Action::AcknowledgeDetach(result) => {

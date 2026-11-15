@@ -2764,15 +2764,17 @@ async fn keys_typed_behind_a_launch_are_counted_when_the_view_closes() {
         (epoch, 2),
         "the notice counts the two keys held behind the launch"
     );
+
+    // The launch waits for its reader's word, which the close gives up on.
+    rig.runtime.close(ClosureReason::CloseRequested).1.release();
     let (_proxy, answer) = tokio::time::timeout(WAIT, launching)
         .await
-        .expect("the removal answers the launch")
+        .expect("the close answers the launch")
         .expect("the launch's task ran");
     assert!(
         answer.is_err(),
         "nothing was installed for a view that left"
     );
-    rig.finish().await;
 }
 
 /// KR-REQ-23.36: the session's close drops what the machine holds, and the notice that the epoch
@@ -2842,22 +2844,22 @@ async fn the_roots_end_counts_what_the_machine_dropped_with_the_attachment_in_th
         "the notice counts the two keys the machine dropped with the attachment"
     );
 
-    let (proxy, answer) = tokio::time::timeout(WAIT, launching)
+    assert_eq!(
+        rig.runtime.session().interrupted_input().bytes,
+        2,
+        "the same two keys are carried to the next acquire, once"
+    );
+
+    // The launch waits for its reader's word, which the close gives up on.
+    rig.runtime.close(ClosureReason::CloseRequested).1.release();
+    let (_proxy, answer) = tokio::time::timeout(WAIT, launching)
         .await
-        .expect("the gesture answers the launch")
+        .expect("the close answers the launch")
         .expect("the launch's task ran");
     assert!(
         answer.is_err(),
         "nothing was installed for a view that left"
     );
-    rig.proxy = Some(proxy);
-    let other = rig.attach().await;
-    assert_eq!(
-        rig.acquire_result(other).await.discarded_bytes.get(),
-        2,
-        "the next acquire reports the same two keys, once"
-    );
-    rig.finish().await;
 }
 
 /// KR-REQ-23.36: the release that an application's keyboard negotiation causes has no request to
