@@ -1,0 +1,21 @@
+[package]
+name = "sandbox-probe-client"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# The probe's own client for its Worker. Its HTTPS, TLS and WebSocket crates are the ones the
+# workspace pins, in the same feature sets, so the traffic it makes is the traffic a client of
+# that stack makes.
+[dependencies]
+futures-util = { version = "=0.3.34", default-features = false, features = ["sink"] }
+http = "=1.5.0"
+reqwest = { version = "=0.13.5", default-features = false, features = ["rustls-no-provider", "http2"] }
+ring = "0.17"
+rustls-platform-verifier = "=0.7.1"
+tokio = { version = "=1.53.3", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "net", "io-util"] }
+tokio-rustls = { version = "=0.26.5", default-features = false, features = ["logging", "ring", "tls12"] }
+tokio-websockets = { version = "=0.13.3", default-features = false, features = ["client", "getrandom", "ring"] }
+rustls-pki-types = "=1.15.1"
+
+[workspace]
