@@ -444,6 +444,15 @@ impl PasteFramer {
         Some(std::mem::take(&mut self.held))
     }
 
+    /// Discards the held delimiter prefix and returns how many bytes it was. An open paste stays
+    /// open: ending that is [`Self::close_for_takeover`]'s work, at the end of the lease.
+    pub fn discard_held_prefix(&mut self) -> usize {
+        let discarded = self.held.len();
+        self.held.clear();
+        self.held_since = None;
+        discarded
+    }
+
     /// Ends framing for a lease that is going away.
     ///
     /// Returns the bytes to write before the next lease's input: an undelivered delimiter prefix
