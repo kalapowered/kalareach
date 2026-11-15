@@ -3028,9 +3028,10 @@ fn shell_quoted(text: &str) -> String {
 /// letter, such as `1006h 1005h`, it turns the mouse reporting on (`1000h`) and then writes those
 /// modes, in that order, instead of the default three, so that the encoding of a click can be shown
 /// for the sequence an application chose. Under the link line the application writes the plain text
-/// address `https://example.invalid/kr-plain`, which a terminal that detects addresses itself offers
-/// to open, so that the two ways a terminal can offer a link are shown beside each other. A mode in
-/// that list is written with padding after its escape when it is spelled `nul:1006l` or `del:1006l`.
+/// address `https://example.invalid/kr-plain`, or the address in `KR_HOLD_PLAIN` when that is set,
+/// which a terminal that detects addresses itself offers to open, so that the two ways a terminal
+/// can offer a link are shown beside each other. A mode in that list is written with padding after
+/// its escape when it is spelled `nul:1006l` or `del:1006l`.
 ///
 /// It writes `env.sh` into `KR_HOLD_DIR` (a directory only this account can write to), which names the
 /// environment `kr attach 1` runs in, the `TERM` to use and the `kr` to run, prints `KR_HOLD_READY`,
@@ -3093,6 +3094,8 @@ async fn a_session_is_held_for_a_person_at_a_terminal() {
     } else {
         "printf '\\033[?1000h\\033[?1002h\\033[?1006h'".to_owned()
     };
+    let plain = std::env::var("KR_HOLD_PLAIN")
+        .unwrap_or_else(|_| "https://example.invalid/kr-plain".to_owned());
     let again = if std::env::var("KR_HOLD_MOUSE_AGAIN").as_deref() == Ok("1") {
         format!("{modes}; ")
     } else {
@@ -3101,11 +3104,12 @@ async fn a_session_is_held_for_a_person_at_a_terminal() {
     let script = format!(
         "{modes}; \
          printf 'a link: \\033]8;;%s\\033\\\\the page on this machine\\033]8;;\\033\\\\\\r\\n' {}; \
-         printf 'plain: https://example.invalid/kr-plain\\r\\n'; \
+         printf 'plain: %s\\r\\n' {}; \
          stty raw -echo; \
          while :; do b=$(dd bs=1 count=1 2>/dev/null | od -An -v -tx1); \
          echo \"$b\" >> {}; {again}done",
         shell_quoted(&link),
+        shell_quoted(&plain),
         shell_quoted(&read_log.display().to_string()),
     );
     let hosted = hosted(&script).await;
