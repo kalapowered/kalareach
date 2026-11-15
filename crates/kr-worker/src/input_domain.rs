@@ -472,6 +472,10 @@ pub(crate) struct WriterHandles {
     pub(crate) unwritten_replies: Arc<AtomicUsize>,
     /// Whether the application is inside a bracketed paste, as the writer has delivered it.
     pub(crate) delivered_paste_open: Arc<AtomicU64>,
+    /// The lease whose open paste the writer ended when it dropped a batch of that lease, as one
+    /// more than its epoch; zero before any. The writer clears the latch above when it ends the
+    /// paste, so this is what tells the end of that lease that a paste was closed.
+    pub(crate) paste_ended_at_a_drop: Arc<AtomicU64>,
     /// The lease epoch the writer compares every queued batch against.
     pub(crate) input_fence: Arc<AtomicU64>,
     /// Set while a lease change is queued for the writer and not yet taken.
@@ -502,6 +506,7 @@ impl WriterHandles {
             dropped_replies: Arc::new(AtomicU64::new(0)),
             unwritten_replies: Arc::new(AtomicUsize::new(0)),
             delivered_paste_open: Arc::new(AtomicU64::new(0)),
+            paste_ended_at_a_drop: Arc::new(AtomicU64::new(0)),
             input_fence: Arc::new(AtomicU64::new(0)),
             lease_change_queued: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "testing")]
@@ -992,6 +997,9 @@ impl InputDomain {
         // report that no paste was interrupted when one was. Before the fence, no writer can have
         // seen it, and a latch an *earlier* change left set was reported by that change.
         let paste_open_for = self.writer.delivered_paste_open.load(Ordering::Acquire);
+        // Read after the latch: the writer marks the paste it ends at a drop before it clears the
+        // latch, so a latch found clear for that reason comes with the mark.
+        let paste_ended_for = self.writer.paste_ended_at_a_drop.load(Ordering::Acquire);
         self.publish_lease();
         let left = self.writer.queued_lease_bytes.take(self.lease.epoch()) as u64;
         drop(boundary);
@@ -1005,6 +1013,7 @@ impl InputDomain {
         LeaseEnded {
             left,
             paste_open_for,
+            paste_ended_for,
         }
     }
 
