@@ -3036,6 +3036,41 @@ async fn a_prefix_held_when_the_root_ends_the_view_is_counted_in_its_notice() {
     rig.finish().await;
 }
 
+/// KR-REQ-23.36: the same end with the prefix held inside an open paste. The paste is open at the
+/// application, and the recogniser holds the Escape that may begin its closing delimiter. The
+/// removal takes that prefix as it takes any other, so the notice counts it and the next acquire
+/// reports it once, and the application is not sent it: the writer's own terminator is the only
+/// thing that ends the paste.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_prefix_held_inside_an_open_paste_when_the_root_ends_the_view_is_counted_in_its_notice() {
+    let mut rig = Rig::start_fenced().await;
+    let attachment = rig.attach().await;
+    let epoch = rig.acquire(attachment).await;
+    let mut lane = rig.lane(attachment).await;
+    let fence_id = rig.at_a_prompt();
+    let timer = rig.runtime.pause_the_timer_at_its_deadline();
+    typed(&mut lane, &[b"\x1b[200~x\x1b"]).await;
+    rig.received_exactly(b"\x1b[200~x").await;
+
+    let (notice, carried) = the_roots_end_with_the_timer_let_go_in_the_gap(
+        &mut rig, &mut lane, epoch, fence_id, timer, 1,
+    )
+    .await;
+    assert_eq!(
+        notice, 1,
+        "the notice counts the Escape the recogniser held inside the paste"
+    );
+    assert_eq!(
+        carried, 1,
+        "the same byte is carried to the next acquire, once"
+    );
+    // The end was applied through the session's own seam, which leaves what it queued for the
+    // writer to the caller.
+    rig.runtime.flush_input();
+    rig.received_exactly(b"\x1b[200~x\x1b[201~").await;
+    rig.finish().await;
+}
+
 /// KR-REQ-23.36: the same end with keys held behind a reserved launch as well: the machine's two
 /// keys and the recogniser's prefix are three bytes in the notice and three in the carried count.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
