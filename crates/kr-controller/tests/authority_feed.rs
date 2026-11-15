@@ -5477,6 +5477,67 @@ async fn a_feed_longer_than_a_pass_reads_is_not_a_synchronisation_until_it_is_re
     assert!(!rig.shown().await.list.feed_stale);
 }
 
+/// Reads on `session` and returns what the read gives, except that a session whose connection ended
+/// is dialled for again, with `dial` (which is given the ended one) and the read is made again on
+/// the new session. A session says `ConnectionEnded` of every end of its connection, so the case
+/// cannot tell what ended it; a failure of any other kind is the answer, and nothing is dialled
+/// for it.
+async fn read_again_when_the_connection_ended<S, T>(
+    session: &mut S,
+    mut read: impl AsyncFnMut(&S) -> Result<T, kr_client::ClientError>,
+    mut dial: impl AsyncFnMut(&S) -> S,
+) -> Result<T, kr_client::ClientError> {
+    loop {
+        match read(&*session).await {
+            Err(kr_client::ClientError::ConnectionEnded) => *session = dial(&*session).await,
+            answered => return answered,
+        }
+    }
+}
+
+/// What the loop above does with a read that fails once, as `first`, and would then succeed: the
+/// answer, and how many times it dialled.
+async fn answer_to_a_read_that_fails_once(
+    first: kr_client::ClientError,
+) -> (Result<(), kr_client::ClientError>, u32) {
+    let mut failure = Some(first);
+    let dials = std::cell::Cell::new(0_u32);
+    let mut session = 0_u32;
+    let answer = read_again_when_the_connection_ended(
+        &mut session,
+        async |_: &u32| failure.take().map_or(Ok(()), Err),
+        async |_: &u32| {
+            dials.set(dials.get() + 1);
+            dials.get()
+        },
+    )
+    .await;
+    (answer, dials.get())
+}
+
+/// A read that fails because its connection ended is read again on one new session, and a read that
+/// fails in any other way is the answer and dials nothing: a loop that dials again for every failure
+/// would hide a fault of the host behind a second connection. It needs no daemon: the daemon's
+/// cases never give the read a failure of another kind in an ordinary run, so only this case tells
+/// such a loop from the one above.
+#[tokio::test]
+async fn a_read_is_dialled_for_again_only_when_its_connection_ended() {
+    let (answer, dials) = answer_to_a_read_that_fails_once(kr_client::ClientError::Withheld).await;
+    assert!(
+        matches!(answer, Err(kr_client::ClientError::Withheld)),
+        "a read that fails in another way is the answer"
+    );
+    assert_eq!(dials, 0, "and no connection is dialled for it");
+
+    let (answer, dials) =
+        answer_to_a_read_that_fails_once(kr_client::ClientError::ConnectionEnded).await;
+    assert!(
+        answer.is_ok(),
+        "a read whose connection ended is read again, and the second read answers"
+    );
+    assert_eq!(dials, 1, "after one new connection");
+}
+
 /// A connection waits for the synchronisation section 10 asks for only as long as the bound: a feed
 /// that holds the read open does not hold the device out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5503,17 +5564,17 @@ async fn a_connection_is_served_while_the_feed_holds_the_read_open_past_the_boun
     // threshold passed with nothing sent) answers a read with `ConnectionEnded`; the case dials
     // again and reads again on that failure alone, with the feed's read still held, and a failure of
     // any other kind fails the case.
-    let doctor = within("the doctor read is answered", async {
-        loop {
-            match rig.doctor_as(&session).await {
-                Err(kr_client::ClientError::ConnectionEnded) => {
-                    session.close();
-                    session = connect(&rig.host, &phone, &record).await;
-                }
-                answered => return answered,
-            }
-        }
-    })
+    let doctor = within(
+        "the doctor read is answered",
+        read_again_when_the_connection_ended(
+            &mut session,
+            async |session: &kr_client::session::Session| rig.doctor_as(session).await,
+            async |ended: &kr_client::session::Session| {
+                ended.close();
+                connect(&rig.host, &phone, &record).await
+            },
+        ),
+    )
     .await;
     doctor.expect("served while the feed still holds the read");
     // The read is still held: a connection served after the host gave the read up would find the
