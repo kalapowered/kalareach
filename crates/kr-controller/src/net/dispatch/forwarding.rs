@@ -517,7 +517,7 @@ impl RemoteConnection {
             // fence, or whose registration was withdrawn or replaced while the record was read, is
             // told that the outcome is not shown.
             Err(error @ ControllerError::SessionClosed { .. }) => {
-                *asked = Some(decided.clone().kept());
+                *asked = Some(decided.clone().kept(validated));
                 if self.admitted_to_answer(validated).is_err() {
                     return Err(outcome_not_shown());
                 }
@@ -634,11 +634,11 @@ impl RemoteConnection {
                     // already held. It goes through the check every answer read from a record goes
                     // through first: a fence this host owes, or a registration withdrawn or
                     // replaced while the worker looked, stops it.
-                    *asked = Some(decided.clone().kept());
+                    *asked = Some(decided.clone().kept(validated));
                     if self.admitted_to_answer(validated).is_err() {
                         return Err(outcome_not_shown());
                     }
-                    match self.may_read_receipts(Some(session_id), answering, acting) {
+                    match self.may_read_receipts(Some(session_id), answering, acting, validated) {
                         Ok(read) => *asked = Some(read),
                         Err(_) => return Err(outcome_not_shown()),
                     }
@@ -693,6 +693,7 @@ impl RemoteConnection {
         session_id: Option<SessionId>,
         answering: Method,
         acting: &Acting,
+        validated: AuthorityRevision,
     ) -> std::result::Result<Asked, ProtocolError> {
         let entry = self.admit(
             Method::ActionRead.as_str(),
@@ -701,7 +702,7 @@ impl RemoteConnection {
         Ok(self
             .ask_under(acting.clone(), session_id, entry, false)?
             .answering(answering)
-            .kept())
+            .kept(validated))
     }
 
     /// Decides the read a retained answer of this daemon's own is written under, when it has one.
@@ -731,6 +732,7 @@ impl RemoteConnection {
         mutation: &MutationRequest,
         reserved: Option<SessionId>,
         acting: &Acting,
+        validated: AuthorityRevision,
     ) -> std::result::Result<Option<Asked>, ProtocolError> {
         if matches!(
             method,
@@ -738,11 +740,13 @@ impl RemoteConnection {
         ) {
             return self
                 .ask(None, Method::OwnerConfirmationPending.entry(), false)
-                .map(|read| Some(read.answering(method).kept()));
+                .map(|read| Some(read.answering(method).kept(validated)));
         }
         let subject = mutation.target.session_id.as_ref().copied().or(reserved);
         if subject.is_some() {
-            return self.may_read_receipts(subject, method, acting).map(Some);
+            return self
+                .may_read_receipts(subject, method, acting, validated)
+                .map(Some);
         }
         Ok(None)
     }
@@ -775,7 +779,7 @@ impl RemoteConnection {
         *asked = Some(if reused {
             decided.clone()
         } else {
-            decided.clone().kept()
+            decided.clone().kept(validated)
         });
         #[cfg(feature = "testing")]
         self.controller.after_the_retained_lookup.wait().await;
@@ -808,7 +812,7 @@ impl RemoteConnection {
         } else {
             None
         };
-        match self.read_of_retained(method, mutation, reserved, &decided.acting) {
+        match self.read_of_retained(method, mutation, reserved, &decided.acting, validated) {
             Ok(Some(read)) => *asked = Some(read),
             Ok(None) => {}
             Err(_) => return Err(outcome_not_shown()),
@@ -855,7 +859,7 @@ impl RemoteConnection {
         decided: &Asked,
         asked: &mut Option<Asked>,
     ) -> ProtocolError {
-        *asked = Some(decided.clone().kept());
+        *asked = Some(decided.clone().kept(validated));
         if self.admitted_to_answer(validated).is_err() {
             return outcome_not_shown();
         }
@@ -876,8 +880,9 @@ impl RemoteConnection {
         &self,
         decided: &Asked,
         asked: &mut Option<Asked>,
+        validated: AuthorityRevision,
     ) -> ProtocolError {
-        *asked = Some(decided.clone().kept());
+        *asked = Some(decided.clone().kept(validated));
         outcome_not_shown()
     }
 
@@ -1114,11 +1119,12 @@ impl RemoteConnection {
         // device may not read. A close is the one exception: it is made whether or not its
         // receipt may be read, and what a worker answers a retried one with is checked on its way
         // back.
-        let read = match self.may_read_receipts(Some(session_id), answering, &asked.acting) {
-            Ok(read) => read,
-            Err(_) if answering == Method::SessionClose => return Ok(None),
-            Err(error) => return Err(RouteRefusal::not_shown(error)),
-        };
+        let read =
+            match self.may_read_receipts(Some(session_id), answering, &asked.acting, validated) {
+                Ok(read) => read,
+                Err(_) if answering == Method::SessionClose => return Ok(None),
+                Err(error) => return Err(RouteRefusal::not_shown(error)),
+            };
         // A connection that serves the host alone has no route to a worker, and says so rather
         // than leaving the request to be refused for another reason further on.
         self.check_worker_route().map_err(RouteRefusal::not_shown)?;

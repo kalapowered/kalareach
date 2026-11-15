@@ -73,7 +73,8 @@ async fn written_for(method: Method, exclusive: bool) -> ControlFrame {
                 StreamKind::Control,
                 &result(),
                 Some(method),
-                REQUEST
+                REQUEST,
+                None
             )
             .await,
         "the connection goes on"
@@ -131,5 +132,107 @@ async fn a_result_is_written_where_no_lease_is_needed() {
             result(),
             "{method} with exclusive management {exclusive}"
         );
+    }
+}
+
+/// When the fence lands relative to the write of a reply read from a record.
+#[derive(Clone, Copy, Debug)]
+enum FenceLands {
+    /// Not at all: the control.
+    Never,
+    /// Before the write begins.
+    Before,
+    /// While the write waits for the peer, which has read none of it.
+    DuringTheWait,
+}
+
+/// KR-REQ-09.09: a reply read from a record passed the kept answer's check, and is asked the standing
+/// that check asked again where its bytes are handed to the transport, after every wait for the
+/// peer. A fence this host comes to owe stops it: where none of it has gone the caller is told the
+/// outcome is not shown, and where the peer has part of it the connection ends, so the stored answer
+/// never reaches the caller whole. The control: with no fence the whole answer is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reply_read_from_a_record_is_not_written_whole_when_a_fence_is_owed_before_or_in_the_wait()
+ {
+    use kr_protocol::ids::{ActorId, ConnectionId};
+
+    for lands in [
+        FenceLands::Never,
+        FenceLands::Before,
+        FenceLands::DuringTheWait,
+    ] {
+        let (_temp, controller, mut writer, mut reader) = connected(false).await;
+        let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+        let revision = controller.policy().authority_revision();
+        controller.admitted_write().insert(
+            connection_id,
+            crate::service::AdmittedConnection::new(
+                ActorId::new("owner").expect("a principal"),
+                revision,
+            ),
+        );
+        // More than a socket holds, so the write waits for the peer to read.
+        let answer = ControlFrame::Response(Response {
+            request_id: REQUEST,
+            outcome: Outcome::Ok(
+                ParamsValue::from_typed(&"x".repeat(256 * 1024)).expect("a large value"),
+            ),
+        });
+        if matches!(lands, FenceLands::Before) {
+            controller.hold_fence(true);
+        }
+        let writing = {
+            let controller = Arc::clone(&controller);
+            let answer = answer.clone();
+            tokio::spawn(async move {
+                let stood = controller
+                    .write_answer(
+                        &mut writer,
+                        StreamKind::Control,
+                        &answer,
+                        Some(Method::PrivacySet),
+                        REQUEST,
+                        Some(crate::given::local_door::FromARecord::for_a_case(
+                            connection_id,
+                            revision,
+                        )),
+                    )
+                    .await;
+                // The connection ends with the writer, as it does when the daemon's loop stops.
+                drop(writer);
+                stood
+            })
+        };
+        if matches!(lands, FenceLands::DuringTheWait) {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            controller.hold_fence(true);
+        }
+        let read = tokio::time::timeout(std::time::Duration::from_secs(30), reader.read_message())
+            .await
+            .expect("the daemon wrote or ended the connection");
+        controller.hold_fence(false);
+        let stood = writing.await.expect("the write ends");
+        match (lands, read) {
+            (FenceLands::Never, Ok(read)) => {
+                assert_eq!(read, answer, "the whole answer is read");
+                assert!(stood);
+            }
+            (FenceLands::Before, Ok(ControlFrame::Response(response)))
+            | (FenceLands::DuringTheWait, Ok(ControlFrame::Response(response))) => {
+                let Outcome::Error(told) = response.outcome else {
+                    panic!("{lands:?}: the stored answer reached the caller");
+                };
+                assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{lands:?}: {told:?}");
+                assert_eq!(
+                    told.message,
+                    crate::error::ControllerError::outcome_not_shown()
+                        .to_protocol_error()
+                        .message
+                );
+            }
+            // The peer had part of it, so the connection ended and the answer is never whole.
+            (FenceLands::DuringTheWait, Err(_)) => assert!(!stood),
+            (lands, read) => panic!("{lands:?}: {read:?}"),
+        }
     }
 }

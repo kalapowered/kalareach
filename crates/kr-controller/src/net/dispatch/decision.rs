@@ -39,9 +39,11 @@ pub(super) struct Asked {
     /// is decided as a read of a receipt, under `action.read`'s entry, and is still the answer to
     /// the method it was kept for, so the two differ there.
     pub(super) shown_as: Method,
-    /// Whether the answer is one kept from an earlier submission of the action, which a device is
-    /// shown only as a read of what that submission produced.
-    kept: bool,
+    /// For an answer kept from an earlier submission of the action, which a device is shown only
+    /// as a read of what that submission produced, the revision of the authority the request was
+    /// admitted under. The answer is written only while the standing it was checked under holds
+    /// ([`Answers::Kept`]).
+    kept: Option<AuthorityRevision>,
     /// For a page of retained output, the privacy state it was read under, which the page is
     /// released under ([`RemoteConnection::write_answer`]).
     pub(super) read_under: Option<ReadUnder>,
@@ -56,24 +58,28 @@ impl Asked {
         }
     }
 
-    /// Returns the same decision, for an answer kept from an earlier submission of the action.
-    pub(super) fn kept(self) -> Self {
-        Self { kept: true, ..self }
+    /// Returns the same decision, for an answer kept from an earlier submission of the action
+    /// whose request was admitted under the authority at `admitted`.
+    pub(super) fn kept(self, admitted: AuthorityRevision) -> Self {
+        Self {
+            kept: Some(admitted),
+            ..self
+        }
     }
 
     /// Whether the answer is held as one kept from an earlier submission of the action, for a test
     /// that a service marks the copy it reads from its own record.
     #[cfg(test)]
     pub(super) const fn is_kept(&self) -> bool {
-        self.kept
+        self.kept.is_some()
     }
 
     /// What the answer this was decided for is the answer to.
     fn answers(&self) -> Answers {
         if self.shown_as.entry().effect != EffectClass::Write {
             Answers::Read
-        } else if self.kept {
-            Answers::Kept
+        } else if let Some(admitted) = self.kept {
+            Answers::Kept(admitted)
         } else {
             Answers::Action
         }
@@ -181,6 +187,17 @@ impl RemoteConnection {
                 Written::Sent => return true,
                 Written::Withdrawn => return false,
                 Written::Undecided => {}
+            }
+            // An answer kept from an earlier submission that the standing it was checked under no
+            // longer holds for is not decided again: the decision can stand while the fence or the
+            // registration it was asked under does not. The device is told the outcome is not
+            // shown.
+            if let Answers::Kept(admitted) = asked.answers()
+                && self.admitted_to_answer(admitted).is_err()
+            {
+                return output
+                    .send(&failure(request_id, super::outcome_not_shown()))
+                    .await;
             }
             match self.ask_under(
                 asked.acting.clone(),
@@ -316,7 +333,7 @@ impl RemoteConnection {
             decision,
             acting,
             shown_as: entry.method,
-            kept: false,
+            kept: None,
             read_under: None,
         })
     }
