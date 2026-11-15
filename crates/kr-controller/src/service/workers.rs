@@ -75,7 +75,9 @@ pub(crate) struct Opening {
     /// The task that opens the link, while it is under way and after it has ended until a caller
     /// has taken what it came to.
     task: tokio::sync::Mutex<Option<OpenTask>>,
-    /// Whether the worker has not yet decided the presentation: the task is still running.
+    /// Whether the task is still running: from the presentation, through the worker's decision of
+    /// it, to the end of what the task does with the connection after (the description of the
+    /// session, or the first exchange of a link).
     running: Arc<AtomicBool>,
 }
 
@@ -109,8 +111,10 @@ enum Presentation {
 }
 
 /// The task that opens a link, or challenges a worker, ended with the opening that owns it. One
-/// opening has one such task at a time, whichever of the two it is, so a worker is never presented
-/// to twice at once by this daemon.
+/// opening has one such task at a time, whichever of the two it is, so the doors that go through
+/// the table of openings (a link, an ask, a recovery's challenge) never present to one worker
+/// twice at once. What presents outside the table (the start's reading of the published
+/// descriptors, and the connections that take a role of their own) is not counted by it.
 struct OpenTask {
     handle: tokio::task::JoinHandle<Result<Opened>>,
     /// Whether it is a recovery's challenge, whose answer a caller that wants a link has no use for.
@@ -735,14 +739,36 @@ impl Controller {
             .remove(&session_id);
     }
 
-    /// Whether a presentation this daemon made to the worker of `session_id` has not been decided
-    /// yet, so that opening another link would leave a second one behind it.
+    /// Whether the task of the opening of `session_id`'s worker is running: a presentation it made
+    /// may not be decided yet, so that another one would leave a second behind it.
     pub(super) fn presentation_in_flight(&self, session_id: SessionId) -> bool {
         self.openings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&session_id)
             .is_some_and(|opening| opening.running.load(Ordering::SeqCst))
+    }
+
+    /// What answers whether the task of the session's opening is still running, for this host's
+    /// own tests. It goes on answering after the opening has been taken away, which is when the
+    /// task ends if the opening was all that held it.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn presentation_task_running_for_tests(
+        &self,
+        session_id: SessionId,
+    ) -> impl Fn() -> bool + Send + Sync + use<> {
+        let running = self
+            .openings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&session_id)
+            .map(|opening| Arc::clone(&opening.running));
+        move || {
+            running
+                .as_ref()
+                .is_some_and(|running| running.load(Ordering::SeqCst))
+        }
     }
 
     /// Opens this daemon's link to a worker, and one more where the worker says that a later
