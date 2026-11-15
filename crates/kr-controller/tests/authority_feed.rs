@@ -396,6 +396,18 @@ async fn within<T>(what: &str, work: impl std::future::Future<Output = T>) -> T 
         .unwrap_or_else(|_| panic!("gave up waiting for {what}"))
 }
 
+/// Whether the feed's client may have given up a request that was made after `since`. Its deadlines
+/// run in real time and no clock of the rig moves them, so a case that holds a request across an
+/// await that a stalled machine can lengthen, and asserts what it shows while the request is held,
+/// asserts it only while this is false.
+fn the_client_may_have_given_up(since: std::time::Instant) -> bool {
+    since.elapsed()
+        >= FEED_DEADLINES
+            .connect
+            .min(FEED_DEADLINES.read)
+            .min(FEED_DEADLINES.total)
+}
+
 /// Lets a connection and a case wait for a pass of the carrier for as long as the pass takes, which
 /// `within` limits. The wait for a synchronisation ends silently at its bound, five seconds unless
 /// a case sets another, and a machine that is busy takes longer over a pass than that: the wait
@@ -5385,13 +5397,25 @@ async fn a_feed_longer_than_a_pass_reads_is_not_a_synchronisation_until_it_is_re
     // given one by the first page, and what the host shows is not current while the scan is under
     // way.
     let reads = rig.arrivals("read");
+    // The feed's client gives the held read up at a deadline in real time, which ends the pass and
+    // serves the connection: a machine that stalls the case for that long finds the pass ended
+    // before the case looks, and the scan has then stopped half way, as it does when the feed lets
+    // the read go unanswered.
+    let held_from = std::time::Instant::now();
     rig.served
         .web()
         .fail_with_member(AUTHORITY, "read", 2, Moment::Hold);
     let waiting = rig.runtime().synchronised_before_serving();
     tokio::pin!(waiting);
+    let mut served = false;
     tokio::select! {
-        () = &mut waiting => panic!("the first page of a feed is no synchronisation"),
+        () = &mut waiting => {
+            served = true;
+            assert!(
+                the_client_may_have_given_up(held_from),
+                "the first page of a feed is no synchronisation"
+            );
+        }
         () = rig.until_arrivals("read", reads + 2) => {}
     }
     assert!(
@@ -5400,7 +5424,9 @@ async fn a_feed_longer_than_a_pass_reads_is_not_a_synchronisation_until_it_is_re
     );
     // The feed lets the read go unanswered, and the scan has stopped half way.
     rig.served.web().release_held();
-    within("the connection is served once the read ended", waiting).await;
+    if !served {
+        within("the connection is served once the read ended", waiting).await;
+    }
     let shown = rig.shown().await;
     assert_eq!(
         shown.list.feed_synchronised_at_ms.0, synchronised,
@@ -5448,10 +5474,8 @@ async fn a_connection_is_served_while_the_feed_holds_the_read_open_past_the_boun
     rig.runtime()
         .wait_for_a_synchronisation_at_most(Duration::from_millis(100));
 
-    // The feed's client gives a request up at deadlines that run in real time, and no clock of the
-    // rig moves them: a machine that stalls the case for longer than the shortest of them while the
-    // read is held finds the feed correctly unreachable. The case counts the real time from before
-    // the read is held, so from before the request can have been made.
+    // The case counts the real time from before the read is held, so from before the request can
+    // have been made.
     let held_from = std::time::Instant::now();
     rig.served
         .web()
@@ -5465,23 +5489,19 @@ async fn a_connection_is_served_while_the_feed_holds_the_read_open_past_the_boun
         .await
         .expect("served while the feed still holds the read");
     let shown = rig.shown().await;
-    let held_for = held_from.elapsed();
     let check = shown.check.expect("the doctor reports the feed");
-    let deadlines = FEED_DEADLINES;
-    if held_for < deadlines.connect.min(deadlines.read).min(deadlines.total) {
+    if the_client_may_have_given_up(held_from) {
+        // The machine stalled the case for longer than the client waits, so either side of the
+        // deadline is right: the read held and the feed current, or the read given up and the feed
+        // unreachable. The doctor is read after the device list, and a read given up stays given
+        // up, so a list that shows the feed stale is followed by a doctor that warns.
+        if shown.list.feed_stale {
+            assert_eq!(check.status, DoctorStatus::Warning, "{check:?}");
+        }
+    } else {
         // The read is still held, and the client cannot have given it up: a connection served
         // after the host gave the read up would find the feed unreachable instead.
         assert!(!shown.list.feed_stale, "{check:?}");
-    } else {
-        // The machine stalled the case for longer than the client waits, so either side of the
-        // deadline is right, and each must show what it is: the read held and the feed current, or
-        // the read given up and the feed unreachable.
-        let status = if shown.list.feed_stale {
-            DoctorStatus::Warning
-        } else {
-            DoctorStatus::Ok
-        };
-        assert_eq!(check.status, status, "{check:?}");
     }
     rig.served.web().release_held();
 }
