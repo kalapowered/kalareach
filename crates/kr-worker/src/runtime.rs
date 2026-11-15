@@ -1103,6 +1103,9 @@ impl SessionRuntime {
             // whether it needs a paste terminator. The framer says what the accepted stream means;
             // a batch this writer never wrote never happened to the application.
             let mut last_fence = writer_fence.load(Ordering::Acquire);
+            // The epoch of the lease whose batch this writer last dropped at its authority's
+            // deadline. Leases are numbered upward, so one epoch is all it ever needs to hold.
+            let mut dropped_epoch: Option<u64> = None;
             while let Some(mut carried) = input_receiver.blocking_recv() {
                 // What this batch holds in the room is given back however the writer is done with
                 // it: by the bytes the terminal takes as they are written, and for the rest when
@@ -1177,6 +1180,15 @@ impl SessionRuntime {
                     continue;
                 }
                 let lease_epoch = epoch.unwrap_or_default();
+                // After the first drop of an epoch nothing later of it is written, whatever that
+                // batch's own deadline: a batch that was dropped leaves a gap in what the person
+                // typed, and the application would get the end of it without its beginning. The
+                // bytes stay in the lease's count, which the end of the epoch, asked for when the
+                // first batch was dropped, reports. The fence is the epoch's own: the next epoch's
+                // first batch is written.
+                if epoch.is_some() && dropped_epoch == Some(lease_epoch) {
+                    continue;
+                }
                 // The response lane's deadline for an answer, when this batch is one. It is looked
                 // at before every attempt to write until the first byte has reached the
                 // application, so an answer that waits for room in the terminal is dropped once it
@@ -1209,6 +1221,7 @@ impl SessionRuntime {
                     // discarded to the view that typed them or, when that view has no stream
                     // left, to whoever takes the keys next. The room goes back as this goes out of
                     // scope.
+                    dropped_epoch = Some(lease_epoch);
                     let _ = epoch_expired.send(lease_epoch);
                     continue;
                 }
@@ -1301,6 +1314,7 @@ impl SessionRuntime {
                     // authority ended: the remainder stays in the lease's count, and the lease's
                     // end, asked for here, reports it as discarded.
                     if epoch.is_some() && lease_epoch >= writer_fence.load(Ordering::Acquire) {
+                        dropped_epoch = Some(lease_epoch);
                         let _ = epoch_expired.send(lease_epoch);
                     }
                 }
