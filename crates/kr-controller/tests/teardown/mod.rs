@@ -360,7 +360,7 @@ pub fn end_what_the_daemon_started(
     // the drain after them and a margin for a busy machine. A worker closing its own session ends
     // what it started, which no other way of ending it establishes.
     started.retain(|(identity, _)| running_or_unknown(identity));
-    let mut accepted = Vec::new();
+    let mut asked = Asked::default();
     let closure = kr_worker::session::GRACE_PERIOD + kr_worker::session::DRAIN_PERIOD + TOOL_BOUND;
     if !started.is_empty() {
         for (_, what) in &started {
@@ -368,7 +368,7 @@ pub fn end_what_the_daemon_started(
                 "ending {what}, which this test started and did not close"
             ));
         }
-        accepted = ask_to_close(environment);
+        asked = ask_to_close(environment);
         wait_for_the_end(&mut started, closure);
     }
 
@@ -380,10 +380,19 @@ pub fn end_what_the_daemon_started(
     // process's own child, and a worker ended by a signal or by launchd may leave what it started
     // behind, so each one leaves the tree kept.
     for (identity, what) in &started {
-        let answer = if accepted.contains(identity) {
-            "accepted its close"
-        } else {
-            "did not accept a close"
+        let answer = match asked
+            .workers
+            .iter()
+            .find(|(known, _)| known == identity)
+            .map(|(_, outcome)| outcome)
+        {
+            Some(Outcome::Accepted) => "accepted its close".to_owned(),
+            Some(Outcome::Failed(failure)) => format!("did not accept a close ({failure})"),
+            Some(Outcome::NoAnswer(why)) => {
+                format!("was handed to the asking and no answer came ({why})")
+            }
+            Some(Outcome::NotAsked(why)) => format!("was not asked to close ({why})"),
+            None => format!("was not asked to close ({})", asked.not_asked),
         };
         unresolved.push(format!(
             "{what} {answer} and was still running {closure:?} later"
@@ -514,109 +523,273 @@ fn running_or_unknown(identity: &ProcessStartIdentity) -> bool {
     !matches!(process_state(identity), ProcessState::Ended)
 }
 
+/// How asking the workers of an environment to close ended.
+#[derive(Default)]
+struct Asked {
+    /// Each worker that had a running, readable descriptor, with how asking it ended.
+    workers: Vec<(ProcessStartIdentity, Outcome)>,
+    /// What to say of a worker that is not among `workers`: it was not asked.
+    not_asked: String,
+}
+
+/// How asking one worker to close ended.
+#[derive(Clone)]
+enum Outcome {
+    /// The worker accepted the close.
+    Accepted,
+    /// The worker was asked and did not accept: the step that failed, how, and how long each step
+    /// took.
+    Failed(String),
+    /// The worker was handed to the asking and no answer came, and why.
+    NoAnswer(String),
+    /// The worker was not asked, and why.
+    NotAsked(String),
+}
+
+/// What asking the workers of one environment left, shared between the thread that asks and the
+/// one that waits, so that an answer that has come is not lost when the waiting ends.
+type Answers = Arc<Mutex<Vec<(ProcessStartIdentity, Outcome)>>>;
+
 /// Asks every running worker that published a descriptor in this environment to close its session,
-/// through its own endpoint, and returns the ones that accepted.
+/// through its own endpoint, and says how each one answered.
 ///
 /// Each worker is first made to prove that it is the one its descriptor names, so a request reaches
 /// no process but that worker, which then ends itself: nothing here names a process by its number.
 /// The workers are asked together, on a runtime on a thread of its own because this runs inside a
 /// drop, and none of it is waited for longer than [`ASKING_BOUND`].
-fn ask_to_close(environment: &EnvironmentPaths) -> Vec<ProcessStartIdentity> {
-    let Ok(entries) = kr_ipc::descriptor::read_all(environment) else {
-        return Vec::new();
+fn ask_to_close(environment: &EnvironmentPaths) -> Asked {
+    let entries = match kr_ipc::descriptor::read_all(environment) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return Asked {
+                not_asked: format!(
+                    "the descriptors of this environment could not be listed: {error}"
+                ),
+                ..Asked::default()
+            };
+        }
     };
-    let workers: Vec<_> = entries
-        .into_iter()
-        .filter_map(|entry| entry.descriptor.ok())
-        .filter(|descriptor| running_or_unknown(&descriptor.process_start_identity))
-        .collect();
-    if workers.is_empty() {
-        return Vec::new();
+    let mut unreadable = Vec::new();
+    let mut ended = 0_usize;
+    let mut workers = Vec::new();
+    for entry in entries {
+        match entry.descriptor {
+            Err(error) => unreadable.push(format!("{}: {error}", entry.path.display())),
+            Ok(descriptor) if running_or_unknown(&descriptor.process_start_identity) => {
+                workers.push(descriptor);
+            }
+            Ok(_) => ended += 1,
+        }
     }
+    let mut not_asked = format!(
+        "no running worker's readable descriptor names it; readable descriptors of workers that had ended: {ended}"
+    );
+    if !unreadable.is_empty() {
+        not_asked.push_str(&format!(
+            ", and {} could not be read ({})",
+            unreadable.len(),
+            unreadable.join("; ")
+        ));
+    }
+    if workers.is_empty() {
+        return Asked {
+            not_asked,
+            ..Asked::default()
+        };
+    }
+    let handed: Vec<_> = workers
+        .iter()
+        .map(|worker| worker.process_start_identity.clone())
+        .collect();
     let environment_id = environment.environment_id();
-    let (answered, answers) = std::sync::mpsc::channel();
+    let answers = Answers::default();
+    let (ended_asking, asking_ended) = std::sync::mpsc::channel();
+    let kept = Arc::clone(&answers);
     let asking = std::thread::Builder::new()
         .name("asking workers to close".to_owned())
         .spawn(move || {
-            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-            else {
-                return;
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = ended_asking.send(Err(format!(
+                        "the runtime that asks could not be built: {error}"
+                    )));
+                    return;
+                }
             };
-            let accepted = runtime.block_on(async move {
+            runtime.block_on(async move {
                 let mut asks = tokio::task::JoinSet::new();
                 for worker in workers {
-                    asks.spawn(ask_one_to_close(worker, environment_id));
+                    let identity = worker.process_start_identity.clone();
+                    let kept = Arc::clone(&kept);
+                    asks.spawn(async move {
+                        let outcome = match close_steps(&worker, environment_id).await {
+                            Ok(()) => Outcome::Accepted,
+                            Err(failure) => Outcome::Failed(failure),
+                        };
+                        kept.lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push((identity, outcome));
+                    });
                 }
-                let mut accepted = Vec::new();
-                while let Some(answer) = asks.join_next().await {
-                    if let Ok(Some(identity)) = answer {
-                        accepted.push(identity);
-                    }
-                }
-                accepted
+                while asks.join_next().await.is_some() {}
             });
-            let _ = answered.send(accepted);
+            let _ = ended_asking.send(Ok(()));
             // A request stuck where no timeout reaches it is left behind rather than waited for.
             runtime.shutdown_timeout(Duration::from_secs(1));
         });
+    let not_asked_at_all = |why: String| -> Asked {
+        say(format_args!(
+            "the workers could not be asked to close: {why}"
+        ));
+        Asked {
+            workers: handed
+                .iter()
+                .map(|identity| (identity.clone(), Outcome::NotAsked(why.clone())))
+                .collect(),
+            not_asked: not_asked.clone(),
+        }
+    };
     if let Err(error) = asking {
-        say(format_args!(
-            "the workers could not be asked to close: {error}"
+        return not_asked_at_all(format!(
+            "the thread that asks could not be started: {error}"
         ));
-        return Vec::new();
     }
-    answers.recv_timeout(ASKING_BOUND).unwrap_or_else(|_| {
-        say(format_args!(
-            "the workers asked to close had not all answered within {ASKING_BOUND:?}"
-        ));
-        Vec::new()
-    })
+    let unanswered = match asking_ended.recv_timeout(ASKING_BOUND) {
+        Ok(Ok(())) => Outcome::NoAnswer("its ask ended without an answer".to_owned()),
+        Ok(Err(why)) => return not_asked_at_all(why),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            let had_not_answered =
+                format!("the workers asked to close had not all answered within {ASKING_BOUND:?}");
+            say(format_args!("{had_not_answered}"));
+            Outcome::NoAnswer(had_not_answered)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let why = "the thread that asks ended without saying how".to_owned();
+            say(format_args!(
+                "the workers could not be asked to close: {why}"
+            ));
+            Outcome::NoAnswer(why)
+        }
+    };
+    let mut workers = std::mem::take(&mut *answers.lock().unwrap_or_else(PoisonError::into_inner));
+    for identity in handed {
+        if !workers.iter().any(|(known, _)| *known == identity) {
+            workers.push((identity, unanswered.clone()));
+        }
+    }
+    Asked { workers, not_asked }
 }
 
-/// Asks one worker to close its session, once it has proved it is the worker its descriptor names,
-/// and returns its identity when it accepted.
+/// Asks one worker to close its session, once it has proved it is the worker its descriptor names.
+///
+/// A worker that did not accept is described by the step that failed (connect, verify or close),
+/// what happened there (an error with its words, a refusal with its code, or the limit of
+/// [`TOOL_BOUND`] running out) and how long each step took.
 pub async fn ask_one_to_close(
     worker: kr_protocol::worker::WorkerDescriptor,
     environment_id: kr_protocol::ids::EnvironmentId,
-) -> Option<ProcessStartIdentity> {
-    let endpoint = kr_ipc::paths::Endpoint::from_path(worker.endpoint.clone()).ok()?;
-    let mut client = tokio::time::timeout(
-        TOOL_BOUND,
+) -> Result<(), String> {
+    close_steps(&worker, environment_id).await
+}
+
+/// The three steps of asking a worker to close, each given at most [`TOOL_BOUND`].
+async fn close_steps(
+    worker: &kr_protocol::worker::WorkerDescriptor,
+    environment_id: kr_protocol::ids::EnvironmentId,
+) -> Result<(), String> {
+    let mut spent: Vec<(&'static str, Duration)> = Vec::new();
+    close_steps_timed(worker, environment_id, &mut spent)
+        .await
+        .map_err(|(step, what)| {
+            let mut failure = format!("the {step} step ended with {what}");
+            if !spent.is_empty() {
+                let timings: Vec<_> = spent
+                    .iter()
+                    .map(|(name, took)| format!("{name} {:.1}ms", took.as_secs_f64() * 1000.0))
+                    .collect();
+                failure.push_str(&format!("; steps took: {}", timings.join(", ")));
+            }
+            failure
+        })
+}
+
+/// [`close_steps`], with the time each step took added to `spent`. A failure names its step and what
+/// happened there.
+async fn close_steps_timed(
+    worker: &kr_protocol::worker::WorkerDescriptor,
+    environment_id: kr_protocol::ids::EnvironmentId,
+    spent: &mut Vec<(&'static str, Duration)>,
+) -> Result<(), (&'static str, String)> {
+    let endpoint = kr_ipc::paths::Endpoint::from_path(worker.endpoint.clone())
+        .map_err(|error| ("connect", format!("an unusable endpoint: {error}")))?;
+    let build = kr_protocol::ids::BuildId::new("kr-test/0")
+        .map_err(|error| ("connect", format!("an unusable build name: {error}")))?;
+    let mut client = within_bound("connect", spent, async {
         kr_ipc::client::LocalClient::connect(
             &endpoint,
             kr_protocol::local::LocalClientKind::Cli,
-            kr_protocol::ids::BuildId::new("kr-test/0").ok()?,
-        ),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    tokio::time::timeout(TOOL_BOUND, client.verify_worker(&worker))
+            build,
+        )
         .await
-        .ok()?
-        .ok()?;
-    let answer = tokio::time::timeout(
-        TOOL_BOUND,
-        client.mutate(
-            kr_protocol::method::Method::SessionClose,
-            kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
-            kr_protocol::envelope::ActionTarget {
-                environment_id,
-                session_id: kr_protocol::scalars::Nullable::some(worker.session_id),
-                session_epoch: kr_protocol::scalars::Nullable::some(worker.session_epoch),
-                application_instance_id: kr_protocol::scalars::Nullable::null(),
-                agent_binding_revision: kr_protocol::scalars::Nullable::null(),
-            },
-            &kr_protocol::session::SessionCloseParams {
-                session_id: worker.session_id,
-            },
-        ),
-    )
+        .map_err(|error| format!("an error: {error}"))
+    })
+    .await?;
+    within_bound("verify", spent, async {
+        client
+            .verify_worker(worker)
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("an error: {error}"))
+    })
+    .await?;
+    within_bound("close", spent, async {
+        let answer = client
+            .mutate(
+                kr_protocol::method::Method::SessionClose,
+                kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+                kr_protocol::envelope::ActionTarget {
+                    environment_id,
+                    session_id: kr_protocol::scalars::Nullable::some(worker.session_id),
+                    session_epoch: kr_protocol::scalars::Nullable::some(worker.session_epoch),
+                    application_instance_id: kr_protocol::scalars::Nullable::null(),
+                    agent_binding_revision: kr_protocol::scalars::Nullable::null(),
+                },
+                &kr_protocol::session::SessionCloseParams {
+                    session_id: worker.session_id,
+                },
+            )
+            .await;
+        match answer {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(refused)) => Err(format!(
+                "a refusal with code {}: {}",
+                refused.code, refused.message
+            )),
+            Err(error) => Err(format!("an error: {error}")),
+        }
+    })
     .await
-    .ok()?;
-    matches!(answer, Ok(Ok(_))).then_some(worker.process_start_identity)
+}
+
+/// Runs one step of asking a worker to close for at most [`TOOL_BOUND`], and records how long it
+/// took. The step's name goes with a failure, whether the step failed or the limit ran out.
+async fn within_bound<T>(
+    step: &'static str,
+    spent: &mut Vec<(&'static str, Duration)>,
+    attempt: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, (&'static str, String)> {
+    let began = tokio::time::Instant::now();
+    let outcome = tokio::time::timeout(TOOL_BOUND, attempt).await;
+    spent.push((step, began.elapsed()));
+    match outcome {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(what)) => Err((step, what)),
+        Err(_) => Err((step, format!("the limit of {TOOL_BOUND:?} running out"))),
+    }
 }
 
 /// Whether the recorded process is this test process's own child, which it has not collected.

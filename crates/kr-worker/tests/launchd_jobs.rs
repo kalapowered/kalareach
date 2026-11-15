@@ -644,11 +644,10 @@ async fn a_starting_host_removes_ended_jobs_and_leaves_live_ones() {
         .filter_map(|entry| entry.descriptor.ok())
         .find(|descriptor| descriptor.session_id == closed)
         .expect("the session's worker published its descriptor");
+    let answer = teardown::ask_one_to_close(descriptor, host.environment_id).await;
     assert!(
-        teardown::ask_one_to_close(descriptor, host.environment_id)
-            .await
-            .is_some(),
-        "the worker accepts the close through its own endpoint"
+        answer.is_ok(),
+        "the worker accepts the close through its own endpoint: {answer:?}"
     );
     until_ended(&closed_worker, "the worker of the closed session").await;
     assert_eq!(
