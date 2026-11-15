@@ -932,9 +932,10 @@ impl Controller {
                 "A revocation is complete for a worker once it acknowledges the revision or is \
                  confirmed ended. While the directory lists a pending worker, this host asks it \
                  again on its own. It asks at the pass that comes about five seconds after a \
-                 refusal or an answer that names actions. After an ask that failed, or an \
-                 acknowledgement that says nothing about its fence, it asks at the first pass \
-                 after a wait of 10 seconds; that wait doubles for each further such ask, to 60 \
+                 refusal or an acknowledgement that reports its fence. After an ask that \
+                 failed, or an acknowledgement that says nothing about its fence, it asks at \
+                 the first pass after a wait of 10 seconds; that wait doubles for each further \
+                 such ask, to 60 \
                  seconds at most. It does not ask a worker while an earlier presentation of \
                  this host to it is still under way. This check shows when every worker has \
                  acknowledged. The first \

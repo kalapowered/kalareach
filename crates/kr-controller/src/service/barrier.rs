@@ -596,8 +596,8 @@ const ASK_INTERVAL_LONGEST: std::time::Duration = std::time::Duration::from_secs
 /// first pass that falls five seconds after the ask began. An ask that could not open a link or
 /// ran out costs a link attempt and the whole of its acknowledgement time: the wait before the next
 /// one, counted from its end, doubles from five seconds to a minute at most, and the ask is made
-/// at the first pass after it. An ask that ran out before its first notice could begin, for want
-/// of time, is paced the same way but costs no link attempt: the link went back whole. An
+/// at the first pass after it. An ask that ran out before a notice could begin, the first or a
+/// later one, is paced the same way but costs no link attempt: the link went back whole. An
 /// acknowledgement that says nothing about the worker's fence is paced the same way, though the
 /// link is good and nothing asks whether the worker has ended. Any other
 /// answer puts the wait back to five seconds. A worker whose earlier presentation is still waiting
