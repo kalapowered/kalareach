@@ -484,9 +484,16 @@ impl Account {
 
     /// Signs this device out, and tells the service.
     pub async fn sign_out(&self) -> AccountView {
-        let outcome = match self.signed_in.sign_out().await {
-            Ok(done) if done.service_told => Outcome::SignedOut,
-            Ok(_) => Outcome::SignedOutPending,
+        // The companion signs out its own account, which no host's deadline, lease or fence
+        // governs, so the check that the sign-out asks under the account's hold always stands.
+        let outcome = match self
+            .signed_in
+            .sign_out(|| Ok::<(), std::convert::Infallible>(()))
+            .await
+        {
+            Ok(Ok(done)) if done.service_told => Outcome::SignedOut,
+            Ok(Ok(_)) => Outcome::SignedOutPending,
+            Ok(Err(never)) => match never {},
             Err(error) => {
                 tracing::warn!(%error, "a sign-out could not remove the sign-in");
                 Outcome::SignOutFailed

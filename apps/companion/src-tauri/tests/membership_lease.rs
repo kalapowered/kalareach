@@ -805,7 +805,10 @@ impl Rig {
     async fn signs_in_as(&self, account: &str) {
         account_system_knows(&self.served, account);
         self.signing.admits(account);
-        let _ = self.tokens.sign_out().await;
+        let _ = self
+            .tokens
+            .sign_out(|| Ok::<(), std::convert::Infallible>(()))
+            .await;
         self.tokens
             .keep(grant_of(account), "a-nonce")
             .await
@@ -1121,7 +1124,10 @@ async fn a_device_that_is_signed_out_is_told_to_sign_in() {
     rig.connection(true).await;
     rig.waits.until_asked(1).await;
 
-    let _ = rig.tokens.sign_out().await;
+    let _ = rig
+        .tokens
+        .sign_out(|| Ok::<(), std::convert::Infallible>(()))
+        .await;
     rig.waits.passes();
 
     let ended = rig.down_because("sign in").await;
@@ -1613,7 +1619,10 @@ async fn a_sign_out_ends_the_member_connection_at_once() {
     rig.waits.passes();
     rig.until_lease_requests(requests + 1).await;
 
-    let _ = rig.tokens.sign_out().await;
+    let _ = rig
+        .tokens
+        .sign_out(|| Ok::<(), std::convert::Infallible>(()))
+        .await;
     let ended = rig.down_because("sign in").await;
     assert_eq!(ended["connected"], false, "{ended}");
     rig.served.web().release_held();
@@ -1869,7 +1878,10 @@ async fn a_visit_that_cannot_get_a_lease_says_why_and_is_not_out_of_contact() {
     let rig = Rig::start().await;
     rig.connection(true).await;
     let _elsewhere = rig.uses_another_host().await;
-    let _ = rig.tokens.sign_out().await;
+    let _ = rig
+        .tokens
+        .sign_out(|| Ok::<(), std::convert::Infallible>(()))
+        .await;
 
     let row = rig.inbox_of(&Arc::new(InboxDesk::default())).await;
     assert_eq!(row.state, HostInboxState::Refused, "{row:?}");
@@ -2296,7 +2308,10 @@ async fn a_session_link_to_a_member_host_closes_at_a_sign_out() {
     let standing = open(rig.companion(), session, "screen").expect("the session opens");
     assert_eq!(standing["state"], "open", "{standing}");
 
-    let _ = rig.tokens.sign_out().await;
+    let _ = rig
+        .tokens
+        .sign_out(|| Ok::<(), std::convert::Infallible>(()))
+        .await;
     let lost = rig
         .standing_where("screen", |standing| standing["state"] == "reconnecting")
         .await;
@@ -2327,7 +2342,10 @@ async fn an_ambient_link_to_a_member_host_is_not_used_after_a_sign_out() {
     };
     read().expect("a link is opened beside the application's and answers");
 
-    let _ = rig.tokens.sign_out().await;
+    let _ = rig
+        .tokens
+        .sign_out(|| Ok::<(), std::convert::Infallible>(()))
+        .await;
     let refused = read().expect_err("the link of the account that left answers nothing");
     assert!(asks_to_sign_in(&refused), "{refused}");
 }
@@ -2352,7 +2370,10 @@ async fn a_command_on_an_ambient_link_when_the_account_signs_out_is_told_to_sign
     rig.control.hold_next_request(Method::QuestionRead);
     let reading = rig.companion().start_call("question_read", params);
     rig.control.until_request_held().await;
-    let _ = rig.tokens.sign_out().await;
+    let _ = rig
+        .tokens
+        .sign_out(|| Ok::<(), std::convert::Infallible>(()))
+        .await;
     rig.control.release_request();
     let refused = reading
         .await
@@ -2399,7 +2420,10 @@ async fn a_terminal_view_of_a_member_host_ends_at_a_sign_out_and_takes_no_more_i
         .state_where(11, |state| state["control"]["state"] == "controlling")
         .await;
 
-    let _ = rig.tokens.sign_out().await;
+    let _ = rig
+        .tokens
+        .sign_out(|| Ok::<(), std::convert::Infallible>(()))
+        .await;
     let ended = companion
         .state_where(11, |state| state["state"] == "ended")
         .await;
@@ -2586,7 +2610,10 @@ async fn an_owner_watcher_lets_its_session_go_when_the_account_signs_out() {
     .expect("the host asks its owner");
     support::listed(&owner.watcher(), |request| request.checkable).await;
 
-    let _ = owner.tokens.sign_out().await;
+    let _ = owner
+        .tokens
+        .sign_out(|| Ok::<(), std::convert::Infallible>(()))
+        .await;
     let row = owner.row_where(asks_to_sign_in_row).await;
     assert!(row["refusal"].is_string(), "{row}");
 }
@@ -2624,7 +2651,10 @@ async fn a_confirmation_in_the_ceremony_when_the_account_signs_out_is_not_comple
     tokio::time::timeout(WATCHDOG, ceremony.started.notified())
         .await
         .expect("the person is asked");
-    let _ = owner.tokens.sign_out().await;
+    let _ = owner
+        .tokens
+        .sign_out(|| Ok::<(), std::convert::Infallible>(()))
+        .await;
     ceremony.gate.add_permits(1);
     let outcome = tokio::time::timeout(WATCHDOG, review)
         .await
@@ -2658,7 +2688,10 @@ async fn a_pass_whose_account_leaves_while_the_host_is_asked(method: Method) {
     rig.control.hold_next_request(method);
     let (row, ()) = tokio::join!(rig.inbox_of(&desk), async {
         rig.control.until_request_held().await;
-        let _ = rig.tokens.sign_out().await;
+        let _ = rig
+            .tokens
+            .sign_out(|| Ok::<(), std::convert::Infallible>(()))
+            .await;
         rig.control.release_request();
     });
     assert_eq!(row.state, HostInboxState::Refused, "{row:?}");
@@ -2695,7 +2728,10 @@ async fn a_kept_visit_whose_account_leaves_before_its_session_list_publishes_not
     rig.control.hold_next_request(Method::SessionList);
     let (row, ()) = tokio::join!(rig.inbox_of(&desk), async {
         rig.control.until_request_held().await;
-        let _ = rig.tokens.sign_out().await;
+        let _ = rig
+            .tokens
+            .sign_out(|| Ok::<(), std::convert::Infallible>(()))
+            .await;
         rig.control.release_request();
     });
     assert_eq!(row.state, HostInboxState::Refused, "{row:?}");
@@ -2725,7 +2761,10 @@ async fn an_inbox_answer_a_slow_host_holds_has_nothing_of_a_host_whose_account_s
     let (rows, ()) = tokio::join!(desk.visit(&device), async {
         // The member host's pass asks once, at its end, whether its connection ended.
         rig.control.until_asked_if_ended(asked + 1).await;
-        let _ = rig.tokens.sign_out().await;
+        let _ = rig
+            .tokens
+            .sign_out(|| Ok::<(), std::convert::Infallible>(()))
+            .await;
         rig.control.stop_holding();
         rig.control.release_all();
     });
