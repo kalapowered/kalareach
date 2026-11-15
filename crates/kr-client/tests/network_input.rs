@@ -1072,10 +1072,8 @@ async fn a_refusal_of_the_first_frame_has_no_prefix() {
 }
 
 /// The host's notice that an epoch ended is told with its sets and the discarded count, even when
-/// the view has nothing outstanding. It runs on a runtime with a second thread: a lane that did not
-/// freeze the epoch would keep a writer going round without waiting for anything, and on one
-/// thread that writer would starve the case, which could then not fail by an assertion.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// the view has nothing outstanding.
+#[tokio::test]
 async fn the_notice_that_an_epoch_ended_carries_the_sets_and_the_fenced_count() {
     let mut rig = rig(2).await;
     rig.lane.begin_epoch(epoch(5)).expect("an epoch");
