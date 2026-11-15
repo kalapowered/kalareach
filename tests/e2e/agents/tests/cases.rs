@@ -5126,9 +5126,93 @@ fn keyboard(stage: &Stage<'_, '_>, session: &Session) -> Keyboard {
     keyboard
 }
 
+/// How long the path case waits, once the screen shows the end of the typed path, for it to show
+/// the whole path.
+const WHOLE_PATH_WATCH: Duration = Duration::from_secs(5);
+
+/// Whether `rows` show `text` whole: on one row, or across consecutive rows where the agent's
+/// composer wrapped it. The blanks and the box-drawing characters at the ends of each row are the
+/// composer's own and are left out.
+fn shows_whole(rows: &[String], text: &str) -> bool {
+    const WRAPPED_ROWS: usize = 4;
+    let bare: Vec<&str> = rows
+        .iter()
+        .map(|row| {
+            row.trim_matches(|character: char| {
+                character.is_whitespace() || ('\u{2500}'..='\u{257f}').contains(&character)
+            })
+        })
+        .collect();
+    (0..bare.len()).any(|first| {
+        (first + 1..=bare.len().min(first + WRAPPED_ROWS))
+            .any(|end| bare[first..end].concat().contains(text))
+    })
+}
+
+/// A composer that wraps a path inside a box still shows it whole, and a screen that shows only the
+/// end of it, or the path's directory and its end on rows that are not next to each other, does
+/// not.
+#[test]
+fn a_path_is_shown_whole_when_the_composer_wrapped_it_and_not_when_only_its_end_is() {
+    let path = "/private/var/run/kalareach/w/kalareach-shot.png";
+    let one_row = vec![format!("│ > {path}  │")];
+    assert!(shows_whole(&one_row, path));
+    let wrapped = vec![
+        "│ > /private/var/run/kalareach │".to_owned(),
+        "│   /w/kalareach-shot.png      │".to_owned(),
+    ];
+    assert!(shows_whole(&wrapped, path));
+    let end_only = vec!["│ > kalareach-shot.png         │".to_owned()];
+    assert!(!shows_whole(&end_only, path));
+    let apart = vec![
+        "/private/var/run/kalareach/w".to_owned(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        "kalareach-shot.png".to_owned(),
+    ];
+    assert!(!shows_whole(&apart, path));
+}
+
+/// How long the view-only control watches the owner's screen for the input of a device that may
+/// not type.
+const VIEW_ONLY_WATCH: Duration = Duration::from_secs(2);
+
+/// Attaches `remote` to the session to observe it, as a device whose grant has no typing right
+/// does. The attach names the session on the connection, so the host has the connection's route to
+/// the worker, which the admission of a typing stream waits for.
+fn attach_to_observe(
+    stage: &Stage<'_, '_>,
+    remote: &kr_e2e_m1b::device::Remote,
+    session_id: kr_protocol::ids::SessionId,
+) -> kr_protocol::ids::AttachmentId {
+    use kr_protocol::attachment::{
+        AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
+    };
+    let mut requested = kr_protocol::scalars::CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    let attached: SessionAttachResult = stage
+        .runtime
+        .block_on(remote.mutate(
+            Method::SessionAttach,
+            kr_e2e_m1b::view::session_target(remote, session_id),
+            &SessionAttachParams {
+                session_id,
+                mode: AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(kr_protocol::session::Dimensions::new(80, 24)),
+                terminal_profile_id: Nullable::some(kr_e2e_m1b::view::TERMINAL_PROFILE.to_owned()),
+                requested,
+            },
+        ))
+        .unwrap_or_else(|why| panic!("the view-only device attaches to observe: {why}"));
+    attached.attachment.attachment_id
+}
+
 /// Types the build's harmless input through the device's keyboard attachment, which holds the
-/// lease, and requires every byte to be forwarded and the device's view of the agent to show what
-/// the input shows, which it did not show before.
+/// lease, and requires the host to accept it and the device's view of the agent to show what the
+/// input shows, which it did not show before.
 fn harmless_input(
     stage: &Stage<'_, '_>,
     session: &Session,
@@ -5158,7 +5242,7 @@ fn harmless_input(
     );
     json!({
         "input_bytes": keys.input.len(),
-        "accepted_bytes": written.bytes,
+        "sent_bytes": written.bytes,
         "screen_shows": keys.shows,
         "keyboard": Keyboard::PROFILE,
     })
@@ -6296,29 +6380,57 @@ fn forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged
                 },
             ))
             .unwrap_or_else(|why| panic!("grant.redeem: {why}"));
-        // The view-only device types on the owner device's attachment through the input lane: the
-        // host refuses the lane's open or its first frame as not permitted, whichever it reads
-        // first, and accepts nothing of it.
+        // The view-only device attaches to observe first, as a device that may see the session
+        // does. The attach names the session on its connection, which the host's admission of a
+        // typing stream waits for, so the stream is judged by the host and not left to time out.
+        let observing = attach_to_observe(stage, &watching, agent.session.session_id);
+        // It then types on the owner device's attachment through the input lane. The host does not
+        // serve the stream of a device that may not type, and it says why by no code: it ends the
+        // stream. So the case requires that the lane does not take the typing (it does not open, or
+        // its first frame is not accepted) and, apart from the lane, that the owner's screen,
+        // watched for a bounded time, does not show the input.
+        let shows = &stage.build.harmless.shows;
+        screen.pump(stage, Duration::from_millis(300));
+        assert!(
+            !screen.view.rows().iter().any(|row| row.contains(shows)),
+            "the agent's screen shows {shows:?} before the view-only device types"
+        );
         let attachment = screen.view.attachment_id();
-        let refused = match stage.runtime.block_on(kr_e2e_m1b::typing::Typing::open(
-            watching.session(),
-            watching.environment_id(),
-            agent.session.session_id,
-            attachment,
-        )) {
-            Err(refused) => refused,
-            Ok(mut lane) => stage
-                .runtime
-                .block_on(lane.type_bytes(
-                    InputLeaseEpoch::new(1),
-                    stage.build.harmless.input.as_bytes(),
-                ))
-                .expect_err("a view-only device's input is refused"),
+        let typed = stage.runtime.block_on(async {
+            let mut lane = kr_e2e_m1b::typing::Typing::open(
+                watching.session(),
+                watching.environment_id(),
+                agent.session.session_id,
+                attachment,
+            )
+            .await?;
+            lane.type_bytes(
+                InputLeaseEpoch::new(1),
+                stage.build.harmless.input.as_bytes(),
+            )
+            .await
+        });
+        let lane_saw = match typed {
+            Ok(written) => {
+                panic!("a view-only device's input is accepted by the host: {written:?}")
+            }
+            Err(not_typed @ kr_e2e_m1b::typing::NotTyped::Opening(_)) => {
+                format!("the lane did not open: {not_typed}")
+            }
+            Err(not_typed) => {
+                format!("the lane opened and the typing was not accepted: {not_typed}")
+            }
         };
-        let viewer_refusal = match refused.code() {
-            Some(ErrorCode::PermissionDenied) => refused.to_string(),
-            _ => panic!("a view-only device's input is refused as not permitted: {refused}"),
-        };
+        let watched_until = std::time::Instant::now() + VIEW_ONLY_WATCH;
+        while std::time::Instant::now() < watched_until {
+            screen.pump(stage, Duration::from_millis(200));
+        }
+        let viewer_rows = screen.view.rows();
+        assert!(
+            !viewer_rows.iter().any(|row| row.contains(shows)),
+            "the owner's screen shows the view-only device's input {shows:?}:\n{}",
+            viewer_rows.join("\n")
+        );
         let mut keyboard = keyboard(stage, &agent.session);
         let admitted = harmless_input(stage, &agent.session, &mut screen, &mut keyboard);
         screen.close(stage);
@@ -6330,10 +6442,15 @@ fn forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged
             "live_bindings": initial.live_bindings,
             "steps": steps,
             "control": {
-                "what": "a view-only device's input refused as not permitted where the owner device's is admitted",
+                "what": "a view-only device's input not taken where the owner device's is admitted",
                 "breaks_property": false,
                 "why_not": "a forgery that changes the host's state needs a registration the host issued, which this host issues to no connector",
-                "viewer": viewer_refusal,
+                "viewer": {
+                    "attached_to_observe": observing.to_string(),
+                    "lane_saw": lane_saw,
+                    "owner_screen_showed_its_input": false,
+                    "watched_for_ms": u64::try_from(VIEW_ONLY_WATCH.as_millis()).unwrap_or(u64::MAX),
+                },
                 "owner": admitted,
             },
         });
@@ -6406,16 +6523,25 @@ fn a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer() {
         let written = keyboard
             .type_text(&agent.session.remote, stage.runtime, &typed)
             .unwrap_or_else(|why| panic!("{why}"));
-        assert_eq!(
-            written.bytes,
-            typed.len(),
-            "every byte of the path is accepted for the terminal"
-        );
-        let rows = screen.wait_for(
+        // The lane's answer carries no count of what the worker took, so the screen shows that
+        // every byte of the path reached the terminal: the agent's composer shows the whole path
+        // and not only its last component, which is what a worker that forwarded a suffix of the
+        // input would leave.
+        let mut rows = screen.wait_for(
             stage,
             &agent.session,
             SHOT,
             "the agent's composer shows the path",
+        );
+        let whole_by = std::time::Instant::now() + WHOLE_PATH_WATCH;
+        while !shows_whole(&rows, &typed) && std::time::Instant::now() < whole_by {
+            screen.pump(stage, Duration::from_millis(200));
+            rows = screen.view.rows();
+        }
+        assert!(
+            shows_whole(&rows, &typed),
+            "the agent's composer shows the whole path {typed:?}, not only the end of it:\n{}",
+            rows.join("\n")
         );
         screen.close(stage);
         // The host announces nothing about the typed path: the instance and its revision as they
@@ -6439,7 +6565,7 @@ fn a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer() {
         );
         let evidence = json!({
             "typed": typed,
-            "accepted_bytes": written.bytes,
+            "sent_bytes": written.bytes,
             "composer_row": rows.iter().find(|row| row.contains(SHOT)),
             "detection": initial.detection.evidence(),
             "announced": after.detection.evidence(),
@@ -8205,12 +8331,51 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
         let (prompts, replies) = count(&conversation);
         once(prompts, replies)
             .unwrap_or_else(|why| panic!("no duplicate work after reconnecting: {why}"));
-        // The old attachment's next input, on the new connection, is refused.
-        let stale =
-            logged
-                .keyboard
-                .type_text(&logged.agent.session.remote, stage.runtime, &account.clear);
-        assert!(stale.is_err(), "the old attachment's next input is refused");
+        // The old attachment's next input, on the new connection, is turned away by the host. The
+        // keyboard's own lane ended with the old connection, so the input goes on a fresh lane that
+        // the case opens for the old attachment on the new connection, and the host is asked. The
+        // host admits a lane once its connection has its route to the worker, which a request that
+        // names the session fixes: the snapshot below.
+        let (old_attachment, old_epoch, _) = old;
+        let _ = events_snapshot(
+            &logged.agent.session.remote,
+            stage.runtime,
+            logged.agent.session.session_id,
+        );
+        let stale = stage.runtime.block_on(async {
+            let remote = &logged.agent.session.remote;
+            let mut lane = kr_e2e_m1b::typing::Typing::open(
+                remote.session(),
+                remote.environment_id(),
+                logged.agent.session.session_id,
+                old_attachment,
+            )
+            .await?;
+            lane.type_bytes(old_epoch, account.clear.as_bytes()).await
+        });
+        // What turned it away is the host's: its refusal with a code, its word that the lease of
+        // the epoch ended, or its end of the stream while the connection stood (the host ends the
+        // stream of a worker's refusal that it cannot tell was given before acceptance). A lane that
+        // did not open, or typing that nothing answered, never put the old attachment to a decision.
+        let stale_by_the_host = match stale {
+            Err(kr_e2e_m1b::typing::NotTyped::Refused(error)) => {
+                format!("the host refused it: {error}")
+            }
+            Err(kr_e2e_m1b::typing::NotTyped::LeaseEnded(epoch)) => format!(
+                "the host said the old attachment no longer holds the lease of epoch {}",
+                epoch.get()
+            ),
+            Err(
+                not_typed @ kr_e2e_m1b::typing::NotTyped::Ended(kr_client::input::EndCause::Reset),
+            ) => {
+                format!("the host ended the stream without accepting it: {not_typed}")
+            }
+            Err(other) => panic!(
+                "the old attachment's next input is turned away by the host, on a lane that \
+                 opened: {other}"
+            ),
+            Ok(written) => panic!("the old attachment's next input is refused: {written:?}"),
+        };
         // The control: the same prompt sent again, on a keyboard of the new connection's own, and
         // the count, read again, is two.
         logged.keyboard = keyboard(stage, &logged.agent.session);
@@ -8241,7 +8406,7 @@ fn a_disconnection_after_the_agent_took_a_prompt_leaves_one_reply_and_no_duplica
             "admission": "the agent's conversation held the prompt, and no screen the device was sent from the submission until it disconnected showed the reply mark or the code in upper case",
             "markers": { "reply_begins": begin, "reply_ends": end, "screen_reply_mark": account.reply_mark, "looked_for": code_start },
             "cutoff": { "reader_stopped": reader_stopped, "fresh_screens": fresh_screens },
-            "reconciled": { "attachment": old.0.to_string(), "epoch": old.1.get(), "next_sequence": old.2, "stale_input": stale.err().map(|refusal| refusal.detail) },
+            "reconciled": { "attachment": old.0.to_string(), "epoch": old.1.get(), "next_sequence": old.2, "stale_input": { "turned_away_by": "the host, on a lane opened for the old attachment on the new connection", "what": stale_by_the_host } },
             "after_reconnect": { "prompts": prompts, "finished_replies": replies, "shows": end, "seen": shown_in_log(stage, "the redrawn reply", &redrawn, &end) },
             "control": { "what": "the same prompt sent again", "breaks_property": true, "prompts": prompts_twice, "finished_replies": replies_twice, "check": control.err() },
         });
