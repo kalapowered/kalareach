@@ -142,6 +142,9 @@ mod with_seams {
         pub unanswered: u64,
         /// The most frames passed on for the lane and not yet answered at one time.
         pub unanswered_peak: u64,
+        /// Frames whose decision waits for the registry, from the first time the wait finds the
+        /// registry taken until the decision is made or let go, now.
+        pub decisions_waiting: u64,
         /// Frames the host holds for the device, from the moment each is read until it is answered,
         /// refused or discarded, now.
         pub host_holds: u64,
@@ -180,6 +183,7 @@ mod with_seams {
         dependent_script: Mutex<Option<Script<DependentScript>>>,
         held: Arc<Gauge>,
         unanswered: Arc<Gauge>,
+        waiting: Arc<Gauge>,
         host_holds: Gauge,
         records: Gauge,
         read: AtomicU64,
@@ -210,6 +214,7 @@ mod with_seams {
                 dependent_script: Mutex::new(None),
                 held: Arc::default(),
                 unanswered: Arc::default(),
+                waiting: Arc::default(),
                 host_holds: Gauge::default(),
                 records: Gauge::default(),
                 read: AtomicU64::new(0),
@@ -351,9 +356,11 @@ mod with_seams {
         pub fn counts(&self) -> InputStageCounts {
             let (held, held_peak) = self.held.counts();
             let (unanswered, unanswered_peak) = self.unanswered.counts();
+            let (decisions_waiting, _) = self.waiting.counts();
             let (host_holds, host_holds_peak) = self.host_holds.counts();
             let (records, records_peak) = self.records.counts();
             InputStageCounts {
+                decisions_waiting,
                 host_holds,
                 host_holds_peak,
                 records,
@@ -478,6 +485,28 @@ mod with_seams {
             Tally(Arc::clone(&self.unanswered))
         }
 
+        /// Counts `decision` as waiting from the first time it is polled and not ready, which is
+        /// when a wait for the registry stands in the lock's queue, until it is ready or let go.
+        pub(in crate::service::net) fn counted_while_it_waits<F: Future>(
+            &self,
+            decision: F,
+        ) -> impl Future<Output = F::Output> + use<F> {
+            let gauge = Arc::clone(&self.waiting);
+            async move {
+                let mut decision = std::pin::pin!(decision);
+                let mut waiting = None;
+                std::future::poll_fn(|context| {
+                    let polled = decision.as_mut().poll(context);
+                    if polled.is_pending() && waiting.is_none() {
+                        gauge.rise();
+                        waiting = Some(Tally(Arc::clone(&gauge)));
+                    }
+                    polled
+                })
+                .await
+            }
+        }
+
         pub(in crate::service::net) fn read_is_full(&self) {
             self.reads_full.send_modify(|turns| *turns += 1);
         }
@@ -587,6 +616,10 @@ mod without_seams {
 
         pub(in crate::service::net) fn unanswered_frame(&self) -> Tally {
             Tally
+        }
+
+        pub(in crate::service::net) fn counted_while_it_waits<F>(&self, decision: F) -> F {
+            decision
         }
 
         pub(in crate::service::net) fn read_is_full(&self) {}
