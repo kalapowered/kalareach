@@ -240,13 +240,13 @@ impl PrivateTempDir {
 pub const REMOVAL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long the drop of a [`PrivateTempDir`] waits for its own line to be written: a bound on the
-/// wait, which a standard error that has stopped draining is the only one to pay, and not a time
-/// that a case's result depends on.
+/// wait, which a standard error that has stopped draining is the only one to pay.
 ///
 /// A stream that takes the line has it written as soon as the thread that writes it runs, and the
-/// drop goes on then; the bound is long enough for a thread of a loaded machine to run in, so that
-/// a process that ends right after the drop keeps its line. A stalled stream holds the drop for the
-/// whole of it, once.
+/// drop goes on then. The bound is an expectation and not a guarantee: it is long enough that no
+/// case's result depends on it when a new thread runs within five seconds, as the thread of a
+/// loaded machine does, so that a process that ends right after the drop keeps its line. A stalled
+/// stream holds the drop for the whole of it, once.
 const LINE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Whether the refusal `error` of a removal is one that time can end: any refusal on Windows, and
@@ -872,15 +872,20 @@ mod tests {
     /// Whether this user is one that a mode refuses nothing to, as a privileged user removes what
     /// a mode refuses to anyone else, so that a case that needs a refusal has nothing to show. It
     /// says so on the standard error, around what the test harness captures and shows only for a
-    /// case that fails, so that the run names the case it did not exercise.
+    /// case that fails, and names the case by the name of its thread, so that the run names the
+    /// case it did not exercise.
     #[cfg(unix)]
     fn a_mode_refuses_nothing_to_this_user() -> bool {
         use std::io::Write as _;
 
         let privileged = rustix::process::getuid().is_root();
         if privileged {
-            let _ = std::io::stderr()
-                .write_all(b"skipped: a mode refuses nothing to a privileged user\n");
+            let thread = std::thread::current();
+            let line = format!(
+                "skipped by {}: a mode refuses nothing to a privileged user\n",
+                thread.name().unwrap_or("a thread with no name")
+            );
+            let _ = std::io::stderr().write_all(line.as_bytes());
         }
         privileged
     }
@@ -961,8 +966,8 @@ mod tests {
     }
 
     /// The drop of a directory whose removal is refused says so on the standard error without
-    /// waiting for a reader: with the standard error full and read by no one, the drop returns and the
-    /// process ends. The removal is refused because the directory's parent does not let it go,
+    /// waiting for a reader: with the standard error full and read by no one, the drop returns and
+    /// the process ends. The removal is refused because the directory's parent does not let it go,
     /// which time does not change.
     ///
     /// The case runs itself again as a process of its own, whose standard error is a pipe that the
@@ -1005,7 +1010,9 @@ mod tests {
     /// standard error, when that takes the line: the drop waits for the line to be written.
     ///
     /// The case runs itself again as a process of its own, which ends as the drop returns, and
-    /// reads its standard error.
+    /// reads its standard error. The process says on its standard output how long the drop took,
+    /// which a failure shows, so that a writer that ran late reads differently from a wait that
+    /// was not made.
     #[cfg(unix)]
     #[test]
     fn a_process_that_ends_after_a_refused_removal_has_said_so() {
@@ -1013,9 +1020,11 @@ mod tests {
 
         if let Some(directory) = std::env::var_os(REFUSED_DIRECTORY) {
             report_panics_on_the_standard_output();
+            let begun = std::time::Instant::now();
             drop(PrivateTempDir {
                 root: directory.into(),
             });
+            println!("the drop took {:?}", begun.elapsed());
             std::process::exit(0);
         }
         if a_mode_refuses_nothing_to_this_user() {
@@ -1026,7 +1035,7 @@ mod tests {
         let ended = run_again(
             NAME,
             &refused.directory,
-            "it did not end after the drop of its directory",
+            "what it waited for is not known here, and its output shows whether the drop returned",
         );
 
         assert!(
@@ -1039,8 +1048,10 @@ mod tests {
             ended
                 .standard_error
                 .contains(&format!("{} is not removed", refused.directory.display())),
-            "the process ended without saying that its directory is not removed: {:?}",
-            ended.standard_error
+            "the process ended without saying that its directory is not removed: {:?}; what it \
+             wrote on its standard output: {:?}",
+            ended.standard_error,
+            ended.standard_output
         );
     }
 
