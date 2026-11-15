@@ -718,13 +718,18 @@ async fn a_client_that_stops_reading_does_not_keep_the_daemon_from_stopping() {
     tokio::time::timeout(LIVENESS, reading)
         .await
         .expect("the stop's answer arrives at its write");
+    let blocked = daemon.controller.local_writes_blocked();
     release.send(()).expect("the write is let go");
 
     // The client reads nothing now. The answer's write waits for it, and ends at its bound.
     daemon.told_to_stop().await;
-    // The connection ended with the write: what is left is read and then the end.
-    let ended = async { while reader.read_message::<ControlFrame>().await.is_ok() {} };
-    tokio::time::timeout(LIVENESS, ended)
-        .await
-        .expect("the connection ends at the answer's bound");
+    // Where the write waited for the client, the connection ended at its bound: what is left is read
+    // and then the end. Where the socket took the answer, the connection goes on, as it does for any
+    // client that reads late.
+    if daemon.controller.local_writes_blocked() > blocked {
+        let ended = async { while reader.read_message::<ControlFrame>().await.is_ok() {} };
+        tokio::time::timeout(LIVENESS, ended)
+            .await
+            .expect("the connection ends at the answer's bound");
+    }
 }
