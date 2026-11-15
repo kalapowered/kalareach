@@ -4240,7 +4240,18 @@ struct Shown {
 }
 
 impl Rig {
+    /// What the owner is shown, read on the local socket. The daemon's own deadlines are counted on
+    /// its clock, which a case may hold still, so the case limits the read in real time as well: a
+    /// read that never answers fails the case with what it waited for.
     async fn shown(&self) -> Shown {
+        within(
+            "what the owner is shown of the feed",
+            self.shown_unbounded(),
+        )
+        .await
+    }
+
+    async fn shown_unbounded(&self) -> Shown {
         let mut local = self.host.client().await;
         let list: DeviceListResult = net_support::pairing::read(
             &mut local,
