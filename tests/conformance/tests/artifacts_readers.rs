@@ -2180,11 +2180,21 @@ mod windows_paths {
                 "{reader:?} refused its own directory under {extended:?}: {reading:?}"
             );
             let directory = reading.directory.clone().expect("a directory");
-            assert!(
-                same(directory.parent().expect("a parent"), &ordinary),
-                "{reader:?}: {directory:?}"
-            );
-            std::fs::remove_dir(&directory).expect("removes the directory the run made");
+            // Git Bash writes the temporary folder as `/tmp` where it is the folder that `TEMP` names.
+            let parent = directory.parent().expect("a parent");
+            let parent = match &reading.slash_tmp {
+                Some(slash_tmp) if reader.is_shell() && parent == Path::new("/tmp") => {
+                    slash_tmp.clone()
+                }
+                _ => parent.to_owned(),
+            };
+            assert!(same(&parent, &ordinary), "{reader:?}: {directory:?}");
+            let made = if parent == directory.parent().expect("a parent") {
+                directory.clone()
+            } else {
+                parent.join(directory.file_name().expect("a name"))
+            };
+            std::fs::remove_dir(&made).expect("removes the directory the run made");
         }
     }
 }
