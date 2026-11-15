@@ -192,8 +192,7 @@ rc=$?
 
 # ---- replay, after the unit has ended ----
 if [ "$wait" -eq 1 ]; then
-  "$here/replay-log.sh" "$sysout" "$prefix.systemd"
-  "$here/replay-log.sh" "$log" "$prefix"
+  "$here/replay-log.sh" "$sysout" "$prefix.systemd" "$log" "$prefix"
   echo "run-unit: $name exit $rc"
 else
   "$here/replay-log.sh" "$sysout" "$prefix.systemd"

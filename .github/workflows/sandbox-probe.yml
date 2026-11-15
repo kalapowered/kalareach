@@ -39,6 +39,32 @@ jobs:
         if: always() && steps.setup.outcome == 'success'
         run: bash scripts/ci/sandbox-probe/c-namespace.sh
 
+      - name: D, reach
+        if: always() && steps.setup.outcome == 'success'
+        run: bash scripts/ci/sandbox-probe/d-reach.sh
+
+      - name: E, socket families
+        if: always() && steps.setup.outcome == 'success'
+        run: bash scripts/ci/sandbox-probe/e-families.sh
+
+      - name: F, inheritance
+        if: always() && steps.setup.outcome == 'success'
+        env:
+          SBX_CANARY_STEP: canary-from-the-step-env
+        run: bash scripts/ci/sandbox-probe/f-inheritance.sh
+
+      - name: G, lifetime
+        if: always() && steps.setup.outcome == 'success'
+        run: bash scripts/ci/sandbox-probe/g-lifetime.sh
+
+      - name: H, writes
+        if: always() && steps.setup.outcome == 'success'
+        run: bash scripts/ci/sandbox-probe/h-writes.sh
+
+      - name: I, output
+        if: always() && steps.setup.outcome == 'success'
+        run: bash scripts/ci/sandbox-probe/i-output.sh
+
       - name: J, exit codes
         if: always() && steps.setup.outcome == 'success'
         run: bash scripts/ci/sandbox-probe/j-exit.sh

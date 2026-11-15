@@ -32,8 +32,7 @@ done
 cg="/sys/fs/cgroup/system.slice/$name.service"
 if [ -d "$cg" ] && [ -n "$(cat "$cg/cgroup.procs" 2>/dev/null)" ]; then gone=0; fi
 
-"$here/replay-log.sh" "$logdir/$name.systemd" "$prefix.systemd"
-"$here/replay-log.sh" "$logdir/$name.log" "$prefix"
+"$here/replay-log.sh" "$logdir/$name.systemd" "$prefix.systemd" "$logdir/$name.log" "$prefix"
 if [ "$gone" -eq 1 ]; then
   echo "stop-unit: $name ended"
   exit 0
