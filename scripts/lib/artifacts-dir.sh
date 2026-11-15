@@ -59,7 +59,21 @@ _kr_artifacts_resolve() {
   _kr_path="${_kr_path%x}"
   _kr_path="${_kr_path%$'\n'}"
   case "$_kr_path" in *$'\n'*) return 1 ;; esac
-  printf '%s\n' "$_kr_path"
+  _kr_artifacts_flat "$_kr_path"
+}
+
+# Prints the path $1 with a leading `//` made one `/`, off Windows. bash keeps a leading `//` in a
+# real path, so the top of the file system comes back as `//` and /tmp behind a link written `//tmp`
+# as `//private/tmp`. Where no network path begins with two slashes they are the one top and the
+# one folder; on Windows `//server/share` is a network path and stays as it is.
+_kr_artifacts_flat() {
+  local _kr_flat="$1"
+  if ! _kr_artifacts_windows; then
+    while :; do
+      case "$_kr_flat" in //*) _kr_flat="${_kr_flat#/}" ;; *) break ;; esac
+    done
+  fi
+  printf '%s\n' "$_kr_flat"
 }
 
 # Succeeds when $1, a folder as Windows writes it, is the top of a file system: a drive (`C:\`) or a
@@ -79,6 +93,14 @@ _kr_artifacts_windows_top() {
   return 1
 }
 
+# Prints the real path of the folder TEMP names (Windows, Git Bash), and fails where it names none.
+# The name as it was given is checked first: the conversion to Git Bash's form drops the line feeds
+# at the end of a name, and a name that ends with one names no folder.
+_kr_artifacts_windows_temp() {
+  case "${TEMP:-}" in *$'\n'*) return 1 ;; esac
+  _kr_artifacts_resolve "$(_kr_artifacts_posix "${TEMP:-}")"
+}
+
 # Prints each temporary root that exists, resolved through its links, one to a line. A root has no
 # line feed in it, and is never the top of a file system.
 _kr_artifacts_roots() {
@@ -90,7 +112,7 @@ _kr_artifacts_roots() {
     # Git Bash makes /tmp from the temporary folder of the process that started the first Git Bash
     # of the session, so it can be a folder that this process's TEMP does not name: /tmp is a root
     # here only where it is the folder TEMP names.
-    _kr_temp="$(_kr_artifacts_resolve "$(_kr_artifacts_posix "${TEMP:-}")")" || _kr_temp=""
+    _kr_temp="$(_kr_artifacts_windows_temp)" || _kr_temp=""
   fi
   for _kr_candidate in "${_kr_named[@]}"; do
     # The name as it was given: the conversion below drops the line feeds at its end.
@@ -126,26 +148,34 @@ _kr_artifacts_posix() {
   esac
 }
 
-# Prints why $1 is refused, with the variable and the roots named, on standard error.
+# Prints why $1 is refused, with the variable and the roots named, on standard error. With a third
+# argument, $1 is a name that was to be made under the temporary folder $3 for the run's own
+# directory, and it is the folder that is refused: nothing was set, so the words do not tell the
+# caller to leave it unset.
 _kr_artifacts_refuse() {
   local _kr_roots
   _kr_roots="$(_kr_artifacts_roots | awk 'BEGIN { s = "" } { s = s (NR > 1 ? ", " : "") $0 } END { print s }')"
-  printf '%s\n' "kr-artifacts: the evidence directory '$1' (KR_TEST_ARTIFACTS_DIR) is refused: $2. It has to be an absolute path inside one of this platform's temporary roots (${_kr_roots}). Set it to a folder under one of them, or leave it unset and the run makes a directory of its own." >&2
+  if [ "$#" -ge 3 ]; then
+    printf '%s\n' "kr-artifacts: no directory of this run's own can be made for its evidence: the temporary folder '$3' is refused: $2. It has to be an absolute path to a folder inside one of this platform's temporary roots (${_kr_roots}). Point TMPDIR (on Windows, TEMP) at such a folder, or set KR_TEST_ARTIFACTS_DIR to a folder under one of the roots." >&2
+  else
+    printf '%s\n' "kr-artifacts: the evidence directory '$1' (KR_TEST_ARTIFACTS_DIR) is refused: $2. It has to be an absolute path inside one of this platform's temporary roots (${_kr_roots}). Set it to a folder under one of them, or leave it unset and the run makes a directory of its own." >&2
+  fi
   return 1
 }
 
 # Prints the real path of $1 when it is inside a temporary root; else says why not and returns 1.
+# With a second argument, $1 is a name under the temporary folder $2 for the run's own directory.
 _kr_artifacts_confine() {
   local _kr_value="$1" _kr_written="$1" _kr_probe _kr_rest="" _kr_real _kr_real_folded _kr_root _kr_inside=0
   _kr_value="$(_kr_artifacts_posix "$_kr_value")"
   if [ -z "$_kr_value" ]; then
-    _kr_artifacts_refuse "$1" "it is empty"
+    _kr_artifacts_refuse "$1" "it is empty" ${2+"$2"}
     return 1
   fi
   case "$_kr_value" in
     /*) ;;
     *)
-      _kr_artifacts_refuse "$1" "it is not an absolute path"
+      _kr_artifacts_refuse "$1" "it is not an absolute path" ${2+"$2"}
       return 1
       ;;
   esac
@@ -157,7 +187,7 @@ _kr_artifacts_confine() {
   case "$_kr_written" in [A-Za-z]:[\\/]*) _kr_written="${_kr_written//\\//}" ;; esac
   case "/$_kr_written/" in
     */../*)
-      _kr_artifacts_refuse "$1" "it steps up a directory with \`..\`"
+      _kr_artifacts_refuse "$1" "it steps up a directory with \`..\`" ${2+"$2"}
       return 1
       ;;
   esac
@@ -174,13 +204,14 @@ _kr_artifacts_confine() {
   done
   [ -n "$_kr_probe" ] || _kr_probe=/
   if [ ! -d "$_kr_probe" ]; then
-    _kr_artifacts_refuse "$1" "$_kr_probe is not a directory"
+    _kr_artifacts_refuse "$1" "$_kr_probe is not a directory" ${2+"$2"}
     return 1
   fi
   _kr_real="$(cd -P -- "$_kr_probe" 2>/dev/null && pwd -P)" || {
-    _kr_artifacts_refuse "$1" "$_kr_probe cannot be resolved"
+    _kr_artifacts_refuse "$1" "$_kr_probe cannot be resolved" ${2+"$2"}
     return 1
   }
+  _kr_real="$(_kr_artifacts_flat "$_kr_real")"
   [ "$_kr_real" = / ] && _kr_real=""
   _kr_real="$_kr_real$_kr_rest"
   _kr_real_folded="$(_kr_artifacts_fold "$_kr_real")"
@@ -192,28 +223,41 @@ _kr_artifacts_confine() {
     esac
   done < <(_kr_artifacts_roots)
   if [ "$_kr_inside" != 1 ]; then
-    _kr_artifacts_refuse "$1" "it is not inside a temporary root"
+    _kr_artifacts_refuse "$1" "it is not inside a temporary root" ${2+"$2"}
     return 1
   fi
   printf '%s\n' "$_kr_real"
 }
 
 # Makes a directory of this run's own under the temporary folder and prints its real path. The
-# folder is checked before the directory is made in it, so that a temporary folder that is no root
-# is left as it was.
+# temporary folder is TMPDIR, else /tmp, and on Windows, where TMPDIR is not set, the folder TEMP
+# names: /tmp there is a folder that TEMP may not name, and it is no root then. The folder is
+# checked before the directory is made in it, so that a temporary folder that is no root is left
+# as it was.
 _kr_artifacts_own() {
-  local _kr_made
-  _kr_artifacts_confine "${TMPDIR:-/tmp}/kr-test-artifacts.XXXXXX" > /dev/null || return 1
-  _kr_made="$(mktemp -d "${TMPDIR:-/tmp}/kr-test-artifacts.XXXXXX")" || {
-    echo "kr-artifacts: no directory of this run's own can be made for its evidence" >&2
+  local _kr_temporary="${TMPDIR:-/tmp}" _kr_made
+  if _kr_artifacts_windows && [ -z "${TMPDIR:-}" ]; then
+    _kr_temporary="$(_kr_artifacts_windows_temp)" || {
+      _kr_artifacts_refuse "${TEMP:-}" "TEMP names no folder that exists" "${TEMP:-}"
+      return 1
+    }
+  fi
+  _kr_artifacts_confine "$_kr_temporary/kr-test-artifacts.XXXXXX" "$_kr_temporary" > /dev/null || return 1
+  _kr_made="$(mktemp -d "$_kr_temporary/kr-test-artifacts.XXXXXX")" || {
+    echo "kr-artifacts: no directory of this run's own can be made in the temporary folder '$_kr_temporary'" >&2
     return 1
   }
-  _kr_artifacts_confine "$_kr_made"
+  _kr_artifacts_confine "$_kr_made" "$_kr_temporary"
 }
 
 # kr_artifacts_dir: sets kr_artifacts to the evidence directory, and exports KR_TEST_ARTIFACTS_DIR.
 kr_artifacts_dir() {
-  local _kr_dir
+  local _kr_dir _kr_caseless=0
+  # Every comparison below is by exact letters, whatever the caller set: with nocasematch a `case`
+  # would take /TMP for /tmp on a disk that keeps them apart. The option is put back at the end
+  # (a refusal ends the script, which has no later use for it).
+  if shopt -q nocasematch; then _kr_caseless=1; fi
+  shopt -u nocasematch
   if [ "${KR_TEST_ARTIFACTS_DIR+set}" = set ]; then
     _kr_dir="$(_kr_artifacts_confine "$KR_TEST_ARTIFACTS_DIR")" || exit 1
   else
@@ -224,6 +268,7 @@ kr_artifacts_dir() {
   export KR_TEST_ARTIFACTS_DIR
   # shellcheck disable=SC2034 # The script that sources this file reads it.
   kr_artifacts="$_kr_dir"
+  if [ "$_kr_caseless" = 1 ]; then shopt -s nocasematch; fi
 }
 
 # kr_artifacts_dir_if_set: as kr_artifacts_dir, but kr_artifacts is empty and nothing is made where

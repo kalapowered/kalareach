@@ -92,35 +92,43 @@ function Get-TemporaryRoots {
     return $roots
 }
 
+# Throws why $Value is refused. With $Folder, $Value is a name that was to be made under the
+# temporary folder $Folder for the run's own directory, and it is the folder that is refused:
+# nothing was set, so the words do not tell the caller to leave it unset.
 function Stop-Refused {
-    param([string] $Value, [string] $Why)
+    param([string] $Value, [string] $Why, $Folder)
     $roots = (Get-TemporaryRoots) -join ', '
+    if ($null -ne $Folder) {
+        throw "kr-artifacts: no directory of this run's own can be made for its evidence: the temporary folder '$Folder' is refused: $Why. It has to be an absolute path to a folder inside one of this platform's temporary roots ($roots). Point TMPDIR (on Windows, TEMP or TMP) at such a folder, or set $variable to a folder under one of the roots."
+    }
     throw "kr-artifacts: the evidence directory '$Value' ($variable) is refused: $Why. It has to be an absolute path inside one of this platform's temporary roots ($roots). Set it to a folder under one of them, or leave it unset and the run makes a directory of its own."
 }
 
-# The real path of $Value, which has to be inside one of the temporary roots.
+# The real path of $Value, which has to be inside one of the temporary roots. With $Folder, $Value
+# is a name under the temporary folder $Folder for the run's own directory.
 function Confine-Value {
-    param([string] $Value)
-    if ([string]::IsNullOrEmpty($Value)) { Stop-Refused $Value 'it is empty' }
-    if (-not [System.IO.Path]::IsPathFullyQualified($Value)) { Stop-Refused $Value 'it is not an absolute path' }
-    if ($Value.Split($separators) -contains '..') { Stop-Refused $Value 'it steps up a directory with `..`' }
+    param([string] $Value, $Folder)
+    if ([string]::IsNullOrEmpty($Value)) { Stop-Refused $Value 'it is empty' $Folder }
+    if (-not [System.IO.Path]::IsPathFullyQualified($Value)) { Stop-Refused $Value 'it is not an absolute path' $Folder }
+    if ($Value.Split($separators) -contains '..') { Stop-Refused $Value 'it steps up a directory with `..`' $Folder }
     $real = (Get-RealPath (Remove-ExtendedPrefix $Value)).TrimEnd($separators)
     foreach ($root in (Get-TemporaryRoots)) {
         if ($real.StartsWith($root + [System.IO.Path]::DirectorySeparatorChar, $comparison)) { return $real }
     }
-    Stop-Refused $Value 'it is not inside a temporary root'
+    Stop-Refused $Value 'it is not inside a temporary root' $Folder
 }
 
 $named = [System.Environment]::GetEnvironmentVariable($variable)
 if ($null -ne $named) {
     $directory = Confine-Value $named
 } else {
-    $made = Join-Path ([System.IO.Path]::GetTempPath()) ('kr-test-artifacts-' + [System.Guid]::NewGuid().ToString('N'))
+    $temporary = [System.IO.Path]::GetTempPath()
+    $made = Join-Path $temporary ('kr-test-artifacts-' + [System.Guid]::NewGuid().ToString('N'))
     # The folder is checked before the directory is made in it, so that a temporary folder that is
     # no root is left as it was.
-    Confine-Value $made | Out-Null
+    Confine-Value $made $temporary | Out-Null
     [System.IO.Directory]::CreateDirectory($made) | Out-Null
-    $directory = Confine-Value $made
+    $directory = Confine-Value $made $temporary
     [Console]::Error.WriteLine("$variable is not set: this run keeps its evidence in $directory")
 }
 [System.Environment]::SetEnvironmentVariable($variable, $directory)

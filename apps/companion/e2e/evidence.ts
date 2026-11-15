@@ -87,6 +87,19 @@ function refused(value: string, why: string): Error {
   )
 }
 
+/**
+ * Why the run's own directory cannot be made under `temporary`: nothing was set, so the words name
+ * the temporary folder and do not tell the caller to leave the variable unset.
+ */
+function refusedOwn(temporary: string, why: string): Error {
+  return new Error(
+    `no directory of this run's own can be made for its evidence: the temporary folder ` +
+      `'${temporary}' is refused: ${why}. It has to be an absolute path to a folder inside one of ` +
+      `this platform's temporary roots (${roots().join(', ')}). Point TMPDIR (on Windows, TEMP or ` +
+      `TMP) at such a folder, or set ${VARIABLE} to a folder under one of the roots.`
+  )
+}
+
 /** Whether `real` is a folder inside `root`, by path components. */
 function inside(real: string, root: string): boolean {
   const from = windows ? root.toLowerCase() : root
@@ -101,14 +114,19 @@ function inside(real: string, root: string): boolean {
  * @throws When the value is empty, relative, steps up with `..` or is not inside a root.
  */
 export function confine(value: string): string {
-  if (value === '') throw refused(value, 'it is empty')
-  if (!fullyQualified(value)) throw refused(value, 'it is not an absolute path')
+  return confineOr(value, (why) => refused(value, why))
+}
+
+/** As `confine`, with `refuse` making the error for the reason a value is refused. */
+function confineOr(value: string, refuse: (why: string) => Error): string {
+  if (value === '') throw refuse('it is empty')
+  if (!fullyQualified(value)) throw refuse('it is not an absolute path')
   if (value.split(/[\\/]/).includes('..')) {
-    throw refused(value, 'it steps up a directory with `..`')
+    throw refuse('it steps up a directory with `..`')
   }
   const real = resolveThrough(value)
   if (!roots().some((root) => inside(real, root))) {
-    throw refused(value, 'it is not inside a temporary root')
+    throw refuse('it is not inside a temporary root')
   }
   return real
 }
@@ -120,8 +138,9 @@ export function confine(value: string): string {
  */
 export function ownDirectory(temporary: string): string {
   const prefix = 'kr-test-artifacts-'
-  confine(join(temporary, `${prefix}XXXXXX`))
-  return confine(mkdtempSync(join(temporary, prefix)))
+  const refuse = (why: string): Error => refusedOwn(temporary, why)
+  confineOr(join(temporary, `${prefix}XXXXXX`), refuse)
+  return confineOr(mkdtempSync(join(temporary, prefix)), refuse)
 }
 
 /** The directory this run keeps its artefacts in. */
