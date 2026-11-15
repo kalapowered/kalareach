@@ -34,6 +34,9 @@ pub(crate) struct DoorReply {
     /// method held to the local owner's lease is written only while the lease holds; a refusal
     /// that carries none is written as it is.
     carries_a_result: bool,
+    /// Whether the daemon stops once this reply has been written: it answers a stop request whose
+    /// wait for the creates under way has ended.
+    stops_the_daemon: bool,
 }
 
 impl DoorReply {
@@ -98,6 +101,7 @@ pub(crate) fn declined(
         frame,
         request_id,
         carries_a_result: false,
+        stops_the_daemon: false,
     }
 }
 
@@ -152,7 +156,11 @@ impl<'a> Standing<'a> {
 pub(crate) async fn told(settled: Settled<ControlFrame>, standing: &Standing<'_>) -> DoorReply {
     #[cfg(feature = "testing")]
     standing.controller.stop_before_a_reply_is_told().await;
-    let Settled { given, withdrew } = settled;
+    let Settled {
+        given,
+        withdrew,
+        stops_after_the_answer,
+    } = settled;
     let origin = given.origin();
     let answer = given.into_answer();
     let Standing {
@@ -190,6 +198,7 @@ pub(crate) async fn told(settled: Settled<ControlFrame>, standing: &Standing<'_>
         frame,
         request_id,
         carries_a_result: true,
+        stops_the_daemon: stops_after_the_answer,
     }
 }
 
@@ -235,7 +244,9 @@ impl<'a> ReplySink<'a> {
     ///
     /// A reply that carries a result is written under the local owner's lease, which is asked again
     /// before every transport write ([`Controller::write_answer`]); a refusal that carries none is
-    /// written as it is.
+    /// written as it is. The reply to a stop request whose wait has ended is written under a bound
+    /// instead, and the daemon is told to stop after it
+    /// ([`Controller::write_the_answer_of_a_stop`]).
     pub(crate) async fn write(
         self,
         controller: &Controller,
@@ -246,9 +257,15 @@ impl<'a> ReplySink<'a> {
             frame,
             request_id,
             carries_a_result,
+            stops_the_daemon,
         } = reply;
         #[cfg(feature = "testing")]
         controller.note_a_reply_written(request_id, &frame);
+        if stops_the_daemon {
+            return controller
+                .write_the_answer_of_a_stop(self.writer, self.kind, &frame)
+                .await;
+        }
         if carries_a_result {
             controller
                 .write_answer(self.writer, self.kind, &frame, method, request_id)

@@ -16,8 +16,9 @@ use kr_protocol::ids::{ActorId, AuthorityRevision, ConnectionId};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, U64, Uuid};
 use kr_protocol::update::{
-    HANDOVER_HOLD_MS, HANDOVER_SETTLE_MS, HandoverStep, HostUpdateHandoverParams,
-    HostUpdateHandoverResult, PathVariable, ReleaseName,
+    HANDOVER_HOLD_MS, HANDOVER_SETTLE_MS, HandoverStep, HostLaunch, HostLaunchVariable,
+    HostStopParams, HostStopResult, HostUpdateHandoverParams, HostUpdateHandoverResult,
+    PathVariable, ReleaseName, STOP_SETTLE_MS,
 };
 
 use crate::error::{ControllerError, Result};
@@ -1356,31 +1357,39 @@ fn whoami() -> String {
         .unwrap_or_else(|| format!("uid {}", kr_ipc::paths::current_uid()))
 }
 
-/// This daemon's side of an update of the host: its gate to new sessions, the creates under way,
-/// and whether it has been told to stop.
+/// This daemon's side of a handover to another release and of a stop requested on its local
+/// socket: its gate to new sessions, the creates under way, and whether it has been told to stop.
 ///
 /// A create passes the gate at its start and is counted until it has settled, and the gate is
-/// closed under the same lock that counts: once a handover closes it, no create begins, and the
-/// ones already under way are the ones a handover waits for. A create settles when its worker has
-/// reported itself or is known not to, so every worker this daemon launched holds its own release
-/// by the time the daemon answers that it has made way.
+/// closed under the same lock that counts: once the gate is closed, no create begins, and the
+/// ones already under way are the ones a handover or a stop waits for. A create settles when its
+/// worker has reported itself or is known not to, so every worker this daemon launched holds its
+/// own release by the time the daemon answers that it has made way.
 ///
-/// A closed gate is an attempt: it is closed for the attempt `prepare` began, and nothing but that
-/// attempt can stop the daemon. An attempt ends at its first stop or resume, when its hold of
-/// [`HANDOVER_HOLD_MS`] lapses (the gate then opens again by itself, so a daemon whose updater
-/// gave up between asking it to prepare and telling it to stop goes on starting sessions), or
-/// when a later `prepare` begins another. A stop names its attempt, and every decision is made
-/// under the lock the gate is under, so a stop that arrives late, after its update gave up and
-/// whatever came after, finds its attempt over and ends nothing; a daemon told to stop refuses to
-/// resume or to prepare, and one that has resumed refuses a stop, so an updater that sees a
-/// daemon resume knows no stop of any earlier attempt will end it.
+/// A closed gate has a reason. An update's attempt closes it for the attempt `prepare` began, and
+/// nothing but that attempt can stop the daemon. An attempt ends at its first stop or resume, when
+/// its hold of [`HANDOVER_HOLD_MS`] lapses (the gate then opens again by itself, so a daemon whose
+/// updater gave up between asking it to prepare and telling it to stop goes on starting
+/// sessions), or when a later `prepare` begins another. A stop names its attempt, and every
+/// decision is made under the lock the gate is under, so a stop that arrives late, after its
+/// update gave up and whatever came after, finds its attempt over and ends nothing; a daemon told
+/// to stop refuses to resume or to prepare, and one that has resumed refuses a stop, so an updater
+/// that sees a daemon resume knows no stop of any earlier attempt will end it.
+///
+/// A stop requested on the local socket (`host.stop`) closes the gate for good, whether it was
+/// open or an attempt held it. While the gate holds that reason a `prepare`, a `resume` and an
+/// update's `stop` leave it as it is and answer that the daemon is stopping, and a create is
+/// refused with the same words; a second request finds the reason and waits for the creates beside
+/// the first. The daemon is told to stop only once the answer of a request whose wait has ended
+/// has been written (see [`Controller::host_stop`]), so that the process does not end before its
+/// client has the answer.
 #[derive(Debug)]
 pub(super) struct Handover {
     gate: std::sync::Mutex<Gate>,
     /// Signalled whenever a create under way settles.
     settled: tokio::sync::Notify,
-    /// Whether this daemon has been told to stop.
-    stopping: tokio::sync::watch::Sender<bool>,
+    /// Why this daemon has been told to stop, once it has been.
+    stopping: tokio::sync::watch::Sender<Option<StopCause>>,
 }
 
 /// The gate itself.
@@ -1388,29 +1397,59 @@ pub(super) struct Handover {
 struct Gate {
     /// The creates admitted and not yet settled.
     creates: usize,
-    /// Why the gate is closed and until when, while it is.
+    /// Why the gate is closed, while it is.
     closed: Option<Closed>,
 }
 
-/// A closed gate, and the attempt it is closed for.
+/// A closed gate, and the attempt or stop it is closed for.
 #[derive(Debug)]
 struct Closed {
-    /// The identity of the attempt, made when it began: what a stop must name.
+    /// The identity of the attempt, made when the gate closed: what a stop must name. A stop
+    /// requested on the local socket has one too, which nobody holds.
     attempt: Uuid,
-    /// The release the host is being updated to.
-    target: ReleaseName,
-    /// When the attempt's hold lapses and the gate opens again by itself.
-    until: std::time::Instant,
+    /// Why the gate is closed.
+    reason: Reason,
+}
+
+/// Why a gate is closed.
+#[derive(Debug)]
+enum Reason {
+    /// An attempt to make way for another release.
+    Update {
+        /// The release the host is being updated to.
+        target: ReleaseName,
+        /// When the attempt's hold lapses and the gate opens again by itself.
+        until: std::time::Instant,
+    },
+    /// A stop requested on the local socket. The gate does not open again: the daemon stops.
+    Stop,
+}
+
+/// Why a daemon was told to stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StopCause {
+    /// The update that replaces this daemon stopped it, under its attempt.
+    Update,
+    /// A stop was requested on the local socket and its answer has been written.
+    Request,
 }
 
 /// What a daemon that has been told to stop says to a step that would keep it.
-fn stopping() -> ControllerError {
+fn stopping(cause: StopCause) -> ControllerError {
+    let detail = match cause {
+        StopCause::Update => {
+            "this control daemon has been told to stop for an update of this host, and is \
+             stopping; the environment is served again once a daemon of the current release \
+             starts"
+        }
+        StopCause::Request => {
+            "this control daemon was asked to stop on its local socket and is stopping; the \
+             environment is served again once a daemon starts"
+        }
+    };
     ControllerError::Refused {
         code: ErrorCode::EnvironmentUnavailable,
-        detail: "this control daemon has been told to stop for an update of this host, and is \
-                 stopping; the environment is served again once a daemon of the current release \
-                 starts"
-            .to_owned(),
+        detail: detail.to_owned(),
     }
 }
 
@@ -1419,7 +1458,7 @@ impl Default for Handover {
         Self {
             gate: std::sync::Mutex::default(),
             settled: tokio::sync::Notify::new(),
-            stopping: tokio::sync::watch::channel(false).0,
+            stopping: tokio::sync::watch::channel(None).0,
         }
     }
 }
@@ -1451,21 +1490,27 @@ impl Handover {
     ///
     /// # Errors
     ///
-    /// `RESOURCE_UNAVAILABLE`, naming the release the host is being updated to, while the gate is
-    /// closed.
+    /// `RESOURCE_UNAVAILABLE`, naming the release the host is being updated to, while an update's
+    /// attempt holds the gate closed; `ENVIRONMENT_UNAVAILABLE` while the gate is closed for a stop
+    /// requested on the local socket.
     pub(super) fn admit(&self) -> Result<UnderWay<'_>> {
         let mut gate = self.lock();
         if let Some(closed) = &gate.closed {
-            if std::time::Instant::now() < closed.until {
-                return Err(ControllerError::Refused {
-                    code: ErrorCode::ResourceUnavailable,
-                    detail: format!(
-                        "this environment's control daemon is making way for release {} of this \
-                         host, and starts no session meanwhile; create the session again once \
-                         the update has finished",
-                        closed.target
-                    ),
-                });
+            match &closed.reason {
+                Reason::Stop => return Err(stopping(StopCause::Request)),
+                Reason::Update { target, until } => {
+                    if std::time::Instant::now() < *until {
+                        return Err(ControllerError::Refused {
+                            code: ErrorCode::ResourceUnavailable,
+                            detail: format!(
+                                "this environment's control daemon is making way for release {} \
+                                 of this host, and starts no session meanwhile; create the \
+                                 session again once the update has finished",
+                                target
+                            ),
+                        });
+                    }
+                }
             }
             // The update that closed it did not come back within its hold: the gate is open.
             gate.closed = None;
@@ -1474,22 +1519,64 @@ impl Handover {
         Ok(UnderWay { handover: self })
     }
 
+    /// Why this daemon would not take a step that begins an attempt or ends one: it was told to
+    /// stop, or the gate is closed for a stop requested on the local socket.
+    fn stopping_for(&self, gate: &Gate) -> Option<StopCause> {
+        (*self.stopping.borrow()).or_else(|| {
+            gate.closed
+                .as_ref()
+                .is_some_and(|closed| matches!(closed.reason, Reason::Stop))
+                .then_some(StopCause::Request)
+        })
+    }
+
+    /// Closes the gate for a stop requested on the local socket, whether it is open or an
+    /// update's attempt holds it. A gate that is closed for a stop already stays as it is, and so
+    /// does a daemon that was told to stop: either way the stop is taken, and the creates are
+    /// waited for beside the request that began it.
+    pub(super) fn begin_stop(&self) {
+        let mut gate = self.lock();
+        if self.stopping_for(&gate).is_some() {
+            return;
+        }
+        gate.closed = Some(Closed {
+            attempt: kr_ipc::new_uuid(),
+            reason: Reason::Stop,
+        });
+    }
+
+    /// Tells this daemon to stop for a stop requested on the local socket, after the answer to
+    /// the request has been written. A daemon that was told to stop for an update already stays
+    /// stopping for it.
+    pub(super) fn stop_after_the_answer(&self) {
+        self.stopping.send_if_modified(|cause| {
+            let changes = cause.is_none();
+            if changes {
+                *cause = Some(StopCause::Request);
+            }
+            changes
+        });
+    }
+
     /// Begins an attempt: closes the gate for `hold` under a new identity, naming the release the
     /// host is being updated to, and returns the identity. An attempt already open is over.
     ///
     /// # Errors
     ///
-    /// `ENVIRONMENT_UNAVAILABLE` once this daemon has been told to stop.
+    /// `ENVIRONMENT_UNAVAILABLE` once this daemon has been told to stop or its gate is closed for a
+    /// stop requested on the local socket.
     pub(super) fn close(&self, target: &ReleaseName, hold: std::time::Duration) -> Result<Uuid> {
         let mut gate = self.lock();
-        if *self.stopping.borrow() {
-            return Err(stopping());
+        if let Some(cause) = self.stopping_for(&gate) {
+            return Err(stopping(cause));
         }
         let attempt = kr_ipc::new_uuid();
         gate.closed = Some(Closed {
             attempt,
-            target: target.clone(),
-            until: std::time::Instant::now() + hold,
+            reason: Reason::Update {
+                target: target.clone(),
+                until: std::time::Instant::now() + hold,
+            },
         });
         Ok(attempt)
     }
@@ -1498,18 +1585,18 @@ impl Handover {
     /// step that acts for it may still be answered.
     pub(super) fn is_current(&self, attempt: Uuid) -> bool {
         self.lock().closed.as_ref().is_some_and(|closed| {
-            closed.attempt == attempt && std::time::Instant::now() < closed.until
+            closed.attempt == attempt
+                && matches!(&closed.reason, Reason::Update { until, .. } if std::time::Instant::now() < *until)
         })
     }
 
-    /// Ends `attempt` and opens the gate, if it is still the attempt the gate is closed for.
+    /// Ends `attempt` and opens the gate, if it is still the attempt the gate is closed for. A gate
+    /// closed for a stop requested on the local socket is no attempt and stays closed.
     pub(super) fn end(&self, attempt: Uuid) {
         let mut gate = self.lock();
-        if gate
-            .closed
-            .as_ref()
-            .is_some_and(|closed| closed.attempt == attempt)
-        {
+        if gate.closed.as_ref().is_some_and(|closed| {
+            closed.attempt == attempt && matches!(closed.reason, Reason::Update { .. })
+        }) {
             gate.closed = None;
         }
     }
@@ -1520,12 +1607,13 @@ impl Handover {
     ///
     /// # Errors
     ///
-    /// `ENVIRONMENT_UNAVAILABLE` once this daemon has been told to stop: it is going, and the
-    /// environment is served again by the daemon that starts after it.
+    /// `ENVIRONMENT_UNAVAILABLE` once this daemon has been told to stop, or its gate is closed for
+    /// a stop requested on the local socket: it is going, and the environment is served again by
+    /// the daemon that starts after it.
     pub(super) fn resume(&self, attempt: Option<Uuid>) -> Result<Option<Uuid>> {
         let mut gate = self.lock();
-        if *self.stopping.borrow() {
-            return Err(stopping());
+        if let Some(cause) = self.stopping_for(&gate) {
+            return Err(stopping(cause));
         }
         match &gate.closed {
             Some(closed) if attempt.is_none_or(|named| named == closed.attempt) => {
@@ -1559,10 +1647,11 @@ impl Handover {
     ///
     /// # Errors
     ///
-    /// `INVALID_ARGUMENT` when no attempt is named, and `RESOURCE_UNAVAILABLE` when the attempt
-    /// is not the one the gate is closed for: this daemon was not prepared, the preparation
-    /// lapsed and it may have started sessions since, or another attempt began or this one
-    /// ended.
+    /// `INVALID_ARGUMENT` when no attempt is named, `ENVIRONMENT_UNAVAILABLE` when the gate is
+    /// closed for a stop requested on the local socket, and `RESOURCE_UNAVAILABLE` when the
+    /// attempt is not the one the gate is closed for: this daemon was not prepared, the
+    /// preparation lapsed and it may have started sessions since, or another attempt began or
+    /// this one ended.
     pub(super) fn stop(&self, attempt: Option<Uuid>) -> Result<Uuid> {
         let Some(attempt) = attempt else {
             return Err(ControllerError::InvalidArgument(
@@ -1571,10 +1660,21 @@ impl Handover {
         };
         let gate = self.lock();
         match &gate.closed {
-            Some(closed)
-                if closed.attempt == attempt && std::time::Instant::now() < closed.until =>
-            {
-                self.stopping.send_replace(true);
+            Some(Closed {
+                reason: Reason::Stop,
+                ..
+            }) => Err(stopping(StopCause::Request)),
+            Some(Closed {
+                attempt: held,
+                reason: Reason::Update { until, .. },
+            }) if *held == attempt && std::time::Instant::now() < *until => {
+                self.stopping.send_if_modified(|cause| {
+                    let changes = cause.is_none();
+                    if changes {
+                        *cause = Some(StopCause::Update);
+                    }
+                    changes
+                });
                 Ok(attempt)
             }
             _ => Err(ControllerError::Refused {
@@ -1586,10 +1686,10 @@ impl Handover {
         }
     }
 
-    /// Waits until this daemon has been told to stop.
-    pub(super) async fn stopped(&self) {
+    /// Waits until this daemon has been told to stop for `cause`.
+    pub(super) async fn stopped_for(&self, cause: StopCause) {
         let mut stopping = self.stopping.subscribe();
-        let _ = stopping.wait_for(|stopping| *stopping).await;
+        let _ = stopping.wait_for(|told| *told == Some(cause)).await;
     }
 }
 
@@ -1665,7 +1765,71 @@ impl Controller {
     /// Waits until a prepared handover has told this daemon to stop, which is when the process
     /// that serves it ends.
     pub async fn handed_over(&self) {
-        self.handover.stopped().await;
+        self.handover.stopped_for(StopCause::Update).await;
+    }
+
+    /// Waits until this daemon has been told to stop by a stop requested on its local socket,
+    /// which is when the process that serves it ends. That is once the answer to the request has
+    /// been written, has failed or has reached its bound.
+    pub async fn stop_requested(&self) {
+        self.handover.stopped_for(StopCause::Request).await;
+    }
+
+    /// `host.stop`: stops this daemon at a request on its local socket, or, for a request that
+    /// asks for the launch alone, says how it was started and stops nothing.
+    ///
+    /// A stop closes the gate to new sessions, waits for the creates under way to settle for
+    /// [`STOP_SETTLE_MS`], and goes on whether they settled or not: it never refuses for a create
+    /// that does not settle, and a create that is cut is resolved by the next start as after a
+    /// crash. It answers its process, how many creates had not settled and how it was started.
+    /// The daemon is told to stop by the local door once that answer has been written, has failed
+    /// or has reached its bound, so the request carries that on its answer
+    /// ([`Stopped::then_stops`]) and nothing else of the daemon's does.
+    ///
+    /// # Errors
+    ///
+    /// `INVALID_ARGUMENT` when the parameters are not a stop's.
+    pub(super) async fn host_stop(&self, mutation: &MutationRequest) -> Result<Stopped> {
+        let params: HostStopParams = parse(&mutation.params)?;
+        // How this daemon was started is what a restart compares a start with. Where it cannot
+        // say, the answer has none and the request is taken all the same: nothing that is stopped
+        // is lost for it.
+        let launch = self.started().ok().map(|started| HostLaunch {
+            arguments: started.arguments,
+            variables: started
+                .environment
+                .into_iter()
+                .map(|variable| HostLaunchVariable {
+                    name: variable.name,
+                    value: variable.value,
+                })
+                .collect(),
+            directory: started.working_directory,
+        });
+        let pid = U64::new(u64::from(std::process::id()));
+        if params.launch_only {
+            return Ok(Stopped {
+                answer: encode(&HostStopResult {
+                    pid,
+                    unsettled: U64::new(0),
+                    launch: Nullable(launch),
+                })?,
+                then_stops: false,
+            });
+        }
+        self.handover.begin_stop();
+        let unsettled = self
+            .handover
+            .settle(std::time::Duration::from_millis(STOP_SETTLE_MS))
+            .await;
+        Ok(Stopped {
+            answer: encode(&HostStopResult {
+                pid,
+                unsettled: U64::new(u64::try_from(unsettled).unwrap_or(u64::MAX)),
+                launch: Nullable(launch),
+            })?,
+            then_stops: true,
+        })
     }
 
     /// How this daemon was started: its arguments, its program's own name left out, and its working
@@ -1748,6 +1912,16 @@ impl Controller {
             configuration_directory: Nullable(started.configuration_directory),
         }
     }
+}
+
+/// What `host.stop` came to: its answer, and whether the daemon stops once that answer has been
+/// written.
+pub(super) struct Stopped {
+    /// The answer: the daemon's process, the creates that did not settle and how it was started.
+    pub(super) answer: ParamsValue,
+    /// True for a stop whose wait for the creates has ended, and false for a request that asked
+    /// for the launch alone.
+    pub(super) then_stops: bool,
 }
 
 /// How a daemon of another release is started like this one: what this daemon was started with,

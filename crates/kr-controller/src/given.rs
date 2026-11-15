@@ -216,6 +216,9 @@ pub(crate) struct Settled<T> {
     /// Evidence that the write's own effect raised the barrier that withdrew every connection of
     /// the host, this write's own included.
     withdrew: Option<HostWithdrawal>,
+    /// Whether the daemon stops once this write's answer has been written: the answer is that of a
+    /// stop request whose wait for the creates under way has ended.
+    stops_after_the_answer: bool,
 }
 
 impl<T> Settled<T> {
@@ -224,13 +227,27 @@ impl<T> Settled<T> {
         Self {
             given,
             withdrew: None,
+            stops_after_the_answer: false,
         }
     }
 
     /// A write that came to `given`, and that withdrew the whole host through its own barrier
     /// when `withdrew` says so.
     pub(crate) const fn withdrawing(given: Given<T>, withdrew: Option<HostWithdrawal>) -> Self {
-        Self { given, withdrew }
+        Self {
+            given,
+            withdrew,
+            stops_after_the_answer: false,
+        }
+    }
+
+    /// The same write, whose answer is the one the local door stops the daemon after: the answer
+    /// of a stop request whose wait for the creates under way has ended. The door writes it under
+    /// a bound and tells the daemon to stop when that write has completed, failed or reached the
+    /// bound, whatever the answer says (an answer that is withheld stops the daemon all the same).
+    pub(crate) fn stopping_after_the_answer(mut self) -> Self {
+        self.stops_after_the_answer = true;
+        self
     }
 
     /// The same write, its answer reshaped by `reshape`.
@@ -238,6 +255,7 @@ impl<T> Settled<T> {
         Settled {
             given: self.given.map(reshape),
             withdrew: self.withdrew,
+            stops_after_the_answer: self.stops_after_the_answer,
         }
     }
 

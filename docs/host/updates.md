@@ -385,6 +385,37 @@ that release, run by its own `kr`, finishes the update.
 
 The control daemon supports communication with a worker both at its current compatibility level and at each level it retains, which is the level of the newest release at the highest level below its own. The control daemon detects the level of each worker from the hello exchange and then reads and writes frames for that worker at the given level. Its hello offers its own public protocol and the protocol each retained level records, and a worker answers with its own, so a worker of an earlier public major at a retained level is reached as a worker of that major. If the control daemon meets a worker at any other level, it refuses to exchange anything but the hello with it (using the `UNSUPPORTED_SCHEMA` error) and logs which session it left running unreached, and why. If the daemon is started with a release whose manifest names a level it does not retain, it will not start up and prints that level.
 
+## Stopping the daemon on its local socket
+
+`host.stop` ends a control daemon at a request on its local socket. It is served on the host
+account's own socket and asks for the right to manage the host; no device, paired party, plugin or
+workflow method has a way to ask for it, and it asks for no confirmation. The daemon knows that a
+stop was requested on its local socket, and no more: code that runs as the host's account can end
+the daemon with the platform's own tools, and this request adds no power to it. A request that
+carries a process bridge's origin is refused with `PERMISSION_DENIED`. The daemon keeps no record of
+the request, and serves it while the host owes a fence and while the local owner's membership lease
+has lapsed. The `kr` command line of this build does not send this request.
+
+A stop closes the daemon's gate to new sessions and waits up to 10 seconds for the creates it has
+already started, then goes on whether they settled or not. It never refuses for a create that does
+not settle. It answers the daemon's process identifier, how many creates had not settled and how the
+daemon was started: the arguments, the variables that decide where it keeps what it keeps, and its
+working directory, which are null where the daemon cannot say. The daemon stops once that answer has
+been written, has failed to be written or has waited five seconds for a client that reads nothing. A
+create that was cut is resolved by the next start as after a crash, and the next start does not
+launch it again. Nothing a session is doing stops: a worker belongs to the service manager, and the
+next daemon finds it again.
+
+While the gate is closed for a stop, a create is refused with `ENVIRONMENT_UNAVAILABLE`, and so is
+an update's `prepare`, `resume` and `stop`; an attempt that was open when the stop came is over. A
+second stop finds the gate closed for a stop, waits beside the first and is taken. The answer to any
+other request, a request for the launch alone included, does not stop the daemon.
+
+With `launch_only` set, the request stops nothing, closes no gate and answers only how the daemon
+was started. A request states `launch_only`; one that leaves it out is refused and stops nothing.
+Under an owed fence the answer to either request is withheld as `OUTCOME_UNKNOWN`, as the answer to
+any write is, and a stop still stops the daemon.
+
 ## A session that runs the release before
 
 An update to a release that retains the level of the release before does not wait for a session whose worker runs that release. The new control daemon finds that worker and publishes its descriptor in the shape the worker reads. It sends it frames suitable for the worker's level. The session's worker, shell and agents are preserved. If the worker asks for its plugin runtime or for a draft before the daemon has found it, the daemon tells it to ask again; the draft steps `facts` and `begin`, which an agent makes before then, are answered unavailable and are not asked again. A mutation a paired device makes reaches the worker of the release before with the remote dispatch lease: before the daemon forwards a mutation other than a close, it takes the lease, bounds the deadline the worker is given by it and sends it with the mutation. The worker admits the mutation only with the lease, and holds that deadline and the revision the device's grant was checked at. A session created after the update has a worker of the new release.

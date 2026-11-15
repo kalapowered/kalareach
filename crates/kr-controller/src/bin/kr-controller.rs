@@ -340,6 +340,11 @@ async fn run(
         () = controller.handed_over() => {
             println!("kr-controller: stopped: an update of this host replaces this daemon");
         }
+        // A stop requested on the local socket, whose answer has been written. Like any other
+        // stop, it stops no session: the workers belong to the service manager.
+        () = controller.stop_requested() => {
+            println!("kr-controller: stopped: a stop was requested on the local socket");
+        }
     }
     Ok(())
 }

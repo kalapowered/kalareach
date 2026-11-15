@@ -724,6 +724,10 @@ pub struct Controller {
     /// shown. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     before_a_reply_is_told: ReadPause,
+    /// Where this host's own tests stop the answer to a stop request as it is about to be written,
+    /// before the daemon is told to stop for it. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    before_a_stop_answer_is_written: ReadPause,
     /// Each reply the local door's sink consumed, with the request it answers, in the order they
     /// were written: what a test reads to hold that a caller is given the reply that was made and
     /// no other. Compiled away in every shipped build.
@@ -1911,3 +1915,8 @@ mod a_pass_that_waits_for_its_turn;
 /// the stop, through its own door.
 #[cfg(test)]
 mod making_way_for_an_update;
+
+/// A daemon stopped by a request on its local socket: its gate, the creates it waits for, the
+/// answer it writes and the stop that follows it, through its own door.
+#[cfg(test)]
+mod stopped_on_the_local_socket;

@@ -115,6 +115,31 @@ impl Daemon {
     }
 }
 
+impl Daemon {
+    /// Waits for the daemon to end by itself, and says how it ended.
+    fn ends_by_itself(&mut self) -> Result<std::process::ExitStatus, String> {
+        let child = self.child.as_mut().ok_or("the daemon has ended")?;
+        let deadline = std::time::Instant::now() + COLLECT_BOUND;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    self.child = None;
+                    return Ok(status);
+                }
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    return Err(format!(
+                        "the daemon had not ended {COLLECT_BOUND:?} after its stop was answered"
+                    ));
+                }
+                Err(error) => return Err(format!("the daemon could not be waited for: {error}")),
+            }
+        }
+    }
+}
+
 impl Drop for Daemon {
     fn drop(&mut self) {
         if let Err(error) = self.stop() {
@@ -854,6 +879,114 @@ async fn a_launch_held_across_a_restart_resolves_as_one_that_produced_no_session
     assert!(
         at_rest.is_empty(),
         "the creator's variable is at rest in: {at_rest:#?}"
+    );
+}
+
+/// A launch held between its reservation and its worker's claim, while the daemon is stopped by a
+/// request on its local socket, is cut at the end of the wait for the creates under way: the stop
+/// does not refuse for it, counts it as one that did not settle, answers, and the daemon ends by
+/// itself with status zero. The next start resolves the launch as one that produced no session, as
+/// after a crash, and does not launch it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_held_across_a_stop_on_the_local_socket_resolves_as_one_that_produced_no_session()
+{
+    let mut host = Host::start_held().await;
+    let outside = tempfile::tempdir().expect("a directory on the internal disk");
+    let value = marker_value();
+    let request = host.request(outside.path(), &value);
+    let mut client = host.client().await;
+    let mutation = client
+        .compose(
+            Method::SessionCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            host.target(None),
+            &request,
+        )
+        .await
+        .expect("composes the request");
+    let creating = tokio::spawn({
+        let mutation = mutation.clone();
+        async move { client.repeat(&mutation).await }
+    });
+    until("the reservation to be spawned with its launcher", || {
+        host.reservations()
+            .iter()
+            .any(|(phase, launcher)| phase == "spawned" && launcher.is_some())
+            .then_some(())
+    })
+    .await;
+    let launched = host.reservations().len();
+
+    // The create does not settle, so the stop waits for it to the end of its wait and goes on.
+    let answered: kr_protocol::update::HostStopResult = host
+        .client()
+        .await
+        .mutate(
+            Method::HostStop,
+            ActionId::new(kr_ipc::new_uuid()),
+            host.target(None),
+            &kr_protocol::update::HostStopParams { launch_only: false },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("a create that does not settle does not refuse the stop")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(answered.unsettled.get(), 1, "the held create was counted");
+    let mut daemon = host.daemon.take().expect("a daemon");
+    let status = daemon.ends_by_itself().expect("the daemon ends by itself");
+    assert_eq!(status.code(), Some(0), "the stop is a graceful end");
+    drop(daemon);
+    let _ = tokio::time::timeout(PATIENCE, creating)
+        .await
+        .expect("the caller's connection ends with the daemon");
+
+    host.run().await;
+    host.open_gate();
+    until(
+        "the held launch to be resolved as a launch that produced no session",
+        || {
+            host.reservations()
+                .iter()
+                .any(|(phase, _)| phase == "failed")
+                .then_some(())
+        },
+    )
+    .await;
+    assert_eq!(
+        host.reservations().len(),
+        launched,
+        "the next start launched nothing for the create it resolved"
+    );
+    let listed: kr_protocol::session::SessionListResult = host
+        .client()
+        .await
+        .request(
+            Method::SessionList,
+            &kr_protocol::session::SessionListParams {
+                environment_id: Nullable::some(host.environment_id),
+                include_closed: true,
+            },
+        )
+        .await
+        .expect("reaches the daemon")
+        .expect("lists")
+        .to_typed()
+        .expect("decodes");
+    assert!(
+        listed.sessions.is_empty(),
+        "no session was started: {:?}",
+        listed.sessions
+    );
+    let replay = host
+        .client()
+        .await
+        .repeat(&mutation)
+        .await
+        .expect("reaches the daemon");
+    assert!(
+        replay.is_err(),
+        "a create whose launch produced no session is not answered with one: {replay:?}"
     );
 }
 
