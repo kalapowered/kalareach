@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 use kr_client::services::account::{AccountTokenSource, BACKUP_WRITE_SCOPE};
 use kr_client::services::{
     BackupState, HttpDeadlines, HttpService, ManagedBackupManifestService, ManagedStorageService,
-    ServiceClients, ServiceHttp, ServiceSigner, StorageService, StorageStatus,
+    Offered, ServiceClients, ServiceHttp, ServiceSigner, StorageService, StorageStatus,
     managed_response_limits,
 };
 use kr_crypto::keys::AuthorisationKeyPair;
@@ -1032,6 +1032,16 @@ impl BackupRuntime {
                  disk, so no new backup is made until it is",
             );
         }
+        // What the service named when it had no capacity ends the line, once, after every clause
+        // the check adds, whichever of the holds the line tells said it.
+        let named = [observed.status_refusal, observed.pass_hold]
+            .into_iter()
+            .flatten()
+            .map(capacity_named)
+            .fold(Offered::default(), Offered::either);
+        if !named.is_empty() {
+            detail = crate::capacity::listed(detail, named);
+        }
         let backup_on = observed
             .status
             .as_ref()
@@ -1195,15 +1205,21 @@ fn hold_sentence(detail: Sentence, hold: Hold, writer: KeyId) -> Sentence {
             detail.stated("the service is not configured for backup storage")
         }
         ErrorCode::RateLimited | ErrorCode::ServiceCapacity if !hold.offered.is_empty() => {
-            crate::capacity::listed(
-                detail.stated(crate::capacity::BACKUP_COLLECTIONS),
-                hold.offered,
-            )
+            detail.stated(crate::capacity::BACKUP_COLLECTIONS)
         }
         ErrorCode::RateLimited | ErrorCode::ServiceCapacity | ErrorCode::UpstreamUnavailable => {
             detail.stated("the service is busy or unreachable, and this host asks again")
         }
         _ => detail.stated("the service turned a request back"),
+    }
+}
+
+/// What a hold that says the service has no managed capacity named, which the line ends with, and
+/// nothing for any other hold.
+fn capacity_named(hold: Hold) -> Offered {
+    match hold.code {
+        ErrorCode::RateLimited | ErrorCode::ServiceCapacity => hold.offered,
+        _ => Offered::default(),
     }
 }
 

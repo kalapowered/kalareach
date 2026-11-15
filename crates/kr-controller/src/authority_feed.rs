@@ -830,6 +830,8 @@ impl FeedRuntime {
         };
         let reads =
             Sentence::new().stated("this host reads its remote revocations from an authority feed");
+        // What a service with no capacity named ends the line, after every clause the check adds.
+        let mut offered = None;
         let (state, detail, remedy): (DoctorStatus, Sentence, Option<&'static str>) =
             if status.removed_at_ms.0.is_some() {
                 (
@@ -863,22 +865,22 @@ impl FeedRuntime {
                     )
                 };
                 match stopped {
-                    Stopped::Capacity(offered) => (
-                        DoctorStatus::Warning,
-                        crate::capacity::listed(
+                    Stopped::Capacity(named) => {
+                        offered = Some(named);
+                        (
+                            DoctorStatus::Warning,
                             reads
                                 .clone()
                                 .stated(", and ")
                                 .stated(crate::capacity::AUTHORITY_FEEDS)
                                 .stated("; ")
                                 .sentence(&synchronised),
-                            offered,
-                        ),
-                        Some(
-                            "This host asks again by itself. What is shown of remote revocations \
-                             is stale until the feed answers.",
-                        ),
-                    ),
+                            Some(
+                                "This host asks again by itself. What is shown of remote \
+                                 revocations is stale until the feed answers.",
+                            ),
+                        )
+                    }
                     Stopped::Unreachable => waits(", which could not be reached"),
                     Stopped::Refused => waits(", which turned a request back"),
                     Stopped::Local => waits(", which this host could not finish reading"),
@@ -992,6 +994,10 @@ impl FeedRuntime {
                 )
         } else {
             detail
+        };
+        let detail = match offered {
+            Some(offered) => crate::capacity::listed(detail, offered),
+            None => detail,
         };
         DoctorCheck::new(
             "authority-feed",

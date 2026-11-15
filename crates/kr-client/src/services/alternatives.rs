@@ -197,6 +197,20 @@ impl Offered {
     pub const fn more(self) -> u64 {
         self.more as u64
     }
+
+    /// What either of two refusals named, for a line that holds both: each recognised alternative
+    /// once, and the larger of the two counts of those this build does not recognise.
+    #[must_use]
+    pub const fn either(self, other: Self) -> Self {
+        Self {
+            known: self.known | other.known,
+            more: if self.more >= other.more {
+                self.more
+            } else {
+                other.more
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -254,6 +268,32 @@ mod tests {
         assert!(Alternatives::none().until_then().is_none());
         assert!(Alternatives::none().offered().is_empty());
         assert!(Alternatives::none().is_empty());
+    }
+
+    /// KR-REQ-17.48: a line that holds two refusals lists what either named, each recognised
+    /// alternative once, and says no fewer of the others than the larger count.
+    #[test]
+    fn kr_req_17_48_what_either_of_two_refusals_named_is_listed_once() {
+        let first = Alternatives::named(vec![SEVEN[0].to_owned(), "A path of its own.".to_owned()])
+            .offered();
+        let second = Alternatives::named(vec![
+            SEVEN[3].to_owned(),
+            SEVEN[0].to_owned(),
+            "A path of its own.".to_owned(),
+            "Another path of its own.".to_owned(),
+        ])
+        .offered();
+        let both = first.either(second);
+        assert_eq!(
+            both.recognised().collect::<Vec<_>>(),
+            vec![
+                Alternative::OwnMailboxService,
+                Alternative::OwnSettingsSyncService
+            ],
+        );
+        assert_eq!(both.more(), 2);
+        assert_eq!(second.either(first), both, "in either order");
+        assert_eq!(Offered::default().either(first), first);
     }
 
     /// KR-REQ-17.48: the list is the service's text, so its rendering says whether it named any

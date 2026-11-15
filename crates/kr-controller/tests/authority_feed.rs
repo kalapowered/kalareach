@@ -3049,6 +3049,38 @@ async fn kr_req_17_48_a_service_with_no_capacity_for_a_new_feed_is_said_as_its_l
     }
 }
 
+/// KR-REQ-17.48: when the feed check has more to say after the service's limit, the list of
+/// alternatives still ends the whole line, once, and no clause starts after a full stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_17_48_the_alternatives_end_the_feed_checks_whole_line() {
+    const OWN: &str = "An authority feed service that you run yourself.";
+    const LIMIT: &str = "the service has no managed capacity for new authority feeds now, which is a limit of the service and not a fault of this host";
+    let PutOff { rig, .. } =
+        a_request_the_host_has_not_taken_ahead_of_a_withdrawal_it_has(false).await;
+    rig.served.web().fail_with_member(
+        AUTHORITY,
+        "delegate",
+        1,
+        short_budget(429, "RATE_LIMITED", 600, &[OWN]),
+    );
+    rig.poll().await;
+    let detail = rig
+        .shown()
+        .await
+        .check
+        .expect("the feed check")
+        .detail()
+        .to_owned();
+    assert!(detail.contains(LIMIT), "{detail}");
+    assert!(
+        detail.contains("catching up with it"),
+        "a clause stands after the limit: {detail}"
+    );
+    assert!(detail.ends_with(&format!("Until then: {OWN}")), "{detail}");
+    assert_eq!(detail.matches("Until then").count(), 1, "{detail}");
+    assert!(!detail.contains(".;"), "{detail}");
+}
+
 /// A change to the list of keys that may remove the feed, turned back with a delay, ends the pass:
 /// the host asks the feed for nothing more until the delay is over, as it does for any request the
 /// feed turns back with one.
