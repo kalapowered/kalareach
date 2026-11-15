@@ -17,7 +17,9 @@
 //!
 //! The question ([`Footing::ask`]) reads those copies and the clocks and nothing else: it takes no
 //! lock, awaits nothing and writes nothing, so it can be asked immediately before the landing
-//! call, in a poll, and from a blocking thread. Every variant of the question ([`Ask`]) is the one
+//! call, in a poll, and from a blocking thread. What it needs from the lease's bound is taken
+//! before its first read, so that after the first read of a member or of a clock nothing in it
+//! allocates, frees, takes a lock or waits. Every variant of the question ([`Ask`]) is the one
 //! code path with some members masked out, and a refused member answers with the words of the
 //! door's own check for that condition ([`Lapse`]); the question has no text of its own.
 //!
@@ -365,12 +367,15 @@ impl Footing {
 
     /// The question: whether the request still stands at this moment, for the members `ask` reads.
     ///
-    /// **Every leaf this calls, and nothing else:** `Copies::fence_is_owed` (an atomic load),
-    /// `Copies::revision` (an atomic load), `AtomicBool::load` of the registration's latch,
-    /// `ContinuousClock::now` (the daemon's continuous clock), `HeldBound::stands_at` (one load of
-    /// the bound's `ArcSwap` cell and comparisons; no lock) and `Copies::settled_utc_now` (the
-    /// wall clock and `UtcFloor::observe`, an atomic raise of the floor that never waits). No lock
-    /// is taken, nothing is awaited and nothing is written but the floor's own raise.
+    /// **Before the first read:** the bound's cell is loaded once and its snapshot copied out
+    /// (`HeldBound::published`), because loading a cell can allocate (the first use of a thread)
+    /// and lets go of a reference. **After the first read** (the flag, the revision or the latch;
+    /// a clock) nothing allocates, frees, takes a lock or waits: the leaves are
+    /// `Copies::fence_is_owed` and `Copies::revision` (atomic loads), `AtomicBool::load` of the
+    /// registration's latch, `ContinuousClock::now` (the daemon's continuous clock),
+    /// `Copies::settled_utc_now` (the wall clock and `UtcFloor::observe`, an atomic raise of the
+    /// floor that never waits) and `HeldBound::stands_in` (comparisons of the copy). Nothing is
+    /// written but the floor's own raise.
     ///
     /// The order is the flag, the revision, the latch, the deadline and the bound. The first three
     /// are read in the order the barrier's writes make true: a reader that finds the flag clear
@@ -381,6 +386,12 @@ impl Footing {
     ///
     /// Returns the first member that refuses.
     pub(crate) fn ask(&self, ask: Ask) -> Result<(), Lapse> {
+        // Everything the bound's comparison needs is taken before the first read below.
+        let bound = self
+            .bound
+            .as_ref()
+            .filter(|_| ask.bound)
+            .map(|bound| (bound, bound.published()));
         if ask.flag && self.copies.fence_is_owed() {
             return Err(Lapse::FenceOwed);
         }
@@ -418,14 +429,12 @@ impl Footing {
         {
             return Err(Lapse::Admission(AdmissionLapse::Expired));
         }
-        if ask.bound
-            && let Some(bound) = &self.bound
-        {
+        if let Some((bound, published)) = &bound {
             // The continuous clock first and the wall clock after it, as every reader of a bound
             // reads them.
             let now = self.copies.now();
             let utc_ms = self.copies.settled_utc_now();
-            match bound.stands_at(now, utc_ms) {
+            match bound.stands_in(published, now, utc_ms) {
                 Stands::Holds => {}
                 Stands::Moved => return Err(Lapse::BoundMoved),
                 Stands::EndedOnTheContinuousClock | Stands::EndedInUtc => {
@@ -704,6 +713,51 @@ mod tests {
             Some(ControllerError::PermissionDenied { .. })
         ));
         assert!(Lapse::BoundMoved.refusal().is_none());
+    }
+
+    /// A clock that ends a lease's bound at its first reading, as a policy commit on another
+    /// thread can between two reads of one question.
+    #[derive(Debug)]
+    struct EndsTheBoundWhenRead {
+        clock: ManualClock,
+        cell: Arc<BoundCell>,
+        ended: AtomicBool,
+    }
+
+    impl ContinuousClock for EndsTheBoundWhenRead {
+        fn now(&self) -> ContinuousInstant {
+            if !self.ended.swap(true, Ordering::SeqCst) {
+                self.cell.end();
+            }
+            self.clock.now()
+        }
+    }
+
+    #[test]
+    fn a_question_compares_the_bound_it_took_before_its_first_read() {
+        let clock = ManualClock::new();
+        let cell = BoundCell::new(
+            BoundIdentity::Unbounded,
+            clock.now().checked_add(Duration::from_secs(3600)),
+            None,
+            false,
+        );
+        let copies = Arc::new(Copies::new(
+            AuthorityRevision::new(3),
+            Arc::new(EndsTheBoundWhenRead {
+                clock,
+                cell: Arc::clone(&cell),
+                ended: AtomicBool::new(false),
+            }),
+            WallClock::from_fn(|| 1_000),
+            Arc::new(UtcFloor::default()),
+        ));
+        let footing = Footing::untargeted(copies).holding(Some(HeldBound::load(&cell)));
+        // The cell ends while the question reads the clock, after its first read: that question
+        // goes by the bound it took before, and does not load the cell again. The next one finds
+        // the end.
+        assert_eq!(footing.ask(Ask::SIGN_IN), Ok(()));
+        assert_eq!(footing.ask(Ask::SIGN_IN), Err(Lapse::LeaseEnded));
     }
 
     #[test]

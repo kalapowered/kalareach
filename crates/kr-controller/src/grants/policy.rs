@@ -346,11 +346,30 @@ impl HeldBound {
     /// and was then established again is another run, and the response is decided again under it.
     #[must_use]
     pub fn stands_at(&self, now: ContinuousInstant, utc_ms: u64) -> Stands {
-        let current = self.cell.load();
-        if current.lineage != self.snapshot.lineage {
+        self.stands_in(&self.published(), now, utc_ms)
+    }
+
+    /// The snapshot its cell publishes now, copied out whole. Loading the cell can allocate (the
+    /// first use of a thread) and lets go of a reference, so a check that must not wait takes this
+    /// before its first read and compares the copy with [`Self::stands_in`] after it.
+    #[must_use]
+    pub fn published(&self) -> BoundSnapshot {
+        *self.cell.load()
+    }
+
+    /// [`Self::stands_at`], from a snapshot that [`Self::published`] copied out earlier: only
+    /// comparisons, so nothing in it allocates, frees, takes a lock or waits.
+    #[must_use]
+    pub fn stands_in(
+        &self,
+        published: &BoundSnapshot,
+        now: ContinuousInstant,
+        utc_ms: u64,
+    ) -> Stands {
+        if published.lineage != self.snapshot.lineage {
             return Stands::Moved;
         }
-        judged(&current, now, utc_ms)
+        judged(published, now, utc_ms)
     }
 
     /// Whether the cell still publishes the snapshot the decision was taken under, and it still
