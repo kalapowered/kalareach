@@ -145,6 +145,24 @@ async fn a_repeat_of_a_withdrawal_is_answered_from_its_record_and_fences_nothing
         .expect("a revocation result");
     let revision = fixture.authority_revision();
     assert_eq!(first.authority_revision, revision);
+    // The claim keeps the withdrawal's marker and the answer is built from the barrier each time, so
+    // no record of what the entries of a barrier read is kept beside it.
+    let receipts =
+        rusqlite::Connection::open(fixture.host.tree().environment().registry_database())
+            .expect("the registry opens");
+    let (markers, records): (i64, i64) = receipts
+        .query_row(
+            "SELECT COUNT(result), COUNT(reads) FROM authority_receipts",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the receipts are counted");
+    assert_eq!(
+        (markers > 0, records),
+        (true, 0),
+        "the marker of a withdrawal is kept with no record of what a barrier read"
+    );
+    drop(receipts);
     drop(client);
 
     let mut client = fixture.host.client().await;
