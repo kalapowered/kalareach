@@ -2041,6 +2041,16 @@ fn another_attachment() -> AttachmentId {
     AttachmentId::new(kr_ipc::new_uuid())
 }
 
+/// A new attachment identifier that sorts after `attachment`, as the host's registry orders keys.
+fn another_attachment_after(attachment: AttachmentId) -> AttachmentId {
+    loop {
+        let other = another_attachment();
+        if other > attachment {
+            return other;
+        }
+    }
+}
+
 /// The most input streams one connection holds, as the listener allows.
 const MAX_STREAMS: usize = kr_transport::listener::DEFAULT_MAX_INPUT_STREAMS;
 
@@ -4965,6 +4975,7 @@ async fn a_frame_waiting_to_be_called_is_not_called_once_its_stream_is_revoked(h
 
     let mut newer = None;
     let mut handler = None;
+    let mut other = None;
     match how {
         Revoked::AnUnknownLaunch => {
             stages.script_dependent_answers(|_| SerialAnswer::Silent);
@@ -4977,6 +4988,10 @@ async fn a_frame_waiting_to_be_called_is_not_called_once_its_stream_is_revoked(h
         }
         Revoked::AReplacement => newer = Some(rig.open().await),
         Revoked::TheConnectionsRelease => {
+            // The release revokes the connection's streams one after the other, in the order of
+            // their attachments' keys. A second stream, for an attachment that sorts after this
+            // rig's, is reset only when the held stream has been revoked, and it is the signal.
+            let mut second = rig.open_for(another_attachment_after(rig.attachment)).await;
             // The handler is held, so the connection's end waits behind it and the stream's end is
             // the release's alone.
             let (answered, release) = rig.adopted.host.pause_after_a_frame_is_answered();
@@ -4990,11 +5005,11 @@ async fn a_frame_waiting_to_be_called_is_not_called_once_its_stream_is_revoked(h
                 .controller()
                 .raise_the_unverified_withdrawal_refusal()
                 .await;
-            // Every stream of the connection is revoked before its accounts are given up.
-            until("the release revoked the streams", || {
-                stages.counts().accounts == 0
-            })
-            .await;
+            assert!(
+                next_or_reset(&mut second).await.is_err(),
+                "the release reset the second stream, so it had revoked the held one before"
+            );
+            other = Some(second);
             handler = Some(release);
         }
     }
@@ -5016,7 +5031,7 @@ async fn a_frame_waiting_to_be_called_is_not_called_once_its_stream_is_revoked(h
         vec![0],
         "{how:?}: the worker was given the frame that waited, after its stream was revoked"
     );
-    drop((newer, handler));
+    drop((newer, handler, other));
     rig.stop().await;
 }
 
@@ -5040,13 +5055,21 @@ async fn a_frame_waiting_to_be_called_is_not_called_after_the_connections_releas
     .await;
 }
 
+// What a new stream of the same attachment in the same epoch starts from. The host's record belongs
+// to one stream, so the new stream starts with an empty record: the limit that the record's
+// documentation names. The planned client opens a new stream only after a new acquire, which is a
+// new epoch, and never meets it.
+
 /// The worker refuses the frame at sequence 0 for room, which an older worker counts as a sequence
-/// taken, and the device then gets a new stream for the same attachment: while the older still
-/// stands (it replaces it), or after the older's task ended. The new stream's frame 1 is accepted.
-/// What the worker refused belongs to the attachment and not to the stream that sent it, so the
-/// worker has accepted one frame of the epoch and a barrier that counts two is not reached, for a
-/// release, a detach and a launch.
-async fn a_barrier_counts_no_frame_past_one_the_worker_refused(replaced_while_standing: bool) {
+/// taken, and a device that is not honest then opens a new stream for the same attachment in the
+/// same epoch and has its frame 1 accepted. The new stream's record holds one acceptance, at
+/// sequence 1, and nothing of the refusal, so a barrier that counts two frames is reached on it:
+/// the host forwards a release, a launch and a detach with a count that the worker did not accept,
+/// and acts on the device's own word about its own typing. A count above what the new stream has
+/// had accepted is still refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_stream_in_the_same_epoch_forwards_a_count_that_includes_a_frame_the_worker_refused()
+{
     let rig = Rig::start_withholding_the_lane().await;
     let _calls = script_calls(&rig, None, |sequence| {
         if sequence == 0 {
@@ -5068,58 +5091,49 @@ async fn a_barrier_counts_no_frame_past_one_the_worker_refused(replaced_while_st
         ),
         "the refusal is told"
     );
-    let mut newer = if replaced_while_standing {
-        let newer = rig.open().await;
-        assert!(
-            next_or_reset(&mut older).await.is_err(),
-            "the older stream is reset"
-        );
-        newer
-    } else {
-        let mut ended = rig.adopted.host.network().input_tasks_ended();
-        drop(older);
-        tokio::time::timeout(WAIT, ended.changed())
-            .await
-            .expect("the older stream's task ended in time")
-            .expect("the count stands");
-        rig.open().await
-    };
+    let mut newer = rig.open().await;
+    assert!(
+        next_or_reset(&mut older).await.is_err(),
+        "the older stream is reset"
+    );
     type_and_wait(&rig, &mut newer, 1, b"b").await;
-    for request in [Dependent::Release, Dependent::Detach, Dependent::Launch] {
-        let refused = send_after(&rig, request, rig.epoch, 2).await;
+    for request in [Dependent::Release, Dependent::Launch] {
+        let reached = send_after(&rig, request, rig.epoch, 2).await;
         assert!(
-            refused.refused_here,
-            "{request:?}: frame 0 was refused, so two frames are not reached: {:?}",
-            refused.answer
+            !reached.refused_here,
+            "{request:?}: the new stream's record holds frame 1 as accepted and nothing of the refused frame 0: {:?}",
+            reached.answer
         );
     }
+    let over = send_after(&rig, Dependent::Launch, rig.epoch, 3).await;
     assert!(
-        forwarded(&sent).is_empty(),
-        "nothing was forwarded: {:?}",
-        forwarded(&sent)
+        over.refused_here,
+        "a count above what the new stream had accepted is refused: {:?}",
+        over.answer
     );
-    let none = send_after(&rig, Dependent::Launch, rig.epoch, 0).await;
+    // A detach ends the stream it follows, so it is last.
+    let detach = send_after(&rig, Dependent::Detach, rig.epoch, 2).await;
     assert!(
-        !none.refused_here,
-        "a barrier of no typing is reached: {:?}",
-        none.answer
+        !detach.refused_here,
+        "Detach: the same count is forwarded: {:?}",
+        detach.answer
     );
-    assert_eq!(position_refusals(&rig), 3);
+    assert_eq!(
+        forwarded(&sent),
+        vec![
+            Method::InputRelease,
+            Method::ShellLaunch,
+            Method::SessionDetach
+        ],
+        "the worker was sent the three requests, each with a count that included the refused frame"
+    );
+    assert_eq!(position_refusals(&rig), 1);
     rig.stop().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_frame_the_worker_refused_is_not_forgotten_when_a_newer_stream_replaces_its_stream() {
-    a_barrier_counts_no_frame_past_one_the_worker_refused(true).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_frame_the_worker_refused_is_not_forgotten_when_a_newer_stream_opens_after_its_stream() {
-    a_barrier_counts_no_frame_past_one_the_worker_refused(false).await;
-}
-
-/// A new epoch starts from nothing, as a stream's own record does: what the worker refused in one
-/// epoch does not bound the count of the next. The control of the case above.
+/// The planned client's path, which the limit above never touches: after a refusal in one epoch it
+/// takes the lease again, which is a new epoch, and opens a new stream. A new epoch counts from
+/// nothing, so a refusal in the older bounds nothing of the newer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_newer_epoch_counts_from_nothing_after_a_refusal_in_an_older_one() {
     let rig = Rig::start_withholding_the_lane().await;
@@ -5175,42 +5189,51 @@ async fn a_newer_epoch_counts_from_nothing_after_a_refusal_in_an_older_one() {
     rig.stop().await;
 }
 
-/// A stream that replaces another starts from what the worker accepted on it: a barrier for the
-/// typing the worker took is reached, and one frame more is not. For a worker with the lane and one
-/// without.
-async fn a_new_stream_starts_from_what_the_worker_accepted(serial: bool) {
+/// A new stream for the same attachment in the same epoch starts with an empty record: a barrier
+/// for the typing that the worker accepted on the stream before is refused, which the device
+/// answers by sending the ending again with no position, until the new stream has had typing
+/// accepted past it. For a worker with the lane and one without.
+async fn a_new_stream_in_the_same_epoch_starts_with_an_empty_record(serial: bool) {
     let (rig, _older) = if serial {
         typed_serial(3).await
     } else {
         typed(3).await
     };
     let sent = script_dependents(&rig, None);
-    let _newer = rig.open().await;
-    let reached = send_after(&rig, Dependent::Launch, rig.epoch, 3).await;
+    let mut newer = rig.open().await;
+    let before = send_after(&rig, Dependent::Launch, rig.epoch, 3).await;
+    assert!(
+        before.refused_here,
+        "the new stream has had nothing accepted, so the three frames the worker took on the stream before are not reached on its record: {:?}",
+        before.answer
+    );
+    type_and_wait(&rig, &mut newer, 3, b"k").await;
+    let reached = send_after(&rig, Dependent::Launch, rig.epoch, 4).await;
     assert!(
         !reached.refused_here,
-        "the worker accepted three frames on the stream before: {:?}",
+        "one acceptance on the new stream is a count of one on its record, so the device's own numbering is the only thing that makes four: {:?}",
         reached.answer
     );
     assert_eq!(forwarded(&sent), vec![Method::ShellLaunch]);
-    let over = send_after(&rig, Dependent::Launch, rig.epoch, 4).await;
+    let over = send_after(&rig, Dependent::Launch, rig.epoch, 5).await;
     assert!(
         over.refused_here,
-        "one frame more than the worker accepted is not reached: {:?}",
+        "one frame more than the record holds is not reached: {:?}",
         over.answer
     );
-    assert_eq!(position_refusals(&rig), 1);
+    assert_eq!(position_refusals(&rig), 2);
     rig.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_new_stream_starts_from_what_a_worker_without_the_lane_accepted() {
-    a_new_stream_starts_from_what_the_worker_accepted(true).await;
+async fn a_new_stream_in_the_same_epoch_starts_with_an_empty_record_for_a_worker_without_the_lane()
+{
+    a_new_stream_in_the_same_epoch_starts_with_an_empty_record(true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_new_stream_starts_from_what_a_worker_with_the_lane_accepted() {
-    a_new_stream_starts_from_what_the_worker_accepted(false).await;
+async fn a_new_stream_in_the_same_epoch_starts_with_an_empty_record_for_a_worker_with_the_lane() {
+    a_new_stream_in_the_same_epoch_starts_with_an_empty_record(false).await;
 }
 
 /// A launch whose result is unknown ends the stream its position was read from. The device opens a
@@ -5240,28 +5263,5 @@ async fn a_stream_opened_while_a_launch_is_out_is_not_reset_when_the_launch_is_u
         "the stream the launch followed was replaced and is reset"
     );
     type_and_wait(&rig, &mut newer, 1, b"k").await;
-    rig.stop().await;
-}
-
-/// What the worker accepted and refused of an attachment's typing outlives the stream that sent it,
-/// and is given up when the attachment is detached.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_account_of_an_attachments_typing_is_given_up_with_its_detach() {
-    let (rig, _stream) = typed_serial(1).await;
-    let stages = rig.adopted.host.network().input_stages();
-    assert_eq!(stages.counts().accounts, 1);
-    detach(&rig).await;
-    until("the account was given up", || stages.counts().accounts == 0).await;
-    rig.stop().await;
-}
-
-/// The same, when the connection that holds the attachment is released.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_account_of_an_attachments_typing_is_given_up_when_its_connection_is_released() {
-    let (rig, _stream) = typed_serial(1).await;
-    let stages = rig.adopted.host.network().input_stages();
-    assert_eq!(stages.counts().accounts, 1);
-    rig.device.close();
-    until("the account was given up", || stages.counts().accounts == 0).await;
     rig.stop().await;
 }

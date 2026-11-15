@@ -151,9 +151,6 @@ mod with_seams {
         pub records: u64,
         /// The most epochs the host held a record of at one time.
         pub records_peak: u64,
-        /// The accounts of what a worker accepted and refused that the host keeps for attachments,
-        /// across connections, now.
-        pub accounts: u64,
         /// How many times a detach that took effect, or may have, told the streams of an attachment.
         pub detaches: u64,
         /// How many times the task that ends a stream for a detach asked for the stream's graceful
@@ -185,7 +182,6 @@ mod with_seams {
         unanswered: Arc<Gauge>,
         host_holds: Gauge,
         records: Gauge,
-        accounts: Gauge,
         read: AtomicU64,
         detaches: AtomicU64,
         detach_ends: AtomicU64,
@@ -216,7 +212,6 @@ mod with_seams {
                 unanswered: Arc::default(),
                 host_holds: Gauge::default(),
                 records: Gauge::default(),
-                accounts: Gauge::default(),
                 read: AtomicU64::new(0),
                 detaches: AtomicU64::new(0),
                 detach_ends: AtomicU64::new(0),
@@ -358,9 +353,7 @@ mod with_seams {
             let (unanswered, unanswered_peak) = self.unanswered.counts();
             let (host_holds, host_holds_peak) = self.host_holds.counts();
             let (records, records_peak) = self.records.counts();
-            let (accounts, _) = self.accounts.counts();
             InputStageCounts {
-                accounts,
                 host_holds,
                 host_holds_peak,
                 records,
@@ -528,14 +521,6 @@ mod with_seams {
             self.host_holds.fall();
         }
 
-        pub(in crate::service::net) fn account_made(&self) {
-            self.accounts.rise();
-        }
-
-        pub(in crate::service::net) fn accounts_fell(&self, count: usize) {
-            self.accounts.fall_by(count);
-        }
-
         pub(in crate::service::net) fn record_made(&self) {
             self.records.rise();
         }
@@ -625,10 +610,6 @@ mod without_seams {
         pub(in crate::service::net) fn frame_taken(&self) {}
 
         pub(in crate::service::net) fn frame_let_go(&self) {}
-
-        pub(in crate::service::net) fn account_made(&self) {}
-
-        pub(in crate::service::net) fn accounts_fell(&self, _count: usize) {}
 
         pub(in crate::service::net) fn record_made(&self) {}
 
