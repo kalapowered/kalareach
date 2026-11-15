@@ -901,6 +901,53 @@ async fn a_frame_past_its_deadline_and_withdrawn_is_cut_and_not_refused() {
     rig.stop().await;
 }
 
+/// The writer asks whether the stream has ended immediately before it writes, so a frame that is
+/// held at the write when the stream's graceful end comes is not given to the worker: a detach ends
+/// the stream once the worker's notice that the lease ended is applied, with the writer held after
+/// the host's decision, and the frame is let go unwritten when the writer is let go. The device is
+/// told nothing of the frame, which it counts as uncertain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_held_at_the_write_when_the_stream_ends_is_not_written() {
+    let rig = Rig::start().await;
+    let mut stream = rig.open().await;
+    let stages = rig.adopted.host.network().input_stages();
+    let (at_write, go_write) = stages.hold_before_a_lane_write();
+    stream
+        .write_message(&rig.frame(0, b"a"))
+        .await
+        .expect("the frame is written");
+    arrived(at_write).await;
+    assert_eq!(stages.counts().unanswered, 1, "the frame is decided");
+
+    detach(&rig).await;
+    rig.lane.send_window(lease_ended(&rig));
+    until("the stream's graceful end is asked", || {
+        stages.counts().detach_ends == 1
+    })
+    .await;
+    let _ = go_write.send(());
+
+    until("the frame is let go", || stages.counts().unanswered == 0).await;
+    assert!(
+        rig.lane.frames().is_empty(),
+        "the worker was given a frame after the stream ended"
+    );
+    let ended = loop {
+        match next_or_reset(&mut stream).await {
+            Ok(Some(ack)) => assert!(
+                !matches!(ack, InputAck::Accepted { .. } | InputAck::Refused { .. }),
+                "the device is told nothing of the frame: {ack:?}"
+            ),
+            other => break other,
+        }
+    };
+    assert!(
+        matches!(ended, Ok(None)),
+        "the stream still finishes cleanly, the end stands as it was decided: {ended:?}"
+    );
+    rig.stop().await;
+}
+
 /// A window of an older epoch that reaches the host after a newer one does not replace it: the
 /// stream goes on in the newer epoch. The device reads the older epoch's end first, so the window
 /// has been applied when the frame is written.

@@ -1224,8 +1224,9 @@ async fn forward(
 }
 
 /// Writes the queue to the worker in the order the stream task read it, one frame at a time. The
-/// authority feed is asked immediately before each socket write, which a decision taken before a
-/// wait for the socket does not replace, and a frame keeps the deadline it was given.
+/// stream's end, the frame's deadline and the authority feed are asked, in that order,
+/// immediately before each socket write, which a decision taken before a wait for the socket does
+/// not replace, and a frame keeps the deadline it was given.
 async fn write_lane(
     mut writer: LinkWriter,
     mut queued: mpsc::UnboundedReceiver<LaneFrame>,
@@ -1281,14 +1282,21 @@ async fn write_lane(
             continue;
         }
         flow.stages.before_a_lane_write().await;
-        // Whether the frame's deadline passed before a write to the socket that was about to be
-        // made. A frame past its deadline is not given to the worker whatever it waited for, and
-        // its end is a cut and never a refusal: the device's frame may be answered or not, and
-        // it is told nothing of it.
+        // Whether the stream's end was decided, and whether the frame's deadline passed, before a
+        // write to the socket that was about to be made. A frame is not given to the worker once
+        // the stream has ended, whatever it waited for: the end stands as it was decided, and the
+        // device's frame is left with no word of its own, as uncertain. A frame past its deadline
+        // is not given to the worker either, and its end is a cut and never a refusal: the
+        // device's frame may be answered or not, and it is told nothing of it.
+        let mut stopped = false;
         let mut expired = false;
         let written = tokio::time::timeout_at(
             item.deadline,
             writer.write_while(&item.frame, || {
+                if flow.ended().is_some() {
+                    stopped = true;
+                    return false;
+                }
                 if tokio::time::Instant::now() >= item.deadline {
                     expired = true;
                     return false;
@@ -1297,6 +1305,11 @@ async fn write_lane(
             }),
         )
         .await;
+        if stopped {
+            flow.unsent(item.request_id);
+            flow.changed();
+            return;
+        }
         if expired {
             flow.end(End::Cut);
             return;
