@@ -322,6 +322,11 @@ fn params_for_a_route(
         Method::HostPolicyConfirm => {
             Some(ParamsValue::from_typed(&HostPolicyConfirmParams {}).expect("encodes"))
         }
+        // The request for the launch alone: it stops nothing, so the walk can send it.
+        Method::HostStop => Some(
+            ParamsValue::from_typed(&kr_protocol::update::HostStopParams { launch_only: true })
+                .expect("encodes"),
+        ),
         Method::OrganisationExclusiveSet => Some(
             ParamsValue::from_typed(&OrganisationExclusiveSetParams { exclusive: false })
                 .expect("encodes"),

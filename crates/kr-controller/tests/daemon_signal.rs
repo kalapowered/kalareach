@@ -1,5 +1,5 @@
 //! What the control daemon does when it is sent SIGTERM, the signal launchd and systemd send at a
-//! stop.
+//! stop, and when it is asked to stop on its local socket.
 //!
 //! The daemon here is the real `kr-controller` program, started as a child of the test with no
 //! supervisor between them, so the status the test collects is the daemon's own: an exit code, or
@@ -24,6 +24,7 @@ use kr_protocol::session::{
     Presentation, SessionCreateParams, SessionCreateResult, SessionListParams, SessionListResult,
     SessionReadParams, SessionReadResult, SessionState, ShellMode,
 };
+use kr_protocol::update::{HostStopParams, HostStopResult};
 
 mod teardown;
 
@@ -234,6 +235,23 @@ impl Host {
         LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
             .await
             .expect("the daemon answers")
+    }
+
+    /// Asks the daemon to stop, or for its launch alone, on a connection of its own.
+    async fn stop(&self, launch_only: bool) -> HostStopResult {
+        self.client()
+            .await
+            .mutate(
+                Method::HostStop,
+                ActionId::new(kr_ipc::new_uuid()),
+                self.target(None),
+                &HostStopParams { launch_only },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .unwrap_or_else(|error| panic!("the stop was refused: {error}"))
+            .to_typed()
+            .expect("decodes")
     }
 
     fn target(&self, session: Option<&SessionCreateResult>) -> ActionTarget {
@@ -631,5 +649,99 @@ async fn a_session_goes_on_through_the_stop_sigterm_asks_for_and_the_next_daemon
         read.session.attachment_count.get(),
         2,
         "both terminals are still attached"
+    );
+}
+
+/// A stop asked on the local socket ends the real daemon after its answer has been written, by the
+/// ordinary way out: an exit code of zero, the line that says why, its sockets removed and its
+/// environment's lock free, and a session goes on through it as it does through a signal. A request
+/// for the launch alone, asked first, stops nothing and says how the daemon was started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_asked_on_the_local_socket_ends_the_daemon_after_its_answer_and_no_session_stops() {
+    let mut host = Host::create();
+    host.run().await;
+    let environment = host.tree.environment();
+    let daemon_id = host.daemon.as_ref().expect("a daemon").id();
+    let created = host.create_session().await;
+    let session_id = created.session.session_id;
+
+    let launch = host.stop(true).await;
+    assert_eq!(launch.pid.get(), u64::from(daemon_id));
+    assert_eq!(launch.unsettled.get(), 0);
+    let started_as = launch
+        .launch
+        .0
+        .expect("the daemon can say how it was started");
+    assert!(
+        started_as
+            .arguments
+            .windows(2)
+            .any(|pair| pair == ["--secret-store", "file"]),
+        "the arguments it was started with: {:?}",
+        started_as.arguments
+    );
+    assert_eq!(
+        std::fs::canonicalize(&started_as.directory).expect("the directory exists"),
+        std::fs::canonicalize(host.tree.root()).expect("the tree exists"),
+    );
+    assert_eq!(
+        SingletonLock::holder(&environment.singleton_lock()).expect("the lock file is read"),
+        Some(daemon_id),
+        "the request for the launch alone stopped nothing"
+    );
+    host.client().await;
+
+    let answered = host.stop(false).await;
+    assert_eq!(answered.pid.get(), u64::from(daemon_id));
+    assert_eq!(answered.unsettled.get(), 0);
+    let status = host.daemon.as_mut().expect("a daemon").collect();
+    assert!(
+        ended_gracefully(status),
+        "the stop ended the daemon by an exit code of zero: {status:?}"
+    );
+    let said = std::fs::read_to_string(host.tree.root().join("daemon.log")).unwrap_or_default();
+    assert!(
+        said.lines()
+            .any(|line| line == "kr-controller: stopped: a stop was requested on the local socket"),
+        "the daemon said why it stopped: {said}"
+    );
+    for endpoint in [
+        environment.controller_endpoint(),
+        environment.rendezvous_endpoint(),
+        environment.attachment_chunk_endpoint(),
+    ] {
+        let endpoint = endpoint.expect("an endpoint");
+        assert!(
+            !endpoint.as_path().exists(),
+            "the daemon removed its socket {}",
+            endpoint.as_path().display()
+        );
+    }
+    SingletonLock::acquire(&environment.singleton_lock(), host.tree.environment_id())
+        .expect("the environment's lock can be taken once the daemon has ended");
+
+    // The session went on, and the next daemon lists it live.
+    host.run().await;
+    let listed: SessionListResult = host
+        .client()
+        .await
+        .request(
+            Method::SessionList,
+            &SessionListParams {
+                environment_id: Nullable::null(),
+                include_closed: false,
+            },
+        )
+        .await
+        .expect("the call reaches the new daemon")
+        .expect("the list succeeds")
+        .to_typed()
+        .expect("decodes");
+    assert!(
+        listed
+            .sessions
+            .iter()
+            .any(|summary| summary.session_id == session_id && summary.state == SessionState::Live),
+        "the daemon started again found the session: {listed:?}"
     );
 }

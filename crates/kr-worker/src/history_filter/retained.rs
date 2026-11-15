@@ -277,6 +277,7 @@ pub const fn result_content(method: Method) -> ResultContent {
         | Method::WorkflowRun
         | Method::WorkflowRearm
         | Method::HostUpdateHandover
+        | Method::HostStop
         | Method::HostClockEstablish
         | Method::AccountSignIn
         | Method::AccountSignOut

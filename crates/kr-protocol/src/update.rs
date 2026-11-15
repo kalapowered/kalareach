@@ -1337,6 +1337,14 @@ pub const HANDOVER_HOLD_MS: u64 = 300_000;
 /// window the create's own answer takes.
 pub const HANDOVER_SETTLE_MS: u64 = 45_000;
 
+/// How long a daemon asked to stop on its local socket (`host.stop`) waits for the creates it has
+/// already started to settle, before it stops whether they settled or not.
+///
+/// Shorter than [`HANDOVER_SETTLE_MS`]: no daemon of another release waits behind this stop for
+/// each worker to hold its own release, and a create that is cut here is resolved by the next
+/// start as after a crash.
+pub const STOP_SETTLE_MS: u64 = 10_000;
+
 /// One step of `host.update.handover`.
 ///
 /// A handover is an attempt: `prepare` begins one and answers its identity, and only a `stop` that
@@ -1412,6 +1420,57 @@ pub struct PathVariable {
     pub name: String,
     /// Its value in the daemon's process; null where the process has none, which is not the same as
     /// an empty value.
+    pub value: Nullable<String>,
+}
+
+/// `host.stop` parameters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostStopParams {
+    /// True to ask how the daemon was started and nothing else: the daemon stops nothing, closes
+    /// no gate and counts no create. False stops the daemon. A request states it, so one that
+    /// leaves it out is refused and stops nothing.
+    pub launch_only: bool,
+}
+
+/// `host.stop` result: the daemon that took the request, the creates that did not settle before
+/// it stopped, and how it was started.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostStopResult {
+    /// The daemon's process identifier.
+    pub pid: U64,
+    /// How many creates under way had not settled when the wait for them ended
+    /// ([`STOP_SETTLE_MS`]); each is resolved by the next start as after a crash. Zero for a
+    /// request that asked for the launch alone.
+    pub unsettled: U64,
+    /// How the daemon was started, or null where it cannot say: an argument that is not text, a
+    /// working directory that no longer exists or a variable whose value is not text.
+    pub launch: Nullable<HostLaunch>,
+}
+
+/// How a control daemon was started, as `host.stop` reports it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostLaunch {
+    /// The arguments it was started with, its program's own name left out.
+    pub arguments: Vec<String>,
+    /// Each variable that decides where the daemon keeps something
+    /// ([`crate::hostinfo::configuration::path_variables`]), with the value it has in the
+    /// daemon's process.
+    pub variables: Vec<HostLaunchVariable>,
+    /// The directory it was started in.
+    pub directory: String,
+}
+
+/// One variable that decides where a daemon keeps something, as the daemon has it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HostLaunchVariable {
+    /// The variable's name.
+    pub name: String,
+    /// Its value in the daemon's process; null where the process has none, which is not the same
+    /// as an empty value.
     pub value: Nullable<String>,
 }
 
@@ -2128,5 +2187,50 @@ mod tests {
         // refused rather than read as one that names none.
         let unstated = serde_json::json!({ "step": "stop", "target": "0.2.0+4254aa6e62e5" });
         assert!(serde_json::from_value::<HostUpdateHandoverParams>(unstated).is_err());
+    }
+
+    /// A stop's parameters and result are closed schemas and round-trip through the canonical
+    /// encoding, and a request that does not state whether it asks for the launch alone is refused:
+    /// no request that leaves a member out stops the daemon.
+    #[test]
+    fn a_stop_round_trips_and_a_request_that_states_nothing_stops_nothing() {
+        for launch_only in [false, true] {
+            let params = HostStopParams { launch_only };
+            let bytes = kr_cbor::to_canonical_vec(&params).expect("encodes");
+            let back: HostStopParams =
+                kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT).expect("decodes");
+            assert_eq!(back, params);
+        }
+        assert!(!HostStopParams::default().launch_only);
+        assert!(serde_json::from_value::<HostStopParams>(serde_json::json!({})).is_err());
+        let unknown = serde_json::json!({ "launch_only": false, "force": true });
+        assert!(serde_json::from_value::<HostStopParams>(unknown).is_err());
+        for launch in [
+            Nullable::null(),
+            Nullable::some(HostLaunch {
+                arguments: vec!["--secret-store".to_owned(), "file".to_owned()],
+                variables: vec![
+                    HostLaunchVariable {
+                        name: "XDG_CONFIG_HOME".to_owned(),
+                        value: Nullable::some("/c".to_owned()),
+                    },
+                    HostLaunchVariable {
+                        name: "KR_STATE_DIR".to_owned(),
+                        value: Nullable::null(),
+                    },
+                ],
+                directory: "/s".to_owned(),
+            }),
+        ] {
+            let result = HostStopResult {
+                pid: U64::new(42),
+                unsettled: U64::new(1),
+                launch,
+            };
+            let bytes = kr_cbor::to_canonical_vec(&result).expect("encodes");
+            let back: HostStopResult =
+                kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT).expect("decodes");
+            assert_eq!(back, result);
+        }
     }
 }

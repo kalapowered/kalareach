@@ -587,6 +587,20 @@ methods! {
           sessions, let the creates it started settle, say how it was started, and stop when \
           told to. No session stops.";
 
+    HostStop = "host.stop", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: keyed("the daemon keeps no record of the request; asked again \
+                                            it finds the stop under way and is taken the same"),
+    doc: "Stops this control daemon. It is served on the daemon's local socket alone. It closes \
+          the gate to new sessions, waits up to ten seconds for creates that are under way, \
+          answers the daemon's process identifier, the count of creates that did not settle and \
+          how the daemon was started, and then ends the daemon. No session stops. With \
+          `launch_only` set it stops nothing, closes no gate and answers only how the daemon was \
+          started. A request states `launch_only`. While the host owes a fence the answer is \
+          withheld, and a stop still ends the daemon. It is served while the local owner's \
+          membership lease has lapsed, and it keeps no record of the request.";
+
     DescriptionSetup = "description.setup", HostAndEnvironment,
     effect: Read, ingress: [LocalIpc, PairedDevice], rights: [req(HostManage)],
     selectors: [Environment],
@@ -1958,8 +1972,9 @@ pub enum LocalHold {
 /// membership lease says, apart from the session's own tooling ([`local_hold`]).
 ///
 /// What recovers the host: presenting a lease, reading what the host holds, asking for, answering
-/// and spending the owner's confirmations, establishing the clock, and confirming a policy the host
-/// found restored. What only restricts or ends
+/// and spending the owner's confirmations, establishing the clock, confirming a policy the host
+/// found restored, and stopping the control daemon so that it can be started again. What only
+/// restricts or ends
 /// access: revoking a device or a grant, leaving an organisation, closing a session, detaching,
 /// releasing input, and cancelling what is pending. And the reads those take their arguments from.
 /// Every other method is held.
@@ -1975,6 +1990,7 @@ pub const LOCAL_RECOVERY: &[Method] = &[
     Method::GrantRevoke,
     Method::OrganisationWithdraw,
     Method::HostPolicyConfirm,
+    Method::HostStop,
     Method::SessionClose,
     Method::SessionDetach,
     Method::InputRelease,
@@ -2200,6 +2216,8 @@ mod tests {
         ("privacy.retained.delete", &[ActionRight::HostManage]),
         // The person at this machine ends the wait a restored policy puts on every remote grant.
         ("host.policy.confirm", &[ActionRight::HostManage]),
+        // Stopping this host's control daemon on its local socket: the daemon is the host's own.
+        ("host.stop", &[ActionRight::HostManage]),
         // This host's own sign-in to the managed account service: whose balance a phone's call
         // spends is the owner's choice at this machine.
         ("account.sign_in", &[ActionRight::HostManage]),

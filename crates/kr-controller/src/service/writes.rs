@@ -116,6 +116,10 @@ impl LocalWrite {
                 "asked again it answers that it lifted nothing, and it reads no record of the \
                  action",
             ),
+            Method::HostStop => Self::Unrecorded(
+                "asked again it finds the stop under way and is taken the same, and it reads no \
+                 record of the action",
+            ),
             _ if net::methods::serves(method) => Self::Pairing,
             _ if crate::transfer::TransferModule::serves(method) => Self::Transfer,
             _ if crate::voice::VoiceModule::serves(method) => Self::Voice,

@@ -1217,6 +1217,8 @@ impl Controller {
             #[cfg(feature = "testing")]
             before_a_reply_is_told: ReadPause::default(),
             #[cfg(feature = "testing")]
+            before_a_stop_answer_is_written: ReadPause::default(),
+            #[cfg(feature = "testing")]
             replies_written: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "testing")]
             replies_made: std::sync::Mutex::new(Vec::new()),

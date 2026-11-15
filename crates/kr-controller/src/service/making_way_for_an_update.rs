@@ -18,7 +18,7 @@ use kr_protocol::update::{
 use crate::service::{Controller, ControllerSetup};
 use crate::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 
-use super::host::Handover;
+use super::host::{Handover, StopCause};
 
 /// How long a wait for something that is going to happen is given.
 const LIVENESS_DEADLINE: Duration = Duration::from_secs(60);
@@ -107,7 +107,7 @@ async fn only_a_prepared_daemon_is_told_to_stop() {
     );
     let waiting = {
         let handover = Arc::clone(&handover);
-        tokio::spawn(async move { handover.stopped().await })
+        tokio::spawn(async move { handover.stopped_for(StopCause::Update).await })
     };
     let attempt = begin(&handover, Duration::from_secs(300));
     assert_eq!(

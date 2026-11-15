@@ -1510,6 +1510,18 @@ impl Controller {
                 let _: kr_protocol::organisation::HostPolicyConfirmParams =
                     parse(&mutation.params)?;
             }
+            // A stop acts on this environment's daemon, which serves the whole environment, not on
+            // a session.
+            Method::HostStop => {
+                if mutation.target.session_id.as_ref().is_some() {
+                    return Err(ControllerError::InvalidArgument(
+                        "a stop request is for this environment's control daemon and cannot name a \
+                         session"
+                            .to_owned(),
+                    ));
+                }
+                let _: kr_protocol::update::HostStopParams = parse(&mutation.params)?;
+            }
             // A machine group step changes this environment's own record, not a session's. A
             // request that named a session here would be asking for a record scoped to something
             // the record does not have.

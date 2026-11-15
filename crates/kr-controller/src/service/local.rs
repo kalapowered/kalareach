@@ -268,6 +268,32 @@ impl Controller {
         matches!(tokio::time::timeout(bound, written).await, Ok(Ok(())))
     }
 
+    /// Writes the answer to a stop request, whose wait for the creates under way has ended, and
+    /// then tells the daemon to stop, and says whether the connection goes on.
+    ///
+    /// The write waits for the peer for at most the bound a local connection gives any write it was
+    /// not asked for: a client that has stopped reading, with its socket's buffer full, would
+    /// otherwise hold the answer for ever and the daemon with it. The daemon is told to stop when
+    /// the write has completed, has failed or has reached the bound, and when it has reached the
+    /// bound the connection ends. It is told whatever the answer says, so an answer that is
+    /// withheld as an unknown outcome stops the daemon all the same, and no other request's answer
+    /// does: this is the only place the daemon is told to stop for a stop requested on its local
+    /// socket.
+    pub(crate) async fn write_the_answer_of_a_stop(
+        &self,
+        writer: &mut kr_ipc::framed::FrameWriter,
+        kind: StreamKind,
+        answer: &ControlFrame,
+    ) -> bool {
+        #[cfg(feature = "testing")]
+        self.before_a_stop_answer_is_written.wait().await;
+        let written = self
+            .write_within(writer, kind, answer, self.local_pace().write_bound)
+            .await;
+        self.handover.stop_after_the_answer();
+        written
+    }
+
     /// What a local caller is told when the local owner's lease ended while its answer was being
     /// written.
     ///
@@ -451,6 +477,19 @@ impl Controller {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push((request_id, frame.clone()));
+    }
+
+    /// Arms the pause the answer to a stop request stops at as it is about to be written, before
+    /// the daemon is told to stop for it. Returns the end that says the answer has arrived, and
+    /// the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_a_stop_answer_is_written(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.before_a_stop_answer_is_written.arm()
     }
 
     /// Stops here while the pause before a reply is told is armed ([`Self::pause_before_a_reply_is_told`]).

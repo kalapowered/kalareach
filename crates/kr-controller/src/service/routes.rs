@@ -995,6 +995,47 @@ impl Controller {
                     None => refused(window_passed()),
                 }
             }
+            // A stop of this daemon, asked on its own local socket by a program that runs on this
+            // machine. No device, paired party, plugin or workflow method reaches it: the registry
+            // gives it the local ingress alone, the actor is checked again here, and a request
+            // that came over a process bridge is refused. It takes no admission into a service and
+            // is not held to the fence by name, so a host that owes a fence can still be stopped
+            // and started again; the answer is told under the fence like any other write's, which
+            // withholds it as an unknown outcome, and the daemon stops all the same. The daemon
+            // keeps no record of the request.
+            (LocalWrite::Unrecorded(_), Method::HostStop) => {
+                if !is_owners_own_socket(actor_id) {
+                    return refused(ControllerError::PermissionDenied {
+                        detail: "this control daemon takes a stop request only on its own local \
+                                 socket, and this request did not arrive there"
+                            .to_owned(),
+                    });
+                }
+                if origin.is_some() {
+                    return refused(ControllerError::PermissionDenied {
+                        detail: "this control daemon takes a stop request only on its own local \
+                                 socket, and this request came over a process bridge"
+                            .to_owned(),
+                    });
+                }
+                match accepted.filter(|accepted| self.clock.now() < accepted.deadline) {
+                    Some(_) => match self.authorised(connection_id) {
+                        Ok(_) => match self.host_stop(mutation).await {
+                            Ok(stopped) => {
+                                let answered = unrecorded_write(request_id, Ok(stopped.answer));
+                                if stopped.then_stops {
+                                    answered.stopping_after_the_answer()
+                                } else {
+                                    answered
+                                }
+                            }
+                            Err(error) => unrecorded_write(request_id, Err(error)),
+                        },
+                        Err(error) => refused(error.into()),
+                    },
+                    None => refused(window_passed()),
+                }
+            }
             _ => refused(ControllerError::InvalidArgument(format!(
                 "{} is not a mutation this daemon serves",
                 method.as_str()

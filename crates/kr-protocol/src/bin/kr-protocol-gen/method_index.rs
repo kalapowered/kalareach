@@ -144,6 +144,7 @@ pub(crate) const fn described_in(method: Method) -> Section {
         | Method::AccountStorageSignOut
         | Method::AccountStorageStatus => at(HOST, "Account sign-in"),
         Method::HostUpdateHandover => at(HOST_UPDATES, "The handover"),
+        Method::HostStop => at(HOST_UPDATES, "Stopping the daemon on its local socket"),
         Method::OrganisationEnrol
         | Method::OrganisationList
         | Method::OrganisationPolicyApply

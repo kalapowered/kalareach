@@ -1757,6 +1757,47 @@ fn the_confirmation_of_a_restored_policy_is_the_person_at_the_machines_alone() {
     }
 }
 
+/// A stop of the control daemon is asked on the host account's own local socket and behind host
+/// management, and the protocol gives no other ingress a way to ask for it.
+///
+/// It asks for no confirmation: the request is the account's own, and the protocol claims no more
+/// than that no device, paired party, plugin or workflow method can send it. It is a method of
+/// recovery, so a host that is exclusively organisation-managed serves it to its local owner whose
+/// lease has lapsed, since a daemon that has to be restarted may be what the lapse left behind.
+#[test]
+fn the_stop_of_a_daemon_is_asked_on_the_local_socket_alone() {
+    let entry = lookup("host.stop").expect("host.stop is in the registry");
+    assert_eq!(entry.effect, EffectClass::Write);
+    assert_eq!(entry.group, MethodGroup::HostAndEnvironment);
+    assert_eq!(entry.ingress, &[ActorIngress::LocalIpc]);
+    assert_eq!(
+        entry.required_rights,
+        &[RequiredRight::right(ActionRight::HostManage)]
+    );
+    assert_eq!(entry.confirmation, ConfirmationRequirement::None);
+    assert!(
+        kr_protocol::method::LOCAL_RECOVERY.contains(&Method::HostStop),
+        "a local owner with no live lease can still stop the daemon"
+    );
+    assert_eq!(
+        kr_protocol::method::local_hold(Method::HostStop),
+        kr_protocol::method::LocalHold::Free
+    );
+    for ingress in [
+        ActorIngress::PairedDevice,
+        ActorIngress::UnpairedPeer,
+        ActorIngress::Workflow,
+        ActorIngress::Plugin,
+        ActorIngress::ServiceClient,
+    ] {
+        assert_eq!(
+            decide("host.stop", MethodVersion::V1, ingress),
+            AuthorityDecision::Denied(DenialReason::ForbiddenIngress { ingress }),
+            "{ingress:?} cannot stop the daemon"
+        );
+    }
+}
+
 /// KR-REQ-25.06: the names a suite's tool wrote in its test reports are the local owner's to read.
 /// A paired device and a workflow are refused the read by the table, so no route of theirs has to
 /// narrow it.
