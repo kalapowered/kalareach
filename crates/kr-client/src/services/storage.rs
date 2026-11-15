@@ -394,6 +394,7 @@ pub fn collection_deleted() -> ClientError {
         retry_after_seconds: None,
         action: UserAction::FixConfiguration,
         service_code: super::signed::named_code("COLLECTION_DELETED"),
+        alternatives: super::alternatives::Alternatives::none(),
     }
 }
 
@@ -1593,6 +1594,7 @@ fn not_held() -> ClientError {
         retry_after_seconds: None,
         action: crate::retry::UserAction::Nothing,
         service_code: None,
+        alternatives: super::alternatives::Alternatives::none(),
     }
 }
 

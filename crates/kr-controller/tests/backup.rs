@@ -6188,6 +6188,7 @@ fn refused(code: ErrorCode, message: &str) -> ClientError {
         retry_after_seconds: None,
         action: UserAction::Nothing,
         service_code: None,
+        alternatives: Default::default(),
     }
 }
 
@@ -6614,6 +6615,7 @@ impl Web {
                 retry_after_seconds: None,
                 action: UserAction::Nothing,
                 service_code: None,
+                alternatives: Default::default(),
             });
         };
         Ok(ObjectDeleted {

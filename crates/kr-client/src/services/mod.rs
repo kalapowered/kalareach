@@ -123,6 +123,7 @@
 
 pub mod account;
 pub mod admission;
+pub mod alternatives;
 pub mod authority;
 pub mod backup;
 pub mod description;
@@ -160,6 +161,7 @@ pub use admission::{
     AdmissionAnswer, AdmissionClock, AdmissionRequest, ManagedPairingAdmission,
     PairingAdmissionService, PairingAdmissions,
 };
+pub use alternatives::{Alternative, Alternatives, Offered};
 pub use authority::{
     AnnouncementOutcome, AnnouncementPlacement, AuthorityFeedClient, AuthorityFeedRecord,
     AuthorityFeedState, AuthorityFeedSummary, FeedAnnouncement, RejectionReason,

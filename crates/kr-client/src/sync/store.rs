@@ -1147,6 +1147,16 @@ impl From<crate::ClientError> for SyncError {
 }
 
 impl SyncError {
+    /// The alternatives a managed service named when it refused for a short budget, as the
+    /// service wrote them. Empty for every other failure.
+    #[must_use]
+    pub fn alternatives(&self) -> &crate::services::Alternatives {
+        match self {
+            Self::Client(error) => error.alternatives(),
+            _ => crate::ClientError::NO_ALTERNATIVES,
+        }
+    }
+
     /// Returns the stable protocol code this refusal is reported under.
     ///
     /// A local store is not a host, and the codes are a vocabulary rather than a claim about one.
