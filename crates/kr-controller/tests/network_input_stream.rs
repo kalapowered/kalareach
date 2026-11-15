@@ -4085,6 +4085,131 @@ async fn an_ending_sent_again_with_no_position_goes_through_after_a_refusal() {
     rig.stop().await;
 }
 
+/// The parameters of a release that carry a valid barrier and a report request of the wrong type.
+#[derive(serde::Serialize)]
+struct ReleaseWithATextReport {
+    session_id: SessionId,
+    attachment_id: AttachmentId,
+    epoch: InputLeaseEpoch,
+    after_input: InputBarrier,
+    fenced_report: &'static str,
+}
+
+/// The parameters of a detach that carry a valid barrier and a report request of the wrong type.
+#[derive(serde::Serialize)]
+struct DetachWithATextReport {
+    attachment_id: Nullable<AttachmentId>,
+    after_input: InputBarrier,
+    fenced_report: &'static str,
+}
+
+/// The parameters of a launch that carry a valid barrier and an expected generation of the wrong
+/// type.
+#[derive(serde::Serialize)]
+struct LaunchWithATextGeneration {
+    session_id: SessionId,
+    command: LaunchCommand,
+    expected_prompt_generation: &'static str,
+    expected_buffer_revision: EditorBufferRevision,
+    after_input: InputBarrier,
+}
+
+/// A release, a detach or a launch whose parameters do not decode whole is refused by the host
+/// itself, whether or not its worker serves a lane: the host never takes a member out of a request
+/// that it could not read, so the barrier, which is valid and not reached, cannot be lost with the
+/// member that is wrong. Nothing is forwarded.
+async fn a_request_that_does_not_decode_whole_is_refused_and_nothing_is_forwarded(serial: bool) {
+    let rig = if serial {
+        Rig::start_serial().await
+    } else {
+        Rig::start().await
+    };
+    let sent = script_dependents(&rig, None);
+    let _stream = rig.open().await;
+    let barrier = || InputBarrier {
+        attachment_id: rig.attachment,
+        epoch: rig.epoch,
+        count: U64::new(1),
+        launch: Nullable::null(),
+    };
+    let target = rig.adopted.workers[0].target(rig.adopted.host.environment_id);
+    let release = rig
+        .device
+        .mutate(
+            Method::InputRelease,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &ReleaseWithATextReport {
+                session_id: rig.session,
+                attachment_id: rig.attachment,
+                epoch: rig.epoch,
+                after_input: barrier(),
+                fenced_report: "yes",
+            },
+        )
+        .await;
+    let detach = rig
+        .device
+        .mutate(
+            Method::SessionDetach,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &DetachWithATextReport {
+                attachment_id: Nullable::some(rig.attachment),
+                after_input: barrier(),
+                fenced_report: "yes",
+            },
+        )
+        .await;
+    let launch = rig
+        .device
+        .mutate(
+            Method::ShellLaunch,
+            ActionId::new(kr_ipc::new_uuid()),
+            target,
+            &LaunchWithATextGeneration {
+                session_id: rig.session,
+                command: LaunchCommand::Arguments(vec!["true".to_owned()]),
+                expected_prompt_generation: "zero",
+                expected_buffer_revision: EditorBufferRevision(U64::new(0)),
+                after_input: barrier(),
+            },
+        )
+        .await;
+    for (method, answer) in [("release", release), ("detach", detach), ("launch", launch)] {
+        assert!(
+            matches!(&answer, Err(error) if error.code == ErrorCode::InvalidArgument),
+            "the {method} is refused as an argument: {answer:?}"
+        );
+    }
+    assert!(
+        forwarded(&sent).is_empty(),
+        "nothing was forwarded: {:?}",
+        forwarded(&sent)
+    );
+    assert_eq!(
+        position_refusals(&rig),
+        0,
+        "the refusal is the host's decoding, not its position check"
+    );
+    assert_eq!(
+        rig.adopted.workers[0].attachments(),
+        1,
+        "nothing was applied: the attachment stands"
+    );
+    rig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_that_does_not_decode_is_refused_for_a_worker_without_the_lane() {
+    a_request_that_does_not_decode_whole_is_refused_and_nothing_is_forwarded(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_that_does_not_decode_is_refused_for_a_worker_with_the_lane() {
+    a_request_that_does_not_decode_whole_is_refused_and_nothing_is_forwarded(false).await;
+}
+
 /// What a stand-in for the worker was sent for a release, a detach and a launch, in order.
 type Dependents = Arc<Mutex<Vec<(Method, ParamsValue)>>>;
 
