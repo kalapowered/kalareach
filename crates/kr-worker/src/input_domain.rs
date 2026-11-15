@@ -21,7 +21,9 @@
 //! may be held while this is taken; this is never held while the session is taken. Nothing is done
 //! under this lock that waits: no disk call, no journal or ledger commit, no process call, no
 //! `await`, no waiting for another lock but the writer's gate, which is held for one non-blocking
-//! write.
+//! write, and the worker's authority state, which a mutation reads under this lock to ask whether
+//! its request is still admitted. The authority state is held for a read of two fields and is
+//! never held while this is taken.
 //!
 //! # What waits for the session
 //!

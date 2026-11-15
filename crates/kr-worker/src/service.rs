@@ -5334,6 +5334,12 @@ impl WorkerService {
         state: &ConnectionState,
         notice: &kr_protocol::worker::AuthorityRevisionNotice,
     ) -> Result<()> {
+        // Read before the authority's lock is taken and never under it: a mutation asks the
+        // authority's state while it holds the input domain, so the two are never held the other
+        // way round. A revision installed after this read leaves what is recorded below owing
+        // nothing, which the maintenance sees when it compares the owed revision with the one
+        // installed before it acts.
+        let held = self.runtime.input().lock().revision();
         let mut authority = self
             .authority
             .lock()
@@ -5342,13 +5348,7 @@ impl WorkerService {
         // An announcement of a revision this worker has already fenced owes nothing, and recording
         // it would join its reach, which is the whole host's for a repeat or a continuation page,
         // with the reach of the next revision it is refused for.
-        if self
-            .runtime
-            .input()
-            .lock()
-            .revision()
-            .is_some_and(|held| held.get() >= notice.revision.get())
-        {
+        if held.is_some_and(|held| held.get() >= notice.revision.get()) {
             return Ok(());
         }
         authority.owed = match authority.owed.take() {
