@@ -665,6 +665,11 @@ pub struct Controller {
     /// can pass in between. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     before_a_pages_limit: ReadPause,
+    /// Where this host's own tests stop the pass that collects the names workers owe and asks the
+    /// workers that are pending, at its beginning and before it does either, so that what each
+    /// step finds can be arranged first. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    before_an_evidence_pass: ReadPause,
     /// How many pages of one worker's fence evidence this host's own tests let one announcement
     /// collect, where they need fewer than the bound that is in force. Compiled away in every
     /// shipped build.
@@ -1290,6 +1295,16 @@ impl Controller {
         &self,
     ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         self.before_a_pages_limit.arm()
+    }
+
+    /// Stops the next pass that collects the names workers owe and asks the workers that are
+    /// pending at its beginning, before it does either, for this host's own tests. Returns the end
+    /// that says the pass has arrived there, and the end that lets it go. The stop fires once.
+    #[cfg(feature = "testing")]
+    pub fn stop_before_an_evidence_pass_for_tests(
+        &self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        self.before_an_evidence_pass.arm()
     }
 
     /// Stops the next barrier once it has advanced the revision and before it tells the workers,
