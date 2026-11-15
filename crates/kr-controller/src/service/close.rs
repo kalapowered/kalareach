@@ -197,6 +197,30 @@ impl Controller {
         }
     }
 
+    /// Asks the admission a close arrived under, inside the exchange's budget: this daemon is
+    /// holding the worker's link while it asks, and a registry another operation is holding must
+    /// not let that link be held past what a closure is allowed to take.
+    ///
+    /// A deadline that ran out is let through, because the worker is the only thing that knows
+    /// whether it already holds this action's receipt; the authority half refuses outright.
+    async fn ask_the_admission_of_a_close(
+        &self,
+        budget: tokio::time::Instant,
+        carried: &crate::authority::AdmittedMutation,
+    ) -> Result<()> {
+        let registry = tokio::time::timeout_at(budget, self.registry.lock())
+            .await
+            .map_err(|_| {
+                ControllerError::supervision(
+                    "this daemon could not read its own authority in time, so nothing was closed",
+                )
+            })?;
+        match self.check_admission(&registry, carried) {
+            Err(ControllerError::WindowExpired { .. }) | Ok(()) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn close_exchange(
         self: &Arc<Self>,
         mutation: &MutationRequest,
@@ -254,24 +278,8 @@ impl Controller {
             // The authority half is different: it refuses outright, because disclosing anything
             // under authority that has been withdrawn is what the contract forbids. A refusal
             // here is no exchange, so the link goes back as it came.
-            let checked = async {
-                // Inside the same budget as the exchange: this daemon is holding the worker's link
-                // while it asks, and a registry another operation is holding must not let that
-                // link be held past what a closure is allowed to take.
-                let registry = tokio::time::timeout_at(budget, self.registry.lock())
-                    .await
-                    .map_err(|_| {
-                        ControllerError::supervision(
-                            "this daemon could not read its own authority in time, so nothing was \
-                             closed",
-                        )
-                    })?;
-                match self.check_admission(&registry, &carried) {
-                    Ok(()) => {}
-                    Err(ControllerError::WindowExpired { .. }) => {}
-                    Err(error) => return Err(error),
-                }
-                drop(registry);
+            let checked: std::result::Result<_, ControllerError> = async {
+                self.ask_the_admission_of_a_close(budget, &carried).await?;
                 // Remote dispatch additionally needs a live lease, taken at the moment the
                 // dispatch runs rather than one that was valid when the request arrived. Its own
                 // remaining time then bounds the deadline the worker is given.
@@ -288,6 +296,13 @@ impl Controller {
                     return Err(error.into());
                 }
             };
+            // The lease's reading takes locks of its own, so the admission is asked once more now,
+            // after the last of them, and nothing but the clocks' reads stands between that ask and
+            // the exchange.
+            if let Err(error) = self.ask_the_admission_of_a_close(budget, &carried).await {
+                link.give_back();
+                return Err(error.into());
+            }
             // What the worker is told is the accepted deadline itself, on the machine's own
             // continuous clock: the same clock the worker reads, so the deadline does not restart
             // on arrival and nothing has to guess at what the journey cost. A deadline already
