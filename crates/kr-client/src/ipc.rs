@@ -253,26 +253,30 @@ impl IpcTransport {
         if self.has_closed() {
             return Err(ClientError::ConnectionEnded);
         }
-        // The write half is taken out for the duration of the write, for the same reason the
-        // read half is: a caller that drops this future part way through drops the half with
-        // it, so a cancelled write closes the socket rather than leaving it on a transport
-        // nobody is using. It cannot be resumed either — the frame writer refuses to continue
-        // a stream an interrupted write left in pieces.
-        let Some(mut writer) = self.writer.lock().await.take() else {
+        // The write half is taken out of its slot for the duration of the write, and `Lent` says
+        // what a write that is dropped or that fails leaves behind: it cannot be resumed (the frame
+        // writer refuses to continue a stream an interrupted write left in pieces), so a frame that
+        // part of went ends the connection, and one that none of went gives the half back.
+        let Some(half) = self.writer.lock().await.take() else {
             return Err(ClientError::ConnectionEnded);
         };
+        let mut lent = Lent {
+            transport: self,
+            half: Some(half),
+        };
         let outcome = tokio::select! {
-            outcome = put_on(&mut writer, frame, limit) => outcome,
+            outcome = put_on(lent.half()?, frame, limit) => outcome,
             // Closing while this was waiting for the socket. The half is dropped with this
             // future, which is what ends the connection rather than waiting for a peer that
             // may never read again.
             () = closing => return Err(ClientError::ConnectionEnded),
         };
-        // A write that failed has ended this connection, and so has a close that arrived while
-        // this one was in progress. Either way the half goes rather than going back.
+        // A failed write leaves the half to `Lent`, which closes the connection when part of the
+        // frame went. A cut frame ends the connection here, and so does a close that arrived while
+        // this write was in progress: the half goes rather than going back.
         let written = match outcome? {
             Written::Cut => {
-                drop(writer);
+                lent.half.take();
                 self.close();
                 return Ok(false);
             }
@@ -281,9 +285,52 @@ impl IpcTransport {
         };
         let mut held = self.writer.lock().await;
         if !self.has_closed() {
-            *held = Some(writer);
+            *held = lent.half.take();
         }
         Ok(written)
+    }
+}
+
+/// The write half while one frame is put on it, and what becomes of it when the write does not
+/// run to its end.
+///
+/// A write that is dropped part way, by a caller that stops waiting for it, would otherwise leave
+/// the half in no slot and the connection standing: the read half keeps the socket open, the
+/// session reads as standing, and every later write fails. So the guard decides. When part of a
+/// frame went, the peer holds the start of a frame that will never be finished, and the connection
+/// is closed, as it is when a bounded write is cut. When none of it went, the frame is taken back
+/// and the half returns to its slot: the connection stands and the next frame is written as usual.
+struct Lent<'a> {
+    transport: &'a IpcTransport,
+    half: Option<FrameWriter>,
+}
+
+impl Lent<'_> {
+    fn half(&mut self) -> Result<&mut FrameWriter> {
+        self.half.as_mut().ok_or(ClientError::ConnectionEnded)
+    }
+}
+
+impl Drop for Lent<'_> {
+    fn drop(&mut self) {
+        let Some(mut half) = self.half.take() else {
+            return;
+        };
+        if self.transport.has_closed() {
+            return;
+        }
+        if half.is_mid_frame() && half.has_sent_any() {
+            self.transport.close();
+            return;
+        }
+        half.withdraw_unstarted();
+        // The slot is empty and nothing else takes it while this write holds the turn; `close`
+        // only looks at it without waiting, and it has not run, since the connection stands.
+        if let Ok(mut held) = self.transport.writer.try_lock()
+            && !self.transport.has_closed()
+        {
+            *held = Some(half);
+        }
     }
 }
 
@@ -392,6 +439,10 @@ impl ControlTransport for IpcTransport {
             held.take();
         }
         self.ending.notify_waiters();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.has_closed()
     }
 }
 
