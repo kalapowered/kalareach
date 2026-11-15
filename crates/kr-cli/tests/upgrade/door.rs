@@ -27,6 +27,7 @@ use kr_transport::error::TransportError;
 use kr_transport::handshake::{self, LocalIdentity};
 
 use super::pairing::{self, Signer};
+use super::raw_input::RawInput;
 
 /// An endpoint bound to the loopback interface.
 fn loopback() -> EndpointConfig {
@@ -44,6 +45,9 @@ pub struct Door {
     pub grant_id: GrantId,
     /// The device's session with the host.
     pub session: Session,
+    /// The session's connection, which can send the one request the client library has no call
+    /// for.
+    pub raw: Arc<RawInput>,
     /// The keys the device holds, which confirm what an owner device confirms.
     pub keys: DeviceKeys,
     /// The endpoint the device dials from, kept for as long as the session is.
@@ -212,10 +216,12 @@ impl Door {
         )
         .await
         .expect("the paired device connects");
+        let raw = RawInput::new(transport);
         Self {
             device_id: paired.device_id,
             grant_id: paired.grant_id,
-            session: Session::start(Arc::new(transport)).expect("a session"),
+            session: Session::start(raw.clone()).expect("a session"),
+            raw,
             keys: paired.keys,
             endpoint: paired.endpoint,
             identity,
