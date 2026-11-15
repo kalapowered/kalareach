@@ -5419,6 +5419,10 @@ async fn a_frame_that_waits_for_the_registry_is_let_go_when_its_stream_ends(
         .await
         .expect("the frame is written");
     until("the frame was read", || stages.counts().read == 2).await;
+    until("the frame's decision waits for the registry", || {
+        stages.counts().decisions_waiting == 1
+    })
+    .await;
     match by {
         EndedBy::TheHost => rig.device.finish_control().await,
         EndedBy::TheDevice => stream.reset(),
@@ -5511,4 +5515,178 @@ async fn a_stream_waiting_for_the_registry_at_its_admission_is_let_go_when_the_d
         EndedBy::TheDevice,
     )
     .await;
+}
+
+// A stream that another task ends gracefully waits for what the device is owed to be written, and a
+// device that does not read can hold that wait for the write deadline of each acknowledgement. A
+// frame whose decision waits for the registry is let go before the wait: a decision that nothing
+// polls would keep its place in the registry's queue, the lock would go to it and stay there, and
+// every other caller of the registry would wait with it.
+
+/// Takes the registry from the case and lets it go again. It is taken in time only when no wait of
+/// the stream stands in its queue with nothing to poll it.
+async fn the_registry_comes_back(rig: &Rig) {
+    let registry = tokio::time::timeout(WAIT, rig.adopted.host.controller().hold_the_registry())
+        .await
+        .expect("the registry came back in time, with the acknowledgements still unwritten");
+    drop(registry);
+}
+
+/// The detach of the rig's attachment, sent on the device's control stream by a task of its own, so
+/// that a case can hold what the detach waits for.
+fn detaching(rig: &Rig) -> tokio::task::JoinHandle<Result<ParamsValue, ProtocolError>> {
+    let device = Arc::clone(&rig.device);
+    let target = rig.adopted.workers[0].target(rig.adopted.host.environment_id);
+    let attachment = rig.attachment;
+    tokio::spawn(async move {
+        device
+            .mutate(
+                Method::SessionDetach,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &SessionDetachParams {
+                    attachment_id: Nullable::some(attachment),
+                    line_token: Nullable::null(),
+                    after_input: None,
+                    fenced_report: false,
+                },
+            )
+            .await
+    })
+}
+
+/// A detach ends the stream while a lane frame's decision waits for the registry, which the case
+/// holds, and the acknowledgement writer holds what the device is owed. Once the guard of the
+/// registry is dropped, the case takes the registry again: the decision was let go with the loop
+/// and does not hold it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_decision_waiting_for_the_registry_is_let_go_before_a_detach_waits_for_the_acknowledgements()
+ {
+    let rig = Rig::start().await;
+    let stages = rig.adopted.host.network().input_stages();
+    let mut stream = rig.open().await;
+    // The detach is out and admitted, and waits for the worker's answer.
+    let _ = script_dependents(&rig, None);
+    let (at_answer, go_answer) = stages.hold_before_a_dependent_answer();
+    let detach = detaching(&rig);
+    arrived(at_answer).await;
+
+    let (at_ack, go_ack) = stages.hold_before_an_ack_write();
+    let mut ends = stages.reads_ended();
+    let registry = rig.adopted.host.controller().hold_the_registry().await;
+    stream
+        .write_message(&rig.frame(0, b"a"))
+        .await
+        .expect("the frame is written");
+    until("the frame's decision waits for the registry", || {
+        stages.counts().decisions_waiting == 1
+    })
+    .await;
+    // The device is owed the notice that its lease ended, which the writer holds.
+    rig.lane.send_window(lease_ended(&rig));
+    arrived(at_ack).await;
+    // The detach is answered, which ends the stream and leaves its task waiting for the writer.
+    go_answer.send(()).expect("the detach's answer is let go");
+    tokio::time::timeout(WAIT, ends.wait_for(|ended| *ended >= 1))
+        .await
+        .expect("the stream task stopped reading in time")
+        .expect("the count stands");
+    drop(registry);
+    the_registry_comes_back(&rig).await;
+
+    go_ack.send(()).expect("the acknowledgement is written");
+    assert_eq!(
+        next_or_reset(&mut stream).await.expect("not reset"),
+        Some(InputAck::EpochEnded {
+            epoch: rig.epoch,
+            fenced_bytes: U64::new(0),
+        }),
+        "the device is told its lease ended"
+    );
+    assert!(
+        matches!(next_or_reset(&mut stream).await, Ok(None)),
+        "the stream then ends cleanly"
+    );
+    assert!(
+        rig.lane.frames().is_empty(),
+        "the worker was given no frame: the decision was let go"
+    );
+    tokio::time::timeout(WAIT, detach)
+        .await
+        .expect("the detach is answered in time")
+        .expect("the detach task ends")
+        .expect("the device detaches");
+    rig.stop().await;
+}
+
+/// The authority feed's refusal ends the stream while a lane frame's decision waits for the
+/// registry, which the case holds: the writer finds the first frame withdrawn, refuses it and ends
+/// the stream, and holds that refusal. The release of the connection's link, which a refusal
+/// starts, is held, so that the end is the writer's alone. Once the guard of the registry is
+/// dropped, the case takes the registry again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_decision_waiting_for_the_registry_is_let_go_before_a_withdrawal_waits_for_the_acknowledgements()
+ {
+    let rig = Rig::start().await;
+    let stages = rig.adopted.host.network().input_stages();
+    let mut stream = rig.open().await;
+    let (at_release, go_release) = stages.hold_before_a_release();
+    let (at_write, go_write) = stages.hold_before_a_lane_write();
+    stream
+        .write_message(&rig.frame(0, b"a"))
+        .await
+        .expect("the frame is written");
+    arrived(at_write).await;
+    rig.adopted
+        .host
+        .controller()
+        .raise_the_unverified_withdrawal_refusal()
+        .await;
+    arrived(at_release).await;
+
+    let (at_ack, go_ack) = stages.hold_before_an_ack_write();
+    let mut ends = stages.reads_ended();
+    let registry = rig.adopted.host.controller().hold_the_registry().await;
+    stream
+        .write_message(&rig.frame(1, b"b"))
+        .await
+        .expect("the frame is written");
+    until("the second frame's decision waits for the registry", || {
+        stages.counts().decisions_waiting == 1
+    })
+    .await;
+    // The writer finds the authority withdrawn: it refuses the first frame and ends the stream.
+    let _ = go_write.send(());
+    arrived(at_ack).await;
+    tokio::time::timeout(WAIT, ends.wait_for(|ended| *ended >= 1))
+        .await
+        .expect("the stream task stopped reading in time")
+        .expect("the count stands");
+    drop(registry);
+    the_registry_comes_back(&rig).await;
+
+    go_ack.send(()).expect("the acknowledgement is written");
+    match next_or_reset(&mut stream).await {
+        Ok(Some(InputAck::Refused {
+            epoch,
+            sequence,
+            error,
+            ..
+        })) => {
+            assert_eq!(epoch, rig.epoch);
+            assert_eq!(sequence.get(), 0);
+            assert_eq!(error.code, ErrorCode::PermissionDenied);
+        }
+        other => panic!("the host was to refuse the first frame, and the stream gave {other:?}"),
+    }
+    assert!(
+        matches!(next_or_reset(&mut stream).await, Ok(None)),
+        "the stream then ends cleanly"
+    );
+    assert!(
+        rig.lane.frames().is_empty(),
+        "the worker was given neither frame"
+    );
+    drop(go_release);
+    rig.stop().await;
 }
