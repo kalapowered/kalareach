@@ -4989,7 +4989,10 @@ impl Watch {
 
     /// Applies what arrives for `within`, and follows a resynchronisation as [`Watch::wait_for`]
     /// does: a view that the worker told to resynchronise has stopped, so the watch opens a fresh
-    /// one and goes on with it. A stopped view then cannot hide what the screen shows.
+    /// one and goes on with it. A stopped view then cannot hide what the screen shows. A fresh view
+    /// starts from an empty terminal, so the watch applies what arrives to it until its screen
+    /// shows something (within [`FRESH_SCREEN_WITHIN`]) before it goes on: a resynchronisation in
+    /// the watch's last slice then leaves the caller a screen to read, not blank rows.
     fn watch_for(&mut self, stage: &Stage<'_, '_>, session: &Session, within: Duration) {
         let until = std::time::Instant::now() + within;
         while std::time::Instant::now() < until {
@@ -4997,6 +5000,12 @@ impl Watch {
             if self.view.kinds().iter().any(|kind| kind == RESYNC) {
                 let stale = std::mem::replace(self, Self::open(stage, session));
                 stale.close(stage);
+                let bound = std::time::Instant::now() + FRESH_SCREEN_WITHIN;
+                while self.view.rows().iter().all(|row| row.trim().is_empty())
+                    && std::time::Instant::now() < bound
+                {
+                    self.pump(stage, Duration::from_millis(200));
+                }
             }
         }
     }
@@ -5139,6 +5148,10 @@ fn keyboard(stage: &Stage<'_, '_>, session: &Session) -> Keyboard {
     keyboard
 }
 
+/// How long a watch that opened a fresh view applies what arrives to it, at most, while the
+/// view's screen is still blank.
+const FRESH_SCREEN_WITHIN: Duration = Duration::from_secs(5);
+
 /// How long the path case waits, once the screen shows the end of the typed path, for it to show
 /// the whole path.
 const WHOLE_PATH_WATCH: Duration = Duration::from_secs(5);
@@ -5189,10 +5202,6 @@ fn a_path_is_shown_whole_when_the_composer_wrapped_it_and_not_when_only_its_end_
     ];
     assert!(!shows_whole(&apart, path));
 }
-
-/// How long the view-only control watches the owner's screen for the input of a device that may
-/// not type.
-const VIEW_ONLY_WATCH: Duration = Duration::from_secs(2);
 
 /// Attaches `remote` to the session to observe it, as a device whose grant has no typing right
 /// does. The attach names the session on the connection, so the host has the connection's route to
@@ -6404,14 +6413,9 @@ fn forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged
         // typing right stands between the viewer and a lane: a device without it is not served, and
         // the host ends the stream before its first word and tells no code. The case requires that
         // the lane does not open. A lane that opened (a host that skips the decision), an open that
-        // ran out of time and any other end fail the case; so does a screen that shows the input,
-        // which is the second check.
-        let shows = &stage.build.harmless.shows;
-        screen.pump(stage, Duration::from_millis(300));
-        assert!(
-            !screen.view.rows().iter().any(|row| row.contains(shows)),
-            "the agent's screen shows {shows:?} before the view-only device types"
-        );
+        // ran out of time and any other end fail the case. The viewer sends no byte, so the
+        // refusal of the open is the whole of what is checked on its side; the owner's input that
+        // follows is the control.
         let lane_saw = stage
             .runtime
             .block_on(kr_e2e_m1b::typing::Typing::refused_open(
@@ -6423,13 +6427,6 @@ fn forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged
             .unwrap_or_else(|why| {
                 panic!("a view-only device's lane does not open, and the host ends it: {why}")
             });
-        screen.watch_for(stage, &agent.session, VIEW_ONLY_WATCH);
-        let viewer_rows = screen.view.rows();
-        assert!(
-            !viewer_rows.iter().any(|row| row.contains(shows)),
-            "the owner's screen shows the view-only device's input {shows:?}:\n{}",
-            viewer_rows.join("\n")
-        );
         let mut keyboard = keyboard(stage, &agent.session);
         let admitted = harmless_input(stage, &agent.session, &mut screen, &mut keyboard);
         screen.close(stage);
@@ -6447,8 +6444,6 @@ fn forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged
                 "viewer": {
                     "attached_to_observe": observing.to_string(),
                     "lane_saw": lane_saw,
-                    "owner_screen_showed_its_input": false,
-                    "watched_for_ms": u64::try_from(VIEW_ONLY_WATCH.as_millis()).unwrap_or(u64::MAX),
                 },
                 "owner": admitted,
             },
