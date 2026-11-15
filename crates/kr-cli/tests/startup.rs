@@ -5526,6 +5526,58 @@ fn kr_host_stop_is_refused_inside_a_session_and_goes_on_where_a_worker_cannot_sa
     assert!(host.running().is_empty());
 }
 
+/// KR-REQ-07.58 (the guard, for `kr host restart`): the command refuses where the session variables
+/// are set, and where a live session's worker says the process is its own, with nothing asked of
+/// the daemon, which answers before and after. The worker's word is what the second form shows.
+#[test]
+fn kr_host_restart_is_refused_inside_a_session_with_nothing_asked() {
+    let (host, session_id, _created, daemon) = a_host_with_a_session();
+    for variable in ["KR_SESSION", "KR_ATTACHMENT"] {
+        let mut command = host.kr(&["--json", "host", "restart"]);
+        command.env(variable, "x");
+        let output = start(command).finish("kr host restart");
+        let refused = document(&output, "kr host restart");
+        assert_eq!(output.status.code(), Some(8), "{variable}: {refused}");
+        assert_eq!(refused["code"], "PERMISSION_DENIED", "{refused}");
+        assert_eq!(stop_of(&refused), "not_asked", "{refused}");
+        let message = refused["message"].as_str().expect("a message");
+        assert!(
+            message.contains("kr host restart runs outside a KalaReach session"),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("Sessions and local attachments go on through a restart."),
+            "{message}"
+        );
+    }
+    let said = host.tree.root().join("typed-restart.out");
+    let line = format!(
+        "env -u KR_SESSION -u KR_ATTACHMENT {runtime_variable}={runtime} {state_variable}={state} \
+         {kr} host restart > {said} 2>&1; echo done-$?",
+        runtime_variable = kr_ipc::paths::RUNTIME_DIR_VARIABLE,
+        runtime = host.tree.paths().runtime_root().display(),
+        state_variable = kr_ipc::paths::STATE_DIR_VARIABLE,
+        state = host.tree.paths().state_root().display(),
+        kr = installation().join("kr").display(),
+        said = said.display(),
+    );
+    runtime().block_on(async {
+        let mut terminal = Typing::attach(&host, session_id, true).await;
+        terminal.type_line(&line).await;
+        terminal.shown("done-8").await;
+    });
+    let typed = std::fs::read_to_string(&said).expect("the command's output");
+    assert!(
+        typed.contains("this process is inside session"),
+        "the worker's word refused it: {typed}"
+    );
+    assert_eq!(
+        host.running(),
+        vec![daemon],
+        "the daemon was not asked to stop"
+    );
+}
+
 /// KR-REQ-07.12 (two stops at once): one daemon has ended, and each command says something true.
 /// A command may see the daemon end, or find no daemon, or meet a holder that does not answer
 /// (the listener has closed and the lock is not yet free) and ask nothing; none says that something

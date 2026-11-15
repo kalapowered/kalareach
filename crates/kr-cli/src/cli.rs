@@ -1392,6 +1392,16 @@ pub enum HostCommand {
     /// through the KalaReach profile, or an SSH login. An interrupt after the request has left does
     /// not cancel the stop.
     Stop,
+    /// Stop this installation's control daemon as `kr host stop` does, and start one the way `kr
+    /// new` starts one, where this environment chooses a start: `kr host startup` shows it. No
+    /// session is stopped: its workers keep running, a local attach keeps working, and the new
+    /// daemon finds the sessions again. Nothing is stopped where no start is chosen or where the
+    /// daemon was started with arguments or variables that this command's start does not give.
+    /// The command refuses where `KR_SESSION` or `KR_ATTACHMENT` is set or a session's worker says
+    /// the command runs inside its session; run it in a terminal window that was not opened
+    /// through the KalaReach profile, or an SSH login. An interrupt after the request has left does
+    /// not cancel the stop.
+    Restart,
     /// Show which network and services this host selects, join the service that publishes a
     /// description of itself, or leave it.
     Network(NetworkArguments),
