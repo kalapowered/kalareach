@@ -87,6 +87,8 @@ mod with_seams {
         /// How many times the task that ends a stream for a detach asked for the stream's graceful
         /// end, after its wait for the worker's notice was over.
         pub detach_ends: u64,
+        /// How many requests the position check refused, with nothing forwarded.
+        pub position_refusals: u64,
         /// How many times a stream was cut because its lane or its write failed or its worker did
         /// not answer (the bound of acknowledgements the device has not read is not counted).
         pub cuts: u64,
@@ -110,6 +112,7 @@ mod with_seams {
         read: AtomicU64,
         detaches: AtomicU64,
         detach_ends: AtomicU64,
+        position_refusals: AtomicU64,
         cuts: AtomicU64,
         frame_deadline_ms: AtomicU64,
         reads_full: watch::Sender<u64>,
@@ -135,6 +138,7 @@ mod with_seams {
                 read: AtomicU64::new(0),
                 detaches: AtomicU64::new(0),
                 detach_ends: AtomicU64::new(0),
+                position_refusals: AtomicU64::new(0),
                 cuts: AtomicU64::new(0),
                 frame_deadline_ms: AtomicU64::new(0),
                 reads_full: watch::channel(0).0,
@@ -234,6 +238,7 @@ mod with_seams {
                 unanswered_peak,
                 detaches: self.detaches.load(Ordering::SeqCst),
                 detach_ends: self.detach_ends.load(Ordering::SeqCst),
+                position_refusals: self.position_refusals.load(Ordering::SeqCst),
                 cuts: self.cuts.load(Ordering::SeqCst),
             }
         }
@@ -320,6 +325,10 @@ mod with_seams {
 
         pub(in crate::service::net) fn detach_told(&self) {
             self.detaches.fetch_add(1, Ordering::SeqCst);
+        }
+
+        pub(in crate::service::net) fn position_refused(&self) {
+            self.position_refusals.fetch_add(1, Ordering::SeqCst);
         }
 
         pub(in crate::service::net) fn detach_end_asked(&self) {
@@ -409,6 +418,8 @@ mod without_seams {
         pub(in crate::service::net) fn waits_to_drain(&self) {}
 
         pub(in crate::service::net) fn detach_told(&self) {}
+
+        pub(in crate::service::net) fn position_refused(&self) {}
 
         pub(in crate::service::net) fn detach_end_asked(&self) {}
 

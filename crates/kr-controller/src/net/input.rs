@@ -44,7 +44,8 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::StreamHeader;
 use kr_protocol::ids::{AttachmentId, ConnectionId, InputLeaseEpoch, InputSequence, RequestId};
 use kr_protocol::input::{
-    InputAck, InputClaim, InputContent, InputFrame, InputWindow, InputWriteParams, input_claim,
+    InputAck, InputBarrier, InputClaim, InputContent, InputFrame, InputWindow, InputWriteParams,
+    input_claim,
 };
 use kr_protocol::local::{ForwardedRequest, InputLane, InputLaneReady};
 use kr_protocol::method::Method;
@@ -59,6 +60,7 @@ use super::chunks::DataDoor;
 use super::dispatch::RemoteConnection;
 use super::proxy::CALL_TIMEOUT;
 
+pub(super) mod barrier;
 mod stages;
 
 #[cfg(not(feature = "testing"))]
@@ -118,37 +120,73 @@ fn client_window() -> InputWindow {
     }
 }
 
+/// What the host knows of one stream's lane, which a position check reads
+/// ([`InputStreams::position_not_reached`]).
+#[derive(Debug, Default)]
+struct Record {
+    /// The epoch of the lease this stream's attachment holds, as the worker last told the lane;
+    /// none while it holds none.
+    holding: Option<InputLeaseEpoch>,
+    /// The highest sequence the worker accepted, with its epoch, recorded before the device is
+    /// told.
+    accepted: Option<(InputLeaseEpoch, u64)>,
+}
+
 /// One live stream: how to end it, and what the worker has accepted on it.
 #[derive(Debug)]
 struct Live {
     handle: StreamHandle,
-    /// The highest sequence the worker accepted, with its epoch, recorded before the device is
-    /// told. A position check reads it ([`InputStreams::accepted_count`]).
-    accepted: Mutex<Option<(InputLeaseEpoch, u64)>>,
+    record: Mutex<Record>,
     /// Woken when the attachment this stream serves is detached.
     detached: tokio::sync::Notify,
 }
 
 impl Live {
-    fn record(&self, epoch: InputLeaseEpoch, through: u64) {
-        let mut accepted = self.accepted.lock().unwrap_or_else(PoisonError::into_inner);
-        let newer = match *accepted {
+    fn lock(&self) -> MutexGuard<'_, Record> {
+        self.record.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Records that the worker accepted frames of `epoch` through `through`.
+    fn accept(&self, epoch: InputLeaseEpoch, through: u64) {
+        let mut record = self.lock();
+        let newer = match record.accepted {
             None => true,
             Some((held, held_through)) => {
                 epoch.get() > held.get() || (epoch == held && through > held_through)
             }
         };
         if newer {
-            *accepted = Some((epoch, through));
+            record.accepted = Some((epoch, through));
         }
+    }
+
+    /// Records the epoch of the lease this stream's attachment holds now, or that it holds none.
+    fn hold(&self, epoch: Option<InputLeaseEpoch>) {
+        self.lock().holding = epoch;
     }
 
     /// The highest accepted sequence of `epoch`, when the epoch is the one the record holds.
     fn through(&self, epoch: InputLeaseEpoch) -> Option<u64> {
-        match *self.accepted.lock().unwrap_or_else(PoisonError::into_inner) {
+        match self.lock().accepted {
             Some((held, through)) if held == epoch => Some(through),
             _ => None,
         }
+    }
+
+    /// Whether the worker has accepted fewer than `count` frames of `epoch`, when `epoch` is the
+    /// epoch of the lease this stream's attachment holds now. For any other epoch the answer is no:
+    /// it is not this lane's to judge, and the worker treats such a barrier as stale. No frame
+    /// accepted in the epoch is a count of none.
+    fn short_of(&self, epoch: InputLeaseEpoch, count: u64) -> bool {
+        let record = self.lock();
+        if record.holding != Some(epoch) {
+            return false;
+        }
+        let accepted = match record.accepted {
+            Some((held, through)) if held == epoch => through.saturating_add(1),
+            _ => 0,
+        };
+        accepted < count
     }
 }
 
@@ -217,7 +255,7 @@ impl InputStreams {
         let key = (connection, attachment);
         let live = Arc::new(Live {
             handle: handle.clone(),
-            accepted: Mutex::new(None),
+            record: Mutex::new(Record::default()),
             detached: tokio::sync::Notify::new(),
         });
         let mut registry = self.live();
@@ -283,17 +321,31 @@ impl InputStreams {
         }
     }
 
-    /// How many frames of `epoch` the worker has accepted on the stream that serves `attachment`
-    /// of `connection`, when the stream stands and the epoch is the one it last accepted in.
-    #[allow(dead_code)]
-    pub(super) fn accepted_count(
+    /// Whether the host's own record of the stream that serves the barrier's attachment for
+    /// `connection` shows that the typing the barrier names has not all been accepted: the worker
+    /// has accepted fewer frames of the barrier's epoch than its count. The answer is no, and the
+    /// request is forwarded for the worker to decide, when the stream does not stand (it ended or
+    /// never opened), and when the barrier's epoch is not the epoch of the lease the stream's
+    /// attachment holds now: the worker treats such a barrier as stale.
+    ///
+    /// The check is advisory. It saves a forward, and it can never be the only one for a worker that
+    /// reads the barrier, which checks its own position. Only the connection that opened the stream
+    /// is reached, so a barrier names no stream of another connection. The device is never told
+    /// anything on its stream by a refusal made here.
+    pub(super) fn position_not_reached(
         &self,
         connection: ConnectionId,
-        attachment: AttachmentId,
-        epoch: InputLeaseEpoch,
-    ) -> Option<u64> {
-        let live = self.live().get(&(connection, attachment)).map(Arc::clone)?;
-        live.through(epoch).map(|through| through + 1)
+        barrier: &InputBarrier,
+    ) -> bool {
+        let live = self
+            .live()
+            .get(&(connection, barrier.attachment_id))
+            .map(Arc::clone);
+        let short = live.is_some_and(|live| live.short_of(barrier.epoch, barrier.count.get()));
+        if short {
+            self.stages.position_refused();
+        }
+        short
     }
 }
 
@@ -588,6 +640,7 @@ impl Flow {
         } else {
             Window::None { known: ready.epoch }
         };
+        live.hold(ready.holder.then_some(ready.epoch));
         let mut acks = VecDeque::new();
         acks.push_back(InputAck::Ready {
             window: client_window(),
@@ -759,7 +812,7 @@ impl Flow {
                 match &response.outcome {
                     Outcome::Ok(_) => {
                         // Recorded before the device is told.
-                        self.live.record(front.epoch, front.sequence);
+                        self.live.accept(front.epoch, front.sequence);
                         match state.acks.back_mut() {
                             Some(InputAck::Accepted { epoch, through })
                                 if *epoch == front.epoch =>
@@ -794,6 +847,7 @@ impl Flow {
             match event {
                 ControlEvent::InputWindow(window) => {
                     if window.epoch.get() >= state.window.epoch().get() {
+                        self.live.hold(window.holder.then_some(window.epoch));
                         state.window = if window.holder {
                             Window::Holder {
                                 epoch: window.epoch,
