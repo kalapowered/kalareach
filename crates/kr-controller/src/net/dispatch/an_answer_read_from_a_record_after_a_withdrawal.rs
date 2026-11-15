@@ -141,11 +141,42 @@ fn a_close_of(
     )
 }
 
+/// A prompt to the agent of `session_id` on `connection`, which a worker performs.
+fn a_prompt_to(
+    world: &fake::Silent,
+    connection: &super::RemoteConnection,
+    session_id: SessionId,
+) -> MutationRequest {
+    let params = kr_protocol::agent::AgentPromptParams {
+        target: kr_protocol::agent::AgentMutationTarget {
+            subject: kr_protocol::agent::AgentSubject {
+                session_id,
+                application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
+                    kr_ipc::new_uuid(),
+                ),
+            },
+            binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
+        },
+        draft_id: Nullable::null(),
+        text: Nullable::some(kr_protocol::agent::PromptText::new("a prompt").expect("text")),
+    };
+    write_naming(
+        world,
+        connection,
+        Method::AgentPromptSubmit,
+        8,
+        &params,
+        Some(session_id),
+    )
+}
+
 /// The place a case stops a request at, to owe the fence there.
 #[derive(Clone, Copy)]
 enum Pause {
     /// After the door's entry check, before the request's effect begins.
     BeforeTheEffect,
+    /// After the worker has answered, before the answer is checked.
+    AfterTheWorkerAnswered,
 }
 
 /// Serves `mutation` to `pause`, owes the fence there when `owed` says so, and returns what the
@@ -160,6 +191,7 @@ async fn answered_with_the_fence(
     let controller = &world.controller;
     let (arrived, go) = match pause {
         Pause::BeforeTheEffect => controller.before_the_effect.arm(),
+        Pause::AfterTheWorkerAnswered => controller.pause_after_the_worker_answered(),
     };
     let (answered, ()) = tokio::join!(
         connection.answer_now(ControlFrame::Mutation(Box::new(mutation))),
@@ -249,6 +281,46 @@ async fn a_close_the_worker_answers_from_its_receipt_is_not_shown_when_a_fence_l
                     let closed: SessionCloseResult = result_of(&answered);
                     assert_eq!(closed.state, SessionState::Closing);
                 }
+                (_, false) => assert_eq!(told, Some(ErrorCode::PermissionDenied), "{what}"),
+            }
+            world.serving.abort();
+        }
+    }
+}
+
+/// KR-REQ-09.09: a mutation the worker answers from a receipt it kept, whether the receipt holds
+/// a result or a refusal, is told to the device only while this host owes no fence. The control:
+/// with none owed the device is told what the receipt holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mutation_the_worker_answers_from_its_receipt_is_not_shown_when_a_fence_lands_after_the_read()
+ {
+    let kept: [(&str, Receipt); 2] = [
+        ("a result", Arc::new(|_| Outcome::Ok(ParamsValue::empty()))),
+        ("a refusal", Arc::new(a_refusal_it_kept)),
+    ];
+    for (what, receipt) in kept {
+        for owed in [false, true] {
+            let world = a_worker_that_answers_from_its_receipt(Arc::clone(&receipt)).await;
+            let (connection, _) = paired_connection(&world.controller, 43, EVERY_RIGHT);
+            let prompt = a_prompt_to(&world, &connection, world.session_id);
+            let answered = answered_with_the_fence(
+                &world,
+                &connection,
+                prompt,
+                Pause::AfterTheWorkerAnswered,
+                owed,
+            )
+            .await;
+            let told = match answered.frame() {
+                ControlFrame::Response(Response {
+                    outcome: Outcome::Error(told),
+                    ..
+                }) => Some(told.code),
+                _ => None,
+            };
+            match (what, owed) {
+                (_, true) => assert_eq!(told, Some(ErrorCode::OutcomeUnknown), "{what}"),
+                ("a result", false) => assert_eq!(told, None, "{what}"),
                 (_, false) => assert_eq!(told, Some(ErrorCode::PermissionDenied), "{what}"),
             }
             world.serving.abort();

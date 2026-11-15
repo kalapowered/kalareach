@@ -262,7 +262,13 @@ async fn no_frame_a_worker_receives_carries_a_voice_right() {
             world.accepted,
             revision,
             with_voice.clone(),
-            &connection.pairing_acting(),
+            &connection
+                .ask(
+                    Some(world.session_id),
+                    Method::AgentPromptSubmit.entry(),
+                    false,
+                )
+                .expect("decided"),
             &mut None,
             &super::forwarding::OwnClaim::none(),
         )

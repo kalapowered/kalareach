@@ -498,10 +498,11 @@ impl RemoteConnection {
         accepted: AcceptedDeadline,
         validated: AuthorityRevision,
         grant_rights: CanonicalSet<ActionRight>,
-        acting: &Acting,
+        decided: &Asked,
         asked: &mut Option<Asked>,
         own_claim: &OwnClaim,
     ) -> std::result::Result<ControlFrame, ProtocolError> {
+        let acting = &decided.acting;
         let Some(session_id) = mutation.target.session_id.as_ref().copied() else {
             return Err(ProtocolError::new(
                 ErrorCode::InvalidArgument,
@@ -618,7 +619,13 @@ impl RemoteConnection {
                     // this device's grant reached, and it is written under present view
                     // authority over the session. A device not given it is told neither that the
                     // action was refused nor what it came to: the worker answered from a receipt it
-                    // already held.
+                    // already held. It goes through the check every answer read from a record goes
+                    // through first: a fence this host owes, or a registration withdrawn or
+                    // replaced while the worker looked, stops it.
+                    *asked = Some(decided.clone().kept());
+                    if self.admitted_to_answer(validated).is_err() {
+                        return Err(outcome_not_shown());
+                    }
                     match self.may_read_receipts(Some(session_id), answering, acting) {
                         Ok(read) => *asked = Some(read),
                         Err(_) => return Err(outcome_not_shown()),
