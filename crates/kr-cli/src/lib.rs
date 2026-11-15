@@ -111,9 +111,11 @@ pub const RELEASE: &str = env!("CARGO_PKG_VERSION");
 /// every build of one version carries the same name, so no daemon is told from another by it.
 #[must_use]
 pub fn controller_build_of_this_release() -> Option<String> {
-    kr_ipc::install::this_process()
-        .ok()
-        .and_then(|running| running.release().map(|release| format!("kr-controller/{release}")))
+    kr_ipc::install::this_process().ok().and_then(|running| {
+        running
+            .release()
+            .map(|release| format!("kr-controller/{release}"))
+    })
 }
 
 /// Returns the build identifier this client presents: `kr/` and its release, which is the name of

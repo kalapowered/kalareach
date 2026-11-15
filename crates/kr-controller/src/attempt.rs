@@ -288,7 +288,13 @@ mod tests {
         let host = temp();
         let environment = host.environment();
         left_by(&environment, "alive-and-old", own(), 1, None);
-        left_by(&environment, "same-number-after-a-restart", another(1), 2, None);
+        left_by(
+            &environment,
+            "same-number-after-a-restart",
+            another(1),
+            2,
+            None,
+        );
         left_by(
             &environment,
             "ended",
@@ -315,7 +321,8 @@ mod tests {
     fn two_commands_keep_a_file_each_and_each_removes_only_its_own() {
         let host = temp();
         let environment = host.environment();
-        let mut first = Marker::begin(&environment, Command::Stop, Some(another(7))).expect("first");
+        let mut first =
+            Marker::begin(&environment, Command::Stop, Some(another(7))).expect("first");
         let second = Marker::begin(&environment, Command::Stop, None).expect("second");
         assert_eq!(recorded(&environment).len(), 2);
         first.told().expect("rewrites its own");
@@ -344,7 +351,13 @@ mod tests {
         let host = temp();
         let environment = host.environment();
         let this_daemon = another(100);
-        left_by(&environment, "names-it", own(), 1, Some(this_daemon.clone()));
+        left_by(
+            &environment,
+            "names-it",
+            own(),
+            1,
+            Some(this_daemon.clone()),
+        );
         left_by(&environment, "names-an-older", own(), 2, Some(another(5)));
         left_by(&environment, "names-none", own(), 3, None);
         let removed = remove_those_that_stop_another_daemon(&environment, &this_daemon);
@@ -364,6 +377,9 @@ mod tests {
         kr_ipc::paths::write_owner_only_file(&directory.join("garbage"), b"not a record")
             .expect("writes");
         assert!(recorded(&environment).is_empty());
-        assert!(directory.join("garbage").exists(), "reading removed nothing");
+        assert!(
+            directory.join("garbage").exists(),
+            "reading removed nothing"
+        );
     }
 }
