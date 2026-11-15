@@ -540,7 +540,10 @@ enum Delivery {
     /// The request was not sent. The connection stands, or ended in a way that the session
     /// recorded before it said that the send stopped.
     Stopped,
-    /// The connection broke under the write: what became of the frame is not known.
+    /// The connection is gone under the write: what became of the frame is not known. A request
+    /// that the session refused as not sent, because the connection had ended or lost its writing
+    /// side, is this too: the connection's end is what the lane is told, and nothing is waited for
+    /// beyond it.
     Broken,
 }
 
@@ -1807,7 +1810,10 @@ impl InputLane {
                         Delivery::Written
                     }
                     Err(error) => {
-                        let broken = matches!(error, ClientError::SubmissionUncertain { .. });
+                        let broken = matches!(
+                            error,
+                            ClientError::SubmissionUncertain { .. } | ClientError::ConnectionEnded
+                        );
                         if let Some(answer) = take_sender(&answer) {
                             let _ = answer.send(Err(error));
                         }
@@ -2206,8 +2212,9 @@ async fn local_writer(
                 let delivery = (work.turn)(limit).await;
                 shared.wake.notify_one();
                 // A write that failed with the connection leaves a frame whose outcome is not
-                // known, and the lane ends with the connection's cause, as it does when a key's
-                // write fails.
+                // known, and a request that was refused because the connection had lost its
+                // writing side was never sent: the lane ends with the connection's cause for
+                // either, as it does when a key's write fails.
                 if matches!(delivery, Delivery::Broken) {
                     shared.end_by_failure(true).await;
                     return;
