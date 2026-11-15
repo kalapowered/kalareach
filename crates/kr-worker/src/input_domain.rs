@@ -156,6 +156,17 @@ impl InputShared {
         Arc::clone(&self.lock().writer().writer_hold)
     }
 
+    /// Returns the stop the terminal's writer stands in when it has dropped a batch and told the
+    /// session, before it ends the application's open paste, for this host's own tests.
+    ///
+    /// It is the one place where the end of the lease that was dropped can come before the paste's
+    /// end, which in a running worker is a matter of which of two threads is first.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn drop_hold(&self) -> Arc<crate::testing::Stall> {
+        Arc::clone(&self.lock().writer().drop_hold)
+    }
+
     /// Asks the pump to take the session and do what is owed.
     pub fn wake_pump(&self) {
         self.pump.notify_one();
@@ -346,6 +357,10 @@ pub(crate) struct WriterHandles {
     /// The stop the writer stands in when it has taken a batch, for this host's own tests.
     #[cfg(feature = "testing")]
     pub(crate) writer_hold: Arc<crate::testing::Stall>,
+    /// The stop the writer stands in when it has dropped a batch and told the session, before it
+    /// ends the application's open paste, for this host's own tests.
+    #[cfg(feature = "testing")]
+    pub(crate) drop_hold: Arc<crate::testing::Stall>,
 }
 
 impl WriterHandles {
@@ -364,6 +379,8 @@ impl WriterHandles {
             terminal_writes: Arc::default(),
             #[cfg(feature = "testing")]
             writer_hold: Arc::default(),
+            #[cfg(feature = "testing")]
+            drop_hold: Arc::default(),
         }
     }
 }

@@ -875,6 +875,8 @@ impl SessionRuntime {
         #[cfg(feature = "testing")]
         let writer_hold = Arc::clone(&domain.lock().writer().writer_hold);
         #[cfg(feature = "testing")]
+        let drop_hold = Arc::clone(&domain.lock().writer().drop_hold);
+        #[cfg(feature = "testing")]
         let writer: Box<dyn std::io::Write + Send> = Box::new(RecordingWriter {
             inner: writer,
             log: Arc::clone(&terminal_writes),
@@ -1136,6 +1138,8 @@ impl SessionRuntime {
                     // scope.
                     dropped_epoch = Some(lease_epoch);
                     let _ = epoch_expired.send(lease_epoch);
+                    #[cfg(feature = "testing")]
+                    drop_hold.stand();
                     // A paste an earlier batch of this epoch opened stays open at the application
                     // while the batch that was to close it is not written, so it is ended here,
                     // before anything else is written.
@@ -1241,6 +1245,8 @@ impl SessionRuntime {
                     if epoch.is_some() && lease_epoch >= writer_fence.load(Ordering::Acquire) {
                         dropped_epoch = Some(lease_epoch);
                         let _ = epoch_expired.send(lease_epoch);
+                        #[cfg(feature = "testing")]
+                        drop_hold.stand();
                         // What reached the application is what it has, delimiters included: a
                         // paste that the delivered part of this batch or an earlier one opened is
                         // ended here, behind the delivered part and before anything else.
