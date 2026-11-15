@@ -660,6 +660,14 @@ impl Network {
         self.guard.host.input.use_no_lane();
     }
 
+    /// How many tasks that serve a terminal-input stream have started, as a count a suite can wait
+    /// on to know that the host has begun to serve a stream it opened.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn input_tasks_started(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.guard.host.input.tasks_started()
+    }
+
     /// How many tasks that serve a terminal-input stream have ended, however they ended, as a count
     /// a suite can wait on to know that the task of a stream it dropped is gone.
     #[cfg(feature = "testing")]

@@ -192,7 +192,20 @@ async fn carry(
         flow.refuse(epoch, sequence, lease_lost());
         return;
     }
-    let decision = match door.remote.decide_an_input_frame(session).await {
+    // The decision waits for the registry, which the stream's end and the device's reset do not
+    // wait for.
+    let Some(decided) = watched(
+        flow,
+        handle,
+        version,
+        resets,
+        door.remote.decide_an_input_frame(session),
+    )
+    .await
+    else {
+        return;
+    };
+    let decision = match decided {
         Ok(decision) => decision,
         Err(error) => {
             flow.refuse(epoch, sequence, error);
@@ -252,21 +265,8 @@ async fn carry(
             )
             .await
     });
-    let joined = loop {
-        version.borrow_and_update();
-        if flow.ended().is_some() {
-            // The end stands as it was decided: the frame is left with no word of its own.
-            return;
-        }
-        tokio::select! {
-            joined = &mut call => break joined,
-            _ = version.changed() => {}
-            _ = &mut *resets => {
-                flow.end(End::Cut);
-                return;
-            }
-            () = handle.revoked() => return,
-        }
+    let Some(joined) = watched(flow, handle, version, resets, &mut call).await else {
+        return;
     };
     let class = joined.map_or(Class::Uncertain, classify);
     match class {
@@ -284,6 +284,36 @@ async fn carry(
             flow.end(End::Graceful);
         }
         Class::Uncertain => flow.end(End::Cut),
+    }
+}
+
+/// Waits for `work`, and gives what it comes to, unless the stream ends first: the flow's own end,
+/// the stream's revocation, or the device's reset, which cuts the stream. The answer is then none,
+/// the end stands as it was decided, and the frame is left with no word of its own. `work` is let
+/// go with the wait, so it must be safe to drop: a wait for a lock is, and a call that runs on a
+/// task of its own is awaited through its handle, which is.
+async fn watched<T>(
+    flow: &Arc<Flow>,
+    handle: &StreamHandle,
+    version: &mut watch::Receiver<u64>,
+    resets: &mut (impl Future<Output = kr_transport::Result<Option<InputFrame>>> + Unpin),
+    work: impl Future<Output = T>,
+) -> Option<T> {
+    let mut work = std::pin::pin!(work);
+    loop {
+        version.borrow_and_update();
+        if flow.ended().is_some() {
+            return None;
+        }
+        tokio::select! {
+            output = &mut work => return Some(output),
+            _ = version.changed() => {}
+            _ = &mut *resets => {
+                flow.end(End::Cut);
+                return None;
+            }
+            () = handle.revoked() => return None,
+        }
     }
 }
 
