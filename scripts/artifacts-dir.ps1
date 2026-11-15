@@ -23,6 +23,16 @@
 #
 # Where the variable is not set, the script makes a directory of its own under the temporary folder
 # and says where it is on the error stream.
+#
+# The reader guards a test run against a mistake: for any value of the evidence variable, and any
+# temporary variable as a platform, a runner, one of our scripts or a developer's shell sets it,
+# with folders and links as tools make them, it returns a folder inside the roots or refuses, and
+# it refuses nothing that the run set right. It is no boundary against a process of the same
+# account, which can write wherever the run can and can change a link or a folder while the reader
+# reads. It does not close a case that somebody arranges: a name with a line feed beside a link at
+# the shortened name, a link whose target climbs through another link, or a server named with no
+# share. On Windows the comparison ignores letter case, so a folder made case-sensitive, and a
+# letter that the disk and the reader do not fold alike, are not told apart.
 
 $ErrorActionPreference = 'Stop'
 $variable = 'KR_TEST_ARTIFACTS_DIR'

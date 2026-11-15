@@ -21,14 +21,25 @@
 # temporary folder of the first Git Bash process of a session. A root is resolved through its links
 # as the platform resolves it (/tmp is /private/tmp on macOS), and so is the part of the value that
 # exists, so a link inside a root that leads out of it is refused and a root that is itself behind
-# a link is honoured. The top of a file system (/, a drive's top, a share's top) is no root, and
+# a link is honoured. The top of a file system (/ or //, a drive's top, a share's top) is no root, and
 # neither is a folder with a line feed in its name or in its real path. A value is compared with a root by path
 # components, never by text: /tmpfoo is not inside /tmp. On Windows the comparison ignores letter
 # case. A relative value, an empty value and a value with a `..` in it are refused, and so is a
 # root itself.
 #
 # Where the variable is not set, the run makes a directory of its own under the temporary folder
-# (readable by this account only) and says where it is on standard error.
+# (readable by this account only) and says where it is on standard error. The temporary folder is
+# the one TMPDIR names, else /tmp, and on Windows, where TMPDIR is not set, the one TEMP names.
+#
+# The reader guards a test run against a mistake: for any value of the evidence variable, and any
+# temporary variable as a platform, a runner, one of our scripts or a developer's shell sets it,
+# with folders and links as tools make them, it returns a folder inside the roots or refuses, and
+# it refuses nothing that the run set right. It is no boundary against a process of the same
+# account, which can write wherever the run can and can change a link or a folder while the reader
+# reads. It does not close a case that somebody arranges: a name with a line feed beside a link at
+# the shortened name, a link whose target climbs through another link, or a server named with no
+# share. On Windows the comparison ignores letter case, so a folder made case-sensitive, and a
+# letter that the disk and the reader do not fold alike, are not told apart.
 
 # Succeeds on Windows (Git Bash), where a name is the same in any letter case.
 _kr_artifacts_windows() {
