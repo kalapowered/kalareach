@@ -72,6 +72,11 @@ pub mod screen;
 pub mod shells;
 #[cfg(all(unix, feature = "legs"))]
 pub mod site;
+/// The typing of a paired device, sent through the client library's input lane. The one source is
+/// the control daemon's network support, which the suites there and the CLI's upgrade suite share.
+#[cfg(all(unix, feature = "legs"))]
+#[path = "../../../../crates/kr-controller/tests/net_support/typing.rs"]
+pub mod typing;
 #[cfg(all(unix, feature = "legs"))]
 pub mod view;
 #[cfg(all(unix, feature = "legs"))]

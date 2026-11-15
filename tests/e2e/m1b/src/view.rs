@@ -9,11 +9,12 @@
 //! never the history that made it.
 //!
 //! Typing is explicit. A network client never takes the input lease implicitly: it asks for it,
-//! and every write names the lease's epoch and its place in the connection's ordered input stream.
+//! and its typing goes through the client library's input lane, under the lease's epoch.
 
 use std::time::Duration;
 
 use kr_client::cursors::{Restoration, StreamCursors};
+use kr_client::input::Writing;
 use kr_client::projection::{Applied, Projection};
 use kr_protocol::attachment::{
     AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
@@ -21,23 +22,21 @@ use kr_protocol::attachment::{
 };
 use kr_protocol::envelope::{ActionTarget, Notification};
 use kr_protocol::ids::{
-    AttachmentId, InputLeaseEpoch, InputSequence, QuestionId, QuestionRevision, SessionEpoch,
-    SessionId, StreamId,
+    AttachmentId, InputLeaseEpoch, QuestionId, QuestionRevision, SessionEpoch, SessionId, StreamId,
 };
-use kr_protocol::input::{
-    InputAcquireParams, InputAcquireResult, InputContent, InputWriteParams, InputWriteResult,
-};
+use kr_protocol::input::{InputAcquireParams, InputAcquireResult};
 use kr_protocol::method::Method;
 use kr_protocol::question::{
     Question, QuestionAnswer, QuestionAnswerParams, QuestionReadParams, QuestionReadResult,
     QuestionResolveResult, QuestionState,
 };
 use kr_protocol::recovery::{EventStream, EventsSubscribeResult, OutputEvent};
-use kr_protocol::scalars::{Bytes, CanonicalSet, Nullable};
+use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_protocol::session::{ClosureRecord, Dimensions, SESSION_CLOSED_EVENT};
 
 use crate::device::{Remote, bounded};
 use crate::screen::{Terminal, projection_rows};
+use crate::typing::Typing;
 
 /// The terminal profile a device's attachment declares.
 pub const TERMINAL_PROFILE: &str = "xterm-256color";
@@ -72,7 +71,8 @@ pub struct View {
     /// How many times an update this attachment could not apply made it ask for a fresh screen.
     fresh_screens: u64,
     closed: Option<ClosureRecord>,
-    lease: Option<(InputLeaseEpoch, u64)>,
+    lease: Option<InputLeaseEpoch>,
+    typing: Option<Typing>,
     acknowledged: u64,
     subscribed: EventsSubscribeResult,
 }
@@ -154,6 +154,7 @@ impl View {
             fresh_screens: 0,
             closed: None,
             lease: None,
+            typing: None,
             acknowledged: 0,
             subscribed,
         })
@@ -410,46 +411,46 @@ impl View {
             )
             .await
             .map_err(|error| format!("input.acquire: {error}"))?;
-        self.lease = Some((acquired.lease.epoch, acquired.lease.next_sequence.get()));
+        self.lease = Some(acquired.lease.epoch);
         Ok(acquired)
     }
 
-    /// Types `text` under the lease this attachment holds, and requires the host to acknowledge
-    /// it: consumed at the place in the connection's ordered input stream it was sent at, with
-    /// every byte forwarded to the terminal.
+    /// Types `text` under the lease this attachment holds, on the attachment's input lane, and
+    /// requires the host to accept it: the lane's first frame under an epoch is sequence zero, and
+    /// the host's acceptance is what this waits for.
     ///
     /// # Errors
     ///
-    /// Returns the host's refusal, that this attachment holds no lease, or an acknowledgement that
-    /// is not of these bytes.
-    pub async fn type_text(
-        &mut self,
-        remote: &Remote,
-        text: &str,
-    ) -> Result<InputWriteResult, String> {
-        let (epoch, sequence) = self.lease.ok_or("this attachment holds no input lease")?;
-        let params = InputWriteParams {
-            session_id: self.session_id,
-            attachment_id: self.attachment_id,
-            epoch,
-            sequence: InputSequence::new(sequence),
-            input: InputContent::Bytes {
-                bytes: Bytes::new(text.as_bytes().to_vec()),
-            },
+    /// Returns what stopped the typing (the host's refusal, the end of the lane), that this
+    /// attachment holds no lease, or an acceptance that is not of these bytes.
+    pub async fn type_text(&mut self, remote: &Remote, text: &str) -> Result<Writing, String> {
+        let epoch = self.lease.ok_or("this attachment holds no input lease")?;
+        if self.typing.is_none() {
+            let lane = Typing::open(
+                remote.session(),
+                remote.environment_id(),
+                self.session_id,
+                self.attachment_id,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            self.typing = Some(lane);
+        }
+        let Some(typing) = self.typing.as_mut() else {
+            return Err("this attachment's input lane is not open".to_owned());
         };
-        let written = bounded("input.write", remote.session().write_input(&params))
-            .await?
-            .map_err(|error| format!("input.write: {error}"))?;
-        let length = u64::try_from(text.len()).unwrap_or(u64::MAX);
-        if written.sequence.get() != sequence || written.forwarded_bytes.get() != length {
+        let written = typing
+            .type_bytes(epoch, text.as_bytes())
+            .await
+            .map_err(|error| error.to_string())?;
+        if written.bytes != text.len() {
             return Err(format!(
-                "input {sequence} of {length} bytes was acknowledged as {} with {} bytes forwarded",
-                written.sequence.get(),
-                written.forwarded_bytes.get()
+                "input of {} bytes was accepted as a frame of {} bytes",
+                text.len(),
+                written.bytes
             ));
         }
         self.acknowledged += 1;
-        self.lease = Some((epoch, sequence + 1));
         Ok(written)
     }
 

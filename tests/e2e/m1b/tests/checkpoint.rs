@@ -810,9 +810,10 @@ fn a_device_uses_an_agent_in_a_managed_shell_and_reattaches_to_the_screen_kr_att
     let written = runtime
         .block_on(view.type_text(&remote, "go on\r"))
         .unwrap_or_else(|why| panic!("{why}"));
-    assert!(
-        written.forwarded_bytes.get() > 0,
-        "the device's input reached the agent"
+    assert_eq!(
+        written.bytes,
+        "go on\r".len(),
+        "the host accepted the whole line the device typed, and the agent's screen shows it next"
     );
     let _ = runtime
         .block_on(view.wait_for(&remote, WENT_ON, LIVENESS))

@@ -70,10 +70,8 @@ use kr_ipc::identity::{ProcessState, process_state};
 use kr_protocol::agent::AgentSubject;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::identity::ProcessStartIdentity;
-use kr_protocol::ids::{InputLeaseEpoch, InputSequence};
-use kr_protocol::input::{InputContent, InputWriteParams};
+use kr_protocol::ids::InputLeaseEpoch;
 use kr_protocol::method::Method;
-use kr_protocol::scalars::Bytes;
 use kr_protocol::scalars::Nullable;
 use serde_json::json;
 
@@ -5160,7 +5158,7 @@ fn harmless_input(
     );
     json!({
         "input_bytes": keys.input.len(),
-        "forwarded_bytes": written.forwarded_bytes.get(),
+        "accepted_bytes": written.bytes,
         "screen_shows": keys.shows,
         "keyboard": Keyboard::PROFILE,
     })
@@ -6298,25 +6296,28 @@ fn forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged
                 },
             ))
             .unwrap_or_else(|why| panic!("grant.redeem: {why}"));
-        let refused = stage
-            .runtime
-            .block_on(watching.session().write_input(&InputWriteParams {
-                session_id: agent.session.session_id,
-                attachment_id: screen.view.attachment_id(),
-                epoch: InputLeaseEpoch::new(1),
-                sequence: InputSequence::new(0),
-                input: InputContent::Bytes {
-                    bytes: Bytes::new(stage.build.harmless.input.as_bytes().to_vec()),
-                },
-            }));
-        let viewer_refusal = match &refused {
-            Err(kr_client::error::ClientError::Host(error))
-                if error.code == ErrorCode::PermissionDenied =>
-            {
-                error.to_string()
-            }
-            Err(error) => panic!("a view-only device's input is refused as not permitted: {error}"),
-            Ok(written) => panic!("a view-only device's input is refused: {written:?}"),
+        // The view-only device types on the owner device's attachment through the input lane: the
+        // host refuses the lane's open or its first frame as not permitted, whichever it reads
+        // first, and accepts nothing of it.
+        let attachment = screen.view.attachment_id();
+        let refused = match stage.runtime.block_on(kr_e2e_m1b::typing::Typing::open(
+            watching.session(),
+            watching.environment_id(),
+            agent.session.session_id,
+            attachment,
+        )) {
+            Err(refused) => refused,
+            Ok(mut lane) => stage
+                .runtime
+                .block_on(lane.type_bytes(
+                    InputLeaseEpoch::new(1),
+                    stage.build.harmless.input.as_bytes(),
+                ))
+                .expect_err("a view-only device's input is refused"),
+        };
+        let viewer_refusal = match refused.code() {
+            Some(ErrorCode::PermissionDenied) => refused.to_string(),
+            _ => panic!("a view-only device's input is refused as not permitted: {refused}"),
         };
         let mut keyboard = keyboard(stage, &agent.session);
         let admitted = harmless_input(stage, &agent.session, &mut screen, &mut keyboard);
@@ -6406,9 +6407,9 @@ fn a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer() {
             .type_text(&agent.session.remote, stage.runtime, &typed)
             .unwrap_or_else(|why| panic!("{why}"));
         assert_eq!(
-            written.forwarded_bytes.get(),
-            u64::try_from(typed.len()).unwrap_or(u64::MAX),
-            "every byte of the path is forwarded to the terminal"
+            written.bytes,
+            typed.len(),
+            "every byte of the path is accepted for the terminal"
         );
         let rows = screen.wait_for(
             stage,
@@ -6438,7 +6439,7 @@ fn a_path_typed_at_the_agent_is_terminal_input_that_reaches_its_composer() {
         );
         let evidence = json!({
             "typed": typed,
-            "forwarded_bytes": written.forwarded_bytes.get(),
+            "accepted_bytes": written.bytes,
             "composer_row": rows.iter().find(|row| row.contains(SHOT)),
             "detection": initial.detection.evidence(),
             "announced": after.detection.evidence(),

@@ -1384,6 +1384,7 @@ pub struct Keyboard {
     attachment_id: kr_protocol::ids::AttachmentId,
     epoch: kr_protocol::ids::InputLeaseEpoch,
     next: u64,
+    typing: Option<kr_e2e_m1b::typing::Typing>,
 }
 
 impl Keyboard {
@@ -1428,6 +1429,7 @@ impl Keyboard {
             attachment_id: attached.attachment.attachment_id,
             epoch: kr_protocol::ids::InputLeaseEpoch::new(0),
             next: 0,
+            typing: None,
         })
     }
 
@@ -1476,53 +1478,52 @@ impl Keyboard {
         Ok(())
     }
 
-    /// Types `text` under the lease, and requires the host to acknowledge it at its place in the
-    /// connection's ordered input with every byte forwarded to the terminal or held as the start of
-    /// a bracketed-paste delimiter, as a lone Escape is while the terminal takes pastes: the worker
-    /// forwards such a prefix once its short deadline passes.
+    /// Types `text` under the lease on the attachment's input lane, and requires the host to accept
+    /// it: with every byte taken by the terminal or held as the start of a bracketed-paste
+    /// delimiter, as a lone Escape is while the terminal takes pastes (the worker forwards such a
+    /// prefix once its short deadline passes), which is what the host's acceptance of the frame
+    /// says.
     ///
     /// # Errors
     ///
-    /// Returns the host's refusal, or an acknowledgement that is not of these bytes.
+    /// Returns the host's refusal, what ended the lane, or an acceptance that is not of these bytes.
     pub fn type_text(
         &mut self,
         remote: &Remote,
         runtime: &tokio::runtime::Runtime,
         text: &str,
-    ) -> Result<kr_protocol::input::InputWriteResult, InputRefusal> {
-        let params = kr_protocol::input::InputWriteParams {
-            session_id: self.session_id,
-            attachment_id: self.attachment_id,
-            epoch: self.epoch,
-            sequence: kr_protocol::ids::InputSequence::new(self.next),
-            input: kr_protocol::input::InputContent::Bytes {
-                bytes: kr_protocol::scalars::Bytes::new(text.as_bytes().to_vec()),
-            },
+    ) -> Result<kr_client::input::Writing, InputRefusal> {
+        let refusal = |error: kr_e2e_m1b::typing::NotTyped| InputRefusal {
+            code: error.code(),
+            detail: format!("input lane: {error}"),
+        };
+        if self.typing.is_none() {
+            let lane = runtime
+                .block_on(kr_e2e_m1b::typing::Typing::open(
+                    remote.session(),
+                    remote.environment_id(),
+                    self.session_id,
+                    self.attachment_id,
+                ))
+                .map_err(refusal)?;
+            self.typing = Some(lane);
+        }
+        let Some(typing) = self.typing.as_mut() else {
+            return Err(InputRefusal {
+                code: None,
+                detail: "this keyboard's input lane is not open".to_owned(),
+            });
         };
         let written = runtime
-            .block_on(remote.session().write_input(&params))
-            .map_err(|error| InputRefusal {
-                code: match &error {
-                    kr_client::error::ClientError::Host(refusal) => Some(refusal.code),
-                    _ => None,
-                },
-                detail: format!("input.write: {error}"),
-            })?;
-        let length = u64::try_from(text.len()).unwrap_or(u64::MAX);
-        let taken = written
-            .forwarded_bytes
-            .get()
-            .saturating_add(written.held_prefix_bytes.get());
-        if written.sequence.get() != self.next || taken < length {
+            .block_on(typing.type_bytes(self.epoch, text.as_bytes()))
+            .map_err(refusal)?;
+        if written.bytes != text.len() {
             return Err(InputRefusal {
                 code: None,
                 detail: format!(
-                    "input {} of {length} bytes was acknowledged as {} with {} bytes forwarded \
-                     and {} held",
-                    self.next,
-                    written.sequence.get(),
-                    written.forwarded_bytes.get(),
-                    written.held_prefix_bytes.get()
+                    "input of {} bytes was accepted as a frame of {} bytes",
+                    text.len(),
+                    written.bytes
                 ),
             });
         }
