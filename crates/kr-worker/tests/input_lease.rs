@@ -2306,14 +2306,14 @@ async fn a_batch_whose_authority_ran_out_while_it_waited_is_never_written() {
         "nothing written after the deadline reaches the pseudo-terminal: {seen:?}"
     );
 
-    // The dropped batch is not still owed against the session's input budget, and neither is it
-    // still counted against the lease that queued it: an application that stopped reading would
-    // otherwise be blamed for bytes nothing is going to write.
+    // The dropped batch is not still owed against the session's input budget. It stays counted
+    // against the lease that queued it until that lease ends, and the end reports it as typing
+    // that never reached the application.
     // The writer gives the entry back a moment after the terminal has the bytes, so the room is
     // waited for and not read at the moment the echo is seen.
     let room = runtime.input().lock().input_room();
     until_the_room_holds(&room, kr_worker::input_room::Cost::default()).await;
-    let session = runtime.session();
+    let mut session = runtime.session();
     assert_eq!(
         session.input().lock().input_room().held(),
         kr_worker::input_room::Cost::default(),
@@ -2321,8 +2321,16 @@ async fn a_batch_whose_authority_ran_out_while_it_waited_is_never_written() {
     );
     assert_eq!(
         session.input().lock().queued_lease_bytes().load(),
-        0,
-        "and so is the lease's share of it"
+        b"kr-expired".len(),
+        "the lease's share of it stays until the lease ends"
+    );
+    let (_, fenced) = session
+        .release_input(id, epoch, None)
+        .expect("the holder releases");
+    assert_eq!(
+        fenced,
+        b"kr-expired".len() as u64,
+        "the end of the lease counts the dropped batch"
     );
     drop(session);
 }
