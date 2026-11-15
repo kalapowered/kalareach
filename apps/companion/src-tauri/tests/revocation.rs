@@ -3370,6 +3370,49 @@ async fn a_request_the_service_refused_does_not_keep_its_device_from_being_share
     );
 }
 
+/// KR-REQ-17.48: a publication that a service with no managed capacity for a new feed turned back
+/// is told with the service's own words, and after them "Until then:" and each alternative it named
+/// as it wrote it. A refusal that names none is told as it was, with no "Until then:".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_17_48_a_publication_turned_back_for_want_of_capacity_names_the_alternatives() {
+    const SERVICE_WORDS: &str = "Managed capacity for new names is not available now.";
+    const NAMED: [&str; 2] = [
+        "An authority feed service that you run yourself.",
+        "A path this version has never heard of.",
+    ];
+    let mut told = Vec::new();
+    for alternatives in [&[][..], &NAMED[..]] {
+        let rig = Rig::start().await;
+        rig.sharing_with_the_phone().await;
+        let lost = revoke_with_the_publication(
+            &rig,
+            short_budget(503, "SERVICE_UNAVAILABLE", 120, alternatives),
+        )
+        .await;
+        told.push(lost["message"].as_str().expect("words").to_owned());
+    }
+    let [alone, with] = &told[..] else {
+        unreachable!("two refusals were told");
+    };
+    assert!(alone.contains(SERVICE_WORDS), "{alone}");
+    assert!(!alone.contains("Until then"), "{alone}");
+    assert!(with.contains(SERVICE_WORDS), "{with}");
+    assert!(
+        with.contains(&format!("Until then: {} {}", NAMED[0], NAMED[1])),
+        "{with}"
+    );
+    assert!(
+        with.find(SERVICE_WORDS) < with.find("Until then"),
+        "the service's own words come first: {with}"
+    );
+    for words in [alone, with] {
+        assert!(
+            words.contains("The request did not reach the host."),
+            "what the host says of its own part is kept: {words}"
+        );
+    }
+}
+
 /// A request waits in the feed at one service, and the sync service this computer uses is changed:
 /// the feed at the new service shows nothing of it, which is not the request gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
