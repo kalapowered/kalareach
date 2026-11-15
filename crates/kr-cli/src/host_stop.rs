@@ -10,7 +10,8 @@
 //! What the command knows is kept apart in its result, because a request that left may have been
 //! taken and a command that was killed may have stopped the daemon: `ended` (the daemon was seen
 //! to end), `told` (the daemon took the stop and was not seen to end), `maybe_asked` (the request
-//! left, and neither its answer nor the daemon's end was seen) and `not_asked`. An answer that is
+//! left, and neither its answer nor the daemon's end was seen), `refused` (the request left and the
+//! daemon refused it) and `not_asked` (no request left). An answer that is
 //! missing or cut is an unknown outcome and never "not stopped": the command looks at the lock and
 //! the process.
 //!
@@ -66,7 +67,9 @@ enum Knows {
     Told,
     /// The request left, and neither its answer nor the daemon's end was seen.
     MaybeAsked,
-    /// Nothing was asked.
+    /// The request left and the daemon refused it: nothing was stopped.
+    Refused,
+    /// Nothing was asked: no request left.
     NotAsked,
 }
 
@@ -76,6 +79,7 @@ impl Knows {
             Self::Ended => "ended",
             Self::Told => "told",
             Self::MaybeAsked => "maybe_asked",
+            Self::Refused => "refused",
             Self::NotAsked => "not_asked",
         }
     }
@@ -311,7 +315,7 @@ fn interrupted(progress: &Progress, stage: Stage, json: bool) -> Completion {
         Stage::Refused => {
             progress.remove_marker();
             (
-                Knows::NotAsked,
+                Knows::Refused,
                 shown!(
                     "kr host stop was interrupted after the control daemon for environment {} \
                      refused the request. Nothing was stopped.",
@@ -834,7 +838,11 @@ async fn stop_the_daemon(
             // Nothing was taken, so an interrupt from here on has nothing to say but that.
             progress.enter(Stage::Refused);
             progress.remove_marker();
-            return refused(&mut client, id, &info, error, &none, json).await;
+            let refusal = Facts {
+                knows: Knows::Refused,
+                ..none
+            };
+            return refused(&mut client, id, &info, error, &refusal, json).await;
         }
     };
     if knows == Knows::Told {
