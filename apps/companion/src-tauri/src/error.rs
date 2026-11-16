@@ -167,12 +167,9 @@ impl CommandError {
         error: kr_protocol::error::ProtocolError,
         action: kr_client::retry::UserAction,
     ) -> Self {
-        Self {
-            code: error.code,
-            message: error.message,
-            user_action: action.as_str().into(),
-            retry: error.code.retry_category(),
-        }
+        let mut failure = Self::from(error);
+        failure.user_action = action.as_str().into();
+        failure
     }
 }
 
