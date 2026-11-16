@@ -26,7 +26,7 @@ use crate::grants::policy::LocalOwnerBound;
 
 /// The refusal of a method the local owner's membership lease holds, when no lease is live.
 ///
-/// Only [`Controller::local_hold`] and [`Controller::lease_is_live_until`] make one: it names no record and no effect, and a held method
+/// Only [`Controller::local_hold`] makes one: it names no record and no effect, and a held method
 /// is refused before anything is looked for. There is no conversion into it from an error.
 #[derive(Debug)]
 pub(crate) struct LeaseNotLive {
@@ -279,23 +279,6 @@ impl Controller {
     /// lease: what a local caller may then ask for is the recovery set and nothing else.
     pub(crate) fn local_owner_is_closed(&self) -> bool {
         self.local_owner_bound_now() == LocalOwnerBound::Closed
-    }
-
-    /// Whether a lease that [`Self::local_hold`] found live until `end` still is, on the clock now:
-    /// asked again after the locks that a check takes between the reading and the change, so that
-    /// a lease that ends in their wait is not read against a time taken before it. Takes no lock.
-    ///
-    /// # Errors
-    ///
-    /// Returns the refusal of a held method when the lease's end has come.
-    pub(crate) fn lease_is_live_until(
-        &self,
-        end: Option<kr_transport::clock::ContinuousInstant>,
-    ) -> std::result::Result<(), LeaseNotLive> {
-        if end.is_some_and(|end| self.clock.now() >= end) {
-            return Err(lease_not_live());
-        }
-        Ok(())
     }
 
     /// Holds a local caller's use of `method` to the local owner's membership lease, at the

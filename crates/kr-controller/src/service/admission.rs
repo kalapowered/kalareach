@@ -868,6 +868,34 @@ impl Controller {
             .stands(super::footing::Ask::MUTATION)
     }
 
+    /// The footing of a mutation that a handler carries to its effect, made once at the handler's
+    /// entry: one read of the connection table finds the registration the mutation was admitted
+    /// under, and every later question of the footing reads atomics and clocks alone. A
+    /// registration that has gone, or was replaced under another revision, refuses in the
+    /// registration's own words, as [`Self::check_registration`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::PermissionDenied`] for a registration that has been withdrawn or
+    /// replaced.
+    pub(super) fn footing_of_a_mutation(
+        &self,
+        admission: &crate::authority::AdmittedMutation,
+    ) -> Result<super::footing::Footing> {
+        let admitted = self.admitted_read();
+        let Some(connection) = admitted.get(&admission.connection_id) else {
+            return Err(super::footing::admission_refusal(
+                crate::authority::AdmissionLapse::Deregistered,
+            ));
+        };
+        if connection.admitted_revision != admission.admitted_revision {
+            return Err(super::footing::admission_refusal(
+                crate::authority::AdmissionLapse::Revoked,
+            ));
+        }
+        Ok(self.footing_of(admission, connection))
+    }
+
     /// The footing of `admission` on the registration `connection` that a read of the connection
     /// table found: the revision and the deadline the mutation was admitted under, and the
     /// registration's own latch.
