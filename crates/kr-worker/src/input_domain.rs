@@ -93,6 +93,9 @@ pub struct InputShared {
     /// Woken when something is owed that only the session can do: a reply the gate now lets out,
     /// or a step the root editor's machine asked for that needs the session.
     pump: tokio::sync::Notify,
+    /// Told once when a taker finds the domain held, for this host's own tests.
+    #[cfg(feature = "testing")]
+    wait_announced: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 impl InputShared {
@@ -101,7 +104,29 @@ impl InputShared {
         Arc::new(Self {
             domain: Mutex::new(domain),
             pump: tokio::sync::Notify::new(),
+            #[cfg(feature = "testing")]
+            wait_announced: Mutex::new(None),
         })
+    }
+
+    /// Lets a test learn that a taker waits for this domain: the returned end is told when the
+    /// next taker finds the domain held and is about to wait for it, for this host's own tests.
+    /// It fires once, for the first contended taker only. A test that holds the domain and has
+    /// nothing else running knows that taker is the request under test. It compiles to nothing
+    /// without the `testing` feature, and no shipped build enables it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the announcement's own lock is poisoned.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn announce_the_next_wait(&self) -> std::sync::mpsc::Receiver<()> {
+        let (arrived, watch) = std::sync::mpsc::channel();
+        *self
+            .wait_announced
+            .lock()
+            .expect("the announcement's lock is not poisoned") = Some(arrived);
+        watch
     }
 
     /// Takes the input domain.
@@ -117,6 +142,16 @@ impl InputShared {
             HELD.with(std::cell::Cell::get) == 0,
             "the input domain was taken by a thread that already holds it"
         );
+        #[cfg(feature = "testing")]
+        if let Err(std::sync::TryLockError::WouldBlock) = self.domain.try_lock()
+            && let Some(arrived) = self
+                .wait_announced
+                .lock()
+                .expect("the announcement's lock is not poisoned")
+                .take()
+        {
+            let _ = arrived.send(());
+        }
         InputGuard::new(
             self.domain
                 .lock()

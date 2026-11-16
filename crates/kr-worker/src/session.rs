@@ -48,6 +48,27 @@ use crate::ownership::OwnedProcesses;
 use crate::pty::{Pty, RootShell, ShellCommand, ShellExit};
 use kr_term::sideeffect::{SideEffect, SideEffectDestination, SideEffectKind};
 
+/// The ask that stands at an effect of a mutation, which refuses when the request's authority has
+/// ended.
+///
+/// It is told how the authority revision this worker has installed is read from where the helper
+/// stands: a helper that holds the input domain reads it from its guard, and one that does not
+/// takes the lock for that one read. The ask therefore never takes the input domain that its own
+/// caller holds, and it reads the authority's state and the installed revision one after the other,
+/// never nested.
+pub type Still<'a> =
+    dyn FnMut(&dyn Fn() -> Option<kr_protocol::ids::AuthorityRevision>) -> Result<()> + 'a;
+
+/// The ask that always agrees.
+///
+/// The helpers that take an ask keep their old names, as callers of the form that takes one with
+/// this ask, for the call sites that have no request to ask for. Remove it when none of those call
+/// sites remains: every helper is then called through the form that takes the ask.
+#[allow(clippy::unnecessary_wraps)]
+pub fn passing(_installed: &dyn Fn() -> Option<kr_protocol::ids::AuthorityRevision>) -> Result<()> {
+    Ok(())
+}
+
 /// What section 7 tells a caller whose attachment this host cannot name.
 pub const DETACH_HINT: &str = "Use kr detach --attachment <id> to detach";
 
@@ -989,17 +1010,47 @@ impl Session {
     /// step of the input domain: nothing is accepted between the stimulus and its effects.
     ///
     /// Returns `None` for a session with no managed root editor.
+    ///
+    /// This is [`Session::stimulate_fence_while`] with an ask that always agrees. It stays for the
+    /// callers that have no request to ask for; remove it when each of them calls
+    /// [`Session::stimulate_fence_while`] and none calls this.
     pub fn stimulate_fence<F>(&mut self, stimulate: F) -> Option<FenceOutcome>
+    where
+        F: FnOnce(&mut crate::fence::FenceDriver) -> crate::fence::Effects,
+    {
+        self.stimulate_fence_while(&mut passing, stimulate)
+            .expect("an ask that always agrees does not refuse")
+    }
+
+    /// Puts one stimulus to the root editor's machine as [`Session::stimulate_fence`] does, asking
+    /// `still` on the held input domain immediately before the stimulus.
+    ///
+    /// # Errors
+    ///
+    /// Returns what `still` refuses with, with nothing stimulated. The answer is `Ok(None)` for a
+    /// session with no managed root editor, which `still` is not asked about.
+    pub fn stimulate_fence_while<F>(
+        &mut self,
+        still: &mut Still<'_>,
+        stimulate: F,
+    ) -> Result<Option<FenceOutcome>>
     where
         F: FnOnce(&mut crate::fence::FenceDriver) -> crate::fence::Effects,
     {
         let shared = Arc::clone(&self.input);
         let mut input = shared.lock();
-        let effects = stimulate(input.fence_mut()?);
+        if input.fence_mut().is_none() {
+            return Ok(None);
+        }
+        still(&|| input.revision())?;
+        let Some(driver) = input.fence_mut() else {
+            return Ok(None);
+        };
+        let effects = stimulate(driver);
         let Applied { mut outcome, owed } = input.apply_effects(effects);
         drop(input);
         self.finish_fence(owed, &mut outcome);
-        Some(outcome)
+        Ok(Some(outcome))
     }
 
     /// Returns the input domain this session shares with its keystroke path.
@@ -2118,6 +2169,26 @@ impl Session {
     /// Returns an error when the attachment is unknown or the engine's state cannot be spelled on
     /// the wire.
     pub fn install_projection(&mut self, attachment_id: AttachmentId) -> Result<()> {
+        self.install_projection_while(attachment_id, &mut passing)
+    }
+
+    /// Installs the screen of one attachment as [`Session::install_projection`] does, asking
+    /// `still` after the wait for the input domain that drawing the screen makes and immediately
+    /// before the screen is published.
+    ///
+    /// This takes the place of [`Session::install_projection`] for a request; that name stays for
+    /// the callers that have no request to ask for, and is removed when each of them calls this
+    /// and none calls it.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Session::install_projection`] returns, and what `still` refuses with, with
+    /// the attachment told to resynchronise and nothing published.
+    pub fn install_projection_while(
+        &mut self,
+        attachment_id: AttachmentId,
+        still: &mut Still<'_>,
+    ) -> Result<()> {
         if self.presentation_of(attachment_id) != crate::output::Presentation::Projected {
             return Ok(());
         }
@@ -2127,7 +2198,7 @@ impl Session {
         // earlier subscription of this attachment was left holding is not what it is about to be
         // sent.
         self.projections.forget(attachment_id);
-        let _ = self.publish_projection(attachment_id, dimensions, None, oldest);
+        let _ = self.publish_projection_asking(attachment_id, dimensions, None, oldest, still)?;
         Ok(())
     }
 
@@ -2246,6 +2317,10 @@ impl Session {
 
     /// Adds an attachment.
     ///
+    /// This is [`Session::attach_while`] with an ask that always agrees. It stays for the callers
+    /// that have no request to ask for; remove it when each of them calls
+    /// [`Session::attach_while`] and none calls this.
+    ///
     /// # Errors
     ///
     /// Returns an error when the session is closed or the request is not valid.
@@ -2255,7 +2330,27 @@ impl Session {
         granted: CanonicalSet<AttachmentCapability>,
         attachment_id: AttachmentId,
     ) -> Result<SessionAttachResult> {
+        self.attach_while(params, granted, attachment_id, &mut passing)
+    }
+
+    /// Adds an attachment, asking `still` after the wait for the input domain that the running
+    /// check makes and immediately before the table takes the attachment. The kernel resize that
+    /// the new window may need follows the table change with no wait between, so it is not asked
+    /// again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session is closed or the request is not valid, and what `still`
+    /// refuses with, with nothing changed.
+    pub fn attach_while(
+        &mut self,
+        params: &SessionAttachParams,
+        granted: CanonicalSet<AttachmentCapability>,
+        attachment_id: AttachmentId,
+        still: &mut Still<'_>,
+    ) -> Result<SessionAttachResult> {
         self.require_running()?;
+        self.ask_unheld(still)?;
         let previous = self.attachments.geometry();
         let change = self.attachments.attach(
             params,
@@ -2456,15 +2551,46 @@ impl Session {
 
     /// Removes an attachment, releasing whatever it held.
     ///
+    /// This is [`Session::detach_while`] with an ask that always agrees. It stays for the callers
+    /// that have no request to ask for; remove it when each of them calls
+    /// [`Session::detach_while`] and none calls this.
+    ///
     /// # Errors
     ///
     /// Returns an error when the attachment is unknown.
     pub fn detach(&mut self, attachment_id: AttachmentId) -> Result<SessionDetachResult> {
+        self.detach_while(attachment_id, &mut passing)
+            .expect("an ask that always agrees does not refuse")
+    }
+
+    /// Removes an attachment, releasing whatever it held, after asking `still` on the held input
+    /// domain and before the first removal.
+    ///
+    /// # Errors
+    ///
+    /// The outer error is what `still` refuses with: nothing was removed and the attachment is
+    /// still the session's. The inner result is the removal's own, as [`Session::detach`] gives it.
+    pub fn detach_while(
+        &mut self,
+        attachment_id: AttachmentId,
+        still: &mut Still<'_>,
+    ) -> Result<Result<SessionDetachResult>> {
+        let shared = Arc::clone(&self.input);
+        let input = shared.lock();
+        still(&|| input.revision())?;
+        Ok(self.detach_held(attachment_id, &shared, input))
+    }
+
+    /// What a detach does once the ask has agreed, on the input domain that the ask was made on.
+    fn detach_held(
+        &mut self,
+        attachment_id: AttachmentId,
+        shared: &Arc<InputShared>,
+        mut input: crate::input_domain::InputGuard<'_>,
+    ) -> Result<SessionDetachResult> {
         self.content_scopes.remove(&attachment_id);
         self.resource_views.remove(&attachment_id);
         self.live_views.remove(&attachment_id);
-        let shared = Arc::clone(&self.input);
-        let mut input = shared.lock();
         input.forget_attachment(attachment_id);
         // Undelivered input from the removed attachment goes with it; nothing is replayed. A paste
         // it had open is closed first, so the application is not left inside a bracketed paste
@@ -2553,12 +2679,35 @@ impl Session {
     /// # Errors
     ///
     /// Returns an error when the attachment is unknown or the dimensions are not valid.
+    ///
+    /// This is [`Session::viewport_while`] with an ask that always agrees. It stays for the callers
+    /// that have no request to ask for; remove it when each of them calls
+    /// [`Session::viewport_while`] and none calls this.
     pub fn viewport(
         &mut self,
         attachment_id: AttachmentId,
         dimensions: Dimensions,
         position: Option<kr_protocol::attachment::ViewportPosition>,
         column: u64,
+    ) -> Result<crate::projection::Landed> {
+        self.viewport_while(attachment_id, dimensions, position, column, &mut passing)
+    }
+
+    /// Records an attachment's own window as [`Session::viewport`] does. The screen that a moved
+    /// window is given is drawn after the response lane has been let out, which waits for the input
+    /// domain; `still` is asked after that wait and immediately before the screen is published, and
+    /// a refusal leaves the attachment told to resynchronise and nothing published.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Session::viewport`] returns, and what `still` refuses with.
+    pub fn viewport_while(
+        &mut self,
+        attachment_id: AttachmentId,
+        dimensions: Dimensions,
+        position: Option<kr_protocol::attachment::ViewportPosition>,
+        column: u64,
+        still: &mut Still<'_>,
     ) -> Result<crate::projection::Landed> {
         let before = self.presentation_of_attachment(attachment_id);
         let before_dimensions = self.attachments.own_dimensions(attachment_id).flatten();
@@ -2636,7 +2785,7 @@ impl Session {
             // either, so there is nothing for the client to ask again for: the pages that cover
             // where it is now looking are queued through its own subscription, charged to its own
             // bound, exactly as the first screen was.
-            self.install_projection(attachment_id)?;
+            self.install_projection_while(attachment_id, still)?;
         }
         Ok(crate::projection::Landed {
             presentation,
@@ -2659,6 +2808,10 @@ impl Session {
 
     /// Adds or withdraws a geometry claim.
     ///
+    /// This is [`Session::configure_while`] with an ask that always agrees. It stays for the
+    /// callers that have no request to ask for; remove it when each of them calls
+    /// [`Session::configure_while`] and none calls this.
+    ///
     /// # Errors
     ///
     /// Returns an error when the attachment is unknown or may not claim geometry.
@@ -2667,11 +2820,30 @@ impl Session {
         attachment_id: AttachmentId,
         claim_geometry: bool,
     ) -> Result<GeometryState> {
+        self.configure_while(attachment_id, claim_geometry, &mut passing)
+    }
+
+    /// Adds or withdraws a geometry claim, asking `still` again after the wait for the input
+    /// domain that the running check makes and immediately before the kernel resize that the claim
+    /// needs. The claim is recorded before that wait, under the ask the request entered with.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the attachment is unknown or may not claim geometry, and what `still`
+    /// refuses with, with the geometry given back as a refusal by the kernel gives it back.
+    pub fn configure_while(
+        &mut self,
+        attachment_id: AttachmentId,
+        claim_geometry: bool,
+        still: &mut Still<'_>,
+    ) -> Result<GeometryState> {
         let previous = self.attachments.geometry();
         let change = self.attachments.configure(attachment_id, claim_geometry)?;
         if change.resize_required
             && self.state().is_running()
-            && let Err(error) = self.resize_canonical(change.state.dimensions)
+            && let Err(error) = self
+                .ask_unheld(still)
+                .and_then(|()| self.resize_canonical(change.state.dimensions))
         {
             // A withdrawn claim stays withdrawn, because the attachment asked for that, but the
             // geometry it would have handed on is not moved when the kernel refuses the size, and
@@ -2688,6 +2860,10 @@ impl Session {
 
     /// Changes the canonical geometry at the owner's request.
     ///
+    /// This is [`Session::resize_while`] with an ask that always agrees. It stays for the callers
+    /// that have no request to ask for; remove it when each of them calls
+    /// [`Session::resize_while`] and none calls this.
+    ///
     /// # Errors
     ///
     /// Returns an error when the caller does not own the size, names a stale epoch, or asks for a
@@ -2698,11 +2874,30 @@ impl Session {
         dimensions: Dimensions,
         expected_epoch: u64,
     ) -> Result<GeometryState> {
+        self.resize_while(attachment_id, dimensions, expected_epoch, &mut passing)
+    }
+
+    /// Changes the canonical geometry at the owner's request, asking `still` after the wait for the
+    /// input domain that the running check makes and after the table's own check, immediately
+    /// before the kernel is asked.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the caller does not own the size, names a stale epoch, or asks for a
+    /// geometry that violates a constraint, and what `still` refuses with, with nothing changed.
+    pub fn resize_while(
+        &mut self,
+        attachment_id: AttachmentId,
+        dimensions: Dimensions,
+        expected_epoch: u64,
+        still: &mut Still<'_>,
+    ) -> Result<GeometryState> {
         self.require_running()?;
         // Ask the kernel first. A table that recorded a size the terminal never took would leave
         // every attachment drawing at a geometry the application does not have.
         self.attachments
             .check_resize(attachment_id, dimensions, expected_epoch)?;
+        self.ask_unheld(still)?;
         self.resize_canonical(dimensions)?;
         let change = self
             .attachments
@@ -2715,6 +2910,10 @@ impl Session {
 
     /// Hands size ownership to another eligible attachment.
     ///
+    /// This is [`Session::transfer_geometry_while`] with an ask that always agrees. It stays for
+    /// the callers that have no request to ask for; remove it when each of them calls
+    /// [`Session::transfer_geometry_while`] and none calls this.
+    ///
     /// # Errors
     ///
     /// Returns an error when the target is unknown or not eligible, or the epoch is stale.
@@ -2723,7 +2922,26 @@ impl Session {
         attachment_id: AttachmentId,
         expected_epoch: u64,
     ) -> Result<GeometryState> {
+        self.transfer_geometry_while(attachment_id, expected_epoch, &mut passing)
+    }
+
+    /// Hands size ownership to another eligible attachment, asking `still` after the wait for the
+    /// input domain that the running check makes and immediately before the table moves the
+    /// ownership. The kernel resize that the new owner's size may need follows the table change
+    /// with no wait between, so it is not asked again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the target is unknown or not eligible, or the epoch is stale, and what
+    /// `still` refuses with, with the ownership where it was.
+    pub fn transfer_geometry_while(
+        &mut self,
+        attachment_id: AttachmentId,
+        expected_epoch: u64,
+        still: &mut Still<'_>,
+    ) -> Result<GeometryState> {
         self.require_running()?;
+        self.ask_unheld(still)?;
         let previous = self.attachments.geometry();
         let change = self.attachments.transfer(attachment_id, expected_epoch)?;
         if change.resize_required {
@@ -2749,6 +2967,10 @@ impl Session {
 
     /// Takes the input lease for an attachment.
     ///
+    /// This is [`Session::acquire_input_while`] with an ask that always agrees. It stays for the
+    /// callers that have no request to ask for; remove it when each of them calls
+    /// [`Session::acquire_input_while`] and none calls this.
+    ///
     /// # Errors
     ///
     /// Returns an error when the session is closed or the attachment is unknown.
@@ -2757,6 +2979,23 @@ impl Session {
         attachment_id: AttachmentId,
         connection_id: ConnectionId,
         expected_epoch: Option<u64>,
+    ) -> Result<InputAcquireResult> {
+        self.acquire_input_while(attachment_id, connection_id, expected_epoch, &mut passing)
+    }
+
+    /// Takes the input lease for an attachment, asking `still` on the held input domain after the
+    /// checks of its own and immediately before the lease moves.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session is closed or the attachment is unknown, and what `still`
+    /// refuses with, with the lease where it was.
+    pub fn acquire_input_while(
+        &mut self,
+        attachment_id: AttachmentId,
+        connection_id: ConnectionId,
+        expected_epoch: Option<u64>,
+        still: &mut Still<'_>,
     ) -> Result<InputAcquireResult> {
         let shared = Arc::clone(&self.input);
         let mut input = shared.lock();
@@ -2774,6 +3013,7 @@ impl Session {
             return Err(WorkerError::LeaseLost);
         }
         self.input_compatible(attachment_id)?;
+        still(&|| input.revision())?;
 
         // An interrupted paste is closed before the new lease writes, so the application never
         // sees a paste finished under a different actor.
@@ -2820,6 +3060,10 @@ impl Session {
 
     /// Releases the lease held by this attachment.
     ///
+    /// This is [`Session::release_input_while`] with an ask that always agrees. It stays for the
+    /// callers that have no request to ask for; remove it when each of them calls
+    /// [`Session::release_input_while`] and none calls this.
+    ///
     /// # Errors
     ///
     /// Returns [`WorkerError::LeaseLost`] when the caller does not hold it at that epoch.
@@ -2828,8 +3072,25 @@ impl Session {
         attachment_id: AttachmentId,
         epoch: u64,
     ) -> Result<InputLeaseState> {
+        self.release_input_while(attachment_id, epoch, &mut passing)
+    }
+
+    /// Releases the lease held by this attachment, asking `still` on the held input domain
+    /// immediately before the lease is released.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::LeaseLost`] when the caller does not hold it at that epoch, and what
+    /// `still` refuses with, with the lease where it was.
+    pub fn release_input_while(
+        &mut self,
+        attachment_id: AttachmentId,
+        epoch: u64,
+        still: &mut Still<'_>,
+    ) -> Result<InputLeaseState> {
         let shared = Arc::clone(&self.input);
         let mut input = shared.lock();
+        still(&|| input.revision())?;
         let owed = self.release_input_locked(&mut input, attachment_id, epoch)?;
         let lease = input.lease();
         drop(input);
@@ -3089,12 +3350,33 @@ impl Session {
     /// It takes the current lease and epoch, accepts no other action, and is not held behind a
     /// reader transition.
     ///
+    /// This is [`Session::interrupt_while`] with an ask that always agrees. It stays for the
+    /// callers that have no request to ask for; remove it when each of them calls
+    /// [`Session::interrupt_while`] and none calls this.
+    ///
     /// # Errors
     ///
     /// Returns [`WorkerError::LeaseLost`] when the caller does not hold the lease.
     pub fn interrupt(&mut self, attachment_id: AttachmentId, epoch: u64) -> Result<()> {
+        self.interrupt_while(attachment_id, epoch, &mut passing)
+    }
+
+    /// Sends the terminal's configured interrupt as [`Session::interrupt`] does, asking `still` on
+    /// the held input domain before the machine is stimulated or the foreground group is signalled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::LeaseLost`] when the caller does not hold the lease, and what `still`
+    /// refuses with, with nothing sent.
+    pub fn interrupt_while(
+        &mut self,
+        attachment_id: AttachmentId,
+        epoch: u64,
+        still: &mut Still<'_>,
+    ) -> Result<()> {
         let shared = Arc::clone(&self.input);
         let mut input = shared.lock();
+        still(&|| input.revision())?;
         // In a managed session the machine decides it: the current epoch and holder, the configured
         // native action and nothing else, and it bypasses the reader-transition hold because a held
         // interrupt would be no interrupt at all.
@@ -3602,6 +3884,9 @@ impl Session {
     /// update, is installed again from a snapshot.
     ///
     /// Returns whether the subscriber was told to resynchronise.
+    ///
+    /// This is [`Session::publish_projection_asking`] with an ask that always agrees, for the
+    /// publications that are the rest of a change that has landed.
     fn publish_projection(
         &mut self,
         attachment_id: AttachmentId,
@@ -3609,6 +3894,26 @@ impl Session {
         reset: Option<ProjectionResetReason>,
         oldest: u64,
     ) -> bool {
+        self.publish_projection_asking(attachment_id, dimensions, reset, oldest, &mut passing)
+            .expect("an ask that always agrees does not refuse")
+    }
+
+    /// Publishes what one attachment is owed as [`Session::publish_projection`] does, asking
+    /// `still` after the screen has been drawn, which includes the wait for the input domain, and
+    /// immediately before anything is published.
+    ///
+    /// # Errors
+    ///
+    /// Returns what `still` refuses with. The attachment holds no base then and is told to
+    /// resynchronise, which is what a screen that could not be sent leaves it with.
+    fn publish_projection_asking(
+        &mut self,
+        attachment_id: AttachmentId,
+        dimensions: Dimensions,
+        reset: Option<ProjectionResetReason>,
+        oldest: u64,
+        still: &mut Still<'_>,
+    ) -> Result<bool> {
         let held = self.projections.held(attachment_id);
         let owed = match held {
             Some(held) if reset.is_none() => self
@@ -3627,7 +3932,7 @@ impl Session {
             _ => crate::snapshot::Owed::Snapshot(reset.unwrap_or(ProjectionResetReason::Attached)),
         };
         let update = match owed {
-            crate::snapshot::Owed::Nothing => return false,
+            crate::snapshot::Owed::Nothing => return Ok(false),
             crate::snapshot::Owed::Update(update) => update,
             crate::snapshot::Owed::Snapshot(reason) => {
                 // The subscriber's own send queue is what a screen has to fit: this is the one
@@ -3664,11 +3969,24 @@ impl Session {
                             self.history.next_cursor(),
                             oldest,
                         );
-                        return true;
+                        return Ok(true);
                     }
                 }
             }
         };
+        if let Err(refusal) = still(&|| self.input.lock().revision()) {
+            // Nothing was published, and the attachment was left holding no base by the install:
+            // it is told to begin again, which is what a screen that could not be sent leaves it
+            // with, so that the window it asked for is not left unserved.
+            self.projections.forget(attachment_id);
+            self.hub.require_resync(
+                attachment_id,
+                ResyncReason::ProjectionReset,
+                self.history.next_cursor(),
+                oldest,
+            );
+            return Err(refusal);
+        }
         let held = crate::snapshot::Held {
             base: update.base,
             viewport: self
@@ -3688,11 +4006,11 @@ impl Session {
                 // Its queue filled part way through. What it has is not a screen, so the base goes
                 // with it and the fresh snapshot it asks for starts again.
                 self.projections.forget(attachment_id);
-                return true;
+                return Ok(true);
             }
         }
         self.projections.record(attachment_id, held);
-        false
+        Ok(false)
     }
 
     /// Records side effects as durable host events, in one transaction and in the order they began.
@@ -4953,10 +5271,30 @@ impl Session {
     ///
     /// The reply is built before any process is signalled, because the caller may be inside the
     /// group about to be stopped.
+    ///
+    /// This is [`Session::begin_close_while`] with an ask that always agrees. It stays for the
+    /// callers that have no request to ask for; remove it when each of them calls
+    /// [`Session::begin_close_while`] and none calls this.
     pub fn begin_close(&mut self, reason: ClosureReason) -> CloseAcceptance {
+        self.begin_close_while(reason, &mut passing)
+            .expect("an ask that always agrees does not refuse")
+    }
+
+    /// Begins closure as [`Session::begin_close`] does, asking `still` on the held input domain
+    /// immediately before the state moves to closing. A closure already under way or finished is
+    /// reported without an ask, as it does nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns what `still` refuses with, with the session as it was.
+    pub fn begin_close_while(
+        &mut self,
+        reason: ClosureReason,
+        still: &mut Still<'_>,
+    ) -> Result<CloseAcceptance> {
         let shared = Arc::clone(&self.input);
         let mut input = shared.lock();
-        match input.state() {
+        Ok(match input.state() {
             SessionState::Closed => {
                 drop(input);
                 CloseAcceptance {
@@ -4976,6 +5314,7 @@ impl Session {
                 }
             }
             SessionState::Creating | SessionState::Live => {
+                still(&|| input.revision())?;
                 // Atomic admission: the state changes before anything else, so input is rejected
                 // from here on and a second request joins this closure instead of starting a
                 // second one. Nothing is signalled yet. The caller may itself be inside the
@@ -5024,7 +5363,7 @@ impl Session {
                     initiated: true,
                 }
             }
-        }
+        })
     }
 
     /// Asks the owned process group to stop.
@@ -5374,6 +5713,12 @@ impl Session {
         } else {
             Err(WorkerError::SessionClosed)
         }
+    }
+
+    /// Asks where this session's input domain is not held: the installed revision is read by taking
+    /// the domain for that one read, so the ask is the last thing that waits before the effect.
+    fn ask_unheld(&self, still: &mut Still<'_>) -> Result<()> {
+        still(&|| self.input.lock().revision())
     }
 }
 

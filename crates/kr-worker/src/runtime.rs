@@ -1625,12 +1625,32 @@ impl SessionRuntime {
     ///
     /// A mutation runs inside the session's serial boundary and cannot take the lock again, so the
     /// admission happens on the guard it is already holding.
+    ///
+    /// This is [`Runtime::close_locked_while`] with an ask that always agrees. It stays for the
+    /// callers that have no request to ask for; remove it when each of them calls
+    /// [`Runtime::close_locked_while`] and none calls this.
     pub fn close_locked(
         self: &Arc<Self>,
         session: &mut Session,
         reason: ClosureReason,
     ) -> (CloseAcceptance, CloseGate) {
-        let acceptance = session.begin_close(reason);
+        self.close_locked_while(session, reason, &mut crate::session::passing)
+            .expect("an ask that always agrees does not refuse")
+    }
+
+    /// Admits a close on a session this caller already holds, asking `still` where the session
+    /// moves to closing.
+    ///
+    /// # Errors
+    ///
+    /// Returns what `still` refuses with, with the session as it was.
+    pub fn close_locked_while(
+        self: &Arc<Self>,
+        session: &mut Session,
+        reason: ClosureReason,
+        still: &mut crate::session::Still<'_>,
+    ) -> crate::error::Result<(CloseAcceptance, CloseGate)> {
+        let acceptance = session.begin_close_while(reason, still)?;
         // Admission moved the input fence and may have produced a paste terminator. Publishing both
         // here is what makes "input is rejected from this moment" true of bytes that were already
         // handed to the writer, rather than only of bytes not yet accepted.
@@ -1639,7 +1659,7 @@ impl SessionRuntime {
             runtime: Arc::clone(self),
             initiated: acceptance.initiated,
         };
-        (acceptance, gate)
+        Ok((acceptance, gate))
     }
 
     /// Whether the supervision is in the middle of a look at the session, for the host's own tests.

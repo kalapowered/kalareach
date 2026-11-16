@@ -9681,3 +9681,412 @@ async fn a_cancel_whose_deadline_passes_between_its_reads_and_its_write_cancels_
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-09.16: the session, input and viewport arms ask again after their wait
+// ---------------------------------------------------------------------------------------------
+
+/// The arms of a dispatch that wait for the session's input domain before their effect.
+#[derive(Clone, Copy, Debug)]
+enum InputArm {
+    Attach,
+    Detach,
+    Close,
+    Configure,
+    Resize,
+    Transfer,
+    Acquire,
+    Release,
+    Interrupt,
+    Viewport,
+}
+
+impl InputArm {
+    const ALL: [Self; 10] = [
+        Self::Attach,
+        Self::Detach,
+        Self::Close,
+        Self::Configure,
+        Self::Resize,
+        Self::Transfer,
+        Self::Acquire,
+        Self::Release,
+        Self::Interrupt,
+        Self::Viewport,
+    ];
+}
+
+/// Holds the session's input domain from a thread of its own until it is dropped.
+struct InputHold {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl InputHold {
+    fn taken(host: &Host) -> Self {
+        let shared = Arc::clone(host.service.runtime().input());
+        let (held, taken) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let guard = shared.lock();
+            let _ = held.send(());
+            let _ = wait.recv();
+            drop(guard);
+        });
+        taken.recv().expect("the input domain is held");
+        Self {
+            release: Some(release),
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for InputHold {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// What these arms change, as the session shows it: the table's entries, the geometry with its
+/// owner and epoch, the input lease and the lifecycle state.
+fn shown_effects(host: &Host) -> String {
+    let session = host.service.runtime().session();
+    format!(
+        "attachments {}; geometry {:?}; lease {:?}; state {:?}",
+        session.attachments().len(),
+        session.geometry(),
+        session.lease(),
+        session.state()
+    )
+}
+
+/// Attaches a terminal through the worker's endpoint, as a person's client does.
+async fn attached_terminal(
+    client: &mut LocalClient,
+    host: &Host,
+    dimensions: Dimensions,
+    claim_geometry: bool,
+) -> kr_protocol::attachment::SessionAttachResult {
+    use kr_protocol::attachment::AttachmentCapability as Right;
+    let mut requested = kr_protocol::scalars::CanonicalSet::new();
+    requested.insert(Right::Input);
+    requested.insert(Right::ObserveTerminal);
+    requested.insert(Right::Geometry);
+    client
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(host),
+            &kr_protocol::attachment::SessionAttachParams {
+                session_id: host.session_id,
+                mode: kr_protocol::attachment::AttachMode::Terminal,
+                claim_geometry,
+                dimensions: Nullable::some(dimensions),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                requested,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("the attachment is accepted")
+        .to_typed()
+        .expect("decodes")
+}
+
+/// A mutation of `method` with `params`, on the frame every case here sends.
+fn input_arm_mutation(
+    client: &LocalClient,
+    host: &Host,
+    method: Method,
+    params: ParamsValue,
+) -> MutationRequest {
+    MutationRequest {
+        method: method.into(),
+        params,
+        ..close_mutation(
+            client,
+            host,
+            DEFAULT_MUTATION_TTL.get(),
+            ParamsValue::empty(),
+        )
+    }
+}
+
+/// What a dispatch of one arm came to when the worker's clock moved by `moved` while the arm waited
+/// for the input domain.
+struct WaitedForTheInput {
+    host: Host,
+    outcome: Outcome,
+    action_id: ActionId,
+    before: String,
+    /// Kept open for the case's reads: an attachment goes with the link that made it.
+    _client: LocalClient,
+}
+
+/// Sends the request of `arm` and holds the input domain from the case until the arm waits for it:
+/// the dispatch has passed the ask at the entry of the arm, nothing else takes the domain between
+/// the marker and the arm, so the first taker that finds it held is the arm. The clock moves by
+/// `moved` in that wait.
+async fn waited_for_the_input(arm: InputArm, moved: std::time::Duration) -> WaitedForTheInput {
+    use kr_transport::clock::ManualClock;
+
+    let clock = ManualClock::new();
+    let host = host_on(
+        |_| {},
+        |_| kr_worker::action::time::TimeSources::system(),
+        Some(Arc::new(clock.clone())),
+    )
+    .await;
+    let mut client = cli(&host).await;
+    let wide = Dimensions::new(100, 30);
+    let own = Dimensions::new(80, 24);
+    let request = match arm {
+        InputArm::Attach => input_arm_mutation(
+            &client,
+            &host,
+            Method::SessionAttach,
+            ParamsValue::from_typed(&kr_protocol::attachment::SessionAttachParams {
+                session_id: host.session_id,
+                mode: kr_protocol::attachment::AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(own),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                requested: {
+                    let mut requested = kr_protocol::scalars::CanonicalSet::new();
+                    requested
+                        .insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
+                    requested
+                },
+            })
+            .expect("encodes"),
+        ),
+        InputArm::Detach => {
+            let attached = attached_terminal(&mut client, &host, own, false).await;
+            input_arm_mutation(
+                &client,
+                &host,
+                Method::SessionDetach,
+                ParamsValue::from_typed(&kr_protocol::attachment::SessionDetachParams {
+                    attachment_id: Nullable::some(attached.attachment.attachment_id),
+                    line_token: Nullable::null(),
+                })
+                .expect("encodes"),
+            )
+        }
+        InputArm::Close => close_mutation(
+            &client,
+            &host,
+            DEFAULT_MUTATION_TTL.get(),
+            ParamsValue::empty(),
+        ),
+        InputArm::Configure => {
+            let attached = attached_terminal(&mut client, &host, wide, false).await;
+            input_arm_mutation(
+                &client,
+                &host,
+                Method::AttachmentConfigure,
+                ParamsValue::from_typed(&kr_protocol::attachment::AttachmentConfigureParams {
+                    attachment_id: attached.attachment.attachment_id,
+                    claim_geometry: true,
+                })
+                .expect("encodes"),
+            )
+        }
+        InputArm::Resize => {
+            let owner = attached_terminal(&mut client, &host, own, true).await;
+            input_arm_mutation(
+                &client,
+                &host,
+                Method::TerminalResize,
+                ParamsValue::from_typed(&kr_protocol::attachment::TerminalResizeParams {
+                    attachment_id: owner.attachment.attachment_id,
+                    dimensions: wide,
+                    expected_geometry_epoch: owner.geometry.epoch,
+                })
+                .expect("encodes"),
+            )
+        }
+        InputArm::Transfer => {
+            let _owner = attached_terminal(&mut client, &host, own, true).await;
+            let successor = attached_terminal(&mut client, &host, wide, true).await;
+            input_arm_mutation(
+                &client,
+                &host,
+                Method::TerminalGeometryTransfer,
+                ParamsValue::from_typed(&kr_protocol::attachment::TerminalGeometryTransferParams {
+                    attachment_id: successor.attachment.attachment_id,
+                    expected_geometry_epoch: successor.geometry.epoch,
+                })
+                .expect("encodes"),
+            )
+        }
+        InputArm::Acquire => {
+            let attached = attached_terminal(&mut client, &host, own, false).await;
+            input_arm_mutation(
+                &client,
+                &host,
+                Method::InputAcquire,
+                ParamsValue::from_typed(&kr_protocol::input::InputAcquireParams {
+                    session_id: host.session_id,
+                    attachment_id: attached.attachment.attachment_id,
+                    expected_epoch: Nullable::null(),
+                })
+                .expect("encodes"),
+            )
+        }
+        InputArm::Release | InputArm::Interrupt => {
+            let attached = attached_terminal(&mut client, &host, own, false).await;
+            let holding: kr_protocol::input::InputAcquireResult = client
+                .mutate(
+                    Method::InputAcquire,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    target(&host),
+                    &kr_protocol::input::InputAcquireParams {
+                        session_id: host.session_id,
+                        attachment_id: attached.attachment.attachment_id,
+                        expected_epoch: Nullable::null(),
+                    },
+                )
+                .await
+                .expect("reaches the worker")
+                .expect("the lease is taken")
+                .to_typed()
+                .expect("decodes");
+            if matches!(arm, InputArm::Release) {
+                input_arm_mutation(
+                    &client,
+                    &host,
+                    Method::InputRelease,
+                    ParamsValue::from_typed(&kr_protocol::input::InputReleaseParams {
+                        session_id: host.session_id,
+                        attachment_id: attached.attachment.attachment_id,
+                        epoch: holding.lease.epoch,
+                    })
+                    .expect("encodes"),
+                )
+            } else {
+                input_arm_mutation(
+                    &client,
+                    &host,
+                    Method::InputInterrupt,
+                    ParamsValue::from_typed(&kr_protocol::input::InputInterruptParams {
+                        session_id: host.session_id,
+                        attachment_id: attached.attachment.attachment_id,
+                        epoch: holding.lease.epoch,
+                        action: kr_protocol::input::InterruptAction::NativeInterrupt,
+                    })
+                    .expect("encodes"),
+                )
+            }
+        }
+        InputArm::Viewport => {
+            // A window narrower than the grid is shown a projection, and moving its first column
+            // is a move of the window that the screen is drawn and published again for.
+            let attached =
+                attached_terminal(&mut client, &host, Dimensions::new(40, 10), false).await;
+            input_arm_mutation(
+                &client,
+                &host,
+                Method::AttachmentViewport,
+                ParamsValue::from_typed(&kr_protocol::attachment::AttachmentViewportParams {
+                    attachment_id: attached.attachment.attachment_id,
+                    dimensions: Dimensions::new(40, 10),
+                    position: Nullable::null(),
+                    column: U64::new(5),
+                })
+                .expect("encodes"),
+            )
+        }
+    };
+    let action_id = request.action_id;
+    let before = shown_effects(&host);
+
+    // Nothing else takes the input domain between the marker and the arm, so the domain is held
+    // from the stop after the marker: past the asks that stand before the arm.
+    let (marked, go_on) = {
+        let mut session = host.service.runtime().session();
+        session
+            .journal_mut()
+            .expect("a journal")
+            .stall_after_next_marker()
+    };
+    let sending = tokio::spawn(async move {
+        let outcome = send_mutation(&mut client, request).await;
+        (client, outcome)
+    });
+    tokio::time::timeout(STOP_WAIT, marked)
+        .await
+        .expect("the dispatch reaches the stop after its marker in time")
+        .expect("the stop is armed");
+    let arrival = host.service.runtime().input().announce_the_next_wait();
+    let hold = InputHold::taken(&host);
+    go_on.send(()).expect("the dispatch is waiting to go on");
+    tokio::task::spawn_blocking(move || arrival.recv_timeout(STOP_WAIT))
+        .await
+        .expect("the wait for the arm ends")
+        .unwrap_or_else(|_| panic!("{arm:?}: the arm reaches the input domain in time"));
+    clock.advance(moved);
+    drop(hold);
+    let (client, outcome) = sending.await.expect("the dispatch ends");
+    WaitedForTheInput {
+        host,
+        outcome,
+        action_id,
+        before,
+        _client: client,
+    }
+}
+
+/// KR-REQ-09.16: a session, input or viewport arm that waits for the input domain asks the
+/// request's deadline again after the wait and immediately before its effect. A deadline that ends
+/// while the arm waits leaves the arm's effect undone: the table, the geometry, the lease and the
+/// lifecycle state are what they were, and the dispatch is refused and recorded as refused, never
+/// as unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_session_input_or_viewport_arm_whose_deadline_ends_while_it_waits_does_nothing() {
+    let past = std::time::Duration::from_millis(DEFAULT_MUTATION_TTL.get() + 1_000);
+    for arm in InputArm::ALL {
+        let waited = waited_for_the_input(arm, past).await;
+        let Outcome::Error(error) = &waited.outcome else {
+            panic!(
+                "{arm:?}: a deadline that ended in the wait did not refuse: {:?}",
+                waited.outcome
+            );
+        };
+        assert_eq!(
+            error.code,
+            ErrorCode::PermissionDenied,
+            "{arm:?}: {error:?}"
+        );
+        assert_eq!(
+            shown_effects(&waited.host),
+            waited.before,
+            "{arm:?}: the arm took effect after its deadline ended"
+        );
+        assert_recorded_refused(&waited.host, waited.action_id, &format!("{arm:?}")).await;
+    }
+}
+
+/// The control of the case above: the same wait with the clock where it was, and the effect runs
+/// once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_session_input_or_viewport_arm_that_waits_with_its_deadline_standing_takes_effect() {
+    for arm in InputArm::ALL {
+        let waited = waited_for_the_input(arm, std::time::Duration::ZERO).await;
+        assert!(
+            matches!(waited.outcome, Outcome::Ok(_)),
+            "{arm:?}: the control is taken: {:?}",
+            waited.outcome
+        );
+        if !matches!(arm, InputArm::Interrupt | InputArm::Viewport) {
+            assert_ne!(
+                shown_effects(&waited.host),
+                waited.before,
+                "{arm:?}: the effect ran once and the session shows it"
+            );
+        }
+    }
+}

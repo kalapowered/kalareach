@@ -541,6 +541,7 @@ async fn wired_holding_fences(
             clock: Arc::clone(clock),
             fence_hold: gate.map(|gate| FenceHold::Gate(gate.clone())),
             hello_abi: "zle-5.9",
+            service_on_the_clock: false,
         },
         |_| {},
     )
@@ -555,6 +556,8 @@ struct Bridging {
     fence_hold: Option<FenceHold>,
     /// The editor ABI the reference shell's hello declares. The worker supports `zle-5.9`.
     hello_abi: &'static str,
+    /// Whether the service decides its deadlines on the same clock, so that the case moves them.
+    service_on_the_clock: bool,
 }
 
 impl Bridging {
@@ -564,6 +567,7 @@ impl Bridging {
             clock: Arc::new(kr_transport::clock::ManualClock::new()),
             fence_hold: None,
             hello_abi: "zle-5.9",
+            service_on_the_clock: false,
         }
     }
 }
@@ -613,6 +617,7 @@ async fn wired_built(
     let mut session = Session::open(config).expect("opens the session");
     session.launch().expect("launches the shell");
     let clock = Arc::clone(&bridging.clock);
+    let service_on_the_clock = bridging.service_on_the_clock;
     if mode == ShellMode::Managed {
         session.install_fence(FenceDriver::new(
             session_id,
@@ -685,22 +690,25 @@ async fn wired_built(
         .worker_endpoint(DisplayNumber::new(1))
         .expect("an endpoint");
     let listener = Listener::bind(&endpoint).expect("binds the endpoint");
-    let service = Arc::new(
-        WorkerService::new(
-            Arc::clone(&runtime),
-            identity,
-            endpoint.clone(),
-            ServiceBinding {
-                environment_id,
-                boot_identity: boot,
-                controller_public_key,
-                controller_generation: ControllerGeneration::new(1),
-                build_id: build(),
-                journal_path: Some(environment.journal_database(session_id)),
-            },
-        )
-        .expect("a service"),
-    );
+    let service = WorkerService::new(
+        Arc::clone(&runtime),
+        identity,
+        endpoint.clone(),
+        ServiceBinding {
+            environment_id,
+            boot_identity: boot,
+            controller_public_key,
+            controller_generation: ControllerGeneration::new(1),
+            build_id: build(),
+            journal_path: Some(environment.journal_database(session_id)),
+        },
+    )
+    .expect("a service");
+    let service = Arc::new(if service_on_the_clock {
+        service.on_clock(Arc::clone(&clock) as Arc<dyn kr_transport::clock::ContinuousClock>)
+    } else {
+        service
+    });
     let serving = tokio::spawn(Arc::clone(&service).serve(listener));
 
     let serving_ends = kr_ipc::testing::Serving::guarding(&serving);
@@ -2102,6 +2110,7 @@ async fn a_launch_hold_ends_on_its_own_deadline_while_the_login_manager_never_an
             clock: Arc::clone(&clock),
             fence_hold: None,
             hello_abi: "zle-5.9",
+            service_on_the_clock: false,
         },
         |config| config.worker_profile = WorkerProfile::DesktopBound,
     ));
@@ -10436,4 +10445,122 @@ async fn a_session_that_refused_a_request_goes_on_serving() {
         .await
         .expect_err("the connection answers again, and refuses again");
     wired.close().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-09.16: the launch arm asks again on the held input domain
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-09.16: a launch that waits for the input domain asks the request's deadline again on the
+/// held domain, after the wait and immediately before it stimulates the root editor's machine. A
+/// deadline that ends while the launch waits reserves no fence and sends the reader nothing, and
+/// the caller is refused; the control, the same wait with the clock where it was, reaches the
+/// reader once.
+///
+/// The dispatch has passed the ask at the entry of the arm and nothing else takes the input domain
+/// between the marker and the arm, so the first taker that finds the domain held is the arm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_whose_deadline_ends_while_it_waits_for_the_input_domain_reserves_no_fence() {
+    let past = Duration::from_millis(kr_protocol::limits::DEFAULT_MUTATION_TTL.get() + 1_000);
+    for moved in [past, Duration::ZERO] {
+        let clock = Arc::new(kr_transport::clock::ManualClock::new());
+        let mut wired = wired_built(
+            ShellMode::Managed,
+            true,
+            Bridging {
+                clock: Arc::clone(&clock),
+                fence_hold: None,
+                hello_abi: "zle-5.9",
+                service_on_the_clock: true,
+            },
+            |_| {},
+        )
+        .await;
+        let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects");
+        let holder = holder_over(&mut client, &wired).await;
+        let _ = fenced_with(&mut wired, holder, None).await;
+        let params = ShellLaunchParams {
+            session_id: wired.session_id,
+            command: LaunchCommand::QuotedCommand("true".to_owned()),
+            expected_prompt_generation: PromptGeneration::new(1),
+            expected_buffer_revision: EditorBufferRevision::new(1),
+        };
+        let target = wired.target();
+        let (marked, go_on) = wired
+            .runtime
+            .session()
+            .journal_mut()
+            .expect("a journal")
+            .stall_after_next_marker();
+        let calling = tokio::spawn(async move {
+            let outcome = client
+                .mutate(
+                    Method::ShellLaunch,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    target,
+                    &params,
+                )
+                .await;
+            (client, outcome)
+        });
+        tokio::time::timeout(Duration::from_secs(60), marked)
+            .await
+            .expect("the dispatch reaches the stop after its marker in time")
+            .expect("the stop is armed");
+        let arrival = wired.runtime.input().announce_the_next_wait();
+        let shared = Arc::clone(wired.runtime.input());
+        let (held, taken) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let holding = std::thread::spawn(move || {
+            let guard = shared.lock();
+            let _ = held.send(());
+            let _ = wait.recv();
+            drop(guard);
+        });
+        taken.recv().expect("the input domain is held");
+        go_on.send(()).expect("the dispatch is waiting to go on");
+        tokio::task::spawn_blocking(move || arrival.recv_timeout(Duration::from_secs(60)))
+            .await
+            .expect("the wait for the arm ends")
+            .expect("the arm reaches the input domain in time");
+        clock.advance(moved);
+        drop(release);
+        holding.join().expect("the holder ends");
+
+        if moved.is_zero() {
+            // The launch reached the reader, and its fence is reserved for it.
+            let request = loop {
+                match wired.next().await {
+                    ToBridge::Request { request, .. } => match *request {
+                        WorkerRequest::Launch(request) => break request,
+                        _ => continue,
+                    },
+                    _ => continue,
+                }
+            };
+            drop(request);
+            assert_eq!(
+                wired.runtime.session().fence().expect("a driver").state(),
+                FenceState::LaunchReserved,
+                "the launch took effect once"
+            );
+        } else {
+            let (_client, outcome) = tokio::time::timeout(Duration::from_secs(30), calling)
+                .await
+                .expect("a launch whose deadline ended in the wait is answered")
+                .expect("the call ends");
+            let refused = outcome
+                .expect("reaches the worker")
+                .expect_err("the launch is refused");
+            assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+            assert_ne!(
+                wired.runtime.session().fence().expect("a driver").state(),
+                FenceState::LaunchReserved,
+                "a launch that was refused reserved no fence"
+            );
+        }
+        wired.close().await;
+    }
 }

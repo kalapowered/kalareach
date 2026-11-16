@@ -6819,7 +6819,7 @@ impl WorkerService {
             .and_then(|()| Self::check_preconditions(&session, mutation))
             // The remote dispatch lease, in the serial path and immediately before the deadline
             // and the marker: a lease that was valid when the action was queued proves nothing.
-            .and_then(|()| self.check_dispatch_lease(caller, method))
+            .and_then(|()| self.check_dispatch_lease(caller, method, &|| self.installed_revision()))
             // The deadline the host derived is the deadline it keeps, measured on the continuous
             // clock so a wall clock that moves cannot extend it. This is also what makes a zero
             // requested lifetime mean what it says.
@@ -7357,8 +7357,34 @@ impl WorkerService {
         method: Method,
         deadline: ContinuousInstant,
     ) -> Result<()> {
-        self.check_dispatch_lease(caller, method)?;
+        self.still_admitted_reading(caller, method, deadline, &|| self.installed_revision())
+    }
+
+    /// The two asks as [`Self::still_admitted`] makes them, for a helper that is told how the
+    /// installed revision is read where it stands.
+    ///
+    /// A helper that holds the input domain reads the revision from its guard: the ask must not
+    /// take the domain again, which waits for the caller that holds it for ever.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::check_dispatch_lease`] and [`Self::check_accepted_deadline`] refuse
+    /// with.
+    fn still_admitted_reading(
+        &self,
+        caller: &Caller,
+        method: Method,
+        deadline: ContinuousInstant,
+        installed: &dyn Fn() -> Option<kr_protocol::ids::AuthorityRevision>,
+    ) -> Result<()> {
+        self.check_dispatch_lease(caller, method, installed)?;
         self.check_accepted_deadline(deadline)
+    }
+
+    /// The authority revision this worker has installed, read by taking the input domain for that
+    /// read alone. Where a caller holds the domain it reads the revision from its guard instead.
+    fn installed_revision(&self) -> Option<kr_protocol::ids::AuthorityRevision> {
+        self.runtime.input().lock().revision()
     }
 
     /// Runs one of the question and alert arms, whose writes ask this request's authority again
@@ -7398,13 +7424,19 @@ impl WorkerService {
     /// ([`kr_protocol::local::needs_a_dispatch_lease`]) do not depend on it.
     ///
     /// The authority state and the installed revision are read one after the other and never
-    /// nested.
+    /// nested: `installed` is how the revision is read, and it is not called while the authority's
+    /// lock is held, so a caller that holds the input domain passes a read from its own guard.
     ///
     /// # Errors
     ///
     /// Returns [`WorkerError::WindowExpired`] for a lease that has ended, and
     /// [`WorkerError::DispatchLeaseRefused`] for any other lease the worker cannot match.
-    fn check_dispatch_lease(&self, caller: &Caller, method: Method) -> Result<()> {
+    fn check_dispatch_lease(
+        &self,
+        caller: &Caller,
+        method: Method,
+        installed: &dyn Fn() -> Option<kr_protocol::ids::AuthorityRevision>,
+    ) -> Result<()> {
         if caller.ingress != ActorIngress::PairedDevice
             || !kr_protocol::local::needs_a_dispatch_lease(method)
         {
@@ -7439,7 +7471,7 @@ impl WorkerService {
                 "this worker has not acknowledged the revision this lease was renewed for",
             );
         }
-        let installed = self.runtime.input().lock().revision();
+        let installed = installed();
         if installed != Some(lease.authority_revision) {
             return refused("this lease is for a revision this worker does not hold");
         }
@@ -9907,6 +9939,11 @@ impl WorkerService {
             }
             return Err(refusal);
         }
+        // The same two asks, for an arm that waits for a lock before its effect and so asks again
+        // after the wait. The arm says how the installed revision is read where it stands.
+        let mut still = |installed: &dyn Fn() -> Option<kr_protocol::ids::AuthorityRevision>| {
+            self.still_admitted_reading(caller, method, deadline, installed)
+        };
         let params = &mutation.params;
         match method {
             Method::SessionAttach => {
@@ -9937,7 +9974,8 @@ impl WorkerService {
                 // narrowed by. Every other caller is drawn the live screen alone: section 10's
                 // live-screen exception never reaches the buffer that is not showing, and this
                 // build serves a grant no retained content beyond it.
-                let mut result = session.attach(&params, granted, attachment_id)?;
+                let mut result =
+                    session.attach_while(&params, granted, attachment_id, &mut still)?;
                 if !owner {
                     // The one filter decides how much of the screen a pairing grant's caller is
                     // drawn: section 10's live-screen exception, and asking the filter rather than
@@ -9998,7 +10036,9 @@ impl WorkerService {
                 // Whose attachment this caller may detach was decided by the validation, on this
                 // same held session, before the dispatch marker.
                 let attachment_id = Self::detach_subject(session, &params)?;
-                let outcome = session.detach(attachment_id);
+                // An ask that refuses has removed nothing: the attachment is still the session's
+                // and this connection still holds it.
+                let outcome = session.detach_while(attachment_id, &mut still)?;
                 // Detaching releases the lease, which moves the input fence, and can produce the
                 // terminator of a paste the attachment had open. Both are published here, *before*
                 // the result is looked at: the lease has already moved whether or not the geometry
@@ -10018,9 +10058,11 @@ impl WorkerService {
             }
             Method::SessionClose => {
                 let params: kr_protocol::session::SessionCloseParams = parse(params)?;
-                let (acceptance, gate) = self
-                    .runtime
-                    .close_locked(session, ClosureReason::CloseRequested);
+                let (acceptance, gate) = self.runtime.close_locked_while(
+                    session,
+                    ClosureReason::CloseRequested,
+                    &mut still,
+                )?;
                 let reply = encode(&SessionCloseResult {
                     session_id: params.session_id,
                     state: acceptance.state,
@@ -10036,39 +10078,50 @@ impl WorkerService {
             }
             Method::AttachmentConfigure => {
                 let params: AttachmentConfigureParams = parse(params)?;
-                let geometry = session.configure(params.attachment_id, params.claim_geometry)?;
+                let geometry = session.configure_while(
+                    params.attachment_id,
+                    params.claim_geometry,
+                    &mut still,
+                )?;
                 Ok((encode(&GeometryResult { geometry })?, AfterEffect::None))
             }
             Method::TerminalResize => {
                 let params: TerminalResizeParams = parse(params)?;
-                let geometry = session.resize(
+                let geometry = session.resize_while(
                     params.attachment_id,
                     params.dimensions,
                     params.expected_geometry_epoch.get(),
+                    &mut still,
                 )?;
                 Ok((encode(&GeometryResult { geometry })?, AfterEffect::None))
             }
             Method::TerminalGeometryTransfer => {
                 let params: TerminalGeometryTransferParams = parse(params)?;
-                let geometry = session.transfer_geometry(
+                let geometry = session.transfer_geometry_while(
                     params.attachment_id,
                     params.expected_geometry_epoch.get(),
+                    &mut still,
                 )?;
                 Ok((encode(&GeometryResult { geometry })?, AfterEffect::None))
             }
             Method::InputAcquire => {
                 let params: InputAcquireParams = parse(params)?;
-                let result = session.acquire_input(
+                let result = session.acquire_input_while(
                     params.attachment_id,
                     state.facts.connection_id,
                     params.expected_epoch.as_ref().map(|epoch| epoch.get()),
+                    &mut still,
                 )?;
                 self.runtime.flush_input();
                 Ok((encode(&result)?, AfterEffect::None))
             }
             Method::InputRelease => {
                 let params: InputReleaseParams = parse(params)?;
-                let lease = session.release_input(params.attachment_id, params.epoch.get())?;
+                let lease = session.release_input_while(
+                    params.attachment_id,
+                    params.epoch.get(),
+                    &mut still,
+                )?;
                 self.runtime.flush_input();
                 Ok((encode(&InputLeaseResult { lease })?, AfterEffect::None))
             }
@@ -10085,7 +10138,8 @@ impl WorkerService {
                 // out on this boundary, whether or not the machine admitted the interrupt itself:
                 // nothing else is due to run, and bytes the machine has let go of are the
                 // application's.
-                let interrupted = session.interrupt(params.attachment_id, params.epoch.get());
+                let interrupted =
+                    session.interrupt_while(params.attachment_id, params.epoch.get(), &mut still);
                 self.runtime.flush_input();
                 interrupted?;
                 Ok((
@@ -10107,14 +10161,23 @@ impl WorkerService {
                 // goes on the session this call already holds: reaching for the lock again here
                 // would be this thread waiting for itself.
                 let receiver = session.register_launch(transaction);
-                let outcome = session
-                    .stimulate_fence(|driver| {
-                        driver.launch_requested(params, attachment_id, transaction)
-                    })
-                    .ok_or_else(|| WorkerError::ShellIntegrationUnsupported {
-                        detail: "this session has no managed root editor to install into"
-                            .to_owned(),
-                    })?;
+                let stimulated = session.stimulate_fence_while(&mut still, |driver| {
+                    driver.launch_requested(params, attachment_id, transaction)
+                });
+                let outcome = match stimulated {
+                    Ok(Some(outcome)) => outcome,
+                    Ok(None) => {
+                        return Err(WorkerError::ShellIntegrationUnsupported {
+                            detail: "this session has no managed root editor to install into"
+                                .to_owned(),
+                        });
+                    }
+                    Err(refusal) => {
+                        // Nothing was put to the machine, so nobody is waiting for the answer.
+                        session.forget_launch(transaction);
+                        return Err(refusal);
+                    }
+                };
                 // The same sweep, and the same reason: a launch request can expire a hold that
                 // arrived before it, and what the machine released belongs to the application now.
                 self.runtime.flush_input();
@@ -10146,11 +10209,12 @@ impl WorkerService {
             }
             Method::AttachmentViewport => {
                 let params: AttachmentViewportParams = parse(params)?;
-                let landed = session.viewport(
+                let landed = session.viewport_while(
                     params.attachment_id,
                     params.dimensions,
                     params.position.0,
                     params.column.get(),
+                    &mut still,
                 )?;
                 Ok((
                     encode(&AttachmentViewportResult {
