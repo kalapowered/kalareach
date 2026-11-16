@@ -1022,7 +1022,7 @@ async fn stop_the_daemon(
                 earlier,
             )
         }
-        End::NotEnded(why) => {
+        End::NotEnded(why, _) => {
             let message = not_ended_said(why, not_known, &environment.paths, id, old);
             failed(
                 CliError::Unfinished {
@@ -1085,7 +1085,7 @@ fn not_ended_said(
         Why::Held => still_held(environment, id),
         Why::Unlooked(why) => unlooked(id, not_known, &why),
         Why::NotShown => not_shown(id, not_known),
-        Why::Running | Why::Answers(_) => {
+        Why::Running | Why::Answers => {
             let what = match not_known {
                 Some(failure) => shown!(
                     "did not show whether it took the stop ({}), and it has not ended",
@@ -1205,14 +1205,16 @@ async fn ended_before_the_request(
     } else {
         operations.look(startup::ANSWER_BOUND.min(left())).await
     };
-    if let Endpoint::Same(answered) = first {
+    // Where the request was not made, any answer at the endpoint is an answer, whether or not it
+    // proves the generation of the daemon that was asked.
+    if let Endpoint::Same(answered) | Endpoint::Unproved(answered) = first {
         return Decided::Answers(answered);
     }
     match wait_for_the_end(operations, old, left()).await {
         // A daemon that answers the last look of the wait is an answer, as at the first look.
-        End::NotEnded(Why::Answers(answered)) => Decided::Answers(answered),
-        End::NotEnded(_) => Decided::NotShown,
-        ended => Decided::Ended(ended),
+        End::NotEnded(_, Some(answered)) => Decided::Answers(answered),
+        End::NotEnded(_, None) => Decided::NotShown,
+        ended @ (End::Gone | End::Successor(_)) => Decided::Ended(ended),
     }
 }
 
@@ -1569,7 +1571,7 @@ enum Why {
     Running,
     /// The last look of the last round showed a daemon of the generation asked answering, whatever
     /// else the round read: a daemon answers, so it has not ended.
-    Answers(Answered),
+    Answers,
     /// No sign of life in the last round and no sign of an end: with no usable reading of the
     /// process (none was possible, or the system did not say) the lock was free and the last look
     /// showed neither the daemon nor its end. The command cannot say that the daemon has not ended.
@@ -1588,8 +1590,9 @@ enum End {
     /// The daemon has ended and another daemon holds the environment or answers at its endpoint:
     /// the number of the process the lock file names as a control daemon, where it names one.
     Successor(Option<u64>),
-    /// The daemon had not ended when the wait did, or it could not be seen whether it had.
-    NotEnded(Why),
+    /// The daemon had not ended when the wait did, or it could not be seen whether it had: why,
+    /// and the answer of the last look where something answered it (a proved generation or not).
+    NotEnded(Why, Option<Answered>),
 }
 
 /// Reads `host.info`, on a new connection once where the authority behind this one was withdrawn,
@@ -1641,8 +1644,9 @@ async fn host_info(
 /// before it: the install lock's wait, a look at the endpoint and the pause between two rounds. A
 /// look that cannot be made leaves the daemon as not ended.
 ///
-/// At the bound the command says what its LAST round read: a daemon answering the round's look is
-/// [`Why::Answers`], whatever else the round read; otherwise a held lock or a running process is
+/// At the bound the command says what its LAST round read: the daemon of the generation asked
+/// answering the round's look is [`Why::Answers`], whatever else the round read (an answer with no
+/// proved generation is no such sign, and is kept as the answer of the last look); otherwise a held lock or a running process is
 /// [`Why::Running`]; and with no usable reading of the process a free lock and a last look that
 /// showed nothing is [`Why::NotShown`], and an unreadable lock is [`Why::Unlooked`].
 async fn wait_for_the_end(
@@ -1680,7 +1684,7 @@ async fn wait_for_the_end(
                 match look {
                     Endpoint::Nobody => Some(End::Gone),
                     Endpoint::Another => Some(End::Successor(operations.named_daemon())),
-                    Endpoint::Same(_) | Endpoint::Unclear => None,
+                    Endpoint::Same(_) | Endpoint::Unproved(_) | Endpoint::Unclear => None,
                 }
             }
             (Ok(true), None) => {
@@ -1694,9 +1698,14 @@ async fn wait_for_the_end(
             return seen;
         }
         if tokio::time::Instant::now() >= deadline {
-            return End::NotEnded(match (unlooked, old_gone, last_look) {
+            // Something answered the last look, with a proved generation or without one.
+            let answered = match last_look {
+                Some(Endpoint::Same(answered) | Endpoint::Unproved(answered)) => Some(answered),
+                Some(Endpoint::Nobody | Endpoint::Another | Endpoint::Unclear) | None => None,
+            };
+            let why = match (unlooked, old_gone, last_look) {
                 // The last look showed a daemon of the generation asked answering.
-                (_, _, Some(Endpoint::Same(answered))) => Why::Answers(answered),
+                (_, _, Some(Endpoint::Same(_))) => Why::Answers,
                 // The lock could not be read, and no process is shown to run: there is no usable
                 // reading of the process, or it has gone.
                 (Some(why), _, _) if no_reading || old_gone => Why::Unlooked(why),
@@ -1704,7 +1713,8 @@ async fn wait_for_the_end(
                 // The lock is free and the last look did not show the daemon: no sign of life.
                 _ if no_reading && lock_free => Why::NotShown,
                 _ => Why::Running,
-            });
+            };
+            return End::NotEnded(why, answered);
         }
         operations.pause(LOOK_EVERY.min(left())).await;
     }
@@ -1736,7 +1746,6 @@ async fn successor_of(
 mod answered {
     use kr_ipc::IpcError;
     use kr_ipc::error::ErrorSource;
-    use kr_protocol::hostinfo::HostInfoResult;
     use kr_protocol::ids::ControllerGeneration;
 
     /// What shows that a daemon answered: its answer to a look (the generation that it reported),
@@ -1751,10 +1760,10 @@ mod answered {
     }
 
     impl Answered {
-        /// The answer of a look: the `host.info` that a daemon gave.
-        pub(super) fn from_info(info: &HostInfoResult) -> Self {
+        /// The answer of a look: the generation that the daemon's `host.info` reported.
+        pub(super) const fn reporting(generation: ControllerGeneration) -> Self {
             Self {
-                generation: Some(info.generation),
+                generation: Some(generation),
             }
         }
 
@@ -1782,13 +1791,27 @@ use answered::Answered;
 enum Endpoint {
     /// Nothing listens there.
     Nobody,
-    /// A daemon of the generation that was asked answers, or one answers where the generation is
-    /// not known.
+    /// A daemon answers and reports the generation that was asked: the same daemon, proved.
     Same(Answered),
+    /// Something answers and no generation is proved: a refusal of the greeting (the daemon's own
+    /// reply, which names no generation), or an answer where the generation that was asked is not
+    /// known. It shows that something answers at the endpoint, and neither that the daemon that
+    /// was asked runs nor that it has ended.
+    Unproved(Answered),
     /// A daemon of another generation answers.
     Another,
     /// Something listens and does not answer, or the look could not be made.
     Unclear,
+}
+
+/// What an answer at the endpoint is, by the generation that it reports and the one that was
+/// asked, where the command knows it.
+fn by_generation(asked: Option<ControllerGeneration>, reported: ControllerGeneration) -> Endpoint {
+    match asked {
+        Some(asked) if asked == reported => Endpoint::Same(Answered::reporting(reported)),
+        Some(_) => Endpoint::Another,
+        None => Endpoint::Unproved(Answered::reporting(reported)),
+    }
 }
 
 /// Looks at the environment's endpoint, the connection, the hello and `host.info` together bounded
@@ -1805,19 +1828,17 @@ async fn endpoint_look(
     tokio::time::timeout(within, async {
         match startup::reach(&endpoint, within, &[]).await {
             Reached::Refused(error) if startup::nothing_listening(&error) => Endpoint::Nobody,
-            // A reply of the daemon's own (a refusal of the hello) shows that a daemon answers.
+            // A reply of the daemon's own (a refusal of the hello) shows that a daemon answers, and
+            // names no generation.
             Reached::Refused(error) => {
-                Answered::of_reply(&error).map_or(Endpoint::Unclear, Endpoint::Same)
+                Answered::of_reply(&error).map_or(Endpoint::Unclear, Endpoint::Unproved)
             }
             Reached::Silent => Endpoint::Unclear,
             Reached::Answered(listed) => match *listed {
                 Listed::Other(_) => Endpoint::Another,
                 Listed::Ours(mut client) => match client.request(Method::HostInfo, &()).await {
                     Ok(Ok(value)) => match value.to_typed::<HostInfoResult>() {
-                        Ok(now) if generation.is_some_and(|asked| now.generation != asked) => {
-                            Endpoint::Another
-                        }
-                        Ok(now) => Endpoint::Same(Answered::from_info(&now)),
+                        Ok(now) => by_generation(generation, now.generation),
                         Err(_) => Endpoint::Unclear,
                     },
                     _ => Endpoint::Unclear,
@@ -1999,7 +2020,7 @@ mod tests {
         .await
         .expect("the wait ends at its bound");
         assert!(
-            matches!(waited, End::NotEnded(Why::Running)),
+            matches!(waited, End::NotEnded(Why::Running, _)),
             "a live holder is not an end"
         );
         drop(held);
@@ -2063,7 +2084,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(waited, End::NotEnded(Why::Held)),
+            matches!(waited, End::NotEnded(Why::Held, _)),
             "a lock that stays held with nothing to show for it is not a successor"
         );
         drop(held);
@@ -2086,7 +2107,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(waited, End::NotEnded(Why::NotShown)),
+            matches!(waited, End::NotEnded(Why::NotShown, _)),
             "a free lock and a listener that does not answer is not an end, and no sign of life"
         );
         drop(listener);
@@ -2100,7 +2121,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(waited, End::NotEnded(Why::Running)),
+            matches!(waited, End::NotEnded(Why::Running, _)),
             "a held lock with nothing to show for a successor is not an end"
         );
         drop(held);
@@ -2475,11 +2496,11 @@ mod tests {
         match end {
             End::Gone => "gone".to_owned(),
             End::Successor(named) => format!("successor {named:?}"),
-            End::NotEnded(Why::Running) => "not ended, running".to_owned(),
-            End::NotEnded(Why::Answers(_)) => "not ended, answers".to_owned(),
-            End::NotEnded(Why::NotShown) => "not ended, not shown".to_owned(),
-            End::NotEnded(Why::Held) => "not ended, held".to_owned(),
-            End::NotEnded(Why::Unlooked(_)) => "not ended, not looked at".to_owned(),
+            End::NotEnded(Why::Running, _) => "not ended, running".to_owned(),
+            End::NotEnded(Why::Answers, _) => "not ended, answers".to_owned(),
+            End::NotEnded(Why::NotShown, _) => "not ended, not shown".to_owned(),
+            End::NotEnded(Why::Held, _) => "not ended, held".to_owned(),
+            End::NotEnded(Why::Unlooked(_), _) => "not ended, not looked at".to_owned(),
         }
     }
 
@@ -3670,7 +3691,7 @@ mod tests {
                 vec![at_once(Endpoint::Unclear)]
             };
             let supplied = Supplied::new().held(vec![at_once(Ok(false))]).look(looks);
-            let End::NotEnded(why) = wait_for_the_end(&supplied, None, END_BOUND).await else {
+            let End::NotEnded(why, _) = wait_for_the_end(&supplied, None, END_BOUND).await else {
                 panic!("the daemon is not shown to have ended");
             };
             assert!(
@@ -3697,10 +3718,10 @@ mod tests {
             at_once(Endpoint::Unclear),
             at_once(Endpoint::Same(an_answer())),
         ]);
-        let End::NotEnded(why) = wait_for_the_end(&supplied, None, END_BOUND).await else {
+        let End::NotEnded(why, _) = wait_for_the_end(&supplied, None, END_BOUND).await else {
             panic!("the daemon still answers");
         };
-        assert!(matches!(why, Why::Answers(_)));
+        assert!(matches!(why, Why::Answers));
         let said = not_ended_said(why, None, &paths, id, None).to_string();
         assert!(
             said.starts_with(&format!(
@@ -3708,6 +3729,74 @@ mod tests {
             )),
             "{said}"
         );
+    }
+
+    /// An answer proves the daemon that was asked only by the generation that it reports. Where the
+    /// generation asked is not known, or the answer names none, the answer proves nothing of which
+    /// daemon it is.
+    #[test]
+    fn an_answer_proves_the_daemon_only_by_the_generation_that_was_asked() {
+        let one = ControllerGeneration::new(1);
+        let two = ControllerGeneration::new(2);
+        assert!(matches!(by_generation(Some(one), one), Endpoint::Same(_)));
+        assert!(matches!(by_generation(Some(one), two), Endpoint::Another));
+        assert!(matches!(by_generation(None, one), Endpoint::Unproved(_)));
+        assert!(matches!(by_generation(None, two), Endpoint::Unproved(_)));
+    }
+
+    /// An answer with no proved generation shows that something answers at the endpoint, and
+    /// neither that the daemon that was asked runs nor that it has ended. After a request that
+    /// was written, with the process read as ended and the lock held by a holder that is not named,
+    /// the command says what the lock shows ("has gone, and something ... still holds"), for a
+    /// told stop and for one whose outcome was not shown: it does not say that the daemon has not
+    /// ended. With no usable reading of the process and the lock free, it says that the end was not
+    /// confirmed. Where the request could not be made, any answer is an answer.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_with_no_proved_generation_is_no_sign_of_life_and_no_sign_of_an_end() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let paths = temp.environment();
+        let id = paths.environment_id();
+        let process = asked_process();
+        let failure = Shown::said("the connection was lost");
+        let unproved = || at_once(Endpoint::Unproved(an_answer()));
+        let supplied = Supplied::new()
+            .held(vec![at_once(Ok(true))])
+            .process(vec![at_once(ProcessState::Ended)])
+            .look(vec![unproved()]);
+        let ended = wait_for_the_end(&supplied, Some(&process), END_BOUND).await;
+        assert_eq!(said(&ended), "not ended, held");
+        let End::NotEnded(why, answered) = ended else {
+            panic!("the daemon is not shown to have ended");
+        };
+        assert!(answered.is_some(), "something answered the last look");
+        assert!(matches!(why, Why::Held));
+        for not_known in [None, Some(&failure)] {
+            let said = not_ended_said(Why::Held, not_known, &paths, id, Some(&process)).to_string();
+            assert!(
+                said.starts_with(&format!(
+                    "The process of the control daemon for environment {id} has gone, and something \
+                     that is not shown to be a control daemon still holds the environment"
+                )),
+                "{said}"
+            );
+            assert!(!said.contains("has not ended"), "{said}");
+        }
+        let supplied = Supplied::new()
+            .held(vec![at_once(Ok(false))])
+            .look(vec![unproved()]);
+        let ended = wait_for_the_end(&supplied, None, END_BOUND).await;
+        assert_eq!(said(&ended), "not ended, not shown");
+        for old in [None, Some(&process)] {
+            let supplied = Supplied::new().look(vec![unproved()]);
+            let ended = arm(&supplied, old, false).await;
+            assert_eq!(arm_said(ended.as_ref()), "the request's failure", "{old:?}");
+            let supplied = Supplied::new()
+                .held(vec![at_once(Ok(true))])
+                .process(vec![at_once(ProcessState::Ended)])
+                .look(vec![unproved()]);
+            let ended = arm(&supplied, old, true).await;
+            assert_eq!(arm_said(ended.as_ref()), "the request's failure", "{old:?}");
+        }
     }
 
     /// A lock that is held and a process that cannot be read (no identity, as on Windows) is a
@@ -4054,7 +4143,8 @@ mod tests {
                 .process(vec![at_once(ProcessState::Unknown {
                     detail: "denied".to_owned(),
                 })]);
-            let End::NotEnded(why) = wait_for_the_end(&supplied, Some(&process), END_BOUND).await
+            let End::NotEnded(why, _) =
+                wait_for_the_end(&supplied, Some(&process), END_BOUND).await
             else {
                 panic!("nothing shows that the daemon has ended");
             };
@@ -4267,7 +4357,7 @@ mod tests {
                 ),
             ),
         ] {
-            for why in [Why::Running, Why::Answers(an_answer())] {
+            for why in [Why::Running, Why::Answers] {
                 let error = CliError::Unfinished {
                     code: ErrorCode::EnvironmentUnavailable,
                     message: not_ended_said(why, not_known, &paths, id, None),
