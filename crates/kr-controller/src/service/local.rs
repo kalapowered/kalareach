@@ -439,12 +439,18 @@ impl Controller {
         let mut begun = false;
         loop {
             let attempt = {
-                let permitted = || match self.ask_where_a_frame_lands(leased, under) {
-                    Ok(held) => {
-                        asked = held;
-                        true
+                let permitted = || {
+                    // What the earlier question was asked with goes before this one's reading of
+                    // the lease: a slot that the new value overwrote would let the old one go after
+                    // this question, and a transport attempt asks before each chunk it writes.
+                    drop(std::mem::take(&mut asked));
+                    match self.ask_where_a_frame_lands(leased, under) {
+                        Ok(held) => {
+                            asked = held;
+                            true
+                        }
+                        Err(_) => false,
                     }
-                    Err(_) => false,
                 };
                 if begun {
                     writer.resume_frame_checked(permitted)

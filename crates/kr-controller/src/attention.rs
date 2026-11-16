@@ -1311,10 +1311,13 @@ impl AttentionModule {
                 // The lease is asked first, which takes the policy lock and so can wait, and the
                 // ticket's clock is compared after it: no wait stands after the comparison.
                 let may_write = || {
-                    lease.is_none_or(|lease| (lease.refused)(&mut asked).is_none())
-                        && (!text_held
-                            || (standing.is_some()
-                                && ticket.holds_text(&fences, self.release_ms())))
+                    lease.is_none_or(|lease| {
+                        // What the earlier question was asked with goes before this one's reading
+                        // of the lease, as an attempt asks before each chunk it writes.
+                        drop(std::mem::take(&mut asked));
+                        (lease.refused)(&mut asked).is_none()
+                    }) && (!text_held
+                        || (standing.is_some() && ticket.holds_text(&fences, self.release_ms())))
                 };
                 if begun {
                     writer.resume_frame_checked(may_write)
