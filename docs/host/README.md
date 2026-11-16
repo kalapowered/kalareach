@@ -1286,8 +1286,8 @@ Two limits remain:
   that store opens. The daemon writes the file `controller-identity` in the state directory just
   after it makes the host's identity, so a host without that file has made no identity, unless a
   start ended between the two writes.
-- On macOS a Keychain that cannot be used from a remote shell fails the start when the daemon
-  first uses the Keychain, with the Keychain's own words after the library's prefix.
+- On macOS a Keychain that cannot be used from a remote shell fails the start at a read or a write
+  of a key, with the Keychain's own words after the library's prefix.
 
 A state directory can hold its network keys in the credential store and its device keys in the
 directory, if an earlier start chose the two stores apart. The daemon now uses the directory's set
@@ -1314,8 +1314,8 @@ and nothing else: it allocates no directory and deletes nothing afterwards, so a
 keys to disappear gives the daemon a state directory it owns and throws away. That is what the
 harnesses do, and it is why nothing a test or a measurement does reaches the person's own
 credential store; the in-process suites call `kr_crypto::store::open_store_in` for the same reason.
-The daemon names the store it opened in its first line of output, so a run's log says where its
-keys went.
+The daemon names the store it opened in its first line of standard output, so a run's log says
+where its keys went.
 
 ## Supervision
 
