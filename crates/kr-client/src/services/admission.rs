@@ -421,6 +421,19 @@ impl Entry {
             .is_some_and(|asked| now.saturating_duration_since(asked) >= ASK_WINDOW)
     }
 
+    /// Whether the entry holds an answer that the service is unable and that still explains a
+    /// failed dial: for as long as it is kept, and for as long as the cache will not ask again
+    /// (three requests with no connection, until the ten minutes after the last), because nothing
+    /// renews it while no request is made.
+    fn answer_stands(&self, now: Instant) -> bool {
+        match self.held {
+            Held::Unavailable { kept_until, .. } => {
+                now < kept_until || (self.asks >= MOST_ASKS && !self.window_passed(now))
+            }
+            _ => false,
+        }
+    }
+
     /// Whether a dial that starts `now` asks for this entry again.
     fn asks_again(&self, now: Instant) -> bool {
         if self.pending || (self.asks >= MOST_ASKS && !self.window_passed(now)) {
@@ -667,9 +680,20 @@ impl PairingAdmissions {
                 retry_after_seconds,
                 answered_at: now,
             },
-            Err(error) => Held::Failed {
-                retry_at: now + retry_delay(&error),
-            },
+            Err(error) => {
+                let retry = now + retry_delay(&error);
+                // A request that failed says nothing about what the service last said, so an answer
+                // that still stands is kept as it is, and only the time a dial asks again moves.
+                // That time moves later: a request is made only once the answer's own retry time
+                // has come.
+                if entry.answer_stands(now)
+                    && let Held::Unavailable { retry_at, .. } = &mut entry.held
+                {
+                    *retry_at = retry;
+                    return;
+                }
+                Held::Failed { retry_at: retry }
+            }
         };
     }
 
@@ -698,20 +722,18 @@ impl PairingAdmissions {
         let now = self.clock.now();
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let entry = state.entries.get(&key)?;
-        // An answer that the service is unable stands for as long as it explains a failed dial, and
-        // for as long as the cache will not ask again (three requests with no connection, until the
-        // ten minutes after the last), because nothing renews it while no request is made.
         match &entry.held {
             Held::Unavailable {
-                kept_until,
                 retry_at,
                 alternatives,
                 retry_after_seconds,
                 answered_at,
-            } if now < *kept_until || (entry.asks >= MOST_ASKS && !entry.window_passed(now)) => {
+                ..
+            } if entry.answer_stands(now) => {
                 // What a person is told to wait is the device's own wait: what is left until it asks
-                // the service again (the answer's retry time, the end of the ask window when the asks
-                // are used up, the end of a stop of requests), whether or not the service named a
+                // the service again (the retry time, which a failed request moves later, the end of
+                // the ask window when the asks are used up, the end of a stop of requests), whether
+                // or not the service named a
                 // delay, and never less than what is left of the delay it named. The answer is kept
                 // past its delay while the cache will not ask again, and every try before then fails
                 // in the same way. At most a day, by the cache's own cap on a delay.

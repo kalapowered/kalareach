@@ -1386,3 +1386,110 @@ async fn kr_req_17_48_a_list_with_no_text_is_no_list() {
     };
     assert_eq!(words_of(alternatives), mixed);
 }
+
+/// What `admissions` hands on at each of `probes` (seconds after the first dial): how many requests
+/// the service has been sent, and the wait a failed dial is told, when a refusal explains it.
+async fn waits_at(
+    service: &Arc<Scripted>,
+    clock: &AdmissionClock,
+    admissions: &PairingAdmissions,
+    probes: &[u64],
+) -> Vec<(u64, usize, Option<u64>)> {
+    let (host, relays) = (key(0x11), network(&[MANAGED]));
+    let mut seen = Vec::new();
+    let mut at = 0;
+    for &probe in probes {
+        clock.advance(Duration::from_secs(probe - at));
+        at = probe;
+        admissions.before_dial(&relays, &host, key(0x22)).await;
+        seen.push((
+            probe,
+            service.asks(),
+            handed_on(&admissions.refusal(&relays, &host)),
+        ));
+    }
+    seen
+}
+
+/// KR-REQ-17.48: a request that fails keeps the answer that the service is unable, for as long as
+/// that answer stands, and moves only the time a dial asks again. A third request that got no
+/// answer does not turn the next ten minutes into "the host cannot be reached" with no wait: each
+/// try is told what the answer said, with the wait that is left until the device asks again.
+#[tokio::test]
+async fn kr_req_17_48_a_failed_request_keeps_the_answer_that_still_stands() {
+    const SHORT: &str = "Managed capacity for new pairing invitations is not available now.";
+    let lists: [&[&str]; 2] = [&STILL_WORK, &[]];
+    for alternatives in lists {
+        let unavailable = || {
+            Ok(AdmissionAnswer::Unavailable {
+                message: SHORT.to_owned(),
+                alternatives: alternatives.iter().map(|path| (*path).to_owned()).collect(),
+                retry_after_seconds: None,
+            })
+        };
+        let failed = || {
+            Err(Error::refusal(
+                ErrorCode::ResourceUnavailable,
+                "no answer".into(),
+            ))
+        };
+        let (host, relays) = (key(0x11), network(&[MANAGED]));
+
+        // Answers at 0 s and 21 s, then no answer to the third request at 61 s, then each try
+        // inside the ten minutes after it. The dial at 661 s asks again and gets none, and what the
+        // answers said has ended by then.
+        let clock = AdmissionClock::default();
+        let service = Scripted::new(vec![unavailable(), unavailable(), failed()]);
+        let admissions = scripted_admissions(Arc::clone(&service), &clock);
+        let seen = waits_at(
+            &service,
+            &clock,
+            &admissions,
+            &[0, 21, 26, 61, 66, 130, 400, 660, 661],
+        )
+        .await;
+        assert_eq!(
+            seen,
+            [
+                (0, 1, Some(20)),
+                (21, 2, Some(20)),
+                (26, 2, Some(15)),
+                (61, 3, Some(600)),
+                (66, 3, Some(595)),
+                (130, 3, Some(531)),
+                (400, 3, Some(261)),
+                (660, 3, Some(1)),
+                (661, 4, None),
+            ],
+            "{alternatives:?}"
+        );
+
+        // A request that fails before the third: the answer still stands, and the next request is
+        // made when the failure moved the time to, twenty seconds on, not when the answer named it.
+        let clock = AdmissionClock::default();
+        let service = Scripted::new(vec![unavailable(), failed()]);
+        let admissions = scripted_admissions(Arc::clone(&service), &clock);
+        let seen = waits_at(&service, &clock, &admissions, &[0, 21, 26, 41, 46]).await;
+        assert_eq!(
+            seen,
+            [
+                (0, 1, Some(20)),
+                (21, 2, Some(20)),
+                (26, 2, Some(15)),
+                (41, 3, Some(600)),
+                (46, 3, Some(595)),
+            ],
+            "{alternatives:?}"
+        );
+        // It is still the answer's own, of the kind it was.
+        match admissions.refusal(&relays, &host) {
+            Some(RelayRefusal::Capacity {
+                alternatives: kept, ..
+            }) => {
+                assert_eq!(words_of(&kept), alternatives);
+            }
+            Some(RelayRefusal::Fault { .. }) => assert!(alternatives.is_empty()),
+            None => panic!("a failed request replaced the answer that still stood"),
+        }
+    }
+}
