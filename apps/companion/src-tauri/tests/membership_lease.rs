@@ -2013,12 +2013,14 @@ async fn a_session_read_after_a_wait_stop_is_sent_with_its_own_wait_and_no_actio
     let rig = Rig::start_with(SERVED, 1).await;
     rig.connection(true).await;
     rig.waits.until_asked(1).await;
+    // Another account signs in. Its keeper has taken no lease, and the service asks it to wait an
+    // hour for the first.
     rig.refuses_the_next_lease(Moment::Refuse {
         status: 429,
         code: "RATE_LIMITED",
         retry_after_seconds: Some(3600),
     });
-    let rig = rig.restarted().await;
+    rig.switches_to("bea").await;
     // The application's own connection asks first and is told to wait; the read then finds the same
     // stop held against the service.
     let _ = rig.down_because("wait").await;
