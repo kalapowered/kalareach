@@ -595,6 +595,16 @@ impl Controller {
         self.after_the_record_asks_the_feed.arm()
     }
 
+    /// Arms the pause the next record of an owner's request or of its answer stops at before its
+    /// transaction begins. Returns the end that says the record has arrived, and the end that lets
+    /// it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_the_record_begins(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.before_the_record_begins.arm()
+    }
+
     /// Arms the pause the next admission check stops at before its last reading of the fence. Returns
     /// the end that says the check has arrived, and the end that lets it go. The pause fires once.
     #[cfg(feature = "testing")]
