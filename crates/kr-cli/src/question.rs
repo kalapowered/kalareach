@@ -1558,17 +1558,27 @@ pub async fn cancel(
         descriptor.session_id,
     )
     .map_err(CliError::Refused)?;
-    let quote = match after_unknown {
-        Some(earlier) => Some(
-            crate::unknown::earlier(&mut client, earlier, Method::QuestionCancel, "cancellation")
-                .await?,
-        ),
-        None => None,
-    };
+    let cancel = shown!("kr question cancel {}", question_id);
     let unknown = crate::unknown::Unknown {
         what: "the cancellation",
         read_back: crate::unknown::ReadBack::of(shown!("{}", descriptor.session_id), None),
-        later: Some(shown!("kr question cancel {}", question_id)),
+        later: Some(crate::unknown::Later {
+            command: cancel.clone(),
+            asks_again: shown!("`{}` asks again", cancel),
+        }),
+    };
+    let quote = match after_unknown {
+        Some(earlier) => Some(
+            crate::unknown::earlier(
+                &mut client,
+                earlier,
+                Method::QuestionCancel,
+                "cancellation",
+                &unknown,
+            )
+            .await?,
+        ),
+        None => None,
     };
     let result: QuestionResolveResult = crate::unknown::mutate_naming(
         &mut client,
