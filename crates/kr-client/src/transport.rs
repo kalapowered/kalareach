@@ -176,13 +176,20 @@ pub trait ControlTransport: Send + Sync + std::fmt::Debug {
     /// Returns [`ClientError::ConnectionEnded`] when the receive side is already claimed.
     fn claim_receiver(&self) -> Result<()>;
 
-    /// Reads the next control frame, or `None` when the stream ended without a failure: this side
-    /// closed the connection, which every transport reports as `None` by its own knowledge of its
-    /// close, whatever its read would otherwise fail with; or the peer finished the stream at a
-    /// frame's boundary on a network connection. Every other end is an error that carries what the
-    /// transport said, and it stays that error when a close follows it. The local link reports the
-    /// peer's end at a frame's boundary as an error, and also closes itself, and then returns
-    /// `None`, after a write that was cut or failed part way.
+    /// Reads the next control frame, or `None` when the stream ended without a failure: this
+    /// transport's own close ended the read, or the peer finished the stream at a frame's boundary
+    /// on a network connection.
+    ///
+    /// A read's end is classified by what the read itself returned and by a mark that the
+    /// transport sets itself, before its own close touches the connection; it reads no record or
+    /// flag that a later close can change. On the network a read whose own cause says that this
+    /// side closed the connection ends cleanly only when the transport's own close was called, so
+    /// a close that another part of the program made (the endpoint's) is an error. On the local
+    /// link this side's close takes no read's result from it. Every other end is an error that
+    /// carries what the read returned (on the network the connection's cause, typed as
+    /// [`kr_transport::TransportError::StreamLost`]), and it stays that error when a close follows
+    /// it. The local link reports the peer's end at a frame's boundary as an error, and also
+    /// closes itself, and then returns `None`, after a write that was cut or failed part way.
     ///
     /// Only the holder of the claim calls this.
     fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>>;
