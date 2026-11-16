@@ -542,8 +542,7 @@ mod tests {
         takes_a_transport::<IpcTransport>();
     }
 
-    use kr_protocol::envelope::{Outcome, ParamsValue, Request, Response};
-    use kr_protocol::error::{ErrorCode, ProtocolError};
+    use kr_protocol::envelope::{ParamsValue, Request};
     use kr_protocol::ids::RequestId;
     use kr_protocol::method::Method;
     use std::time::Duration;
@@ -619,13 +618,6 @@ mod tests {
         })
     }
 
-    fn answer(id: u64, outcome: Outcome) -> ControlFrame {
-        ControlFrame::Response(Response {
-            request_id: RequestId::new(id),
-            outcome,
-        })
-    }
-
     fn request_id_of(frame: &ControlFrame) -> RequestId {
         match frame {
             ControlFrame::Request(request) => request.request_id,
@@ -667,20 +659,57 @@ mod tests {
         }
     }
 
-    /// A failed write with part of a frame sent whose error does not say that the peer has gone
-    /// closes the connection: it holds the start of a frame and nothing else would end it. The
-    /// failure is made by writing on a writer that already holds part of a frame, which a write
-    /// never leaves behind and which the frame writer refuses with an error of its own.
+    /// Hands one piece of a frame of more than one piece to the peer, and no more, so that the
+    /// writer holds part of a frame on every platform whatever a socket or a pipe would take of
+    /// the whole.
+    ///
+    /// The checked write asks `may_write` before each transport write and stops at a refusal. The
+    /// check here allows one write for each attempt: the write that goes hands over what one write
+    /// takes (never none, on a socket or a pipe that holds nothing yet), and the next is refused
+    /// with the rest in hand. A transport write that is answered as not ready before a byte goes
+    /// (a pipe that is new to the runtime) is waited for and the frame is continued.
+    async fn hold_part_of_a_frame(half: &mut FrameWriter, frame: &[u8]) {
+        for _ in 0..8 {
+            let mut allowed = true;
+            let mut one_write = || std::mem::take(&mut allowed);
+            let outcome = if half.is_mid_frame() {
+                half.resume_frame_checked(&mut one_write)
+            } else {
+                half.begin_frame_checked(frame, &mut one_write)
+            }
+            .expect("the peer is there");
+            assert_ne!(
+                outcome,
+                kr_ipc::framed::CheckedWrite::Complete,
+                "a frame of several pieces went whole in one write"
+            );
+            if half.has_sent_any() {
+                return;
+            }
+            half.writable().ready().await.expect("the wait returns");
+        }
+        panic!("the connection took no byte of the frame in eight attempts");
+    }
+
+    /// A failed write whose error does not say that the peer has gone, on a writer that holds part
+    /// of a frame, closes the connection: it holds the start of a frame and nothing else would end
+    /// it. It is the rule for every platform, and the case makes its state with no help from the
+    /// socket or the pipe: the writer is made to hold part of a frame by one permitted write, and
+    /// the next write on it is refused by the frame writer with an error of its own, which a write
+    /// never leaves behind and which says nothing of a peer that has gone.
     #[tokio::test]
     async fn a_failed_write_that_does_not_say_the_peer_has_gone_closes_the_connection() {
         let (transport, _peer_reader, _peer_writer, _tree) = over_a_raw_connection().await;
         let mut half = transport.writer.lock().await.take().expect("the half");
-        let framed =
-            FrameWriter::encode(StreamKind::Control, &request(1, 900_000)).expect("encodes");
-        half.begin_frame(&framed).expect("begins");
+        let framed = FrameWriter::encode(
+            StreamKind::Control,
+            &request(1, 3 * kr_ipc::framed::CHECKED_WRITE_BYTES),
+        )
+        .expect("encodes");
+        hold_part_of_a_frame(&mut half, &framed).await;
         assert!(
             half.is_mid_frame() && half.has_sent_any(),
-            "the socket of a peer that reads nothing takes part of the frame"
+            "the writer holds part of a frame"
         );
         *transport.writer.lock().await = Some(half);
         let failed = transport.send(&request(2, 8)).await;
@@ -697,65 +726,85 @@ mod tests {
         );
     }
 
-    /// A failed write with part of a frame sent whose error says that the peer has gone does not
-    /// close the connection: the peer wrote its last frames before it went, and every one of them
-    /// is read, then the end. No frame can be written from then on.
-    #[tokio::test]
-    async fn a_failed_write_to_a_peer_that_has_gone_leaves_what_it_sent_to_be_read() {
-        let (transport, peer_reader, mut peer_writer, _tree) = over_a_raw_connection().await;
-        let transport = std::sync::Arc::new(transport);
-        let big = request(1, 900_000);
-        let sending = tokio::spawn({
-            let transport = std::sync::Arc::clone(&transport);
-            async move { transport.send(&big).await }
-        });
-        // The peer reads nothing, so part of the frame goes and the write waits for room.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(!sending.is_finished(), "the frame did not fit the socket");
-        peer_writer
-            .write_message(&answer(7, Outcome::Ok(ParamsValue::empty())))
-            .await
-            .expect("the answer");
-        peer_writer
-            .write_message(&answer(
-                0,
-                Outcome::Error(ProtocolError::new(
-                    ErrorCode::PermissionDenied,
-                    "this connection is refused",
-                )),
-            ))
-            .await
-            .expect("the refusal");
-        // The peer goes with part of the frame unread.
-        drop((peer_reader, peer_writer));
-        let failed = tokio::time::timeout(Duration::from_secs(8), sending)
-            .await
-            .expect("the write ended")
-            .expect("the task");
-        assert!(
-            matches!(&failed, Err(ClientError::Ipc(kr_ipc::IpcError::PeerClosed))),
-            "{failed:?}"
-        );
-        assert!(
-            !transport.is_closed(),
-            "the connection stands, for its reader to read to the peer's end"
-        );
-        assert!(!transport.can_send(), "nothing can be written any more");
-        let mut read = Vec::new();
-        loop {
-            match transport.recv().await {
-                Ok(Some(frame)) => read.push(request_id_of(&frame)),
-                // The peer's end at a frame's boundary is the link's own failure, which the end of
-                // a session carries; it is no clean end, which is this side's own close.
-                Err(ClientError::Ipc(kr_ipc::IpcError::PeerClosed)) => break,
-                other => panic!("a read that is neither a frame nor the peer's end: {other:?}"),
-            }
+    /// The case that needs a socket which takes part of a frame of 900,000 bytes from a peer that
+    /// reads nothing. A Unix socket does. A Windows named pipe does not: its write takes the whole
+    /// slice it is offered, and the unbounded write that a send without a limit makes offers the
+    /// whole frame as one slice (`FrameWriter::begin_frame` on that platform), so the frame goes
+    /// whole and the premise cannot be made there. It is for Unix alone; the rule that closes the
+    /// connection is shown on every platform by the case above.
+    #[cfg(unix)]
+    mod a_peer_that_reads_nothing {
+        use super::*;
+        use kr_protocol::envelope::{Outcome, Response};
+        use kr_protocol::error::{ErrorCode, ProtocolError};
+
+        fn answer(id: u64, outcome: Outcome) -> ControlFrame {
+            ControlFrame::Response(Response {
+                request_id: RequestId::new(id),
+                outcome,
+            })
         }
-        assert_eq!(
-            read,
-            [RequestId::new(7), RequestId::new(0)],
-            "every frame the peer sent before it went is read"
-        );
+
+        /// A failed write with part of a frame sent whose error says that the peer has gone does
+        /// not close the connection: the peer wrote its last frames before it went, and every one
+        /// of them is read, then the end. No frame can be written from then on.
+        #[tokio::test]
+        async fn a_failed_write_to_a_peer_that_has_gone_leaves_what_it_sent_to_be_read() {
+            let (transport, peer_reader, mut peer_writer, _tree) = over_a_raw_connection().await;
+            let transport = std::sync::Arc::new(transport);
+            let big = request(1, 900_000);
+            let sending = tokio::spawn({
+                let transport = std::sync::Arc::clone(&transport);
+                async move { transport.send(&big).await }
+            });
+            // The peer reads nothing, so part of the frame goes and the write waits for room.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(!sending.is_finished(), "the frame did not fit the socket");
+            peer_writer
+                .write_message(&answer(7, Outcome::Ok(ParamsValue::empty())))
+                .await
+                .expect("the answer");
+            peer_writer
+                .write_message(&answer(
+                    0,
+                    Outcome::Error(ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "this connection is refused",
+                    )),
+                ))
+                .await
+                .expect("the refusal");
+            // The peer goes with part of the frame unread.
+            drop((peer_reader, peer_writer));
+            let failed = tokio::time::timeout(Duration::from_secs(8), sending)
+                .await
+                .expect("the write ended")
+                .expect("the task");
+            assert!(
+                matches!(&failed, Err(ClientError::Ipc(kr_ipc::IpcError::PeerClosed))),
+                "{failed:?}"
+            );
+            assert!(
+                !transport.is_closed(),
+                "the connection stands, for its reader to read to the peer's end"
+            );
+            assert!(!transport.can_send(), "nothing can be written any more");
+            let mut read = Vec::new();
+            loop {
+                match transport.recv().await {
+                    Ok(Some(frame)) => read.push(request_id_of(&frame)),
+                    // The peer's end at a frame's boundary is the link's own failure, which the end of
+                    // a session carries; it is no clean end, which is this side's own close.
+                    Err(ClientError::Ipc(kr_ipc::IpcError::PeerClosed)) => break,
+                    other => panic!("a read that is neither a frame nor the peer's end: {other:?}"),
+                }
+            }
+            assert_eq!(
+                read,
+                [RequestId::new(7), RequestId::new(0)],
+                "every frame the peer sent before it went is read"
+            );
+        }
     }
 
     use crate::ordered::{Ended, Ordered, OrderedEvents};
