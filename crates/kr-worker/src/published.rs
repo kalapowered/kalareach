@@ -12,8 +12,10 @@
 //! application is doing, and how many launches wait for the reader, is for that reason read from
 //! the input domain, which holds all three as they are, and never from the copy. The application's
 //! producer writes what the application is doing there as each fact joins, and the task that reads
-//! the fact waits for no storage call to do it, so a turn that begins while a storage call holds
-//! the session is in the answer from the evidence loop's next read of the broker. A question cannot
+//! the fact waits for no storage call of the session's to do it (it can wait for the broker's lock,
+//! for at most five seconds, behind a broker commit that waits for the journal's file while a hold
+//! keeps it), so a turn that begins while a storage call holds the session is in the answer from
+//! the evidence loop's next read of the broker. A question cannot
 //! begin then, because its creation runs with the session taken, and a launch that begins then is
 //! not in the answer: it is registered under the session, which the request waits for.
 //!
