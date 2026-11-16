@@ -1117,7 +1117,12 @@ impl Host {
         let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
         let ending = kr_ipc::testing::Serving::guarding(&clients);
         // The endpoint configuration is this suite's own, so the network is registered here rather
-        // than from the environment. The device keys live in memory and go with it.
+        // than from the environment. Unless a case holds the daemon's timer, the network's keys
+        // are this suite's memory store, which a restart keeps so that the same endpoint comes
+        // back, while the daemon's own keys (the membership key, which
+        // `replace_host_authorisation` replaces on its own) stay in the environment's directory.
+        // So these cases run two key sets in one start on purpose: the product opens one store for
+        // both, and `network_key_store.rs` is where that is shown.
         let joined = net::register(
             &controller,
             NetworkSetup {

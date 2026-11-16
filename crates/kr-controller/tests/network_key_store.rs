@@ -145,9 +145,15 @@ async fn a_start_where_the_platform_store_does_not_open_is_refused_and_makes_no_
         StoreSelection::Platform,
     )
     .await;
+    let refusal = refusal_of(
+        refused,
+        "a host whose keys are in the platform store does not start without it",
+    );
     assert!(
-        refused.is_err(),
-        "a host whose keys are in the platform store does not start without it"
+        refusal.contains("This host keeps its keys in ")
+            && refusal.contains("cannot be opened from here")
+            && refusal.contains("No key was made or changed"),
+        "the refusal says what could not be opened and that no key was made: {refusal}"
     );
     assert!(
         kept_in_files(&environment).is_empty(),
@@ -201,9 +207,13 @@ async fn a_start_with_the_file_store_over_a_platform_record_is_refused_and_makes
     drop(first);
 
     let refused = start(&environment, host.environment_id(), StoreSelection::File).await;
+    let refusal = refusal_of(
+        refused,
+        "the file store is not the store of a host whose keys are in the platform's",
+    );
     assert!(
-        refused.is_err(),
-        "the file store is not the store of a host whose keys are in the platform's"
+        refusal.contains("`--secret-store file`") && refusal.contains("No key was made or changed"),
+        "the refusal names the option and says that no key was made: {refusal}"
     );
     assert!(
         kept_in_files(&environment).is_empty(),
@@ -230,6 +240,14 @@ async fn a_start_with_the_file_store_over_a_platform_record_is_refused_and_makes
     );
 }
 
+/// The words of a refused start, or a failure of the case when the daemon started.
+fn refusal_of(started: kr_controller::Result<Arc<Controller>>, why: &str) -> String {
+    match started {
+        Ok(_) => panic!("{why}"),
+        Err(error) => error.to_string(),
+    }
+}
+
 /// Writes the document that puts the host on the network, on loopback alone.
 fn put_on_the_network(environment: &kr_ipc::paths::EnvironmentPaths) {
     let mut document = ConfigurationDocument::empty();
@@ -250,6 +268,9 @@ fn put_on_the_network(environment: &kr_ipc::paths::EnvironmentPaths) {
 /// Starts a daemon in-process over `environment` with the store `selection` names, launching no
 /// worker. The controller's own identity is opened through the same selection, as the daemon's
 /// program opens it, so the directory and the record are in the state the program leaves them in.
+/// The program reads its marker file to tell a first start from a later one; this passes
+/// `initialised_before = false` every time, so a start here never meets the program's own refusal
+/// of a missing identity, and a case shows the selection's rule and not that older one.
 async fn start(
     environment: &kr_ipc::paths::EnvironmentPaths,
     environment_id: EnvironmentId,

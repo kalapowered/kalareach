@@ -2583,6 +2583,10 @@ mod tests {
     ))]
     #[test]
     fn a_recorded_fallback_is_not_abandoned() {
+        // `open_store` asks the platform store whether it opens before it reads the record, so
+        // this case holds the stand-in and never reaches this machine's own credential service.
+        let switch = stand_in::Switch::take("kalareach-test");
+        switch.opens();
         let base = scratch_directory("migration");
         let store = FileStore::open(&base).expect("a store");
         store
