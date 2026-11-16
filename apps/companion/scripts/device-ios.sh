@@ -613,7 +613,7 @@ session_tests() { # <name>
     *) return 1 ;;
   esac
 }
-session_minutes() { case $1 in s0) echo 20 ;; s1) echo 30 ;; s2a) echo 30 ;; s2b) echo 30 ;; s3a) echo 10 ;; s3b) echo 15 ;; s4) echo 10 ;; esac; }
+session_minutes() { case $1 in s0) echo 20 ;; s1) echo 30 ;; s2a) echo 30 ;; s2b) echo 120 ;; s3a) echo 10 ;; s3b) echo 15 ;; s4) echo 10 ;; esac; }
 # Which build of the application a session installs: s0 and s1 hold Firebase's configuration, s2a and s2b run the harness page.
 session_app() { case $1 in s0 | s1) echo app ;; s2a | s2b) echo harness-nofirebase ;; *) echo app-nofirebase ;; esac; }
 
