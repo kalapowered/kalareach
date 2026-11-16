@@ -24,7 +24,7 @@ use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable};
 use super::a_result_the_lease_ended_over::{
     Presenter, connected_under_a_lease_that_can_be_presented_again,
 };
-use super::an_owner_establishes_the_clock::{Door, registry};
+use super::an_owner_establishes_the_clock::{Door, decides, paired, registry};
 use crate::error::ControllerError;
 use crate::service::net::owner::{Caller, Resolved};
 
@@ -306,6 +306,87 @@ async fn recorded_with_the_bound_moving_inside(display: ConfirmationDisplay) -> 
     with_its_replay(found, &temp, again.0, again.1, action, shown).await
 }
 
+/// As [`recorded_with`], for a caller that is an owner's device on a host with no lease, whose
+/// grant ends in the last wait when `grant_ends` says so. The record is stopped at the end of the
+/// feed's locked ask, which is where its own owner check follows: the grant's end, measured on the
+/// continuous clock the host anchored it on, is found by that check alone, since the landing's
+/// deadline is an hour away and the feed's refusal was read before the stop.
+async fn recorded_by_a_device(grant_ends: bool) -> Found {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (continuous, wall, clocks) = crate::service::net::tests::manual_clocks();
+    let controller = crate::service::net::tests::daemon_on(&temp, clocks).await;
+    let device = paired(
+        &controller,
+        &kr_crypto::keys::DeviceKeys::generate().expect("keys"),
+        0x42,
+        &[ActionRight::HostManage],
+        kr_protocol::grant::GrantExpiry::At {
+            expires_at_ms: kr_protocol::scalars::TimestampMs::new(
+                wall.load(Ordering::SeqCst) + 10 * 60 * 1000,
+            ),
+        },
+    );
+    // The host decides the grant here for the first time, which anchors it: the record's own check
+    // reads what has been anchored and writes nothing.
+    assert!(
+        decides(&controller, &device),
+        "the grant is in force before the request"
+    );
+    let door = Door::open(&temp, &controller).await;
+    let revision = controller.admitted_revision(door.connection_id()).ok();
+    let deadline = controller
+        .clock
+        .now()
+        .checked_add(Duration::from_secs(3600))
+        .expect("a deadline");
+    let caller = Caller::device(device).landed(controller.pairing_landing(
+        door.connection_id(),
+        revision,
+        Some(deadline),
+    ));
+    let action = (
+        ActionId::new(kr_ipc::new_uuid()),
+        Digest256::from_bytes([3; 32]),
+    );
+    let (arrived, go) = controller.pause_after_the_record_asks_the_feed();
+    let owner = Arc::clone(controller.owner_authority());
+    let (again, shown) = ((Arc::clone(&owner), caller.clone()), establishing());
+    let begun_at = kr_ipc::now_ms().get();
+    let asking = tokio::task::spawn_blocking(move || {
+        let copied = AtomicBool::new(false);
+        let answered = owner.request(&caller, resolved(establishing()), action, &copied);
+        (answered, copied.load(Ordering::Acquire))
+    });
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30)))
+        .await
+        .expect("the wait ends")
+        .expect("the record reaches the end of the feed's ask");
+    if grant_ends {
+        continuous.advance(Duration::from_secs(11 * 60));
+    }
+    go.send(()).expect("the record goes on");
+    let (answered, copied) = asking.await.expect("the request ends");
+    let first_writes = controller.first_writes_reached();
+    let ended_at = kr_ipc::now_ms().get();
+    let rows = registry(&temp)
+        .query_row(
+            "SELECT COUNT(*) FROM pairing_actions WHERE action_id = ?1",
+            [action.0.get().as_bytes().as_slice()],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("the records are read");
+    let found = Found {
+        answered,
+        copied,
+        rows,
+        replayed: None,
+        has_an_owner: false,
+        window: (begun_at, ended_at),
+        first_writes,
+    };
+    with_its_replay(found, &temp, again.0, again.1, action, shown).await
+}
+
 /// The request's reply, compared whole. Every field a case can know is compared with what it knows: the
 /// action, the digest, the absent destination, the empty rights, the expiry (a confirmation's
 /// lifetime on from the wall reading, between the readings the case took around the request) and
@@ -501,4 +582,26 @@ async fn a_request_whose_deadline_passes_while_its_write_stands_is_refused_at_th
             "the record is refused after its first write, at the commit"
         );
     }
+}
+
+/// KR-REQ-17.54: the record's own owner check reads the device's grant after the feed's locked ask,
+/// inside the transaction: a grant that ends in the last wait is found by that check, the request
+/// is refused in the check's own words, whole, and no row is recorded and no write is made. The
+/// control: where the grant stands, the same request is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_from_a_device_whose_grant_ends_in_the_last_wait_is_refused_as_no_owners_and_records_nothing()
+ {
+    written(&recorded_by_a_device(false).await);
+    let found = recorded_by_a_device(true).await;
+    let refusal = found.answered.as_ref().expect_err("the request is refused");
+    let not_the_owner = ControllerError::PermissionDenied {
+        detail: "only this host's owner asks for an owner confirmation".to_owned(),
+    };
+    assert_eq!(refusal.to_string(), not_the_owner.to_string());
+    assert_eq!(refusal.code(), not_the_owner.code());
+    assert_eq!(found.rows, 0, "nothing is recorded");
+    assert_eq!(
+        found.first_writes, 0,
+        "the record is refused before its first write"
+    );
 }
