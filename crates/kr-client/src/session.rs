@@ -1180,9 +1180,11 @@ impl Session {
     /// write, so the request may reach the host with no one waiting for its answer; on the local
     /// link a drop inside the write closes the connection. Dropped once the frame is written, it
     /// gives back its place among the outstanding mutations and its waiter. The action stays on
-    /// the book as held and unresolved until its owner settles it ([`Session::settle`]): an answer
-    /// that comes later does not clear it, whatever the answer was. An action whose call was
-    /// dropped inside the write stays on the book in the same way.
+    /// the book as unresolved, and the session settles it when the host's definite answer comes,
+    /// though no one waits for it: only an answer that says the outcome is unknown, or no answer,
+    /// leaves it there. An action whose call was dropped inside the write is on the book in the
+    /// same way. A caller that holds its own record of the action sends it with
+    /// [`Session::send`] instead, which leaves the settling to the caller.
     ///
     /// # Errors
     ///
