@@ -17,8 +17,13 @@
  * phase, so that its look is the one that the press had kept until the release.
  *
  * Every event line ends with the time that the page read it (`t=`, milliseconds on the page's own
- * clock, the clock of the pane's handling), and a line of its own says when a link gets and loses the
- * pressed look, so that a tap's release-to-click time and the length of the look can be read from the log.
+ * clock, the clock of the pane's handling) and the time that the event itself was made (`e=`, the same
+ * clock), and a line of its own says when a link gets and loses the pressed look, so that a tap's
+ * release-to-click time and the length of the look can be read from the log. A link has the look while
+ * its element carries `data-pressed`, so the record compares the links that carry it with the links it
+ * has said are lit after every change of the page's elements: a link that loses the look by losing its
+ * element is logged as off, and no other element's pressed state is recorded. `TAPLIT` names the links
+ * that are lit now.
  */
 
 import { useEffect, type ReactNode } from 'react'
@@ -121,7 +126,14 @@ export function TapRecord({ controls }: { readonly controls: FakeHostControls })
     const places = document.getElementById('kr-taps-links')
     const opened = document.getElementById('kr-taps-opened')
     const focus = document.getElementById('kr-taps-focus')
-    if (!log || !places || !opened || !focus) return undefined
+    const lit = document.getElementById('kr-taps-lit')
+    if (!log || !places || !opened || !focus || !lit) return undefined
+    /** The names of the links that carry the pressed look now: the message links' own elements alone. */
+    const litNow = (): string[] => Array.from(document.querySelectorAll<HTMLElement>('.md-link[data-pressed]'), (link) => nameOf(link.title)).sort()
+    const keep = (line: string): void => {
+      seen.push(line)
+      if (seen.length > KEPT) seen.shift()
+    }
     const show = (): void => {
       const rectangles = Array.from(document.querySelectorAll<HTMLElement>('.m-node .md-link'), (link) => {
         const box = link.getBoundingClientRect()
@@ -148,24 +160,34 @@ export function TapRecord({ controls }: { readonly controls: FakeHostControls })
         [log, `TAPLOG ${seen.join(' ; ')}`],
         [places, `TAPLINKS ${[pane, where, ...rectangles].join(' ; ')}`],
         [opened, `TAPOPENED ${String(controls.openedLinks.length)} ${controls.openedLinks.join(' ')}`],
-        [focus, `TAPFOCUS active=${describe(document.activeElement)}`]
+        [focus, `TAPFOCUS active=${describe(document.activeElement)}`],
+        [lit, `TAPLIT ${litNow().join(',') || '-'}`]
       ]
       for (const [element, text] of texts) if (element.textContent !== text) element.textContent = text
     }
-    const litName = (): string => nameOf(document.querySelector<HTMLElement>('.md-link[data-pressed]')?.title ?? '') || '-'
     // When a link gets and loses the pressed look, after the event that it follows: `V <the last event's number> on|off <link> t=<ms>`.
-    const looks = new MutationObserver((records) => {
-      for (const record of records) {
-        const link = record.target
-        if (!(link instanceof HTMLElement)) continue
-        const lit = link.hasAttribute('data-pressed')
-        if (lit === (record.oldValue !== null)) continue
-        seen.push(`V ${String(order)} ${lit ? 'on' : 'off'} ${nameOf(link.title)} t=${round(performance.now())}`)
-        if (seen.length > KEPT) seen.shift()
+    // The links that these lines have said are lit are compared with the links that carry the look after every change of an
+    // attribute or of the page's elements, so a lit link that is replaced or removed is logged as off like one that loses the attribute.
+    const said = new Set<string>()
+    const looks = new MutationObserver(() => {
+      const now = new Set(litNow())
+      const at = round(performance.now())
+      let changed = false
+      for (const name of said) {
+        if (now.has(name)) continue
+        said.delete(name)
+        keep(`V ${String(order)} off ${name} t=${at}`)
+        changed = true
       }
-      show()
+      for (const name of now) {
+        if (said.has(name)) continue
+        said.add(name)
+        keep(`V ${String(order)} on ${name} t=${at}`)
+        changed = true
+      }
+      if (changed) show()
     })
-    looks.observe(document.body, { attributes: true, attributeFilter: ['data-pressed'], attributeOldValue: true, subtree: true })
+    looks.observe(document.body, { attributes: true, attributeFilter: ['data-pressed'], childList: true, subtree: true })
     const note = (event: Event): void => {
       const at = event as MouseEvent
       order += 1
@@ -174,11 +196,11 @@ export function TapRecord({ controls }: { readonly controls: FakeHostControls })
       // At a pointer down, a pointer up and a click, the link that the page's press handling had lit by then
       // (`-` for none): the pointer down and the click run in the bubble phase, after the handler's own listener
       // on the document and the page's own have run, and the pointer up runs before the handler's release.
-      const lit = event.type === 'pointerdown' || event.type === 'pointerup' || event.type === 'click' ? litName() : '-'
-      seen.push(
-        `E ${String(order)} ${event.type} ${describe(event.target)} ${event.isTrusted ? '1' : '0'} ${String(at.detail ?? 0)} ${round(at.clientX ?? 0)} ${round(at.clientY ?? 0)} ${event.constructor.name} ${typeof pointer.pointerId === 'number' ? String(pointer.pointerId) : '-'} ${pointer.pointerType || '-'} lit=${lit} t=${round(performance.now())}`
+      // Every link that is lit then, by name, joined with commas.
+      const litThen = event.type === 'pointerdown' || event.type === 'pointerup' || event.type === 'click' ? litNow().join(',') || '-' : '-'
+      keep(
+        `E ${String(order)} ${event.type} ${describe(event.target)} ${event.isTrusted ? '1' : '0'} ${String(at.detail ?? 0)} ${round(at.clientX ?? 0)} ${round(at.clientY ?? 0)} ${event.constructor.name} ${typeof pointer.pointerId === 'number' ? String(pointer.pointerId) : '-'} ${pointer.pointerType || '-'} lit=${litThen} t=${round(performance.now())} e=${round(event.timeStamp)}`
       )
-      if (seen.length > KEPT) seen.shift()
       show()
     }
     const types = ['pointerup', 'pointercancel', 'focusin'] as const
@@ -215,6 +237,7 @@ export function TapRecord({ controls }: { readonly controls: FakeHostControls })
       <div id="kr-taps-links" />
       <div id="kr-taps-opened" />
       <div id="kr-taps-focus" />
+      <div id="kr-taps-lit" />
     </div>
   )
 }
