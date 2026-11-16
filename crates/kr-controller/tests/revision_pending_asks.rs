@@ -81,6 +81,15 @@ fn authority_presentations(worker: &Worker) -> u64 {
         .presentations_begun_for_tests(ControllerConnectionRole::Authority)
 }
 
+/// The presentations of the daemon's authority role that are waiting at a worker's held boundary
+/// now. The daemon's attention and description readers start by themselves, and a presentation of
+/// theirs that waits at the same boundary is not in it.
+fn authority_presentations_waiting(worker: &Worker) -> usize {
+    worker
+        .service
+        .presentations_waiting_for_role_for_tests(ControllerConnectionRole::Authority)
+}
+
 /// The authority presentations begun at a worker since a count taken earlier.
 fn authority_presentations_since(worker: &Worker, baseline: u64) -> u64 {
     authority_presentations(worker) - baseline
@@ -979,7 +988,6 @@ async fn a_worker_whose_boundary_is_held_through_twenty_passes_holds_one_present
         workers,
     } = Adopted::start(1).await;
     let worker = &workers[0];
-    let service = Arc::clone(&worker.service);
     let begun_before_the_link_closed =
         authority_presentations_with_the_link_up(host.controller(), worker).await;
     let held = restricted_while_the_boundary_is_held(host.controller(), worker).await;
@@ -1004,9 +1012,9 @@ async fn a_worker_whose_boundary_is_held_through_twenty_passes_holds_one_present
         tokio::time::sleep(DEBT_PASS_INTERVAL * 3).await;
     }
     assert_eq!(
-        service.presentations_waiting_for_tests(),
+        authority_presentations_waiting(worker),
         1,
-        "the host's presentations waiting at the held boundary after twenty passes"
+        "the host's authority presentations waiting at the held boundary after twenty passes"
     );
     // A presentation whose daemon has closed its link leaves the count above within a pause, so a
     // host that closed its waiting opening and began another would still show one waiting: what a
@@ -1030,9 +1038,9 @@ async fn a_worker_whose_boundary_is_held_through_twenty_passes_holds_one_present
     )
     .await;
     assert_eq!(
-        service.presentations_waiting_for_tests(),
+        authority_presentations_waiting(worker),
         0,
-        "the one presentation was decided once the boundary was free"
+        "the one authority presentation was decided once the boundary was free"
     );
     host.stop().await;
     drop(workers);
@@ -1318,7 +1326,7 @@ async fn a_repeat_of_a_revocation_does_not_wait_for_a_presentation_that_is_under
     until(
         Duration::from_secs(40),
         "the pass's ask of the worker, which begins a presentation that waits",
-        || worker.service.presentations_waiting_for_tests() == 1,
+        || authority_presentations_waiting(worker) == 1,
     )
     .await;
 
@@ -1715,7 +1723,7 @@ async fn two_openings_waiting_at_held_boundaries_do_not_keep_a_stopped_daemon_al
         || {
             workers
                 .iter()
-                .all(|worker| worker.service.presentations_waiting_for_tests() == 1)
+                .all(|worker| authority_presentations_waiting(worker) == 1)
         },
     )
     .await;
@@ -1908,7 +1916,7 @@ async fn the_pass_looks_at_a_worker_whose_presentation_is_waiting_and_asks_it_no
         Duration::from_secs(40),
         "the pass's ask of the worker, which begins a presentation that waits",
         || {
-            worker.service.presentations_waiting_for_tests() == 1
+            authority_presentations_waiting(worker) == 1
                 && !asks_of(host.controller(), worker.session_id).is_empty()
         },
     )
@@ -1935,7 +1943,7 @@ async fn the_pass_looks_at_a_worker_whose_presentation_is_waiting_and_asks_it_no
         "a worker whose presentation is waiting is not asked again"
     );
     assert_eq!(
-        worker.service.presentations_waiting_for_tests(),
+        authority_presentations_waiting(worker),
         1,
         "the host's one presentation is still waiting"
     );
