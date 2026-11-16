@@ -1515,7 +1515,8 @@ fn handed_on(refusal: &Option<RelayRefusal>) -> Option<u64> {
 /// KR-REQ-17.48: what a failed dial hands on as the wait is the seconds from now until this device
 /// asks the service again, and never less than what is left of the delay the service named: not the
 /// delay as it was named when the answer was read, which is kept past itself while no request is
-/// made. Rounded up, and twenty seconds at least where the service named none.
+/// made. Rounded up. Where the service named no delay, the device asks again twenty seconds after
+/// the answer.
 #[tokio::test]
 async fn kr_req_17_48_the_wait_handed_on_is_the_wait_until_the_device_asks_again() {
     const SHORT: &str = "Managed capacity for new pairing invitations is not available now.";
