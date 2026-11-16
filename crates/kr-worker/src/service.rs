@@ -6905,26 +6905,20 @@ impl WorkerService {
         self.abandon_pending(&ready.pending);
     }
 
-    /// Rejects an accepted action nothing is left to dispatch, and never waits for the session.
+    /// Rejects an accepted action nothing is left to dispatch, and waits for nothing.
     ///
     /// Every end of a connection that held an accepted action comes here: the loop's look at a
-    /// peer that has gone, a preparation whose connection ended, and the clean-up. When a holder
-    /// has the session, the rejection is owed to the service, which makes it when the session
-    /// comes free; the receipt stays `accepted` until then, and counts as outstanding for its
-    /// actor. A client that stays is answered with its rejection by [`Self::reject_accepted`],
-    /// which waits.
+    /// peer that has gone, a preparation whose connection ended, and the clean-up. The rejection is
+    /// owed to the service, whose owner makes it when the session is free, reads the receipt and
+    /// commits the change: the connection's path takes no lock and touches no storage. The receipt
+    /// stays `accepted` until then, and counts as outstanding for its actor. A client that stays is
+    /// answered with its rejection by [`Self::reject_accepted`], which waits.
     fn abandon_pending(&self, pending: &PendingPreparation) {
-        let actor_id = pending.caller.actor_id.clone();
-        let action_id = pending.mutation.action_id;
-        let Some(mut session) = self.runtime.try_session() else {
-            self.clean_up_owed.session.owe(SessionWork::Reject {
-                actor_id,
-                action_id,
-                accepted_at: pending.accepted_at,
-            });
-            return;
-        };
-        Self::reject_abandoned(&mut session, actor_id, action_id, pending.accepted_at);
+        self.clean_up_owed.session.owe(SessionWork::Reject {
+            actor_id: pending.caller.actor_id.clone(),
+            action_id: pending.mutation.action_id,
+            accepted_at: pending.accepted_at,
+        });
     }
 
     /// Rejects an action whose connection ended before it was dispatched, under the session the
