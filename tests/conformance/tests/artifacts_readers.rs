@@ -47,6 +47,7 @@ struct Reading {
     #[cfg_attr(not(unix), allow(dead_code))]
     caseless_after: Option<bool>,
     /// The cache folder PowerShell was given for this run; `None` for the shell.
+    #[cfg_attr(not(unix), allow(dead_code))]
     cache: Option<PathBuf>,
     /// Everything the reader said on its error stream.
     words: String,
@@ -246,11 +247,19 @@ fn spelled_for(reader: Reader, path: &Path) -> PathBuf {
     }
 }
 
-fn readers() -> Vec<Reader> {
+/// The shell reader where a shell is installed, made with no look for PowerShell: a case that
+/// leaves PowerShell out asks for its readers here, so that a look for PowerShell that failed
+/// cannot fail it.
+fn shell_readers() -> Vec<Reader> {
     let mut readers = Vec::new();
     if shell().is_some() {
         readers.push(Reader::Shell);
     }
+    readers
+}
+
+fn readers() -> Vec<Reader> {
+    let mut readers = shell_readers();
     if powershell().is_some() {
         readers.push(Reader::PowerShell);
     }
@@ -261,6 +270,15 @@ fn readers() -> Vec<Reader> {
 /// one, for the cases that bash 3.2 and a newer bash may read differently.
 fn readers_and_system_shell() -> Vec<Reader> {
     let mut readers = readers();
+    if system_shell().is_some() {
+        readers.push(Reader::SystemShell);
+    }
+    readers
+}
+
+/// The shell readers of [`readers_and_system_shell`], made with no look for PowerShell.
+fn shell_readers_and_system_shell() -> Vec<Reader> {
+    let mut readers = shell_readers();
     if system_shell().is_some() {
         readers.push(Reader::SystemShell);
     }
@@ -650,10 +668,7 @@ fn a_filesystem_root_as_the_value_is_refused() {
 /// command substitution, so a `..` before it is the value's last name, and a step up.
 #[test]
 fn a_step_up_before_a_final_line_feed_is_refused_by_the_shell_reader() {
-    for reader in readers()
-        .into_iter()
-        .filter(|reader| matches!(reader, Reader::Shell))
-    {
+    for reader in shell_readers() {
         let temporary = tempfile::tempdir().expect("a temporary folder");
         std::fs::create_dir(temporary.path().join("evidence")).expect("a folder");
         let mut value =
@@ -1147,10 +1162,7 @@ fn the_shell_reader_compares_exact_letters_whatever_the_callers_nocasematch_is()
     let root = parent.path().join("root");
     std::fs::create_dir(&root).expect("a folder");
     let inside = root.join("evidence");
-    for reader in readers_and_system_shell()
-        .into_iter()
-        .filter(|reader| reader.is_shell())
-    {
+    for reader in shell_readers_and_system_shell() {
         for option in ["", "nocasematch"] {
             let named = [
                 ("RUNNER_TEMP", root.as_os_str()),
@@ -1463,10 +1475,7 @@ fn a_drive_letter_is_an_ascii_letter_in_every_locale() {
         stub.path().display(),
         std::env::var("PATH").expect("PATH")
     );
-    for reader in readers_and_system_shell()
-        .into_iter()
-        .filter(|reader| reader.is_shell())
-    {
+    for reader in shell_readers_and_system_shell() {
         let reading = reader.read_with(
             Some(OsStr::new("\u{e9}:\\kr-evidence")),
             None,
@@ -2242,7 +2251,7 @@ mod windows_paths {
             std::process::id()
         ));
         assert!(!nowhere.exists());
-        for reader in readers().into_iter().filter(|reader| reader.is_shell()) {
+        for reader in shell_readers() {
             let named = [
                 ("TMP", nowhere.as_os_str()),
                 ("TEMP", nowhere.as_os_str()),
@@ -2409,4 +2418,49 @@ fn no_two_starts_of_powershell_share_a_cache_folder() {
 #[should_panic(expected = "the look for PowerShell failed: it ended with signal: 11")]
 fn a_look_that_failed_fails_the_case_that_asks() {
     let _ = answer(&Look::Failed("it ended with signal: 11".to_owned()));
+}
+
+/// A look for PowerShell that failed fails the cases that need PowerShell and no other. The cases
+/// run here are the real ones, started in a second run of this test program whose search path
+/// holds a `pwsh` that is the system's `false`: the cases that leave PowerShell out stay green,
+/// and one that needs it fails with the look's words.
+#[cfg(unix)]
+#[test]
+fn a_failed_look_for_powershell_fails_only_the_cases_that_need_it() {
+    let false_program = found_on(&search_path(), "false").expect("the system has false");
+    let folder = tempfile::tempdir().expect("a folder for the failing PowerShell");
+    std::os::unix::fs::symlink(&false_program, folder.path().join("pwsh")).expect("a link");
+    let path = std::env::join_paths(
+        std::iter::once(folder.path().to_owned()).chain(std::env::split_paths(&search_path())),
+    )
+    .expect("a search path");
+    let run = |cases: &[&str]| {
+        Command::new(std::env::current_exe().expect("this test program"))
+            .args(cases)
+            .arg("--exact")
+            .env("PATH", &path)
+            .env_remove("CI")
+            .output()
+            .expect("runs this test program")
+    };
+
+    let shell_only = run(&[
+        "a_step_up_before_a_final_line_feed_is_refused_by_the_shell_reader",
+        "the_shell_reader_compares_exact_letters_whatever_the_callers_nocasematch_is",
+        "a_drive_letter_is_an_ascii_letter_in_every_locale",
+    ]);
+    let text = String::from_utf8_lossy(&shell_only.stdout);
+    assert!(
+        shell_only.status.success() && text.contains("3 passed"),
+        "{text}"
+    );
+
+    let needs_it = run(&["a_value_outside_the_temporary_roots_is_refused_with_its_words"]);
+    let text = String::from_utf8_lossy(&needs_it.stdout);
+    assert!(
+        !needs_it.status.success()
+            && text.contains("the look for PowerShell failed")
+            && text.contains("exit status: 1"),
+        "{text}"
+    );
 }
