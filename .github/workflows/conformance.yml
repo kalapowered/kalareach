@@ -577,7 +577,9 @@ jobs:
       # The report runs from a copy of its program, in a folder of this run's own under the
       # temporary directory, as scripts/run-conformance.sh runs it on the other platforms: a step of
       # the plan builds the report's own package again, and Windows does not let the program that is
-      # running be replaced. The folder is removed when the step ends, by the name the step gave it.
+      # running be replaced. The step removes the folder when it ends, by the name it gave it. A kill
+      # that cannot run that removal leaves the folder and its copy of the program under the
+      # temporary directory.
       - name: The conformance report
         if: ${{ !cancelled() }}
         timeout-minutes: 281

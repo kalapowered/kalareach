@@ -999,6 +999,47 @@ fn no_job_of_the_conformance_workflow_runs_the_report_from_the_file_the_build_wr
     );
 }
 
+/// A person on Windows is shown the PowerShell commands that start the report twice: in the guide,
+/// and in what the script prints where it refuses to run there. They are the same lines.
+#[test]
+fn the_guides_powershell_block_is_what_the_script_prints_on_windows() {
+    let guide = fs::read_to_string(repository().join("docs/conformance/README.md"))
+        .expect("the conformance guide");
+    let block: Vec<&str> = guide
+        .lines()
+        .skip_while(|line| *line != "```powershell")
+        .skip(1)
+        .take_while(|line| *line != "```")
+        .collect();
+    assert!(!block.is_empty(), "the guide holds no PowerShell block");
+    let script = fs::read_to_string(repository().join("scripts/run-conformance.sh"))
+        .expect("the conformance script");
+    // The lines after the one that says to start the report from PowerShell, up to the script's
+    // exit: each is an `echo` of the line, two spaces in, to the error output.
+    let printed: Vec<String> = script
+        .lines()
+        .skip_while(|line| !line.contains("start the report from PowerShell"))
+        .skip(1)
+        .take_while(|line| line.trim() != "exit 2")
+        .map(|line| {
+            let echoed = line
+                .trim()
+                .strip_prefix("echo ")
+                .and_then(|rest| rest.strip_suffix(" >&2"))
+                .unwrap_or_else(|| panic!("not an echo to the error output: {line}"));
+            let quoted = &echoed[1..echoed.len() - 1];
+            quoted
+                .strip_prefix("  ")
+                .unwrap_or_else(|| panic!("not two spaces in: {line}"))
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        printed, block,
+        "the script prints other commands than the guide shows for Windows"
+    );
+}
+
 /// The report builds every suite's test programs in turn into one directory, with no build cache,
 /// and the debug information is the greater part of what that directory holds. A run of the
 /// Windows job that built with it filled the drive near the end, and the last two suites failed to

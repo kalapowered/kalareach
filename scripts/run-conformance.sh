@@ -85,9 +85,11 @@ case "$(uname -s)" in
         echo "run-conformance: on Windows, start the report from PowerShell, from a copy of its program:" >&2
         echo "  pnpm install --frozen-lockfile" >&2
         echo "  cargo build --locked -p kr-conformance --bin kr-conformance" >&2
-        echo '  $folder = (New-Item -ItemType Directory -Path (Join-Path $env:TEMP "kr-conformance-start-$PID")).FullName' >&2
-        echo '  Copy-Item target\debug\kr-conformance.exe $folder' >&2
-        echo '  & "$folder\kr-conformance.exe" run --root . --evidence <a directory under %TEMP%>' >&2
+        echo '  $folder = Join-Path (Get-Item $env:TEMP).FullName "kr-conformance-start-$([guid]::NewGuid())"' >&2
+        echo '  if (New-Item -ItemType Directory -Path $folder -ErrorAction Stop) {' >&2
+        echo '      Copy-Item target\debug\kr-conformance.exe $folder -ErrorAction Stop' >&2
+        echo '      & "$folder\kr-conformance.exe" run --root . --evidence <a directory under %TEMP%>' >&2
+        echo '  }' >&2
         exit 2
         ;;
     *) echo "run-conformance: $(uname -s) is not a platform the report runs on" >&2; exit 2 ;;
@@ -431,8 +433,9 @@ fi
 # plan builds the report's own package again (every `cargo test -p kr-conformance` does), and a
 # build that writes a different program over the one that is running fails where the system does
 # not let a running program be replaced. The copy lives in a folder of this run's own under the
-# temporary directory, which is where the report makes its private copies, and the folder is
-# removed when the script ends, by the name this script gave it.
+# temporary directory, which is where the report makes its private copies, and the script removes
+# the folder when it ends, by the name it gave it. A kill that cannot run that removal leaves the
+# folder and its copy of the program under the temporary directory.
 runner_base="${TMPDIR:-/tmp}"
 runner_dir=""
 remove_runner() {

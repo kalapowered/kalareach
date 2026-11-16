@@ -19,19 +19,23 @@ scripts/run-conformance.sh --all-terminals    # every group, and then section 27
 
 The script fetches what the applications group needs, installs the TypeScript packages when that
 group runs, builds the `kr-conformance` binary in `tests/conformance`, copies it into a new folder
-under the temporary directory and runs the copy, and removes the folder when it ends. The report
-never runs from the file the build wrote, because a step of the plan builds the report's own
-package again and Windows does not let a running program be replaced. On Windows the report is
-started from PowerShell instead, because a POSIX shell's runtime enables privileges in the token of
-everything it starts and changes how the console's interrupt reaches it. It runs from a copy there
-too:
+under the temporary directory, runs the copy and removes the folder when it ends. A kill that
+cannot run the removal leaves that folder and its copy of the program under the temporary
+directory. The report never runs from the file the build wrote, because a step of the plan builds
+the report's own package again and Windows does not let a running program be replaced. On Windows
+the report is started from PowerShell instead, because a POSIX shell's runtime enables privileges
+in the token of everything it starts and changes how the console's interrupt reaches it. It runs
+from a copy there too, in a folder with a new name for each run, and the block stops where that
+folder cannot be made:
 
 ```powershell
 pnpm install --frozen-lockfile
 cargo build --locked -p kr-conformance --bin kr-conformance
-$folder = (New-Item -ItemType Directory -Path (Join-Path $env:TEMP "kr-conformance-start-$PID")).FullName
-Copy-Item target\debug\kr-conformance.exe $folder
-& "$folder\kr-conformance.exe" run --root . --evidence <a directory under %TEMP%>
+$folder = Join-Path (Get-Item $env:TEMP).FullName "kr-conformance-start-$([guid]::NewGuid())"
+if (New-Item -ItemType Directory -Path $folder -ErrorAction Stop) {
+    Copy-Item target\debug\kr-conformance.exe $folder -ErrorAction Stop
+    & "$folder\kr-conformance.exe" run --root . --evidence <a directory under %TEMP%>
+}
 ```
 
 Remove that folder when the run ends. The result is
