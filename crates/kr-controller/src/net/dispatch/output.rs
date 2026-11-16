@@ -9,7 +9,7 @@ use kr_protocol::error::ProtocolError;
 use kr_protocol::ids::{ConnectionId, DeviceId, RequestId};
 use kr_transport::listener::{AuthorisedSession, ControlSender};
 
-use crate::grants::policy::{BoundIdentity, HeldBound, Stands};
+use crate::grants::policy::{BoundIdentity, BoundSnapshot, HeldBound, Stands};
 use crate::service::{Ask, Controller, Footing};
 
 /// The QUIC application error code a withdrawn connection is closed with.
@@ -197,8 +197,10 @@ pub(super) struct RelayGrant {
 }
 
 impl RelayGrant {
-    /// Returns whether the decision still holds at this instant.
-    fn holds(&self, controller: &Controller) -> bool {
+    /// Returns whether the decision still holds at this instant, by `copies` of the cells of its
+    /// bounds, one for each of [`Self::under`] in order, which the caller took before it read a
+    /// clock ([`Copied`]).
+    fn holds(&self, controller: &Controller, copies: &[BoundSnapshot]) -> bool {
         if controller.authority_epoch() != self.epoch {
             return false;
         }
@@ -216,7 +218,12 @@ impl RelayGrant {
                 return false;
             }
         }
-        bounds_hold(controller, &self.under, HeldBound::holds_as_decided)
+        copied_bounds_hold(
+            controller,
+            &self.under,
+            copies,
+            HeldBound::holds_as_decided_in,
+        )
     }
 }
 
@@ -224,6 +231,9 @@ impl RelayGrant {
 /// waiting: a check inside a poll takes no lock and calls no store. A bound found ended owes only
 /// what a lapse owes today, which the next step outside the poll writes: in UTC, the floor the
 /// reading raised; on the continuous clock, for the offline bound, the time it has spent.
+///
+/// It loads each bound's cell after its first clock read, so it is for a check outside a poll. The
+/// writer's own standing is asked by [`copied_bounds_hold`].
 pub(super) fn bounds_hold(
     controller: &Controller,
     under: &[HeldBound],
@@ -234,29 +244,83 @@ pub(super) fn bounds_hold(
     }
     let now = controller.clock.now();
     let settled = controller.settled_utc_now();
-    for held in under {
-        match judge(held, now, settled) {
-            Stands::Holds => {}
-            Stands::Moved => return false,
-            Stands::EndedInUtc => {
-                controller.keep_lapse(settled);
-                return false;
-            }
-            Stands::EndedOnTheContinuousClock => {
-                match held.snapshot().identity {
-                    BoundIdentity::Offline { .. } => controller.lifetimes().owe_offline_time(),
-                    // A share that ran out on the clock that cannot be wound back stays run out:
-                    // its end is owed to the grant store, which the host's record task writes.
-                    BoundIdentity::Share { grant_id } => {
-                        controller.lifetimes().owe_stored_expiry(grant_id);
-                    }
-                    BoundIdentity::Lease(_) | BoundIdentity::Unbounded => {}
+    under
+        .iter()
+        .all(|held| held_by(controller, held, judge(held, now, settled), settled))
+}
+
+/// [`bounds_hold`], by `copies` of the cells of `under`, one for each in order, that the caller
+/// took before it read a clock: only comparisons stand after the reads, so nothing in them
+/// allocates, frees, takes a lock or waits.
+fn copied_bounds_hold(
+    controller: &Controller,
+    under: &[HeldBound],
+    copies: &[BoundSnapshot],
+    judge: impl Fn(&HeldBound, &BoundSnapshot, kr_transport::clock::ContinuousInstant, u64) -> Stands,
+) -> bool {
+    debug_assert_eq!(under.len(), copies.len(), "a copy for every bound");
+    if under.is_empty() {
+        return true;
+    }
+    let now = controller.clock.now();
+    let settled = controller.settled_utc_now();
+    under
+        .iter()
+        .zip(copies)
+        .all(|(held, copy)| held_by(controller, held, judge(held, copy, now, settled), settled))
+}
+
+/// Whether a bound holds as `stands` says, owing what its end owes.
+fn held_by(controller: &Controller, held: &HeldBound, stands: Stands, settled: u64) -> bool {
+    match stands {
+        Stands::Holds => true,
+        Stands::Moved => false,
+        Stands::EndedInUtc => {
+            controller.keep_lapse(settled);
+            false
+        }
+        Stands::EndedOnTheContinuousClock => {
+            match held.snapshot().identity {
+                BoundIdentity::Offline { .. } => controller.lifetimes().owe_offline_time(),
+                // A share that ran out on the clock that cannot be wound back stays run out:
+                // its end is owed to the grant store, which the host's record task writes.
+                BoundIdentity::Share { grant_id } => {
+                    controller.lifetimes().owe_stored_expiry(grant_id);
                 }
-                return false;
+                BoundIdentity::Lease(_) | BoundIdentity::Unbounded => {}
             }
+            false
         }
     }
-    true
+}
+
+/// Every bound's cell that one standing compares, the answer's and the relayed batch's, copied out
+/// whole.
+///
+/// Loading a cell can allocate, on the first use of a thread, and lets go of a reference, and
+/// either can wait in the allocator for as long as a lease or an offline bound has left. So the
+/// writer takes the copies before the first read of a clock that its comparisons use, compares
+/// them after it, and keeps them until the attempt has handed its bytes over, so that nothing is
+/// freed between its last question and the write.
+struct Copied {
+    answer: Vec<BoundSnapshot>,
+    relayed: Vec<BoundSnapshot>,
+}
+
+impl Copied {
+    fn of(under: &[HeldBound], relaying: Option<&Relaying<'_>>) -> Self {
+        Self {
+            answer: under.iter().map(HeldBound::published).collect(),
+            relayed: relaying.map_or_else(Vec::new, |relaying| {
+                relaying
+                    .grant
+                    .under
+                    .iter()
+                    .map(HeldBound::published)
+                    .collect()
+            }),
+        }
+    }
 }
 
 /// What a relayed batch is written under.
@@ -664,17 +728,27 @@ impl RemoteOutput {
         // What stands at the stream, asked in one place and taking no lock: every bound the answer
         // is written under, the decision a relayed batch rides on, and last the standing a kept
         // answer or a conflict was admitted under (the fence this host owes, the revision in force
-        // and the connection's latch). The bounds are read first because reading a bound's cell
-        // can wait, and the footing's question reads atomics alone, so nothing it reads is behind
-        // such a wait.
-        let standing = || {
-            bounds_hold(&self.authority.controller, under, HeldBound::stands_at)
-                && relaying
-                    .as_ref()
-                    .is_none_or(|relaying| relaying.grant.holds(&self.authority.controller))
-                && kept_standing.is_none_or(|footing| footing.ask(Ask::KEPT_ANSWER).is_ok())
+        // and the connection's latch). Reading a bound's cell can wait, so the caller copies every
+        // cell BEFORE the first read of a clock ([`Copied`]) and this compares the copies: after
+        // the copies nothing it reads allocates, frees, takes a lock or waits.
+        let standing = |copied: &Copied| {
+            copied_bounds_hold(
+                &self.authority.controller,
+                under,
+                &copied.answer,
+                HeldBound::stands_in,
+            ) && relaying.as_ref().is_none_or(|relaying| {
+                relaying
+                    .grant
+                    .holds(&self.authority.controller, &copied.relayed)
+            }) && kept_standing.is_none_or(|footing| footing.ask(Ask::KEPT_ANSWER).is_ok())
         };
-        let decided = || !feed_refuses() && standing() && read_under.is_none_or(ReadUnder::stands);
+        // Outside the poll: the copies live for the one question.
+        let decided = || {
+            !feed_refuses()
+                && standing(&Copied::of(under, relaying.as_ref()))
+                && read_under.is_none_or(ReadUnder::stands)
+        };
         if !decided() {
             return Written::Undecided;
         }
@@ -693,15 +767,19 @@ impl RemoteOutput {
                 None => None,
             };
             // The first fence is the early ask. The feed's refusal takes locks and is read next,
-            // and it is the last read that does. What stands after it is asked once, reading
-            // atomics and clocks alone, and the grant's own expiry, which the bounds leave out, is
-            // read after that: the last ask before the bytes are handed over.
+            // and it is the last read that does. The bounds' cells are copied after it and before
+            // the first clock read of what stands, which is asked once, reading atomics and clocks
+            // alone, and the grant's own expiry, which the bounds leave out, is read after that:
+            // the last ask before the bytes are handed over. The copies are kept until the attempt
+            // has handed its bytes over.
+            let mut copied = None;
             let admitted = self.fence()
                 && !feed_refuses()
                 && {
+                    let taken = copied.insert(Copied::of(under, relaying.as_ref()));
                     #[cfg(feature = "testing")]
                     self.authority.controller.after_the_feed_is_read.wait();
-                    standing()
+                    standing(taken)
                 }
                 && self.fence();
             if admitted {

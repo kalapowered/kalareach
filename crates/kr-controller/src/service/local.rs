@@ -575,8 +575,9 @@ impl Controller {
     }
 
     /// Arms the pause the next frame written to a network connection stops at once the authority
-    /// feed's refusal has been read, before the standing it is asked at the stream. Returns the end
-    /// that says the frame has arrived, and the end that lets it go. The pause fires once.
+    /// feed's refusal has been read and the cells of its bounds are copied, before the standing it
+    /// is asked at the stream reads a clock. Returns the end that says the frame has arrived, and
+    /// the end that lets it go. The pause fires once.
     #[cfg(feature = "testing")]
     pub fn pause_after_the_feed_is_read(
         &self,

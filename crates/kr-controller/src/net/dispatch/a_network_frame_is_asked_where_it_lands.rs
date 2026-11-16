@@ -18,7 +18,9 @@ use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 
 use super::decision::Answered;
-use super::write_boundary::{Recording, paired_connection_expiring};
+use super::output::{RelayGrant, Relaying, Written};
+use super::write_boundary::{Recording, paired_connection_expiring, record_for};
+use crate::grants::organisation::testing::TestOrganisation;
 use crate::service::Reach;
 
 /// What an answer read from a record is.
@@ -386,5 +388,138 @@ async fn a_kept_answer_is_not_written_when_the_grant_ends_while_the_feed_waits_f
         }
         drop(connection);
         drop(controller);
+    }
+}
+
+/// What happens to a lease's bound in the pause between the writer's copy of its cell and its first
+/// read of a clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AtTheBound {
+    /// A restrictive change ends the bound at its cell.
+    ItsCellEnds,
+    /// The bound's deadline passes on the continuous clock.
+    ItsDeadlinePasses,
+    /// The lease is renewed, which publishes another snapshot of the cell.
+    ItsCellPublishesAnew,
+}
+
+/// How a write ends, and what was handed to the stream, when `at` happens to the lease's bound of
+/// the answer, or of the relayed batch, in the pause after the writer has copied the cell. A second
+/// write, made afterwards, shows what the cell says by then.
+async fn written_with_the_bound_changed(
+    at: AtTheBound,
+    relayed: bool,
+) -> (Written, Written, Vec<ControlFrame>) {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (continuous, wall, clocks) = super::super::tests::manual_clocks();
+    let controller = super::super::tests::daemon_on(&temp, clocks).await;
+    let now = wall.load(Ordering::SeqCst);
+    let organisation = TestOrganisation::new(0x47, now - 60 * 60 * 1000);
+    let (grant, _) = super::super::tests::leased_member(&controller, &organisation, now);
+    let recording = Arc::new(Recording::default());
+    let connection = super::RemoteConnection::for_test_writing_to(
+        &controller,
+        record_for(&grant),
+        Box::new(Arc::clone(&recording)),
+    );
+    let asked = connection
+        .ask(None, Method::SessionList.entry(), false)
+        .expect("the lease answers for the member's grant");
+    let under = asked.decision.bounds();
+    let cell = super::super::tests::member_cell(&controller, &organisation, &grant);
+    let epoch = controller.authority_epoch();
+    let frame = ControlFrame::Event(kr_protocol::envelope::ControlEvent::Keepalive);
+    let write = |connection: Arc<super::RemoteConnection>| {
+        let (frame, under) = (frame.clone(), under.clone());
+        async move {
+            let redecide = || true;
+            let relaying = relayed.then(|| Relaying {
+                grant: RelayGrant {
+                    epoch,
+                    until: None,
+                    lapses_at_ms: None,
+                    under: under.clone(),
+                },
+                redecide: &redecide,
+            });
+            let held: &[crate::grants::policy::HeldBound] = if relayed { &[] } else { &under };
+            connection
+                .output()
+                .write_held(
+                    &frame,
+                    held,
+                    relaying,
+                    super::output::Answers::Nothing,
+                    None,
+                )
+                .await
+        }
+    };
+    let connection = Arc::new(connection);
+    let (arrived, go) = controller.pause_after_the_feed_is_read();
+    let writing = tokio::spawn(write(Arc::clone(&connection)));
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30)))
+        .await
+        .expect("the wait ends")
+        .expect("the writer reaches the pause after it copied the cell");
+    match at {
+        AtTheBound::ItsCellEnds => cell.end(),
+        AtTheBound::ItsDeadlinePasses => continuous.advance(Duration::from_secs(15 * 60 + 30)),
+        AtTheBound::ItsCellPublishesAnew => {
+            let held = cell.load();
+            cell.publish(
+                held.identity,
+                held.continuous_deadline,
+                held.utc_deadline_ms.map(|end| end + 60_000),
+                false,
+                true,
+            );
+        }
+    }
+    go.send(()).expect("the writer goes on");
+    let first = writing.await.expect("the write ends");
+    let second = write(connection).await;
+    let frames = recording.frames();
+    drop(controller);
+    (first, second, frames)
+}
+
+/// KR-REQ-09.12: the writer copies the cell of every bound before its first read of a clock, and
+/// judges the copy: a lease that a restrictive change ends in the pause between the two, and a
+/// relayed batch's lease that is renewed there, are judged as the copy says. The write goes, and
+/// the write after it finds what the cell says. A lease whose deadline passes in the pause is
+/// found ended by the clock read that follows the copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bound_is_judged_by_the_copy_taken_before_the_first_clock_read() {
+    let (first, second, frames) =
+        written_with_the_bound_changed(AtTheBound::ItsCellEnds, false).await;
+    assert_eq!(
+        first,
+        Written::Sent,
+        "the copy says the lease had not ended"
+    );
+    assert_eq!(second, Written::Undecided, "the cell says it has");
+    assert_eq!(frames.len(), 1, "only the first write reached the stream");
+
+    let (first, second, frames) =
+        written_with_the_bound_changed(AtTheBound::ItsCellPublishesAnew, true).await;
+    assert_eq!(
+        first,
+        Written::Sent,
+        "the copy holds the snapshot the batch was decided under"
+    );
+    assert_eq!(second, Written::Undecided, "the cell says another snapshot");
+    assert_eq!(frames.len(), 1, "only the first write reached the stream");
+
+    for relayed in [false, true] {
+        let (first, second, frames) =
+            written_with_the_bound_changed(AtTheBound::ItsDeadlinePasses, relayed).await;
+        assert_eq!(
+            first,
+            Written::Undecided,
+            "the clock read after the copy finds the deadline passed (relayed: {relayed})"
+        );
+        assert_eq!(second, Written::Undecided);
+        assert!(frames.is_empty(), "nothing reached the stream: {frames:?}");
     }
 }
