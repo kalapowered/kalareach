@@ -853,3 +853,68 @@ async fn a_mutation_dropped_while_it_waits_for_its_answer_stays_on_the_book_unti
         .await;
     assert!(session.submitted_actions().await.is_empty());
 }
+
+#[tokio::test]
+async fn a_dropped_whole_write_answer_leaves_its_action_held_until_its_owner_settles_it() {
+    let (transport, session, _events) = ordered(4);
+    let mutation = composed(&session, 5).await;
+    let answering = within(session.send_whole(&mutation))
+        .await
+        .expect("the frame was written");
+    let request_id = transport.written_at_least(1).await;
+    assert_eq!(session.waiting_requests(), 1);
+    drop(answering);
+    assert_eq!(session.waiting_requests(), 0);
+    assert_eq!(session.submitted_actions().await.len(), 1);
+    // The host's definite answer does not clear it: the action is held until its owner settles it.
+    transport.feed(answer(request_id, Ok(typed(&Empty {}))));
+    tokio::time::sleep(STILL).await;
+    assert_eq!(session.submitted_actions().await.len(), 1);
+    session
+        .settle(ActionId::new(Uuid::from_bytes([5; 16])))
+        .await;
+    assert!(session.submitted_actions().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_mutate_dropped_while_it_waits_for_its_answer_is_settled_by_the_hosts_late_answer() {
+    let (transport, session, _events) = ordered(4);
+    let waiting = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move {
+            session
+                .mutate(
+                    Method::SessionCreate,
+                    ActionTarget::environment(environment()),
+                    None,
+                    &Empty {},
+                    &Empty {},
+                    DurationMs::new(120_000),
+                )
+                .await
+                .map(|_| ())
+        })
+    };
+    let request_id = transport.written_at_least(1).await;
+    assert_eq!(session.waiting_requests(), 1);
+    waiting.abort();
+    let _ = waiting.await;
+    assert_eq!(session.waiting_requests(), 0);
+    assert_eq!(
+        session.submitted_actions().await.len(),
+        1,
+        "the action was not left on the book"
+    );
+    // The host's definite answer comes with no one waiting, and the session settles the action.
+    transport.feed(answer(request_id, Ok(typed(&Empty {}))));
+    let settled = tokio::time::timeout(LIVENESS, async {
+        while !session.submitted_actions().await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        settled.is_ok(),
+        "a late definite answer left the action of a dropped mutate on the book"
+    );
+}
