@@ -2105,6 +2105,32 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         },
     },
     IgnoredRun {
+        package: "kr-worker",
+        target: "--test close_on_a_hung_store",
+        cases: &[
+            "a_close_stops_the_session_while_a_marker_write_stands_still",
+            "a_close_stops_the_session_while_a_settlement_stands_still",
+            "a_close_stops_the_session_while_the_maintenance_prune_stands_still",
+            "a_close_that_was_admitted_is_carried_out_while_a_prune_stands_still",
+            "a_close_whose_own_marker_write_stands_still_stops_the_session",
+            "a_close_whose_own_settlement_stands_still_stops_the_session",
+        ],
+        runs: Runs::Nowhere {
+            why: "each of these cases shows a fault that is still open: a close stops late while a storage call stands still, so each fails until the close's bounded stop is built, and the entry goes when the cases lose their `ignore`",
+        },
+    },
+    IgnoredRun {
+        package: "kr-controller",
+        target: "--test close_on_a_hung_store",
+        cases: &[
+            "a_close_at_the_daemon_stops_the_session_while_a_marker_write_stands_still",
+            "a_close_from_a_paired_device_stops_the_session_while_a_marker_write_stands_still",
+        ],
+        runs: Runs::Nowhere {
+            why: "each of these cases shows a fault that is still open: a close stops late while a storage call stands still, so each fails until the close's bounded stop is built, and the entry goes when the cases lose their `ignore`",
+        },
+    },
+    IgnoredRun {
         package: "kr-cli",
         target: "--test startup_windows",
         cases: &[
