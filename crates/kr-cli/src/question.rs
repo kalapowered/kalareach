@@ -1534,6 +1534,21 @@ impl QuestionHost for Workers {
     }
 }
 
+/// What `kr question cancel` says when its cancellation ended with an outcome nobody established:
+/// the session whose worker keeps the receipt, and the question the later request names. Where the
+/// host holds no receipt for the earlier action, the plain command asks again.
+fn cancel_unknown(session: Shown, question_id: QuestionId) -> crate::unknown::Unknown {
+    let command = shown!("kr question cancel {}", question_id);
+    crate::unknown::Unknown {
+        what: "the cancellation",
+        read_back: crate::unknown::ReadBack::of(session, None),
+        later: Some(crate::unknown::Later {
+            asks_again: shown!("`{}` asks again", command),
+            command,
+        }),
+    }
+}
+
 /// Cancels one question.
 ///
 /// The cancellation is sent once. When its outcome is not established, the command ends as
@@ -1558,15 +1573,7 @@ pub async fn cancel(
         descriptor.session_id,
     )
     .map_err(CliError::Refused)?;
-    let cancel = shown!("kr question cancel {}", question_id);
-    let unknown = crate::unknown::Unknown {
-        what: "the cancellation",
-        read_back: crate::unknown::ReadBack::of(shown!("{}", descriptor.session_id), None),
-        later: Some(crate::unknown::Later {
-            command: cancel.clone(),
-            asks_again: shown!("`{}` asks again", cancel),
-        }),
-    };
+    let unknown = cancel_unknown(shown!("{}", descriptor.session_id), question_id);
     let quote = match after_unknown {
         Some(earlier) => Some(
             crate::unknown::earlier(
@@ -2374,5 +2381,60 @@ mod tests {
         let text = line.text();
         assert!(text.contains("pending"));
         assert!(text.contains("/usr/bin/some-agent"));
+    }
+
+    /// A cancellation that ended with an unknown outcome says what the host holds of it, what a later
+    /// cancellation that names it is, and that the plain command asks again where the host holds no
+    /// receipt. It does not say that a second cancellation does no harm: a second one is refused by
+    /// the worker as `QUESTION_RESOLVED` when the first was applied, which changes nothing, and no
+    /// requirement says that a repeat returns the existing state as one does for a close.
+    #[test]
+    fn a_cancellation_that_ended_unknown_says_what_each_state_of_the_host_calls_for() {
+        let action = ActionId::new(Uuid::from_bytes([7; 16]));
+        let question = QuestionId::new(Uuid::from_bytes([11; 16]));
+        let CliError::Unfinished { message, .. } =
+            cancel_unknown(shown!("5"), question).ended(action, crate::unknown::Cause::Connection)
+        else {
+            panic!("an unknown outcome ends as unfinished");
+        };
+        assert_eq!(
+            message.as_str(),
+            format!(
+                "the exchange with the host failed after the request for the cancellation was \
+                 composed, and the request may have reached the host, so whether it performed it \
+                 is not known. The request was made as action {action} and is not sent again; \
+                 `kr action read {action} --session 5` shows what the host holds of it. If the host \
+                 holds it with an unknown outcome, `kr question cancel {question} --after-unknown \
+                 {action}` makes the later request that names it. If the host holds no receipt for \
+                 it, `kr question cancel {question}` asks again."
+            )
+        );
+    }
+
+    /// The worker's refusal to show an action it holds no receipt for is followed, for a later
+    /// cancellation, by one sentence that says what holds if the host holds none.
+    #[test]
+    fn a_refused_read_of_the_earlier_cancellation_says_that_the_plain_command_asks_again() {
+        let action = ActionId::new(Uuid::from_bytes([7; 16]));
+        let question = QuestionId::new(Uuid::from_bytes([11; 16]));
+        let worker = kr_client::error::refusal(
+            ErrorCode::InvalidArgument,
+            shown!("no receipt for action {}", action),
+        );
+        let today = CliError::Refused(worker.clone()).said();
+        let said = crate::unknown::read_refused(
+            worker,
+            action,
+            "cancellation",
+            &cancel_unknown(shown!("5"), question),
+        )
+        .said();
+        assert_eq!(
+            said.as_str(),
+            format!(
+                "{today}\nIf the host holds no receipt for action {action}, there is nothing for a \
+                 later cancellation to name: `kr question cancel {question}` asks again."
+            )
+        );
     }
 }

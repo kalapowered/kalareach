@@ -229,7 +229,7 @@ where
 /// receipt for the action. Only the refusal's code decides that: the worker words that refusal for
 /// an action it has no receipt for, and also for other arguments it cannot use, and the sentence
 /// says what holds if it is the first.
-fn read_refused(
+pub(crate) fn read_refused(
     refusal: ProtocolError,
     action: ActionId,
     what: &'static str,
