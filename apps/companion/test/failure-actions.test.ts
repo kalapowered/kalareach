@@ -147,8 +147,11 @@ describe('a refusal that says its own wait', () => {
       fileName.endsWith('x') ? ts.ScriptKind.TSX : ts.ScriptKind.TS
     )
     const reads = { property: 0, element: 0, binding: 0, table: 0 }
-    const named = (name: ts.Node | undefined) =>
-      name !== undefined && (ts.isIdentifier(name) || ts.isStringLiteralLike(name)) && name.text === 'user_action'
+    const named = (name: ts.Node | undefined): boolean =>
+      name !== undefined &&
+      (ts.isComputedPropertyName(name)
+        ? ts.isStringLiteralLike(name.expression) && name.expression.text === 'user_action'
+        : (ts.isIdentifier(name) || ts.isStringLiteralLike(name)) && name.text === 'user_action')
     const visit = (node: ts.Node): void => {
       if (ts.isPropertyAccessExpression(node) && node.name.text === 'user_action') reads.property += 1
       else if (ts.isElementAccessExpression(node) && named(node.argumentExpression)) reads.element += 1
@@ -188,6 +191,7 @@ describe('a refusal that says its own wait', () => {
       ['binding', 'const { user_action } = failure'],
       ['binding', 'const { code, user_action: key } = failure'],
       ['binding', "const { 'user_action': key } = failure"],
+      ['binding', "const { ['user_action']: key } = failure"],
       ['binding', 'const { user_action }: HostError = failure'],
       ['binding', 'function show({ user_action }: HostError) { return user_action }'],
       ['binding', 'const show = ({ code, user_action: key }: HostError) => key'],
@@ -212,5 +216,137 @@ describe('a refusal that says its own wait', () => {
       'interface HostError { readonly user_action: string }'
     ].join('\n')
     expect(readsOf(none)).toEqual({ property: 0, element: 0, binding: 0, table: 0 })
+  })
+
+  /**
+   * The forms the scan above cannot follow to a read of the action, found with the compiler's types:
+   * a spread or a rest of a failure object, an element read or a computed key that is not a string
+   * literal on one, and an iteration over its members. A form is one only where the value it works
+   * on has the member `user_action` in its type. A string-literal computed key is a read, and
+   * `readsOf` counts it.
+   */
+  const unfollowedIn = (source: ts.SourceFile, checker: ts.TypeChecker): string[] => {
+    const holdsTheAction = (node: ts.Node | undefined): boolean => {
+      if (node === undefined) return false
+      const type = checker.getTypeAtLocation(node)
+      const members = type.isUnion() ? type.types : [type]
+      return members.some((one) => one.getProperty('user_action') !== undefined)
+    }
+    /** The value a destructuring takes apart: a declaration's initializer or type, or a parameter's type. */
+    const taken = (pattern: ts.Node): ts.Node | undefined => {
+      const owner = pattern.parent
+      if (ts.isVariableDeclaration(owner)) return owner.initializer ?? owner.type
+      if (ts.isParameter(owner)) return owner.type
+      return undefined
+    }
+    const found: string[] = []
+    const visit = (node: ts.Node): void => {
+      if (ts.isSpreadAssignment(node) && holdsTheAction(node.expression)) found.push('spread')
+      else if (
+        ts.isBindingElement(node) &&
+        ts.isObjectBindingPattern(node.parent) &&
+        holdsTheAction(taken(node.parent))
+      ) {
+        if (node.dotDotDotToken !== undefined) found.push('rest')
+        else if (
+          node.propertyName !== undefined &&
+          ts.isComputedPropertyName(node.propertyName) &&
+          !ts.isStringLiteralLike(node.propertyName.expression)
+        )
+          found.push('computed key')
+      } else if (
+        ts.isElementAccessExpression(node) &&
+        !ts.isStringLiteralLike(node.argumentExpression) &&
+        holdsTheAction(node.expression)
+      )
+        found.push('computed key')
+      else if (ts.isForInStatement(node) && holdsTheAction(node.expression)) found.push('iteration')
+      else if (
+        ts.isCallExpression(node) &&
+        ts.isPropertyAccessExpression(node.expression) &&
+        ts.isIdentifier(node.expression.expression) &&
+        node.expression.expression.text === 'Object' &&
+        ['keys', 'values', 'entries', 'getOwnPropertyNames', 'fromEntries'].includes(node.expression.name.text) &&
+        node.arguments.some((argument) => holdsTheAction(argument))
+      )
+        found.push('iteration')
+      ts.forEachChild(node, visit)
+    }
+    visit(source)
+    return found
+  }
+
+  /** A program over `texts` (by file name), with the project's own options where a file of it is wanted. */
+  const programOf = (texts: Readonly<Record<string, string>>, options: ts.CompilerOptions): ts.Program => {
+    const host = ts.createCompilerHost(options)
+    const original = host.getSourceFile.bind(host)
+    host.getSourceFile = (name, ...rest) =>
+      name in texts ? ts.createSourceFile(name, texts[name], ts.ScriptTarget.Latest, true) : original(name, ...rest)
+    host.fileExists = (name) => name in texts || ts.sys.fileExists(name)
+    host.readFile = (name) => texts[name] ?? ts.sys.readFile(name)
+    return ts.createProgram(Object.keys(texts), options, host)
+  }
+
+  const PLANT_OPTIONS: ts.CompilerOptions = {
+    target: ts.ScriptTarget.ES2023,
+    lib: ['lib.es2023.d.ts'],
+    strict: true,
+    noEmit: true,
+    types: [],
+    skipLibCheck: true
+  }
+  const FAILURE = 'declare const failure: { code: string; message: string; user_action: string }\n'
+  const OTHER = 'declare const other: { a: number }\ndeclare const key: string\n'
+
+  it('refuses what it cannot follow: each form on a failure object fails the scan, shown on a plant of each', () => {
+    const plants: readonly (readonly [string, string])[] = [
+      ['spread', 'export const copy = { ...failure, extra: 1 }'],
+      ['spread', "export const { ['user_action']: said } = { ...failure }"],
+      ['rest', 'export const { code, ...rest } = failure'],
+      ['computed key', 'declare const key: string\nexport const said = failure[key]'],
+      ['computed key', 'declare const key: string\nexport const { [key]: said } = failure'],
+      ['iteration', 'export const names = Object.keys(failure)'],
+      ['iteration', 'export const values = Object.values(failure)'],
+      ['iteration', 'export const pairs = Object.entries(failure)'],
+      ['iteration', 'export function each() { for (const name in failure) void name }']
+    ]
+    const texts = Object.fromEntries(plants.map(([, plant], at) => [`/plants/failing-${at}.ts`, FAILURE + plant]))
+    const program = programOf(texts, PLANT_OPTIONS)
+    const checker = program.getTypeChecker()
+    plants.forEach(([form], at) => {
+      const source = program.getSourceFile(`/plants/failing-${at}.ts`)
+      expect(source, form).toBeDefined()
+      expect(unfollowedIn(source!, checker), plants[at][1]).toContain(form)
+    })
+  })
+
+  it('lets the same forms pass on a value that has no action, and a string-literal key is counted as a read', () => {
+    const innocent = [
+      'export const copy = { ...other }',
+      'export const { a, ...rest } = other',
+      'export const said = other[key as keyof typeof other]',
+      'export const names = Object.keys(other)',
+      'export const pairs = Object.entries(other)',
+      'export function each() { for (const name in other) void name }',
+      "export const { ['user_action']: said } = failure"
+    ].join('\n')
+    const program = programOf({ '/plants/innocent.ts': FAILURE + OTHER + innocent }, PLANT_OPTIONS)
+    const source = program.getSourceFile('/plants/innocent.ts')!
+    expect(unfollowedIn(source, program.getTypeChecker())).toEqual([])
+    expect(readsOf("const { ['user_action']: key } = failure").binding).toBe(1)
+  })
+
+  it('meets no form it cannot follow on a failure object, outside the one formatter', { timeout: 120_000 }, () => {
+    const root = decodeURIComponent(new URL('../', import.meta.url).pathname)
+    const configFile = ts.readConfigFile(`${root}tsconfig.json`, (name) => ts.sys.readFile(name))
+    const config = ts.parseJsonConfigFileContent(configFile.config, ts.sys, root)
+    const sources = config.fileNames.filter((name) => name.includes('/src/') && !/\/src\/host\/fake[^/]*\.ts$/.test(name))
+    const program = ts.createProgram(sources, config.options)
+    const checker = program.getTypeChecker()
+    const found = sources
+      .filter((name) => !name.endsWith('/src/host/port.ts'))
+      .map((name) => [name.slice(root.length), unfollowedIn(program.getSourceFile(name)!, checker)] as const)
+      .filter(([, forms]) => forms.length > 0)
+    expect(found).toEqual([])
   })
 })
