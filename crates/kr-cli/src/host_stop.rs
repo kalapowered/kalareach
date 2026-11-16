@@ -3266,7 +3266,12 @@ mod tests {
     async fn each_source_is_read_for_what_it_is_at_the_greeting_and_at_the_read() {
         let id = an_environment();
         let process = asked_process();
-        let mut replies = vec![the_hellos_refusal()];
+        let mut replies = vec![
+            the_hellos_refusal(),
+            kr_ipc::IpcError::LinkFenced {
+                detail: "the worker refused the link".to_owned(),
+            },
+        ];
         replies.push(kr_ipc::IpcError::UnexpectedMessage(
             "a frame of another kind",
         ));
