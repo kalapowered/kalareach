@@ -1361,10 +1361,11 @@ async fn a_result_is_removed_when_a_state_that_could_not_be_read_reads_on() {
 /// shown the result, the store still holds it, and the removal when the store accepts it leaves
 /// the readers saying the same.
 ///
-/// This host serves its endpoint, so its first pass of maintenance retries the cleanup and raises
-/// the fence itself before the case's first read. The case does not pin the fence raised at the
-/// open; `a_session_reopened_under_privacy_mode_serves_no_receipt_content_before_its_first_pass`
-/// in `privacy.rs`, which runs no service, does.
+/// This host serves its endpoint, and serving starts maintenance on its own, so a pass can retry
+/// the cleanup and raise the fence itself before the case's first read. The case therefore does not
+/// pin the fence raised at the open;
+/// `a_session_reopened_under_privacy_mode_serves_no_receipt_content_before_its_first_pass` in
+/// `privacy.rs`, which runs no service, does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_result_is_not_shown_while_its_removal_is_owed() {
     let (host, params, answered, stored) = reopened_after_an_answer(|journal| {
