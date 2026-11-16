@@ -587,7 +587,9 @@ impl Refusals {
 /// Returns the relay selection.
 ///
 /// An empty relay list is [`RelayMode::Disabled`], not a fallback to the public map. A deployment
-/// that wants no relay gets no relay.
+/// that wants no relay gets no relay. The one exception is an endpoint whose configuration says
+/// that relays are added when it dials: its map starts empty and is custom, so the relays it is
+/// given later are used and no public one is.
 fn relay_mode(config: &EndpointConfig) -> RelayMode {
     if config.relays_disabled() {
         RelayMode::Disabled
@@ -952,6 +954,32 @@ mod tests {
             panic!("a selected relay map is custom");
         };
         assert_eq!(map.len(), 1);
+    }
+
+    /// KR-REQ-10.02: an endpoint that adds relays when it dials starts with a custom map that holds
+    /// none, which is not the disabled mode, and it may take the relay-only form that a disabled
+    /// map refuses.
+    #[tokio::test]
+    async fn an_empty_map_that_relays_are_added_to_is_custom_and_not_disabled() {
+        let config = EndpointConfig {
+            relays_added_on_dial: true,
+            ..EndpointConfig::default()
+        };
+        assert!(!config.relays_disabled());
+        let RelayMode::Custom(map) = relay_mode(&config) else {
+            panic!("an empty map that relays are added to is custom");
+        };
+        assert!(map.is_empty());
+
+        let identity = TransportIdentityKeyPair::generate().expect("a transport identity");
+        let relay_only = EndpointConfig {
+            relay_only: true,
+            ..config
+        };
+        let endpoint = bind_dialer(&relay_only, &identity)
+            .await
+            .expect("a relay-only endpoint with an empty map");
+        endpoint.close().await;
     }
 
     /// KR-REQ-17.43: the relay mode an endpoint is built with is a custom map of exactly the
