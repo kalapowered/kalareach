@@ -14,6 +14,19 @@
 //! TLS: the resolver is this module's, and it has no DNS-over-HTTPS client, which would follow
 //! those variables.
 //!
+//! The device's one endpoint is built with no service named and takes them one host at a time: a
+//! host's relays and address lookups are added when the device first dials that host, and a lookup
+//! is asked only about the identity of the host that owns it. The device contacts a relay only on
+//! account of a host that it has dialled: one that the host's configuration names, which enters
+//! the relay map, or one that the host's own record names, where the device opens a client for that
+//! host. A relay in the map can receive the net report's probes: an HTTPS request, which carries
+//! no endpoint identity, and a QUIC address probe, which goes to at most five of the relays in the
+//! map. The report runs when the map changes, about every 20 to 26 seconds, and at least every
+//! five minutes in a report that plans an HTTPS probe for every relay in the map. The relay that
+//! the report prefers as home relay also keeps the device's endpoint identity registered while the
+//! endpoint is open, and a relay used for a connection keeps it until the device has written no
+//! datagram to it for 60 seconds. See [`crate::dialler`].
+//!
 //! [`connect`] is the dialling half: it opens a connection and, when a relay the connection needed
 //! turned this endpoint away, or the network refused the relay's WebSocket upgrade, says so rather
 //! than reporting a peer that did not answer.
