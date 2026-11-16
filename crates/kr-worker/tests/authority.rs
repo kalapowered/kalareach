@@ -1295,3 +1295,296 @@ async fn saturate(client: &mut Client<impl Codec>, session_id: SessionId) -> boo
     }
     false
 }
+
+/// How long a test waits for a count to settle before it reads the count and asserts it. Nothing
+/// is decided by it: the assertion that follows names the count that did not settle.
+const SETTLE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Waits until `settled` holds, or `SETTLE` has passed, and says whether it held.
+async fn settle(mut settled: impl FnMut() -> bool) -> bool {
+    let end = tokio::time::Instant::now() + SETTLE;
+    while !settled() {
+        if tokio::time::Instant::now() >= end {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    true
+}
+
+/// Holds the worker's dispatch boundary on a thread of its own until it is released.
+struct Held {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Held {
+    async fn boundary(host: &Host) -> Self {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (held, confirmed) = tokio::sync::oneshot::channel::<()>();
+        let service = Arc::clone(&host.service);
+        let thread = std::thread::spawn(move || {
+            let _boundary = service.hold_the_dispatch_boundary();
+            let _ = held.send(());
+            let _ = wait.recv();
+        });
+        tokio::time::timeout(WAIT, confirmed)
+            .await
+            .expect("the boundary is held in time")
+            .expect("the holder ended without holding the boundary");
+        Self {
+            release: Some(release),
+            thread: Some(thread),
+        }
+    }
+
+    fn release(mut self) {
+        drop(self.release.take());
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("the holding thread finishes");
+        }
+    }
+}
+
+/// What a presentation on a task of its own came to: the link, and the worker's answer.
+type Presented = (
+    BoundLink,
+    kr_ipc::Result<kr_protocol::worker::GenerationAccepted>,
+);
+
+/// A connection that says hello and presents `generation`, on a task of its own that owns the link.
+/// Ending the task is the daemon going away.
+fn presenting(host: &Host, generation: u64) -> tokio::task::JoinHandle<Presented> {
+    let endpoint = host.endpoint.clone();
+    let signer = host.signer();
+    tokio::spawn(async move {
+        let mut link = BoundLink::connect(&endpoint, build())
+            .await
+            .expect("connects");
+        let answer = present(&mut link, signer, generation).await;
+        (link, answer)
+    })
+}
+
+fn presenting_many(
+    host: &Host,
+    count: usize,
+    generation: u64,
+) -> Vec<tokio::task::JoinHandle<Presented>> {
+    (0..count).map(|_| presenting(host, generation)).collect()
+}
+
+/// Ends the tasks, which closes each presentation's link: its daemon has gone.
+async fn peers_go(peers: Vec<tokio::task::JoinHandle<Presented>>) {
+    for peer in &peers {
+        peer.abort();
+    }
+    for peer in peers {
+        let _ = peer.await;
+    }
+}
+
+/// Presentations whose peers have gone do not keep the worker's connections while its dispatch
+/// boundary is held.
+///
+/// Three rounds of thirty connections say hello and present, and their tasks end while the
+/// boundary is still held. Each round's connections are given back before the next round
+/// begins, so the third finds the worker where the first did, and nothing was decided for any of
+/// them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn presentations_whose_peers_have_gone_do_not_keep_their_connections_while_the_boundary_is_held()
+ {
+    let host = host(1).await;
+    let service = &host.service;
+    let boundary = Held::boundary(&host).await;
+    let start = service.connections_held_for_tests();
+    for round in 1..=3 {
+        let peers = presenting_many(&host, 30, 1);
+        settle(|| service.presentations_waiting_for_tests() == 30).await;
+        assert_eq!(
+            service.presentations_waiting_for_tests(),
+            30,
+            "round {round}: the presentations wait at the held boundary"
+        );
+        peers_go(peers).await;
+        settle(|| {
+            service.connections_held_for_tests() == start
+                && service.presentations_waiting_for_tests() == 0
+        })
+        .await;
+        assert_eq!(
+            service.connections_held_for_tests(),
+            start,
+            "round {round}: the connections of the peers that went are given back while the boundary is still held"
+        );
+        assert_eq!(
+            service.presentations_waiting_for_tests(),
+            0,
+            "round {round}: no presentation of a peer that went still waits"
+        );
+    }
+    assert_eq!(
+        service.accepted_generation(),
+        None,
+        "nothing was decided for a peer that was not there"
+    );
+    boundary.release();
+}
+
+/// A presentation whose peer is there waits through a long hold and is answered when it ends, while
+/// the presentations of the peers that went beside it are given up.
+///
+/// The living one is found by its answer and by what it is served as: it holds the authority.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_living_presentation_waits_through_a_long_hold_and_is_answered() {
+    let host = host(1).await;
+    let service = &host.service;
+    let boundary = Held::boundary(&host).await;
+    let start = service.connections_held_for_tests();
+    let living = presenting(&host, 1);
+    let dead = presenting_many(&host, 8, 1);
+    settle(|| service.presentations_waiting_for_tests() == 9).await;
+    assert_eq!(service.presentations_waiting_for_tests(), 9);
+    peers_go(dead).await;
+    settle(|| {
+        service.presentations_waiting_for_tests() == 1
+            && service.connections_held_for_tests() == start + 1
+    })
+    .await;
+    assert_eq!(
+        service.presentations_waiting_for_tests(),
+        1,
+        "the living presentation is the one that waits"
+    );
+    assert_eq!(
+        service.connections_held_for_tests(),
+        start + 1,
+        "the living presentation keeps its connection and the dead ones' are given back"
+    );
+
+    // The living presentation tries the boundary again and again before it is free.
+    let before = service.presentation_tries_for_tests();
+    settle(|| service.presentation_tries_for_tests() >= before + 8).await;
+    assert!(
+        service.presentation_tries_for_tests() >= before + 8,
+        "the living presentation found the boundary held again and again"
+    );
+    assert!(!living.is_finished(), "it waits for the hold");
+    assert_eq!(service.accepted_generation(), None);
+
+    boundary.release();
+    let (mut link, answer) = tokio::time::timeout(WAIT, living)
+        .await
+        .expect("the living presentation is answered once the boundary is free")
+        .expect("the task ends");
+    answer.expect("the living presentation is accepted");
+    assert_eq!(
+        service.accepted_generation(),
+        Some(ControllerGeneration::new(1))
+    );
+    read_session(&mut link, host.session_id)
+        .await
+        .expect("the connection that waited is the one that holds the authority");
+}
+
+/// A presentation with a frame behind its token is not taken for a peer that has gone.
+///
+/// The frame sits unread in the worker's socket while the presentation waits, which is what the
+/// system reports as bytes waiting and not as an end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_presentation_with_a_frame_behind_its_token_is_not_taken_for_gone() {
+    let host = host(1).await;
+    let service = &host.service;
+    let boundary = Held::boundary(&host).await;
+    let mut link = BoundLink::connect(&host.endpoint, build())
+        .await
+        .expect("connects");
+    // The link hands the challenge's nonce to the signing step. Failing it there leaves the token
+    // to be sent by hand, so that a frame can follow it.
+    let mut nonce = None;
+    link.present_generation(|challenge| {
+        nonce = Some(*challenge);
+        Err(kr_ipc::IpcError::UnexpectedMessage(
+            "the test sends the token itself",
+        ))
+    })
+    .await
+    .expect_err("the signing step is failed on purpose");
+    let signer = host.signer();
+    let token = signer
+        .identity
+        .generation_token(
+            ControllerGeneration::new(1),
+            &signer.boot,
+            &nonce.expect("the link issued a challenge"),
+        )
+        .expect("signs");
+    link.send(&ControlFrame::GenerationToken(Box::new(token)))
+        .await
+        .expect("sends the token");
+    settle(|| service.presentations_waiting_for_tests() == 1).await;
+    assert_eq!(service.presentations_waiting_for_tests(), 1);
+    link.send(&ControlFrame::Event(
+        kr_protocol::envelope::ControlEvent::Keepalive,
+    ))
+    .await
+    .expect("sends a frame behind the token");
+
+    let before = service.presentation_tries_for_tests();
+    settle(|| service.presentation_tries_for_tests() >= before + 8).await;
+    assert!(service.presentation_tries_for_tests() >= before + 8);
+    assert_eq!(
+        service.presentations_waiting_for_tests(),
+        1,
+        "a peer with bytes behind its token is there"
+    );
+    assert_eq!(service.connections_held_for_tests(), 1);
+
+    boundary.release();
+    match tokio::time::timeout(WAIT, link.recv())
+        .await
+        .expect("the worker answers once the boundary is free")
+        .expect("the answer arrives")
+    {
+        ControlFrame::GenerationAccepted(accepted) => {
+            assert_eq!(accepted.generation, ControllerGeneration::new(1));
+        }
+        other => panic!("the worker answered {other:?}"),
+    }
+}
+
+/// The owner's own connection is admitted while presentations of peers that have gone wait at a
+/// held boundary: they do not take the worker's connections to its bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_owners_own_connection_is_admitted_while_dead_presentations_wait() {
+    let host = host(1).await;
+    let service = &host.service;
+    let boundary = Held::boundary(&host).await;
+    let peers = presenting_many(&host, kr_worker::service::MAX_CONNECTIONS, 1);
+    settle(|| service.presentations_waiting_for_tests() == kr_worker::service::MAX_CONNECTIONS)
+        .await;
+    assert_eq!(
+        service.presentations_waiting_for_tests(),
+        kr_worker::service::MAX_CONNECTIONS,
+        "every connection the worker admits is a presentation that waits"
+    );
+    assert_eq!(
+        service.connections_held_for_tests(),
+        kr_worker::service::MAX_CONNECTIONS
+    );
+    peers_go(peers).await;
+    settle(|| service.connections_held_for_tests() == 0).await;
+    assert_eq!(
+        service.connections_held_for_tests(),
+        0,
+        "the connections of the peers that went are given back"
+    );
+    tokio::time::timeout(
+        WAIT,
+        LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build()),
+    )
+    .await
+    .expect("the owner's connection is answered while the boundary is held")
+    .expect("the owner's connection is admitted");
+    boundary.release();
+}

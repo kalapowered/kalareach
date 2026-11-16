@@ -174,6 +174,17 @@ pub const LATER_CONNECTION_HOLDS_AUTHORITY: &str =
 /// bound is the attachment limit with room to reconnect rather than the attachment limit exactly.
 pub const MAX_CONNECTIONS: usize = kr_protocol::limits::MAX_CONCURRENT_ATTACHMENTS * 2;
 
+/// How long a presentation that finds the dispatch boundary held waits before it tries again the
+/// first time. Each wait after it is twice the one before, up to [`PRESENTATION_RETRY_CAP`].
+const PRESENTATION_FIRST_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// The longest a presentation waits between two tries for the dispatch boundary.
+///
+/// It is also the longest, once the boundary is free, that a presentation whose peer is there can
+/// wait beyond a blocking wait, and the longest after its peer has gone that it keeps its
+/// connection, when the boundary is held throughout.
+const PRESENTATION_RETRY_CAP: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// The largest replay page one notification carries.
 ///
 /// A control frame is bounded at 1 MiB including its metadata, so a replay page stays well inside
@@ -601,6 +612,10 @@ pub struct WorkerService {
     /// this host's own tests read. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     presentations_waiting: std::sync::atomic::AtomicUsize,
+    /// How many times a presentation has found the dispatch boundary held, which this host's own
+    /// tests read. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    presentation_tries: std::sync::atomic::AtomicU64,
     /// Whether every announcement of an authority revision finds the dispatch boundary held, which
     /// this host's own tests arm. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -613,6 +628,16 @@ pub struct WorkerService {
     /// tests arm. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     evidence_forgotten: Mutex<std::collections::BTreeSet<u64>>,
+}
+
+/// What one try of a presentation came to.
+enum Presentation {
+    /// The boundary was free, and the token was decided under it.
+    Decided(ControlFrame),
+    /// The boundary is held and the peer is there: try again after a pause.
+    Held,
+    /// The peer has gone, and nothing was decided for it.
+    PeerGone,
 }
 
 /// A presentation that is waiting for the dispatch boundary, counted for as long as it waits. It is
@@ -1011,6 +1036,8 @@ impl WorkerService {
             announcements_before_a_held_boundary: Mutex::new(None),
             #[cfg(feature = "testing")]
             presentations_waiting: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "testing")]
+            presentation_tries: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "testing")]
             refusing_announcements: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "testing")]
@@ -1444,6 +1471,22 @@ impl WorkerService {
     #[must_use]
     pub fn presentations_waiting_for_tests(&self) -> usize {
         self.presentations_waiting
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many connections this worker is serving now, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn connections_held_for_tests(&self) -> usize {
+        self.connections.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many times a presentation has found the dispatch boundary held and tried again, for
+    /// this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn presentation_tries_for_tests(&self) -> u64 {
+        self.presentation_tries
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -2518,6 +2561,7 @@ impl WorkerService {
         let mut state =
             ConnectionState::new(connection_id, &peer, Arc::new(Mutex::new(Vec::new())));
         state.facts.local = Some(local_writes);
+        state.peer_watch = Some(Arc::clone(&writer));
         // The caller's record is validated and the connection registered in one step. The
         // listener checked the peer when it accepted the connection; this is the final check, and
         // it happens where the registration is written, so nothing can be admitted in between.
@@ -3476,9 +3520,7 @@ impl WorkerService {
                 }
             }
             ControlFrame::ControllerRole(role) => Some(Self::declare_role(state, role)),
-            ControlFrame::GenerationToken(token) => {
-                Some(off_the_executor(|| self.accept_generation(state, &token)))
-            }
+            ControlFrame::GenerationToken(token) => self.present_generation(state, &token).await,
             ControlFrame::AcceptanceDelivered(action_id) => {
                 // The proxy has passed the acceptance on. Whatever it names, only the close this
                 // connection is holding can be released by it.
@@ -4437,33 +4479,102 @@ impl WorkerService {
         ControlFrame::ControllerRole(role)
     }
 
-    fn accept_generation(
+    /// Decides a controller's generation token, waiting for the dispatch boundary for as long as
+    /// the peer is there to be answered.
+    ///
+    /// A generation that arrives while a mutation is between its authority check and its effect
+    /// waits for the boundary, so no request is ever fenced half way through. The wait is made of
+    /// tries and not of a lock that blocks: a presentation that finds the boundary held asks the
+    /// operating system whether its peer has gone, and tries again after a pause that starts at
+    /// five milliseconds and doubles to a quarter of a second. A peer that has gone ends the
+    /// presentation there. No acceptance runs for it, and its connection is read to its end at once
+    /// and its place in the worker's count of connections is given back, where a blocking wait
+    /// would keep both, and a thread, until the hold ended. A peer that is there waits for the whole
+    /// hold, however long, and takes the boundary at its first try after the holder lets go, which
+    /// is at most one pause after the release. The try, the question to the system and the
+    /// acceptance are one step that returns no guard, so nothing is held across a pause.
+    ///
+    /// What this leaves open, as limits to know:
+    ///
+    /// - A peer can go at any time after the last question, and the acceptance then runs for a peer
+    ///   that has just gone. No design closes that window. Such a presentation cannot collect: its
+    ///   answer fails to write and its connection ends.
+    /// - A Unix peer that sent bytes behind its token, and then went, is taken as there for as long
+    ///   as those bytes are unread, which is the whole hold. A client sends nothing behind its
+    ///   token until the worker has answered.
+    /// - A peer that stops using a link without closing it is there, as far as the system can say.
+    /// - On Windows a client that dropped its link is reported gone once its own runtime has
+    ///   released the handle, which happens when that runtime next turns. A client whose runtime
+    ///   does not turn is taken as there.
+    /// - There is no bound of time or of count beside the question: a peer that stays and never
+    ///   answers keeps its connection for as long as the hold lasts.
+    async fn present_generation(
         &self,
         state: &mut ConnectionState,
         token: &kr_protocol::worker::ControllerGenerationToken,
-    ) -> ControlFrame {
+    ) -> Option<ControlFrame> {
         let Some(nonce) = state.generation_nonce.take() else {
-            return failure(
+            return Some(failure(
                 RequestId::new(0),
                 &ProtocolError::new(
                     ErrorCode::PermissionDenied,
                     "a generation token answers a challenge this worker issued",
                 ),
-            );
+            ));
         };
         #[cfg(feature = "testing")]
-        let _decided = self.wait_before_presentation();
-        // Taken before the authority lock, and held for the whole decision. A generation that
-        // arrives while a mutation is between its authority check and its effect waits here, so no
-        // request is ever fenced half way through.
+        let _decided = off_the_executor(|| self.wait_before_presentation());
         #[cfg(feature = "testing")]
         let waiting = PresentationWaiting::begin(&self.presentations_waiting);
-        let _barrier = self
-            .dispatch
-            .lock()
-            .expect("the dispatch barrier is not poisoned");
+        let mut pause = PRESENTATION_FIRST_RETRY;
+        let decided = loop {
+            match off_the_executor(|| self.present_once(state, &nonce, token)) {
+                Presentation::Decided(answer) => break Some(answer),
+                Presentation::PeerGone => break None,
+                Presentation::Held => {}
+            }
+            tokio::time::sleep(pause).await;
+            pause = (pause * 2).min(PRESENTATION_RETRY_CAP);
+        };
         #[cfg(feature = "testing")]
         drop(waiting);
+        decided
+    }
+
+    /// One try of a presentation: takes the dispatch boundary when it is free and decides the
+    /// token under it, and otherwise asks whether the peer has gone. It holds nothing when it
+    /// returns.
+    fn present_once(
+        &self,
+        state: &mut ConnectionState,
+        nonce: &Nonce256,
+        token: &kr_protocol::worker::ControllerGenerationToken,
+    ) -> Presentation {
+        let _barrier = match self.dispatch.try_lock() {
+            Ok(barrier) => barrier,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                #[cfg(feature = "testing")]
+                self.presentation_tries
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return if state.peer_has_gone() {
+                    Presentation::PeerGone
+                } else {
+                    Presentation::Held
+                };
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                panic!("the dispatch barrier is not poisoned")
+            }
+        };
+        Presentation::Decided(self.accept_generation(state, nonce, token))
+    }
+
+    fn accept_generation(
+        &self,
+        state: &mut ConnectionState,
+        nonce: &Nonce256,
+        token: &kr_protocol::worker::ControllerGenerationToken,
+    ) -> ControlFrame {
         // One lock for the whole decision. Reading the accepted generation, checking the token
         // against it and installing the new generation with the connection that presented it
         // happen without a window in between, so two tokens cannot interleave and leave the
@@ -4478,7 +4589,7 @@ impl WorkerService {
             boot_identity: self.boot_identity.clone(),
             accepted_generation: authority.accepted_generation,
         };
-        match check_generation_token(&acceptance, &nonce, token) {
+        match check_generation_token(&acceptance, nonce, token) {
             Ok(()) => {
                 // A token for a higher generation replaces the authority, so the connection that
                 // held it and every proxy of it are fenced together. Anything a previous generation
@@ -10887,6 +10998,9 @@ pub struct ConnectionState {
     /// Pinning it here is what stops a process identifier the kernel recycles while this
     /// connection is open from being answered as though it were the caller that opened it.
     pub peer_process: Option<kr_protocol::identity::ProcessStartIdentity>,
+    /// This connection's own writer, which the wait for the dispatch boundary asks whether the
+    /// peer has gone: the operating system answers through it, and nothing is read.
+    pub(crate) peer_watch: Option<Arc<Mutex<kr_ipc::framed::FrameWriter>>>,
     /// What binding the caller to this session came to, for the mutation being dispatched now.
     ///
     /// Asking the kernel who the caller is takes as long as the kernel takes, so it is done before
@@ -10948,9 +11062,24 @@ impl ConnectionState {
             peer_process: peer
                 .pid
                 .and_then(|pid| kr_ipc::identity::process_start_identity(pid).ok()),
+            peer_watch: None,
             binding: None,
             next_request: 0,
         }
+    }
+
+    /// Whether the operating system says the peer of this connection has gone.
+    ///
+    /// Nothing is read and nothing waits. A connection with no watch has no peer to ask, and its
+    /// peer is taken as there.
+    fn peer_has_gone(&self) -> bool {
+        self.peer_watch.as_ref().is_some_and(|writer| {
+            writer
+                .lock()
+                .expect("the connection writer is not poisoned")
+                .peer_state()
+                == PeerState::Gone
+        })
     }
 
     /// Returns whether this connection is owed a keepalive: it has negotiated and a process
