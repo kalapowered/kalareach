@@ -39,7 +39,7 @@ pub struct LibraryQualification {
     pub notes: &'static [&'static str],
     /// Behaviour that constrains the direct compatibility profile.
     pub direct_mode_constraints: &'static [&'static str],
-    /// The accessors the pinned revision adds to the upstream tree.
+    /// What the pinned revision adds to the upstream tree.
     pub qualified_additions: &'static [QualifiedAddition],
     /// The accessors the profile needs and the pinned revision does not expose.
     ///
@@ -50,7 +50,7 @@ pub struct LibraryQualification {
 /// The qualification record for the pinned revision.
 pub const LIBRARY: LibraryQualification = LibraryQualification {
     repository: "https://github.com/kalapowered/wezterm",
-    revision: "9a9015119497fd5803c35a10ea4ffc503f2a7dfb",
+    revision: "f3227b5b167844e03ca588ad7093b3975602d287",
     upstream: "https://github.com/wezterm/wezterm",
     upstream_revision: "699fd77b44641c43476c945054cfae6518dbd632",
     notes: &[
@@ -150,6 +150,28 @@ pub const LIBRARY: LibraryQualification = LibraryQualification {
                      own, and a compact row that worked out where its cells are by clustering its \
                      text again would join adjacent scalars and drop the columns they held, so the \
                      compact form keeps the cell boundaries it was given",
+        },
+        QualifiedAddition {
+            state: "Line::caller_mark() and Line::set_caller_mark(), a mark that goes with a \
+                    line's content through a clone, a split, a rewrap and a join",
+            reason: "privacy mode keeps no row above the screen, and a row's position is not \
+                     its identity: a reverse index, an insert or a scroll moves a row past any \
+                     position the engine could record, so the engine marks the line itself and \
+                     the library carries the mark wherever it puts the content",
+        },
+        QualifiedAddition {
+            state: "the scrolls inside left and right margins carrying a line's caller mark to \
+                    the line that receives its cells",
+            reason: "those scrolls copy cells between two line objects instead of moving the \
+                     lines, so a mark that only travels with the line object would stay behind \
+                     while the cells it describes moved",
+        },
+        QualifiedAddition {
+            state: "TerminalState::primary_screen_mut(), the primary buffer with its scrollback, \
+                    whichever buffer is active",
+            reason: "while a full screen application holds the alternate buffer the library \
+                     lends out only that buffer for writing, so the rows the primary buffer \
+                     holds above its screen could not be given up until the application left",
         },
     ],
     required_patch: &[],
