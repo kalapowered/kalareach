@@ -18,7 +18,7 @@ use kr_protocol::confirmation::{ConfirmationDisplay, OwnerConfirmationRequestRes
 use kr_protocol::ids::ActionId;
 use kr_protocol::pairing::SensitiveAction;
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{CanonicalSet, Digest256};
+use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable};
 
 use super::a_result_the_lease_ended_over::{
     Presenter, connected_under_a_lease_that_can_be_presented_again,
@@ -45,6 +45,42 @@ struct Found {
     answered: Result<OwnerConfirmationRequestResult, ControllerError>,
     copied: bool,
     rows: i64,
+    /// What the same action is answered when it is asked again, which reads the row the first
+    /// request wrote: none where the first was refused.
+    replayed: Option<Result<OwnerConfirmationRequestResult, ControllerError>>,
+    /// Whether the host has an owner, which decides the reply's bootstrap flag.
+    has_an_owner: bool,
+    /// The wall readings before the request began and after it ended: the expiry it issued lies
+    /// between them, a confirmation's lifetime on.
+    window: (u64, u64),
+}
+
+/// Completes what a request found with what the case reads beside it: the host's owner, and the
+/// answer to the same action asked again.
+async fn with_its_replay(
+    mut found: Found,
+    temp: &kr_ipc::testing::TempHost,
+    owner: Arc<crate::service::net::owner::OwnerAuthority>,
+    caller: Caller,
+    action: (ActionId, Digest256),
+    display: ConfirmationDisplay,
+) -> Found {
+    found.has_an_owner = registry(temp)
+        .query_row("SELECT COUNT(*) FROM host_owner", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("the owner is read")
+        > 0;
+    if found.rows == 1 {
+        found.replayed = Some(
+            tokio::task::spawn_blocking(move || {
+                owner.request(&caller, resolved(display), action, &AtomicBool::new(false))
+            })
+            .await
+            .expect("the request is asked again"),
+        );
+    }
+    found
 }
 
 fn resolved(display: ConfirmationDisplay) -> Resolved {
@@ -143,6 +179,8 @@ async fn recorded_with(ends: Ends, display: ConfirmationDisplay) -> Found {
         }
     };
     let owner = Arc::clone(controller.owner_authority());
+    let (again, shown) = ((Arc::clone(&owner), caller.clone()), display.clone());
+    let begun_at = kr_ipc::now_ms().get();
     let asking = tokio::task::spawn_blocking(move || {
         let copied = AtomicBool::new(false);
         let answered = owner.request(&caller, resolved(display), action, &copied);
@@ -162,6 +200,7 @@ async fn recorded_with(ends: Ends, display: ConfirmationDisplay) -> Found {
     }
     go.send(()).expect("the record goes on");
     let (answered, copied) = asking.await.expect("the request ends");
+    let ended_at = kr_ipc::now_ms().get();
     let rows = registry(&temp)
         .query_row(
             "SELECT COUNT(*) FROM pairing_actions WHERE action_id = ?1",
@@ -169,11 +208,15 @@ async fn recorded_with(ends: Ends, display: ConfirmationDisplay) -> Found {
             |row| row.get::<_, i64>(0),
         )
         .expect("the records are read");
-    Found {
+    let found = Found {
         answered,
         copied,
         rows,
-    }
+        replayed: None,
+        has_an_owner: false,
+        window: (begun_at, ended_at),
+    };
+    with_its_replay(found, &temp, again.0, again.1, action, shown).await
 }
 
 /// As [`recorded_with`], for a bound that moves inside the record's transaction, after the feed's
@@ -200,6 +243,8 @@ async fn recorded_with_the_bound_moving_inside(display: ConfirmationDisplay) -> 
     let (before, go_in) = controller.pause_before_the_record_begins();
     let (after_the_feed, go_on) = controller.pause_after_the_record_asks_the_feed();
     let owner = Arc::clone(controller.owner_authority());
+    let (again, shown) = ((Arc::clone(&owner), caller.clone()), display.clone());
+    let begun_at = kr_ipc::now_ms().get();
     let asking = tokio::task::spawn_blocking(move || {
         let copied = AtomicBool::new(false);
         let answered = owner.request(&caller, resolved(display), action, &copied);
@@ -218,6 +263,7 @@ async fn recorded_with_the_bound_moving_inside(display: ConfirmationDisplay) -> 
     held.swap().await;
     go_on.send(()).expect("the record goes on");
     let (answered, copied) = asking.await.expect("the request ends");
+    let ended_at = kr_ipc::now_ms().get();
     let rows = registry(&temp)
         .query_row(
             "SELECT COUNT(*) FROM pairing_actions WHERE action_id = ?1",
@@ -225,24 +271,52 @@ async fn recorded_with_the_bound_moving_inside(display: ConfirmationDisplay) -> 
             |row| row.get::<_, i64>(0),
         )
         .expect("the records are read");
-    Found {
+    let found = Found {
         answered,
         copied,
         rows,
-    }
+        replayed: None,
+        has_an_owner: false,
+        window: (begun_at, ended_at),
+    };
+    with_its_replay(found, &temp, again.0, again.1, action, shown).await
 }
 
+/// The request's reply, compared whole. Every field a case can know is compared with what it knows: the
+/// action, the digest, the absent destination, the empty rights, the expiry (a confirmation's
+/// lifetime on from the wall reading, between the readings the case took around the request) and
+/// the bootstrap flag (the host has no owner yet). Four fields no case can know beforehand are
+/// compared with the row instead, by asking for the same action again, which returns what the
+/// request recorded: the challenge's identity and nonce, which the host draws at random, and the
+/// host's own device and endpoint identities, which no case reads from the host.
 fn written(found: &Found) {
     let answered = found.answered.as_ref().expect("the request is answered");
     assert!(!found.copied, "the request was recorded here, not copied");
-    assert!(
-        matches!(
-            &answered.request.action,
-            SensitiveAction::ChangeHostAuthority
-        ),
-        "the challenge is the one asked for: {answered:?}"
-    );
     assert_eq!(found.rows, 1, "the record is written once");
+    let recorded = found
+        .replayed
+        .as_ref()
+        .expect("the action is asked again")
+        .as_ref()
+        .expect("the row is read back");
+    assert_eq!(
+        answered, recorded,
+        "the reply is the row's challenge, whole"
+    );
+    let challenge = &answered.request;
+    assert_eq!(challenge.action, SensitiveAction::ChangeHostAuthority);
+    assert_eq!(challenge.action_digest, Digest256::from_bytes([9; 32]));
+    assert_eq!(challenge.destination_keys, Nullable::null());
+    assert_eq!(challenge.destination_rights, CanonicalSet::new());
+    let lifetime = kr_pairing::confirm::CONFIRMATION_LIFETIME_MS;
+    let expires = challenge.expires_at_ms.get();
+    assert!(
+        (found.window.0 + lifetime..=found.window.1 + lifetime).contains(&expires),
+        "the expiry {expires} is a lifetime on from a reading between {} and {}",
+        found.window.0,
+        found.window.1
+    );
+    assert_eq!(answered.initial_bootstrap, !found.has_an_owner);
 }
 
 fn refused_as_a_caller_no_lease_serves(found: &Found) {
