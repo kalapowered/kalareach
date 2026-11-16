@@ -79,6 +79,9 @@ use crate::session::Session;
 use crate::trace::Site;
 
 mod overtake;
+mod standing;
+
+use standing::{Mode, ShownAtAdmission, Sweep};
 
 /// How often the worker replaces a live connection's action window.
 ///
@@ -610,6 +613,12 @@ pub struct WorkerService {
     /// in every shipped build.
     #[cfg(feature = "testing")]
     fence_stall: crate::testing::Stall,
+    /// A stop in a first admission between the checks of its limits and the check of its window,
+    /// which this host's own tests arm to settle a launch or move a clock where the first
+    /// admission has read the journal and not yet taken the session. It is compiled away in every
+    /// shipped build.
+    #[cfg(feature = "testing")]
+    after_limits_stall: crate::testing::Stall,
     /// A stop at the start of the next accepted action's preparation, before its bound begins and
     /// before its component is asked, which this host's own tests arm to hold an action in its
     /// preparation for as long as they need. It is compiled away in every shipped build.
@@ -1159,6 +1168,8 @@ impl WorkerService {
             binding_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
             fence_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            after_limits_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             preparation_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
@@ -1987,6 +1998,23 @@ impl WorkerService {
         std::sync::mpsc::Sender<()>,
     ) {
         self.fence_stall.arm()
+    }
+
+    /// Stops the next first admission of a mutation after it has checked its limits and before it
+    /// checks its window, for this host's own tests: the journal has been read for the uncertain
+    /// outcome in the way, and the session is not yet held.
+    ///
+    /// Returns the end that says the admission has arrived, and the end that lets it go. The stop
+    /// fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_next_admission_after_its_limits(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.after_limits_stall.arm()
     }
 
     /// Sets how long an admitted operation has to reach its upstream before the worker records an
@@ -5880,9 +5908,7 @@ impl WorkerService {
         facts: &ConnectionFacts,
         method: Method,
     ) -> std::result::Result<Option<crate::local_gate::Allowed>, WorkerError> {
-        if facts.client_kind == LocalClientKind::Controller
-            || kr_protocol::method::local_hold(method) == kr_protocol::method::LocalHold::Free
-        {
+        if !Self::holds_local(facts, method) {
             return Ok(None);
         }
         // The gate's lock and, for an owner whose membership is bound, the time contract's lock
@@ -5893,6 +5919,14 @@ impl WorkerService {
             .map_err(|refused| WorkerError::PermissionDenied {
                 detail: refused.detail().to_owned(),
             })
+    }
+
+    /// Whether a method of this connection is held to the local owner's lease: a connection the
+    /// control daemon opened is never held, and a method the host does not hold is served whatever
+    /// the lease says.
+    fn holds_local(facts: &ConnectionFacts, method: Method) -> bool {
+        facts.client_kind != LocalClientKind::Controller
+            && kr_protocol::method::local_hold(method) != kr_protocol::method::LocalHold::Free
     }
 
     /// The caller of a held method, bounded by the lease it answers to, and the gate's
@@ -5920,7 +5954,26 @@ impl WorkerService {
     /// dispatched: the gate must allow it now, and must not have been restricted since the request
     /// was admitted. A notice to `Closed` that arrived while the request waited for the boundary
     /// cannot be overtaken by it.
+    ///
+    /// This is the full check: it raises the host's clock floor and owes its record, and it
+    /// returns what the gate allows, for the caller whose end is to be laid again from it.
     fn check_local_dispatch(
+        &self,
+        facts: &ConnectionFacts,
+        method: Method,
+        caller: &Caller,
+    ) -> Result<Option<crate::local_gate::Allowed>> {
+        // It takes the local gate's lock and may read the host's floor from the disk.
+        crate::input_domain::assert_not_held("a check of the local owner's access");
+        let allowed = self.check_local_hold(facts, method)?;
+        self.check_restrictions(caller)?;
+        Ok(allowed)
+    }
+
+    /// The same question as [`Self::check_local_dispatch`], asked by a pass that asks again: the
+    /// gate's bound and its time ends are compared with the clocks and the floor as they stand,
+    /// and nothing is raised, owed or kept.
+    fn check_local_standing(
         &self,
         facts: &ConnectionFacts,
         method: Method,
@@ -5928,7 +5981,18 @@ impl WorkerService {
     ) -> Result<()> {
         // It takes the local gate's lock and may read the host's floor from the disk.
         crate::input_domain::assert_not_held("a check of the local owner's access");
-        self.check_local_hold(facts, method)?;
+        if Self::holds_local(facts, method) {
+            off_the_executor(|| self.gate.check_bound()).map_err(|refused| {
+                WorkerError::PermissionDenied {
+                    detail: refused.detail().to_owned(),
+                }
+            })?;
+        }
+        self.check_restrictions(caller)
+    }
+
+    /// Refuses a caller admitted under a lease that the host has restricted since.
+    fn check_restrictions(&self, caller: &Caller) -> Result<()> {
         if let Some(admitted) = caller.gate_restrictions
             && self.gate.restrictions() != admitted
         {
@@ -7030,15 +7094,24 @@ impl WorkerService {
         // reboot or a step of the wall clock is revalidated here, on this mutation's own way
         // through, rather than left for a maintenance tick that may be a minute away.
         self.revalidate_time();
-        self.check_authority(&state.facts)?;
         // Inside the barrier, and before anything durable: an action the daemon validated under an
         // authority revision this worker has since installed past is an action whose authority has
         // been withdrawn. The daemon takes its lease before it forwards, but a request can arrive
         // after the revision it was validated under was replaced, and the barrier is where that has
         // to be caught: a revocation is complete for a worker when the worker has stopped being
         // able to act under what it removed.
-        self.check_validated_revision(caller)?;
-        self.check_local_dispatch(&state.facts, method, caller)?;
+        let first = self.standing_pass(Mode::First);
+        first.authority(&state.facts, caller, method)?;
+        // The local owner's full check is the first admission's own work: it raises the host's
+        // clock floor and owes its record. It stands at the place of the comparison that a pass
+        // that asks again makes, and what it allows lays the caller's continuous end again, so that
+        // the window check below and everything after it reads the end as it stands now. The count
+        // it is compared with is the one the request was admitted at, read before the check.
+        let allowed = self.check_local_dispatch(&state.facts, method, caller)?;
+        let relaid = caller
+            .gate_restrictions
+            .and_then(|admitted| Self::bound_by_lease(caller, allowed, admitted));
+        let caller = relaid.as_ref().unwrap_or(caller);
         let digest = kr_protocol::digest::mutation_digest(mutation, &actor_id)
             .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
 
@@ -7072,13 +7145,15 @@ impl WorkerService {
         // The envelope is checked before anything durable happens: the target this worker will
         // act on, the grant the caller claims, the preconditions the subject must still satisfy
         // and the freshness window that admits a first request.
-        self.check_envelope(mutation, entry, caller)?;
+        first.envelope(mutation, entry, caller)?;
         Self::check_draft_route(state, mutation, method)?;
         // What this mutation asks for, as distinct from the identifier it asks under. It is what
         // decides whether a fresh identifier would be taking an uncertain outcome's place.
         let subject = kr_protocol::action::subject_digest(mutation)
             .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
-        self.check_admission_limits(caller, state, mutation, method, subject)?;
+        let shown = first.limits(None, caller, state, mutation, method, subject, None)?;
+        #[cfg(feature = "testing")]
+        self.after_limits_stall.stand();
         // The deadline lives on the continuous clock. That is what admission, revalidation and
         // expiry all read, so a wall clock that moves cannot lengthen or shorten an action's life.
         let now = self.clock.now();
@@ -7132,6 +7207,7 @@ impl WorkerService {
             work,
             volatile_permitted,
             &submission,
+            shown,
         );
         state.binding = None;
         answered
@@ -7150,6 +7226,7 @@ impl WorkerService {
         work: crate::persistence::fault::WorkClass,
         volatile_permitted: bool,
         submission: &crate::journal::Submission,
+        shown: ShownAtAdmission,
     ) -> Result<Answered> {
         // From here the session is locked and stays locked. Admission, the final revalidation, the
         // dispatch marker, the effect and the recorded outcome are one serial boundary: nothing
@@ -7181,6 +7258,19 @@ impl WorkerService {
                 detail: refusal.message,
             });
         }
+
+        // The uncertain outcome in the way is asked again under the hold that reaches the accept:
+        // an earlier launch can settle as unknown while this request waited for the session. A
+        // refusal here has written no receipt, as at the first admission.
+        self.standing_pass(Mode::Again).limits(
+            Some(&mut *session),
+            caller,
+            state,
+            mutation,
+            method,
+            submission.subject_digest,
+            Some(shown),
+        )?;
 
         // Storage failure stops an ordinary typed mutation before dispatch. An authorised stop is
         // the named exception: section 7 requires `session.close` to proceed on the worker's
@@ -7246,21 +7336,23 @@ impl WorkerService {
         let second_pass = preparation.is_some();
         // Revalidate inside the boundary. Anything that was true at acceptance may not be now, and
         // this is the last moment at which checking it still means something.
-        let revalidated = self
-            .validate(&session, state, mutation, method, caller)
-            .and_then(|()| Self::check_preconditions(&session, mutation))
-            // The remote dispatch lease, in the serial path and immediately before the deadline
-            // and the marker: a lease that was valid when the action was queued proves nothing.
-            .and_then(|()| self.check_dispatch_lease(caller, method))
+        let pass = self.standing_pass(if second_pass {
+            Mode::Again
+        } else {
+            Mode::First
+        });
+        let revalidated = pass
+            .subject(&session, state, mutation, method, caller)
             // The deadline the host derived is the deadline it keeps, measured on the continuous
             // clock so a wall clock that moves cannot extend it. This is also what makes a zero
-            // requested lifetime mean what it says.
-            .and_then(|()| self.check_accepted_deadline(deadline))
-            // And last, what the effect itself would have refused. Last, because that is where the
-            // effect asked it: moving a refusal before the marker must not move it in front of a
-            // precondition the caller stated or a deadline this host accepted. For a mutation the
-            // broker owns, what comes back is the admission itself.
-            .and_then(|()| self.decidable(&session, mutation, method, caller, preparation));
+            // requested lifetime mean what it says. It is asked, with the remote dispatch lease
+            // that comes before it, last among the checks of the request, because that is where
+            // the effect asked it: moving a refusal before the marker must not move it in front of
+            // a precondition the caller stated or a deadline this host accepted. For a mutation
+            // the broker owns, what comes back is the admission itself.
+            .and_then(|()| {
+                pass.dispatch(&session, mutation, method, caller, deadline, preparation)
+            });
         let mut prepared = match revalidated {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -7972,19 +8064,51 @@ impl WorkerService {
     ///   ([`Self::uncertain_outcome_in_the_way`]).
     /// * An actor holds at most eight admitted, unsettled mutations at once, lowered by whatever
     ///   the connection negotiated.
+    ///
+    /// The first admission reads what the person was shown and publishes a journal that fails; a
+    /// pass that asks again, which holds the session itself, is given the value that the first
+    /// admission read and leaves the note of a failed journal to it.
+    #[allow(clippy::too_many_arguments)]
     fn check_admission_limits(
         &self,
+        mode: Mode,
+        held: Option<&mut Session>,
         caller: &Caller,
         state: &ConnectionState,
         mutation: &MutationRequest,
         method: Method,
         subject: kr_protocol::scalars::Digest256,
-    ) -> Result<()> {
+        shown: Option<ShownAtAdmission>,
+    ) -> Result<ShownAtAdmission> {
         let actor_id = &caller.actor_id;
         let declared = MutationPreconditions::parse(&mutation.expected)?.supersedes;
-        let mut session = self.runtime.session();
+        // A person is shown a result through the local owner's commands or a paired device. The
+        // workflow ingress serves one close of the session a run started and shows nobody
+        // anything, so a quote made through it has been shown to no one.
+        let shown = shown.unwrap_or_else(|| {
+            ShownAtAdmission(
+                declared
+                    .filter(|_| {
+                        matches!(
+                            caller.ingress,
+                            ActorIngress::LocalIpc | ActorIngress::PairedDevice
+                        )
+                    })
+                    .and_then(|declared| {
+                        self.shown_receipts
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .revision(actor_id, declared.action_id)
+                    }),
+            )
+        });
+        let mut taken: Option<std::sync::MutexGuard<'_, Session>> = None;
+        let session: &mut Session = match held {
+            Some(session) => session,
+            None => taken.insert(self.runtime.session()),
+        };
         let Some(journal) = session.journal_mut() else {
-            return Ok(());
+            return Ok(shown);
         };
         // These two reads are what stops a *new* rich action being admitted twice or past its
         // limit. An authorised stop and a native interrupt are neither, and a store that cannot
@@ -7997,8 +8121,10 @@ impl WorkerService {
         let (uncertain, outstanding) = match read {
             Ok(pair) => pair,
             Err(error) if volatile_permitted && is_storage_failure(&error) => {
-                session.note_journal_failure(error.to_string());
-                return Ok(());
+                if mode == Mode::First {
+                    session.note_journal_failure(error.to_string());
+                }
+                return Ok(shown);
             }
             Err(error) => return Err(error),
         };
@@ -8006,33 +8132,18 @@ impl WorkerService {
             action_id,
             revision,
         });
-        drop(session);
-        // A person is shown a result through the local owner's commands or a paired device. The
-        // workflow ingress serves one close of the session a run started and shows nobody
-        // anything, so a quote made through it has been shown to no one.
-        let shown = declared
-            .filter(|_| {
-                matches!(
-                    caller.ingress,
-                    ActorIngress::LocalIpc | ActorIngress::PairedDevice
-                )
-            })
-            .and_then(|declared| {
-                self.shown_receipts
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .revision(actor_id, declared.action_id)
-            });
-        crate::action::dedup::check_supersession(uncertain, declared, shown)?;
+        drop(taken);
+        crate::action::dedup::check_supersession(uncertain, declared, shown.0)?;
         if !crate::action::dedup::bounded_by_outstanding(method) {
-            return Ok(());
+            return Ok(shown);
         }
         crate::action::dedup::check_outstanding(
             outstanding,
             crate::action::dedup::outstanding_limit(
                 state.peer_limits.max_outstanding_mutations.get(),
             ),
-        )
+        )?;
+        Ok(shown)
     }
 
     /// Returns the actor's uncertain outcome that a fresh `mutation` for `subject` has to show, if
@@ -8175,6 +8286,7 @@ impl WorkerService {
         mutation: &MutationRequest,
         method: Method,
         caller: &Caller,
+        sweep: Sweep,
     ) -> Result<()> {
         match method {
             Method::SessionAttach => {
@@ -8326,12 +8438,10 @@ impl WorkerService {
                 self.questions
                     .check_own(&source, params.question_id, &params.caller_token)?;
                 let revision = self.questions.question(params.question_id)?.revision;
-                Ok(self.questions.check_resolvable(
-                    params.question_id,
-                    revision,
-                    None,
-                    self.question_clock(),
-                )?)
+                self.sweep_questions(sweep)?;
+                Ok(self
+                    .questions
+                    .check_resolvable(params.question_id, revision, None)?)
             }
             Method::AlertCreate => {
                 let params: kr_protocol::question::AlertCreateParams = parse(&mutation.params)?;
@@ -8347,11 +8457,11 @@ impl WorkerService {
                 let params: kr_protocol::question::QuestionAnswerParams = parse(&mutation.params)?;
                 Self::check_session(session, params.session_id)?;
                 let reach = caller.disclosure(true);
+                self.sweep_questions(sweep)?;
                 Ok(self.questions.check_resolvable_reaching(
                     params.question_id,
                     params.expected_revision,
                     Some(&params.answer),
-                    self.question_clock(),
                     |question| reach.reaches_question(question),
                 )?)
             }
@@ -8359,11 +8469,11 @@ impl WorkerService {
                 let params: kr_protocol::question::QuestionCancelParams = parse(&mutation.params)?;
                 Self::check_session(session, params.session_id)?;
                 let reach = caller.disclosure(true);
+                self.sweep_questions(sweep)?;
                 Ok(self.questions.check_resolvable_reaching(
                     params.question_id,
                     params.expected_revision,
                     None,
-                    self.question_clock(),
                     |question| reach.reaches_question(question),
                 )?)
             }
@@ -8414,6 +8524,16 @@ impl WorkerService {
                 method.as_str()
             ))),
         }
+    }
+
+    /// Expires the questions that are due, when the pass is the first admission's, so that the
+    /// check of a question that follows reads it as it stands: the question methods' checks read
+    /// and change nothing.
+    fn sweep_questions(&self, sweep: Sweep) -> Result<()> {
+        if sweep == Sweep::Run {
+            self.questions.sweep(self.question_clock())?;
+        }
+        Ok(())
     }
 
     /// Wraps one broker admission as the work that happens once the session boundary ends.

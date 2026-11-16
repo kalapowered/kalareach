@@ -230,6 +230,9 @@ impl Questions {
     /// Called for the same reason as [`Self::check_create`]: an answer to a question somebody else
     /// has already answered is a refusal, not an uncertain outcome.
     ///
+    /// It reads the question as it stands and changes nothing: a question that is due and has not
+    /// been swept ([`Self::sweep`]) reads as pending, and whoever must see it expired sweeps first.
+    ///
     /// # Errors
     ///
     /// Returns [`QuestionError::Resolved`], [`QuestionError::Expired`],
@@ -239,16 +242,15 @@ impl Questions {
         question_id: kr_protocol::ids::QuestionId,
         expected: kr_protocol::ids::QuestionRevision,
         answer: Option<&QuestionAnswer>,
-        now: Now,
     ) -> Result<()> {
-        self.check_resolvable_reaching(question_id, expected, answer, now, |_| true)
+        self.check_resolvable_reaching(question_id, expected, answer, |_| true)
     }
 
     /// Checks that a question can still be resolved by a caller whose history reaches it, and that
     /// the answer fits its form.
     ///
-    /// What the caller's history reaches is decided first, after the question's own deadline has
-    /// been applied and before anything else about it is said: a question the caller's history does
+    /// What the caller's history reaches is decided first, before anything else about the question
+    /// is said: a question the caller's history does
     /// not reach is refused exactly as one this session does not hold is, so the refusal tells it
     /// nothing about the question's state, its revision or its form. What is left is
     /// [`Self::check_resolvable`]'s order, which the answering surfaces rely on: the form, then
@@ -263,15 +265,9 @@ impl Questions {
         question_id: kr_protocol::ids::QuestionId,
         expected: kr_protocol::ids::QuestionRevision,
         answer: Option<&QuestionAnswer>,
-        now: Now,
         reaches: impl FnOnce(&Question) -> bool,
     ) -> Result<()> {
-        let mut store = self.locked()?;
-        let expired = expiry_events(store.expire_due(now, self.agents.as_deref())?, now);
-        let question = store.read(question_id);
-        drop(store);
-        self.woken_by(&expired);
-        let question = question?;
+        let question = self.locked()?.read(question_id)?;
         if !reaches(&question) {
             return Err(crate::questions::error::unknown(question_id));
         }
