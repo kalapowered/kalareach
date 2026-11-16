@@ -1320,8 +1320,9 @@ async fn host_info(
 /// holder cannot be read), the daemon has ended when the lock is free and nothing answers at its
 /// endpoint, and the command cannot name or wait for the process itself.
 ///
-/// Each look is bounded by what is left of the one deadline, and a look that cannot be made
-/// leaves the daemon as not ended.
+/// Each wait is bounded by what is left of the one deadline when it starts, counted after the wait
+/// before it: the install lock's wait, a look at the endpoint and the pause between two rounds. A
+/// look that cannot be made leaves the daemon as not ended.
 async fn wait_for_the_end(
     host: &HostPaths,
     environment: &EnvironmentPaths,
@@ -1330,28 +1331,28 @@ async fn wait_for_the_end(
     bound: Duration,
 ) -> End {
     let deadline = tokio::time::Instant::now() + bound;
+    let left = || deadline.saturating_duration_since(tokio::time::Instant::now());
     let installation = Installation::of(host, environment);
     loop {
-        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let held = installation.held(left).await;
+        let held = installation.held(left()).await;
         let unlooked = held.as_ref().err().cloned();
         let process = old.map(identity::process_state);
         let old_gone = matches!(process, Some(ProcessState::Ended));
         let seen = match (held, process) {
             (Ok(false), Some(ProcessState::Ended)) => Some(End::Gone),
             (Ok(true), Some(ProcessState::Ended)) => {
-                successor_of(environment, generation, old, left)
+                successor_of(environment, generation, old, left())
                     .await
                     .map(End::Successor)
             }
             // The process runs, or the system did not say: the daemon has not ended.
             (_, Some(ProcessState::Running | ProcessState::Unknown { .. })) => None,
-            (Ok(false), None) => match endpoint_look(environment, generation, left).await {
+            (Ok(false), None) => match endpoint_look(environment, generation, left()).await {
                 Endpoint::Nobody => Some(End::Gone),
                 Endpoint::Another => Some(End::Successor(named_daemon(environment))),
                 Endpoint::Same | Endpoint::Unclear => None,
             },
-            (Ok(true), None) => successor_of(environment, generation, None, left)
+            (Ok(true), None) => successor_of(environment, generation, None, left())
                 .await
                 .map(End::Successor),
             (Err(_), _) => None,
@@ -1366,7 +1367,7 @@ async fn wait_for_the_end(
                 _ => Why::Running,
             });
         }
-        tokio::time::sleep(LOOK_EVERY.min(left)).await;
+        tokio::time::sleep(LOOK_EVERY.min(left())).await;
     }
 }
 
