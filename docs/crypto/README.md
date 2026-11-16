@@ -484,7 +484,13 @@ check on the directory itself.
 `open_store_in` records nothing. The `.store-kind` marker is `open_store`'s record of a choice made
 once for a host, and this choice is passed in at every start. `StoreSelection::File` reads the
 record before it opens the directory and refuses a host whose record names the platform store,
-because none of that host's keys are in the directory.
+because that host's keys are in the platform store, not in the directory.
+
+`open_store` and `StoreSelection::open` take the program that keeps the keys, `KeyOwner::Host` for
+the control daemon or `KeyOwner::Device` for the companion and the client library's own store. A
+refusal names that program and tells its person what to do in its words: the daemon's person starts
+the host again, the companion's person opens the app again. Only the host has a command line that
+names `StoreSelection::File`, so only the host is refused it over a recorded platform store.
 
 ### The recorded choice
 
