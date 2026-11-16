@@ -391,7 +391,6 @@ pub struct Session {
     /// outlives a reboot is the other consumer, and no store holds one yet.
     time: Arc<crate::action::time::TimeContract>,
     closure: Option<ClosureRecord>,
-    application_state: Option<ApplicationState>,
     closing_reason: Option<ClosureReason>,
     created_at_ms: TimestampMs,
     /// Where the variables the root shell is started with came from, which the worker that built
@@ -753,7 +752,6 @@ impl Session {
             health,
             time,
             closure: None,
-            application_state: None,
             closing_reason: None,
             created_at_ms: kr_ipc::now_ms(),
             environment_sources: None,
@@ -896,7 +894,9 @@ impl Session {
                 self.owned = Some(owned);
                 self.shell = Some(shell);
                 self.input.lock().set_state(SessionState::Live);
-                self.application_state = Some(ApplicationState::ShellReady);
+                self.input
+                    .lock()
+                    .put_application_state(Some(ApplicationState::ShellReady));
                 // What the session is, written where a reader can find it after this worker is
                 // gone. Without it a closed session is only a closure record, and the shell it ran,
                 // the directory it ran in and when it started are lost with the process.
@@ -1763,21 +1763,6 @@ impl Session {
         }
     }
 
-    /// Sets what the session's application is doing, publishes the summary when that changed, and
-    /// returns whether it did.
-    ///
-    /// A session that no longer accepts input has no application to describe: closing clears the
-    /// state, and nothing sets it again afterwards. The state is published on its own, not only
-    /// with the name of the application, because the sleep demand of a held session reads it.
-    pub(crate) fn set_application_state(&mut self, state: Option<ApplicationState>) -> bool {
-        if !self.state().accepts_input() || self.application_state == state {
-            return false;
-        }
-        self.application_state = state;
-        self.publish_summary();
-        true
-    }
-
     /// Returns the summary this session last published outside its own lock, which a read that
     /// cannot take the session answers from.
     #[must_use]
@@ -1811,7 +1796,7 @@ impl Session {
             created_at_ms: self.created_at_ms,
             dimensions: self.attachments.dimensions(),
             attachment_count: U64::new(self.attachments.len() as u64),
-            application_state: Nullable(self.application_state),
+            application_state: Nullable(self.input.lock().application_state()),
             root_process: Nullable(self.root_identity()),
             closure: Nullable(self.closure.clone()),
             environment_sources: self.environment_sources,
@@ -5440,7 +5425,7 @@ impl Session {
             record.durability = Durability::Volatile;
         }
         self.input.lock().set_state(SessionState::Closed);
-        self.application_state = None;
+        self.input.lock().put_application_state(None);
         self.application = None;
         self.closure = Some(record.clone());
         self.publish_summary();
