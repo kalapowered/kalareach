@@ -217,9 +217,10 @@ impl Waiting {
 /// KR-REQ-23.30: a prepared action whose client goes while the boundary is held is rejected at
 /// once, and its connection's place is given back, without the boundary.
 ///
-/// Only the boundary is held, so the rejection needs nothing that is held: the receipt is
-/// `rejected` before the holder lets go, and nothing is owed to the owner. The loop that served the
-/// client has ended, and nothing was written to the upstream.
+/// Only the boundary is held, and the rejection needs the session alone, which nobody holds: the
+/// receipt is `rejected` before the holder lets go. The connection's path owes the rejection and the
+/// owner makes it, once. The loop that served the client has ended, and nothing was written to the
+/// upstream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_a_prepared_action_whose_client_goes_under_a_held_boundary_is_rejected_at_once()
  {
@@ -245,10 +246,10 @@ async fn kr_req_23_30_a_prepared_action_whose_client_goes_under_a_held_boundary_
             waiting.accepted.revision.get() + 1,
             "{how:?}: rejected once: {receipt:?}"
         );
-        assert_eq!(
-            waiting.service.owed_done_for_tests().0,
-            0,
-            "{how:?}: nothing was owed, since the session was free"
+        assert!(
+            settles(|| waiting.service.owed_done_for_tests().0 == 1).await,
+            "{how:?}: the owner made the rejection while the boundary was held: {:?}",
+            waiting.service.owed_done_for_tests()
         );
         waiting.held.release();
         drop(gone);
