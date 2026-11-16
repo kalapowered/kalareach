@@ -4461,3 +4461,345 @@ async fn a_launch_still_waiting_when_its_view_ends_is_an_unknown_outcome() {
         assert_eq!(code(&late), "LEASE_LOST", "{ending}: {late}");
     }
 }
+
+// ---- The session's input lane and the order of its notifications ------------------------------
+
+/// A launch that the page presses, which the tests below send as one command.
+fn the_press() -> Value {
+    json!({
+        "command": { "arguments": ["claude"] },
+        "expected_prompt_generation": "12",
+        "expected_buffer_revision": "3",
+    })
+}
+
+/// The lane writes one key at a time on this link and waits for the worker's answer to each, so a
+/// release made while a key waits for its answer stands behind that key. Nothing of the release is
+/// on the wire, the page is told at once that control ended, and the page's close ends the wait
+/// and the connection with it: the worker's own clean-up at the connection's end gives the lease
+/// back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_release_behind_an_unanswered_key_is_not_on_the_wire_and_the_close_ends_the_wait() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        controlling(&page, &mut worker, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    page.text(&view, 1, "a").expect("the key is taken");
+    let _key = link.expect(Method::InputWrite).await;
+    page.release(&view, 2);
+    let told = page
+        .newest(3, |state| control(state) == (2, "watching".to_owned()))
+        .await;
+    assert_eq!(told["state"], "showing", "the page is told at once");
+    assert!(
+        link.quiet_for(QUIET).await,
+        "the release stands behind the key: nothing of it is on the wire"
+    );
+    page.close(&view);
+    assert_eq!(page.held(), 0, "the close ended the view");
+    let sent = link.closed().await;
+    assert!(
+        sent.is_empty(),
+        "the close ended the connection with neither the release nor the detach written: {sent:?}"
+    );
+}
+
+/// The mirror of the last: a detach at the person's close stands behind a key that the worker has
+/// not answered, and the close ends the wait and the connection without writing it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_detach_behind_an_unanswered_key_is_not_on_the_wire_and_the_close_ends_the_connection() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        controlling(&page, &mut worker, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    page.text(&view, 1, "a").expect("the key is taken");
+    let _key = link.expect(Method::InputWrite).await;
+    page.close(&view);
+    assert_eq!(page.held(), 0, "the close ended the view");
+    let sent = link.closed().await;
+    assert!(
+        sent.is_empty(),
+        "the close ended the connection and the detach behind the key was not written: {sent:?}"
+    );
+}
+
+/// With every key answered the detach is written whole, and before the connection closes: it is
+/// the one call on the wire after the launch that followed the key, which the worker has read
+/// when the lane has taken the key's answer, and it asks for no barrier on a link whose typing is
+/// requests.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_detach_is_written_whole_before_the_connection_closes() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        controlling(&page, &mut worker, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    page.text(&view, 1, "a").expect("the key is taken");
+    next_write(&mut link, &mut lease).await;
+    let pressing = page.invoke_later(
+        "terminal_view_launch",
+        json!({ "view": view, "press": the_press() }),
+    );
+    // The launch is written once the lane has the key's answer: no key waits now.
+    link.expect(Method::ShellLaunch).await;
+    page.close(&view);
+    let sent = link.closed().await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].method, Method::SessionDetach.to_string());
+    let detach: kr_protocol::attachment::SessionDetachParams = sent[0].params();
+    assert!(detach.after_input.is_none());
+    let _ = pressing.await;
+}
+
+/// A launch stands behind the key before it: it is not on the wire until the worker has answered
+/// the key, and goes at once after.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_launch_goes_after_the_key_before_it_and_not_before_the_worker_answers_it() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        controlling(&page, &mut worker, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    page.text(&view, 1, "a").expect("the key is taken");
+    let key = link.expect(Method::InputWrite).await;
+    let pressing = page.invoke_later(
+        "terminal_view_launch",
+        json!({ "view": view, "press": the_press() }),
+    );
+    assert!(
+        link.quiet_for(QUIET).await,
+        "the launch stands behind the key: nothing of it is on the wire"
+    );
+    lease.answer(&mut link, &key).await;
+    link.expect(Method::ShellLaunch).await;
+    page.close(&view);
+    let told = pressing
+        .await
+        .expect("joins")
+        .expect_err("the view ended before the session answered");
+    assert_eq!(code(&told), "OUTCOME_UNKNOWN");
+}
+
+/// A launch behind a key that the worker does not answer is never on the wire: the close ends the
+/// wait and the connection, and the page is told that the launch's outcome is unknown, as it is
+/// for any launch the session had not answered when the view ended.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_launch_behind_an_unanswered_key_is_told_unknown_when_the_close_ends_the_wait() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        controlling(&page, &mut worker, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    page.text(&view, 1, "a").expect("the key is taken");
+    let _key = link.expect(Method::InputWrite).await;
+    let pressing = page.invoke_later(
+        "terminal_view_launch",
+        json!({ "view": view, "press": the_press() }),
+    );
+    assert!(
+        link.quiet_for(QUIET).await,
+        "the launch stands behind the key: nothing of it is on the wire"
+    );
+    page.close(&view);
+    let told = pressing
+        .await
+        .expect("joins")
+        .expect_err("the view ended before the launch was written");
+    assert_eq!(code(&told), "OUTCOME_UNKNOWN");
+    let sent = link.closed().await;
+    assert!(sent.is_empty(), "{sent:?}");
+}
+
+/// A burst of keys is taken whole: each one is told taken at once, and the lane writes them one
+/// after the other, in the order made, under the numbers 0, 1, 2 and on, each when the worker has
+/// answered the one before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_burst_of_keys_is_written_in_order_one_at_a_time() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        controlling(&page, &mut worker, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    for key in 0..200 {
+        page.text(&view, 1, &format!("k{key};"))
+            .expect("the key is taken");
+    }
+    for key in 0..200_u64 {
+        let (sequence, bytes) = next_write(&mut link, &mut lease).await;
+        assert_eq!(sequence, key, "the key's number");
+        assert_eq!(bytes, format!("k{key};").into_bytes(), "the key's bytes");
+    }
+}
+
+/// A key that the session refuses as the lease having moved on ends the view's control with the
+/// session's words, and the page is told so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lease_refusal_of_a_key_ends_control_with_the_sessions_words() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        controlling(&page, &mut worker, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    page.text(&view, 1, "a").expect("the key is taken");
+    let key = link.expect(Method::InputWrite).await;
+    link.refuse_with(&key, ErrorCode::LeaseLost, "the lease has moved on")
+        .await;
+    tokio::time::sleep(QUIET).await;
+    let ended = newest_now(&page, 3);
+    assert_eq!(
+        control(&ended),
+        (1, "watching".to_owned()),
+        "the refusal ended control"
+    );
+    let words = ended["control"]["ended"]
+        .as_str()
+        .expect("words of the end");
+    assert!(words.starts_with("Control ended"), "{words}");
+}
+
+/// A connection that goes while the attach waits ends the open with how the link ended.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_lost_during_the_attach_says_how_the_link_ended() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let _view = page.open(worker.session_id, 10, 2, 3);
+    let mut link = worker.link().await;
+    link.expect(Method::SessionAttach).await;
+    drop(link);
+    let ended = page.state(3, 0).await;
+    assert_eq!(ended["state"], "ended");
+    assert_eq!(
+        ended["reason"],
+        "The connection to this session ended: the peer closed the connection"
+    );
+}
+
+/// A delivery that restarts is told from the one it replaces by its first notification at 0:
+/// everything of the old stream that still arrives, before the subscription's answer and after it,
+/// is dropped, and the page never shows it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_delivery_drops_the_old_streams_frames_until_its_first_at_zero() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let (_view, mut link) = showing(&page, &mut worker, 3).await;
+    let shown = page.states(3).len();
+    link.push("session.resync", &resync_marker(60)).await;
+    let subscribe = link.expect(Method::EventsSubscribe).await;
+    screen(&mut link, 2, 50, vec![row(0, "stale before")], 0).await;
+    link.answer(&subscribe, &scripted_worker::subscribed())
+        .await;
+    screen(&mut link, 2, 55, vec![row(0, "stale after")], 0).await;
+    link.restart_stream();
+    screen(&mut link, 3, 80, vec![row(0, "new")], 0).await;
+    page.newest(3, |state| {
+        state["state"] == "showing" && text_of(state) == ["new"]
+    })
+    .await;
+    for state in &page.states(3)[shown..] {
+        if state["state"] == "showing" {
+            assert_ne!(
+                text_of(state)[0],
+                "stale before",
+                "an old frame before the answer"
+            );
+            assert_ne!(
+                text_of(state)[0],
+                "stale after",
+                "an old frame after the answer"
+            );
+        }
+    }
+}
+
+/// A view that is slower than the host loses no notification: every screen the host sent is
+/// shown, in order, and when the host's connection goes the view ends with the words it always
+/// had.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_view_loses_no_notification_and_ends_with_its_words() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let (_view, mut link) = showing(&page, &mut worker, 3).await;
+    let shown = page.states(3).len();
+    let screens = 150_u64;
+    for number in 0..screens {
+        screen(
+            &mut link,
+            number + 2,
+            60 + number,
+            vec![row(0, &format!("screen {number}"))],
+            0,
+        )
+        .await;
+    }
+    drop(link);
+    let ended = page.newest(3, |state| state["state"] == "ended").await;
+    assert_eq!(ended["reason"], "The connection to this session ended.");
+    let texts: Vec<String> = page.states(3)[shown..]
+        .iter()
+        .filter(|state| state["state"] == "showing")
+        .map(|state| text_of(state)[0].clone())
+        .collect();
+    let expected: Vec<String> = (0..screens)
+        .map(|number| format!("screen {number}"))
+        .collect();
+    assert_eq!(texts, expected, "every screen is shown, in order");
+}
+
+/// An answer that is ready is not kept waiting by a flood of notifications: the loop takes it after
+/// at most 64 of them, so the page is told what the answer said while most of the flood is still
+/// queued.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_that_is_ready_is_taken_after_at_most_64_notifications() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let (view, mut link) = showing(&page, &mut worker, 3).await;
+    page.resize(&view, 12, 3);
+    let asked = link.expect(Method::AttachmentViewport).await;
+    let before = page.states(3).len();
+    link.answer(&asked, &viewport_answer(1)).await;
+    for number in 0..300_u64 {
+        screen(&mut link, number + 2, 60 + number, vec![row(0, "flood")], 0).await;
+    }
+    page.newest(3, |state| {
+        state["attachment"]["presentation_reason"] == "size_mismatch"
+    })
+    .await;
+    let at = page.states(3)[before..]
+        .iter()
+        .position(|state| state["attachment"]["presentation_reason"] == "size_mismatch")
+        .expect("the answer's state");
+    assert!(at <= 64, "the answer was taken after {at} states");
+}
+
+/// A call that the loop started is never dropped by the loop going on: a report that waits for its
+/// answer while notifications and commands pass is still answered when the answer comes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_waiting_for_its_answer_survives_everything_the_loop_does_meanwhile() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let (view, mut link) = showing(&page, &mut worker, 3).await;
+    page.resize(&view, 12, 3);
+    let asked = link.expect(Method::AttachmentViewport).await;
+    for number in 0..20_u64 {
+        screen(&mut link, number + 2, 60 + number, vec![row(0, "busy")], 0).await;
+        page.resize(&view, 12 + number % 2, 3);
+    }
+    page.newest(3, |state| {
+        state["state"] == "showing" && text_of(state) == ["busy"]
+    })
+    .await;
+    link.answer(&asked, &viewport_answer(1)).await;
+    // The answer is applied to the attachment the page is shown, with the next screen.
+    screen(&mut link, 40, 300, vec![row(0, "after")], 1).await;
+    let after = page
+        .newest(3, |state| {
+            state["state"] == "showing" && text_of(state) == ["after"]
+        })
+        .await;
+    assert_eq!(
+        after["attachment"]["presentation_reason"], "size_mismatch",
+        "the answer of a call that waited through all that is applied"
+    );
+}

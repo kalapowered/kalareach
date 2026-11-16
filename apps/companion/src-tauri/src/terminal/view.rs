@@ -1566,17 +1566,7 @@ impl View {
     fn lane_event(&mut self, event: InputEvent) -> Option<Ending> {
         match event {
             InputEvent::Accepted { epoch, through, .. } => {
-                let accepted: Vec<(u64, u64)> = self
-                    .keys
-                    .range(..=(epoch.get(), through.get()))
-                    .map(|(key, _)| *key)
-                    .filter(|(of, _)| *of == epoch.get())
-                    .collect();
-                for key in accepted {
-                    if let Some(tag) = self.keys.remove(&key) {
-                        self.lease.answered(tag, Ok(ParamsValue::empty()));
-                    }
-                }
+                self.accepted(epoch, through);
                 None
             }
             InputEvent::Refused {
@@ -1629,6 +1619,20 @@ impl View {
                     None
                 }
             },
+        }
+    }
+
+    /// The host accepted the keys of `epoch` up to `through`: each is answered, as accepted.
+    fn accepted(&mut self, epoch: InputLeaseEpoch, through: kr_protocol::ids::InputSequence) {
+        let accepted: Vec<(u64, u64)> = self
+            .keys
+            .range((epoch.get(), 0)..=(epoch.get(), through.get()))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in accepted {
+            if let Some(tag) = self.keys.remove(&key) {
+                self.lease.answered(tag, Ok(ParamsValue::empty()));
+            }
         }
     }
 
@@ -1891,6 +1895,15 @@ impl View {
     /// to its end, so that its reader is released.
     async fn finish(&mut self, detach: bool) {
         self.requests = FuturesUnordered::new();
+        // What the lane already knows of the keys is applied before the detach is placed: a key
+        // that the host answered and whose acceptance the view has not read yet is not one that
+        // waits.
+        tokio::task::yield_now().await;
+        while let Some(event) = self.lane_events.as_mut().and_then(InputEvents::try_recv) {
+            if let InputEvent::Accepted { epoch, through, .. } = event {
+                self.accepted(epoch, through);
+            }
+        }
         if detach {
             self.detach().await;
         }
