@@ -1486,6 +1486,20 @@ impl WorkerService {
         }
     }
 
+    /// Takes the authority record and holds it until the returned guard is dropped, for this
+    /// host's own tests: what a generation that is being decided holds while it reads the journal.
+    ///
+    /// The guard is taken on the calling thread and has to be dropped on it.
+    #[cfg(feature = "testing")]
+    pub fn hold_the_authority_for_tests(&self) -> AuthorityHeld<'_> {
+        AuthorityHeld {
+            _record: self
+                .authority
+                .lock()
+                .expect("the authority lock is not poisoned"),
+        }
+    }
+
     /// Takes the dispatch boundary and holds it until the returned guard is dropped, for this
     /// host's own tests: what an announcement of an authority revision meets while a mutation, a
     /// generation another link presents or a maintenance pass is inside it.
@@ -3476,7 +3490,7 @@ impl WorkerService {
         // that no longer exists, so the connection's windows go when it does, and so does its
         // registration.
         self.windows.retire_connection(connection_id);
-        self.deregister(connection_id);
+        self.deregister(connection_id, state.facts.controller);
         Ok(())
     }
 
@@ -5454,8 +5468,16 @@ impl WorkerService {
     }
 
     /// Removes a connection that has ended of its own accord.
-    fn deregister(&self, connection_id: ConnectionId) {
-        self.unbind(connection_id);
+    ///
+    /// A connection whose presentation was never accepted took no place in the authority record or
+    /// in the privacy fence, so it leaves nothing there and does not wait for the lock on them: a
+    /// presentation that is deciding holds both while it reads the journal, and a connection that
+    /// ended because its peer went would otherwise keep its place in the count of connections
+    /// until that read was done.
+    fn deregister(&self, connection_id: ConnectionId, presented: bool) {
+        if presented {
+            self.unbind(connection_id);
+        }
         let held = self
             .admitted
             .lock()
@@ -11347,6 +11369,14 @@ struct ArmedReplacement {
     arrived: tokio::sync::oneshot::Sender<()>,
     go: tokio::sync::oneshot::Receiver<()>,
     replaced: tokio::sync::oneshot::Sender<()>,
+}
+
+/// The authority record, held for a test until it is dropped.
+///
+/// Returned by [`WorkerService::hold_the_authority_for_tests`], for this host's own tests.
+#[cfg(feature = "testing")]
+pub struct AuthorityHeld<'a> {
+    _record: std::sync::MutexGuard<'a, Authority>,
 }
 
 /// A test's hold on the next controller presentation.
