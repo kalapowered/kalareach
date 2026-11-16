@@ -2015,7 +2015,10 @@ async fn a_session_read_after_a_sign_out_is_sent_with_the_sign_in_words_and_no_a
 {
     let rig = Rig::start_with(SERVED, 1).await;
     rig.connection(true).await;
-    let _ = rig.tokens.sign_out().await;
+    let _ = rig
+        .tokens
+        .sign_out(|| Ok::<(), std::convert::Infallible>(()))
+        .await;
 
     let refused = rig
         .companion()
