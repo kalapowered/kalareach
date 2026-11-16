@@ -462,6 +462,12 @@ impl Lease {
         }
     }
 
+    /// The epoch of the lease the view holds, when it holds one.
+    #[must_use]
+    pub fn held_epoch(&self) -> Option<InputLeaseEpoch> {
+        self.held.as_ref().map(|held| held.epoch)
+    }
+
     /// Whether a write made under the page's take `take` may be written now.
     #[must_use]
     pub fn controls(&self, take: u64) -> bool {

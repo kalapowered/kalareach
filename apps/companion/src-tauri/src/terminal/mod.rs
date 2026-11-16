@@ -21,10 +21,10 @@
 
 mod input;
 mod keys;
+mod link;
 pub mod screen;
 mod view;
 mod window;
-mod wire;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};

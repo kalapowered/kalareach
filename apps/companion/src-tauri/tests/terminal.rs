@@ -3125,15 +3125,17 @@ async fn a_release_and_a_new_take_keep_their_epochs_apart() {
     let old_write = link.expect(Method::InputWrite).await;
     page_view.release(&view, 2);
     page_view.take(&view, 3);
+    // The release stands behind the key the worker has not answered, so the take's acquire goes
+    // first, and the release follows the key's answer.
+    let acquire = link.expect(Method::InputAcquire).await;
+    link.refuse_with(&old_write, ErrorCode::LeaseLost, "the lease has moved on")
+        .await;
     let release = link.expect(Method::InputRelease).await;
     assert_eq!(release.params::<InputReleaseParams>().epoch.get(), 5);
-    let acquire = link.expect(Method::InputAcquire).await;
     lease.answer(&mut link, &release).await;
     lease.answer(&mut link, &acquire).await;
     page_view
         .newest(3, |state| control(state) == (3, "controlling".to_owned()))
-        .await;
-    link.refuse_with(&old_write, ErrorCode::LeaseLost, "the lease has moved on")
         .await;
     tokio::time::sleep(QUIET).await;
     assert_eq!(
@@ -4159,9 +4161,47 @@ async fn text_is_its_utf8_and_a_paste_is_bracketed_when_the_program_asks() {
         b"\x1b[200~rm -rf /\ninnocent\x1b[201~",
         "a paste cannot end itself"
     );
+    // A paste of 64 KiB with its marks is more than one frame carries: the lane cuts it, in frames
+    // of at most the level's input bytes, and never inside a mark.
     let longest = "x".repeat(64 * 1024 - 12);
     page_view.paste(&view, 1, &longest).expect("taken");
-    assert_eq!(next_write(&mut link, &mut lease).await.1.len(), 64 * 1024);
+    let start = b"\x1b[200~".as_slice();
+    let end = b"\x1b[201~".as_slice();
+    let mut expected = start.to_vec();
+    expected.extend_from_slice(longest.as_bytes());
+    expected.extend_from_slice(end);
+    let frame_bytes = kr_protocol::input::max_input_bytes(64 * 1024);
+    let mut writes: Vec<Vec<u8>> = Vec::new();
+    let mut joined = Vec::new();
+    while joined.len() < expected.len() {
+        let bytes = next_write(&mut link, &mut lease).await.1;
+        joined.extend_from_slice(&bytes);
+        writes.push(bytes);
+    }
+    assert_eq!(
+        joined, expected,
+        "the writes of a paste, joined in their order, are the paste whole with its marks"
+    );
+    assert!(
+        writes.iter().all(|bytes| bytes.len() <= frame_bytes),
+        "every write of the paste is at most the lane's frame bytes"
+    );
+    let mut at = 0;
+    for bytes in &writes[..writes.len() - 1] {
+        at += bytes.len();
+        for mark in [start, end] {
+            for begin in at.saturating_sub(mark.len() - 1)..at {
+                assert!(
+                    !expected[begin..].starts_with(mark),
+                    "a cut of the paste never falls inside one of its marks"
+                );
+            }
+        }
+    }
+    assert!(
+        writes.last().is_some_and(|last| last.ends_with(end)),
+        "the closing mark travels whole, at the end of the last write"
+    );
 }
 
 /// The launch surface a worker answers when the editor is verified and this view holds the input.
