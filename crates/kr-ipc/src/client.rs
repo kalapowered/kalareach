@@ -1468,8 +1468,10 @@ impl<C: Codec> Client<C> {
     ///
     /// # Errors
     ///
-    /// Returns [`IpcError::NotInLevel`] for a frame the level cannot read, which is then not
-    /// written, and a transport failure.
+    /// Returns [`IpcError::NotInLevel`] for a frame the level cannot read, and [`IpcError::Frame`]
+    /// for one that cannot be encoded or exceeds the stream's bound: neither has written a byte. A
+    /// transport failure ([`IpcError::PeerClosed`] or [`IpcError::Socket`]) may come after a part
+    /// of the frame went.
     pub async fn send(&mut self, frame: &ControlFrame) -> Result<()> {
         let payload = self
             .codec

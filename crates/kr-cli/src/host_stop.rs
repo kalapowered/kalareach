@@ -10,7 +10,7 @@
 //! What the command knows is kept apart in its result, because a request that left may have been
 //! taken and a command that was killed may have stopped the daemon: `ended` (the daemon was seen
 //! to end), `told` (the daemon took the stop and was not seen to end), `maybe_asked` (the request
-//! left, and neither its answer nor the daemon's end was seen), `refused` (the request left and the
+//! may have left, and neither its answer nor the daemon's end was seen), `refused` (the request left and the
 //! daemon refused it) and `not_asked` (no request left). An answer that is
 //! missing or cut is an unknown outcome and never "not stopped": the command looks at the lock and
 //! the process.
@@ -66,7 +66,8 @@ enum Knows {
     Ended,
     /// The daemon took the stop, and was not seen to end.
     Told,
-    /// The request left, and neither its answer nor the daemon's end was seen.
+    /// The request may have left (its write failed where a part of it may have gone, or no answer
+    /// came), and neither its answer nor the daemon's end was seen.
     MaybeAsked,
     /// The request left and the daemon refused it: nothing was stopped.
     Refused,
@@ -733,12 +734,14 @@ fn lock_held(environment: &EnvironmentPaths) -> std::result::Result<bool, Shown>
 enum Asked {
     /// The daemon took the stop and answered.
     Taken(HostStopResult),
-    /// The outcome is not known: no answer came, it was cut, or the daemon's word does not say
-    /// whether it took the stop. The daemon is waited for as one that took it.
+    /// The outcome is not known: the write of the request failed where a part of it may have gone,
+    /// or no answer came, or it was cut, or the daemon's word does not say whether it took the
+    /// stop. The request may or may not have left. The daemon is waited for as one that took it.
     Unknown(Shown),
     /// The daemon refused, and its word is that nothing was done.
     Refused(ProtocolError),
-    /// The request could not be made: nothing was sent. `error` is the failure of composing it.
+    /// The request could not be made: nothing was sent. `error` is the failure of composing it, or
+    /// the level's refusal at the write, which comes before any byte is written.
     NotComposed { error: kr_ipc::IpcError },
 }
 
@@ -752,11 +755,27 @@ fn closed_by_the_daemon(error: &kr_ipc::IpcError) -> bool {
     )
 }
 
+/// What the request came to where its write failed with `error`. The level's check refuses a frame
+/// that the daemon's level cannot read ([`kr_ipc::IpcError::NotInLevel`]) before any byte is
+/// written, so nothing left and the request is as one that could not be made. Every other failure
+/// of the write may come after a part of the frame went, and its outcome is unknown. A frame that
+/// cannot be encoded ([`kr_ipc::IpcError::Frame`]) is also raised before any byte, and stays
+/// unknown here: the source function answers it as a closure, the roster's `Frame` row that
+/// differs.
+fn after_the_write_failed(error: kr_ipc::IpcError) -> Asked {
+    if matches!(error, kr_ipc::IpcError::NotInLevel(_)) {
+        Asked::NotComposed { error }
+    } else {
+        Asked::Unknown(Shown::ipc(&error))
+    }
+}
+
 /// Sends the request, says that it left, and waits for its answer.
 ///
-/// The answer is read from the connection, and anything but a whole answer to this request is an
-/// unknown outcome: a daemon that ends for another cause gets no answer, and the daemon stops when
-/// its write of the answer has completed, failed or reached its bound, so an answer can be cut.
+/// A write that the level's check refuses left nothing ([`after_the_write_failed`]). Any other
+/// write that fails, and anything but a whole answer to this request, is an unknown outcome: a
+/// daemon that ends for another cause gets no answer, and the daemon stops when its write of the
+/// answer has completed, failed or reached its bound, so an answer can be cut.
 async fn ask(
     client: &mut LocalClient,
     environment_id: EnvironmentId,
@@ -784,7 +803,12 @@ async fn ask(
         .send(&ControlFrame::Mutation(Box::new(mutation)))
         .await
     {
-        return Asked::Unknown(Shown::ipc(&error));
+        let failed = after_the_write_failed(error);
+        if matches!(failed, Asked::NotComposed { .. }) {
+            // Nothing left, so an interrupt from here on has no request to speak of.
+            progress.enter(Stage::BeforeAsking);
+        }
+        return failed;
     }
     if !json {
         report::say(&shown!(
@@ -906,7 +930,8 @@ async fn stop_the_daemon(
             (Knows::MaybeAsked, None, None, Some(said))
         }
         Asked::NotComposed { error } => {
-            // The request was never made, so nothing left and there is no stop to wait for. The
+            // The request was never made (it could not be composed, or the level's check refused
+            // the frame at the write), so nothing left and there is no stop to wait for. The
             // daemon may have gone meanwhile, as it does when another command's stop has taken
             // effect: its end is decided as for any failure before the request, within the one
             // deadline, which counts from the failure. A daemon that answered a look is the unmade
@@ -958,20 +983,16 @@ async fn stop_the_daemon(
         unsettled,
         records: none.records.clone(),
     };
+    // What the request came to: its failure where whether the daemon took it is not known.
+    let not_known = match (knows, unknown.as_ref()) {
+        (Knows::MaybeAsked, Some(failure)) => Some(failure),
+        _ => None,
+    };
     match ended {
         End::Gone => {
             progress.remove_marker();
-            let cut = creates_under_way(unsettled);
-            let process = named.map_or_else(|| Shown::said(""), |pid| shown!(" (process {})", pid));
             done(
-                &shown!(
-                    "Stopped the control daemon for environment {}{}. No session was stopped: its \
-                     workers keep running, a local attach keeps working, and the next daemon finds \
-                     the sessions again. Paired devices' connections close until a daemon runs.{}",
-                    id,
-                    process,
-                    cut
-                ),
+                &gone_said(id, named, not_known, unsettled),
                 &result(Knows::Ended),
                 json,
                 earlier,
@@ -987,11 +1008,6 @@ async fn stop_the_daemon(
             )
         }
         End::NotEnded(why) => {
-            // What the request came to: its failure where whether the daemon took it is not known.
-            let not_known = match (knows, unknown.as_ref()) {
-                (Knows::MaybeAsked, Some(failure)) => Some(failure),
-                _ => None,
-            };
             let message = not_ended_said(why, not_known, &environment.paths, id, old);
             failed(
                 CliError::Unfinished {
@@ -1003,6 +1019,41 @@ async fn stop_the_daemon(
             )
         }
     }
+}
+
+/// What the command says where it saw the daemon end after the request was written and no other
+/// daemon holds the environment. Where the daemon took the stop and answered, it says that it
+/// stopped the daemon. Where the outcome is not known (`not_known` is the request's failure), it
+/// says only what it knows: that the daemon did not show whether it took the stop, and that it has
+/// ended. What follows the first sentence is the same for both.
+fn gone_said(
+    id: EnvironmentId,
+    named: Option<u64>,
+    not_known: Option<&Shown>,
+    unsettled: Option<u64>,
+) -> Shown {
+    let process = named.map_or_else(|| Shown::said(""), |pid| shown!(" (process {})", pid));
+    let first = match not_known {
+        None => shown!(
+            "Stopped the control daemon for environment {}{}.",
+            id,
+            process
+        ),
+        Some(failure) => shown!(
+            "The control daemon for environment {}{} did not show whether it took the stop ({}), \
+             and it has ended.",
+            id,
+            process,
+            *failure
+        ),
+    };
+    shown!(
+        "{} No session was stopped: its workers keep running, a local attach keeps working, and \
+         the next daemon finds the sessions again. Paired devices' connections close until a \
+         daemon runs.{}",
+        first,
+        creates_under_way(unsettled)
+    )
 }
 
 /// What the command says where the wait for the end gave up at its bound with the request written:
@@ -1019,7 +1070,7 @@ fn not_ended_said(
         Why::Held => still_held(environment, id),
         Why::Unlooked(why) => unlooked(id, not_known, &why),
         Why::NotShown => not_shown(id, not_known),
-        Why::Running => {
+        Why::Running | Why::Answers(_) => {
             let what = match not_known {
                 Some(failure) => shown!(
                     "did not show whether it took the stop ({}), and it has not ended",
@@ -1105,17 +1156,18 @@ enum Decided {
     Ended(End),
     /// The end is not shown within the bound, and no daemon answered.
     NotShown,
-    /// A daemon answered a look. This is the only result that leads to exit 3, and it holds the
-    /// answer.
+    /// A daemon answered a look: the first, or the last of the wait at its bound. This is the only
+    /// result that leads to exit 3, and it holds the answer.
     Answers(Answered),
 }
 
 /// Decides, where the request could not be made, whether the daemon had ended when it could not be.
 /// A daemon that closed the connection is going and is waited for to its end within the one
 /// deadline, once. A daemon that did not close it is looked at once first, for as long as the
-/// deadline leaves, and one that answers stays: nothing is waited for. Where no daemon answered, the
-/// end is proved or it is not shown in the bound; there is no other result. The deadline is the
-/// caller's, set before the look, so that the look and the wait together stay inside it.
+/// deadline leaves, and one that answers stays: nothing is waited for. A daemon that answers the
+/// last look of the wait, at its bound, stays as well. Where no daemon answered, the end is proved
+/// or it is not shown in the bound; there is no other result. The deadline is the caller's, set
+/// before the look, so that the look and the wait together stay inside it.
 ///
 /// `connection` is the command's connection to the daemon, which is let go before anything is
 /// looked at, as before the wait of a request that was asked.
@@ -1141,6 +1193,8 @@ async fn ended_before_the_request(
         return Decided::Answers(answered);
     }
     match wait_for_the_end(operations, old, left()).await {
+        // A daemon that answers the last look of the wait is an answer, as at the first look.
+        End::NotEnded(Why::Answers(answered)) => Decided::Answers(answered),
         End::NotEnded(_) => Decided::NotShown,
         ended => Decided::Ended(ended),
     }
@@ -1151,7 +1205,8 @@ async fn ended_before_the_request(
 enum Before {
     /// The daemon had ended: what the command says, and the process that it names.
     Ended { said: Shown, pid: Option<u64> },
-    /// The daemon closed the connection and was not shown to have ended within the bound.
+    /// A daemon's end can have caused the failure, and no end was shown within the bound, with no
+    /// daemon answering the last look.
     Silent,
     /// A daemon answered, by a look or by a reply of its own: the failure keeps its own words,
     /// with exit 3. It holds the answer.
@@ -1238,8 +1293,8 @@ async fn host_info_failed(
 }
 
 /// Ends the command by what a failed connection came to: with the daemon's end where it had
-/// ended, and as for a daemon that does not answer where it closed the connection and was not
-/// shown to have ended. It gives the answer where a daemon answered: the failure keeps its own
+/// ended, and as for a daemon that does not answer where no end was shown within the bound and no
+/// daemon answered the last look. It gives the answer where a daemon answered: the failure keeps its own
 /// words, and only an answer in hand builds those.
 fn ended_by(
     before: Before,
@@ -1487,9 +1542,11 @@ fn unlooked(id: EnvironmentId, not_known: Option<&Shown>, why: &Shown) -> Shown 
 
 /// Why the daemon had not ended when the wait did.
 enum Why {
-    /// Its process runs, a lock is held or the last look showed the daemon, or nothing shows that
-    /// it has gone where its process was read: the daemon is told to stop and goes on.
+    /// Its process runs, or the lock is held: the daemon is told to stop and goes on.
     Running,
+    /// The last look of the last round showed a daemon of the generation asked answering, whatever
+    /// else the round read: a daemon answers, so it has not ended.
+    Answers(Answered),
     /// No sign of life in the last round and no sign of an end: with no usable reading of the
     /// process (none was possible, or the system did not say) the lock was free and the last look
     /// showed neither the daemon nor its end. The command cannot say that the daemon has not ended.
@@ -1559,6 +1616,11 @@ async fn host_info(
 /// Each wait is bounded by what is left of the one deadline when it starts, counted after the wait
 /// before it: the install lock's wait, a look at the endpoint and the pause between two rounds. A
 /// look that cannot be made leaves the daemon as not ended.
+///
+/// At the bound the command says what its LAST round read: a daemon answering the round's look is
+/// [`Why::Answers`], whatever else the round read; otherwise a held lock or a running process is
+/// [`Why::Running`]; and with no usable reading of the process a free lock and a last look that
+/// showed nothing is [`Why::NotShown`], and an unreadable lock is [`Why::Unlooked`].
 async fn wait_for_the_end(
     operations: &impl Operations,
     old: Option<&ProcessStartIdentity>,
@@ -1578,9 +1640,11 @@ async fn wait_for_the_end(
         let mut last_look = None;
         let seen = match (held, process) {
             (Ok(false), Some(ProcessState::Ended)) => Some(End::Gone),
-            (Ok(true), Some(ProcessState::Ended)) => successor_of(operations, old, left())
-                .await
-                .map(End::Successor),
+            (Ok(true), Some(ProcessState::Ended)) => {
+                let (successor, look) = successor_of(operations, old, left()).await;
+                last_look = look;
+                successor.map(End::Successor)
+            }
             // The process runs, or the system did not say and the lock is held or unreadable: the
             // daemon has not ended.
             (_, Some(ProcessState::Running))
@@ -1595,22 +1659,26 @@ async fn wait_for_the_end(
                     Endpoint::Same(_) | Endpoint::Unclear => None,
                 }
             }
-            (Ok(true), None) => successor_of(operations, None, left())
-                .await
-                .map(End::Successor),
+            (Ok(true), None) => {
+                let (successor, look) = successor_of(operations, None, left()).await;
+                last_look = look;
+                successor.map(End::Successor)
+            }
             (Err(_), _) => None,
         };
         if let Some(seen) = seen {
             return seen;
         }
         if tokio::time::Instant::now() >= deadline {
-            return End::NotEnded(match (unlooked, old_gone) {
-                (Some(why), _) if old.is_none() || old_gone => Why::Unlooked(why),
-                (None, true) => Why::Held,
+            return End::NotEnded(match (unlooked, old_gone, last_look) {
+                // The last look showed a daemon of the generation asked answering.
+                (_, _, Some(Endpoint::Same(answered))) => Why::Answers(answered),
+                // The lock could not be read, and no process is shown to run: there is no usable
+                // reading of the process, or it has gone.
+                (Some(why), _, _) if no_reading || old_gone => Why::Unlooked(why),
+                (None, true, _) => Why::Held,
                 // The lock is free and the last look did not show the daemon: no sign of life.
-                _ if no_reading && lock_free && !matches!(last_look, Some(Endpoint::Same(_))) => {
-                    Why::NotShown
-                }
+                _ if no_reading && lock_free => Why::NotShown,
                 _ => Why::Running,
             });
         }
@@ -1621,19 +1689,23 @@ async fn wait_for_the_end(
 /// Whether the environment is held by a daemon that is not the one that was asked, and the number
 /// of the process the lock file names as that daemon where it names one: a live process named
 /// kr-controller other than `old`, or a daemon of another generation that answers. Nothing else
-/// proves a successor.
+/// proves a successor. With it, the look that it made, where it made one: the round keeps it.
 async fn successor_of(
     operations: &impl Operations,
     old: Option<&ProcessStartIdentity>,
     within: Duration,
-) -> Option<Option<u64>> {
+) -> (Option<Option<u64>>, Option<Endpoint>) {
     let named = operations
         .named_daemon()
         .filter(|named| old.is_none_or(|old| *named != old.pid.get()));
     if named.is_some() && old.is_some() {
-        return Some(named);
+        return (Some(named), None);
     }
-    (operations.look(within).await == Endpoint::Another).then(|| operations.named_daemon())
+    let look = operations.look(within).await;
+    (
+        (look == Endpoint::Another).then(|| operations.named_daemon()),
+        Some(look),
+    )
 }
 
 /// The evidence that a daemon answered.
@@ -2380,6 +2452,7 @@ mod tests {
             End::Gone => "gone".to_owned(),
             End::Successor(named) => format!("successor {named:?}"),
             End::NotEnded(Why::Running) => "not ended, running".to_owned(),
+            End::NotEnded(Why::Answers(_)) => "not ended, answers".to_owned(),
             End::NotEnded(Why::NotShown) => "not ended, not shown".to_owned(),
             End::NotEnded(Why::Held) => "not ended, held".to_owned(),
             End::NotEnded(Why::Unlooked(_)) => "not ended, not looked at".to_owned(),
@@ -2603,12 +2676,13 @@ mod tests {
 
     /// The real wait loop, against a daemon that still answers every time: a daemon of the same
     /// start is not an end, with or without an identity for its process, and the wait gives up at
-    /// its deadline as not ended and running. A supplied end could not show this.
+    /// its deadline as not ended: answering where the last look showed it, and running where its
+    /// process was read as running. A supplied end could not show this.
     #[tokio::test(start_paused = true)]
     async fn a_daemon_that_still_answers_in_every_round_is_not_ended_at_the_deadline() {
         let supplied = Supplied::new().look(vec![at_once(Endpoint::Same(an_answer()))]);
         let ended = wait_for_the_end(&supplied, None, END_BOUND).await;
-        assert_eq!(said(&ended), "not ended, running");
+        assert_eq!(said(&ended), "not ended, answers");
         assert!(supplied.looks() > 100, "the wait looked round after round");
         assert_eq!(supplied.start.elapsed(), END_BOUND);
 
@@ -2636,11 +2710,13 @@ mod tests {
                     detail: "denied".to_owned(),
                 },
                 Ok(false),
-                "not ended, running",
+                "not ended, answers",
             ),
             (ProcessState::Running, Ok(true), "not ended, running"),
             (ProcessState::Ended, Ok(false), "gone"),
-            (ProcessState::Ended, Ok(true), "not ended, held"),
+            // The look that decides a held lock shows the daemon answering, and the last look
+            // decides: it is not a held lock that nothing shows to be a daemon.
+            (ProcessState::Ended, Ok(true), "not ended, answers"),
             (
                 ProcessState::Ended,
                 Err(Shown::said("the lock could not be taken")),
@@ -2650,6 +2726,14 @@ mod tests {
                 ProcessState::Running,
                 Err(Shown::said("the lock could not be taken")),
                 "not ended, running",
+            ),
+            // Nothing shows a process that runs, and the lock cannot be read: nothing is known.
+            (
+                ProcessState::Unknown {
+                    detail: "denied".to_owned(),
+                },
+                Err(Shown::said("the lock could not be taken")),
+                "not ended, not looked at",
             ),
         ] {
             let supplied = Supplied::new()
@@ -2665,7 +2749,7 @@ mod tests {
         for (look, expected) in [
             (Endpoint::Unclear, "not ended, not shown"),
             (Endpoint::Nobody, "gone"),
-            (Endpoint::Same(an_answer()), "not ended, running"),
+            (Endpoint::Same(an_answer()), "not ended, answers"),
         ] {
             let supplied = Supplied::new()
                 .held(vec![at_once(Ok(false))])
@@ -2702,8 +2786,15 @@ mod tests {
         let ended = wait_for_the_end(&supplied, Some(&process), END_BOUND).await;
         assert_eq!(
             said(&ended),
+            "not ended, answers",
+            "a daemon of the same start is no successor, and the last look shows that it answers"
+        );
+        let supplied = held_ended();
+        let ended = wait_for_the_end(&supplied, Some(&process), END_BOUND).await;
+        assert_eq!(
+            said(&ended),
             "not ended, held",
-            "a daemon of the same start is no successor"
+            "a lock that stays held, and a look that shows nothing, is not a successor"
         );
     }
 
@@ -2716,11 +2807,11 @@ mod tests {
         for (held, look, expected) in [
             (Ok(false), Endpoint::Nobody, "gone"),
             (Ok(false), Endpoint::Another, "successor None"),
-            (Ok(false), Endpoint::Same(an_answer()), "not ended, running"),
+            (Ok(false), Endpoint::Same(an_answer()), "not ended, answers"),
             (Ok(false), Endpoint::Unclear, "not ended, not shown"),
             (Ok(true), Endpoint::Another, "successor None"),
             (Ok(true), Endpoint::Nobody, "not ended, running"),
-            (Ok(true), Endpoint::Same(an_answer()), "not ended, running"),
+            (Ok(true), Endpoint::Same(an_answer()), "not ended, answers"),
             (
                 Err(Shown::said("the lock could not be taken")),
                 Endpoint::Nobody,
@@ -3533,8 +3624,8 @@ mod tests {
         }
     }
 
-    /// The last look that shows the same daemon, with the lock free, is a sign of life: the daemon
-    /// has not ended, and the words say so.
+    /// The last look that shows the same daemon, with the lock free, is a sign of life and an
+    /// answer: the daemon has not ended, and the words say so.
     #[tokio::test(start_paused = true)]
     async fn a_last_look_of_the_same_daemon_with_a_free_lock_says_that_it_has_not_ended() {
         let temp = kr_ipc::testing::TempHost::create();
@@ -3547,7 +3638,7 @@ mod tests {
         let End::NotEnded(why) = wait_for_the_end(&supplied, None, END_BOUND).await else {
             panic!("the daemon still answers");
         };
-        assert!(matches!(why, Why::Running));
+        assert!(matches!(why, Why::Answers(_)));
         let said = not_ended_said(why, None, &paths, id, None).to_string();
         assert!(
             said.starts_with(&format!(
@@ -3861,6 +3952,213 @@ mod tests {
             Err(CliError::Ipc(error)) => assert!(closed_by_the_daemon(&error), "{error}"),
             Err(other) => panic!("a closed connection leaves the transport error, not {other}"),
             Ok(_) => panic!("the read was refused"),
+        }
+    }
+
+    /// With an identity whose process state the system did not say, and a lock that cannot be read
+    /// in the last round, nothing shows that the daemon runs and nothing that it has gone: the
+    /// wait ends as not looked at, and the words say that the end could not be read, with exit 1,
+    /// whether the daemon was told or its outcome is not known.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreadable_process_and_an_unreadable_lock_say_that_the_end_could_not_be_read() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let paths = temp.environment();
+        let id = paths.environment_id();
+        let process = asked_process();
+        let failure = Shown::said("the connection was lost");
+        for (not_known, expected) in [
+            (
+                None,
+                format!(
+                    "The control daemon for environment {id} was told to stop, and whether it has \
+                     ended could not be read after 30 seconds: the lock could not be taken. Run \
+                     kr host stop again in a moment."
+                ),
+            ),
+            (
+                Some(&failure),
+                format!(
+                    "The control daemon for environment {id} did not show whether it took the \
+                     stop (the connection was lost), and whether it has ended could not be read \
+                     after 30 seconds: the lock could not be taken. Run kr host stop again in a \
+                     moment."
+                ),
+            ),
+        ] {
+            let supplied = Supplied::new()
+                .held(vec![at_once(Err(Shown::said(
+                    "the lock could not be taken",
+                )))])
+                .process(vec![at_once(ProcessState::Unknown {
+                    detail: "denied".to_owned(),
+                })]);
+            let End::NotEnded(why) = wait_for_the_end(&supplied, Some(&process), END_BOUND).await
+            else {
+                panic!("nothing shows that the daemon has ended");
+            };
+            assert!(matches!(why, Why::Unlooked(_)), "{not_known:?}");
+            let error = CliError::Unfinished {
+                code: ErrorCode::EnvironmentUnavailable,
+                message: not_ended_said(why, not_known, &paths, id, Some(&process)),
+            };
+            assert_eq!(error.exit_code(), 1);
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    /// A write that fails at the level's check left nothing, and is a request that could not be
+    /// made. Every other failure of the write may come after a part of the frame went: its outcome
+    /// is unknown, whatever the source function says of it (a fault of the socket of another kind
+    /// than nothing listening is this side's own, and part of the frame may have gone before it).
+    /// A frame that cannot be encoded stays unknown: the roster's `Frame` row that differs.
+    #[test]
+    fn a_write_that_the_level_refused_left_nothing_and_any_other_failure_is_unknown() {
+        let refused = kr_ipc::IpcError::NotInLevel("a field".to_owned());
+        let said = refused.to_string();
+        match after_the_write_failed(refused) {
+            Asked::NotComposed { error } => assert_eq!(error.to_string(), said),
+            _ => panic!("the level refused before any byte was written: {said}"),
+        }
+        for error in [
+            kr_ipc::IpcError::PeerClosed,
+            a_frame_cut_by_the_end(),
+            a_spoiled_frame(),
+            a_fault_of_the_socket(),
+            kr_ipc::IpcError::socket(
+                "write the control frame",
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+            ),
+        ] {
+            let said = Shown::ipc(&error).to_string();
+            match after_the_write_failed(error) {
+                Asked::Unknown(unknown) => assert_eq!(unknown.to_string(), said),
+                _ => panic!("a failed write may have sent a part of the frame: {said}"),
+            }
+        }
+    }
+
+    /// A daemon that answers the last look of the wait is an answer, as one that answers the first
+    /// look is. Where the request could not be made and the connection was closed, the wait reads
+    /// its last look at the bound: the daemon that answers it stays, with exit 3 and the unmade
+    /// request's words, and the command does not say that it does not answer. A look that showed
+    /// nothing, and an answer of an earlier round only, leave the end not shown.
+    #[tokio::test(start_paused = true)]
+    async fn a_daemon_that_answers_the_last_look_of_the_wait_is_an_answer() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let paths = temp.environment();
+        let id = paths.environment_id();
+        let environment = KnownEnvironment {
+            environment_id: id,
+            paths,
+        };
+        let earlier = Earlier::read(&environment.paths);
+        let none = Facts::none(Vec::new());
+        let closed = kr_ipc::IpcError::PeerClosed;
+        let same = || at_once(Endpoint::Same(an_answer()));
+        for (held, looks, expected) in [
+            (Ok(false), vec![same()], "answers"),
+            (Ok(true), vec![same()], "answers"),
+            (
+                Ok(false),
+                vec![same(), at_once(Endpoint::Unclear)],
+                "silent",
+            ),
+            (Ok(true), vec![same(), at_once(Endpoint::Unclear)], "silent"),
+            (Ok(false), vec![at_once(Endpoint::Unclear)], "silent"),
+            (Ok(true), vec![at_once(Endpoint::Nobody)], "silent"),
+        ] {
+            let supplied = Supplied::new()
+                .held(vec![at_once(held.clone())])
+                .look(looks);
+            let before = failed_before_the_request(
+                &supplied,
+                supplied.connection(),
+                None,
+                &closed,
+                id,
+                the_deadline(),
+            )
+            .await;
+            assert_eq!(before_said(&before), expected, "{held:?}");
+        }
+        let supplied = Supplied::new().look(vec![same()]);
+        let before = failed_before_the_request(
+            &supplied,
+            supplied.connection(),
+            None,
+            &closed,
+            id,
+            the_deadline(),
+        )
+        .await;
+        match unmade_ended(before, &closed, id, &environment, &none, true, &earlier) {
+            Completion::Reported(error) => {
+                assert_eq!(error.exit_code(), 3);
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "kr host stop could not make its request for the control daemon of \
+                         environment {id}: {}. Nothing was sent, and nothing was stopped.",
+                        Shown::ipc(&closed)
+                    )
+                );
+            }
+            _ => panic!("a daemon that answers is a failure that the command has reported"),
+        }
+    }
+
+    /// Where the daemon was seen to end after the request was written, the first sentence says
+    /// that the command stopped it only where the daemon took the stop and answered, and otherwise
+    /// says what the command knows: that the daemon did not show whether it took the stop, and
+    /// that it has ended. The sentences after the first are the same, and the command ends with
+    /// exit 0 either way.
+    #[test]
+    fn an_end_after_a_stop_that_was_told_says_stopped_and_one_not_known_says_what_is_known() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let paths = temp.environment();
+        let id = paths.environment_id();
+        let failure = Shown::said("the connection was lost");
+        let after = "No session was stopped: its workers keep running, a local attach keeps \
+                     working, and the next daemon finds the sessions again. Paired devices' \
+                     connections close until a daemon runs.";
+        let creates = " 2 session creates were still under way after 10 seconds, when the daemon \
+                       went on with its stop. Each of them finished or ended with the daemon.";
+        for (said, expected) in [
+            (
+                gone_said(id, Some(4000), None, Some(0)),
+                format!("Stopped the control daemon for environment {id} (process 4000). {after}"),
+            ),
+            (
+                gone_said(id, None, None, Some(2)),
+                format!("Stopped the control daemon for environment {id}. {after}{creates}"),
+            ),
+            (
+                gone_said(id, Some(4000), Some(&failure), None),
+                format!(
+                    "The control daemon for environment {id} (process 4000) did not show whether \
+                     it took the stop (the connection was lost), and it has ended. {after}"
+                ),
+            ),
+            (
+                gone_said(id, None, Some(&failure), None),
+                format!(
+                    "The control daemon for environment {id} did not show whether it took the \
+                     stop (the connection was lost), and it has ended. {after}"
+                ),
+            ),
+        ] {
+            assert_eq!(said.to_string(), expected);
+            let earlier = Earlier::read(&paths);
+            let facts = Facts {
+                knows: Knows::Ended,
+                pid: Some(4000),
+                unsettled: None,
+                records: Vec::new(),
+            };
+            assert!(
+                matches!(done(&said, &facts, true, &earlier), Completion::Done),
+                "an end that was seen is a result, with exit 0"
+            );
         }
     }
 }
