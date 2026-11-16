@@ -334,7 +334,8 @@ impl Account {
     pub async fn status(&self) -> AccountView {
         let view = self.view().await;
         if matches!(view, AccountView::SignedIn { email: None, .. }) {
-            if let Ok(IdentityRead::Disagreed) = self.signed_in.complete_identity(|| true).await {
+            if let Ok(IdentityRead::Disagreed) = self.signed_in.complete_identity(|| Some(())).await
+            {
                 self.set_outcome(Some(Outcome::NotForThisSignIn));
             }
             return self.view().await;
@@ -443,8 +444,12 @@ impl Account {
                 // them; a store that cannot say is settled, never revoked while it may hold them.
                 // The companion signs in its own account, which no host's deadline, lease or fence
                 // governs, so the check that the keep asks under the account's hold always stands.
-                match self.signed_in.keep(issued, grant.nonce(), || true).await {
-                    Ok(Commit::Kept) => match self.signed_in.complete_identity(|| true).await {
+                match self
+                    .signed_in
+                    .keep(issued, grant.nonce(), || Some(()))
+                    .await
+                {
+                    Ok(Commit::Kept) => match self.signed_in.complete_identity(|| Some(())).await {
                         Ok(IdentityRead::Disagreed) => Some(Outcome::NotForThisSignIn),
                         _ => None,
                     },

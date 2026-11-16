@@ -1227,7 +1227,7 @@ async fn an_expired_token_is_refreshed_once_and_kept_before_it_is_handed_out() {
         .commit(
             issued_for("account-1", "first", &["openid", "voice"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("a sign-in");
@@ -1258,7 +1258,7 @@ async fn two_callers_at_once_cause_one_refresh() {
         .commit(
             issued_for("account-1", "first", &["openid", "voice"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("a sign-in");
@@ -1291,7 +1291,7 @@ async fn a_sign_out_during_a_refresh_waits_and_revokes_the_rotated_token() {
         .commit(
             issued_for("account-1", "first", &["openid", "voice"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("a sign-in");
@@ -1347,7 +1347,7 @@ async fn a_sign_in_during_a_refresh_of_an_older_grant_keeps_the_new_grant() {
         .commit(
             issued_for("account-1", "first", &["openid", "voice"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("a sign-in");
@@ -1366,7 +1366,7 @@ async fn a_sign_in_during_a_refresh_of_an_older_grant_keeps_the_new_grant() {
                 .commit(
                     issued_for("account-2", "second", &["openid", "voice"]),
                     "b-nonce",
-                    || true,
+                    || Some(()),
                 )
                 .await
         })
@@ -1392,7 +1392,7 @@ async fn recovery_keeps_a_later_sign_in_while_an_earlier_revocation_is_pending()
         .commit(
             issued_for("account-1", "grant-a", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("A");
@@ -1407,7 +1407,7 @@ async fn recovery_keeps_a_later_sign_in_while_an_earlier_revocation_is_pending()
         .commit(
             issued_for("account-1", "grant-b", &["openid"]),
             "b-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("B");
@@ -1435,7 +1435,7 @@ async fn a_grant_whose_own_revocation_is_pending_is_removed_at_start() {
         .commit(
             issued_for("account-1", "grant-a", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("A");
@@ -1494,6 +1494,15 @@ struct FaultyStore {
     ends_after_queue_write: Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
     /// A standing that ends once the next read of the session item has returned.
     ends_after_session_read: Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
+    /// The reads of the revocation queue so far.
+    queue_reads: std::sync::atomic::AtomicUsize,
+    /// A standing that ends once the revocation queue has been read this many times in all.
+    ends_after_queue_reads: Mutex<Option<(usize, Arc<std::sync::atomic::AtomicBool>)>>,
+    /// The guards that the caller's standing handed out and that are still held.
+    guards: Mutex<Option<Arc<std::sync::atomic::AtomicUsize>>>,
+    /// Each write of the revocation queue or of the session item, in order, with the number of
+    /// guards held at the moment the store was handed it.
+    writes: Mutex<Vec<(&'static str, usize)>>,
 }
 
 impl FaultyStore {
@@ -1506,7 +1515,42 @@ impl FaultyStore {
             queue_lands: std::sync::atomic::AtomicBool::new(false),
             ends_after_queue_write: Mutex::new(None),
             ends_after_session_read: Mutex::new(None),
+            queue_reads: std::sync::atomic::AtomicUsize::new(0),
+            ends_after_queue_reads: Mutex::new(None),
+            guards: Mutex::new(None),
+            writes: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Ends `standing` once the revocation queue has been read `reads` times in all.
+    fn standing_ends_after_the_queue_has_been_read(
+        &self,
+        reads: usize,
+        standing: &Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        *self.ends_after_queue_reads.lock().expect("the plan") =
+            Some((reads, Arc::clone(standing)));
+    }
+
+    /// Counts, at each write, the guards of `standing` still held.
+    fn count_the_guards_held_at_each_write(&self, held: &Arc<std::sync::atomic::AtomicUsize>) {
+        *self.guards.lock().expect("the plan") = Some(Arc::clone(held));
+    }
+
+    /// Each write of the queue ("queue") or of the session item ("session"), in order, with the
+    /// number of guards held when the store was handed it.
+    fn writes_made(&self) -> Vec<(&'static str, usize)> {
+        self.writes.lock().expect("the writes").clone()
+    }
+
+    fn note_a_write(&self, kind: &'static str) {
+        let held = self
+            .guards
+            .lock()
+            .expect("the plan")
+            .as_ref()
+            .map_or(0, |held| held.load(Ordering::SeqCst));
+        self.writes.lock().expect("the writes").push((kind, held));
     }
 
     /// Ends `standing` once the next write of the revocation queue has landed.
@@ -1561,6 +1605,12 @@ fn refused() -> kr_crypto::CryptoError {
 impl SecretStore for FaultyStore {
     fn set(&self, name: &SecretName, secret: &[u8]) -> kr_crypto::Result<()> {
         if name.as_str().ends_with("account/session") {
+            self.note_a_write("session");
+        }
+        if name.as_str().ends_with("account/revoke") {
+            self.note_a_write("queue");
+        }
+        if name.as_str().ends_with("account/session") {
             let write = std::mem::replace(
                 &mut *self.session.lock().expect("the plan"),
                 SessionWrite::Works,
@@ -1602,6 +1652,15 @@ impl SecretStore for FaultyStore {
             return Err(refused());
         }
         let read = self.inner.get(name);
+        if name.as_str().ends_with("account/revoke") {
+            let reads = self.queue_reads.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut ends = self.ends_after_queue_reads.lock().expect("the plan");
+            if ends.as_ref().is_some_and(|(after, _)| reads >= *after)
+                && let Some((_, standing)) = ends.take()
+            {
+                standing.store(false, Ordering::SeqCst);
+            }
+        }
         if name.as_str().ends_with("account/session")
             && let Some(standing) = self
                 .ends_after_session_read
@@ -1616,6 +1675,9 @@ impl SecretStore for FaultyStore {
 
     fn delete(&self, name: &SecretName) -> kr_crypto::Result<()> {
         // An empty queue is written by removing it, which is a write of the queue all the same.
+        if name.as_str().ends_with("account/revoke") {
+            self.note_a_write("queue");
+        }
         self.queue_write_allowed(name)?;
         self.inner.delete(name)
     }
@@ -1660,7 +1722,7 @@ async fn a_commit_whose_standing_ended_writes_nothing_and_a_keep_ends_its_tokens
         .commit(
             issued_for("account-1", "grant-a", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("A");
@@ -1669,7 +1731,7 @@ async fn a_commit_whose_standing_ended_writes_nothing_and_a_keep_ends_its_tokens
         .commit(
             issued_for("account-1", "grant-b", &["openid"]),
             "b-nonce",
-            || false,
+            || None::<()>,
         )
         .await
         .expect("a commit");
@@ -1681,7 +1743,7 @@ async fn a_commit_whose_standing_ended_writes_nothing_and_a_keep_ends_its_tokens
         .keep(
             issued_for("account-1", "grant-c", &["openid"]),
             "c-nonce",
-            || false,
+            || None::<()>,
         )
         .await
         .expect("a keep");
@@ -1697,7 +1759,7 @@ async fn a_commit_whose_standing_ended_writes_nothing_and_a_keep_ends_its_tokens
         .keep(
             issued_for("account-1", "grant-d", &["openid"]),
             "d-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("a keep");
@@ -1723,7 +1785,7 @@ async fn a_keep_whose_standing_ends_while_the_store_works_writes_no_grant_and_pu
         .commit(
             issued_for("account-1", "grant-a", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("A");
@@ -1735,7 +1797,7 @@ async fn a_keep_whose_standing_ends_while_the_store_works_writes_no_grant_and_pu
         .commit(
             issued_for("account-1", "grant-b", &["openid"]),
             "b-nonce",
-            || standing.load(Ordering::SeqCst),
+            || standing.load(Ordering::SeqCst).then_some(()),
         )
         .await
         .expect("a commit");
@@ -1754,7 +1816,7 @@ async fn a_keep_whose_standing_ends_while_the_store_works_writes_no_grant_and_pu
         .keep(
             issued_for("account-1", "grant-c", &["openid"]),
             "c-nonce",
-            || standing.load(Ordering::SeqCst),
+            || standing.load(Ordering::SeqCst).then_some(()),
         )
         .await
         .expect("a keep");
@@ -1770,13 +1832,145 @@ async fn a_keep_whose_standing_ends_while_the_store_works_writes_no_grant_and_pu
         .keep(
             issued_for("account-1", "grant-d", &["openid"]),
             "d-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("a keep");
     assert_eq!(kept, Commit::Kept);
     assert_eq!(stored_refresh(&store.inner).as_deref(), Some("grant-d"));
     assert_eq!(stub.revoked(), ["grant-c", "grant-a"]);
+}
+
+/// What a caller's standing hands out where it holds, counted while it is held.
+struct StandingHeld(Arc<std::sync::atomic::AtomicUsize>);
+
+impl StandingHeld {
+    fn new(count: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(count))
+    }
+}
+
+impl Drop for StandingHeld {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The caller's standing is asked immediately before the replaced grant's revocation is queued,
+/// after the queue's reads that prepare it: where it ended while the queue was read, nothing is
+/// queued and nothing is written, so the first write of the store is the proof, the grant that was
+/// held stays, and a keep ends the tokens the grant came with.
+#[tokio::test]
+async fn a_keep_whose_standing_ends_while_the_queue_is_read_queues_nothing_and_writes_nothing() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
+    signed_in
+        .commit(
+            issued_for("account-1", "grant-a", &["openid"]),
+            "a-nonce",
+            || Some(()),
+        )
+        .await
+        .expect("A");
+
+    for keep in [false, true] {
+        let standing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writes_before = store.writes_made().len();
+        // The commit reads the queue to keep it whole for a put-back, and again to prepare the
+        // revocation: the standing ends when the second read has returned.
+        let reads = store.queue_reads.load(Ordering::SeqCst);
+        store.standing_ends_after_the_queue_has_been_read(reads + 2, &standing);
+        let outcome = if keep {
+            signed_in
+                .keep(
+                    issued_for("account-1", "grant-c", &["openid"]),
+                    "c-nonce",
+                    || {
+                        standing
+                            .load(Ordering::SeqCst)
+                            .then(|| StandingHeld::new(&held))
+                    },
+                )
+                .await
+        } else {
+            signed_in
+                .commit(
+                    issued_for("account-1", "grant-b", &["openid"]),
+                    "b-nonce",
+                    || {
+                        standing
+                            .load(Ordering::SeqCst)
+                            .then(|| StandingHeld::new(&held))
+                    },
+                )
+                .await
+        }
+        .expect("a commit");
+        assert!(
+            !standing.load(Ordering::SeqCst),
+            "the standing ended while the queue was read"
+        );
+        assert_eq!(outcome, Commit::Withheld);
+        if !keep {
+            assert_eq!(
+                store.writes_made().len(),
+                writes_before,
+                "the store was handed no write at all"
+            );
+        }
+        assert_eq!(stored_refresh(&store.inner).as_deref(), Some("grant-a"));
+        assert_eq!(held.load(Ordering::SeqCst), 0, "no guard is left held");
+    }
+    assert_eq!(
+        stub.revoked(),
+        ["grant-c"],
+        "a keep ends the tokens the grant came with, and the grant that was held is not ended"
+    );
+}
+
+/// Where the standing holds, the guard the standing gave is held until each write has returned:
+/// the store is handed the queue's write with one guard held, and the grant's write with one
+/// guard held, the earlier ask's guard having been let go after the queue's write.
+#[tokio::test]
+async fn a_commit_holds_the_standing_it_was_given_until_each_write_has_returned() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::new());
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
+    signed_in
+        .commit(
+            issued_for("account-1", "grant-a", &["openid"]),
+            "a-nonce",
+            || Some(()),
+        )
+        .await
+        .expect("A");
+
+    let held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    store.count_the_guards_held_at_each_write(&held);
+    let writes_before = store.writes_made().len();
+    let kept = signed_in
+        .commit(
+            issued_for("account-1", "grant-b", &["openid"]),
+            "b-nonce",
+            || Some(StandingHeld::new(&held)),
+        )
+        .await
+        .expect("a commit");
+    assert_eq!(kept, Commit::Kept);
+    let writes = store.writes_made();
+    assert_eq!(
+        &writes[writes_before..writes_before + 2],
+        [("queue", 1), ("session", 1)],
+        "the queue's write and the grant's write are each handed to the store with the guard held"
+    );
+    assert_eq!(held.load(Ordering::SeqCst), 0, "no guard is left held");
 }
 
 /// Where the standing ended in the store's wait and the queue cannot be put back, the outcome is
@@ -1795,7 +1989,7 @@ async fn a_keep_whose_standing_ends_while_the_store_works_and_whose_queue_cannot
         .commit(
             issued_for("account-1", "grant-a", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("A");
@@ -1808,7 +2002,7 @@ async fn a_keep_whose_standing_ends_while_the_store_works_and_whose_queue_cannot
         .keep(
             issued_for("account-1", "grant-b", &["openid"]),
             "b-nonce",
-            || standing.load(Ordering::SeqCst),
+            || standing.load(Ordering::SeqCst).then_some(()),
         )
         .await
         .expect_err("the queue cannot be put back");
@@ -1855,7 +2049,7 @@ async fn a_sign_out_whose_standing_ends_while_the_store_is_read_removes_and_queu
         .commit(
             issued_for("account-1", "grant-a", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("A");
@@ -1904,7 +2098,7 @@ async fn a_commit_that_cannot_write_the_new_grant_leaves_the_old_one_whole() {
         .commit(
             issued_for("account-1", "grant-a", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("A");
@@ -1918,7 +2112,7 @@ async fn a_commit_that_cannot_write_the_new_grant_leaves_the_old_one_whole() {
         .commit(
             issued_for("account-1", "grant-b", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect_err("the new grant cannot be written");
@@ -1961,7 +2155,7 @@ async fn a_failed_commit_gives_a_full_queue_back_as_it_was() {
             .commit(
                 issued_for("account-1", &format!("grant-{number}"), &["openid"]),
                 "a-nonce",
-                || true,
+                || Some(()),
             )
             .await
             .expect("a sign-in");
@@ -1977,7 +2171,7 @@ async fn a_failed_commit_gives_a_full_queue_back_as_it_was() {
         .commit(
             issued_for("account-1", "grant-new", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect_err("the new grant cannot be written");
@@ -2003,7 +2197,7 @@ async fn a_grant_whose_queue_could_not_be_put_back_is_not_ended_while_it_is_held
         .commit(
             issued_for("account-1", "grant-a", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("A");
@@ -2014,7 +2208,7 @@ async fn a_grant_whose_queue_could_not_be_put_back_is_not_ended_while_it_is_held
         .commit(
             issued_for("account-1", "grant-b", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect_err("the new grant cannot be written");
@@ -2049,7 +2243,7 @@ async fn a_queue_write_that_lands_and_then_fails_is_given_back_whole() {
         .commit(
             issued_for("account-1", "grant-a", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("A");
@@ -2061,7 +2255,7 @@ async fn a_queue_write_that_lands_and_then_fails_is_given_back_whole() {
         .commit(
             issued_for("account-1", "grant-b", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect_err("the queue cannot be written");
@@ -2099,7 +2293,7 @@ async fn a_commit_whose_result_cannot_be_read_queues_both_grants_and_ends_neithe
         .commit(
             issued_for("account-1", "grant-a", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("A");
@@ -2112,7 +2306,7 @@ async fn a_commit_whose_result_cannot_be_read_queues_both_grants_and_ends_neithe
             .commit(
                 issued_for("account-1", "grant-b", &["openid"]),
                 "a-nonce",
-                || true
+                || Some(())
             )
             .await
             .expect("the commit says it cannot tell, and does not fail"),
@@ -2157,7 +2351,7 @@ async fn an_unsettled_sign_in_ends_every_token(write: SessionWrite) {
         .commit(
             issued_for("account-1", "grant-a", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("A");
@@ -2168,7 +2362,7 @@ async fn an_unsettled_sign_in_ends_every_token(write: SessionWrite) {
             .keep(
                 issued_for("account-1", "grant-b", &["openid"]),
                 "a-nonce",
-                || true
+                || Some(())
             )
             .await
             .expect("the store could not say, which is not a failure"),
@@ -2214,7 +2408,7 @@ async fn an_unsettled_sign_in_the_queue_cannot_take(
         .commit(
             issued_for("account-1", "grant-a", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("A");
@@ -2226,7 +2420,7 @@ async fn an_unsettled_sign_in_the_queue_cannot_take(
         .keep(
             issued_for("account-1", "grant-b", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("the store could not say, which is not a failure");
@@ -2296,7 +2490,7 @@ async fn a_token_kept_in_memory_is_queued_by_the_first_send_that_can_and_survive
         .commit(
             issued_for("account-1", "grant-a", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("A");
@@ -2310,7 +2504,7 @@ async fn a_token_kept_in_memory_is_queued_by_the_first_send_that_can_and_survive
             .keep(
                 issued_for("account-1", "grant-b", &["openid"]),
                 "a-nonce",
-                || true
+                || Some(())
             )
             .await
             .expect("the store could not say"),
@@ -2364,7 +2558,7 @@ async fn a_token_in_the_queue_and_in_memory_is_ended_once() {
             .keep(
                 issued_for("account-1", "grant-b", &["openid"]),
                 "a-nonce",
-                || true
+                || Some(())
             )
             .await
             .expect("the store could not say"),
@@ -2395,7 +2589,7 @@ async fn a_sign_in_that_is_kept_later_ends_a_token_that_was_only_in_memory() {
             .keep(
                 issued_for("account-1", "grant-b", &["openid"]),
                 "a-nonce",
-                || true
+                || Some(())
             )
             .await
             .expect("the store could not say"),
@@ -2408,7 +2602,7 @@ async fn a_sign_in_that_is_kept_later_ends_a_token_that_was_only_in_memory() {
         .commit(
             issued_for("account-1", "grant-c", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("a sign-in");
@@ -2467,7 +2661,7 @@ async fn a_token_only_memory_holds_is_counted_as_waiting() {
             .keep(
                 issued_for("account-1", "grant-b", &["openid"]),
                 "a-nonce",
-                || true
+                || Some(())
             )
             .await
             .expect("the store could not say"),
@@ -2516,7 +2710,7 @@ async fn a_memory_token_the_service_acknowledged_is_let_go_of() {
             .keep(
                 issued_for("account-1", "grant-b", &["openid"]),
                 "a-nonce",
-                || true
+                || Some(())
             )
             .await
             .expect("the store could not say"),
@@ -2546,7 +2740,7 @@ async fn a_token_the_queue_took_while_reporting_a_failure_is_sent_once() {
             .keep(
                 issued_for("account-1", "grant-b", &["openid"]),
                 "a-nonce",
-                || true
+                || Some(())
             )
             .await
             .expect("the store could not say"),
@@ -2571,7 +2765,7 @@ async fn a_failing_queue_clean_up_does_not_keep_a_memory_token_from_the_service(
         .commit(
             issued_for("account-1", "grant-a", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("A");
@@ -2585,7 +2779,7 @@ async fn a_failing_queue_clean_up_does_not_keep_a_memory_token_from_the_service(
             .keep(
                 issued_for("account-1", "grant-b", &["openid"]),
                 "a-nonce",
-                || true
+                || Some(())
             )
             .await
             .expect("the store could not say"),
@@ -2644,7 +2838,7 @@ async fn a_keep_whose_standing_ended_says_when_its_revocation_reached_neither_qu
             .keep(
                 issued_for("account-1", "grant-c", &["openid"]),
                 "c-nonce",
-                || false,
+                || None::<()>,
             )
             .await
             .expect("a keep");
@@ -2702,7 +2896,7 @@ async fn a_sign_in_the_next_recovery_would_remove_is_not_reported_as_kept() {
         .commit(
             issued_for("account-1", "grant-a", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("A");
@@ -2715,7 +2909,7 @@ async fn a_sign_in_the_next_recovery_would_remove_is_not_reported_as_kept() {
             .keep(
                 issued_for("account-1", "grant-b", &["openid"]),
                 "a-nonce",
-                || true
+                || Some(())
             )
             .await
             .expect("the store could not say"),
@@ -2747,7 +2941,7 @@ async fn a_sign_in_the_store_is_known_not_to_have_kept_ends_its_token_and_leaves
         .commit(
             issued_for("account-1", "grant-a", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("A");
@@ -2756,7 +2950,7 @@ async fn a_sign_in_the_store_is_known_not_to_have_kept_ends_its_token_and_leaves
         .keep(
             issued_for("account-1", "grant-b", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect_err("the store refused the new grant");
@@ -2785,7 +2979,7 @@ async fn a_write_that_lands_and_then_fails_is_the_commit() {
         .commit(
             issued_for("account-1", "grant-a", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("A");
@@ -2794,7 +2988,7 @@ async fn a_write_that_lands_and_then_fails_is_the_commit() {
         .commit(
             issued_for("account-1", "grant-b", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("the grant is in place, so the commit stands");
@@ -2818,7 +3012,7 @@ async fn invalid_grant_ends_the_sign_in_and_an_unknown_outcome_keeps_it() {
         .commit(
             issued_for("account-1", "first", &["openid", "voice"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("a sign-in");
@@ -2859,7 +3053,7 @@ async fn a_refused_refresh_answer_ends_the_grant_and_revokes_its_token() {
         .commit(
             issued_for("account-1", "first", &["openid", "voice"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("a sign-in");
@@ -2888,7 +3082,7 @@ async fn a_sign_out_with_the_service_unreachable_signs_out_here_and_sends_later(
         .commit(
             issued_for("account-1", "grant-a", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("a sign-in");
@@ -2932,7 +3126,7 @@ async fn a_token_for_a_scope_the_grant_lacks_is_refused() {
         .commit(
             issued_for("account-1", "first", &["openid", "voice"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("a sign-in");
@@ -2960,12 +3154,15 @@ async fn the_identity_read_after_a_sign_in_is_held_to_the_sign_ins_subject() {
     let sign_in = || issued_for("account-1", "grant", &["openid", "email", USAGE_SCOPE]);
 
     signed_in
-        .commit(sign_in(), "a-nonce", || true)
+        .commit(sign_in(), "a-nonce", || Some(()))
         .await
         .expect("a sign-in");
     *stub.identity.lock().expect("the identity") = Some(Err(ErrorCode::UpstreamUnavailable));
     assert_eq!(
-        signed_in.complete_identity(|| true).await.expect("a read"),
+        signed_in
+            .complete_identity(|| Some(()))
+            .await
+            .expect("a read"),
         IdentityRead::Unread
     );
     assert!(matches!(
@@ -2979,7 +3176,10 @@ async fn the_identity_read_after_a_sign_in_is_held_to_the_sign_ins_subject() {
         name: None,
     }));
     assert_eq!(
-        signed_in.complete_identity(|| true).await.expect("a read"),
+        signed_in
+            .complete_identity(|| Some(()))
+            .await
+            .expect("a read"),
         IdentityRead::Read
     );
     assert!(matches!(
@@ -2993,7 +3193,10 @@ async fn the_identity_read_after_a_sign_in_is_held_to_the_sign_ins_subject() {
         name: None,
     }));
     assert_eq!(
-        signed_in.complete_identity(|| true).await.expect("a read"),
+        signed_in
+            .complete_identity(|| Some(()))
+            .await
+            .expect("a read"),
         IdentityRead::Disagreed
     );
     assert_eq!(
@@ -3001,6 +3204,86 @@ async fn the_identity_read_after_a_sign_in_is_held_to_the_sign_ins_subject() {
         AccountStatus::SignedOut
     );
     assert_eq!(stub.revoked(), ["grant"]);
+}
+
+/// The identity's write is asked immediately before it, after the grant is read again under the
+/// account's hold: where the standing ended while that read was made, nothing is written, so the
+/// store is handed no write at all, and the outcome is [`IdentityRead::Unread`]. The control:
+/// where the standing holds, the one write the store is handed is made with the guard held.
+#[tokio::test]
+async fn an_identity_read_whose_standing_ends_while_the_grant_is_read_writes_nothing() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    let stub = Arc::new(Stub::holding_identity());
+    *stub.identity.lock().expect("the identity") = Some(Ok(AccountIdentity {
+        subject: "account-1".to_owned(),
+        email: Some("sam@example.com".to_owned()),
+        name: Some("Sam".to_owned()),
+    }));
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
+    signed_in
+        .commit(
+            issued_for("account-1", "grant-a", &["openid"]),
+            "a-nonce",
+            || Some(()),
+        )
+        .await
+        .expect("the sign-in");
+
+    for standing_holds in [false, true] {
+        let standing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        store.count_the_guards_held_at_each_write(&held);
+        let writes_before = store.writes_made().len();
+        let reads_before = stub.identity_reads.load(Ordering::SeqCst);
+        let reading = {
+            let signed_in = Arc::clone(&signed_in);
+            let standing = Arc::clone(&standing);
+            let held = Arc::clone(&held);
+            tokio::spawn(async move {
+                signed_in
+                    .complete_identity(|| {
+                        standing
+                            .load(Ordering::SeqCst)
+                            .then(|| StandingHeld::new(&held))
+                    })
+                    .await
+            })
+        };
+        while stub.identity_reads.load(Ordering::SeqCst) == reads_before {
+            tokio::task::yield_now().await;
+        }
+        if !standing_holds {
+            // The next read of the session item is the one the identity's write is prepared by.
+            store.standing_ends_after_the_session_read(&standing);
+        }
+        stub.identity_held
+            .as_ref()
+            .expect("a held read")
+            .add_permits(1);
+        let read = reading.await.expect("the read runs").expect("a read");
+        if standing_holds {
+            assert_eq!(read, IdentityRead::Read, "the control");
+            assert_eq!(
+                store.writes_made()[writes_before..],
+                [("session", 1)],
+                "the one write is made with the guard held"
+            );
+        } else {
+            assert!(
+                !standing.load(Ordering::SeqCst),
+                "the standing ended while the grant was read"
+            );
+            assert_eq!(read, IdentityRead::Unread);
+            assert_eq!(
+                store.writes_made().len(),
+                writes_before,
+                "the store was handed no write at all"
+            );
+        }
+        assert_eq!(held.load(Ordering::SeqCst), 0, "no guard is left held");
+    }
 }
 
 /// The address and name are written under the caller's standing, asked after the service has
@@ -3024,7 +3307,7 @@ async fn an_identity_read_whose_standing_ended_while_the_service_answered_writes
         .commit(
             issued_for("account-1", "grant-a", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("the sign-in");
@@ -3037,7 +3320,7 @@ async fn an_identity_read_whose_standing_ended_while_the_service_answered_writes
             let standing = Arc::clone(&standing);
             tokio::spawn(async move {
                 signed_in
-                    .complete_identity(|| standing.load(Ordering::SeqCst))
+                    .complete_identity(|| standing.load(Ordering::SeqCst).then_some(()))
                     .await
             })
         };
@@ -3087,14 +3370,14 @@ async fn a_disagreeing_identity_ends_only_the_grant_it_was_read_for() {
         .commit(
             issued_for("account-1", "grant-a", &["openid"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("the first sign-in");
 
     let reading = {
         let signed_in = Arc::clone(&signed_in);
-        tokio::spawn(async move { signed_in.complete_identity(|| true).await })
+        tokio::spawn(async move { signed_in.complete_identity(|| Some(())).await })
     };
     while stub.identity_reads.load(Ordering::SeqCst) == 0 {
         tokio::task::yield_now().await;
@@ -3103,7 +3386,7 @@ async fn a_disagreeing_identity_ends_only_the_grant_it_was_read_for() {
         .commit(
             issued_for("account-2", "grant-b", &["openid"]),
             "b-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("the second sign-in");
@@ -3146,7 +3429,7 @@ async fn a_refresh_that_drops_the_asked_for_scope_is_kept_and_the_token_refused(
         .commit(
             issued_for("account-1", "grant", &["openid", "voice", LEASE_SCOPE]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("a sign-in");
@@ -3181,7 +3464,7 @@ async fn usage_names_the_grant_it_was_read_with() {
         .commit(
             issued_for("account-1", "grant-a", &["openid", USAGE_SCOPE]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("the first sign-in");
@@ -3198,7 +3481,7 @@ async fn usage_names_the_grant_it_was_read_with() {
         .commit(
             issued_for("account-1", "grant-b", &["openid", USAGE_SCOPE]),
             "b-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("the second sign-in, the same account");
@@ -3555,7 +3838,7 @@ async fn a_grant_kept_for_one_origin_is_not_read_back_for_another() {
         .commit(
             issued_for("account-1", "owner-grant", &["openid", "backup.write"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("the owner's sign-in");
@@ -3582,7 +3865,7 @@ async fn a_grant_kept_for_one_origin_is_not_read_back_for_another() {
         .commit(
             issued_for("account-1", "managed-grant", &["openid", "backup.write"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("the managed sign-in");
@@ -3632,7 +3915,7 @@ async fn the_mark_of_an_account_at_another_origin_is_taken_from_its_own_issuer()
         kept.commit(
             issued_for("account-1", "a-grant", &["openid", "backup.write"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("a sign-in");
@@ -3677,7 +3960,7 @@ async fn the_managed_stored_grant_document_and_account_mark_keep_their_bytes() {
         .commit(
             issued_for("account-1", "a-refresh", &["openid", "backup.write"]),
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("a sign-in");

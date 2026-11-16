@@ -2502,17 +2502,23 @@ impl SignedInAccount {
 
     /// Keeps a sign-in's tokens, replacing any grant this device held, whose revocation is queued.
     ///
-    /// `stands` says whether the caller's authority for the sign-in still holds. It is asked under
-    /// the account's hold, and asked twice. The first ask comes before the store is read: the hold
-    /// can be kept by a token refresh across its request to the service, so whatever the caller
-    /// checked before calling has had that wait to go stale. Where it says no, nothing is written,
-    /// queued or sent, and the outcome is [`Commit::Withheld`]. The second ask comes immediately
-    /// before the grant is written, after the reads and the queue's write that the store takes,
-    /// and is the last one before the change. Where it says no, the queue is put back as it was
-    /// found, nothing of the new grant is written or sent, the grant that was held stays, and the
-    /// outcome is [`Commit::Withheld`] too. Where the queue cannot be put back, the outcome is
-    /// the one a grant that cannot be written has: the error, with the grant that was held
-    /// removed by the next recovery.
+    /// `stands` says whether the caller's authority for the sign-in still holds: it gives a guard
+    /// where it does, and none where it does not. The guard is held until the write that the ask
+    /// stands before has returned, so that what the caller's authority rests on is not let go of
+    /// between the ask and the write. `stands` is asked under the account's hold, three times.
+    /// The first ask comes before the store is read: the hold can be kept by a token refresh across
+    /// its request to the service, so whatever the caller checked before calling has had that wait
+    /// to go stale. Where it says no, nothing is written, queued or sent, and the outcome is
+    /// [`Commit::Withheld`]. The second ask comes immediately before the replaced grant's
+    /// revocation is queued, after the reads that prepare the queue. Where it says no, nothing is
+    /// queued and nothing is put back, nothing of the new grant is written or sent, the grant that
+    /// was held stays, and the outcome is [`Commit::Withheld`] too. The third ask comes
+    /// immediately before the grant is written, after the queue's write, and is the last one
+    /// before the change. Where it says no, the queue is put back as it was found, nothing of the
+    /// new grant is written or sent, the grant that was held stays, and the outcome is
+    /// [`Commit::Withheld`] too. Where the queue cannot be put back, the outcome is the one a
+    /// grant that cannot be written has: the error, with the grant that was held removed by the
+    /// next recovery.
     ///
     /// An error means the new grant is known not to be held: the token it came with is the
     /// caller's to end ([`Self::revoke_unkept`]). A token is never ended while the store may hold
@@ -2528,15 +2534,15 @@ impl SignedInAccount {
     /// of the grant the store holds, and the next recovery removes a held grant whose own
     /// revocation is queued, so the grant that was replaced is not ended while it is still held. A
     /// write that fails after the grant is in place and is then seen to be there counts as kept.
-    pub async fn commit(
+    pub async fn commit<G>(
         &self,
         issued: IssuedGrant,
         nonce: &str,
-        stands: impl Fn() -> bool,
+        stands: impl Fn() -> Option<G>,
     ) -> Result<Commit> {
         let replaced = {
             let _held = self.hold().await?;
-            if !stands() {
+            if stands().is_none() {
                 return Ok(Commit::Withheld);
             }
             let grant =
@@ -2557,27 +2563,44 @@ impl SignedInAccount {
                 }
                 Ok(())
             };
-            if let Some(old) = &replaced
-                && let Err(error) = self.queue(&old.grant_id, old.refresh_token.clone())
-            {
-                // The grant write never started, so the old grant is the one held: a queue write
-                // can fail at its last step, after its contents are in place. If the queue cannot
-                // be put back either, the old grant and its own queued revocation are both there,
-                // which a send does not send and the next recovery settles; the error is the one
-                // the caller is given either way.
-                let _ = put_back(&replaced);
-                return Err(error);
+            if let Some(old) = &replaced {
+                // The queue is prepared first, with every read it makes, and asked for after them
+                // with only its write after the ask. Where the ask says no nothing was queued, so
+                // nothing is put back.
+                let entries = match self.queued(&old.grant_id, old.refresh_token.clone()) {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        let _ = put_back(&replaced);
+                        return Err(error);
+                    }
+                };
+                let Some(guard) = stands() else {
+                    return Ok(Commit::Withheld);
+                };
+                let queued = self.write_pending(&entries);
+                drop(guard);
+                if let Err(error) = queued {
+                    // The grant write never started, so the old grant is the one held: a queue
+                    // write can fail at its last step, after its contents are in place. If the
+                    // queue cannot be put back either, the old grant and its own queued revocation
+                    // are both there, which a send does not send and the next recovery settles; the
+                    // error is the one the caller is given either way.
+                    let _ = put_back(&replaced);
+                    return Err(error);
+                }
             }
             // The last ask, after every read and the queue's write, with only the grant's write
             // after it. The grant that was held stays, and its revocation is not owed. If the queue
             // cannot be put back, the old grant and its own queued revocation are both there, which
             // the next recovery settles by removing the grant: the outcome is the failed put-back,
             // as it is the failed write of a grant.
-            if !stands() {
+            let Some(guard) = stands() else {
                 put_back(&replaced)?;
                 return Ok(Commit::Withheld);
-            }
-            if let Err(error) = self.write_grant(&grant) {
+            };
+            let written = self.write_grant(&grant);
+            drop(guard);
+            if let Err(error) = written {
                 // A write can fail at its last step, after the grant is in place. What the store
                 // holds decides: a grant that landed is the commit, and the queue stays as it is.
                 match self.read_grant() {
@@ -2646,11 +2669,11 @@ impl SignedInAccount {
     /// # Errors
     ///
     /// Returns the error of the commit.
-    pub async fn keep(
+    pub async fn keep<G>(
         &self,
         issued: IssuedGrant,
         nonce: &str,
-        stands: impl Fn() -> bool,
+        stands: impl Fn() -> Option<G>,
     ) -> Result<Commit> {
         let refresh = issued.refresh_token.clone();
         match self.commit(issued, nonce, stands).await {
@@ -2702,17 +2725,21 @@ impl SignedInAccount {
     /// A subject other than the sign-in's means the two answers disagree about who signed in, so
     /// the sign-in is undone and revoked. A service that cannot be asked leaves the grant as it is.
     ///
-    /// `stands` says whether the caller's authority for the sign-in still holds. It is asked under
-    /// the account's hold, after the service has answered and the grant is read, immediately before
-    /// the address and name are written: that wait is the service's and the hold's, and the
-    /// authority can end in it. Where it says no, nothing is written and the outcome is
-    /// [`IdentityRead::Unread`], as when the service cannot be asked: the grant the sign-in kept is
-    /// left as it is.
+    /// `stands` says whether the caller's authority for the sign-in still holds: it gives a guard
+    /// where it does, and none where it does not. It is asked under the account's hold, after the
+    /// service has answered and the grant is read, immediately before the address and name are
+    /// written: that wait is the service's and the hold's, and the authority can end in it. The
+    /// guard is held until the write has returned. Where it says no, nothing is written and the
+    /// outcome is [`IdentityRead::Unread`], as when the service cannot be asked: the grant the
+    /// sign-in kept is left as it is.
     ///
     /// # Errors
     ///
     /// Returns an error when no account is signed in or the store cannot be read.
-    pub async fn complete_identity(&self, stands: impl Fn() -> bool) -> Result<IdentityRead> {
+    pub async fn complete_identity<G>(
+        &self,
+        stands: impl Fn() -> Option<G>,
+    ) -> Result<IdentityRead> {
         let access = self.token("openid").await?;
         // The token and the grant it belongs to are taken together under the lock: a grant that
         // another sign-in, here or in another process, put in its place meanwhile is not the one
@@ -2746,12 +2773,14 @@ impl SignedInAccount {
                 if let Some(mut current) = self.read_grant()?
                     && current.grant_id == grant.grant_id
                 {
-                    if !stands() {
-                        return Ok(IdentityRead::Unread);
-                    }
                     current.email = identity.email;
                     current.name = identity.name;
-                    self.write_grant(&current)?;
+                    let Some(guard) = stands() else {
+                        return Ok(IdentityRead::Unread);
+                    };
+                    let written = self.write_grant(&current);
+                    drop(guard);
+                    written?;
                     self.publish();
                 }
                 Ok(IdentityRead::Read)
@@ -3436,7 +3465,7 @@ mod tests {
             Client::Desktop,
         );
         account
-            .commit(issued, grant.nonce(), || true)
+            .commit(issued, grant.nonce(), || Some(()))
             .await
             .expect("the grant is kept");
 
@@ -3612,7 +3641,7 @@ mod tests {
             client,
         );
         account
-            .commit(issued, grant.nonce(), || true)
+            .commit(issued, grant.nonce(), || Some(()))
             .await
             .expect("the grant is kept");
         account
