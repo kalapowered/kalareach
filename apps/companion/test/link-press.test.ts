@@ -970,6 +970,23 @@ describe('the end of a press at every pointer down', () => {
   })
 })
 
+describe('a button that a pointer adds while one of its buttons is down', () => {
+  const y = 328
+
+  it('is a move: it ends no press, and the look of a mouse press stays', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(links[3]?.[0], { clientX: 18, clientY: y, pointerType: 'mouse' }))
+    fire('pointermove', pointer(links[3]?.[0], { clientX: 18, clientY: y, pointerType: 'mouse', button: 2, buttons: 3 }))
+    expect(lives(), 'the mouse press after its right button was added').toBe(true)
+    expect(isLit(links[3]?.[0]), 'the look of the mouse press after its right button was added').toBe(true)
+    fire('pointerdown', pointer(texts[3], { clientY: y, pointerType: 'pen' }))
+    fire('pointermove', pointer(texts[3], { clientY: y, pointerType: 'pen', button: 2, buttons: 3 }))
+    expect(lives(), 'the pen press after its barrel was added').toBe(true)
+  })
+})
+
 describe('a touch’s or a pen’s press while the page’s selection is not collapsed', () => {
   // The first link of message 3 has its words at x 10 to 26 and y 320 to 337; the tap on plain text is 6 px before it.
   const y = 328
@@ -1032,6 +1049,47 @@ describe('a touch’s or a pen’s press while the page’s selection is not col
     fire('scroll', {} as Event)
     expect(lives(), 'the press after a scroll of 3 px').toBe(true)
     expect(isLit(links[3]?.[0]), 'the look after a scroll of 3 px').toBe(false)
+  })
+
+  it('does not light a press that the selection held back once the selection has gone: a scroll of 3 px gives no look, the press lives, and the click gives it', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100, 130)
+    for (const type of touchOrPen) {
+      selectRange(texts[1])
+      fire('pointerdown', pointer(links[3]?.[0], { ...own, pointerType: type }))
+      expect(isLit(links[3]?.[0]), `the look of a ${type} press with a selection in the page`).toBe(false)
+      document.getSelection()?.removeAllRanges()
+      fire('selectionchange', {} as Event)
+      expect(isLit(links[3]?.[0]), `the look of a ${type} press after the selection went`).toBe(false)
+      scrolled(3)
+      fire('scroll', {} as Event)
+      expect(lives(), `the ${type} press after a scroll of 3 px`).toBe(true)
+      expect(isLit(links[3]?.[0]), `the look of a ${type} press after a scroll of 3 px`).toBe(false)
+      scrolled(-3)
+      release(links[3]?.[0], own, { pointerType: type })
+      expect(isLit(links[3]?.[0]), `the look at the click of a ${type} press`).toBe(true)
+      fire('pointerdown', pointer(texts[1], { pointerId: 2, clientX: 300, clientY: 150 }))
+    }
+  })
+
+  it('keeps the look of a lit press through a scroll of 3 px, and ends the press and its look where a release would open nothing', () => {
+    const { pane, links } = conversation(6, 3)
+    start(pane)
+    clock(100)
+    for (const type of touchOrPen) {
+      fire('pointerdown', pointer(links[3]?.[0], { ...own, pointerType: type }))
+      expect(isLit(links[3]?.[0]), `the look of a ${type} press`).toBe(true)
+      scrolled(3)
+      fire('scroll', {} as Event)
+      expect(lives(), `the ${type} press after a scroll of 3 px`).toBe(true)
+      expect(isLit(links[3]?.[0]), `the look of a ${type} press after a scroll of 3 px`).toBe(true)
+      scrolled(200)
+      fire('scroll', {} as Event)
+      expect(lives(), `the ${type} press after a scroll of 203 px`).toBe(false)
+      expect(isLit(links[3]?.[0]), `the look of a ${type} press after a scroll of 203 px`).toBe(false)
+      scrolled(-203)
+    }
   })
 
   it('leaves a mouse press as it was: the look at the pointer down and at a selection that comes during it', () => {

@@ -1221,6 +1221,27 @@ test.describe('the end of a press at every pointer down', () => {
       expect(await pressedLooks(page), 'the pressed look after the release').toBe(0)
     })
 
+    test(`ends nothing when a mouse's right button is added to the press of its left button, which the engine reports as a move, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface, { only: TWO_LINKS })
+      const words = await pointOnWords(page, DOCS)
+      await page.evaluate(() => {
+        const seen = { downs: 0 }
+        ;(window as unknown as { chord: typeof seen }).chord = seen
+        document.addEventListener('pointerdown', () => (seen.downs += 1), true)
+      })
+      const downs = (): Promise<number> => page.evaluate(() => (window as unknown as { chord: { downs: number } }).chord.downs)
+      await page.mouse.move(words.x, words.y)
+      await page.mouse.down()
+      expect(await pressedLooks(page), 'the pressed look of the left button').toBe(1)
+      expect(await downs(), 'pointer downs after the left button').toBe(1)
+      await page.mouse.down({ button: 'right' })
+      expect(await downs(), 'pointer downs after the right button was added (the engine reports a move)').toBe(1)
+      expect(await pressedLooks(page), 'the pressed look after the right button was added').toBe(1)
+      await page.mouse.up({ button: 'right' })
+      await page.mouse.up()
+      expect(await pressedLooks(page), 'the pressed look after both buttons were released').toBe(0)
+    })
+
     test(`puts out the look of a held touch at a second finger, and nothing opens, on ${surface}`, async ({ page, browserName }) => {
       test.skip(browserName !== 'chromium', 'two touches are held through the Chromium protocol: WebKit has no tool for a second touch')
       await pressPage(page, surface, { only: TWO_LINKS })
@@ -1380,6 +1401,62 @@ test.describe('a touch’s or a pen’s press while the page’s selection is no
       expect(await pressedLooks(page), 'the pressed look of a mouse press with a selection in the page').toBe(1)
       await page.mouse.up()
       expect(await pressedLooks(page), 'the pressed look after the release').toBe(0)
+    })
+
+    test(`gives a press that the selection held back no look at a scroll of 3 px, whether the selection stands or has gone, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface, { only: longTwo() })
+      await pointOnWords(page, DOCS)
+      await selectAt(page, OTHER, 'range')
+      await pointerDownOn(page, { href: DOCS })
+      expect(await pressedLooks(page), 'the pressed look of a touch press with a selection in the page').toBe(0)
+      await scrollPaneBy(page, 3)
+      expect(await pressedLooks(page), 'the pressed look after a scroll of 3 px with the selection standing').toBe(0)
+      await selectAt(page, OTHER, 'none')
+      expect(await pressedLooks(page), 'the pressed look after the selection went').toBe(0)
+      await scrollPaneBy(page, -3)
+      expect(await pressedLooks(page), 'the pressed look after the selection went and the pane scrolled back by 3 px').toBe(0)
+    })
+
+    test(`keeps the look of a held press through a scroll of 3 px, a caret and no selection, and puts it out for a range, with a press that the page's script holds, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface, { only: longTwo() })
+      await pointOnWords(page, DOCS)
+      await pointerDownOn(page, { href: DOCS })
+      expect(await pressedLooks(page), 'the pressed look of a held touch press').toBe(1)
+      await scrollPaneBy(page, 3)
+      expect(await pressedLooks(page), 'the pressed look after a scroll of 3 px').toBe(1)
+      await scrollPaneBy(page, -3)
+      await selectAt(page, OTHER, 'caret')
+      expect(await pressedLooks(page), 'the pressed look after the selection became a caret').toBe(1)
+      await selectAt(page, OTHER, 'none')
+      expect(await pressedLooks(page), 'the pressed look after the selection went').toBe(1)
+      await selectAt(page, OTHER, 'range')
+      expect(await pressedLooks(page), 'the pressed look after a range came').toBe(0)
+      await scrollPaneBy(page, 3)
+      expect(await pressedLooks(page), 'the pressed look after a scroll of 3 px with the range standing').toBe(0)
+    })
+
+    test(`gives a held touch that the selection held back no look at a scroll of 3 px once the selection has gone, and the click gives it, on ${surface}`, async ({ page, browserName }) => {
+      test.skip(browserName !== 'chromium', 'the touch is held through the Chromium protocol: WebKit has no tool for a held touch')
+      await pressPage(page, surface, { only: longTwo() })
+      const words = await pointOnWords(page, DOCS)
+      const { session } = await touchSession(page)
+      const touch = (type: 'touchStart' | 'touchEnd'): Promise<unknown> =>
+        session.send('Input.dispatchTouchEvent', { type, touchPoints: type === 'touchStart' ? [{ x: words.x, y: words.y }] : [] })
+      await selectAt(page, OTHER, 'range')
+      const mark = await marked(page)
+      await touch('touchStart')
+      expect(await pressedLooks(page), 'the pressed look of a held touch with a selection in the page').toBe(0)
+      await selectAt(page, OTHER, 'none')
+      await scrollPaneBy(page, 3)
+      expect(await pressedLooks(page), 'the pressed look after the selection went and the pane scrolled by 3 px').toBe(0)
+      await touch('touchEnd')
+      const made = await recordedSince(page, mark, 5000)
+      expect(made.arrived, 'the browser’s click for the held touch').toBe(true)
+      expect(made.opened, 'links opened by the held touch').toEqual([DOCS])
+      expect(
+        made.clicks.filter((click) => click.phase === 'bubble' && click.trusted).map((click) => click.lit),
+        'the link lit at the click'
+      ).toEqual([DOCS])
     })
 
     test(`puts out the look of a held touch when a selection comes, does not give it back at a scroll of 3 px, and gives it at the browser's click, on ${surface}`, async ({ page, browserName }) => {

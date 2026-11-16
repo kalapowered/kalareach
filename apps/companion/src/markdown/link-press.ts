@@ -24,8 +24,10 @@
  *   outside it) and, for a touch or a pen only, a scroll of any box or of the visual viewport, or a
  *   resize of the viewport, after which a release at the press's point would open nothing
  *   (`releaseOpens`). At its death the record goes and the look ends at once, so a dead press opens
- *   nothing. Only a primary pointer's main button begins a press: a second finger, a pen's barrel and a
- *   mouse's other buttons end the press that is going on and begin none. The next pointer down is the
+ *   nothing. Only a primary pointer's main button begins a press: a second finger, and a pen's barrel or a
+ *   mouse's other button pressed while that pointer has no button down, end the press that is going on and
+ *   begin none. A button that a pointer adds while one of its buttons is down is a move, not a pointer
+ *   down, and ends the press only as any move does, past the slop. The next pointer down is the
  *   net for a press whose end never comes: iOS can take a touch for its own text selection and give the
  *   page that touch's pointer down alone, with no move, release or cancel after it, and WebKit then
  *   counts the touch as still down, so the next touch is not primary. A mouse's or a trackpad's record never
@@ -35,25 +37,27 @@
  *   the slop), lit again where it is back, and out at the release.
  * - A touch's or a pen's press and the page's selection. While the page's selection is not collapsed, a
  *   touch's or a pen's press lights nothing at its pointer down, on a link's own element too, and a live
- *   press's look goes out when such a selection appears; a scroll that leaves the press live does not give
- *   it back. The page's selection is read whole: the selected words are not tested against the press.
+ *   press's look goes out when such a selection appears; a scroll never lights a touch's or a pen's press,
+ *   so it does not give the look back. The page's selection is read whole: the selected words are not tested against the press.
  *   iOS selects the words under a held finger and sends no click at the release, and a drag that starts on
  *   that selection is the system's own: the page gets that drag's pointer down alone. The press lives on
  *   with its record, so a click that does come is decided as for any press, and its look comes at the
  *   click, as for a press on plain text, with the selection as it stands. A selection inside a text field
  *   leaves the page's selection collapsed and changes nothing, and a mouse's press is not changed. What
  *   this leaves: a touch that the system takes with no end, that went down on a link's own element while
- *   the selection was collapsed and makes none, keeps its look until the next pointer down, a scroll that
- *   moves the link from its point, the window's blur or the page's hiding. None is known. A selection that
- *   comes after the release leaves the look that the release holds until `LOOK_HOLD` ends it.
+ *   the selection was collapsed and makes none, keeps its look until the next pointer down, a scroll or a
+ *   resize after which a release at the press's point would open nothing, the window's blur or the page's
+ *   hiding. None is known. A selection that comes after the release leaves the look that the release
+ *   holds until `LOOK_HOLD` ends it.
  * - The look at the click. The pointer's type of the last primary press (in the pane or outside it) is kept apart from the
  *   record, so that the record's end does not clear it. At each trusted click in the pane the look is set
  *   to the link that `lookAt` gives and to no other: where the last press was a touch or a pen, the link
  *   the click names, or the link that `decide` opens from plain text; a lit link that the click does not
- *   open goes out. On plain text near a link the look therefore comes at the click, on the link that opens,
- *   and a press on a link's own element keeps the look it got at the pointer down (none, for a touch or a
- *   pen while the page's selection is not collapsed: its click gives it). A touch's or a
- *   pen's look ends `LOOK_HOLD` after the click, or after a release that gets no click, and at once at any
+ *   open goes out. On plain text near a link the look therefore comes at the click, on the link that opens.
+ *   A touch's or a pen's press on a link's own element has the look it got at the pointer down until its
+ *   click, which sets the look to that link again where the press got none (the page's selection held it
+ *   back) or lost it (a selection came during the press). A touch's or a pen's look ends `LOOK_HOLD`
+ *   after the click, or after a release that gets no click, and at once at any
  *   end of the handler and at the next pointer down. It has no motion. The click that this handler makes inside
  *   the first one is untrusted and leaves the look as the first one set it.
  * - The open at the click runs the same rule at the press's own point, so for a touch or a pen the link
@@ -193,9 +197,10 @@ export function startLinkPress(element: HTMLElement): () => void {
   }
   // The scroll of any box (scroll events do not bubble, so the capture phase on the document hears them
   // all) and the visual viewport's scroll and resize move the page under a held pointer. A touch's or a pen's
-  // press is kept, with its look if it has one, only where a release would still open the link it names
-  // (`releaseOpens`), and ends otherwise. A mouse's or a trackpad's look is lit or put out by the same answer,
-  // as at a move.
+  // press is kept only where a release would still open the link it names (`releaseOpens`), and ends otherwise;
+  // a scroll leaves its look as it is, the look it has or none, and never lights it: the look of a touch or a pen
+  // is given at the pointer down and at the click alone, and the page's selection may have held it back or put it
+  // out. A mouse's or a trackpad's look is lit or put out by the same answer, as at a move.
   const recheck = (): void => {
     if (press === null) return
     const opens = releaseOpens(element, press)
@@ -204,7 +209,7 @@ export function startLinkPress(element: HTMLElement): () => void {
     // lives on, and its look follows the pointer as at a move, out where a release would open nothing, lit again
     // where the pointer is back. Only a press on the link's own element has a look.
     if (!opens && opensByRule(press.pointerType)) die()
-    else if (press.own) light(opens && !withheld(press.pointerType) ? press.start.link : null)
+    else if (press.own && !opensByRule(press.pointerType)) light(opens ? press.start.link : null)
   }
   // A selection that is not collapsed puts out the look of a touch or a pen that is down. The press and its record
   // stay: a click that does come is decided as for any press, and its look comes at the click.
@@ -254,7 +259,8 @@ export function startLinkPress(element: HTMLElement): () => void {
   const down = (event: PointerEvent): void => {
     // Every pointer down ends the press that is going on, in the pane or outside it, before the test of
     // whether it begins one: the next touch after one that the system took is not primary, and a second
-    // finger, a pen's barrel and a mouse's other buttons end a press too.
+    // finger, a pen's barrel and a mouse's other button pressed with no button down end a press too. A button
+    // added to a pointer that has one down is a move: it ends nothing here.
     die()
     // Only a primary pointer's main button begins a press, and only it sets the pointer type that the
     // click reads.
