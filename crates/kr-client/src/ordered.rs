@@ -25,7 +25,9 @@ use crate::error::ClientError;
 
 /// How a session's control stream ended, as the reader read it.
 pub enum Ended {
-    /// The host finished its side of the stream and sent nothing more.
+    /// The host finished its side of the stream and sent nothing more, or the owner closed or
+    /// dropped the session, which is how the reader tells the owner's own close: the owner asked
+    /// for it, so it is no failure.
     Finished,
     /// Reading the stream failed: the transport's own failure.
     Failed(ClientError),
@@ -54,8 +56,10 @@ pub struct OrderedEvents {
 
 impl OrderedEvents {
     /// Waits for the next item. The end of the session's reading is the [`Ordered::Ended`] item,
-    /// and nothing comes after it. The result is none only once the session has been dropped and
-    /// the channel is drained.
+    /// and the result is none right after it: the channel ends with the reader, whether or not the
+    /// session, a lane or an answer that still holds the session's state lives. Closing or
+    /// dropping the session loses none of what the reader had taken before: each notification,
+    /// the end and then none still arrive, in that order.
     pub async fn recv(&mut self) -> Option<Ordered> {
         self.receiver.recv().await
     }

@@ -708,9 +708,6 @@ struct SessionState {
     /// other. Two locks would let a snapshot fall between the two writes and carry neither.
     outcomes: Mutex<Outcomes>,
     events: broadcast::Sender<Notification>,
-    /// Where the reader hands every notification, in order, when the session was started for an
-    /// ordered delivery ([`Session::start_ordered`]).
-    ordered: Option<crate::ordered::OrderedSender>,
     /// True once the connection has ended, which a holder of the session may wait for.
     ended: tokio::sync::watch::Sender<bool>,
     /// Raised each time the host answers a request on the connection with a word that
@@ -764,7 +761,13 @@ pub struct Session {
     /// The next request identifier, shared with the lanes that send on data streams of this
     /// connection.
     next_request_id: Arc<AtomicU64>,
-    reader: tokio::task::JoinHandle<()>,
+    /// Raised by the owner's close or drop, before the transport is closed: the reader stops
+    /// reading, and reads a failure of the transport that comes after it as the close.
+    stop: tokio::sync::watch::Sender<bool>,
+    /// The reader of a session that is not ordered, which the owner's close aborts. The reader of
+    /// an ordered session is not held: it may hold a notification or an end that its owner has
+    /// still to take, and it ends itself, once that is delivered.
+    reader: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// The identity the next session started in this process takes.
@@ -846,20 +849,28 @@ impl Session {
             cursors: Mutex::new(cursors),
             outcomes: Mutex::new(Outcomes::default()),
             events,
-            ordered,
             ended: tokio::sync::watch::channel(false).0,
             in_doubt: tokio::sync::Notify::new(),
             unsignalled: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             outstanding: AtomicU64::new(0),
             max_outstanding: limits.max_outstanding_mutations.get(),
         });
-        let reader = tokio::spawn(read_loop(Arc::clone(&transport), Arc::clone(&state)));
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let delivers_in_order = ordered.is_some();
+        let reader = tokio::spawn(read_loop(
+            Arc::clone(&transport),
+            Arc::clone(&state),
+            ordered,
+            stopped,
+        ));
         Ok(Self {
             id: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
             transport,
             state,
             next_request_id: Arc::new(AtomicU64::new(1)),
-            reader,
+            stop,
+            // An ordered reader is left to end itself, as the field says.
+            reader: (!delivers_in_order).then_some(reader),
         })
     }
 
@@ -1921,10 +1932,26 @@ impl Session {
     ///
     /// The transition is synchronous, so a caller that drops this future still leaves the session
     /// ended and every waiter woken.
+    ///
+    /// The reader reads nothing more, and this returns at once. The owner of an ordered delivery
+    /// ([`Session::start_ordered`]) still gets everything the reader had already taken from the
+    /// connection, in order: each notification, then the end, with the cause the reader had read
+    /// ([`crate::ordered::Ended`]), or as [`crate::ordered::Ended::Finished`] when it had read none,
+    /// and then the channel's end. Dropping the session does the same.
     pub fn close(&self) {
+        self.stop_reading();
+    }
+
+    /// Stops the reader, ends the session and closes the connection.
+    fn stop_reading(&self) {
+        // The signal comes first, so that a reader that finds the transport failing because of the
+        // close below has already been told that the owner closed it.
+        self.stop.send_replace(true);
         self.transport.close();
         self.state.end();
-        self.reader.abort();
+        if let Some(reader) = &self.reader {
+            reader.abort();
+        }
     }
 
     fn register(&self, request_id: RequestId) -> Result<Waiter> {
@@ -1940,9 +1967,7 @@ impl Drop for Session {
     fn drop(&mut self) {
         // A dropped session ends its connection. Leaving it open would hold the transport, its
         // streams and its queued traffic with nothing left to read or answer them.
-        self.transport.close();
-        self.state.end();
-        self.reader.abort();
+        self.stop_reading();
     }
 }
 
@@ -1999,14 +2024,31 @@ impl Drop for Waiter {
 }
 
 /// Reads the control stream until it ends, routing what arrives.
-async fn read_loop(transport: Arc<dyn ControlTransport>, state: Arc<SessionState>) {
+///
+/// `ordered` is where an ordered delivery's notifications and end go; it belongs to this task and
+/// to no state that a lane or an answer shares, so the channel ends when this task does. `stopped`
+/// is raised by the owner's close or drop. It stops the reading and nothing else: a notification or
+/// an end that this task already holds is delivered, whatever the owner did after it was read.
+async fn read_loop(
+    transport: Arc<dyn ControlTransport>,
+    state: Arc<SessionState>,
+    ordered: Option<crate::ordered::OrderedSender>,
+    mut stopped: tokio::sync::watch::Receiver<bool>,
+) {
     let ended = loop {
-        let frame = match transport.recv().await {
+        let read = tokio::select! {
+            biased;
+            () = until_raised(&mut stopped) => break Ended::Finished,
+            read = transport.recv() => read,
+        };
+        let frame = match read {
             Ok(Some(frame)) => frame,
             Ok(None) => break Ended::Finished,
+            // A read that fails after the owner closed the session failed because of the close.
+            Err(_) if *stopped.borrow() => break Ended::Finished,
             Err(error) => break Ended::Failed(error),
         };
-        if !route(&state, frame).await {
+        if !route(&state, frame, ordered.as_ref()).await {
             // The host's refusal of the connection is recorded before the reader stops on it; a
             // frame a client may not receive records nothing.
             let refusal = state.waiters().refusal.clone();
@@ -2018,10 +2060,17 @@ async fn read_loop(transport: Arc<dyn ControlTransport>, state: Arc<SessionState
     // connection nothing is reading. Every waiter learns that its answer is not coming.
     transport.close();
     state.end();
-    // Told last, behind every notification the owner of an ordered delivery was handed.
-    if let Some(ordered) = &state.ordered {
+    // Told last, behind every notification the owner of an ordered delivery was handed. This waits
+    // for room in the owner's channel and holds no lock; it ends when the owner has taken the item
+    // or has dropped its end. The channel ends when `ordered` is dropped here.
+    if let Some(ordered) = ordered {
         ordered.end(ended).await;
     }
+}
+
+/// Resolves once the owner has closed or dropped the session.
+async fn until_raised(stopped: &mut tokio::sync::watch::Receiver<bool>) {
+    let _ = stopped.wait_for(|stop| *stop).await;
 }
 
 /// What a host's refusal of a mutation is, given the action the mutation carried.
@@ -2108,7 +2157,11 @@ async fn refused_by_the_host(
 /// if the receiver then refuses it: a host that sent a client a worker's startup handshake is not
 /// a host this client understands, and carrying on would mean deciding, frame by frame, which of
 /// its messages to believe.
-async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
+async fn route(
+    state: &Arc<SessionState>,
+    frame: ControlFrame,
+    ordered: Option<&crate::ordered::OrderedSender>,
+) -> bool {
     match frame {
         ControlFrame::Response(response) => {
             let request_id = response.request_id;
@@ -2166,7 +2219,7 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
             // is not: a subscriber that already applied it would apply it twice.
             let delivery = state.cursors.lock().await.accept(&notification);
             let broadcast = delivery != Delivery::Duplicate;
-            match &state.ordered {
+            match ordered {
                 None => {
                     if broadcast {
                         let _ = state.events.send(notification);
