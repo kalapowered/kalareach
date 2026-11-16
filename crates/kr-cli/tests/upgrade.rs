@@ -1153,7 +1153,11 @@ async fn the_frames_the_controller_sends_on_its_own_are_read_by_the_worker_of_th
         .expect("the session is published");
     let endpoint = kr_ipc::paths::Endpoint::from_path(&descriptor.endpoint).expect("an endpoint");
     let opened = kr_crypto::store::StoreSelection::File
-        .open(CONTROLLER_SECRET_SERVICE, &environment.secrets_dir())
+        .open(
+            CONTROLLER_SECRET_SERVICE,
+            &environment.secrets_dir(),
+            kr_crypto::store::KeyOwner::Host,
+        )
         .expect("the host's secrets");
     let identity = ControllerIdentity::load(opened.store.as_ref(), environment.environment_id())
         .expect("the host's own identity");

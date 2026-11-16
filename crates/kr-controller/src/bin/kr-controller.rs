@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
-use kr_crypto::store::StoreSelection;
+use kr_crypto::store::{KeyOwner, StoreSelection};
 use kr_ipc::endpoint::Listener;
 use kr_ipc::install::Running;
 use kr_ipc::paths::HostPaths;
@@ -222,7 +222,7 @@ async fn run(
     let selection = StoreSelection::from(arguments.secret_store);
     let open_identity = move || -> kr_controller::Result<ControllerIdentity> {
         let store = selection
-            .open(CONTROLLER_SECRET_SERVICE, &secrets_dir)
+            .open(CONTROLLER_SECRET_SERVICE, &secrets_dir, KeyOwner::Host)
             .map_err(|error| kr_controller::ControllerError::NotConfigured(error.to_string()))?;
         // Named in the daemon's own output, so a run's log says where its keys went rather than
         // leaving it to be worked out from the command line that started it.

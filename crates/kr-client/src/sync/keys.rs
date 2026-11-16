@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex};
 
 use kr_crypto::envelope::{open_sync_object, seal_sync_object};
 use kr_crypto::secret::{Secret, SymmetricKey};
-use kr_crypto::store::{OpenedStore, SecretName, SecretStore, StoreSelection};
+use kr_crypto::store::{KeyOwner, OpenedStore, SecretName, SecretStore, StoreSelection};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::sync::SealedSyncObject;
 
@@ -232,7 +232,7 @@ impl StoredCollectionKeys {
         scope: &str,
     ) -> Result<Self> {
         let opened = selection
-            .open(service, directory)
+            .open(service, directory, KeyOwner::Device)
             .map_err(|error| sealing_failed(&error))?;
         Ok(Self::of(opened, scope))
     }
@@ -928,7 +928,11 @@ mod tests {
         let parent = tempfile::tempdir().expect("a place for one");
         let directory = parent.path().join("secrets");
         let opened = StoreSelection::File
-            .open("kalareach-collection-keys-test", &directory)
+            .open(
+                "kalareach-collection-keys-test",
+                &directory,
+                KeyOwner::Device,
+            )
             .expect("a store");
 
         // 31 bytes under the name a collection key is kept at: a truncated write, a partly
