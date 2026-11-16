@@ -28,7 +28,8 @@ use iroh::endpoint::{
     RelayStatus, VarInt, presets,
 };
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr, Watcher,
+    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr,
+    Watcher,
 };
 use iroh_mainline_address_lookup::DhtAddressLookup;
 use iroh_mdns_address_lookup::MdnsAddressLookup;
@@ -126,8 +127,27 @@ async fn bind(
     accept: bool,
     name_server: Option<std::net::SocketAddr>,
 ) -> Result<Endpoint> {
+    bind_sharing_map(config, identity, accept, name_server)
+        .await
+        .map(|(endpoint, _)| endpoint)
+}
+
+/// Builds the endpoint, as [`bind`] does, and returns with it the relay map that it was given.
+///
+/// A relay map is a shared handle: the endpoint holds the very map that this returns, so an entry
+/// put into it or taken out of it is what the endpoint's relay transport sees, and the endpoint's
+/// own `insert_relay` and `remove_relay` write to it. The library has no accessor that returns the
+/// map of a bound endpoint, so this is how the device endpoint reads the map that it manages.
+pub(crate) async fn bind_sharing_map(
+    config: &EndpointConfig,
+    identity: &TransportIdentityKeyPair,
+    accept: bool,
+    name_server: Option<std::net::SocketAddr>,
+) -> Result<(Endpoint, RelayMap)> {
     let seed = identity.export_endpoint_seed();
     let secret_key = SecretKey::from_bytes(seed.expose());
+    let mode = relay_mode(config);
+    let relay_map = mode.relay_map();
     let mut builder = Endpoint::builder(presets::Minimal)
         .secret_key(secret_key)
         .transport_config(transport_config(if accept {
@@ -135,7 +155,7 @@ async fn bind(
         } else {
             0
         }))
-        .relay_mode(relay_mode(config))
+        .relay_mode(mode)
         // This endpoint keeps no TLS session tickets, so it never offers QUIC 0-RTT to anyone.
         // Version 1 accepts no application mutation in 0-RTT, and the simplest way not to send
         // early data is to have nothing to resume from.
@@ -195,10 +215,11 @@ async fn bind(
         // path. Every packet then goes through the selected relay, because there is nothing else.
         builder = builder.clear_ip_transports();
     }
-    builder
+    let endpoint = builder
         .bind()
         .await
-        .map_err(|error| TransportError::Bind(error.to_string()))
+        .map_err(|error| TransportError::Bind(error.to_string()))?;
+    Ok((endpoint, relay_map))
 }
 
 /// Opens a connection to `peer`, and names the relay that could not be used when that is why no

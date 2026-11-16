@@ -56,6 +56,7 @@ pub mod clock;
 pub mod codec;
 pub mod config;
 pub mod deadlines;
+pub mod dialler;
 pub mod endpoint;
 pub mod error;
 pub mod handshake;

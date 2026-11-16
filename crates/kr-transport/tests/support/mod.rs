@@ -9,6 +9,7 @@
 pub mod conditions;
 pub mod dns;
 pub mod front;
+pub mod gate;
 pub mod pkarr;
 pub mod proxy;
 pub mod tls;
@@ -216,6 +217,9 @@ pub fn direct_addr(side: &Side) -> EndpointAddr {
 pub struct LocalRelay {
     pub url: iroh::RelayUrl,
     pub ca_roots: Vec<Vec<u8>>,
+    /// What the relay admitted and what it turned away: it admits every endpoint until a test
+    /// refuses one.
+    pub gate: gate::Gate,
     _server: iroh_relay::server::Server,
 }
 
@@ -234,9 +238,11 @@ impl LocalRelay {
             (Ipv4Addr::LOCALHOST, 0),
             CertConfig::Manual { server_config },
         );
+        let gate = gate::Gate::default();
         let mut relay = RelayServerConfig::new((Ipv4Addr::LOCALHOST, 0));
         relay.tls = Some(tls);
         relay.key_cache_capacity = Some(1024);
+        relay.access = Arc::new(gate.clone());
 
         let mut config = ServerConfig::default();
         config.relay = Some(relay);
@@ -249,6 +255,7 @@ impl LocalRelay {
         Self {
             url,
             ca_roots: certs.into_iter().map(|cert| cert.to_vec()).collect(),
+            gate,
             _server: server,
         }
     }
