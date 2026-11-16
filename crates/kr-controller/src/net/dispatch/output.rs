@@ -645,20 +645,37 @@ impl RemoteOutput {
             self.withdraw();
             return Written::Withdrawn;
         }
-        let bounds_hold_now = || {
-            !(answers != Answers::Nothing
+        // The feed's refusal is the last read that takes a lock: the connection table's read lock
+        // and the connection's shares lock, which a withdrawal or a commit can hold. Nothing that
+        // is asked after it takes one.
+        let feed_refuses = || {
+            answers != Answers::Nothing
                 && self
                     .authority
                     .controller
                     .feed_refusal_on(self.authority.connection_id)
-                    .is_some())
-                && self.kept_answer_stands(kept_standing)
+                    .is_some()
+        };
+        // What stands at the stream, asked in one place and reading atomics and clocks alone: the
+        // standing a kept answer or a conflict was admitted under (the fence this host owes, the
+        // revision in force and the connection's latch), every bound the answer is written under
+        // and the decision a relayed batch rides on.
+        let kept = kept_standing.map(|admitted_revision| {
+            self.authority.controller.footing_of_a_network_request(
+                self.authority.connection_id,
+                admitted_revision,
+                &self.authority.latch,
+            )
+        });
+        let standing = || {
+            kept.as_ref()
+                .is_none_or(|footing| footing.ask(crate::service::Ask::KEPT_ANSWER).is_ok())
                 && bounds_hold(&self.authority.controller, under, HeldBound::stands_at)
                 && relaying
                     .as_ref()
                     .is_none_or(|relaying| relaying.grant.holds(&self.authority.controller))
         };
-        let decided = || bounds_hold_now() && read_under.is_none_or(ReadUnder::stands);
+        let decided = || !feed_refuses() && standing() && read_under.is_none_or(ReadUnder::stands);
         if !decided() {
             return Written::Undecided;
         }
@@ -676,11 +693,18 @@ impl RemoteOutput {
                 },
                 None => None,
             };
-            // The fence reads no lock, and the bounds read several (the connection table, the
-            // shares, the fence this host owes), which a withdrawal or a commit can hold. The bounds
-            // leave the grant's own expiry out, so the fence is read again after them: the last
-            // ask before the bytes are handed over.
-            let admitted = self.fence() && bounds_hold_now() && self.fence();
+            // The first fence is the early ask. The feed's refusal takes locks and is read next,
+            // and it is the last read that does. What stands after it is asked once, reading
+            // atomics and clocks alone, and the grant's own expiry, which the bounds leave out, is
+            // read after that: the last ask before the bytes are handed over.
+            let admitted = self.fence()
+                && !feed_refuses()
+                && {
+                    #[cfg(feature = "testing")]
+                    self.authority.controller.after_the_feed_is_read.wait();
+                    standing()
+                }
+                && self.fence();
             if admitted {
                 begun.store(true, Ordering::Release);
                 attempt();
@@ -753,26 +777,6 @@ impl RemoteOutput {
         if let Some(waiting) = waiting {
             let _ = waiting.send(());
         }
-    }
-
-    /// Whether the standing an answer read from a record was checked under still holds: the fence
-    /// this host owes and the registration at the revision the request was admitted under, asked
-    /// as the kept answer's own check asks them. Any other answer stands.
-    ///
-    /// Asked inside the poll that hands bytes to the stream, so the last ask before the transport
-    /// takes a byte is made after every wait of the write: the turn, the stream's room and the
-    /// reader's pace. After that ask the bytes are the transport's and no later ask exists.
-    fn kept_answer_stands(&self, standing: Option<AuthorityRevision>) -> bool {
-        standing.is_none_or(|admitted_revision| {
-            self.authority
-                .controller
-                .check_retained_under(&crate::authority::AdmittedMutation {
-                    connection_id: self.authority.connection_id,
-                    admitted_revision,
-                    deadline: None,
-                })
-                .is_ok()
-        })
     }
 
     /// Returns whether a byte of a frame may go on this connection at this instant.
