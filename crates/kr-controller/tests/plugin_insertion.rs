@@ -7,8 +7,6 @@
 //! the worker reads and claims them over the daemon's rendezvous endpoint, as it does in the
 //! product. Nothing else is played.
 
-#![cfg(unix)]
-
 use std::sync::Arc;
 
 use kr_protocol::envelope::Outcome;
@@ -25,7 +23,7 @@ use plugin_world::acting::{
     Acting, Change, Upstream, answer, ask_for_receipt, contribution, read_receipt,
     receipt_answered, send, supersede, until_receipt, until_settled,
 };
-use plugin_world::{PATIENCE, kill, until};
+use plugin_world::{PATIENCE, client_goes, kill, until};
 
 /// The state of one binding of a draft.
 fn state_of(draft: &DraftRecord, handle: &AttachmentHandle) -> InsertionState {
@@ -1041,8 +1039,30 @@ fn cancellation(
     cancel
 }
 
+/// The client ends what it sends and stays to read: a socket can, and a pipe cannot.
+#[cfg(unix)]
+fn ends_what_it_sends(client: &mut kr_ipc::client::LocalClient) {
+    client
+        .writer()
+        .shut_down(std::net::Shutdown::Write)
+        .expect("ends what the client sends");
+}
+
+/// The cases that end what the client sends are Unix's, so nothing reaches this on another platform.
+#[cfg(not(unix))]
+fn ends_what_it_sends(_client: &mut kr_ipc::client::LocalClient) {
+    unreachable!("only a socket ends what it sends and stays to read");
+}
+
 /// How the client of an offer behaves while the connection's loop is held.
 #[derive(Clone, Copy)]
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "the cases that end what the client sends are Unix's"
+    )
+)]
 enum Client {
     /// It closes its connection. Where the system says so, the worker's next write to it fails.
     Closed,
@@ -1083,6 +1103,8 @@ async fn kr_req_23_30_an_offer_claimed_when_its_connection_ends_is_rejected_and_
 /// back to its choice with the finished preparation waiting and the end of the stream not yet read.
 /// The loop takes the preparation first, which it may at random: the end is found all the same, as
 /// the reader finds it, and the action is not dispatched on a connection that is over.
+// Ends what the client sends and leaves it reading, which a socket does and a pipe cannot.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_an_offer_claimed_when_its_client_has_ended_its_stream_is_rejected_and_its_claim_settled()
  {
@@ -1095,6 +1117,8 @@ async fn kr_req_23_30_an_offer_claimed_when_its_client_has_ended_its_stream_is_r
 /// The question and the end are both unread when the loop comes back to its choice, and it takes
 /// the finished preparation first, which it may at random. The question is answered before the
 /// offer's fate is decided, and the end is found once the question has been read.
+// Ends what the client sends and leaves it reading, which a socket does and a pipe cannot.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_an_offer_whose_client_asked_about_it_and_then_went_is_rejected_after_the_answer()
  {
@@ -1129,6 +1153,8 @@ async fn kr_req_23_30_an_offer_held_for_a_question_is_dispatched_when_its_client
 /// The cancellation and the end are both unread when the loop comes back to its choice, and it
 /// takes the finished preparation first, which it may at random. The cancellation is acted on
 /// before the offer is dispatched: the client said so before it went.
+// Ends what the client sends and leaves it reading, which a socket does and a pipe cannot.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_an_offer_cancelled_by_a_client_that_then_went_is_not_dispatched() {
     an_offer_while_its_client(Client::CancelledThenEnded).await;
@@ -1181,40 +1207,25 @@ async fn an_offer_while_its_client(how: Client) {
     })
     .await;
 
-    // The client goes, and the loop is let go to find it so. Closing the client's end is not
-    // enough to end the connection when a process that another case of this file has started holds
-    // a copy of the descriptor until it executes, so the socket is shut down first.
+    // The client goes, and the loop is let go to find it so.
     let mut staying = match how {
         Client::Closed => {
-            asking
-                .writer()
-                .shut_down(std::net::Shutdown::Both)
-                .expect("shuts the client's socket down");
-            drop(asking);
+            drop(client_goes(asking));
             None
         }
         Client::Ended => {
-            asking
-                .writer()
-                .shut_down(std::net::Shutdown::Write)
-                .expect("ends what the client sends");
+            ends_what_it_sends(&mut asking);
             Some(asking)
         }
         Client::AskedThenEnded => {
             ask_for_receipt(&mut asking, action_id).await;
-            asking
-                .writer()
-                .shut_down(std::net::Shutdown::Write)
-                .expect("ends what the client sends");
+            ends_what_it_sends(&mut asking);
             Some(asking)
         }
         Client::CancelledThenEnded => {
             let cancel = cancellation(&acting, &asking, action_id);
             write(&mut asking, cancel).await;
-            asking
-                .writer()
-                .shut_down(std::net::Shutdown::Write)
-                .expect("ends what the client sends");
+            ends_what_it_sends(&mut asking);
             Some(asking)
         }
         Client::AskedAndStayed => {
@@ -1635,7 +1646,15 @@ async fn kr_req_24_09_a_staged_file_that_is_not_what_the_frame_says_is_refused_b
     let staged = staged_file(&acting, &handle);
     let original = std::fs::read(&staged).expect("reads the staged file");
     let mut permissions = std::fs::metadata(&staged).expect("metadata").permissions();
+    // The file is made writable: by its mode on Unix, by its read-only attribute on Windows.
+    #[cfg(unix)]
     std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o600);
+    #[cfg(not(unix))]
+    #[allow(
+        clippy::permissions_set_readonly_false,
+        reason = "off Unix it clears the attribute and nothing else"
+    )]
+    permissions.set_readonly(false);
     std::fs::set_permissions(&staged, permissions).expect("the test may write the file");
     std::fs::write(&staged, vec![0xff; original.len()]).expect("corrupts the file");
 

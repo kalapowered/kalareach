@@ -12,8 +12,6 @@
 //! Where the test components are not built the cases skip with words, and fail when
 //! `KR_REQUIRE_PLUGIN_FIXTURES=1` is set, which is what the fixture's own cases do.
 
-#![cfg(unix)]
-
 mod plugin_world;
 
 use std::sync::Arc;
@@ -221,19 +219,13 @@ async fn waiting_for_the_boundary(hold: Hold, before: Before) -> Option<Waiting>
 }
 
 impl Waiting {
-    /// The client that sent the action goes. Its socket is shut down first: closing the client's end
-    /// is not enough to end the connection when a process that another case has started holds a
-    /// copy of the descriptor until it executes.
-    async fn client_goes(&mut self, how: Goes) -> LocalClient {
+    /// The client that sent the action goes, as the fixture's `client_goes` has a client go.
+    async fn client_goes(&mut self, how: Goes) -> Option<LocalClient> {
         let mut asking = self.asking.take().expect("the client is still there");
         if matches!(how, Goes::BehindAFrame) {
             ask_for_receipt(&mut asking, self.action_id).await;
         }
-        asking
-            .writer()
-            .shut_down(std::net::Shutdown::Both)
-            .expect("shuts the client's socket down");
-        asking
+        plugin_world::client_goes(asking)
     }
 
     /// Waits until the connection of the client that went is given back, while the locks are held.

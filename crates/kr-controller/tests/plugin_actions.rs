@@ -14,8 +14,6 @@
 //! in the component keeps the plugin host's replies back; every wait is for a condition the
 //! product reaches.
 
-#![cfg(unix)]
-
 use std::sync::Arc;
 use std::time::Duration;
 
