@@ -1,0 +1,139 @@
+# Every place that makes a value of the local protocol's error, read by error_makers.rs.
+# Columns: file | owner (impl type and function) | variant | n (times made there) | what makes it there | source | control | function
+#   what: own (this side's own check, file or directory operation) | arrived (a frame or a reply that arrived) | connect (the socket at a
+#         connect) | stream (the socket on a connected stream) | conversion (a From impl or #[from])
+#   source: the failure's true source: reply | closure | own | closure+own (two makers of one row differ: the note names them)
+#   control: where a control connection of a command can return it: connect, greeting, request (joined by +); - where it cannot
+#   function: whether comes_from gives that source for the variant: agrees | differs | by-kind (the source depends on the socket's kind)
+crates/kr-cli/src/export.rs | refuse_existing | Io | 1 | own | own | - | agrees
+crates/kr-cli/src/export.rs | write | Io | 1 | own | own | - | agrees
+crates/kr-cli/src/service_manager.rs | install | Io | 1 | own | own | - | agrees
+crates/kr-cli/src/service_manager.rs | remove | Io | 2 | own | own | - | agrees
+crates/kr-cli/src/share.rs | ask_again | UnexpectedMessage | 2 | arrived | reply | - | agrees
+crates/kr-cli/src/share.rs | sent_within | UnexpectedMessage | 1 | arrived | reply | - | agrees
+crates/kr-cli/src/startup.rs | Log::from_file | Io | 1 | own | own | - | agrees
+crates/kr-cli/src/startup.rs | Log::open | Io | 1 | own | own | - | agrees
+crates/kr-cli/src/startup.rs | Log::output | Io | 1 | own | own | - | agrees
+crates/kr-client/src/pairing/clock.rs | write_record | Io | 1 | own | own | - | agrees
+crates/kr-controller/src/attempt.rs | Marker::write | Io | 1 | own | own | - | agrees
+crates/kr-controller/src/net/proxy.rs | WorkerProxy::call | UnexpectedMessage | 1 | arrived | reply | - | agrees
+crates/kr-controller/src/service/attention_reach.rs | Controller::connect_role | Socket | 1 | connect | closure+own | - | by-kind
+crates/kr-controller/src/service/rendezvous.rs | Controller::rendezvous_claim | Frame | 1 | arrived | closure | - | agrees
+crates/kr-controller/src/singleton.rs | SingletonLock::holder | Io | 1 | own | own | - | agrees
+crates/kr-controller/src/singleton.rs | SingletonLock::not_locked | Io | 1 | own | own | - | agrees
+crates/kr-controller/src/singleton.rs | SingletonLock::not_opened | Io | 1 | own | own | - | agrees
+crates/kr-controller/src/singleton.rs | SingletonLock::open | Io | 1 | own | own | - | agrees
+crates/kr-controller/src/singleton.rs | SingletonLock::record_holder | Io | 1 | own | own | - | agrees
+crates/kr-ipc/src/client.rs | BoundLink::connecting | IdentityUnavailable | 1 | arrived | reply | - | differs   # a worker's refusal of the controller's link
+crates/kr-ipc/src/client.rs | BoundLink::connecting | OutsideLevel | 2 | own | own | - | agrees   # worker link
+crates/kr-ipc/src/client.rs | BoundLink::connecting | UnexpectedMessage | 1 | arrived | reply | - | agrees   # worker link
+crates/kr-ipc/src/client.rs | Client::acknowledged | IdentityUnavailable | 1 | arrived | reply | - | differs   # a worker's refusal
+crates/kr-ipc/src/client.rs | Client::acknowledged | UnexpectedMessage | 1 | arrived | reply | - | agrees   # worker link
+crates/kr-ipc/src/client.rs | Client::await_response | LinkFenced | 1 | arrived | reply | request | differs   # a worker's refusal of the controller's link, a complete reply
+crates/kr-ipc/src/client.rs | Client::await_response | UnexpectedMessage | 1 | arrived | reply | request | agrees
+crates/kr-ipc/src/client.rs | Client::challenge_worker | UnexpectedMessage | 1 | arrived | reply | - | agrees   # worker link
+crates/kr-ipc/src/client.rs | Client::exchange_admissions | IdentityUnavailable | 2 | arrived | reply | - | differs   # a worker's refusal
+crates/kr-ipc/src/client.rs | Client::exchange_admissions | UnexpectedMessage | 2 | arrived | reply | - | agrees   # worker link
+crates/kr-ipc/src/client.rs | Client::forward_for | RightNotForwarded | 1 | own | own | - | agrees   # worker link
+crates/kr-ipc/src/client.rs | Client::hold | Socket | 1 | own | own | request | agrees   # this side's bound on what the host pushed while a call was outstanding
+crates/kr-ipc/src/client.rs | Client::present_generation | IdentityUnavailable | 1 | arrived | reply | - | differs   # a worker's refusal
+crates/kr-ipc/src/client.rs | Client::present_generation | UnexpectedMessage | 2 | arrived | reply | - | agrees   # worker link
+crates/kr-ipc/src/client.rs | Client::verify_worker | UnexpectedMessage | 1 | arrived | reply | - | agrees   # worker link
+crates/kr-ipc/src/client.rs | LocalClient::connect_listing | UnexpectedMessage | 1 | own | own | - | differs   # made before any connection, for a link kind that no control connection of a command has
+crates/kr-ipc/src/client.rs | LocalClient::connecting | UnexpectedMessage | 1 | own | own | - | differs   # made before any connection, for a link kind that no control connection of a command has
+crates/kr-ipc/src/client.rs | hello | HostRefused | 1 | arrived | reply | greeting | agrees
+crates/kr-ipc/src/client.rs | hello | UnexpectedMessage | 1 | arrived | reply | greeting | agrees
+crates/kr-ipc/src/client.rs | hello | VersionMismatch | 1 | arrived | reply | greeting | agrees
+crates/kr-ipc/src/client.rs | retained_level | UnretainedLevel | 1 | own | own | - | agrees   # worker link
+crates/kr-ipc/src/descriptor.rs | DescriptorDirectory::entries | Io | 4 | own | own | - | agrees
+crates/kr-ipc/src/descriptor.rs | DescriptorDirectory::open | DirectoryAccessRefused | 1 | own | own | - | agrees
+crates/kr-ipc/src/descriptor.rs | DescriptorDirectory::open | Io | 5 | own | own | - | agrees
+crates/kr-ipc/src/descriptor.rs | DescriptorDirectory::open | UntrustedFile | 5 | own | own | - | agrees
+crates/kr-ipc/src/descriptor.rs | DescriptorDirectory::open_entry | Io | 3 | own | own | - | agrees
+crates/kr-ipc/src/descriptor.rs | DescriptorDirectory::open_entry | UntrustedFile | 4 | own | own | - | agrees
+crates/kr-ipc/src/descriptor.rs | DescriptorDirectory::read_entry | Io | 2 | own | own | - | agrees
+crates/kr-ipc/src/descriptor.rs | DescriptorDirectory::read_entry | UntrustedFile | 3 | own | own | - | agrees
+crates/kr-ipc/src/descriptor.rs | check_identity | UntrustedFile | 3 | own | own | - | agrees
+crates/kr-ipc/src/descriptor.rs | check_owner | Io | 1 | own | own | - | agrees
+crates/kr-ipc/src/descriptor.rs | check_owner | UntrustedFile | 3 | own | own | - | agrees
+crates/kr-ipc/src/descriptor.rs | clear_non_blocking | Io | 2 | own | own | - | agrees
+crates/kr-ipc/src/descriptor.rs | decode_under | Frame | 1 | arrived | closure | - | agrees
+crates/kr-ipc/src/descriptor.rs | decode_under | UnexpectedMessage | 1 | arrived | reply | - | agrees
+crates/kr-ipc/src/descriptor.rs | retire | Io | 1 | own | own | - | agrees
+crates/kr-ipc/src/endpoint.rs | Accepted::refusal | PeerAccountRejected | 1 | own | own | - | agrees
+crates/kr-ipc/src/endpoint.rs | Connection::connect | PeerAccountRejected | 1 | own | own | connect | agrees
+crates/kr-ipc/src/endpoint.rs | Connection::connect | Socket | 3 | connect | closure+own | connect | by-kind   # nothing listening is a closure; the Windows pipe that stays busy to its deadline (TimedOut) is the daemon's, and the function says own
+crates/kr-ipc/src/endpoint.rs | Connection::peer | PeerClosed | 1 | stream | closure | connect | agrees
+crates/kr-ipc/src/endpoint.rs | Connection::peer | PeerUnknown | 2 | own | own | connect | agrees
+crates/kr-ipc/src/endpoint.rs | Connection::writability | Socket | 1 | stream | own | greeting+request | agrees
+crates/kr-ipc/src/endpoint.rs | EndpointGuard::take | Io | 2 | own | own | - | agrees
+crates/kr-ipc/src/endpoint.rs | Listener::accept | Socket | 3 | stream | own | - | agrees
+crates/kr-ipc/src/endpoint.rs | Listener::bind | Socket | 1 | stream | own | - | agrees
+crates/kr-ipc/src/endpoint.rs | Listener::bind_with_descriptor | Socket | 5 | stream | own | - | agrees
+crates/kr-ipc/src/endpoint.rs | probe | Socket | 4 | connect | closure+own | - | by-kind
+crates/kr-ipc/src/endpoint.rs | replace_stale_socket | Io | 2 | own | own | - | agrees
+crates/kr-ipc/src/endpoint.rs | replace_stale_socket | Socket | 1 | stream | own | - | agrees
+crates/kr-ipc/src/endpoint.rs | replace_stale_socket | UntrustedFile | 1 | own | own | - | agrees
+crates/kr-ipc/src/endpoint.rs | set_owner_only | Io | 1 | own | own | - | agrees
+crates/kr-ipc/src/endpoint.rs | socket_identity | Io | 1 | own | own | - | agrees
+crates/kr-ipc/src/error.rs | IpcError::#[from] | Frame | 1 | conversion | closure+own | greeting+request | differs   # a frame codec failure turned in by ? or into: the decode of what arrived (closure), the encode of this side's request (own)
+crates/kr-ipc/src/error.rs | IpcError::from | Frame | 1 | conversion | closure+own | request | differs   # a codec failure: the encode of this side's frame (own) and a decode of a retained value (closure)
+crates/kr-ipc/src/error.rs | IpcError::from | NotInLevel | 1 | conversion | own | request | agrees   # the encode of this side's frame names a field that is not in the level
+crates/kr-ipc/src/error.rs | IpcError::from | OutsideLevel | 1 | conversion | own | request | agrees   # the encode of this side's frame is outside the level
+crates/kr-ipc/src/error.rs | IpcError::io | Io | 1 | own | own | - | agrees   # the constructor; its callers have the rows
+crates/kr-ipc/src/error.rs | IpcError::socket | Socket | 1 | connect | closure+own | - | by-kind   # the constructor; its callers have the rows
+crates/kr-ipc/src/error.rs | IpcError::stream | PeerClosed | 1 | stream | closure | greeting+request | agrees   # a gone peer on a stream
+crates/kr-ipc/src/error.rs | IpcError::stream | Socket | 1 | stream | own | greeting+request | agrees   # the stream's other faults
+crates/kr-ipc/src/floor.rs | FloorIdentity::fresh | IdentityUnavailable | 1 | own | own | - | agrees
+crates/kr-ipc/src/floor.rs | SharedFloor::create | Io | 1 | own | own | - | agrees
+crates/kr-ipc/src/floor.rs | SharedFloor::create | UntrustedFile | 1 | own | own | - | agrees
+crates/kr-ipc/src/framed.rs | FrameReader::decode | Frame | 1 | arrived | closure | greeting+request | agrees
+crates/kr-ipc/src/framed.rs | FrameReader::read_message_without_schema | Frame | 1 | arrived | closure | greeting+request | agrees
+crates/kr-ipc/src/framed.rs | FrameReader::read_payload | TruncatedFrame | 1 | arrived | closure | greeting+request | agrees
+crates/kr-ipc/src/framed.rs | FrameReader::read_payload_within | PeerClosed | 1 | arrived | closure | greeting+request | agrees
+crates/kr-ipc/src/framed.rs | FrameReader::read_payload_within | TruncatedFrame | 2 | arrived | closure | greeting+request | agrees
+crates/kr-ipc/src/framed.rs | FrameWriter::attempt_checked | PeerClosed | 4 | stream | closure | greeting+request | agrees
+crates/kr-ipc/src/framed.rs | FrameWriter::attempt_checked | Socket | 2 | stream | own | greeting+request | agrees
+crates/kr-ipc/src/framed.rs | FrameWriter::begin_frame | Socket | 1 | stream | own | greeting+request | agrees
+crates/kr-ipc/src/framed.rs | FrameWriter::begin_frame_checked | Socket | 1 | stream | own | greeting+request | agrees
+crates/kr-ipc/src/framed.rs | FrameWriter::shut_down | PeerClosed | 1 | stream | closure | - | agrees   # no production caller
+crates/kr-ipc/src/framed.rs | FrameWriter::shut_down | Socket | 1 | stream | own | - | agrees   # no production caller
+crates/kr-ipc/src/framed.rs | Readiness::ready | Socket | 1 | stream | own | greeting+request | agrees
+crates/kr-ipc/src/framed.rs | bytes_read | Socket | 1 | stream | own | greeting+request | agrees
+crates/kr-ipc/src/identity.rs | boot_epoch | IdentityUnavailable | 1 | own | own | - | agrees
+crates/kr-ipc/src/identity.rs | unavailable | IdentityUnavailable | 1 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | Endpoint::from_path | Io | 1 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | Endpoint::from_path | SocketPathTooLong | 1 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | EnvironmentPaths::claim_identity | EnvironmentPrefixCollision | 1 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | EnvironmentPaths::claim_identity | Io | 1 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | HostPaths::open_environment_id | IdentityUnavailable | 1 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | build_owner_only_directory | Io | 1 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | check_owner_only | DirectoryAccessRefused | 2 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | check_owner_only | DirectoryNotOwnerOnly | 1 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | check_owner_only | Io | 2 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | create_directory_with_list | Io | 2 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | create_new_owner_only_file | Io | 3 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | create_new_private_directory | Io | 1 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | create_private_directory | Io | 4 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | create_private_tree | Io | 2 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | default_runtime_root | IdentityUnavailable | 1 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | default_state_root | IdentityUnavailable | 1 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | home_directory | IdentityUnavailable | 1 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | read_environment_id | IdentityUnavailable | 2 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | read_environment_marker | IdentityUnavailable | 3 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | read_owner_only_file | Io | 7 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | read_owner_only_file | UntrustedFile | 9 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | resolve_here | Io | 1 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | sync_directory | Io | 1 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | write_owner_only_file | Io | 3 | own | own | - | agrees
+crates/kr-ipc/src/peer.rs | PeerIdentity::authorise | PeerRejected | 1 | own | own | connect | agrees
+crates/kr-ipc/src/starter.rs | decode | Io | 1 | own | own | - | agrees
+crates/kr-ipc/src/starter.rs | leave_claim | Io | 1 | own | own | - | agrees
+crates/kr-ipc/src/starter.rs | open_log | Io | 3 | own | own | - | agrees
+crates/kr-ipc/src/starter.rs | open_log | UntrustedFile | 1 | own | own | - | agrees
+crates/kr-ipc/src/starter.rs | read_claim | Io | 1 | own | own | - | agrees
+crates/kr-ipc/src/starter.rs | take_claim | Io | 1 | own | own | - | agrees
+crates/kr-ipc/src/verify.rs | IpcError::from | IdentityUnavailable | 1 | conversion | own | - | agrees   # the verification of a worker's identity
+crates/kr-plugin-service/src/client.rs | write_offered | PeerClosed | 2 | stream | closure | - | agrees
+crates/kr-shell-integration/src/host/startup.rs | EntryRecord::hold | Io | 1 | own | own | - | agrees
+crates/kr-shell-integration/src/host/terminal_profile/record.rs | ProfileRecord::hold | Io | 1 | own | own | - | agrees
