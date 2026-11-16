@@ -3015,8 +3015,8 @@ async fn forgetting_the_host_ends_the_call_and_owes_the_revocation() {
         .call("hosts_forget", json!({ "reference": reference }))
         .expect("the host is forgotten");
 
-    // The end is over when the device holds nothing: the cause is shown while the device is still
-    // finishing it, before it has noted what it owes.
+    // The end is shown with what it owes, in one update, while the device is still finishing the
+    // call at the service; the call is over when the device holds nothing.
     let ended = scene
         .state_where("the end", |state| {
             state["ended"]["cause"] == "host_forgotten" && state["setting_up"] == false
@@ -4261,8 +4261,8 @@ async fn a_host_that_holds_no_such_call_settles_what_was_owed_to_it() {
     .await;
     // The call the host revoked ended with its revocation. The phone's own end then asks the host
     // about a voice session it no longer holds, and the host says it holds none: that owes nothing.
-    // The end is shown before the device has recorded what it owes, so the absence of an entry
-    // is read once the device holds nothing.
+    // The end and what it owes are one update, and the device holds nothing once the slot is free,
+    // so the absence of an entry is read after both.
     let ended = scene
         .state_where("the call the host revoked, ended", |state| {
             state["running"] == false && state["ended"].is_object() && state["setting_up"] == false
