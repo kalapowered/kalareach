@@ -11,8 +11,11 @@
 #   failure of this host (wait_failed, not_prepared, unread) names the path that failed and the system's error, with no profile in front of it, because
 #   the profile is not what failed; `/tmp/kr-shell-ask-ID` is the call's folder and `/tmp/walk/pwsh` the program that this host could not wait for.
 # what the install leaves: for each row the second section says what a failed question leaves: nothing written for PowerShell at the profile question,
-#   the profile as it was at the other two (the walk compares the home with what it was for every way that it makes), and that the install goes on where
-#   the answer is used.
+#   the profile as it was at the other two, and that the install goes on where the answer is used. The walk makes every way but used and timed_out through
+#   the install, each in a dry run and in a real run, and compares the home with what it was (at the profile question it also shows that no record is
+#   written); a dry run shows that the install goes on for the used rows. The three timed_out rows are not made (the install gives each question sixty
+#   seconds): their second cell is the rule that the install ends at the question that fails, before it writes for it, the same end that the walk shows
+#   for every other way.
 # outside the table: the answers that a script gives as refusals of the profile (`kr-refused <code>`), and a placement that is not inside the profile,
 #   are answers that are used; each has its own sentence about the profile, and none depends on how a question ended. This file is made on Unix.
 
@@ -128,4 +131,4 @@ question=check way=wrong_form stand-in=another word
 question=check way=wrong_form stand-in=a refusal that this host does not know
 
 ## ways that the walk through the install does not make
-way=timed_out: the install gives each question sixty seconds, and each of the three would wait them; a case of kr-shell-integration ends each question by a limit of 400 ms and compares the error with the one that this table's row comes from, and a case there shows that the install gives each question more than the five seconds of a report
+way=timed_out: the install gives each question sixty seconds, and each of the three would wait them; a case of kr-shell-integration ends each question by a limit of 400 ms and compares the error with the one that this table's row comes from, and a case there shows that the install gives each question more than the five seconds of a report; the second cell of the three rows, what the install leaves, is the rule alone: no run of this walk waits the limit

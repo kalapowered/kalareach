@@ -5481,8 +5481,8 @@ mod tests {
     /// time to answer, ends in what [`conclude`] gives for that way at that question: the same
     /// refusal, or this host's failure of the same file and kind. The ways that this case does not
     /// make need a state of the whole process, which only a run of its own has (a temporary folder
-    /// that is not one, and a signal for an ended child that is ignored), and the install's walk
-    /// makes them: `not_prepared` and `wait_failed`.
+    /// that is not one, and a thread that takes the end of every child before the wait sees it), and
+    /// the install's walk makes them: `not_prepared` and `wait_failed`.
     #[cfg(unix)]
     #[test]
     fn each_way_a_question_ends_in_is_what_conclude_says_at_each_question() {
@@ -5589,6 +5589,16 @@ mod tests {
             assert_eq!(placed.join().expect("ends").expect("waits"), 0);
             assert_eq!(checked.join().expect("ends").expect("waits"), None);
         });
+    }
+
+    /// The limit that an install gives PowerShell for each of its questions is one minute, the figure
+    /// that the host guide names for a question that does not answer, and it is longer than the five
+    /// seconds that a report gives. The cases of the limits show that the questions do not take the
+    /// report's time; this one reads the figure that they take.
+    #[test]
+    fn the_install_gives_each_question_a_minute() {
+        assert_eq!(PLACEMENT_DEADLINE, std::time::Duration::from_secs(60));
+        assert_eq!(ASK_DEADLINE, std::time::Duration::from_secs(5));
     }
 
     /// The call's folder is gone after a question that failed, whatever the way: a code other than
