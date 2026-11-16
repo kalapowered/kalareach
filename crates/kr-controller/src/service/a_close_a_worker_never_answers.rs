@@ -777,6 +777,82 @@ async fn a_close_whose_read_of_the_registry_does_not_return_is_answered_within_i
     serving.abort();
 }
 
+/// A close of a session that this daemon holds no worker for reads the registry inside the budget
+/// of the exchange. When that read does not answer, and another close has had a worker's answer for
+/// the session meanwhile, the account in that answer is what this daemon knows, and the close is
+/// answered with it: it is not told that how an earlier request ended is not known.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_whose_read_stands_is_answered_with_an_account_that_arrived_meanwhile() {
+    let Silent {
+        _temp,
+        controller,
+        environment_id,
+        session_id,
+        actor,
+        accepted,
+        serving,
+        ..
+    } = silent_worker().await;
+    acknowledged(&controller, session_id);
+    let carried = admission(&controller, accepted).await;
+    controller.directory.lock().await.remove(session_id);
+    let account = kr_protocol::session::ClosureRecord {
+        durability: kr_protocol::session::Durability::Volatile,
+        ..super::a_migration_and_a_recovery_of_one_session::closure_of(session_id)
+    };
+
+    let (arrived, release) = controller
+        .registry
+        .lock()
+        .await
+        .stall_the_next_closure_read();
+    let close = {
+        let controller = Arc::clone(&controller);
+        let request = close_request(environment_id, session_id);
+        tokio::spawn(async move {
+            controller
+                .session_close(&request, &actor, Some(accepted), carried)
+                .await
+                .into_answer_for_test()
+        })
+    };
+    // The close knows no closure and waits for the registry. A worker's answer for the session is
+    // then settled, as another close does it: the account is kept before it is written.
+    let reached =
+        tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30))).await;
+    controller
+        .settle_close_answer(
+            session_id,
+            &kr_protocol::session::SessionCloseResult {
+                session_id,
+                state: kr_protocol::session::SessionState::Closed,
+                durability: account.durability,
+                closure: Nullable::some(account.clone()),
+                session: None,
+            },
+        )
+        .await;
+    let answered = tokio::time::timeout(CLOSE_EXCHANGE + Duration::from_secs(3), close).await;
+    // Let go before any assertion, so that a close that was not answered does not hold the
+    // program.
+    let _ = release.send(());
+    reached
+        .expect("the wait for the read ends")
+        .expect("the read of the registry was the one that stood");
+    let answered = answered
+        .expect("the close is answered when its budget ends")
+        .expect("the close's task ends")
+        .expect("a close is answered with the account that arrived while its read stood");
+    let result: kr_protocol::session::SessionCloseResult =
+        answered.to_typed().expect("the answer decodes");
+    assert_eq!(
+        result.closure.as_ref(),
+        Some(&account),
+        "the answer is the account the worker gave: {result:?}"
+    );
+    serving.abort();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_client_is_retired_rather_than_held_for_the_next_caller() {
     let Silent {

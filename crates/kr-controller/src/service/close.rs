@@ -513,7 +513,15 @@ impl Controller {
         .await;
         let closure = match read {
             Ok(Ok(Ok(closure))) => closure,
-            Ok(Ok(Err(_)) | Err(_)) | Err(_) => return Err(unreadable()),
+            // Another close can have had a worker's answer while this read waited, and that
+            // answer is kept before it is written: what this daemon knows now is the answer, and
+            // not that how an earlier request ended is not known.
+            Ok(Ok(Err(_)) | Err(_)) | Err(_) => {
+                return match self.known_closure(session_id) {
+                    Some(known) => encode(&known),
+                    None => Err(unreadable()),
+                };
+            }
         };
         match closure {
             Some(closure) => encode(&answer_of_record(&closure)),
