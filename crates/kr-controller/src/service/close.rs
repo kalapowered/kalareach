@@ -611,6 +611,12 @@ impl Controller {
     /// Starts the write of a final closure that this daemon knows and has not recorded, unless a
     /// task of its own is writing it. A write that fails is tried again by the next close of the
     /// session, and by the watch over the worker's end.
+    ///
+    /// A worker's account is written as it is. A record of this daemon's own is tried again
+    /// through a look at the worker's end ([`Self::reconcile_session`]), as the watch makes it,
+    /// and not written directly: the look reads the worker's journal first, which an earlier look
+    /// may not have been able to read, and writes the kept record only where the journal gives
+    /// none.
     fn record_known_closure_soon(self: &Arc<Self>, session_id: SessionId) {
         let (record, whose) = {
             let mut known = self
@@ -628,7 +634,19 @@ impl Controller {
         };
         let me = Arc::clone(self);
         tokio::spawn(async move {
-            let written = me.retire_as(&record, whose).await;
+            let written = match whose {
+                Whose::Worker => me.retire_as(&record, whose).await,
+                Whose::Daemon => {
+                    let looked = me.reconcile_session(record.session_id).await;
+                    if matches!(looked, Ok(Some(_))) {
+                        // A closure is recorded, by this look or by another path first, and
+                        // what was kept is no longer what a close is answered from.
+                        me.forget_known_closure(record.session_id);
+                        me.review_power_soon();
+                    }
+                    looked.map(|_| ())
+                }
+            };
             if let Some(entry) = me
                 .known_closures
                 .lock()
