@@ -419,6 +419,26 @@ mod tests {
         );
     }
 
+    /// KR-REQ-24.04 on Windows: the lock file is held open with no sharing, so a read of the process
+    /// that it names fails while the daemon holds the environment, and reads the process that the
+    /// daemon wrote once the daemon has let go.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_the_holder_is_unreadable_while_the_daemon_holds_the_lock_and_readable_after() {
+        let host = kr_ipc::testing::TempHost::create();
+        let path = host.environment().singleton_lock();
+        let daemon = SingletonLock::acquire(&path, host.environment_id()).expect("takes the lock");
+        assert!(
+            SingletonLock::holder(&path).is_err(),
+            "the lock file cannot be read while the daemon holds the lock"
+        );
+        drop(daemon);
+        assert_eq!(
+            SingletonLock::holder(&path).expect("reads"),
+            Some(std::process::id())
+        );
+    }
+
     /// KR-REQ-24.04 on Windows: the open of a file another handle holds fails with a sharing
     /// violation, which is another daemon. A refused access is not: it is a failure that names the
     /// lock file.
