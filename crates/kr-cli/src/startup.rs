@@ -770,7 +770,9 @@ async fn service_is_set_up(environment: &EnvironmentPaths) -> std::result::Resul
             remedy: None,
             not_set_up: true,
         }),
-        Ok(Err(service_manager::Refusal::Failed(why))) => Err(Unstartable {
+        Ok(Err(
+            service_manager::Refusal::Failed(why) | service_manager::Refusal::NoAnswer(why),
+        )) => Err(Unstartable {
             why: shown!("the service manager could not be asked: {}", why),
             remedy: None,
             not_set_up: false,
@@ -1232,6 +1234,20 @@ fn last_line_said(line: &str) -> Shown {
     }
 }
 
+/// Notes, in `launched`, a start request that the manager was asked and did not answer in time:
+/// the requested daemon may still start. A manager that could not be asked, or that refused at
+/// once, was asked nothing that it may still be doing.
+#[cfg(unix)]
+fn asked_and_unanswered(
+    refusal: service_manager::Refusal,
+    launched: &AtomicBool,
+) -> service_manager::Refusal {
+    if refusal.may_still_start() {
+        launched.store(true, Ordering::SeqCst);
+    }
+    refusal
+}
+
 /// Asks this user's service manager to start the daemon from the definition kr wrote, and waits
 /// for it to answer.
 ///
@@ -1250,11 +1266,13 @@ async fn managed(
 ) -> Result<(Listed, Option<Started>)> {
     let refused = |refusal| match refusal {
         service_manager::Refusal::NotSetUp(why) => resolve::not_running(environment, error, why),
-        service_manager::Refusal::Failed(why) => unanswered(shown!(
-            "the service manager did not start the control daemon for environment {}: {}",
-            environment.environment_id(),
-            why
-        )),
+        service_manager::Refusal::Failed(why) | service_manager::Refusal::NoAnswer(why) => {
+            unanswered(shown!(
+                "the service manager did not start the control daemon for environment {}: {}",
+                environment.environment_id(),
+                why
+            ))
+        }
     };
     let blocked = |error: tokio::task::JoinError| {
         CliError::Other(shown!(
@@ -1277,7 +1295,7 @@ async fn managed(
     let asked = tokio::task::spawn_blocking(move || verified.start())
         .await
         .map_err(blocked)?
-        .map_err(refused)?;
+        .map_err(|refusal| refused(asked_and_unanswered(refusal, launched)))?;
     launched.store(true, Ordering::SeqCst);
     let started = Started {
         pid: asked.pid,
@@ -2618,6 +2636,30 @@ mod tests {
                 .exists(),
             "and nothing was started for it"
         );
+    }
+
+    /// A start request that the manager was asked and did not answer in time sets `launched`, for
+    /// the requested daemon may still start; one that the manager could not be asked, or refused
+    /// at once, sets nothing.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_manager_that_was_asked_and_did_not_answer_leaves_a_daemon_that_may_still_start() {
+        let not_asked = AtomicBool::new(false);
+        for refusal in [
+            service_manager::Refusal::Failed(Shown::said("the manager could not be asked")),
+            service_manager::Refusal::NotSetUp(Shown::said("the definition is not as written")),
+        ] {
+            let kept = asked_and_unanswered(refusal, &not_asked);
+            assert!(!kept.may_still_start());
+            assert!(!not_asked.load(Ordering::SeqCst), "{kept:?}");
+        }
+        let unanswered = AtomicBool::new(false);
+        let kept = asked_and_unanswered(
+            service_manager::Refusal::NoAnswer(Shown::said("the manager did not answer")),
+            &unanswered,
+        );
+        assert!(matches!(kept, service_manager::Refusal::NoAnswer(_)));
+        assert!(unanswered.load(Ordering::SeqCst));
     }
 
     /// Something that accepts connections on an environment's endpoint and never says hello.
