@@ -493,17 +493,50 @@ async fn a_lease_that_ends_after_it_is_read_is_answered_in_the_leases_words() {
 /// KR-REQ-17.54: a lease's bound that moved to another run between the writer's reading of the
 /// lease and its question is decided by no refusal of the question's own: the writer reads the
 /// lease again, goes by that reading, and the frame is written once. The lease is presented again
-/// with other rights, which narrows it and starts another run of its bound.
+/// with other rights at each of the two pauses, which narrows it and starts another run of its
+/// bound each time, so that the reading that follows the first is found moved too. A moved bound
+/// taken as a pass never reaches the second pause, taken as the lease's end it is answered in the
+/// lease's words, and returned without the writer's reading again it is not shown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_bound_that_moved_is_decided_by_the_writers_own_reading_of_the_lease() {
+    use crate::grants::policy::{HeldBound, Stands};
+    use kr_protocol::rights::ActionRight;
+
     let (_temp, controller, _continuous, presenter, writer, reader) =
         connected_under_a_lease_that_can_be_presented_again().await;
     let (_, _, footing) = registered(&controller);
-    let held = controller
+    let first = controller
         .local_hold(Method::PrivacySet)
         .expect("the lease is live")
         .bound
         .expect("the lease has a bound");
+    // The bound that the writer's second reading finds, which the second pause's change takes
+    // before it presents the lease again.
+    let second: Arc<std::sync::Mutex<Option<HeldBound>>> = Arc::default();
+    let presenter = Arc::new(std::sync::Mutex::new(presenter));
+    let first_presentation: Change = Box::new({
+        let presenter = Arc::clone(&presenter);
+        move || {
+            presenter
+                .lock()
+                .expect("the presenter is free")
+                .present(&[ActionRight::FilesRead]);
+        }
+    });
+    let second_presentation: Change = Box::new({
+        let controller = Arc::clone(&controller);
+        let second = Arc::clone(&second);
+        move || {
+            *second.lock().expect("the reading is free") = controller
+                .local_hold(Method::PrivacySet)
+                .expect("the lease is live")
+                .bound;
+            presenter
+                .lock()
+                .expect("the presenter is free")
+                .present(&[ActionRight::SessionView]);
+        }
+    });
     let (stood, handed) = what_the_caller_is_handed(
         &controller,
         writer,
@@ -511,21 +544,26 @@ async fn a_bound_that_moved_is_decided_by_the_writers_own_reading_of_the_lease()
         &result(),
         Method::PrivacySet,
         WrittenUnder::for_an_own_effect_case(footing, true),
-        vec![Box::new(move || {
-            presenter.present(&[kr_protocol::rights::ActionRight::FilesRead]);
-        })],
+        vec![first_presentation, second_presentation],
     )
     .await;
     assert!(stood, "the connection goes on");
     assert_eq!(handed, vec![result()], "the writer goes by its own reading");
-    // The bound that the pause's change moved is another run than the one the writer first read.
+    // Each presentation moved the bound to another run than the one the writer had read.
+    let second = second
+        .lock()
+        .expect("the reading is free")
+        .take()
+        .expect("the writer read the lease again at the second pause");
     let now = controller.clock.now();
     let utc = controller.settled_utc_now();
-    assert_eq!(
-        held.stands_at(now, utc),
-        crate::grants::policy::Stands::Moved,
-        "the presentation started another run of the bound"
-    );
+    for (reading, bound) in [("first", &first), ("second", &second)] {
+        assert_eq!(
+            bound.stands_at(now, utc),
+            Stands::Moved,
+            "the presentation after the {reading} reading started another run of the bound"
+        );
+    }
 }
 
 /// KR-REQ-17.54: the ask that finds a bound moved does not refuse it. Asked by itself, with no
