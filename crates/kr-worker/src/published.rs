@@ -6,11 +6,13 @@
 //! the session keeps a copy of its summary outside its own lock, a read takes the session for no
 //! longer than [`TAKE_BOUND`], and a read that did not get it answers from the copy.
 //!
-//! The copy is set when the session launches, when it builds its record again, when what its
-//! application is doing changes, when it admits a close and when it records its closure. It can
-//! therefore be older than the session: a close can be admitted a moment before the copy says so.
-//! What the answer says about the lifecycle, and how many launches wait for the reader, is for that
-//! reason read from the input domain, which holds both as they are, and never from the copy.
+//! The copy is set when the session launches, when it builds its record again, when it admits a
+//! close and when it records its closure. It can therefore be older than the session: a close can
+//! be admitted a moment before the copy says so. What the answer says about the lifecycle, what the
+//! application is doing, and how many launches wait for the reader, is for that reason read from
+//! the input domain, which holds all three as they are, and never from the copy. The application's
+//! producer writes what the application is doing there before it waits for the session, so a turn,
+//! a question or a launch that begins while a storage call holds the session is in the answer.
 //!
 //! Three things the answer does not follow:
 //!
@@ -18,7 +20,8 @@
 //!   supervision sees the exit, and it waits for the session, so the domain still says `Live`, and
 //!   the answer says so with the `root_process` of the root that has ended.
 //! - An answer given between the domain's change to `Closed` and the copy's publication of the
-//!   closure says `Closed` with no closure record, and the application name the copy had.
+//!   closure says `Closed` with no closure record, and the application name the copy had; and the
+//!   domain's application state, which the closure clears, can be the one it had before.
 //! - A record of what a worker said, kept by a reader that asks again and again, can take an older
 //!   copy of the same stage in the place of a newer one, because two answers of one stage are not
 //!   ordered by anything the answer carries.
@@ -26,6 +29,7 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
+use kr_protocol::scalars::Nullable;
 use kr_protocol::session::SessionSummary;
 
 use crate::input_domain::InputShared;
@@ -83,8 +87,8 @@ impl PublishedSummary {
     }
 
     /// Returns the answer to a read that could not take the session: the published summary with
-    /// the lifecycle state read from the input domain, and how many launches the domain holds
-    /// for the reader to decide.
+    /// the lifecycle state and what the application is doing read from the input domain, and how
+    /// many launches the domain holds for the reader to decide.
     ///
     /// This is the one place where the answer takes what the session's own admission of a close
     /// holds. Today that is the state alone, which the domain changes in the step that admits a
@@ -96,6 +100,7 @@ impl PublishedSummary {
         let mut summary = self.copy();
         let domain = input.lock();
         summary.state = domain.state();
+        summary.application_state = Nullable(domain.application_state());
         let outstanding_launches = summary
             .state
             .is_running()
