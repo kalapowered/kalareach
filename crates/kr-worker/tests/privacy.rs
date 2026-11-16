@@ -1725,11 +1725,17 @@ fn a_session_that_reads_its_state_as_off_captures_description_facts_again() {
     assert!(unread.private, "the facts say they are private");
     assert!(unread.facts.is_none(), "and hold nothing");
 
-    put_the_privacy_record_right(&temp, session_id, 0, 0);
+    // The record the state is read from names a generation that is not nought, so that the release
+    // shows that it takes the generation that it read.
+    put_the_privacy_record_right(&temp, session_id, 7, 0);
     session.collect_expired();
     facts.note_intent("a prompt typed after the state reads as off");
-    let read = facts.read(0, Some(0));
+    let read = facts.read(0, Some(7));
     assert!(!read.private, "capture is on again");
+    assert_eq!(
+        read.privacy_generation, 7,
+        "under the generation that was read"
+    );
     let record = read
         .facts
         .expect("the new prompt is a fact the description gets");
@@ -1741,4 +1747,32 @@ fn a_session_that_reads_its_state_as_off_captures_description_facts_again() {
         !format!("{record:?}").contains("cannot be read"),
         "nothing from before the release is brought back: {record:?}"
     );
+}
+
+/// A session reopened under privacy mode owes the removal of settled receipts' content until its
+/// first pass, and no reader is told of that content meanwhile. No service runs here, so no pass of
+/// maintenance does: the fence raised at the open is all that stands between a reader and the
+/// content, which the store still holds whole until the pass has run.
+#[test]
+fn a_session_reopened_under_privacy_mode_serves_no_receipt_content_before_its_first_pass() {
+    let (temp, mut session) = session_on_disk();
+    let session_id = session.summary().session_id;
+    settle_two_receipts(&mut session);
+    drop(session);
+    put_the_privacy_record_right(&temp, session_id, 1, 1);
+    let journal = temp.environment().journal_database(session_id);
+    let mut reopened = Session::open(config_at(&temp, session_id, journal)).expect("opens again");
+    reopened
+        .journal_mut()
+        .expect("a journal")
+        .accept(&submission(3))
+        .expect("an action is accepted");
+    assert!(reopened.privacy().is_enabled());
+    assert_eq!(what_the_store_holds(&temp, session_id), whole());
+    assert_eq!(reads(&reopened), after_the_removal());
+
+    // The first pass removes what was owed, and the readers say the same afterwards.
+    reopened.collect_expired();
+    assert_eq!(reads(&reopened), after_the_removal());
+    assert_eq!(what_the_store_holds(&temp, session_id), after_the_removal());
 }
