@@ -3424,7 +3424,7 @@ async fn a_barrier_that_names_another_attachment_is_refused(rig: Rig) {
         "nothing was forwarded: {:?}",
         forwarded(&sent)
     );
-    assert_eq!(position_refusals(&rig), 0, "no position was judged");
+    assert_eq!(position_refusals(&rig), 0, "no position was refused");
     let own = send_after(&rig, Dependent::Release, rig.epoch, 3).await;
     assert!(
         own.answer.is_ok(),
