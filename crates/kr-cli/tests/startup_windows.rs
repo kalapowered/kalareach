@@ -1939,9 +1939,10 @@ impl DaemonThatEnds {
 /// pipe, and the command could not see the daemon go. This case does not choose the path to that
 /// end: where the close has reached the command when it composes its request, it makes none and
 /// says so; where it composed first it sent its request into the closed connection and waits for
-/// the daemon as one that may have taken it. The case takes the sentence that its run came to and
+/// the daemon as one that may have taken it, and says that the daemon did not show whether it took
+/// the stop and that it has ended. The case takes the sentence that its run came to and
 /// holds what is true of that path: the unmade request's own sentence with no line that says a
-/// request was asked, or the end of a daemon that was asked. It can miss a fault of the
+/// request was asked, or the end of a daemon whose outcome was not shown. It can miss a fault of the
 /// closed-connection branch on a run that composed first, which the unit cases of the stop's
 /// decision hold.
 #[test]
@@ -1953,7 +1954,13 @@ fn kr_host_stop_sees_a_daemon_end_that_closed_the_connection_the_command_held() 
     let out = String::from_utf8_lossy(&output.stdout);
     let said = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{out} {said}");
-    if out.starts_with("The control daemon for environment ") {
+    if out.contains("did not show whether it took the stop") && out.contains("and it has ended") {
+        // The request that was made into the closed connection: not answered, and the daemon ended.
+        assert!(
+            out.starts_with("The control daemon for environment "),
+            "neither path's sentence: {out}"
+        );
+    } else if out.starts_with("The control daemon for environment ") {
         // The unmade request.
         assert!(
             out.contains(" ended, and this command could not make its request for it: "),
@@ -1965,7 +1972,7 @@ fn kr_host_stop_sees_a_daemon_end_that_closed_the_connection_the_command_held() 
         );
         assert!(!said.contains("Asked the control daemon"), "{said}");
     } else {
-        // The request that was made into the closed connection.
+        // The request that was made into the closed connection, and answered.
         assert!(
             out.starts_with("Stopped the control daemon for environment "),
             "neither path's sentence: {out}"
