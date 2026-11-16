@@ -5189,10 +5189,14 @@ async fn a_newer_epoch_counts_from_nothing_after_a_refusal_in_an_older_one() {
     rig.stop().await;
 }
 
-/// A new stream for the same attachment in the same epoch starts with an empty record: a barrier
-/// for the typing that the worker accepted on the stream before is refused, which the device
-/// answers by sending the ending again with no position, until the new stream has had typing
-/// accepted past it. For a worker with the lane and one without.
+/// The named limit of the host's record of a stream (the doc of `Record` in `net/input.rs`), shown
+/// as it is and not as a wanted behaviour: a new stream for the same attachment in the same epoch
+/// starts with an empty record, because the host carries no count from one stream to the next. A
+/// barrier for the typing that the worker accepted on the stream before is refused by the host,
+/// though the worker would take it, and the device answers by sending the ending again with no
+/// position, until the new stream has had typing accepted past it. The planned client opens a new
+/// stream only after a new acquire, which is a new epoch, and never meets the limit. For a worker
+/// with the lane and one without.
 async fn a_new_stream_in_the_same_epoch_starts_with_an_empty_record(serial: bool) {
     let (rig, _older) = if serial {
         typed_serial(3).await
@@ -5204,21 +5208,21 @@ async fn a_new_stream_in_the_same_epoch_starts_with_an_empty_record(serial: bool
     let before = send_after(&rig, Dependent::Launch, rig.epoch, 3).await;
     assert!(
         before.refused_here,
-        "the new stream has had nothing accepted, so the three frames the worker took on the stream before are not reached on its record: {:?}",
+        "the limit of the record: the new stream has had nothing accepted, so the three frames the worker took on the stream before are not reached on its record: {:?}",
         before.answer
     );
     type_and_wait(&rig, &mut newer, 3, b"k").await;
     let reached = send_after(&rig, Dependent::Launch, rig.epoch, 4).await;
     assert!(
         !reached.refused_here,
-        "one acceptance on the new stream is a count of one on its record, so the device's own numbering is the only thing that makes four: {:?}",
+        "the limit of the record: one acceptance on the new stream is a count of one on its record, so the device's own numbering is the only thing that makes four: {:?}",
         reached.answer
     );
     assert_eq!(forwarded(&sent), vec![Method::ShellLaunch]);
     let over = send_after(&rig, Dependent::Launch, rig.epoch, 5).await;
     assert!(
         over.refused_here,
-        "one frame more than the record holds is not reached: {:?}",
+        "the limit of the record: one frame more than the record holds is not reached: {:?}",
         over.answer
     );
     assert_eq!(position_refusals(&rig), 2);
