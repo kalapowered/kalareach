@@ -95,7 +95,9 @@ use tokio::sync::watch;
 
 use crate::config::Outbound;
 use crate::error::{ControllerError, Result};
+use crate::grants::policy::HeldBound;
 use crate::managed_transport::{ClosedTransport, ManagedTransport};
+use crate::service::{Ask, Controller, Footing, LeasedFooting, LeasedLapse};
 
 /// How long the daemon waits for the person's browser to come back.
 const WAIT: Duration = Duration::from_secs(15 * 60);
@@ -230,18 +232,66 @@ impl Outcome {
     }
 }
 
-/// What the authority a sign-in was started under rests on, given to whoever asks whether it still
-/// stands. The one who asks holds it until the write that the ask stands before has returned, so
-/// that the host is not let go of between the ask and the write.
+/// What the authority a sign-in was started under rests on, and what its question is asked with:
+/// the host, and the footing with the lease's bound where the sign-in is held to a lease. It is
+/// made before the question and the question is asked through it ([`Self::ask`]), so that nothing
+/// is allocated and nothing is let go of between the question and the write that follows it. The
+/// one who asks holds it until that write has returned: letting go of the host or of the bound's
+/// last reference can free memory, and the host is not let go of between the ask and the write.
 pub struct Guard {
-    _held: Box<dyn Send + Sync>,
+    /// The host, held so that it is not let go of between the question and the write.
+    _daemon: Option<Arc<Controller>>,
+    /// What the question is asked with.
+    standing: Standing,
+}
+
+/// What a [`Guard`] asks its question with.
+enum Standing {
+    /// No host's authority governs the account: the question stands.
+    Nothing,
+    /// A footing, for a sign-in that no lease holds.
+    Open(Footing),
+    /// A footing and the bound of the lease that the sign-in is held to.
+    Leased(LeasedFooting),
 }
 
 impl Guard {
-    /// A guard that holds `held` until it is let go.
-    pub fn new(held: impl Send + Sync + 'static) -> Self {
+    /// A guard for an account that no host's authority governs: its question always stands.
+    #[must_use]
+    pub const fn none() -> Self {
         Self {
-            _held: Box::new(held),
+            _daemon: None,
+            standing: Standing::Nothing,
+        }
+    }
+
+    /// A guard that holds `daemon` and asks with `footing`, and with `bound` where the lease's
+    /// reading found one. It allocates nothing: it takes what it is given.
+    pub(crate) fn holding(
+        daemon: Arc<Controller>,
+        footing: Footing,
+        bound: Option<HeldBound>,
+    ) -> Self {
+        Self {
+            _daemon: Some(daemon),
+            standing: match bound {
+                Some(bound) => Standing::Leased(footing.holding(bound)),
+                None => Standing::Open(footing),
+            },
+        }
+    }
+
+    /// The footing's question, asked through the guard ([`Footing::ask`]): no lock is taken,
+    /// nothing is awaited, allocated or let go of, and nothing is written.
+    ///
+    /// # Errors
+    ///
+    /// Returns the member that refuses, and a bound that moved as itself.
+    pub(crate) fn ask(&self, ask: Ask) -> std::result::Result<(), LeasedLapse> {
+        match &self.standing {
+            Standing::Nothing => Ok(()),
+            Standing::Open(footing) => footing.ask(ask).map_err(LeasedLapse::from),
+            Standing::Leased(leased) => leased.ask(ask),
         }
     }
 }
@@ -255,7 +305,8 @@ impl std::fmt::Debug for Guard {
 /// Whether the authority a sign-in was started under still stands, asked when the person completes
 /// it, after the request that started it has answered and its connection has ended. It asks the
 /// fence this host owes and the local owner's membership lease, and neither the request's deadline
-/// nor its connection. Where it stands, it gives the [`Guard`] to hold until the write has returned.
+/// nor its connection. The [`Guard`] is made before the question and the question is asked through
+/// it; where the authority stands, the guard is given to hold until the write has returned.
 pub type Lasting = Arc<dyn Fn() -> Result<Guard> + Send + Sync>;
 
 /// What a finished attempt shows a person's browser.
