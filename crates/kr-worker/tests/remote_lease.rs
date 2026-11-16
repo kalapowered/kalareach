@@ -761,3 +761,101 @@ async fn a_local_forwarded_action_and_a_devices_stop_need_no_lease() {
         .await
         .expect("the closure finishes");
 }
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-09.16: the accepted deadline is asked again in the dispatch marker's step
+// ---------------------------------------------------------------------------------------------
+
+/// What a local `session.attach` comes to when the worker's clock moves by `moved` while the
+/// dispatch stands in the marker's step, between its read of the receipt and its first write.
+async fn attach_while_the_clock_moves(
+    moved: Duration,
+) -> (Host, MutationRequest, Outcome, BoundLink) {
+    let clock = ManualClock::new();
+    let host = host_on(Some(Arc::new(clock.clone()))).await;
+    let mut sender = link(&host, 1, None).await;
+    let mutation = attach(&host);
+    let (reached, release) = {
+        let mut session = host.service.runtime().session();
+        let journal = session.journal_mut().expect("this session keeps a journal");
+        journal.stall_next_marker_before_its_write()
+    };
+    let frame = forwarded(&mutation, ActorIngress::LocalIpc, 1, 0, None);
+    let answering = tokio::spawn(async move {
+        let outcome = answer_to(&mut sender, frame).await;
+        (sender, outcome)
+    });
+    tokio::time::timeout(WAIT, reached)
+        .await
+        .expect("the dispatch reaches the stop in time")
+        .expect("the stop is armed");
+    clock.advance(moved);
+    release.send(()).expect("the dispatch is waiting to go on");
+    let (sender, outcome) = answering.await.expect("the dispatch ends");
+    // The link stays open while the case looks at the session.
+    (host, mutation, outcome, sender)
+}
+
+/// The receipt of an action of `actor_id`.
+fn receipt_for(
+    host: &Host,
+    actor_id: ActorId,
+    mutation: &MutationRequest,
+) -> kr_protocol::receipt::Receipt {
+    let mut session = host.service.runtime().session();
+    session
+        .journal_mut()
+        .expect("a journal")
+        .read(actor_id, mutation.action_id)
+        .expect("reads")
+        .expect("the action has a receipt")
+}
+
+fn local_actor() -> ActorId {
+    ActorId::new("local:501").expect("a principal")
+}
+
+/// How many attachments the session holds: the effect of a `session.attach`, counted.
+fn attachments(host: &Host) -> usize {
+    host.service.runtime().session().attachments().len()
+}
+
+/// Whether the journal holds a dispatch marker's event for the action.
+fn marker_event_written(host: &Host, actor_id: ActorId, mutation: &MutationRequest) -> bool {
+    receipt_for(host, actor_id, mutation)
+        .state
+        .has_dispatch_marker()
+}
+
+/// KR-REQ-09.16: the accepted deadline is asked inside the marker's own step, after the receipt is
+/// read and before the marker's first write. A deadline that passes in that step leaves the receipt
+/// as it was and rejects the action as expired: no marker, and no attachment made. The control, the
+/// same step with the clock where it was, writes the marker and attaches once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_accepted_deadline_that_passes_in_the_markers_step_leaves_no_marker_and_no_effect() {
+    let (host, mutation, outcome, _link) =
+        attach_while_the_clock_moves(Duration::from_secs(121)).await;
+    // What landed is read before what was answered, so that a marker written after the deadline
+    // is what this case reports.
+    assert!(
+        !marker_event_written(&host, local_actor(), &mutation),
+        "the marker was written after the deadline passed"
+    );
+    let receipt = receipt_for(&host, local_actor(), &mutation);
+    assert_eq!(receipt.state, ReceiptState::Rejected, "{receipt:?}");
+    assert_eq!(receipt.reason.as_ref(), Some(&RejectionReason::Expired));
+    assert_eq!(attachments(&host), 0, "the effect was made");
+    let Outcome::Error(error) = &outcome else {
+        panic!("a deadline that passed before the marker's write did not refuse: {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+
+    let (host, mutation, outcome, _link) =
+        attach_while_the_clock_moves(Duration::from_secs(1)).await;
+    assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
+    assert_eq!(
+        receipt_for(&host, local_actor(), &mutation).state,
+        ReceiptState::Applied
+    );
+    assert_eq!(attachments(&host), 1, "the control attaches once");
+}

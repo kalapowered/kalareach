@@ -1047,6 +1047,14 @@ pub struct Broker {
     /// build.
     #[cfg(feature = "testing")]
     submit_pause: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    /// Where this host's own tests stop an approval's answer between its permit's last check and
+    /// its dispatch marker's commit. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    commit_pause: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    /// The instant this host's own tests hold the deadline clock at, where one is held. Compiled
+    /// away in every shipped build.
+    #[cfg(feature = "testing")]
+    held_clock: Mutex<Option<TimestampMs>>,
 }
 
 /// The two ends of one armed pause: what says the recovery arrived, and what lets it go on.
@@ -1198,6 +1206,10 @@ impl Broker {
             marker_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
             submit_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            commit_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            held_clock: Mutex::new(None),
         })
     }
 
@@ -2545,6 +2557,39 @@ impl Broker {
         (watch, release)
     }
 
+    /// Stops the next approval answer between its permit's last check and its dispatch marker's
+    /// commit, on the thread that makes the commit, for this host's own tests: the answer is
+    /// admitted, its permit is taken, and the marker has not asked its own last checks.
+    ///
+    /// Returns the end that says the answer has arrived there and the end that lets it go on. It
+    /// is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_the_marker_commit(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (arrived, watch) = std::sync::mpsc::channel();
+        let (release, go) = std::sync::mpsc::channel();
+        *self
+            .commit_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Waits, blocking this thread, at an armed pause before an answer's marker is committed.
+    #[cfg(feature = "testing")]
+    pub(crate) fn at_commit_pause(&self) {
+        let armed = self
+            .commit_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.recv();
+        }
+    }
+
     /// Waits, blocking this thread, at an armed pause before the transport's call.
     #[cfg(feature = "testing")]
     pub(crate) fn at_submit_pause(&self) {
@@ -2577,6 +2622,33 @@ impl Broker {
     #[cfg(not(feature = "testing"))]
     #[allow(clippy::unused_async)]
     pub(crate) async fn at_marker_pause(&self) {}
+
+    /// The wall clock reading that an operation's resource deadline is compared with where its
+    /// effect lands.
+    #[cfg(not(feature = "testing"))]
+    pub(crate) fn deadline_now(&self) -> TimestampMs {
+        kr_ipc::now_ms()
+    }
+
+    /// The same reading, which this host's own tests can hold at an instant of their own with
+    /// [`Broker::hold_clock_at`].
+    #[cfg(feature = "testing")]
+    pub(crate) fn deadline_now(&self) -> TimestampMs {
+        self.held_clock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(kr_ipc::now_ms)
+    }
+
+    /// Holds the clock that resource deadlines are compared with where an effect lands at `now`,
+    /// or lets it run again, for this host's own tests. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn hold_clock_at(&self, now: Option<TimestampMs>) {
+        *self
+            .held_clock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = now;
+    }
 
     /// Says whether a response the native client wrote answers a request that has already been
     /// taken by another answer or has ended, and where that request stands.
@@ -2620,12 +2692,24 @@ impl Broker {
     /// Returns [`BrokerError::Arbitration`] when this claim does not hold the resource's
     /// transmission admission, and [`BrokerError::LedgerUnavailable`] when the marker cannot be
     /// written.
-    fn commit_dispatch(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
+    fn commit_dispatch(
+        &self,
+        claim: &Claim,
+        against: &AdmittedAgainst,
+        request: &UpstreamRequest,
+        now: TimestampMs,
+    ) -> Result<PendingResource> {
         let mut state = self.state();
         // A fence raised between the admission and this marker is a fence the answer is behind:
         // a marker this host cannot write is one it does not try to.
         state.volatile.require_rich_work()?;
         let transition = state.arbitration.plan_dispatched(claim)?;
+        // The last asks, under the lock that stays held across the write below: what the
+        // admission was checked against, and the two deadlines on clocks read here, not on the
+        // reading the caller took before it waited for this lock. Nothing but the event's
+        // construction stands between them and the write.
+        state.recheck_admitted(against, request)?;
+        against.require_in_time(self.deadline_now())?;
         // The resource's own state does not change here: it was claimed and stays claimed. What
         // changes is the marker, and that is a durable change like any other, so the event that
         // announces it is written in the same transaction and published with it.

@@ -238,6 +238,11 @@ impl UpstreamDispatch for RendezvousUpstream {
 }
 
 async fn host() -> Host {
+    host_on(None).await
+}
+
+/// A host whose worker decides its deadlines on `clock`, where one is given.
+async fn host_on(clock: Option<Arc<dyn kr_transport::clock::ContinuousClock>>) -> Host {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
@@ -295,22 +300,24 @@ async fn host() -> Host {
         .worker_endpoint(DisplayNumber::new(1))
         .expect("an endpoint");
     let listener = Listener::bind(&endpoint).expect("binds the endpoint");
-    let service = Arc::new(
-        WorkerService::new(
-            Arc::clone(&runtime),
-            identity,
-            endpoint.clone(),
-            ServiceBinding {
-                environment_id,
-                boot_identity: boot.clone(),
-                controller_public_key: *controller.public_key(),
-                controller_generation: ControllerGeneration::new(1),
-                journal_path: Some(journal_path),
-                build_id: build(),
-            },
-        )
-        .expect("a worker service"),
-    );
+    let service = WorkerService::new(
+        Arc::clone(&runtime),
+        identity,
+        endpoint.clone(),
+        ServiceBinding {
+            environment_id,
+            boot_identity: boot.clone(),
+            controller_public_key: *controller.public_key(),
+            controller_generation: ControllerGeneration::new(1),
+            journal_path: Some(journal_path),
+            build_id: build(),
+        },
+    )
+    .expect("a worker service");
+    let service = Arc::new(match clock {
+        Some(clock) => service.on_clock(clock),
+        None => service,
+    });
     let serving = kr_ipc::testing::Serving::spawn(Arc::clone(&service).serve(listener));
     Host {
         _serving: serving,
@@ -1160,6 +1167,16 @@ fn offer_approval<U: UpstreamDispatch + 'static>(
     host: &Host,
     upstream: Arc<U>,
 ) -> kr_protocol::ids::PendingResourceId {
+    offer_approval_until(host, upstream, None)
+}
+
+/// The same, for a request whose upstream stops waiting for an answer at `deadline`, where it has
+/// one.
+fn offer_approval_until<U: UpstreamDispatch + 'static>(
+    host: &Host,
+    upstream: Arc<U>,
+    deadline: Option<TimestampMs>,
+) -> kr_protocol::ids::PendingResourceId {
     let broker = host.service.broker();
     broker
         .bind_descriptor(
@@ -1248,7 +1265,7 @@ fn offer_approval<U: UpstreamDispatch + 'static>(
                     label: "Allow".to_owned(),
                 }],
             },
-            None,
+            deadline,
             TimestampMs::new(3),
         )
         .expect("interpreted")
@@ -5055,4 +5072,166 @@ async fn kr_req_10_51_an_answering_action_is_held_to_the_callers_history() {
     .await
     .expect("a history that reaches back to the request answers it");
     assert_eq!(carried(), 2, "the reached approval's answer was carried");
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-09.16: the deadlines of an answer are asked again where its effect lands
+// ---------------------------------------------------------------------------------------------
+
+/// Which of an answer's two deadlines passes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Deadline {
+    /// The deadline the host accepted for the action, on the worker's continuous clock.
+    Accepted,
+    /// The deadline after which the pending request's upstream takes no answer, on the wall clock.
+    Resource,
+}
+
+/// Which wait of an answer a deadline passes in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Wait {
+    /// Between the permit's last check and the commit of the broker's dispatch marker.
+    BeforeTheMarker,
+    /// The hop to the thread that makes the transport's call, after the marker is written.
+    BeforeTheSubmission,
+}
+
+/// What an answer came to when `deadline` passed (or did not) in `wait`.
+struct Answered {
+    outcome: Outcome,
+    /// How many times the transport was asked to carry the answer.
+    carried: usize,
+    /// Whether the broker's dispatch marker is in its ledger: the first write of the answer.
+    marker_written: bool,
+    /// Whether the pending request is still waiting for an answer.
+    still_pending: bool,
+}
+
+async fn answer_whose_deadline(deadline: Deadline, wait: Wait, passes: bool) -> Answered {
+    let clock = kr_transport::clock::ManualClock::new();
+    let host = host_on(Some(Arc::new(clock.clone()))).await;
+    let upstream = Arc::new(CountingUpstream::default());
+    register(&host, None);
+    let resource_ends = TimestampMs::new(kr_ipc::now_ms().get() + 600_000);
+    let resource_id = offer_approval_until(
+        &host,
+        Arc::clone(&upstream),
+        (deadline == Deadline::Resource).then_some(resource_ends),
+    );
+    let mut client = cli(&host).await;
+    let mutation = approval_mutation(&client, &host, 31, resource_id);
+
+    let broker = host.service.broker();
+    let (arrived, release) = match wait {
+        Wait::BeforeTheMarker => broker.pause_before_the_marker_commit(),
+        Wait::BeforeTheSubmission => broker.pause_before_submit(),
+    };
+    let sending = tokio::spawn(async move { send(&mut client, mutation).await });
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(LIVENESS_DEADLINE))
+        .await
+        .expect("the wait ends")
+        .expect("the answer reaches the wait");
+    if passes {
+        match deadline {
+            // The request's accepted lifetime is a minute; the clock is the case's own.
+            Deadline::Accepted => clock.advance(std::time::Duration::from_secs(61)),
+            Deadline::Resource => {
+                broker.hold_clock_at(Some(TimestampMs::new(resource_ends.get() + 1)))
+            }
+        }
+    }
+    release.send(()).expect("the answer is let go");
+    let outcome = sending.await.expect("the mutation is answered");
+
+    let marker_written = rusqlite::Connection::open_with_flags(
+        &host.journal_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("the ledger opens")
+    .query_row(
+        "SELECT dispatched FROM broker_pending WHERE resource_id = ?1",
+        rusqlite::params![resource_id.get().as_bytes().as_slice()],
+        |row| row.get::<_, i64>(0),
+    )
+    .expect("the broker's row is readable")
+        == 1;
+    Answered {
+        outcome,
+        carried: upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        marker_written,
+        still_pending: host
+            .service
+            .broker()
+            .pending(resource_id)
+            .is_some_and(|pending| pending.state == kr_protocol::gateway::PendingState::Pending),
+    }
+}
+
+/// KR-REQ-09.16 and section 9: an answer whose accepted deadline, or whose request's own deadline,
+/// passes while it waits between the permit's last check and the marker's commit is refused at the
+/// marker. The marker is the answer's first write, and it is not written; the transport is never
+/// asked; the request stays answerable. The control, where the deadline does not pass, writes the
+/// marker and carries the answer once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_16_an_answer_whose_deadline_passes_before_its_marker_is_refused_at_the_marker() {
+    for (deadline, code) in [
+        (Deadline::Accepted, ErrorCode::PermissionDenied),
+        (Deadline::Resource, ErrorCode::DraftConflict),
+    ] {
+        let passed = answer_whose_deadline(deadline, Wait::BeforeTheMarker, true).await;
+        let Outcome::Error(error) = passed.outcome else {
+            panic!("{deadline:?} passed before the marker and the answer applied");
+        };
+        assert_eq!(error.code, code, "{deadline:?}");
+        assert!(
+            !passed.marker_written,
+            "{deadline:?}: the marker was written after the deadline passed"
+        );
+        assert_eq!(passed.carried, 0, "{deadline:?}: the transport was asked");
+        assert!(
+            passed.still_pending,
+            "{deadline:?}: the request stays answerable"
+        );
+
+        let control = answer_whose_deadline(deadline, Wait::BeforeTheMarker, false).await;
+        assert!(matches!(control.outcome, Outcome::Ok(_)), "{deadline:?}");
+        assert!(
+            control.marker_written,
+            "{deadline:?}: the control writes its marker"
+        );
+        assert_eq!(
+            control.carried, 1,
+            "{deadline:?}: the control is carried once"
+        );
+    }
+}
+
+/// KR-REQ-09.16 and section 9: an answer whose deadline passes in the hop to the thread that makes
+/// the transport's call is refused there. The marker is already written, so the request is left
+/// uncertain as every failure after the marker leaves it, and the transport is never asked. The
+/// control carries the answer once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_16_an_answer_whose_deadline_passes_before_its_submission_is_refused_there() {
+    for (deadline, code) in [
+        (Deadline::Accepted, ErrorCode::PermissionDenied),
+        (Deadline::Resource, ErrorCode::DraftConflict),
+    ] {
+        let passed = answer_whose_deadline(deadline, Wait::BeforeTheSubmission, true).await;
+        let Outcome::Error(error) = passed.outcome else {
+            panic!("{deadline:?} passed before the submission and the answer applied");
+        };
+        assert_eq!(error.code, code, "{deadline:?}");
+        assert!(
+            passed.marker_written,
+            "{deadline:?}: the marker was before the wait"
+        );
+        assert_eq!(passed.carried, 0, "{deadline:?}: the transport was asked");
+
+        let control = answer_whose_deadline(deadline, Wait::BeforeTheSubmission, false).await;
+        assert!(matches!(control.outcome, Outcome::Ok(_)), "{deadline:?}");
+        assert_eq!(
+            control.carried, 1,
+            "{deadline:?}: the control is carried once"
+        );
+    }
 }
