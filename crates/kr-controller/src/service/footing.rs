@@ -38,7 +38,7 @@ use kr_transport::clock::{ContinuousClock, ContinuousInstant};
 use super::WallClock;
 use crate::authority::AdmissionLapse;
 use crate::error::ControllerError;
-use crate::grants::policy::{HeldBound, Stands, UtcFloor};
+use crate::grants::policy::{BoundSnapshot, HeldBound, Stands, UtcFloor};
 
 /// The copies of this daemon's authority that every [`Footing`] reads: whether a fence is owed,
 /// the authority revision in force, and the clocks.
@@ -81,6 +81,18 @@ impl Copies {
             wall,
             floor,
         }
+    }
+
+    /// Copies that stand for ever: no fence owed, revision zero, the system's clocks. For a case of
+    /// the pairing records that runs no daemon.
+    #[cfg(feature = "testing")]
+    pub(crate) fn standing_for_ever() -> Self {
+        Self::new(
+            AuthorityRevision::new(0),
+            Arc::new(kr_transport::clock::SystemContinuousClock::default()),
+            WallClock::system(),
+            Arc::new(UtcFloor::at(0)),
+        )
     }
 
     /// Whether a fence is owed. Takes no lock.
@@ -470,6 +482,16 @@ impl Footing {
     }
 }
 
+/// The snapshot a [`LeasedFooting`]'s bound published when it was copied out, or none where the
+/// question reads no bound.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CopiedBound(Option<BoundSnapshot>);
+
+impl CopiedBound {
+    /// The copy of a landing that holds no bound.
+    pub(crate) const NONE: Self = Self(None);
+}
+
 impl LeasedFooting {
     /// The question: [`Footing::ask`] and then the bound, for the members `ask` reads.
     ///
@@ -488,10 +510,28 @@ impl LeasedFooting {
     ///
     /// Returns the first member that refuses, and the bound that moved as itself.
     pub(crate) fn ask(&self, ask: Ask) -> Result<(), LeasedLapse> {
-        // Everything the bound's comparison needs is taken before the first read below.
-        let published = ask.bound.then(|| self.bound.published());
+        self.ask_copied(ask, &self.copy(ask))
+    }
+
+    /// The copy of the bound's cell that [`Self::ask_copied`] compares, for the members `ask`
+    /// reads. A landing that asks the feed's refusal where it takes its locks takes this after
+    /// that ask and asks the question with it, so that the copy, which can allocate, is the last
+    /// thing before the question.
+    #[must_use]
+    pub(crate) fn copy(&self, ask: Ask) -> CopiedBound {
+        CopiedBound(ask.bound.then(|| self.bound.published()))
+    }
+
+    /// [`Self::ask`], with the copy of the bound's cell taken earlier by [`Self::copy`] for the
+    /// same `ask`. After the copy nothing allocates, frees, takes a lock or waits.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first member that refuses, and the bound that moved as itself.
+    pub(crate) fn ask_copied(&self, ask: Ask, copied: &CopiedBound) -> Result<(), LeasedLapse> {
+        let published = &copied.0;
         self.footing.ask(ask)?;
-        if let Some(published) = &published {
+        if let Some(published) = published {
             // The continuous clock first and the wall clock after it, as every reader of a bound
             // reads them.
             let now = self.footing.copies.now();

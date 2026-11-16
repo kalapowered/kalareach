@@ -945,7 +945,7 @@ async fn an_issue_whose_identifier_is_spent_meanwhile_spends_no_confirmation() {
     .expect("answered");
 
     let pairing = host.network().pairing();
-    let caller = Caller::local(ActorId::new("local:test").expect("a principal"));
+    let caller = Caller::local(ActorId::new("local:test").expect("a principal")).landed_for_ever();
     let action = ActionId::new(kr_ipc::new_uuid());
     let refused = pairing.invite(
         &caller,
@@ -986,7 +986,7 @@ async fn a_confirmation_whose_identifier_is_spent_meanwhile_spends_no_confirmati
     let owner = Signer::OwnerDevice(&owner_keys);
     let grant = viewer();
     let pairing = host.network().pairing();
-    let caller = Caller::local(ActorId::new("local:test").expect("a principal"));
+    let caller = Caller::local(ActorId::new("local:test").expect("a principal")).landed_for_ever();
     let admitted: Admission = Arc::new(|| Ok(()));
 
     calls::confirm_subject(
@@ -1097,7 +1097,7 @@ async fn a_repeated_confirmation_is_answered_as_a_copy_of_its_record() {
     let owner = Signer::OwnerDevice(&owner_keys);
     let grant = viewer();
     let pairing = host.network().pairing();
-    let caller = Caller::local(ActorId::new("local:test").expect("a principal"));
+    let caller = Caller::local(ActorId::new("local:test").expect("a principal")).landed_for_ever();
     let admitted: Admission = Arc::new(|| Ok(()));
 
     calls::confirm_subject(
@@ -1224,7 +1224,7 @@ async fn a_repeated_withdrawal_is_answered_as_a_copy_of_its_record() {
     let owner = Signer::OwnerDevice(&owner_keys);
     let grant = viewer();
     let pairing = host.network().pairing();
-    let caller = Caller::local(ActorId::new("local:test").expect("a principal"));
+    let caller = Caller::local(ActorId::new("local:test").expect("a principal")).landed_for_ever();
     let admitted: Admission = Arc::new(|| Ok(()));
 
     calls::confirm_subject(

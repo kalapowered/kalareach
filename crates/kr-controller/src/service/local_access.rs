@@ -276,6 +276,24 @@ impl Controller {
         policy.local_owner_bound(self.local_owner_device(), now, now_ms)
     }
 
+    /// What the host's local owner's lease is now, in one reading under the policy lock: whether
+    /// the host is exclusively organisation-managed and the local owner has no live lease, which
+    /// limits a local caller to the recovery set, and the held bound of the lease the reading
+    /// chose, as [`Self::local_hold`] reads it.
+    pub(crate) fn local_owner_scope(&self) -> super::net::owner::LocalScope {
+        let policy = self
+            .policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = self.clock.now();
+        let now_ms = self.settled_utc_now();
+        let (bound, held) = policy.local_owner_hold(self.local_owner_device(), now, now_ms);
+        super::net::owner::LocalScope {
+            closed: bound == LocalOwnerBound::Closed,
+            held,
+        }
+    }
+
     /// Whether the host is exclusively organisation-managed and its local owner has no live
     /// lease: what a local caller may then ask for is the recovery set and nothing else.
     pub(crate) fn local_owner_is_closed(&self) -> bool {
@@ -357,10 +375,14 @@ impl Controller {
         let controller = Arc::downgrade(self);
         super::net::owner::Caller::local(actor_id.clone())
             .confirming_recovery_only(self.local_owner_is_closed())
-            .asking_again_whether_closed(move || {
-                controller
-                    .upgrade()
-                    .is_none_or(|controller| controller.local_owner_is_closed())
+            .asking_again_where_it_stands(move || {
+                controller.upgrade().map_or_else(
+                    || super::net::owner::LocalScope {
+                        closed: true,
+                        held: None,
+                    },
+                    |controller| controller.local_owner_scope(),
+                )
             })
     }
 

@@ -1780,10 +1780,13 @@ async fn a_confirmation_request_another_copy_was_given_is_not_given_back_while_a
     let attempt = async || {
         controller
             .pairing_write(
-                Caller::local(door.actor_id().clone()),
+                Caller::local(door.actor_id().clone()).landed(controller.pairing_landing(
+                    connection_id,
+                    revision,
+                    deadline,
+                )),
                 Method::OwnerConfirmationRequest,
                 &request,
-                controller.pairing_admission(connection_id, revision, deadline),
                 controller.pairing_standing(connection_id, revision),
                 controller.pairing_guard(connection_id, revision, deadline),
                 controller.pairing_life(deadline),
