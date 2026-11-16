@@ -1422,16 +1422,30 @@ async fn ended_before_the_request(
     } else {
         operations.look(startup::ANSWER_BOUND.min(left())).await
     };
-    // Where the request was not made, any answer at the endpoint is an answer, whether or not it
-    // proves the generation of the daemon that was asked.
-    if let Endpoint::Same(answered) | Endpoint::Unproved(answered) = first {
+    if let Some(answered) = first_look_answers(first) {
         return Decided::Answers(answered);
     }
-    match wait_for_the_end(operations, old, left()).await {
-        // A daemon that answers the last look of the wait is an answer, as at the first look.
+    decided_by_the_wait(wait_for_the_end(operations, old, left()).await)
+}
+
+/// What the first look makes of a request that could not be made: any answer at the endpoint is an
+/// answer, whether or not it proves the generation of the daemon that was asked, and nothing else
+/// is.
+fn first_look_answers(look: Endpoint) -> Option<Answered> {
+    match look {
+        Endpoint::Same(answered) | Endpoint::Unproved(answered) => Some(answered),
+        Endpoint::Nobody | Endpoint::Another | Endpoint::Unclear => None,
+    }
+}
+
+/// What the end of the wait makes of a request that could not be made: a daemon that answered the
+/// last look of the wait is an answer, as at the first look; the daemon's end is its end; and
+/// anything else is an end that is not shown.
+fn decided_by_the_wait(end: End) -> Decided {
+    match end {
         End::NotEnded(_, Some(answered)) => Decided::Answers(answered),
         End::NotEnded(_, None) => Decided::NotShown,
-        ended @ (End::Gone | End::Successor(_)) => Decided::Ended(ended),
+        End::Gone | End::Successor(_) => Decided::Ended(end),
     }
 }
 
@@ -1798,6 +1812,7 @@ fn unlooked(id: EnvironmentId, not_known: Option<&Shown>, why: &Shown) -> Shown 
 }
 
 /// Why the daemon had not ended when the wait did.
+#[derive(Clone, Debug)]
 enum Why {
     /// Its process runs, or the lock is held: the daemon is told to stop and goes on.
     Running,
@@ -1815,6 +1830,7 @@ enum Why {
 }
 
 /// How the wait for the daemon's end came out.
+#[derive(Clone, Debug)]
 enum End {
     /// The daemon has ended and the environment is free: its process has gone where its identity
     /// was known, and otherwise the lock is free and nothing answers at its endpoint.
@@ -4962,5 +4978,565 @@ mod tests {
             "{error}"
         );
         drop(held);
+    }
+
+    // The table of the end's decision: every combination of what a round reads and of what a
+    // request came to, walked, written into one file that the repository holds, and read by the
+    // properties of the cases after it.
+
+    /// A set whose every value is listed by a chain: `after` has an arm for each value, so that a
+    /// value added to the set stops the build here until the walk takes it.
+    trait Every: Sized {
+        fn first() -> Self;
+        fn after(&self) -> Option<Self>;
+    }
+
+    /// Every value of `T`, from the chain.
+    fn every<T: Every>() -> Vec<T> {
+        let mut all = vec![T::first()];
+        while let Some(next) = all.last().and_then(T::after) {
+            all.push(next);
+        }
+        all
+    }
+
+    /// What a value is called in the table.
+    trait Label {
+        fn label(&self) -> String;
+    }
+
+    /// What a round's look showed: none where the round made none.
+    type Look = Option<Endpoint>;
+
+    impl Every for Lock {
+        fn first() -> Self {
+            Self::Free
+        }
+
+        fn after(&self) -> Option<Self> {
+            match self {
+                Self::Free => Some(Self::Held),
+                Self::Held => Some(Self::Unreadable(Shown::said("the lock could not be taken"))),
+                Self::Unreadable(_) => None,
+            }
+        }
+    }
+
+    impl Label for Lock {
+        fn label(&self) -> String {
+            match self {
+                Self::Free => "free",
+                Self::Held => "held",
+                Self::Unreadable(_) => "unreadable",
+            }
+            .to_owned()
+        }
+    }
+
+    impl Every for Process {
+        fn first() -> Self {
+            Self::NoIdentity
+        }
+
+        fn after(&self) -> Option<Self> {
+            match self {
+                Self::NoIdentity => Some(Self::Running),
+                Self::Running => Some(Self::Ended),
+                Self::Ended => Some(Self::Unreadable),
+                Self::Unreadable => None,
+            }
+        }
+    }
+
+    impl Label for Process {
+        fn label(&self) -> String {
+            match self {
+                Self::NoIdentity => "no_identity",
+                Self::Running => "running",
+                Self::Ended => "ended",
+                Self::Unreadable => "unreadable",
+            }
+            .to_owned()
+        }
+    }
+
+    impl Every for Holder {
+        fn first() -> Self {
+            Self::NotRead
+        }
+
+        fn after(&self) -> Option<Self> {
+            match self {
+                Self::NotRead => Some(Self::Nobody),
+                Self::Nobody => Some(Self::Asked),
+                Self::Asked => Some(Self::Other(4001)),
+                Self::Other(_) => None,
+            }
+        }
+    }
+
+    impl Label for Holder {
+        fn label(&self) -> String {
+            match self {
+                Self::NotRead => "not_read",
+                Self::Nobody => "nobody",
+                Self::Asked => "asked",
+                Self::Other(_) => "other",
+            }
+            .to_owned()
+        }
+    }
+
+    impl Every for Look {
+        fn first() -> Self {
+            None
+        }
+
+        fn after(&self) -> Option<Self> {
+            match self {
+                None => Some(Some(Endpoint::Nobody)),
+                Some(Endpoint::Nobody) => Some(Some(Endpoint::Same(an_answer()))),
+                Some(Endpoint::Same(_)) => Some(Some(Endpoint::Unproved(an_answer()))),
+                Some(Endpoint::Unproved(_)) => Some(Some(Endpoint::Another)),
+                Some(Endpoint::Another) => Some(Some(Endpoint::Unclear)),
+                Some(Endpoint::Unclear) => None,
+            }
+        }
+    }
+
+    impl Label for Look {
+        fn label(&self) -> String {
+            match self {
+                None => "not_made",
+                Some(Endpoint::Nobody) => "nobody",
+                Some(Endpoint::Same(_)) => "same",
+                Some(Endpoint::Unproved(_)) => "unproved",
+                Some(Endpoint::Another) => "another",
+                Some(Endpoint::Unclear) => "unclear",
+            }
+            .to_owned()
+        }
+    }
+
+    impl Every for Request {
+        fn first() -> Self {
+            Self::Told
+        }
+
+        fn after(&self) -> Option<Self> {
+            match self {
+                Self::Told => Some(Self::MaybeAsked(Shown::said("the connection was lost"))),
+                Self::MaybeAsked(_) => None,
+            }
+        }
+    }
+
+    impl Label for Request {
+        fn label(&self) -> String {
+            match self {
+                Self::Told => "told",
+                Self::MaybeAsked(_) => "maybe_asked",
+            }
+            .to_owned()
+        }
+    }
+
+    impl Every for Start {
+        fn first() -> Self {
+            Self::OtherMajor
+        }
+
+        fn after(&self) -> Option<Self> {
+            match self {
+                Self::OtherMajor => Some(Self::Silent),
+                Self::Silent => Some(Self::NothingListening),
+                Self::NothingListening => None,
+            }
+        }
+    }
+
+    impl Label for Start {
+        fn label(&self) -> String {
+            match self {
+                Self::OtherMajor => "other_major",
+                Self::Silent => "silent",
+                Self::NothingListening => "nothing_listening",
+            }
+            .to_owned()
+        }
+    }
+
+    impl Every for Before {
+        fn first() -> Self {
+            Self::Ended {
+                said: Shown::said("the daemon ended"),
+                pid: Some(4000),
+            }
+        }
+
+        fn after(&self) -> Option<Self> {
+            match self {
+                Self::Ended { .. } => Some(Self::Silent { accepted: true }),
+                Self::Silent { accepted: true } => Some(Self::Silent { accepted: false }),
+                Self::Silent { accepted: false } => Some(Self::Answers(an_answer())),
+                Self::Answers(_) => Some(Self::OwnFault),
+                Self::OwnFault => None,
+            }
+        }
+    }
+
+    impl Label for Before {
+        fn label(&self) -> String {
+            match self {
+                Self::Ended { .. } => "ended",
+                Self::Silent { accepted: true } => "silent_accepted",
+                Self::Silent { accepted: false } => "silent_nothing_accepted",
+                Self::Answers(_) => "answers",
+                Self::OwnFault => "own_fault",
+            }
+            .to_owned()
+        }
+    }
+
+    impl Label for Why {
+        fn label(&self) -> String {
+            match self {
+                Self::Running => "running",
+                Self::Answers => "answers",
+                Self::NotShown => "not_shown",
+                Self::Held => "held",
+                Self::Unlooked(_) => "unlooked",
+            }
+            .to_owned()
+        }
+    }
+
+    impl Label for Option<End> {
+        fn label(&self) -> String {
+            match self {
+                None => "go_on".to_owned(),
+                Some(End::Gone) => "gone".to_owned(),
+                Some(End::Successor(pid)) => format!(
+                    "successor({})",
+                    pid.map_or_else(|| "-".to_owned(), |pid| pid.to_string())
+                ),
+                Some(End::NotEnded(why, answered)) => format!(
+                    "not_ended:{} answered={}",
+                    why.label(),
+                    if answered.is_some() { "yes" } else { "no" }
+                ),
+            }
+        }
+    }
+
+    impl Label for AfterRequest {
+        fn label(&self) -> String {
+            match self {
+                Self::Stopped => "stopped",
+                Self::Successor(_) => "successor",
+                Self::NotEnded => "not_ended",
+                Self::NotShown => "not_shown",
+                Self::StillHeld => "still_held",
+                Self::Unlooked(_) => "unlooked",
+            }
+            .to_owned()
+        }
+    }
+
+    impl Label for BeforeRequest {
+        fn label(&self) -> String {
+            match self {
+                Self::Ended { .. } => "ended",
+                Self::HoldsAndSilent => "holds_and_is_silent",
+                Self::Silent => "silent",
+                Self::Unmade(Unmade::Answered(_)) => "unmade:answered",
+                Self::Unmade(Unmade::OwnFault) => "unmade:own_fault",
+                Self::Unmade(Unmade::NothingListening) => "unmade:nothing_listening",
+            }
+            .to_owned()
+        }
+    }
+
+    impl Label for AtStart {
+        fn label(&self) -> String {
+            match self {
+                Self::OtherMajor => "other_major",
+                Self::NoDaemon => "no_daemon",
+                Self::HoldsAndSilent => "holds_and_is_silent",
+                Self::Silent => "silent",
+                Self::LockUnreadable(_) => "lock_unreadable",
+            }
+            .to_owned()
+        }
+    }
+
+    impl Label for Decided {
+        fn label(&self) -> String {
+            match self {
+                Self::Ended(End::Gone) => "ended",
+                Self::Ended(End::Successor(_)) => "ended_by_a_successor",
+                Self::Ended(End::NotEnded(..)) => "ended?",
+                Self::NotShown => "not_shown",
+                Self::Answers(_) => "answers",
+            }
+            .to_owned()
+        }
+    }
+
+    /// The exit code of a result.
+    fn code_of(exit: Exit) -> u8 {
+        exit.failure(Shown::said("a failure"))
+            .map_or(0, |error| error.exit_code())
+    }
+
+    /// What a result says in the table: the kind of sentence, the exit code and the `stop` member.
+    fn said_line<S: Label>(said: &Said<S>) -> String {
+        format!(
+            "{} exit={} stop={}",
+            said.sentence.label(),
+            code_of(said.exit),
+            said.stop.word()
+        )
+    }
+
+    /// What a round reads, in the table.
+    fn readings(round: &Round) -> String {
+        format!(
+            "lock={} process={} holder={} look={}",
+            round.lock.label(),
+            round.process.label(),
+            round.holder.label(),
+            round.look.label()
+        )
+    }
+
+    /// Every combination of what a round reads, with the successor that the lock file names after
+    /// a look of another generation.
+    fn every_round() -> Vec<Round> {
+        let mut all = Vec::new();
+        for lock in every::<Lock>() {
+            for process in every::<Process>() {
+                for holder in every::<Holder>() {
+                    for look in every::<Look>() {
+                        all.push(Round {
+                            lock: lock.clone(),
+                            process,
+                            holder,
+                            look,
+                            successor: matches!(look, Some(Endpoint::Another)).then_some(5000),
+                        });
+                    }
+                }
+            }
+        }
+        all
+    }
+
+    /// Whether a round can happen: the holder is read where [`holder_wanted`] says so (and the asked
+    /// process is named only where an identity exists), and the look is made where [`look_wanted`]
+    /// says so. These are the rounds that the wait makes.
+    fn reachable(round: &Round) -> bool {
+        let wanted = holder_wanted(&round.lock, round.process);
+        let holder_read = match round.holder {
+            Holder::NotRead => !wanted,
+            Holder::Asked => wanted && round.process != Process::NoIdentity,
+            Holder::Nobody | Holder::Other(_) => wanted,
+        };
+        holder_read && round.look.is_some() == look_wanted(&round.lock, round.process, round.holder)
+    }
+
+    /// The rounds that can happen, made by asking [`holder_wanted`] and [`look_wanted`] and not by a
+    /// list: one round where no look is made, and one for each value of the look where one is.
+    fn the_rounds_that_happen() -> Vec<Round> {
+        let mut all = Vec::new();
+        for lock in every::<Lock>() {
+            for process in every::<Process>() {
+                let holders: Vec<Holder> = if holder_wanted(&lock, process) {
+                    every::<Holder>()
+                        .into_iter()
+                        .filter(|holder| *holder != Holder::NotRead)
+                        .filter(|holder| *holder != Holder::Asked || process != Process::NoIdentity)
+                        .collect()
+                } else {
+                    vec![Holder::NotRead]
+                };
+                for holder in holders {
+                    let looks: Vec<Look> = if look_wanted(&lock, process, holder) {
+                        every::<Look>().into_iter().flatten().map(Some).collect()
+                    } else {
+                        vec![None]
+                    };
+                    for look in looks {
+                        all.push(Round {
+                            lock: lock.clone(),
+                            process,
+                            holder,
+                            look,
+                            successor: matches!(look, Some(Endpoint::Another)).then_some(5000),
+                        });
+                    }
+                }
+            }
+        }
+        all
+    }
+
+    const TABLE_HEADER: &str = "\
+# Generated by the lib case host_stop::tests::the_table_of_the_end_is_the_file of kr-cli. Make it again: KR_WRITE_END_TABLE=1 cargo test -p kr-cli --lib host_stop::tests::the_table_of_the_end_is_the_file (the case fails once after it writes; run it again without the variable).
+# One line per combination. A change of what `kr host stop` says or exits with at its end is a change of this file.
+# rounds: every combination of what a round of the wait reads (lock, process, holder named, look), with whether the bound is reached,
+#   whether the wait can make that round (`reachable`), and what the round shows: gone, successor(pid), go_on, or not_ended:<why> with
+#   whether something answered the last look (a proved generation or not).
+# after a request: the rounds that can happen, at the bound, for a told request and one whose outcome was not shown: the kind of
+#   sentence, the exit code and the `stop` member of `--json`.
+# before a request: the decision of the wait for a request that could not be made, what is said for each way the failure came out
+#   (with the lock read again where the decision asks for it), the first look, and the start of the command.
+";
+
+    /// The whole table, as the file holds it.
+    fn the_table() -> String {
+        let mut out = String::from(TABLE_HEADER);
+        out.push_str("\n## rounds\n");
+        for round in every_round() {
+            for at_bound in [false, true] {
+                out.push_str(&format!(
+                    "{} bound={} reachable={} -> {}\n",
+                    readings(&round),
+                    if at_bound { "yes" } else { "no" },
+                    if reachable(&round) { "yes" } else { "no" },
+                    what_the_round_shows(&round, at_bound).label()
+                ));
+            }
+        }
+        out.push_str("\n## after a request that was written, at the bound\n");
+        for round in the_rounds_that_happen() {
+            let end =
+                what_the_round_shows(&round, true).expect("a round at the bound shows an end");
+            for request in every::<Request>() {
+                let said = said_after_the_request(end.clone(), &request);
+                out.push_str(&format!(
+                    "{} request={} -> {}\n",
+                    readings(&round),
+                    request.label(),
+                    said_line(&said)
+                ));
+            }
+        }
+        out.push_str(
+            "\n## a request that could not be made: what the wait decides, at the bound\n",
+        );
+        for round in the_rounds_that_happen() {
+            let end =
+                what_the_round_shows(&round, true).expect("a round at the bound shows an end");
+            out.push_str(&format!(
+                "{} -> {}\n",
+                readings(&round),
+                decided_by_the_wait(end).label()
+            ));
+        }
+        out.push_str("\n## a request that could not be made: what is said, with the lock read again where asked\n");
+        for lock in every::<Lock>() {
+            for before in every::<Before>() {
+                let label = before.label();
+                let asked = std::cell::Cell::new(false);
+                let said = said_before_the_request(before, || {
+                    asked.set(true);
+                    lock.clone()
+                });
+                if asked.get() {
+                    out.push_str(&format!(
+                        "before={} lock_again={} -> {}\n",
+                        label,
+                        lock.label(),
+                        said_line(&said)
+                    ));
+                } else if matches!(lock, Lock::Free) {
+                    out.push_str(&format!(
+                        "before={} lock_again=- -> {}\n",
+                        label,
+                        said_line(&said)
+                    ));
+                }
+            }
+        }
+        out.push_str("\n## a request that could not be made: the first look, made where the connection was not closed\n");
+        out.push_str("closed=yes: no look is made, and the wait decides\n");
+        for look in every::<Look>().into_iter().flatten() {
+            out.push_str(&format!(
+                "closed=no look={} -> {}\n",
+                Some(look).label(),
+                if first_look_answers(look).is_some() {
+                    "answers"
+                } else {
+                    "the wait decides"
+                }
+            ));
+        }
+        out.push_str("\n## the start of the command\n");
+        for start in every::<Start>() {
+            for lock in every::<Lock>() {
+                let said = said_at_the_start(&start, || lock.clone());
+                out.push_str(&format!(
+                    "start={} lock={} -> {}\n",
+                    start.label(),
+                    lock.label(),
+                    said_line(&said)
+                ));
+            }
+        }
+        out
+    }
+
+    /// The table that the code makes is the table that the repository holds: a change of a
+    /// decision, a sentence's kind, an exit or a `stop` member shows as a change of the file.
+    #[test]
+    fn the_table_of_the_end_is_the_file() {
+        let made = the_table();
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/host_stop_end_table.txt");
+        if std::env::var_os("KR_WRITE_END_TABLE").is_some() {
+            std::fs::write(path, &made).expect("the table is written");
+            panic!(
+                "the table was written to {path}; build and run the case again without KR_WRITE_END_TABLE"
+            );
+        }
+        let held = include_str!("../tests/host_stop_end_table.txt");
+        if made != held {
+            let (made_lines, held_lines): (Vec<_>, Vec<_>) =
+                (made.lines().collect(), held.lines().collect());
+            let first = (0..made_lines.len().max(held_lines.len()))
+                .find(|index| made_lines.get(*index) != held_lines.get(*index))
+                .unwrap_or(0);
+            let said: Vec<String> = (first..first + 6)
+                .filter(|index| *index < made_lines.len().max(held_lines.len()))
+                .map(|index| {
+                    format!(
+                        "line {}:\n  file: {}\n  made: {}",
+                        index + 1,
+                        held_lines.get(index).unwrap_or(&"(none)"),
+                        made_lines.get(index).unwrap_or(&"(none)")
+                    )
+                })
+                .collect();
+            panic!(
+                "the table that the code makes differs from crates/kr-cli/tests/host_stop_end_table.txt from line {}:\n{}",
+                first + 1,
+                said.join("\n")
+            );
+        }
+    }
+
+    /// The rounds that the wait can make, asked of the two small functions, are the combinations
+    /// that [`reachable`] keeps of the whole product.
+    #[test]
+    fn the_rounds_that_happen_are_those_of_the_whole_product_that_the_wait_can_make() {
+        let all = every_round();
+        let made = the_rounds_that_happen();
+        let kept: Vec<String> = all
+            .iter()
+            .filter(|round| reachable(round))
+            .map(readings)
+            .collect();
+        assert_eq!(made.iter().map(readings).collect::<Vec<_>>(), kept);
+        assert!(made.len() < all.len());
     }
 }
