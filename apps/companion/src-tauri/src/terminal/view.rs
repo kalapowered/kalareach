@@ -809,9 +809,13 @@ struct View {
     /// The calls the view has started, which the loop polls before it takes anything else. A call
     /// is never dropped before it completes while the loop runs.
     requests: FuturesUnordered<BoxFuture<'static, Done>>,
-    /// The keys the lane has taken and the host has not answered, by their epoch and number in
-    /// it, and the view's number for each, which the lease knows it by.
-    keys: BTreeMap<(u64, u64), RequestId>,
+    /// Every key the lane has taken and has not settled, in every epoch, by its epoch and number in
+    /// it. The lane settles a key when it says the host accepted or refused it, or that no key of
+    /// its epoch is in flight, and nothing else takes a key off: a key of an older epoch that is
+    /// in flight stays, because the lane's writer still waits for the host's answer to it. The
+    /// value is the view's number for the key, which the lease knows it by, until the lease was
+    /// told that the key's epoch is over.
+    keys: BTreeMap<(u64, u64), Option<RequestId>>,
     /// The endings that wait for the host to have the typing before them.
     endings: Vec<Barred>,
     /// The launches whose later typing the lane holds, by the view's number for the launch, and the
@@ -903,6 +907,21 @@ async fn next_lane_event(events: &mut Option<InputEvents>) -> Option<InputEvent>
     match events {
         Some(events) => events.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+/// Waits until the lane says the host has the typing before `barrier`, or will not have it, or the
+/// lane ended.
+async fn barrier_passed(events: &mut InputEvents, barrier: &InputBarrier) {
+    while let Some(event) = events.recv().await {
+        match event {
+            InputEvent::Reached(reached) if &reached == barrier => return,
+            InputEvent::NotReached {
+                barrier: missed, ..
+            } if &missed == barrier => return,
+            InputEvent::Ended { .. } => return,
+            _ => {}
+        }
     }
 }
 
@@ -1576,7 +1595,7 @@ impl View {
             };
             let tag = self.next_id();
             self.lease.written(tag, epoch);
-            self.keys.insert((epoch.get(), sequence.get()), tag);
+            self.keys.insert((epoch.get(), sequence.get()), Some(tag));
         }
         None
     }
@@ -1589,20 +1608,17 @@ impl View {
         if self.lane_epoch == Some(epoch) {
             return;
         }
-        if lane.begin_epoch(epoch).is_ok() {
-            self.lane_epoch = Some(epoch);
-            // The frames of an older epoch are settled by the lane's own events for it, or are not
-            // written: none of them waits for an answer the view will read.
-            let older: Vec<(u64, u64)> = self
-                .keys
-                .keys()
-                .copied()
-                .filter(|(of, _)| *of < epoch.get())
-                .collect();
-            for key in older {
-                if let Some(tag) = self.keys.remove(&key) {
-                    self.lease.answered(tag, Ok(ParamsValue::empty()));
-                }
+        if lane.begin_epoch(epoch).is_err() {
+            return;
+        }
+        self.lane_epoch = Some(epoch);
+        // The lane gives no event for a frame of an older epoch that is answered after this, so
+        // the lease is told now that none of them waits for an answer it will read. The lane still
+        // has such a frame unsettled while the host has not answered it, and the record keeps it:
+        // the lane's writer waits for that answer, and what is queued behind it waits too.
+        for tag in self.keys.range_mut(..(epoch.get(), 0)).map(|(_, tag)| tag) {
+            if let Some(tag) = tag.take() {
+                self.lease.answered(tag, Ok(ParamsValue::empty()));
             }
         }
     }
@@ -1651,23 +1667,8 @@ impl View {
                 error,
                 ..
             } => {
-                let refused = self.keys.remove(&(epoch.get(), sequence.get()));
-                let later: Vec<(u64, u64)> = self
-                    .keys
-                    .range((epoch.get(), sequence.get())..)
-                    .map(|(key, _)| *key)
-                    .filter(|(of, _)| *of == epoch.get())
-                    .collect();
-                // The first refusal ends the epoch, and the frames after it are refused with it.
-                if let Some(tag) = refused
-                    && self.lease.answered(tag, Err(error))
-                {
+                if self.refused(epoch, sequence, error) {
                     self.control_changed();
-                }
-                for key in later {
-                    if let Some(tag) = self.keys.remove(&key) {
-                        self.lease.answered(tag, Ok(ParamsValue::empty()));
-                    }
                 }
                 None
             }
@@ -1698,18 +1699,54 @@ impl View {
         }
     }
 
-    /// The host accepted the keys of `epoch` up to `through`: each is answered, as accepted.
+    /// The host accepted the keys of `epoch` up to `through`: each is answered, as accepted. The
+    /// lane writes one key at a time and waits for the host's answer to each, so no key before
+    /// the accepted one, in this epoch or an older one, is in flight any more: they are settled
+    /// with it.
     fn accepted(&mut self, epoch: InputLeaseEpoch, through: kr_protocol::ids::InputSequence) {
         let accepted: Vec<(u64, u64)> = self
             .keys
-            .range((epoch.get(), 0)..=(epoch.get(), through.get()))
+            .range(..=(epoch.get(), through.get()))
             .map(|(key, _)| *key)
             .collect();
         for key in accepted {
-            if let Some(tag) = self.keys.remove(&key) {
+            if let Some(Some(tag)) = self.keys.remove(&key) {
                 self.lease.answered(tag, Ok(ParamsValue::empty()));
             }
         }
+    }
+
+    /// The host refused the key `sequence` of `epoch`: it and every later key of the epoch are
+    /// settled as refused, and every key before it as answered. Returns whether the lease says
+    /// control ended.
+    fn refused(
+        &mut self,
+        epoch: InputLeaseEpoch,
+        sequence: kr_protocol::ids::InputSequence,
+        error: ProtocolError,
+    ) -> bool {
+        let at = (epoch.get(), sequence.get());
+        let before: Vec<(u64, u64)> = self.keys.range(..at).map(|(key, _)| *key).collect();
+        for key in before {
+            if let Some(Some(tag)) = self.keys.remove(&key) {
+                self.lease.answered(tag, Ok(ParamsValue::empty()));
+            }
+        }
+        let refused = self.keys.remove(&at).flatten();
+        let later: Vec<(u64, u64)> = self
+            .keys
+            .range(at..)
+            .map(|(key, _)| *key)
+            .filter(|(of, _)| *of == epoch.get())
+            .collect();
+        // The first refusal ends the epoch, and the frames after it are refused with it.
+        let ended = refused.is_some_and(|tag| self.lease.answered(tag, Err(error)));
+        for key in later {
+            if let Some(Some(tag)) = self.keys.remove(&key) {
+                self.lease.answered(tag, Ok(ParamsValue::empty()));
+            }
+        }
+        ended
     }
 
     /// Sends the ending that waited for `barrier`.
@@ -1999,12 +2036,21 @@ impl View {
     async fn finish(&mut self, detach: bool) {
         self.requests = FuturesUnordered::new();
         // What the lane already knows of the keys is applied before the detach is placed: a key
-        // that the host answered and whose acceptance the view has not read yet is not one that
-        // waits.
+        // that the host answered and whose acceptance or refusal the view has not read yet is not
+        // one that waits.
         tokio::task::yield_now().await;
         while let Some(event) = self.lane_events.as_mut().and_then(InputEvents::try_recv) {
-            if let InputEvent::Accepted { epoch, through, .. } = event {
-                self.accepted(epoch, through);
+            match event {
+                InputEvent::Accepted { epoch, through, .. } => self.accepted(epoch, through),
+                InputEvent::Refused {
+                    epoch,
+                    sequence,
+                    error,
+                    ..
+                } => {
+                    let _ = self.refused(epoch, sequence, error);
+                }
+                _ => {}
             }
         }
         if detach {
@@ -2017,10 +2063,13 @@ impl View {
     /// Writes the detach whole, behind the typing the lane holds.
     ///
     /// On a link that carries the typing as requests it is queued behind the keys, and the view
-    /// waits for it to be written only when no key waits for the host's answer: a key that the host
-    /// has not answered holds the lane's writer, the view does not wait for it, and the connection's
-    /// end, which the worker detaches on, is what ends the attachment. On a link with a stream of
-    /// its own the detach waits for the lane to say the host has the typing, which the lane bounds.
+    /// waits for it to be written only when the lane has settled every key, in every epoch: a key
+    /// that the host has not answered holds the lane's writer, the view does not wait for it, and
+    /// the connection's end, which the worker detaches on, is what ends the attachment. On a link
+    /// with a stream of its own the detach waits for the lane to say the host has the typing, which
+    /// the lane bounds. Whatever it waits for, the view reads and drops what the session says
+    /// meanwhile, so that the session's reader, which waits for room in its channel while the view
+    /// does not read, is never what the wait waits for.
     async fn detach(&mut self) {
         let attachment_id = self.attachment.attachment_id;
         let params = move |after_input| SessionDetachParams {
@@ -2033,7 +2082,11 @@ impl View {
         if self.networked && placed {
             let barrier = self.lane.as_ref().and_then(|lane| lane.mark(None).ok());
             if let Some(barrier) = barrier {
-                self.barrier_passed(&barrier).await;
+                if let Some(lane_events) = self.lane_events.as_mut() {
+                    self.events
+                        .dropping_during(barrier_passed(lane_events, &barrier))
+                        .await;
+                }
                 let Ok(composed) = self
                     .link
                     .compose(
@@ -2045,7 +2098,10 @@ impl View {
                 else {
                     return;
                 };
-                let _ = self.link.send_whole(&composed).await;
+                let _ = self
+                    .events
+                    .dropping_during(self.link.send_whole(&composed))
+                    .await;
                 return;
             }
         }
@@ -2075,30 +2131,15 @@ impl View {
         match queued {
             Some((Ok(_answer), wait)) => {
                 if self.keys.is_empty() {
-                    let _ = wait.await;
+                    let _ = self.events.dropping_during(wait).await;
                 }
             }
             // Nothing was queued: the lane cannot place it, or there is no lane.
             Some((Err(_), _)) | None => {
-                let _ = self.link.send_whole(&composed).await;
-            }
-        }
-    }
-
-    /// Waits until the lane says the host has the typing before `barrier`, or will not have it, or
-    /// the lane ended.
-    async fn barrier_passed(&mut self, barrier: &InputBarrier) {
-        let Some(events) = self.lane_events.as_mut() else {
-            return;
-        };
-        while let Some(event) = events.recv().await {
-            match event {
-                InputEvent::Reached(reached) if &reached == barrier => return,
-                InputEvent::NotReached {
-                    barrier: missed, ..
-                } if &missed == barrier => return,
-                InputEvent::Ended { .. } => return,
-                _ => {}
+                let _ = self
+                    .events
+                    .dropping_during(self.link.send_whole(&composed))
+                    .await;
             }
         }
     }
