@@ -5069,6 +5069,135 @@ fn an_identifier_two_actors_used_identifies_nothing_to_cancel() {
     );
 }
 
+/// KR-REQ-09.14, KR-REQ-23.30: a rejection owed for an acceptance leaves the receipt of a later
+/// acceptance that took the same identity.
+///
+/// Every new receipt is written at revision 1, so the revision cannot tell two receipts of one
+/// identity apart. The order: an action is accepted; its rejection is deferred; retention removes
+/// the receipt; the same identity is accepted again; the deferred rejection runs against the first
+/// acceptance's sequence, and the new receipt stays accepted. The second acceptance's own sequence
+/// rejects it, and a duplicate of an acceptance names that acceptance's sequence.
+#[test]
+fn a_deferred_rejection_leaves_the_receipt_that_took_the_identity_after_retention() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let path = temp
+        .environment()
+        .journal_database(SessionId::new(kr_ipc::new_uuid()));
+    let mut journal = Journal::open(&path).expect("a journal");
+    let phone = || actor("device:phone");
+    let first = journal
+        .accept(&at(1, 1, 1, TimestampMs::new(1_000)))
+        .expect("the first acceptance");
+    assert!(!first.deduplicated);
+    assert_ne!(first.sequence, 0, "a new acceptance has an event sequence");
+    assert_eq!(
+        journal
+            .acceptance_sequence(&phone(), action(1))
+            .expect("reads"),
+        first.sequence
+    );
+    let duplicate = journal
+        .accept(&at(1, 1, 1, TimestampMs::new(1_000)))
+        .expect("an exact retry");
+    assert!(duplicate.deduplicated);
+    assert_eq!(
+        duplicate.sequence, first.sequence,
+        "a duplicate names the acceptance that made the receipt"
+    );
+
+    // Retention removes the receipt with its events: the record reads as an earlier run's, which
+    // is what a record past the retention period always is.
+    rusqlite::Connection::open(&path)
+        .expect("the same database")
+        .execute(
+            "UPDATE receipts SET created_boot = NULL, created_continuous_ms = NULL
+             WHERE action_id = ?1",
+            rusqlite::params![action(1).get().as_bytes().as_slice()],
+        )
+        .expect("the record reads as an earlier run's");
+    assert_eq!(
+        journal
+            .prune(TimestampMs::new(RETENTION_MS + 2_000))
+            .expect("prunes"),
+        1
+    );
+    assert!(
+        journal.read(phone(), action(1)).expect("reads").is_none(),
+        "retention removed the receipt"
+    );
+
+    let second = journal
+        .accept(&at(1, 1, 1, kr_ipc::now_ms()))
+        .expect("the same identity is accepted again");
+    assert!(!second.deduplicated);
+    assert_eq!(
+        first.receipt.revision, second.receipt.revision,
+        "both receipts are at revision 1: the revision cannot tell them apart"
+    );
+    assert_ne!(
+        first.sequence, second.sequence,
+        "the journal allocates each sequence once"
+    );
+
+    let reason = kr_protocol::receipt::RejectionReason::AdmissionFailed;
+    assert!(
+        !journal
+            .reject_if_accepted_at(
+                phone(),
+                action(1),
+                first.sequence,
+                reason,
+                None,
+                kr_ipc::now_ms()
+            )
+            .expect("the deferred rejection runs"),
+        "the deferred rejection leaves the new receipt"
+    );
+    assert_eq!(
+        journal
+            .read(phone(), action(1))
+            .expect("reads")
+            .expect("a receipt")
+            .state,
+        ReceiptState::Accepted,
+        "the new receipt stays accepted"
+    );
+    assert!(
+        journal
+            .reject_if_accepted_at(
+                phone(),
+                action(1),
+                second.sequence,
+                reason,
+                None,
+                kr_ipc::now_ms()
+            )
+            .expect("the rejection of its own acceptance runs"),
+        "the new receipt's own acceptance rejects it"
+    );
+    assert_eq!(
+        journal
+            .read(phone(), action(1))
+            .expect("reads")
+            .expect("a receipt")
+            .state,
+        ReceiptState::Rejected
+    );
+    assert!(
+        !journal
+            .reject_if_accepted_at(
+                phone(),
+                action(1),
+                second.sequence,
+                reason,
+                None,
+                kr_ipc::now_ms()
+            )
+            .expect("a second run"),
+        "a receipt that has moved on is left as it is"
+    );
+}
+
 /// KR-REQ-09.14, KR-REQ-09.15: retention never deletes a record whose own freshness window could
 /// still admit its exact original request.
 #[test]
