@@ -515,6 +515,23 @@ impl LeasedFooting {
     }
 }
 
+/// What the question of a lease was asked with. The writer of an answer holds it from the question
+/// until the transport has taken what the question let through, so that letting go of it, which
+/// can free memory, never stands between the question and the write.
+#[derive(Default)]
+pub struct LeaseAsked {
+    _leased: Option<LeasedFooting>,
+}
+
+impl LeaseAsked {
+    /// What a question was asked with where the lease's bound was read.
+    pub(crate) const fn with(leased: LeasedFooting) -> Self {
+        Self {
+            _leased: Some(leased),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;

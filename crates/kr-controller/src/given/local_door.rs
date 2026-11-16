@@ -15,13 +15,12 @@ use kr_protocol::ids::RequestId;
 use kr_protocol::method::Method;
 
 use super::{Origin, Settled, may_have_taken_effect, names_a_reused_identifier};
-use crate::attention::LeaseAsked;
 use crate::authority::AdmissionLapse;
 use crate::error::ControllerError;
 use crate::grants::policy::HeldBound;
 use crate::service::{
-    Ask, Controller, EnvelopeRefused, Footing, HostWithdrawal, Lapse, LeaseNotLive, LeasedLapse,
-    SpendFailed, Unauthorised, error_reply, respond,
+    Ask, Controller, EnvelopeRefused, Footing, HostWithdrawal, Lapse, LeaseAsked, LeaseNotLive,
+    LeasedLapse, SpendFailed, Unauthorised, error_reply, respond,
 };
 
 /// What the local door answers a mutation with, and so how the answer is written.

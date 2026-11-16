@@ -383,42 +383,44 @@ async fn a_fresh_reply_asks_the_registration_and_no_fence() {
 /// that nothing was done, and it is the door's verdict that reaches the writer, whatever the code
 /// of the refusal is. Told through the door and written through the sink, such a refusal whose
 /// registration is withdrawn in the pause after the lease's reading is not shown, where a fresh
-/// refusal of the same code is the registration's refusal. The control: with the registration
-/// standing, the refusal is written as it is.
+/// refusal of the same code is the registration's refusal, and so is one that a service withheld
+/// (its answer is a refusal read from a record that is not the caller's to be told). The control:
+/// with the registration standing, the refusal is written as it is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refusal_made_after_an_effect_is_not_shown_when_its_registration_goes_before_the_write() {
     use crate::given::local_door::{ReplySink, Standing, told};
     use crate::given::{Given, Settled};
 
-    for (name, after_an_effect, withdrawn, expected) in [
+    for (name, given_of, withdrawn, expected) in [
         (
             "after an effect, the registration withdrawn",
-            true,
+            Given::after_an_effect as fn(ControlFrame) -> Given<ControlFrame>,
             true,
             not_shown(),
         ),
         (
             "after an effect, the registration standing",
-            true,
+            Given::after_an_effect,
             false,
             a_definite_refusal(),
         ),
         (
             "a fresh refusal, the registration withdrawn",
-            false,
+            Given::fresh,
             true,
             registration_gone(),
+        ),
+        (
+            "a refusal the service withheld, the registration withdrawn",
+            Given::withheld,
+            true,
+            not_shown(),
         ),
     ] {
         let (_temp, controller, mut writer, reader) = connected(false).await;
         let (connection_id, _, footing) = registered(&controller);
-        let given = if after_an_effect {
-            Given::after_an_effect(a_definite_refusal())
-        } else {
-            Given::fresh(a_definite_refusal())
-        };
         let reply = told(
-            Settled::of(given),
+            Settled::of(given_of(a_definite_refusal())),
             &Standing::new(&controller, footing, REQUEST),
         )
         .await;
@@ -581,9 +583,87 @@ async fn the_ask_that_finds_a_bound_moved_reads_the_lease_again_and_does_not_ref
     });
     arrival(arrived).await;
     presenter.present(&[kr_protocol::rights::ActionRight::FilesRead]);
+    // The second reading of the lease reaches the pause again: the ask read it, and does not
+    // return the moved bound as a pass.
+    let (arrived_again, go_again) = controller.pause_after_the_lease_is_read();
     go.send(()).expect("the ask goes on");
+    arrival(arrived_again).await;
+    go_again.send(()).expect("the ask goes on");
     assert!(
         asking.await.expect("the ask ends").is_ok(),
         "the ask goes by the lease's second reading"
+    );
+}
+
+/// KR-REQ-09.09: a frame larger than one checked write is asked once before each piece, and what
+/// the question of one piece was asked with is let go before the question of the next. The shared
+/// value's count at the pause after the lease's reading of the second piece is the count at the
+/// first piece's pause: a slot left to be overwritten by the next question would hold the old
+/// value across that question, and the count would be one more. The reader reads while the writer
+/// writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn what_a_piece_was_asked_with_is_let_go_before_the_next_piece_is_asked() {
+    let (_temp, controller, _continuous, writer, mut reader) = connected_under_a_lease().await;
+    let (_, _, footing) = registered(&controller);
+    let under = WrittenUnder::for_an_own_effect_case(footing, true);
+    let frame = ControlFrame::Response(Response {
+        request_id: REQUEST,
+        outcome: Outcome::Ok(
+            ParamsValue::from_typed(&"x".repeat(3 * kr_ipc::framed::CHECKED_WRITE_BYTES / 2))
+                .expect("a large value"),
+        ),
+    });
+    let reading = tokio::spawn(async move {
+        let mut handed = Vec::new();
+        while let Ok(read) = tokio::time::timeout(
+            Duration::from_secs(30),
+            reader.read_message::<ControlFrame>(),
+        )
+        .await
+        .expect("the daemon wrote or ended the connection")
+        {
+            handed.push(read);
+        }
+        handed
+    });
+    let (arrived, go) = controller.pause_after_the_lease_is_read();
+    let writing = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        let frame = frame.clone();
+        async move {
+            let mut writer = writer;
+            let stood = controller
+                .write_answer(
+                    &mut writer,
+                    StreamKind::Control,
+                    &frame,
+                    Some(Method::PrivacySet),
+                    REQUEST,
+                    &under,
+                )
+                .await;
+            drop(writer);
+            stood
+        }
+    });
+    arrival(arrived).await;
+    let at_the_first_piece = Arc::strong_count(&controller.copies);
+    let (arrived, go_again) = controller.pause_after_the_lease_is_read();
+    go.send(()).expect("the writer goes on");
+    arrival(arrived).await;
+    let at_the_second_piece = Arc::strong_count(&controller.copies);
+    go_again.send(()).expect("the writer goes on");
+    assert!(
+        writing.await.expect("the write ends"),
+        "the connection goes on"
+    );
+    assert_eq!(
+        reading.await.expect("the reader ends"),
+        vec![frame],
+        "the whole frame reached the reader"
+    );
+    assert_eq!(
+        at_the_second_piece, at_the_first_piece,
+        "what the first piece was asked with is let go before the second is asked"
     );
 }
