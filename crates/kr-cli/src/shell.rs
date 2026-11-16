@@ -683,6 +683,9 @@ mod tests {
     use crate::shown::marker::MARKER;
     use kr_shell_integration::host::startup::Placement;
 
+    #[cfg(unix)]
+    mod question_table;
+
     /// The roots a test works in: none is a store's, so nothing is registered.
     fn host_paths() -> HostPaths {
         HostPaths::new(std::env::temp_dir(), std::env::temp_dir()).expect("roots")
