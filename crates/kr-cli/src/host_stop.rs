@@ -751,10 +751,14 @@ enum Asked {
     NotComposed { why: Shown, closed: bool },
 }
 
-/// Whether the failure of composing a request is the daemon's close of the connection, which a
-/// daemon does when it goes.
+/// Whether a failure of the connection is the daemon's close of it, which a daemon does when it
+/// goes: the end of the stream at a frame boundary, and inside a frame too (a reset reads as an end
+/// of the stream, so a frame that the close cut is a truncated one).
 fn closed_by_the_daemon(error: &kr_ipc::IpcError) -> bool {
-    matches!(error, kr_ipc::IpcError::PeerClosed)
+    matches!(
+        error,
+        kr_ipc::IpcError::PeerClosed | kr_ipc::IpcError::TruncatedFrame { .. }
+    )
 }
 
 /// Sends the request, says that it left, and waits for its answer.
@@ -1118,8 +1122,8 @@ async fn failed_before_the_request(
 }
 
 /// The command's greeting of the daemon failed with `error`: what the failure came to. Only a
-/// closed peer says that a daemon is ending; a rejection, a mismatch or a fault of another kind
-/// keeps its words and nothing is looked at.
+/// closed peer, or a frame that the close cut, says that a daemon is ending; a rejection, a
+/// mismatch or a fault of another kind keeps its words and nothing is looked at.
 async fn greeting_failed(
     operations: &impl Operations,
     error: &kr_ipc::IpcError,
@@ -1434,7 +1438,15 @@ async fn host_info(
         };
     match client.request(Method::HostInfo, &()).await? {
         Err(refused) if refused.code == ErrorCode::PermissionDenied => {
-            *client = crate::resolve::open_controller(environment, crate::build_id()).await?;
+            // The new connection keeps its transport error: the opener that commands use turns it
+            // into "no KalaReach host is running", which a daemon that is ending would make false.
+            let endpoint = environment.controller_endpoint()?;
+            *client = LocalClient::connect(
+                &endpoint,
+                kr_protocol::local::LocalClientKind::Cli,
+                crate::build_id(),
+            )
+            .await?;
             typed(client.request(Method::HostInfo, &()).await?)
         }
         other => typed(other),
