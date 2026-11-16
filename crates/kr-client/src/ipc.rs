@@ -429,7 +429,9 @@ impl ControlTransport for IpcTransport {
             };
             // A local frame reader reports the end of the stream as a failure rather than as an
             // absent message, because every local exchange has a next frame until the peer goes
-            // away. To a session the two are one thing: the connection ended.
+            // away. It is returned as that failure, as every other failed read is, so that what a
+            // session reports of how its connection ended carries what the link said. A session
+            // ends on either result alike. Only this side's own close is the clean end.
             let frame = tokio::select! {
                 frame = reader.read_message::<ControlFrame>() => frame,
                 () = closing => return Ok(None),
@@ -445,7 +447,10 @@ impl ControlTransport for IpcTransport {
                     *held = Some(reader);
                     Ok(Some(frame))
                 }
-                Err(_) => Ok(None),
+                // A read that fails after this side closed the connection failed because of the
+                // close.
+                Err(_) if self.has_closed() => Ok(None),
+                Err(error) => Err(ClientError::Ipc(error)),
             }
         })
     }
@@ -726,13 +731,187 @@ mod tests {
         );
         assert!(!transport.can_send(), "nothing can be written any more");
         let mut read = Vec::new();
-        while let Some(frame) = transport.recv().await.expect("a read") {
-            read.push(request_id_of(&frame));
+        loop {
+            match transport.recv().await {
+                Ok(Some(frame)) => read.push(request_id_of(&frame)),
+                // The peer's end at a frame's boundary is the link's own failure, which the end of
+                // a session carries; it is no clean end, which is this side's own close.
+                Err(ClientError::Ipc(kr_ipc::IpcError::PeerClosed)) => break,
+                other => panic!("a read that is neither a frame nor the peer's end: {other:?}"),
+            }
         }
         assert_eq!(
             read,
             [RequestId::new(7), RequestId::new(0)],
             "every frame the peer sent before it went is read"
         );
+    }
+
+    use crate::ordered::{Ended, Ordered, OrderedEvents};
+
+    const WITHIN: Duration = Duration::from_secs(8);
+
+    fn notice() -> ControlFrame {
+        ControlFrame::Notification(kr_protocol::envelope::Notification {
+            stream_id: kr_protocol::ids::StreamId::new("session.output").expect("a stream"),
+            sequence: kr_protocol::ids::EventSequence::new(0),
+            event_type: kr_protocol::ids::EventType::new("terminal.output").expect("an event type"),
+            payload: ParamsValue::empty(),
+        })
+    }
+
+    /// A frame whose length prefix is whole and whose payload no decoder reads.
+    fn undecodable_frame() -> Vec<u8> {
+        let mut framed = FrameWriter::encode(StreamKind::Control, &request(1, 8)).expect("encodes");
+        for byte in &mut framed[kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN..] {
+            *byte = 0xff;
+        }
+        framed
+    }
+
+    async fn an_ordered_session_over_a_raw_connection() -> (
+        crate::session::Session,
+        OrderedEvents,
+        FrameReader,
+        FrameWriter,
+        kr_ipc::testing::TempHost,
+    ) {
+        let (transport, peer_reader, peer_writer, tree) = over_a_raw_connection().await;
+        let (session, events) =
+            crate::session::Session::start_ordered(std::sync::Arc::new(transport), 4)
+                .expect("an ordered session");
+        (session, events, peer_reader, peer_writer, tree)
+    }
+
+    async fn the_next_item(events: &mut OrderedEvents) -> Option<Ordered> {
+        tokio::time::timeout(WITHIN, events.recv())
+            .await
+            .expect("the channel gave an item in time")
+    }
+
+    /// The peer's end at a frame's boundary is a failed read that says what the link said, and no
+    /// clean end: a clean end is this side's own close.
+    #[tokio::test]
+    async fn the_peer_going_at_a_frames_boundary_is_a_failed_read() {
+        let (transport, peer_reader, peer_writer, _tree) = over_a_raw_connection().await;
+        drop((peer_reader, peer_writer));
+        let read = tokio::time::timeout(WITHIN, transport.recv())
+            .await
+            .expect("the read ended");
+        assert!(
+            matches!(read, Err(ClientError::Ipc(kr_ipc::IpcError::PeerClosed))),
+            "{read:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_frame_cut_short_is_a_failed_read() {
+        let (transport, peer_reader, mut peer_writer, _tree) = over_a_raw_connection().await;
+        let framed = FrameWriter::encode(StreamKind::Control, &request(1, 8)).expect("encodes");
+        peer_writer
+            .write_frame(&framed[..framed.len() - 2])
+            .await
+            .expect("the start of a frame");
+        drop((peer_reader, peer_writer));
+        let read = tokio::time::timeout(WITHIN, transport.recv())
+            .await
+            .expect("the read ended");
+        assert!(
+            matches!(
+                read,
+                Err(ClientError::Ipc(kr_ipc::IpcError::TruncatedFrame { .. }))
+            ),
+            "{read:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_frame_that_cannot_be_decoded_is_a_failed_read() {
+        let (transport, _peer_reader, mut peer_writer, _tree) = over_a_raw_connection().await;
+        peer_writer
+            .write_frame(&undecodable_frame())
+            .await
+            .expect("a frame");
+        let read = tokio::time::timeout(WITHIN, transport.recv())
+            .await
+            .expect("the read ended");
+        assert!(
+            matches!(read, Err(ClientError::Ipc(kr_ipc::IpcError::Frame(_)))),
+            "{read:?}"
+        );
+    }
+
+    /// This side's own close ends a read that waits and every read after it, with no failure.
+    #[tokio::test]
+    async fn this_sides_own_close_is_a_clean_end_of_the_read() {
+        let (transport, _peer_reader, _peer_writer, _tree) = over_a_raw_connection().await;
+        let transport = std::sync::Arc::new(transport);
+        let waiting = tokio::spawn({
+            let transport = std::sync::Arc::clone(&transport);
+            async move { transport.recv().await }
+        });
+        transport.close();
+        let read = tokio::time::timeout(WITHIN, waiting)
+            .await
+            .expect("the read ended")
+            .expect("the task");
+        assert!(matches!(read, Ok(None)), "{read:?}");
+        assert!(matches!(transport.recv().await, Ok(None)));
+    }
+
+    /// On a real local link a session's end carries the link's failure, after the notification that
+    /// came before it.
+    #[tokio::test]
+    async fn an_ordered_session_ends_with_the_peers_end_on_the_local_link() {
+        let (session, mut events, peer_reader, mut peer_writer, _tree) =
+            an_ordered_session_over_a_raw_connection().await;
+        peer_writer
+            .write_message(&notice())
+            .await
+            .expect("a notification");
+        drop((peer_reader, peer_writer));
+        assert!(matches!(
+            the_next_item(&mut events).await,
+            Some(Ordered::Notification(_))
+        ));
+        assert!(matches!(
+            the_next_item(&mut events).await,
+            Some(Ordered::Ended(Ended::Failed(ClientError::Ipc(
+                kr_ipc::IpcError::PeerClosed
+            ))))
+        ));
+        assert!(the_next_item(&mut events).await.is_none());
+        drop(session);
+    }
+
+    #[tokio::test]
+    async fn an_ordered_session_ends_with_the_decoders_text_on_a_frame_that_cannot_be_decoded() {
+        let (session, mut events, _peer_reader, mut peer_writer, _tree) =
+            an_ordered_session_over_a_raw_connection().await;
+        peer_writer
+            .write_frame(&undecodable_frame())
+            .await
+            .expect("a frame");
+        assert!(matches!(
+            the_next_item(&mut events).await,
+            Some(Ordered::Ended(Ended::Failed(ClientError::Ipc(
+                kr_ipc::IpcError::Frame(_)
+            ))))
+        ));
+        assert!(the_next_item(&mut events).await.is_none());
+        drop(session);
+    }
+
+    /// The owner's own close, with the reader parked in a read of the real link, is the clean end.
+    #[tokio::test]
+    async fn an_ordered_session_the_owner_closes_ends_cleanly_on_the_local_link() {
+        let (session, mut events, _peer_reader, _peer_writer, _tree) =
+            an_ordered_session_over_a_raw_connection().await;
+        session.close();
+        assert!(matches!(
+            the_next_item(&mut events).await,
+            Some(Ordered::Ended(Ended::Finished))
+        ));
+        assert!(the_next_item(&mut events).await.is_none());
     }
 }
