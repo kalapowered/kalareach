@@ -630,7 +630,9 @@ async fn a_record_of_the_daemons_own_does_not_replace_the_account_a_worker_gave(
 
 /// A record of this daemon's own that its registry refused gives its reason, and its reason alone,
 /// to the record that the next look at the worker's end writes: that record is built from the next
-/// look's own pass, and its reason is the kept record's, not the one that look was given.
+/// look's own pass, and its reason is the kept record's, not the one that look was given, except
+/// where the look's own pass establishes a reason from a fact that the first look could not have (an
+/// earlier boot, a lost desktop), which a later case holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_record_of_the_daemons_own_that_was_not_written_gives_its_reason_at_the_next_look() {
     let temp = TempHost::create();
