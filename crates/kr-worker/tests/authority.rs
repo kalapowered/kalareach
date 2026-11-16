@@ -2410,8 +2410,9 @@ fn writing_then_going<T: serde::Serialize + Send + Sync + 'static>(
 /// way, two clients write behind the boundary and then go: one cancels a receipt, and one attaches.
 /// The ways are a client that ends what it sends and stays to read (Unix) and one that closes its
 /// socket. The attaches leave the wait at once and nothing is made for them. The cancellations keep
-/// their places for as long as the boundary is held, and no longer: at the release each cancels its
-/// receipt, the client that stayed is answered, and every connection is given back.
+/// their places while the boundary is held, since the cancellation of an action asks nothing of its
+/// client: at the release each cancels its receipt, the client that stayed is answered, and every
+/// connection is given back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cancellation_whose_client_has_gone_is_carried_out_and_a_starting_mutation_is_dropped() {
     let host = host_ready_apart(false).await;
@@ -2602,8 +2603,12 @@ async fn a_controller_link_that_goes_while_the_authority_is_held_is_unbound_once
     );
     holder.release();
     assert!(
-        settle(|| !service.controller_is_bound_for_tests()).await,
-        "the owner removes the link from the authority record when the authority is let go"
+        settle(|| service.owed_done_for_tests().2 == 1).await,
+        "the owner never took the link's entry"
+    );
+    assert!(
+        !service.controller_is_bound_for_tests(),
+        "the owner counted the link's entry without removing the link from the authority record"
     );
     assert_eq!(
         service.owed_done_for_tests().2,
