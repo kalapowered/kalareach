@@ -1165,3 +1165,285 @@ async fn a_launch_that_says_privacy_mode_is_on_at_generation_nought_is_refused()
         failure.error
     );
 }
+
+// DISCARD-DEFERRAL CASES
+//
+// A write of the session's output to its spool that is in flight is never waited for by the
+// discard that privacy mode owes. The discard is left owed, no reader is told of a byte of the
+// output meanwhile, and whoever sees the write end makes it. These cases hold the write by not
+// making it: the session returns the write it owes and the case decides when it is made.
+
+/// What every reader of a session's history is told, as text, so that two readings compare field by
+/// field and a difference names the reader.
+fn told(session: &Session) -> Vec<String> {
+    use kr_worker::history::{Files, Reach};
+    let mut told = Vec::new();
+    for from in [0, 1000, 4096, 5000, 9000] {
+        told.push(format!(
+            "page {from}: {:?}",
+            session.history_page(from, 1 << 20)
+        ));
+        told.push(format!(
+            "cause {from}: {:?}",
+            session.history_gap_cause(from)
+        ));
+        for reach in [Reach::Whole, Reach::From(100), Reach::Nothing { end: 8192 }] {
+            for files in [Files::Served, Files::Withheld] {
+                told.push(format!(
+                    "within {from} {reach:?} {files:?}: {:?}",
+                    session.history_page_within(from, 1 << 20, reach, files)
+                ));
+            }
+        }
+    }
+    told.push(format!("oldest {}", session.oldest_retained_cursor()));
+    told.push(format!("retained {}", session.retained_output_bytes()));
+    told.push(format!(
+        "reach {:?}",
+        session
+            .output_time_index()
+            .and_then(|times| times.first_cursor_from(0))
+    ));
+    told
+}
+
+/// The segment files a session's spool holds.
+fn segments(temp: &kr_ipc::testing::TempHost, session_id: SessionId) -> usize {
+    std::fs::read_dir(temp.environment().session_spool(session_id))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "out"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Makes the write a session owes on another thread, once told to, and says whether it was told
+/// before. After ten seconds it makes the write anyway, so that a discard that waited for it ends
+/// the case with a failed assertion and not with a hang.
+fn make_the_write_when_told(
+    write: kr_worker::history::SpoolWrite,
+    bytes: &'static [u8],
+) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<bool>) {
+    let (tell, told) = std::sync::mpsc::channel();
+    let making = std::thread::spawn(move || {
+        let was_told = told
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .is_ok();
+        assert!(write.perform(bytes));
+        was_told
+    });
+    (tell, making)
+}
+
+/// A session that has retained one batch, and owes the write of a second, with privacy mode turned
+/// on while that write is in flight. Returns what tells the write to be made.
+fn privacy_on_with_a_write_in_flight(
+    session: &mut Session,
+) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<bool>) {
+    session.ingest_output(&[b'x'; 4096]);
+    let (_, owed) = session.ingest_output_deferring_the_spool(&[b'y'; 4096]);
+    let write = owed.expect("the second batch's write to the spool is owed");
+    let (tell, making) = make_the_write_when_told(write, &[b'y'; 4096]);
+    let enabling = session
+        .enable_privacy(PrivacyGeneration::new(1), &mut [])
+        .expect("enables");
+    let unfinished = enabling
+        .unfinished("history")
+        .expect("the removal waits for the write");
+    assert_eq!(unfinished.step, kr_worker::privacy::Step::Remove);
+    (tell, making)
+}
+
+#[test]
+fn a_privacy_call_with_a_write_in_flight_returns_and_no_reader_reaches_the_output_it_owes() {
+    let (temp, mut session) = session_on_disk();
+    let session_id = session.summary().session_id;
+    session.ingest_output(&[b'x'; 4096]);
+    let before = session.history_page(0, 1 << 20).expect("a page");
+    assert_eq!(
+        before.bytes.as_slice().len(),
+        4096,
+        "read until privacy mode"
+    );
+
+    let (tell, making) = privacy_on_with_a_write_in_flight(&mut session);
+    tell.send(()).expect("the write is waiting to be told");
+    assert!(
+        making.join().expect("the write is made"),
+        "the discard returned before the write was made"
+    );
+    // The discard is owed, the output is still on the disk, and nothing reads it.
+    assert!(!session.reconcile_privacy(&[]).is_complete());
+    assert!(segments(&temp, session_id) > 0);
+    let owing = told(&session);
+    assert!(
+        session
+            .history_page(0, 1 << 20)
+            .expect("a page")
+            .bytes
+            .as_slice()
+            .is_empty(),
+        "no retained byte is read while the discard is owed"
+    );
+
+    // The next pass of maintenance makes it, and what a reader is told does not change.
+    session.collect_expired();
+    assert!(session.reconcile_privacy(&[]).is_complete());
+    assert_eq!(segments(&temp, session_id), 0);
+    assert_eq!(told(&session), owing, "a reader is told the same after it");
+}
+
+#[test]
+fn a_session_reopened_under_privacy_mode_serves_no_retained_byte_before_its_first_pass() {
+    let (temp, mut session) = session_on_disk();
+    let session_id = session.summary().session_id;
+    for _ in 0..2 {
+        session.ingest_output(&[b'x'; 4096]);
+    }
+    // The removal is refused, so the output stays on the disk when the session ends.
+    let spool = temp.environment().session_spool(session_id);
+    std::fs::create_dir(spool.join("boundary")).expect("blocks the boundary file");
+    session
+        .enable_privacy(PrivacyGeneration::new(1), &mut [])
+        .expect("enables");
+    drop(session);
+    std::fs::remove_dir(spool.join("boundary")).expect("unblocks it");
+    assert!(segments(&temp, session_id) > 0, "the output is still there");
+
+    let journal = temp.environment().journal_database(session_id);
+    let mut reopened = Session::open(config_at(&temp, session_id, journal)).expect("opens again");
+    assert!(reopened.privacy().is_enabled());
+    assert!(
+        reopened
+            .history_page(0, 1 << 20)
+            .expect("a page")
+            .bytes
+            .as_slice()
+            .is_empty(),
+        "no retained byte is read before the first pass"
+    );
+    assert_eq!(reopened.retained_output_bytes(), 0);
+    let owing = told(&reopened);
+    reopened.collect_expired();
+    assert_eq!(segments(&temp, session_id), 0, "the first pass removed it");
+    assert_eq!(told(&reopened), owing, "and a reader is told the same");
+}
+
+/// Opens a session again over the stores of one whose journal says `state` ("generation, enabled")
+/// where `sabotage` made the privacy record unreadable, and returns it with the means to put the
+/// record right.
+fn reopened_with_an_unreadable_privacy_record(
+    earlier_output: bool,
+) -> (kr_ipc::testing::TempHost, Session, SessionId) {
+    let (temp, mut session) = session_on_disk();
+    let session_id = session.summary().session_id;
+    if earlier_output {
+        session.ingest_output(&[b'x'; 4096]);
+    }
+    drop(session);
+    let journal = temp.environment().journal_database(session_id);
+    rusqlite::Connection::open(&journal)
+        .expect("the journal")
+        .execute(
+            "UPDATE privacy SET generation = 'unreadable' WHERE id = 1",
+            [],
+        )
+        .expect("the record is made unreadable");
+    let reopened = Session::open(config_at(&temp, session_id, journal)).expect("opens again");
+    (temp, reopened, session_id)
+}
+
+fn put_the_privacy_record_right(
+    temp: &kr_ipc::testing::TempHost,
+    session_id: SessionId,
+    generation: i64,
+    enabled: i64,
+) {
+    rusqlite::Connection::open(temp.environment().journal_database(session_id))
+        .expect("the journal")
+        .execute(
+            "UPDATE privacy SET generation = ?1, enabled = ?2 WHERE id = 1",
+            [generation, enabled],
+        )
+        .expect("the record is put right");
+}
+
+#[test]
+fn a_session_that_cannot_read_its_state_serves_no_byte_and_keeps_its_history_whole_when_it_reads_off()
+ {
+    let (temp, mut session, session_id) = reopened_with_an_unreadable_privacy_record(true);
+    assert!(session.privacy_cleanup_failure().is_some());
+    assert!(
+        session
+            .history_page(0, 1 << 20)
+            .expect("a page")
+            .bytes
+            .as_slice()
+            .is_empty(),
+        "no retained byte is read while the state cannot be read"
+    );
+    assert_eq!(session.retained_output_bytes(), 0);
+    // A pass that still cannot read it changes nothing.
+    session.collect_expired();
+    assert!(session.privacy_cleanup_failure().is_some());
+    assert!(segments(&temp, session_id) > 0);
+
+    // It reads as off: the history was never private, and it is served whole again.
+    put_the_privacy_record_right(&temp, session_id, 0, 0);
+    session.collect_expired();
+    assert!(session.privacy_cleanup_failure().is_none());
+    assert_eq!(
+        session
+            .history_page(0, 1 << 20)
+            .expect("a page")
+            .bytes
+            .as_slice(),
+        &[b'x'; 4096][..],
+        "the page gives the bytes it gave before the open"
+    );
+    assert_eq!(session.retained_output_bytes(), 4096);
+}
+
+#[test]
+fn a_session_that_reads_its_state_as_off_retains_what_arrives_after_it() {
+    let (temp, mut session, session_id) = reopened_with_an_unreadable_privacy_record(false);
+    session.ingest_output(b"during");
+    assert_eq!(
+        session.retained_output_bytes(),
+        0,
+        "nothing is kept while it cannot say"
+    );
+    put_the_privacy_record_right(&temp, session_id, 0, 0);
+    session.collect_expired();
+    session.ingest_output(b"after");
+    assert_eq!(session.retained_output_bytes(), 5);
+    assert_eq!(
+        session
+            .history_page(6, 1 << 20)
+            .expect("a page")
+            .bytes
+            .as_slice(),
+        b"after"
+    );
+}
+
+#[test]
+fn a_session_that_cannot_read_its_state_removes_its_history_when_it_reads_on() {
+    let (temp, mut session, session_id) = reopened_with_an_unreadable_privacy_record(true);
+    assert!(segments(&temp, session_id) > 0);
+    put_the_privacy_record_right(&temp, session_id, 1, 1);
+    session.collect_expired();
+    assert!(session.privacy().is_enabled());
+    assert!(session.privacy_cleanup_failure().is_none());
+    assert_eq!(segments(&temp, session_id), 0, "the discard ran");
+    assert!(
+        session
+            .history_page(0, 1 << 20)
+            .expect("a page")
+            .bytes
+            .as_slice()
+            .is_empty()
+    );
+}

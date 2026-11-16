@@ -130,6 +130,17 @@ pub struct Discarded {
     pub left_behind: Option<String>,
 }
 
+/// What a reader of the retained range is told ([`OutputHistory::standing`]).
+#[derive(Clone, Copy, Debug)]
+struct Standing {
+    /// Whether the history is read as it stands once an owed discard is done.
+    discarded: bool,
+    /// The oldest cursor that is served.
+    oldest: u64,
+    /// The cursor the spool stopped at, while it has stopped.
+    suspended_at: Option<u64>,
+}
+
 /// How coarse the resident window's own record of when its output arrived is.
 ///
 /// One mark per minute bounds the record at a few entries for a window of any size, and bounds
@@ -366,6 +377,14 @@ pub struct OutputHistory {
     /// Whether the last pass found the host over its cap and another session holding the lock on
     /// it, so that this one gave up nothing for the cap and is to look again soon.
     awaits_the_host_cap_lock: bool,
+    /// Whether a discard of everything retained is owed, so that every reader is told the history
+    /// as it stands once the discard is done ([`Self::standing`]).
+    ///
+    /// The session raises it where it owes the discard: when privacy mode is turned on and the
+    /// removal is not finished, when a session opens under privacy mode, and when a session cannot
+    /// read whether privacy mode is on. It falls with the discard, or, for a session that could
+    /// not read its state and then reads that privacy mode is off, with the history whole.
+    discard_owed: bool,
     /// Waited at by a test after the host has been read and before anything is decided from the
     /// reading, so that the passes of several sessions read the same total.
     #[cfg(test)]
@@ -458,6 +477,7 @@ impl OutputHistory {
             clock_proven: false,
             host_reading: None,
             awaits_the_host_cap_lock: false,
+            discard_owed: false,
             #[cfg(test)]
             after_host_reading: None,
             #[cfg(test)]
@@ -487,17 +507,29 @@ impl OutputHistory {
     ///
     /// A pass of maintenance holds it beyond the session's lock to write it: the write is a call to
     /// the disk, and the output path waits for the lock.
+    ///
+    /// While a discard is owed there is none to give: a completed discard has taken the index's
+    /// rows, and a reader that was handed them would work out a different reach than one that finds
+    /// none.
     #[must_use]
     pub fn time_index(&self) -> Option<TimeIndex> {
+        if self.standing().discarded {
+            return None;
+        }
         self.times.clone()
     }
 
     /// Writes the time index, with nothing else held.
     ///
+    /// Nothing is written while a discard is owed: the rows are about to be removed.
+    ///
     /// # Errors
     ///
     /// Returns why the index could not be written; its intervals are kept for the next write.
     pub fn flush_times(&self) -> std::result::Result<(), String> {
+        if self.standing().discarded {
+            return Ok(());
+        }
         self.times.as_ref().map_or(Ok(()), TimeIndex::flush)
     }
 
@@ -555,13 +587,52 @@ impl OutputHistory {
     /// over a spool with nothing left starts its cursor at the boundary the spool wrote down
     /// rather than at nought, so the range that went is a gap rather than output that never
     /// existed.
+    ///
+    /// While a discard is owed it is where the output ends, which is what a completed discard
+    /// leaves.
     #[must_use]
     pub fn oldest_retained_cursor(&self) -> u64 {
+        self.standing().oldest
+    }
+
+    /// Returns the oldest cursor the window or the spool holds, whether or not a reader may be
+    /// told of it. The history's own passes work from this.
+    fn oldest_held_cursor(&self) -> u64 {
         match &self.spool {
             Some(spool) => spool.oldest_cursor().map_or(self.resident_start, |oldest| {
                 oldest.min(self.resident_start)
             }),
             None => self.resident_start,
+        }
+    }
+
+    /// Says that a discard of everything retained is owed, or no longer is.
+    ///
+    /// While one is owed every reader is told the history as it stands once the discard is done:
+    /// the window and the spool are still there, and nothing of them is read or counted.
+    pub fn set_discard_owed(&mut self, owed: bool) {
+        self.discard_owed = owed;
+    }
+
+    /// What a reader of the retained range is told, from the one place that says so.
+    ///
+    /// The history as it stands, or, while a discard is owed, as it stands once the discard is
+    /// done: the oldest cursor is where the output ends, no window or segment holds a byte, and the
+    /// spool takes output again, because a completed discard clears the stop. Every reader asks
+    /// this and answers from it; the history's own passes do not, because they work on what is held.
+    fn standing(&self) -> Standing {
+        if self.discard_owed {
+            Standing {
+                discarded: true,
+                oldest: self.next_cursor,
+                suspended_at: None,
+            }
+        } else {
+            Standing {
+                discarded: false,
+                oldest: self.oldest_held_cursor(),
+                suspended_at: self.spool.as_ref().and_then(Spool::suspended_at),
+            }
         }
     }
 
@@ -765,7 +836,12 @@ impl OutputHistory {
 
     /// Returns where the spool stopped taking output, and why, while it has.
     #[must_use]
+    ///
+    /// A completed discard clears the stop, so none is reported while one is owed.
     pub fn suspended(&self) -> Option<(u64, &str)> {
+        if self.standing().discarded {
+            return None;
+        }
         self.spool.as_ref().and_then(Spool::suspension)
     }
 
@@ -881,8 +957,13 @@ impl OutputHistory {
     ///
     /// It reads the spool's index. A file that goes while the index still names it is found when
     /// a page reaches it, and is forgotten by the next retention pass.
+    ///
+    /// While a discard is owed there is none, as after it.
     #[must_use]
     pub fn holes(&self) -> Vec<(u64, u64)> {
+        if self.standing().discarded {
+            return Vec::new();
+        }
         self.spool
             .as_ref()
             .map_or_else(Vec::new, |spool| spool.uncovered(self.resident_start))
@@ -894,8 +975,19 @@ impl OutputHistory {
     /// newest part of what the spool holds, so adding the two would read a session as larger than
     /// it is; and a range the spool no longer holds is not retained, whatever the distance from
     /// the oldest cursor to the newest says.
+    ///
+    /// While a discard is owed it is nought, as after it.
     #[must_use]
     pub fn retained_bytes(&self) -> u64 {
+        if self.standing().discarded {
+            return 0;
+        }
+        self.held_bytes()
+    }
+
+    /// Returns how many bytes the window and the spool hold together, whether or not a reader may
+    /// be told of them. The history's own passes work from this.
+    fn held_bytes(&self) -> u64 {
         let resident = self.resident.len() as u64;
         let Some(spool) = self.spool.as_ref() else {
             return resident;
@@ -908,8 +1000,19 @@ impl OutputHistory {
     ///
     /// The spool's oldest segment when it has one, and otherwise the resident window's own
     /// oldest mark: a session serving from memory alone still has an age.
+    ///
+    /// While a discard is owed there is none, as after it.
     #[must_use]
     pub fn oldest_written_at_ms(&self) -> Option<TimestampMs> {
+        if self.standing().discarded {
+            return None;
+        }
+        self.oldest_held_written_at_ms()
+    }
+
+    /// Returns when the oldest output the window or the spool holds was last written, whether or
+    /// not a reader may be told of it. The history's own passes work from this.
+    fn oldest_held_written_at_ms(&self) -> Option<TimestampMs> {
         self.spool
             .as_ref()
             .and_then(Spool::oldest_written_at_ms)
@@ -1098,11 +1201,11 @@ impl OutputHistory {
         // go; which one applies decides what the reader is told. The host figure is what the age
         // pass left of it, and only the bytes that left the filesystem count against a figure
         // measured from files.
-        let session_bytes = self.retained_bytes();
+        let session_bytes = self.held_bytes();
         let pressure = Pressure {
             session_bytes,
             host_bytes: host_bytes.saturating_sub(files_removed).max(session_bytes),
-            oldest_at_ms: self.oldest_written_at_ms(),
+            oldest_at_ms: self.oldest_held_written_at_ms(),
         };
         let over = retention.bytes_over_cap(&pressure);
         if over > 0
@@ -1152,7 +1255,7 @@ impl OutputHistory {
         self.try_resume();
         // The rows of output that is no longer retained go with it, at the next write of the index.
         if let Some(times) = self.times.as_ref() {
-            times.forget_before(self.oldest_retained_cursor());
+            times.forget_before(self.oldest_held_cursor());
         }
         taken
     }
@@ -1188,7 +1291,7 @@ impl OutputHistory {
         now_ms: TimestampMs,
         age_permitted: bool,
     ) -> Vec<Eviction> {
-        let session_bytes = self.retained_bytes();
+        let session_bytes = self.held_bytes();
         let output_end = self.next_cursor;
         let now = std::time::Instant::now();
         self.awaits_the_host_cap_lock = false;
@@ -1282,8 +1385,8 @@ impl OutputHistory {
         expires_before: u64,
         now_ms: TimestampMs,
     ) -> (Option<Eviction>, u64) {
-        let before = self.oldest_retained_cursor();
-        let held_before = self.retained_bytes();
+        let before = self.oldest_held_cursor();
+        let held_before = self.held_bytes();
         let mut file_bytes = 0;
         if let Some(spool) = self.spool.as_mut() {
             let (dropped, left_behind) = spool.drop_older_than(expires_before);
@@ -1311,7 +1414,7 @@ impl OutputHistory {
                 self.trim_marks();
             }
         }
-        let after = self.oldest_retained_cursor();
+        let after = self.oldest_held_cursor();
         if after <= before {
             return (None, file_bytes);
         }
@@ -1320,7 +1423,7 @@ impl OutputHistory {
                 limit: RetentionLimit::Age,
                 from_cursor: before,
                 to_cursor: after,
-                bytes: held_before.saturating_sub(self.retained_bytes()),
+                bytes: held_before.saturating_sub(self.held_bytes()),
                 at_ms: now_ms,
             }),
             file_bytes,
@@ -1328,11 +1431,12 @@ impl OutputHistory {
     }
 
     /// Returns why a cursor is no longer retained, when this host recorded a reason.
-    fn cause_of(&self, cursor: u64) -> Option<HistoryGapCause> {
-        let spool_stopped_before = self
-            .spool
-            .as_ref()
-            .and_then(Spool::suspended_at)
+    ///
+    /// Whether the spool stopped before it is what `standing` says, so that a history that is owed
+    /// a discard is not told to stop where the discard will have let it go on.
+    fn cause_of(&self, standing: Standing, cursor: u64) -> Option<HistoryGapCause> {
+        let spool_stopped_before = standing
+            .suspended_at
             .is_some_and(|stopped| cursor >= stopped);
         if spool_stopped_before
             || self
@@ -1366,7 +1470,8 @@ impl OutputHistory {
     ///
     /// Returns an error when a spool segment cannot be read.
     pub fn page(&self, from_cursor: u64, max_bytes: u64) -> Result<HistoryPageResult> {
-        let oldest = self.oldest_retained_cursor();
+        let standing = self.standing();
+        let oldest = standing.oldest;
         let limit = max_bytes.clamp(1, MAX_HISTORY_PAGE_BYTES);
         let unaccounted = self.boundary_unreadable();
         let (mut start, mut gap) = if unaccounted {
@@ -1387,7 +1492,7 @@ impl OutputHistory {
                 Some(HistoryGap {
                     from_cursor: U64::new(from_cursor),
                     to_cursor: U64::new(oldest),
-                    cause: self.cause_of(from_cursor),
+                    cause: self.cause_of(standing, from_cursor),
                 }),
             )
         } else {
@@ -1415,7 +1520,7 @@ impl OutputHistory {
                         from_cursor: U64::new(start),
                         to_cursor: U64::new(to),
                         cause: Some(
-                            self.cause_of(start)
+                            self.cause_of(standing, start)
                                 .unwrap_or(HistoryGapCause::ArchiveIncomplete),
                         ),
                     });
@@ -1511,7 +1616,7 @@ impl OutputHistory {
         for &(start, end) in ranges {
             self.withheld.note(start, end);
         }
-        self.withheld.forget_before(self.oldest_retained_cursor());
+        self.withheld.forget_before(self.oldest_held_cursor());
     }
 
     /// Reads one page of retained output for a reader that reaches `reach` of it and is not given
@@ -1553,6 +1658,11 @@ impl OutputHistory {
 
     /// Reads what this history holds from `start`, up to `limit` bytes.
     fn read_held(&self, start: u64, limit: u64) -> Result<Held> {
+        if self.discard_owed {
+            // No byte is copied out while a discard is owed. The cursors a page reads from are at
+            // or past where the output ends then, so this is what the read would find anyway.
+            return Ok(Held::Bytes(Vec::new()));
+        }
         if start >= self.next_cursor {
             return Ok(Held::Bytes(Vec::new()));
         }
@@ -4301,6 +4411,134 @@ mod tests {
         let done = history.discard_retained();
         assert_eq!(done.left_behind, None, "{done:?}");
         assert_eq!(done.bytes, 4, "every byte went once: {done:?}");
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// Everything a reader of a history is told, as text, so that two histories can be compared
+    /// field by field and a difference names the reader.
+    fn told(history: &OutputHistory) -> Vec<String> {
+        let mut told = Vec::new();
+        for from in [0, 5, 12, 20, 25, 31, 32, 40] {
+            told.push(format!("page {from}: {:?}", history.page(from, 64)));
+            for reach in [Reach::Whole, Reach::From(10), Reach::Nothing { end: 32 }] {
+                told.push(format!(
+                    "within {from} {reach:?}: {:?}",
+                    history.page_within(from, 64, reach)
+                ));
+                told.push(format!(
+                    "without files {from} {reach:?}: {:?}",
+                    history.page_without_files(from, 64, reach, 30)
+                ));
+            }
+        }
+        told.push(format!("oldest {}", history.oldest_retained_cursor()));
+        told.push(format!("retained {}", history.retained_bytes()));
+        told.push(format!("holes {:?}", history.holes()));
+        told.push(format!("written {:?}", history.oldest_written_at_ms()));
+        told.push(format!("suspended {:?}", history.suspended()));
+        told.push(format!("evictions {:?}", history.evictions()));
+        told.push(format!("next {}", history.next_cursor()));
+        told.push(format!(
+            "reach {:?}",
+            history
+                .time_index()
+                .and_then(|times| times.first_cursor_from(0))
+        ));
+        told
+    }
+
+    /// A history over a spool that holds thirty-two bytes in two segments with the last eight in
+    /// the window too, whose output was timed on a clock that could be proved, and which has
+    /// recorded that the first eight bytes went to the session cap.
+    fn history_to_discard(name: &str, how: &str) -> (OutputHistory, std::path::PathBuf) {
+        let directory = spool_directory(name);
+        let mut history =
+            OutputHistory::with_spool(8, directory.clone(), SpoolLayout::new(16, 1 << 20))
+                .expect("a spool")
+                .with_time_index(directory.join("times"));
+        history.set_clock_proven(true);
+        for chunk in [b"aaaaaaaa", b"bbbbbbbb", b"cccccccc", b"dddddddd"] {
+            history.append(chunk);
+        }
+        history.record_eviction(Eviction {
+            limit: RetentionLimit::SessionCap,
+            from_cursor: 0,
+            to_cursor: 8,
+            bytes: 8,
+            at_ms: TimestampMs::new(1),
+        });
+        let spool = history.spool.as_mut().expect("a spool");
+        match how {
+            "unreadable boundary" => spool.unreadable_boundary = true,
+            "stopped spool" => {
+                spool.suspended = Some(Suspension {
+                    at: 20,
+                    reason: "a test stopped it".to_owned(),
+                    resumable: true,
+                    boundary: false,
+                });
+            }
+            _ => {}
+        }
+        (history, directory)
+    }
+
+    #[test]
+    fn while_a_discard_is_owed_every_reader_is_told_what_it_is_told_after_the_discard() {
+        for how in ["plain", "unreadable boundary", "stopped spool"] {
+            let (mut owing, owing_directory) = history_to_discard("fence-owing", how);
+            let (mut done, done_directory) = history_to_discard("fence-done", how);
+            assert_eq!(
+                owing.page(0, 64).expect("a page").bytes.as_slice().len(),
+                24,
+                "{how}: the output is read before the discard"
+            );
+            owing.set_discard_owed(true);
+            let discarded = done.discard_retained();
+            assert_eq!(discarded.left_behind, None, "{how}: {discarded:?}");
+            assert_eq!(told(&owing), told(&done), "{how}");
+            std::fs::remove_dir_all(&owing_directory).ok();
+            std::fs::remove_dir_all(&done_directory).ok();
+        }
+    }
+
+    #[test]
+    fn the_time_index_is_removed_in_the_first_hold_of_a_discard_that_meets_a_write() {
+        let directory = spool_directory("owed-write-times");
+        let mut history =
+            OutputHistory::with_spool(64, directory.clone(), SpoolLayout::new(64, 1 << 20))
+                .expect("a spool")
+                .with_time_index(directory.join("times"));
+        history.set_clock_proven(true);
+        history.append(b"ab");
+        let (_, owed) = history.append_deferred(b"cd");
+        let write = owed.expect("the write is owed");
+        let times = history.time_index().expect("an index");
+        assert_eq!(times.first_cursor_from(0), Some(0), "the output is timed");
+        let discarded = history.discard_retained();
+        assert_eq!(discarded.left_behind.as_deref(), Some(WRITE_IN_FLIGHT));
+        assert_eq!(
+            times.first_cursor_from(0),
+            None,
+            "the index went with the first hold, not with the write"
+        );
+        assert!(write.perform(b"cd"));
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_history_that_is_not_owed_a_discard_is_read_whole() {
+        let (mut history, directory) = history_to_discard("fence-whole", "plain");
+        history.set_discard_owed(true);
+        history.set_discard_owed(false);
+        let page = history.page(0, 64).expect("a page");
+        assert_eq!(
+            page.bytes.as_slice(),
+            b"aaaaaaaabbbbbbbbcccccccc",
+            "the spool serves what it holds"
+        );
+        assert_eq!(history.retained_bytes(), 32);
+        assert!(history.time_index().is_some());
         std::fs::remove_dir_all(&directory).ok();
     }
 
