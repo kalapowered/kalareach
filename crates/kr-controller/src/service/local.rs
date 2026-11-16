@@ -16,6 +16,7 @@ use kr_protocol::method::Method;
 use kr_protocol::scalars::{CanonicalSet, Nullable, U64};
 use kr_transport::window::MAX_WINDOW_VALIDITY;
 
+use crate::attention::LeaseAsked;
 use crate::error::{ControllerError, Result};
 use crate::given::local_door::{
     Declined, DoorReply, ReplySink, Standing, WrittenUnder, declined, told,
@@ -344,7 +345,8 @@ impl Controller {
     /// The question a frame is asked immediately before the transport takes any of its bytes: the
     /// local owner's lease is read first, which waits for the policy lock, and the footing's one
     /// question is asked after that, with the bound of the lease that reading found. Nothing but
-    /// the question stands between it and the transport's write.
+    /// the question stands between it and the transport's write: what the question was asked with
+    /// is returned to the writer, which lets it go after the write.
     ///
     /// A bound whose cell moved to another lineage between the reading and the question is not
     /// decided by the question: the lease is read again and the question asked with the new bound.
@@ -356,7 +358,7 @@ impl Controller {
         &self,
         leased: Option<Method>,
         under: &WrittenUnder,
-    ) -> std::result::Result<(), Lapse> {
+    ) -> std::result::Result<LeaseAsked, Lapse> {
         loop {
             let held = match leased {
                 Some(method) => self.local_hold(method).map_err(|_| Lapse::LeaseEnded)?,
@@ -367,23 +369,30 @@ impl Controller {
             match under.asked_holding(held.bound) {
                 Err(LeasedLapse::BoundMoved) => {}
                 Err(LeasedLapse::Lapse(lapse)) => return Err(lapse),
-                Ok(()) => return Ok(()),
+                Ok(asked) => return Ok(asked),
             }
         }
     }
 
     /// What stops a read's frame being written now, for the attention release that asks it before
     /// every transport write: none while the lease holds and the registration stands, and
-    /// otherwise the reply of the member that refused, in the words of the door's own check.
+    /// otherwise the reply of the member that refused, in the words of the door's own check. Where
+    /// none stops it, what the question was asked with is left in `asked`, for the release to let
+    /// go after the write.
     pub(super) fn the_refusal_where_a_read_lands(
         &self,
         method: Option<Method>,
         under: &WrittenUnder,
         request_id: RequestId,
+        asked: &mut LeaseAsked,
     ) -> Option<ControlFrame> {
-        let lapse = self
-            .ask_where_a_frame_lands(Self::held_to_the_lease(method), under)
-            .err()?;
+        let lapse = match self.ask_where_a_frame_lands(Self::held_to_the_lease(method), under) {
+            Ok(held) => {
+                *asked = held;
+                return None;
+            }
+            Err(lapse) => lapse,
+        };
         Some(under.withheld(lapse, request_id, || {
             self.lease_ended_reply(request_id, method)
         }))
@@ -425,15 +434,26 @@ impl Controller {
         let Ok(bytes) = kr_ipc::framed::FrameWriter::encode(kind, answer) else {
             return false;
         };
-        let permitted = || self.ask_where_a_frame_lands(leased, under).is_ok();
+        // What the question was asked with, held until the transport's write has been made.
+        let mut asked = LeaseAsked::default();
         let mut begun = false;
         loop {
-            let attempt = if begun {
-                writer.resume_frame_checked(&permitted)
-            } else {
-                begun = true;
-                writer.begin_frame_checked(&bytes, &permitted)
+            let attempt = {
+                let permitted = || match self.ask_where_a_frame_lands(leased, under) {
+                    Ok(held) => {
+                        asked = held;
+                        true
+                    }
+                    Err(_) => false,
+                };
+                if begun {
+                    writer.resume_frame_checked(permitted)
+                } else {
+                    begun = true;
+                    writer.begin_frame_checked(&bytes, permitted)
+                }
             };
+            drop(std::mem::take(&mut asked));
             match attempt {
                 Ok(CheckedWrite::Complete) => return true,
                 Ok(CheckedWrite::Blocked) => {
@@ -446,7 +466,7 @@ impl Controller {
                         return false;
                     }
                     match self.ask_where_a_frame_lands(leased, under) {
-                        Ok(()) => {
+                        Ok(_) => {
                             // The lease was presented again, or the fence given back, meanwhile:
                             // offered afresh.
                             begun = false;
@@ -1056,11 +1076,12 @@ impl Controller {
                                             let under = WrittenUnder::of_a_read(
                                                 self.footing_of_a_request(connection_id),
                                             );
-                                            let refused = || {
+                                            let refused = |asked: &mut LeaseAsked| {
                                                 self.the_refusal_where_a_read_lands(
                                                     method,
                                                     &under,
                                                     request.request_id,
+                                                    asked,
                                                 )
                                             };
                                             let lease =

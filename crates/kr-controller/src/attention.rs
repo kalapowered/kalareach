@@ -596,8 +596,27 @@ impl Ticket {
 pub struct LeaseHold<'a> {
     /// What stops the answer being written now: none while the lease holds and the registration
     /// stands, and otherwise what is written instead of an answer none of which has gone, in the
-    /// words of the member that refused.
-    pub refused: &'a (dyn Fn() -> Option<kr_protocol::envelope::ControlFrame> + Sync),
+    /// words of the member that refused. Where none stops it, what the question was asked with is
+    /// left in `asked`, which the writer lets go only after the transport's write.
+    pub refused:
+        &'a (dyn Fn(&mut LeaseAsked) -> Option<kr_protocol::envelope::ControlFrame> + Sync),
+}
+
+/// What the question of a lease was asked with. The writer of an answer holds it from the question
+/// until the transport has taken what the question let through, so that letting go of it, which
+/// can free memory, never stands between the question and the write.
+#[derive(Default)]
+pub struct LeaseAsked {
+    _leased: Option<crate::service::LeasedFooting>,
+}
+
+impl LeaseAsked {
+    /// What a question was asked with where the lease's bound was read.
+    pub(crate) const fn with(leased: crate::service::LeasedFooting) -> Self {
+        Self {
+            _leased: Some(leased),
+        }
+    }
 }
 
 /// One read of this group's answer, ready to be released to the reader who asked.
@@ -1278,6 +1297,9 @@ impl AttentionModule {
         let mut bytes = kr_ipc::framed::FrameWriter::encode(kind, &frame)?;
         let mut text_held = withheld.is_some();
         let mut begun = false;
+        // What the lease's question was asked with, held until the transport's write has been
+        // made.
+        let mut asked = LeaseAsked::default();
         loop {
             let attempt = {
                 let fences = self.release.read().await;
@@ -1288,7 +1310,7 @@ impl AttentionModule {
                 let may_write = || {
                     (!text_held
                         || (standing.is_some() && ticket.holds_text(&fences, self.release_ms())))
-                        && lease.is_none_or(|lease| (lease.refused)().is_none())
+                        && lease.is_none_or(|lease| (lease.refused)(&mut asked).is_none())
                 };
                 if begun {
                     writer.resume_frame_checked(may_write)
@@ -1297,11 +1319,13 @@ impl AttentionModule {
                     writer.begin_frame_checked(&bytes, may_write)
                 }
             }?;
+            drop(std::mem::take(&mut asked));
             match attempt {
                 CheckedWrite::Complete => return Ok(()),
                 CheckedWrite::Blocked => writer.writable().ready().await?,
                 CheckedWrite::Refused => {
-                    let lapsed = lease.and_then(|lease| (lease.refused)());
+                    let lapsed =
+                        lease.and_then(|lease| (lease.refused)(&mut LeaseAsked::default()));
                     if !writer.withdraw_unstarted() {
                         return Err(kr_ipc::IpcError::socket(
                             "write",

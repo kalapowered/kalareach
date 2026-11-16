@@ -582,5 +582,8 @@ async fn the_ask_that_finds_a_bound_moved_reads_the_lease_again_and_does_not_ref
     arrival(arrived).await;
     presenter.present(&[kr_protocol::rights::ActionRight::FilesRead]);
     go.send(()).expect("the ask goes on");
-    assert_eq!(asking.await.expect("the ask ends"), Ok(()));
+    assert!(
+        asking.await.expect("the ask ends").is_ok(),
+        "the ask goes by the lease's second reading"
+    );
 }
