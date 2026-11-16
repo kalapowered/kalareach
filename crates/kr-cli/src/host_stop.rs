@@ -419,6 +419,15 @@ fn interrupted(progress: &Progress, stage: Stage, json: bool) -> Completion {
     )
 }
 
+/// The daemon a restart started, for `--json`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StartedFact {
+    /// The start: `standalone`, `launchd`, `systemd` or `task`.
+    pub(crate) start: &'static str,
+    /// Its process, where the start knows it.
+    pub(crate) pid: Option<u32>,
+}
+
 /// The facts a result carries in `--json`.
 #[derive(Clone)]
 pub(crate) struct Facts {
@@ -427,6 +436,8 @@ pub(crate) struct Facts {
     pub(crate) unsettled: Option<u64>,
     /// What earlier attempts recorded, which this command said at its start.
     pub(crate) records: Vec<Shown>,
+    /// What a restart started: absent for a stop, and null where the restart started no daemon.
+    pub(crate) started: Option<Option<StartedFact>>,
 }
 
 impl Facts {
@@ -437,14 +448,33 @@ impl Facts {
             pid: None,
             unsettled: None,
             records,
+            started: None,
+        }
+    }
+
+    /// These facts for a restart, which started no daemon so far.
+    pub(crate) fn of_a_restart(self) -> Self {
+        Self {
+            started: Some(None),
+            ..self
         }
     }
 
     pub(crate) fn document(&self) -> Document {
-        let document = Document::new()
+        let mut document = Document::new()
             .with("stop", self.knows.word())
             .with("pid", self.pid)
             .with("unsettled", self.unsettled);
+        if let Some(started) = self.started {
+            document.set(
+                "started",
+                started.map(|started| {
+                    Document::new()
+                        .with("start", started.start)
+                        .with("pid", started.pid)
+                }),
+            );
+        }
         if self.records.is_empty() {
             document
         } else {
@@ -504,7 +534,10 @@ pub(crate) async fn begin(
         return Err(failed(error, &Facts::none(Vec::new()), json));
     }
     let mut earlier = Earlier::read(&environment.paths);
-    let none = Facts::none(earlier.said(id));
+    let none = match which {
+        Which::Stop => Facts::none(earlier.said(id)),
+        Which::Restart => Facts::none(earlier.said(id)).of_a_restart(),
+    };
     *progress
         .earlier
         .lock()
@@ -734,6 +767,7 @@ fn record_said(recorded: &attempt::Recorded, id: EnvironmentId) -> Shown {
     let process = recorded.attempt.process.pid.get();
     let command = match recorded.attempt.command {
         attempt::Command::Stop => "kr host stop",
+        attempt::Command::Restart => "kr host restart",
     };
     if recorded.standing() == Standing::UnderWay {
         return shown!(
@@ -756,6 +790,22 @@ fn record_said(recorded: &attempt::Recorded, id: EnvironmentId) -> Shown {
         attempt::Phase::Told => shown!(
             "The last record of a {} (process {}) is at {}: the control daemon for environment {} \
              had been told to stop. What happened after that is not recorded.",
+            command,
+            process,
+            at,
+            id
+        ),
+        attempt::Phase::Starting => shown!(
+            "The last record of a {} (process {}) is at {}: it had asked for a new control daemon \
+             for environment {}. What happened after that is not recorded.",
+            command,
+            process,
+            at,
+            id
+        ),
+        attempt::Phase::StartFailed => shown!(
+            "The last record of a {} (process {}) is at {}: its start of a control daemon for \
+             environment {} had failed. Run kr host restart to try again.",
             command,
             process,
             at,
@@ -1077,6 +1127,7 @@ async fn stop_the_daemon(
                     pid: named,
                     unsettled: None,
                     records: none.records.clone(),
+                    started: None,
                 };
                 return done(
                     &ended_before_the_request_said(id, named, ended, &why),
@@ -1127,6 +1178,7 @@ async fn stop_the_daemon(
         pid,
         unsettled,
         records: none.records.clone(),
+        started: None,
     };
     match ended {
         End::Gone => {
@@ -1298,7 +1350,7 @@ fn is_the_daemons_own_refusal(
 /// under the same right, is asked. Where it is answered, the daemon is of a build that does not
 /// know the request, and nothing is done to it; where it is refused too, the refusal is the
 /// daemon's own and is shown as it is, the lapse of a lease included.
-async fn refused(
+pub(crate) async fn refused(
     client: &mut LocalClient,
     id: EnvironmentId,
     info: &HostInfoResult,
