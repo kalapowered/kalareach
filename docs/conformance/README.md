@@ -31,6 +31,7 @@ folder cannot be made:
 ```powershell
 pnpm install --frozen-lockfile
 cargo build --locked -p kr-conformance --bin kr-conformance
+$folder = $null
 $folder = Join-Path (Get-Item $env:TEMP).FullName "kr-conformance-start-$([guid]::NewGuid())"
 if (New-Item -ItemType Directory -Path $folder -ErrorAction Stop) {
     Copy-Item target\debug\kr-conformance.exe $folder -ErrorAction Stop
