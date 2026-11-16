@@ -540,7 +540,6 @@ async fn an_owner_that_drops_its_end_does_not_stop_the_reader() {
     );
     assert_eq!(
         answered
-            .ok()
             .expect("an answer")
             .expect("the call ran")
             .expect("a listing"),
