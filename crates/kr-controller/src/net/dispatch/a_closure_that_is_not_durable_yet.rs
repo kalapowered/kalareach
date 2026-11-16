@@ -175,3 +175,76 @@ async fn a_closure_whose_write_stands_is_answered_at_both_doors_and_recorded_as_
         world.serving.abort();
     }
 }
+
+/// A worker's closure that its daemon has not recorded is the answer to a close at either door
+/// after the worker has stopped accepting connections: the daemon does not reach for a worker that
+/// would refuse it, and answers from what it knows, with the word the worker gave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_after_the_worker_stopped_accepting_is_answered_from_what_the_daemon_knows() {
+    for volatile in [false, true] {
+        let given = if volatile {
+            Durability::Volatile
+        } else {
+            Durability::Durable
+        };
+        let script = Scripted::new();
+        script.accepts_with_its_closure();
+        script.its_closure_is_volatile(volatile);
+        let world = scripted::scripted(&script).await;
+        let controller = &world.controller;
+        let (connection, _) = paired_connection(controller, 36, EVERY_RIGHT);
+        let registry = || {
+            rusqlite::Connection::open(controller.paths.registry_database())
+                .expect("the registry opens beside the daemon's own handle")
+        };
+        registry()
+            .execute_batch(
+                "CREATE TRIGGER the_closure_is_not_kept BEFORE INSERT ON tombstones
+                 BEGIN SELECT RAISE(ABORT, 'the registry keeps no closure'); END;",
+            )
+            .expect("the registry is made to refuse the write that records a closure");
+
+        let first =
+            closed_at_the_local_door(&world, fake::admission(controller, world.accepted).await)
+                .await;
+        assert_eq!(first.durability, given, "{first:?}");
+        world.serving.abort();
+
+        let local =
+            closed_at_the_local_door(&world, fake::admission(controller, world.accepted).await)
+                .await;
+        assert_eq!(
+            (local.state, local.durability),
+            (SessionState::Closed, given),
+            "{local:?}"
+        );
+        let paired = closed_at_the_paired_door(&world, &connection, 91).await;
+        assert_eq!(
+            (paired.state, paired.durability),
+            (SessionState::Closed, given),
+            "{paired:?}"
+        );
+        assert_eq!(
+            script.forwarded().len(),
+            1,
+            "the closes after the first are answered without reaching the worker, volatile \
+             {volatile}"
+        );
+
+        registry()
+            .execute_batch("DROP TRIGGER the_closure_is_not_kept;")
+            .expect("the registry takes a closure again");
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            // A close asks for the write again; the write's own retries may be spent.
+            while recorded_durability(&world).await.is_none() {
+                closed_at_the_local_door(&world, fake::admission(controller, world.accepted).await)
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the closure is recorded once the registry takes it");
+        assert_eq!(recorded_durability(&world).await, Some(given));
+        world.serving.abort();
+    }
+}
