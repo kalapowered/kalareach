@@ -876,6 +876,10 @@ async fn a_read_of_a_held_session_names_the_application_the_session_had() {
         answered <= READ_BOUND,
         "the read of a held session was answered after {answered:?}, past {READ_BOUND:?}"
     );
+    assert!(
+        read.launch_profile.0.is_none(),
+        "the read was answered while the session was held"
+    );
     assert_eq!(read.session.application.as_deref(), Some("an editor"));
 }
 
@@ -1000,6 +1004,10 @@ async fn a_read_of_a_session_whose_close_is_underway_says_closing_from_the_domai
     assert!(
         answered <= READ_BOUND,
         "the read of a held session was answered after {answered:?}, past {READ_BOUND:?}"
+    );
+    assert!(
+        read.launch_profile.0.is_none(),
+        "the read was answered while the session was held"
     );
     assert_eq!(
         read.session.state,
