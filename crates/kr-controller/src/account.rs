@@ -234,7 +234,7 @@ impl Outcome {
 
 /// What the authority a sign-in was started under rests on, and what its question is asked with:
 /// the host, and the footing with the lease's bound where the sign-in is held to a lease. It is
-/// made before the question and the question is asked through it ([`Self::ask`]), so that nothing
+/// made before the question and the question is asked through it (`Guard::ask`), so that nothing
 /// is allocated and nothing is let go of between the question and the write that follows it. The
 /// one who asks holds it until that write has returned: letting go of the host or of the bound's
 /// last reference can free memory, and the host is not let go of between the ask and the write.
