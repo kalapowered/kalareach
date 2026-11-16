@@ -46,6 +46,8 @@ struct Reading {
     /// PowerShell and where the reader ended the shell.
     #[cfg_attr(not(unix), allow(dead_code))]
     caseless_after: Option<bool>,
+    /// The cache folder PowerShell was given for this run; `None` for the shell.
+    cache: Option<PathBuf>,
     /// Everything the reader said on its error stream.
     words: String,
 }
@@ -81,6 +83,11 @@ enum Look {
     Failed(String),
 }
 
+/// The machine's search path for programs.
+fn search_path() -> std::ffi::OsString {
+    std::env::var_os("PATH").unwrap_or_default()
+}
+
 /// The first file named `name` (with the platform's program suffix) in a folder of `path`.
 fn found_on(path: &OsStr, name: &str) -> Option<PathBuf> {
     std::env::split_paths(path)
@@ -88,18 +95,40 @@ fn found_on(path: &OsStr, name: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// Looks for the first of `names` that is a program on `path`, and starts it once to see that it
-/// runs.
-fn look_among(names: &[&str], path: &OsStr) -> Look {
+/// Gives a start of PowerShell a cache folder of its own, which the returned folder holds until it
+/// is dropped (nothing off Unix). PowerShell reads its startup profile from
+/// `$XDG_CACHE_HOME/powershell` (by default `~/.cache/powershell`) when it starts, and rewrites the
+/// file in place when it ends. Starts that run at once in one cache folder, as the cases of a run
+/// and the runs of a machine's one user do, read a file that another is rewriting, and some of
+/// them end with a segmentation fault or an unhandled exception. A start in a folder of its own
+/// would also make its telemetry identifier there, under a lock that the runtime keeps in a
+/// `.dotnet` folder of the temporary folder, which the cases that watch that folder would find;
+/// the start opts out of telemetry, so that it does neither.
+fn with_own_cache(start: &mut Command) -> Option<tempfile::TempDir> {
+    cfg!(unix).then(|| {
+        let cache = tempfile::tempdir().expect("a cache folder for PowerShell");
+        start
+            .env("XDG_CACHE_HOME", cache.path())
+            .env("POWERSHELL_TELEMETRY_OPTOUT", "1");
+        cache
+    })
+}
+
+/// What the look asks of a PowerShell it starts: to run nothing and end well.
+const PROBE: [&str; 3] = ["-NoProfile", "-Command", "exit 0"];
+
+/// Looks for the first of `names` that is a program on `path`, and starts it once, with
+/// `arguments`, to see that it runs.
+fn look_among(names: &[&str], path: &OsStr, arguments: &[&str]) -> Look {
     let mut failures = Vec::new();
     for name in names {
         let Some(program) = found_on(path, name) else {
             continue;
         };
-        match Command::new(&program)
-            .args(["-NoProfile", "-Command", "exit 0"])
-            .output()
-        {
+        let mut start = Command::new(&program);
+        start.args(arguments);
+        let _cache = with_own_cache(&mut start);
+        match start.output() {
             Ok(output) if output.status.success() => return Look::Found(program),
             Ok(output) => failures.push(format!(
                 "{} ended with {} and said {:?}",
@@ -132,7 +161,13 @@ fn powershell() -> Option<&'static Path> {
     } else {
         &["pwsh"]
     };
-    match LOOK.get_or_init(|| look_among(names, &std::env::var_os("PATH").unwrap_or_default())) {
+    answer(LOOK.get_or_init(|| look_among(names, &search_path(), &PROBE)))
+}
+
+/// What a case that needs PowerShell is told of a look: the program, nothing where PowerShell is
+/// not installed and the run is not a hosted one, and a failure where the look failed.
+fn answer(look: &Look) -> Option<&Path> {
+    match look {
         Look::Found(program) => Some(program),
         Look::Failed(words) => panic!("the look for PowerShell failed: {words}"),
         Look::NotInstalled => {
@@ -279,6 +314,7 @@ impl Reader {
         named: &[(&str, &OsStr)],
     ) -> Reading {
         let root = repository();
+        let mut _cache = None;
         let mut run = match self {
             Reader::Shell | Reader::SystemShell | Reader::LoginShell => {
                 let program = match self {
@@ -317,6 +353,7 @@ impl Reader {
                     "-NoProfile",
                     "-Command",
                     r#"$ErrorView = 'NormalView'
+                    "cache=$([System.Environment]::GetEnvironmentVariable('XDG_CACHE_HOME'))"
                     $directory = & $env:KR_READER_SCRIPT
                     "directory=$directory"
                     "exported=$([System.Environment]::GetEnvironmentVariable('KR_TEST_ARTIFACTS_DIR'))""#,
@@ -325,6 +362,7 @@ impl Reader {
                     "KR_READER_SCRIPT",
                     root.join("scripts").join("artifacts-dir.ps1"),
                 );
+                _cache = with_own_cache(&mut run);
                 run
             }
         };
@@ -367,6 +405,7 @@ impl Reader {
             succeeded: output.status.success(),
             directory: line("directory"),
             exported: line("exported"),
+            cache: line("cache").filter(|path| !path.as_os_str().is_empty()),
             slash_tmp: line("slash_tmp").filter(|path| !path.as_os_str().is_empty()),
             caseless_after: text
                 .lines()
@@ -2279,40 +2318,28 @@ mod windows_paths {
     }
 }
 
-/// A folder that holds one program, named `name`, whose text is `script`.
-#[cfg(unix)]
-fn folder_with_program(name: &str, script: &str, mode: u32) -> tempfile::TempDir {
-    use std::os::unix::fs::PermissionsExt;
-    let folder = tempfile::tempdir().expect("a folder for the program");
-    let program = folder.path().join(name);
-    std::fs::write(&program, script).expect("writes the program");
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(mode))
-        .expect("sets the program's mode");
-    folder
-}
-
 /// The look tells three answers apart, so that a PowerShell that is there and does not run is
-/// never taken for one that is not installed (which skips the cases of its reader).
+/// never taken for one that is not installed (which skips the cases of its reader). The programs
+/// it starts here are the system's own `false` and `true`: a program written for the case and
+/// started at once can be refused as busy while another thread's child still holds it open.
 #[cfg(unix)]
 #[test]
 fn the_look_for_powershell_tells_not_installed_from_a_start_that_failed() {
     let empty = tempfile::tempdir().expect("a folder with no program");
     assert_eq!(
-        look_among(&["pwsh"], empty.path().as_os_str()),
+        look_among(&["pwsh"], empty.path().as_os_str(), &PROBE),
         Look::NotInstalled
     );
 
-    let ends_badly = folder_with_program("pwsh", "#!/bin/sh\necho boom >&2\nexit 3\n", 0o755);
-    let Look::Failed(words) = look_among(&["pwsh"], ends_badly.path().as_os_str()) else {
+    let Look::Failed(words) = look_among(&["false"], &search_path(), &PROBE) else {
         panic!("a program that ends with a failure is not a found one, nor an absent one");
     };
-    assert!(
-        words.contains("exit status: 3") && words.contains("boom"),
-        "{words}"
-    );
+    assert!(words.contains("exit status: 1"), "{words}");
 
-    let not_runnable = folder_with_program("pwsh", "#!/bin/sh\nexit 0\n", 0o644);
-    let Look::Failed(words) = look_among(&["pwsh"], not_runnable.path().as_os_str()) else {
+    // A file that is there and cannot be run is not an absent program either.
+    let not_runnable = tempfile::tempdir().expect("a folder for the file");
+    std::fs::write(not_runnable.path().join("pwsh"), "").expect("writes a file that is no program");
+    let Look::Failed(words) = look_among(&["pwsh"], not_runnable.path().as_os_str(), &PROBE) else {
         panic!("a program that cannot be started is not an absent one");
     };
     assert!(words.contains("could not be started"), "{words}");
@@ -2322,11 +2349,64 @@ fn the_look_for_powershell_tells_not_installed_from_a_start_that_failed() {
 #[cfg(unix)]
 #[test]
 fn the_look_for_powershell_names_the_program_that_ran() {
-    let first = folder_with_program("pwsh", "#!/bin/sh\nexit 1\n", 0o755);
-    let second = folder_with_program("powershell", "#!/bin/sh\nexit 0\n", 0o755);
-    let path = std::env::join_paths([first.path(), second.path()]).expect("a search path");
-    assert_eq!(
-        look_among(&["pwsh", "powershell"], &path),
-        Look::Found(second.path().join("powershell"))
+    let Look::Found(program) = look_among(&["false", "true"], &search_path(), &PROBE) else {
+        panic!("`true` runs and ends well");
+    };
+    assert_eq!(program.file_name(), Some(OsStr::new("true")), "{program:?}");
+}
+
+/// PowerShell rewrites its startup profile in its cache folder as it ends, and a start that reads
+/// the file while another rewrites it can end with a segmentation fault. No two starts of the
+/// cases share a cache folder, so that none reads what another writes: the look's start, which
+/// here is the system's shell writing down the folder it was given, and the reader's run.
+#[cfg(unix)]
+#[test]
+fn no_two_starts_of_powershell_share_a_cache_folder() {
+    let folder = tempfile::tempdir().expect("a folder for what the starts saw");
+    let seen = folder.path().join("seen");
+    let seen_text = seen.to_str().expect("a path that is text");
+    for _ in 0..2 {
+        let look = look_among(
+            &["sh"],
+            &search_path(),
+            &[
+                "-c",
+                r#"printf '%s\n' "$XDG_CACHE_HOME" >> "$0""#,
+                seen_text,
+            ],
+        );
+        assert!(matches!(look, Look::Found(_)), "{look:?}");
+    }
+    let seen = std::fs::read_to_string(&seen).expect("what the starts saw");
+    let seen: Vec<&str> = seen.lines().collect();
+    assert!(
+        seen.len() == 2 && !seen[0].is_empty() && !seen[1].is_empty() && seen[0] != seen[1],
+        "the look's starts: {seen:?}"
     );
+
+    if powershell().is_none() {
+        return;
+    }
+    let temporary = tempfile::tempdir().expect("a temporary folder");
+    let caches: Vec<Option<PathBuf>> = (0..2)
+        .map(|_| {
+            let reading = Reader::PowerShell.read(None, Some(temporary.path()));
+            assert!(reading.succeeded, "{reading:?}");
+            std::fs::remove_dir(reading.directory.as_deref().expect("a directory"))
+                .expect("removes the directory the run made");
+            reading.cache
+        })
+        .collect();
+    assert!(
+        caches[0].is_some() && caches[1].is_some() && caches[0] != caches[1],
+        "the reader's runs: {caches:?}"
+    );
+}
+
+/// A case that needs PowerShell is failed by a look that failed, with the start's own words, and
+/// is not skipped as it is where PowerShell is not installed.
+#[test]
+#[should_panic(expected = "the look for PowerShell failed: it ended with signal: 11")]
+fn a_look_that_failed_fails_the_case_that_asks() {
+    let _ = answer(&Look::Failed("it ended with signal: 11".to_owned()));
 }
