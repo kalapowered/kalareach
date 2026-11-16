@@ -305,6 +305,33 @@ async fn filler(reader: &mut kr_ipc::framed::FrameReader) {
         .expect("a filler frame");
 }
 
+/// Reads filler frames, one at a time, until the writer says it has reached the end of its wait for
+/// room, and returns how many were read. How many frames the socket must lose before it is
+/// writable again is the kernel's to say (Linux reports room once a quarter of the bytes it
+/// accounts for are free, and a read of one frame frees one frame's share), so the case reads until
+/// the writer arrives and does not assume that one read is enough. Where every filler has been read
+/// the socket is empty, and the writer is waited for under the same bound.
+#[cfg(unix)]
+async fn drained_until_the_writer_arrives(
+    reader: &mut kr_ipc::framed::FrameReader,
+    arrived: &std::sync::mpsc::Receiver<()>,
+    fillers: usize,
+) -> usize {
+    let mut read = 0;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while arrived.try_recv().is_err() {
+            if read < fillers {
+                filler(reader).await;
+                read += 1;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the writer reaches the end of its wait");
+    read
+}
+
 /// Fills the connection's socket to the byte with whole filler frames, so that the next frame the
 /// writer is handed meets a socket that takes none of it, and returns the number of filler frames
 /// the peer has yet to read. The case owns both ends: it writes small frames one byte at a time
@@ -430,11 +457,7 @@ async fn written_after_a_wait_for_room(ends: Ends) -> (ControlFrame, ControlFram
              with no byte written"
         );
     }
-    filler(&mut reader).await;
-    tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30)))
-        .await
-        .expect("the wait ends")
-        .expect("the writer reaches the end of its wait");
+    let drained = drained_until_the_writer_arrives(&mut reader, &arrived, fillers).await;
     match ends {
         Ends::Nothing => {}
         Ends::TheLeasesTime => continuous.advance(Duration::from_secs(16 * 60)),
@@ -447,7 +470,7 @@ async fn written_after_a_wait_for_room(ends: Ends) -> (ControlFrame, ControlFram
         Ends::TheReplacementWaitsAndItsRegistrationEnd => controller.deregister(connection_id),
     }
     go.send(()).expect("the writer goes on");
-    for _ in 1..fillers {
+    for _ in drained..fillers {
         filler(&mut reader).await;
     }
     let read = tokio::time::timeout(Duration::from_secs(30), reader.read_message())
