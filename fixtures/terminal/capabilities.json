@@ -32,7 +32,7 @@
         },
         {
           "path": "profile.json",
-          "sha256": "aa5981d11833cf82243d61a29dbbb01cf661e5a56cbed69608734961478e1349"
+          "sha256": "9bb1bde3af641826a9bca43131c42d4c97daa4baac9d4ea3a8672b948888c975"
         }
       ],
       "name": "worker-responses",
@@ -56,7 +56,7 @@
       "fixtures": [
         {
           "path": "profile.json",
-          "sha256": "aa5981d11833cf82243d61a29dbbb01cf661e5a56cbed69608734961478e1349"
+          "sha256": "9bb1bde3af641826a9bca43131c42d4c97daa4baac9d4ea3a8672b948888c975"
         },
         {
           "path": "input-encodings.json",

@@ -64,7 +64,7 @@
         "state": "Line::compress_for_scrollback() keeping the cells, attributes and wrap markers it was given"
       },
       {
-        "reason": "privacy mode keeps no row above the screen, and a row's position is not its identity: a reverse index, an insert or a scroll moves a row past any position the engine could record, so the engine marks the line itself and the library carries the mark wherever it puts the content",
+        "reason": "privacy mode keeps no row above the screen, and a row's position is not its identity: a reverse index, an insert or a scroll moves a row past any position the engine could record, so the engine marks the line itself. The mark goes with the line through the operations the engine uses: a clone, a split, a rewrap, a join, and the moves of whole lines by a reverse index, an insert, a delete or a scroll. Two paths of the library copy content without the mark, and the engine reaches neither: the library's own repeat of the last character, which the engine takes out of the stream and draws itself, and the helper that makes a new line from columns, which the engine does not call",
         "state": "Line::caller_mark() and Line::set_caller_mark(), a mark that goes with a line's content through a clone, a split, a rewrap and a join"
       },
       {
