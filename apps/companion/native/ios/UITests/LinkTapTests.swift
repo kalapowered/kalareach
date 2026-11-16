@@ -439,7 +439,7 @@ final class LinkTapTests: HarnessTestCase {
 
     /// Scrolls the conversation until a link's words lie near the middle of the screen, and reads the link again.
     private func scroll(to name: String, attempts: Int = 10) -> Link {
-        for _ in 0..<attempts {
+        for attempt in 0..<attempts {
             let current = link(name)
             let shift = offset(of: current)
             let room = pane().room
@@ -448,7 +448,10 @@ final class LinkTapTests: HarnessTestCase {
             let distance = screenY - (room.midY + shift.dy)
             if abs(distance) < 60 { return current }
             // A drag from the middle of the pane moves the content with the finger; a drag that starts on a link scrolls too.
-            let start = screenPoint(CGPoint(x: room.midX, y: room.midY), shift)
+            // The frame that the system gives a button far off the screen can be wrong: after eight drags that have not brought the
+            // link near, the drag starts at the middle of the screen, where the pane lies at both text sizes.
+            if attempt == 8 { say("LINKLOOK scroll to \(name): not near after 8 drags: its first line is \(current.words.first ?? .zero), the pane \(room), the button's offset \(shift)") }
+            let start = attempt < 8 ? screenPoint(CGPoint(x: room.midX, y: room.midY), shift) : app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
             let end = start.withOffset(CGVector(dx: 0, dy: -max(min(distance, 300), -300)))
             start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.3)
             Thread.sleep(forTimeInterval: 1.0)
