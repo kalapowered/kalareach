@@ -442,13 +442,21 @@ async fn an_endpoint_that_cannot_be_removed_does_not_replace_the_account_a_worke
     }
 
     let world = AccountThatWasRefused::made().await;
-    drop(
-        world
+    // The session's lock file is made before the directory is made unwritable. The watch that the
+    // refused write started may hold the session at this moment, so it is asked for until it is
+    // free.
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while let Err(held) = world
             .controller
             .archive()
             .own_closed(world.session_id, || Ok(false))
-            .expect("the session's lock is made"),
-    );
+        {
+            let _ = held;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the session's lock is made");
     let endpoint = world
         .controller
         .paths
