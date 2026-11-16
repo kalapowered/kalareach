@@ -82,9 +82,12 @@ case "$(uname -s)" in
         # A POSIX runtime on Windows enables privileges in the token of everything it starts and
         # changes how the console's interrupt reaches it, so the suites would not run as they run
         # on their own. The report is started from a native shell there.
-        echo "run-conformance: on Windows, start the report from PowerShell or cmd:" >&2
+        echo "run-conformance: on Windows, start the report from PowerShell, from a copy of its program:" >&2
         echo "  pnpm install --frozen-lockfile" >&2
-        echo "  cargo run --locked -p kr-conformance --bin kr-conformance -- run --root . --evidence <a directory under %TEMP%>" >&2
+        echo "  cargo build --locked -p kr-conformance --bin kr-conformance" >&2
+        echo '  $folder = (New-Item -ItemType Directory -Path (Join-Path $env:TEMP "kr-conformance-start-$PID")).FullName' >&2
+        echo '  Copy-Item target\debug\kr-conformance.exe $folder' >&2
+        echo '  & "$folder\kr-conformance.exe" run --root . --evidence <a directory under %TEMP%>' >&2
         exit 2
         ;;
     *) echo "run-conformance: $(uname -s) is not a platform the report runs on" >&2; exit 2 ;;
@@ -424,6 +427,33 @@ if selected typescript; then
     pnpm install --frozen-lockfile
 fi
 
+# The report runs from a copy of its program, never from the file the build wrote. A step of the
+# plan builds the report's own package again (every `cargo test -p kr-conformance` does), and a
+# build that writes a different program over the one that is running fails where the system does
+# not let a running program be replaced. The copy lives in a folder of this run's own under the
+# temporary directory, which is where the report makes its private copies, and the folder is
+# removed when the script ends, by the name this script gave it.
+runner_base="${TMPDIR:-/tmp}"
+runner_dir=""
+remove_runner() {
+    [ -n "$runner_dir" ] || return 0
+    case "$runner_dir" in
+        "$runner_base"/kr-conformance-start.?*) ;;
+        *)
+            echo "run-conformance: not removing $runner_dir, which is not a folder this run made" >&2
+            return 0
+            ;;
+    esac
+    rm -rf "${runner_dir:?}" || echo "run-conformance: could not remove $runner_dir" >&2
+}
+trap remove_runner EXIT
+
 cargo build --locked -p kr-conformance --bin kr-conformance
-binary="${CARGO_TARGET_DIR:-$root/target}/debug/kr-conformance"
-exec "$binary" "${arguments[@]}"
+built="${CARGO_TARGET_DIR:-$root/target}/debug/kr-conformance"
+runner_dir="$(mktemp -d "$runner_base/kr-conformance-start.XXXXXX")"
+[ -n "$runner_dir" ] || { echo "run-conformance: no folder was made for the report's program" >&2; exit 2; }
+runner="$runner_dir/kr-conformance"
+cp "$built" "$runner"
+status=0
+"$runner" "${arguments[@]}" || status=$?
+exit "$status"

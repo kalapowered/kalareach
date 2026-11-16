@@ -573,6 +573,11 @@ jobs:
       # the job's steps add up to 352 of its 355 minutes. A part takes about half of the plan and
       # the two builds that open it: 128 and 123 minutes in the run of 12 November, so the limit
       # is more than twice what a part needs and a part keeps more than a quarter of it.
+      #
+      # The report runs from a copy of its program, in a folder of this run's own under the
+      # temporary directory, as scripts/run-conformance.sh runs it on the other platforms: a step of
+      # the plan builds the report's own package again, and Windows does not let the program that is
+      # running be replaced. The folder is removed when the step ends, by the name the step gave it.
       - name: The conformance report
         if: ${{ !cancelled() }}
         timeout-minutes: 281
@@ -588,7 +593,24 @@ jobs:
             $arguments += '--group'
             $arguments += $name
           }
-          cargo run --locked -p kr-conformance --bin kr-conformance -- run --root $PWD.Path --evidence $evidence --part "$env:REPORT_PART/2" @arguments
+          cargo build --locked -p kr-conformance --bin kr-conformance
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $PWD.Path 'target' }
+          $built = Join-Path $target 'debug\kr-conformance.exe'
+          $folder = Join-Path (Get-Item $env:TEMP).FullName "kr-conformance-start-$([guid]::NewGuid().ToString('N'))"
+          New-Item -ItemType Directory -Path $folder | Out-Null
+          $status = 1
+          try {
+            $runner = Join-Path $folder 'kr-conformance.exe'
+            Copy-Item -LiteralPath $built -Destination $runner
+            & $runner run --root $PWD.Path --evidence $evidence --part "$env:REPORT_PART/2" @arguments
+            $status = $LASTEXITCODE
+          } finally {
+            if ($folder -and (Split-Path -Leaf $folder).StartsWith('kr-conformance-start-')) {
+              Remove-Item -LiteralPath $folder -Recurse -Force
+            }
+          }
+          exit $status
 
       # The drives as the report left them; the change in used space since the first reading is what
       # the job took.

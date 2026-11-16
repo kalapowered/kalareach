@@ -18,15 +18,23 @@ scripts/run-conformance.sh --all-terminals    # every group, and then section 27
 ```
 
 The script fetches what the applications group needs, installs the TypeScript packages when that
-group runs, builds the `kr-conformance` binary in `tests/conformance` and runs it. On Windows the
-report is started from PowerShell or cmd instead, because a POSIX shell's runtime enables privileges
-in the token of everything it starts and changes how the console's interrupt reaches it:
+group runs, builds the `kr-conformance` binary in `tests/conformance`, copies it into a new folder
+under the temporary directory and runs the copy, and removes the folder when it ends. The report
+never runs from the file the build wrote, because a step of the plan builds the report's own
+package again and Windows does not let a running program be replaced. On Windows the report is
+started from PowerShell instead, because a POSIX shell's runtime enables privileges in the token of
+everything it starts and changes how the console's interrupt reaches it. It runs from a copy there
+too:
 
 ```powershell
 pnpm install --frozen-lockfile
-cargo run --locked -p kr-conformance --bin kr-conformance -- run --root . --evidence <a directory under %TEMP%>
+cargo build --locked -p kr-conformance --bin kr-conformance
+$folder = (New-Item -ItemType Directory -Path (Join-Path $env:TEMP "kr-conformance-start-$PID")).FullName
+Copy-Item target\debug\kr-conformance.exe $folder
+& "$folder\kr-conformance.exe" run --root . --evidence <a directory under %TEMP%>
 ```
- The result is
+
+Remove that folder when the run ends. The result is
 `<evidence>/conformance/result.json`, and each step's log is under `<evidence>/conformance/logs/`.
 Beside the log of a `cargo test` step is a directory named for it with `.records` in place of `.log`.
 It holds `binaries.txt` and, for each test binary under the standard harness, what the harness wrote.
