@@ -361,6 +361,16 @@ final class LinkTapTests: HarnessTestCase {
         }
     }
 
+    /// Whether the record still holds a line from before `order`. Its lines go oldest out, and the number each line carries never falls, so a line
+    /// that is older than a step and still there shows that no line of the step has gone.
+    private func recordReaches(before order: Int) -> Bool {
+        recordText("TAPLOG").dropFirst("TAPLOG".count).components(separatedBy: " ; ").contains { part in
+            let fields = part.split(separator: " ")
+            guard fields.count >= 2, ["E", "V", "C", "S"].contains(fields[0]), let key = Int(fields[1]) else { return false }
+            return key < order
+        }
+    }
+
     /// Whether the pointer down of a pointer was a primary pointer's, from the record's `C` lines, or nil where the record has none of it.
     private func isPrimary(_ pointer: String) -> Bool? {
         for part in recordText("TAPLOG").dropFirst("TAPLOG".count).components(separatedBy: " ; ") {
@@ -990,8 +1000,10 @@ final class LinkTapTests: HarnessTestCase {
         XCTAssertFalse(cleanDrag.events.contains { $0.type == "click" }, "\(cleanDrag.label): a click came")
         XCTAssertTrue(cleanDrag.opened.isEmpty, "\(cleanDrag.label): opened \(cleanDrag.opened)")
 
-        // A press of one second on a link's words: what the platform does with it stands, and the page adds nothing.
+        // A press of one second on a link's words, the start of the step that ends with the tap elsewhere below: no click comes at the hold and
+        // nothing opens, and what the platform does with it otherwise stands. The links opened so far are counted for the whole step.
         let pressed = scroll(to: "table-2")
+        let openedBeforeStep = opened().count
         let held = tap(
             "\(named): a press of one second on a link's words",
             at: CGPoint(x: pressed.words[0].midX, y: pressed.words[0].midY),
@@ -999,9 +1011,9 @@ final class LinkTapTests: HarnessTestCase {
             hold: 1.0,
             clickExpected: false
         )
-        let heldClicks = held.events.filter { $0.type == "click" && $0.trusted }.count
-        XCTAssertEqual(held.opened.count, heldClicks, "\(held.label): \(heldClicks) clicks of the system's, \(held.opened.count) links opened")
-        XCTAssertFalse(held.events.contains { $0.type == "click" && !$0.trusted }, "\(held.label): the page added a click")
+        let heldClicks = held.events.filter { $0.type == "click" }.map { "\($0.trusted ? "the system's" : "the page's") click on \($0.target)" }
+        XCTAssertTrue(heldClicks.isEmpty, "\(held.label): a click came at the hold: \(heldClicks)")
+        XCTAssertTrue(held.opened.isEmpty, "\(held.label): opened \(held.opened)")
 
         // The held press leaves the system's own selection of the words under the finger. A touch's look and the page's selection never show
         // together, so the held link's look is out when the selection comes: out at the release when the selection came first. A selection
@@ -1029,7 +1041,9 @@ final class LinkTapTests: HarnessTestCase {
         // Toward the end of the conversation if it has room that way, and toward its start if not.
         let place = pane()
         let by: CGFloat = place.top + 180 <= place.most ? -180 : 180
-        say("LINKTAP \(named): the conversation before the drag: room \(place.room), scrolled \(Int(place.top)) of \(Int(place.most)); the page's selection \(selection().text)")
+        let beforeDrag = selection()
+        say("LINKTAP \(named): the conversation before the drag: room \(place.room), scrolled \(Int(place.top)) of \(Int(place.most)); the page's selection \(beforeDrag.text)")
+        XCTAssertTrue(beforeDrag.range, "\(named): the page's selection is not a range right before the drag: \(beforeDrag.text)")
         let result = drag("\(named): a drag that starts on a link, right after a held press", from: CGPoint(x: draggedWords.midX, y: draggedWords.midY), by: CGVector(dx: 0, dy: by), shift: draggedShift)
         let afterDrag = selection()
         let draggedMoved = pane().top - place.top
@@ -1058,6 +1072,18 @@ final class LinkTapTests: HarnessTestCase {
         XCTAssertFalse(elsewhere.looks.contains { $0.on }, "\(elsewhere.label): a look came on: \(elsewhere.looks)")
         XCTAssertTrue(elsewhere.opened.isEmpty, "\(elsewhere.label): opened \(elsewhere.opened)")
         XCTAssertTrue(litNow().isEmpty, "\(elsewhere.label): lit at its end: \(litNow())")
+
+        // The whole step, from the press of the hold to the end of the tap elsewhere, counted once: no link opened, and the look lines are one look on
+        // and one look off, the held link's, at the hold. The reads between the step's own taps are not taps, so a look that comes on and goes out
+        // or a link that opens between two of them shows only here. The record keeps the last lines only, so the count holds only if a line from
+        // before the hold is still in it.
+        let holdLookOn = (held.looks.first { $0.on }?.at ?? .infinity) - 1
+        let stepLooks = record().looks.filter { $0.at >= holdLookOn }.map { "\($0.on ? "on" : "off")(\($0.name))" }
+        let stepOpened = Array(opened().dropFirst(openedBeforeStep))
+        say("LINKTAP \(named): the whole step, from the hold to the end of the tap elsewhere: look lines \(stepLooks), links opened \(stepOpened)")
+        XCTAssertTrue(recordReaches(before: (holdDown?.order ?? 0) - 1), "\(named): the record no longer holds a line from before the hold, so the whole step's look lines are not all in it")
+        XCTAssertEqual(stepLooks, ["on(\(pressed.name))", "off(\(pressed.name))"], "\(named): the look lines of the whole step: \(stepLooks)")
+        XCTAssertTrue(stepOpened.isEmpty, "\(named): links opened in the whole step: \(stepOpened)")
 
         // A link tapped while the composer has focus: the link opens once, and the report says where the focus is
         // and whether the keyboard is still up.
