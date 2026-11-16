@@ -2080,6 +2080,8 @@ pub enum Commit {
 /// What [`SignedInAccount::keep`] came to, and what became of the revocation of the tokens it
 /// ended.
 #[derive(Debug)]
+#[must_use = "the outcome says whether the grant is kept and whether a token is left that only this \
+              process holds"]
 pub struct KeepOutcome {
     /// The outcome the keep gives, or the failure of the commit where the grant was not kept.
     pub answer: Result<Commit>,
@@ -2476,15 +2478,6 @@ impl SignedInAccount {
         Ok(entries)
     }
 
-    /// Whether this process holds `refresh_token` in memory for the next send.
-    fn held_in_memory(&self, refresh_token: &RefreshToken) -> bool {
-        self.unsettled
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .any(|(_, held)| held == refresh_token)
-    }
-
     /// Keeps a token in memory until a send can queue it or the service acknowledges it: the one
     /// way in, so a token is held once however often it is added.
     fn keep_in_memory(&self, grant_id: &str, refresh_token: RefreshToken) {
@@ -2536,7 +2529,7 @@ impl SignedInAccount {
             }
             Err(error) => Some(Unrevoked::Queued(error)),
         };
-        let commit = if self.held_in_memory(&refresh_token) {
+        let commit = if matches!(unrevoked, Some(Unrevoked::Held(_))) {
             Commit::WithheldOwing
         } else {
             Commit::Withheld
