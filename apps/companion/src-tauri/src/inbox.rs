@@ -426,10 +426,12 @@ async fn present(
         .present_membership(&connection.session(), host, &identity, presentation)
         .await
         .map_err(|error| match error {
-            LinkError::Refused(refusal)
-            | LinkError::Membership(refusal)
-            | LinkError::Declined(refusal) => {
+            LinkError::Refused(refusal) | LinkError::Declined(refusal) => {
                 Missed::Refused(Asked::Connection, CommandError::from(refusal))
+            }
+            // The stop of the lease says what the person is asked after its words.
+            LinkError::Membership(refusal, action) => {
+                Missed::Refused(Asked::Connection, CommandError::asking(refusal, action))
             }
             LinkError::Lost(_) | LinkError::Configuration(_) | LinkError::Selection(_) => {
                 Missed::Unreached

@@ -198,18 +198,18 @@ impl LeaseStop {
         }
     }
 
-    /// What the person does about it.
+    /// What the person is asked to do after the stop's words. `Later` asks nothing: its words say
+    /// how long this device waits before it asks again, and a wait that the code chose would be a
+    /// second one.
     #[must_use]
     pub const fn user_action(&self) -> UserAction {
         match self {
             Self::SignIn | Self::TokenRefused => UserAction::SignIn,
-            Self::NotAMember | Self::Refused(_) => UserAction::Nothing,
+            Self::NotAMember | Self::Refused(_) | Self::Later(_) => UserAction::Nothing,
             Self::Unusable => UserAction::Update,
-            Self::Later(_)
-            | Self::ConnectionEnded
-            | Self::Unreachable
-            | Self::AccountChanged
-            | Self::Presenting => UserAction::Wait,
+            Self::ConnectionEnded | Self::Unreachable | Self::AccountChanged | Self::Presenting => {
+                UserAction::Wait
+            }
         }
     }
 

@@ -116,10 +116,16 @@ impl std::fmt::Debug for LeaseDesk {
 /// It is not the host's word about what it was asked: a stop can be the organisation's service, this
 /// device's account, or the host's refusal of the lease it was given. A connection that ended under
 /// the presentation is the one thing it says of the host: it was lost.
+///
+/// The stop says what is asked of the person after its words ([`LeaseStop::user_action`]), and the
+/// failure carries that beside them.
 fn failed(stop: &LeaseStop) -> LinkError {
     match stop {
         LeaseStop::ConnectionEnded => LinkError::Lost(stop.to_string()),
-        other => LinkError::Membership(ProtocolError::new(other.code(), other.to_string())),
+        other => LinkError::Membership(
+            ProtocolError::new(other.code(), other.to_string()),
+            other.user_action(),
+        ),
     }
 }
 
@@ -342,7 +348,7 @@ fn failed_on(session: &Session, stop: &LeaseStop) -> LinkError {
     if *stop == LeaseStop::ConnectionEnded
         && let Some(error) = session.transport().ended_by_this_device()
     {
-        return LinkError::Membership(error);
+        return LinkError::membership_by_code(error);
     }
     if let Some(refused) = crate::connection::Unopened::refusal_kept_by(session) {
         return refused;
@@ -387,7 +393,7 @@ impl MembershipPresenter for LeaseDesk {
                 BoundTransport::over(transport, signed.sign_in, gate_changes, task_changes, lease);
             // The account may have left while the connection was dialled: nothing is opened.
             match bound.ended_by_this_device() {
-                Some(error) => Err(LinkError::Membership(error)),
+                Some(error) => Err(LinkError::membership_by_code(error)),
                 None => Ok(bound),
             }
         })

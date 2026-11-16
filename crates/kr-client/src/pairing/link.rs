@@ -59,6 +59,7 @@ use tokio::sync::{Mutex, watch};
 
 use super::BoxFuture;
 use super::paired::PairedHost;
+use crate::retry::UserAction;
 use crate::services::{PairingAdmissions, RelayRefusal};
 use crate::session::Session;
 use crate::shown::{Said, Shown};
@@ -79,7 +80,12 @@ pub enum LinkError {
     /// this device's account, or the host's refusal of the lease it was given, and the message says
     /// which. It is no refusal of what the caller asked the host, so a caller that reads a refusal
     /// as the host's decision about that does not read this as one.
-    Membership(ProtocolError),
+    ///
+    /// The action is what a person is asked to do after the words, as the stop of the lease that
+    /// made this failure says it: a stop whose words say when the device asks again asks nothing
+    /// more. A failure that comes with no stop of the lease (see [`Self::membership_by_code`])
+    /// carries the action its code gives.
+    Membership(ProtocolError, UserAction),
     /// The host refused the connection itself, with the error it answers a device with at
     /// admission, before the device had presented what the host needs of it: the connection was
     /// made, and the host's refusal came before the lease was taken. The refusal is the session's
@@ -109,6 +115,15 @@ impl LinkError {
     pub(crate) fn lost(reason: Shown) -> Self {
         Self::Lost(reason.into_string())
     }
+
+    /// A failure to give the host the lease it needs that comes with no stop of the lease to say
+    /// what to do about it, as when a connection recorded why it ended: the action is the one the
+    /// error's code gives.
+    #[must_use]
+    pub fn membership_by_code(error: ProtocolError) -> Self {
+        let action = crate::retry::user_action(error.code);
+        Self::Membership(error, action)
+    }
 }
 
 impl Said for LinkError {
@@ -119,7 +134,7 @@ impl Said for LinkError {
                 error.code,
                 Shown::protocol(error)
             ),
-            Self::Membership(error) | Self::Declined(error) => Shown::protocol(error),
+            Self::Membership(error, _) | Self::Declined(error) => Shown::protocol(error),
             Self::ConnectionRefused(error) => crate::shown!(
                 "the host refused the connection: {}: {}",
                 error.code,

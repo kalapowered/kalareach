@@ -362,7 +362,7 @@ impl Owner {
         .map_err(|error| match error {
             // The host was reached and was asked nothing: this computer could not give it the
             // lease it needs, and the words say why.
-            LinkError::Membership(refusal) => Missed::Refused(refusal.message),
+            LinkError::Membership(refusal, _) => Missed::Refused(refusal.message),
             // The host is not out of contact when this computer's own budget of connections to it
             // is used, or when it has no room for this computer's connection: the next visit asks
             // again. Any other cause is out of contact, a connection that the host refused at its

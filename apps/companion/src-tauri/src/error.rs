@@ -157,6 +157,25 @@ impl From<kr_protocol::error::ProtocolError> for CommandError {
     }
 }
 
+impl CommandError {
+    /// The failure of an error that this application made itself, with the action that what made
+    /// it says, rather than the one its code gives. A stop whose words say when to try again asks
+    /// for nothing more, so no second wait follows them. Where nothing but a code is known (an
+    /// error that came over the wire), [`From<ProtocolError>`] gives the code's action.
+    #[must_use]
+    pub fn asking(
+        error: kr_protocol::error::ProtocolError,
+        action: kr_client::retry::UserAction,
+    ) -> Self {
+        Self {
+            code: error.code,
+            message: error.message,
+            user_action: action.as_str().into(),
+            retry: error.code.retry_category(),
+        }
+    }
+}
+
 /// The answer a command gives.
 pub type Result<T> = std::result::Result<T, CommandError>;
 
