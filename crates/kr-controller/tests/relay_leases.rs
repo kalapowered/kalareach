@@ -5187,6 +5187,8 @@ async fn a_device_that_is_refused_free_capacity_is_told_so_when_it_cannot_pair()
         .expect("the attempt ran")
         .expect_err("a relay that takes no session carries nothing");
     assert_eq!(failure.kind, FailureKind::RelayCapacity);
+    // The host never saw this device, so its invitation is as it was.
+    assert!(!failure.invitation_spent);
     // The failure holds the paths the service named, as it wrote them.
     assert_eq!(told_paths(&failure), STAND_IN_PATHS);
     // The service named no delay, and the device still asks again after twenty seconds.
@@ -5516,6 +5518,7 @@ async fn a_device_that_is_refused_free_capacity_is_handed_its_own_wait() {
         .expect("the attempt ran")
         .expect_err("a relay that takes no session carries nothing");
     assert_eq!(failure.kind, FailureKind::RelayCapacity);
+    assert!(!failure.invitation_spent);
     // What a person is told to wait is the device's own wait, what is left until it asks again,
     // which is no more than the delay the service named and at least a second until it has passed.
     let wait = failure.retry_after_seconds.expect("a wait");

@@ -505,6 +505,12 @@ struct WatchedLink {
     fresh_dials_fail: Arc<AtomicBool>,
     /// How long a dial that fails takes to fail.
     fresh_dial_stall: Option<Duration>,
+    /// Holding the endpoint of a host fails.
+    fail_hold: bool,
+    /// Opening the pre-authorisation surface of a connection fails.
+    fail_open: bool,
+    /// What a failed dial is explained by, as a managed relay's standing answer would.
+    relay_refused: Option<kr_client::services::RelayRefusal>,
     /// The first connection's pre-authorisation surface reaches the device this much later than
     /// the host answered its handshake, as a slow network would deliver that answer.
     first_open_delay: Option<Duration>,
@@ -541,6 +547,9 @@ impl WatchedLink {
             sever_paired: false,
             fresh_dials_fail: Arc::new(AtomicBool::new(false)),
             fresh_dial_stall: None,
+            fail_hold: false,
+            fail_open: false,
+            relay_refused: None,
             first_open_delay: None,
             first_opened: Mutex::new(None),
             transit: Arc::new(Transit::default()),
@@ -674,6 +683,9 @@ impl HostLink for WatchedLink {
         network: &NetworkConfig,
         endpoint: &EndpointKey,
     ) -> Option<kr_client::services::RelayRefusal> {
+        if let Some(refusal) = &self.relay_refused {
+            return Some(refusal.clone());
+        }
         match &self.elsewhere {
             Some((network, endpoint)) => self.inner.relay_refusal(network, endpoint),
             None => self.inner.relay_refusal(network, endpoint),
@@ -685,6 +697,9 @@ impl HostLink for WatchedLink {
         connection: &'a Connection,
         identity: &'a LocalIdentity,
     ) -> BoxFuture<'a, Result<Box<dyn Preauth>, LinkError>> {
+        if self.fail_open {
+            return Box::pin(async { Err(severed()) });
+        }
         let earlier = self.opened.fetch_add(1, Ordering::SeqCst);
         if earlier == 0 {
             *self.first_opened.lock().expect("the record") = Some(tokio::time::Instant::now());
@@ -733,6 +748,9 @@ impl HostLink for WatchedLink {
         &'a self,
         network: &'a NetworkConfig,
     ) -> BoxFuture<'a, Result<EndpointHold, LinkError>> {
+        if self.fail_hold {
+            return Box::pin(async { Err(severed()) });
+        }
         self.inner.hold(network)
     }
 
@@ -1384,6 +1402,10 @@ async fn an_expired_resume_keeps_the_host_and_asks_nothing() {
         .expect("an attempt was waiting")
         .expect_err("not reported as paired");
     assert_eq!(failure.kind, FailureKind::HostUnreachable);
+    assert!(
+        !failure.invitation_spent,
+        "the host had committed this device"
+    );
     assert_eq!(failure.tries_left, Some(MAX_CLIENT_ATTEMPTS - 1));
     assert_eq!(
         made(&link).paired_connects.load(Ordering::SeqCst),
@@ -1446,6 +1468,10 @@ async fn the_deadline_holds_while_the_device_confirms_what_it_became() {
     paired_gate.open();
     let failure = outcome(attempt).await.expect_err("not reported as paired");
     assert_eq!(failure.kind, FailureKind::HostUnreachable);
+    assert!(
+        !failure.invitation_spent,
+        "the host had committed this device"
+    );
     assert_eq!(failure.tries_left, Some(MAX_CLIENT_ATTEMPTS - 1));
     assert_eq!(
         link.paired_connects.load(Ordering::SeqCst),
@@ -2910,3 +2936,120 @@ async fn each_host_is_reached_through_its_own_network_configuration() {
 /// A method that takes no parameters.
 #[derive(serde::Serialize)]
 struct EmptyParams {}
+
+/// A host for a code attempt: one invitation, and the device that is about to enter its code.
+async fn attempt_through(
+    configure: impl FnOnce(&mut WatchedLink),
+) -> Result<PairedHost, kr_client::pairing::PairingFailure> {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = invite_code(environment, &mut client, &viewer(), None, &owner).await;
+    let (origin, code, _) = code_of(&invited);
+    let (_link, making) = watching(configure);
+    let device = ProductDevice::new(Arc::new(host.room.clone()), making);
+    let (attempt, _shown) = device.enter(&origin, &code);
+    outcome(attempt).await
+}
+
+/// KR-REQ-10.19: a code attempt that fails on the way to the host, after the host locked its
+/// invitation to the attempt, says so: whichever of the three steps failed (holding the endpoint,
+/// the dial, opening the host's first surface), and whether a managed relay's refusal explains the
+/// dial or not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_code_attempt_that_fails_on_the_way_to_the_host_says_its_invitation_is_spent() {
+    use kr_client::services::{Alternatives, RelayRefusal};
+
+    let refusal = || RelayRefusal::Capacity {
+        alternatives: Alternatives::for_test(&["A path that the service named."]),
+        retry_after_seconds: 90,
+    };
+    type Configure = Box<dyn FnOnce(&mut WatchedLink)>;
+    let sites: [(&str, Configure, FailureKind); 5] = [
+        (
+            "hold",
+            Box::new(|link: &mut WatchedLink| link.fail_hold = true),
+            FailureKind::HostUnreachable,
+        ),
+        (
+            "dial",
+            Box::new(|link: &mut WatchedLink| link.severed.store(true, Ordering::SeqCst)),
+            FailureKind::HostUnreachable,
+        ),
+        (
+            "open",
+            Box::new(|link: &mut WatchedLink| link.fail_open = true),
+            FailureKind::HostUnreachable,
+        ),
+        (
+            "relay capacity",
+            Box::new(move |link: &mut WatchedLink| {
+                link.severed.store(true, Ordering::SeqCst);
+                link.relay_refused = Some(refusal());
+            }),
+            FailureKind::RelayCapacity,
+        ),
+        (
+            "relay fault",
+            Box::new(|link: &mut WatchedLink| {
+                link.severed.store(true, Ordering::SeqCst);
+                link.relay_refused = Some(RelayRefusal::Fault {
+                    retry_after_seconds: 600,
+                });
+            }),
+            FailureKind::RelayFault,
+        ),
+    ];
+    for (site, configure, kind) in sites {
+        let failure = attempt_through(configure)
+            .await
+            .expect_err("the host cannot be reached");
+        assert_eq!(failure.kind, kind, "{site}");
+        assert!(failure.invitation_spent, "{site}");
+        assert_eq!(failure.tries_left, Some(MAX_CLIENT_ATTEMPTS - 1), "{site}");
+        let sent = serde_json::to_value(&failure).expect("sent");
+        assert_eq!(sent["invitation_spent"], serde_json::json!(true), "{site}");
+    }
+}
+
+/// KR-REQ-10.32: a device that starts again while its attempt waits for the owner, and cannot reach
+/// the host to ask, does not know whether the owner decided. It says so, and does not say that the
+/// invitation can no longer be used: the host is still holding it for this device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resume_that_cannot_reach_the_host_does_not_know_whether_the_owner_decided() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = invite_code(environment, &mut client, &viewer(), None, &owner).await;
+    let (origin, code, _) = code_of(&invited);
+
+    let device = ProductDevice::new(Arc::new(host.room.clone()), |link| Arc::new(link));
+    let (attempt, mut shown) = device.enter(&origin, &code);
+    awaiting_value(&mut shown).await;
+    attempt.abort();
+    let _ = attempt.await;
+
+    let (_link, making) = watching(|link| link.fail_hold = true);
+    let restarted = device.restarted(making);
+    let (progress, _shown) = watch::channel(AttemptState::Idle);
+    let failure = tokio::time::timeout(WATCHDOG, restarted.resume(&progress))
+        .await
+        .expect("the resumed attempt ends")
+        .expect("an attempt was waiting")
+        .expect_err("not paired");
+    assert_eq!(failure.kind, FailureKind::ApprovalUnknown);
+    assert!(!failure.invitation_spent);
+    assert_eq!(failure.tries_left, Some(MAX_CLIENT_ATTEMPTS - 1));
+    assert!(
+        restarted
+            .hosts
+            .waiting_attempt()
+            .expect("readable")
+            .is_some(),
+        "the attempt is kept until a person stops it"
+    );
+}
