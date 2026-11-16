@@ -1164,37 +1164,60 @@ final class LinkTapTests: HarnessTestCase {
         say("LINKLOOK \(named): stacked links walk: the link that opened at each step, from the border downward and then upward: \(walk.joined(separator: " ")); \(walkOther) at which the click named another link than the nearest words")
     }
 
-    /// A touch in the gap below the pane, next to the link at the pane's lower edge: the click that WebKit moves onto the link
-    /// opens it, and it has the look at the click.
+    /// Where the conversation's last link and the pane's lower edge lie now: the screen offset, the pane and the link's last line.
+    private func geometryBelowThePane() -> (shift: CGVector, room: CGRect, words: CGRect) {
+        let last = link("last-line")
+        return (offset(of: last), pane().room, last.words[last.words.count - 1])
+    }
+
+    /// A click that WebKit moves onto the composer focuses it and raises the keyboard, which moves the pane and the gap with it. A tap on
+    /// plain text of the conversation, away from every link, ends the focus; then the conversation is scrolled to its end and the gap's
+    /// geometry is read again, so that the next tap in the gap is a tap in the gap and not on the keyboard.
+    private func settleBelowThePane() -> (shift: CGVector, room: CGRect, words: CGRect) {
+        for attempt in 1...3 where app.keyboards.count > 0 {
+            guard let away = awayFromLinks() else {
+                XCTFail("the keyboard is up and no point of the conversation lies a line away from every link: \(pane().room)")
+                break
+            }
+            _ = tap("the gap: ending the composer's focus, attempt \(attempt)", at: away, shift: offset(of: link("last-line")))
+            Thread.sleep(forTimeInterval: 1.5)
+        }
+        XCTAssertEqual(app.keyboards.count, 0, "the keyboard stayed up after the composer's focus was ended")
+        scrollToEnd()
+        return geometryBelowThePane()
+    }
+
+    /// A touch in the gap below the pane, next to the link at the pane's lower edge. The page's rule reads the press's point, so a press
+    /// there lights nothing and opens nothing, whether the engine gives no click or moves a click onto plain text or the composer inside
+    /// the pane (the iOS path that the lines show); a click that the engine moves onto the link opens it once and lights only it, and the
+    /// count says how many taps met one. Every tap must reach the page.
     private func tapBelowThePane(named: String) {
         scrollToEnd()
-        let last = link("last-line")
-        let shift = offset(of: last)
-        let room = pane().room
-        let words = last.words[last.words.count - 1]
-        let composerTop = composer.frame.minY - shift.dy
-        let gap = composerTop - room.maxY
-        say("LINKLOOK \(named): the gap below the pane: the pane ends at \(room.maxY), the composer's frame starts at \(composerTop), \(gap) px between them; the last link's words \(words)")
+        var place = geometryBelowThePane()
+        let composerTop = composer.frame.minY - place.shift.dy
+        let gap = composerTop - place.room.maxY
+        say("LINKLOOK \(named): the gap below the pane: the pane ends at \(place.room.maxY), the composer's frame starts at \(composerTop), \(gap) px between them; the last link's words \(place.words)")
         XCTAssertGreaterThan(gap, 3, "\(named): no gap below the pane to tap in")
-        let all = links()
-        var moved = 0
+        var counts: [String: Int] = [:]
         var taps = 0
+        var reached = 0
+        var settled = 0
         for below in [1, 2, 4, 6, 8, 10, 11] as [CGFloat] where below < gap - 1 {
-            for (index, x) in [words.minX + 2, words.midX, words.maxX - 2].enumerated() {
-                let what = "\(named): the gap, \(Int(below)) px below the pane, column \(index), next to the last link"
-                let result = tap(what, at: CGPoint(x: x, y: room.maxY + below), shift: shift, clickExpected: false)
-                taps += 1
-                _ = judge(result, among: all, what: what)
-                if let click = result.events.first(where: { $0.type == "click" && $0.trusted }), click.target.contains("md-link") {
-                    moved += 1
-                    XCTAssertEqual(clickLook(result), "last-line", "\(what): the look at the click that the engine moved onto the link")
-                } else {
-                    XCTAssertTrue(result.opened.isEmpty, "\(what): opened \(result.opened) with a click that did not name the link")
+            for column in 0..<3 {
+                if app.keyboards.count > 0 {
+                    place = settleBelowThePane()
+                    settled += 1
                 }
+                let x = [place.words.minX + 2, place.words.midX, place.words.maxX - 2][column]
+                let what = "\(named): the gap, \(Int(below)) px below the pane, column \(column), next to the last link"
+                let result = tap(what, at: CGPoint(x: x, y: place.room.maxY + below), shift: place.shift, clickExpected: false)
+                taps += 1
+                if result.events.contains(where: { $0.type == "pointerdown" }) { reached += 1 }
+                counts[LinkTapRules.clickKind(result), default: 0] += 1
+                if let problem = LinkTapRules.gapDisagreement(result, paneBottom: place.room.maxY) { XCTFail("\(what): \(problem)") }
             }
         }
-        // Whether the engine moves a click from the gap onto the link is the engine's: the check is that the look and the opening agree.
-        say("LINKLOOK \(named): the gap below the pane: \(taps) taps, \(moved) at which the click named the last link")
+        say("LINKLOOK \(named): the gap below the pane: \(taps) taps, \(reached) reached the page; with no click \(counts["none", default: 0]), with a click on plain text \(counts["plain text", default: 0]), on the composer \(counts["composer", default: 0]), on a control \(counts["control", default: 0]); \(counts["link", default: 0]) at which the engine moved the click onto the last link; the composer's focus was ended \(settled) times")
     }
 
     func testTapsAtTheDefaultTextSize() {
