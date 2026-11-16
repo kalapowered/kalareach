@@ -70,28 +70,80 @@ impl Reader {
     }
 }
 
+/// What the look for PowerShell came to: three results that a case can tell apart.
+#[derive(Debug, PartialEq, Eq)]
+enum Look {
+    /// The program that runs PowerShell, and it started and ended well.
+    Found(PathBuf),
+    /// The search of the path found no program of any name PowerShell has here.
+    NotInstalled,
+    /// A program was found and its start failed, or it ended badly: the start's own words.
+    Failed(String),
+}
+
+/// The first file named `name` (with the platform's program suffix) in a folder of `path`.
+fn found_on(path: &OsStr, name: &str) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .map(|folder| folder.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Looks for the first of `names` that is a program on `path`, and starts it once to see that it
+/// runs.
+fn look_among(names: &[&str], path: &OsStr) -> Look {
+    let mut failures = Vec::new();
+    for name in names {
+        let Some(program) = found_on(path, name) else {
+            continue;
+        };
+        match Command::new(&program)
+            .args(["-NoProfile", "-Command", "exit 0"])
+            .output()
+        {
+            Ok(output) if output.status.success() => return Look::Found(program),
+            Ok(output) => failures.push(format!(
+                "{} ended with {} and said {:?}",
+                program.display(),
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+            Err(error) => failures.push(format!(
+                "{} could not be started: {error}",
+                program.display()
+            )),
+        }
+    }
+    if failures.is_empty() {
+        Look::NotInstalled
+    } else {
+        Look::Failed(failures.join("; "))
+    }
+}
+
 /// The program that runs PowerShell here, or `None` where none is installed and the run is not a
-/// hosted one. A hosted run has PowerShell on every platform, so there its absence fails.
-fn powershell() -> Option<&'static str> {
-    let candidates: &[&str] = if cfg!(windows) {
+/// hosted one. A hosted run has PowerShell on every platform, so there its absence fails. A
+/// program that is there and does not run fails the case that asks, with the start's own words:
+/// the cases of its reader are never skipped on a machine that has it. The look is made once, so
+/// that every case of a run reads the same answer.
+fn powershell() -> Option<&'static Path> {
+    static LOOK: std::sync::OnceLock<Look> = std::sync::OnceLock::new();
+    let names: &[&str] = if cfg!(windows) {
         &["pwsh", "powershell"]
     } else {
         &["pwsh"]
     };
-    for candidate in candidates {
-        let ran = Command::new(candidate)
-            .args(["-NoProfile", "-Command", "exit 0"])
-            .output();
-        if ran.is_ok_and(|output| output.status.success()) {
-            return Some(candidate);
+    match LOOK.get_or_init(|| look_among(names, &std::env::var_os("PATH").unwrap_or_default())) {
+        Look::Found(program) => Some(program),
+        Look::Failed(words) => panic!("the look for PowerShell failed: {words}"),
+        Look::NotInstalled => {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "a hosted run has PowerShell, and none was found"
+            );
+            eprintln!("no PowerShell is installed here: its reader's cases are not run");
+            None
         }
     }
-    assert!(
-        std::env::var_os("CI").is_none(),
-        "a hosted run has PowerShell, and none was found"
-    );
-    eprintln!("no PowerShell is installed here: its reader's cases are not run");
-    None
 }
 
 /// The program that runs the shell reader: `bash` on Unix, and Git's own `bash.exe` on Windows,
@@ -2225,4 +2277,56 @@ mod windows_paths {
             std::fs::remove_dir(&made).expect("removes the directory the run made");
         }
     }
+}
+
+/// A folder that holds one program, named `name`, whose text is `script`.
+#[cfg(unix)]
+fn folder_with_program(name: &str, script: &str, mode: u32) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let folder = tempfile::tempdir().expect("a folder for the program");
+    let program = folder.path().join(name);
+    std::fs::write(&program, script).expect("writes the program");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(mode))
+        .expect("sets the program's mode");
+    folder
+}
+
+/// The look tells three answers apart, so that a PowerShell that is there and does not run is
+/// never taken for one that is not installed (which skips the cases of its reader).
+#[cfg(unix)]
+#[test]
+fn the_look_for_powershell_tells_not_installed_from_a_start_that_failed() {
+    let empty = tempfile::tempdir().expect("a folder with no program");
+    assert_eq!(
+        look_among(&["pwsh"], empty.path().as_os_str()),
+        Look::NotInstalled
+    );
+
+    let ends_badly = folder_with_program("pwsh", "#!/bin/sh\necho boom >&2\nexit 3\n", 0o755);
+    let Look::Failed(words) = look_among(&["pwsh"], ends_badly.path().as_os_str()) else {
+        panic!("a program that ends with a failure is not a found one, nor an absent one");
+    };
+    assert!(
+        words.contains("exit status: 3") && words.contains("boom"),
+        "{words}"
+    );
+
+    let not_runnable = folder_with_program("pwsh", "#!/bin/sh\nexit 0\n", 0o644);
+    let Look::Failed(words) = look_among(&["pwsh"], not_runnable.path().as_os_str()) else {
+        panic!("a program that cannot be started is not an absent one");
+    };
+    assert!(words.contains("could not be started"), "{words}");
+}
+
+/// The look names the program that ran, and a name that fails does not hide a later one that runs.
+#[cfg(unix)]
+#[test]
+fn the_look_for_powershell_names_the_program_that_ran() {
+    let first = folder_with_program("pwsh", "#!/bin/sh\nexit 1\n", 0o755);
+    let second = folder_with_program("powershell", "#!/bin/sh\nexit 0\n", 0o755);
+    let path = std::env::join_paths([first.path(), second.path()]).expect("a search path");
+    assert_eq!(
+        look_among(&["pwsh", "powershell"], &path),
+        Look::Found(second.path().join("powershell"))
+    );
 }
