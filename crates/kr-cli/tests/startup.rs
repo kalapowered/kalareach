@@ -5734,7 +5734,7 @@ fn kr_host_restart_replaces_the_daemon_and_the_new_one_is_the_one_it_started() {
     assert!(host.answers(), "the new daemon answers");
     assert!(attempts(&host).is_empty(), "the command removed its record");
 
-    let status = start(host.kr(&["--json", "status"])).finish("kr status");
+    let status = start(host.kr(&["--json", "status", &session_id.to_string()])).finish("kr status");
     assert!(
         status.status.success(),
         "kr status after the restart: {} {}",
