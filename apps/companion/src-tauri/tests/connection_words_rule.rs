@@ -221,10 +221,10 @@ const EXCEPTIONS: [Exception; 66] = [
     },
     Exception {
         file: "connection.rs",
-        function: "open",
+        function: "of_stop",
         needle: "Asked::Connection",
         lines: 1,
-        reason: "this device ended the connection for the account's sake before the host was asked anything, and the words are the account's; no refusal of the host's is read",
+        reason: "the one conversion of a stop of the lease, whose words are this device's own and whose action is the stop's: it names the failure as that of the connection and reads no refusal of the host's",
     },
     Exception {
         file: "connection.rs",
@@ -307,8 +307,8 @@ const EXCEPTIONS: [Exception; 66] = [
         file: "inbox.rs",
         function: "present",
         needle: "Asked::Connection",
-        lines: 2,
-        reason: "names the visit's refusal as that of the connection, the host's own and the lease's, which carries the action that its stop says; it chooses no words",
+        lines: 1,
+        reason: "names the visit's refusal as that of the connection; it chooses no words",
     },
     Exception {
         file: "inbox.rs",

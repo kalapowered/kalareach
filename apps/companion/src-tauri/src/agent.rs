@@ -44,6 +44,7 @@ use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_protocol::worker::WorkerDescriptor;
 use serde::Serialize;
 
+use crate::connection::{HeldAs, Unopened};
 use crate::error::{CommandError, Result};
 use crate::standing::{Flight, Leased, PairedLinks};
 use crate::state::AppState;
@@ -680,7 +681,7 @@ fn answered(
 ) -> CommandError {
     ended_by_this_device.map_or_else(
         || CommandError::from(error),
-        |end| CommandError::asking(end.error, end.action),
+        |end| Unopened::of_stop(end.error, end.action, HeldAs::Refused).into_error(),
     )
 }
 

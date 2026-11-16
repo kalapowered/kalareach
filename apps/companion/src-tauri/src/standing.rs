@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use kr_client::pairing::link::LinkError;
 use kr_client::pairing::paired::PairedHost;
-use kr_client::{ClientError, Said as _, Session};
+use kr_client::{ClientError, Session};
 use kr_protocol::error::{ErrorCode, RetryCategory};
 use kr_protocol::ids::{EnvironmentId, GrantId, SessionEpoch, SessionId};
 use kr_protocol::method::Method;
@@ -42,7 +42,7 @@ use tauri::{AppHandle, Emitter as _};
 use tokio::sync::Notify;
 
 use crate::agent::Link;
-use crate::connection::{Asked, Unopened};
+use crate::connection::{Asked, HeldAs, Unopened};
 use crate::device::Device;
 use crate::error::{CommandError, Result};
 
@@ -252,7 +252,9 @@ impl Dial {
             // A connection that could not be given the lease the host needs, or whose account left,
             // is waited out: the opening stands and its watch dials again, as for a host that did
             // not answer.
-            error @ LinkError::Membership(..) => Unopened::unreached(error.said().into_string()),
+            LinkError::Membership(error, action) => {
+                Unopened::of_stop(error, action, HeldAs::Waited)
+            }
             other => Unopened::of_link(other),
         })
     }
@@ -264,8 +266,7 @@ impl Dial {
         grant_id: Option<GrantId>,
     ) -> std::result::Result<Opening, Unopened> {
         let transport = self.transport().await?;
-        let session = Session::start(transport)
-            .map_err(|error| Unopened::unreached(error.said().into_string()))?;
+        let session = Session::start(transport).map_err(|error| Unopened::unreached_by(&error))?;
         let opened = tokio::time::timeout(
             OPEN_WITHIN,
             session.read::<_, SessionOpenResult>(
@@ -294,8 +295,8 @@ impl Dial {
                 // This device ended the connection, because the account left or the keeper holds
                 // no lease the host took, and says so.
                 let unopened = match session.transport().ended_by_this_device() {
-                    Some(end) => Unopened::unreached_asking(end.error.message, end.action),
-                    None => Unopened::unreached(other.said().into_string()),
+                    Some(end) => Unopened::of_stop(end.error, end.action, HeldAs::Waited),
+                    None => Unopened::unreached_by(&other),
                 };
                 session.close();
                 return Err(unopened);
