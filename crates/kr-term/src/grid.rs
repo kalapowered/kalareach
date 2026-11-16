@@ -219,6 +219,12 @@ struct HistoryAccount {
     stale: bool,
 }
 
+/// No mark: every row is kept, up to the cache bound.
+const KEEP_ALL: i64 = i64::MIN;
+
+/// A mark past every row: none is kept.
+const KEEP_NONE: i64 = i64::MAX;
+
 /// The fewest charges the reservation for the account is written against.
 ///
 /// The array is asked for one charge a row, and an allocator gives at least what it is asked for
@@ -642,6 +648,11 @@ pub struct CanonicalGrid {
     stale: [bool; 2],
     /// What the retained rows cost, carried rather than measured.
     history: HistoryAccount,
+    /// The stable row index of the first row that may be kept, or one of the two ends of the scale.
+    ///
+    /// A retained row below it is given up ([`Self::give_up_unkept_rows`]). Privacy mode sets it past
+    /// every row and, when it ends, to the end of the rows the primary buffer holds at that moment.
+    keep_from: i64,
     /// How many rows a measurement has read the cells of.
     ///
     /// Reading a row's cells is the expensive part of every figure the resident budgets are
@@ -734,6 +745,7 @@ impl CanonicalGrid {
             dropped_marks: 0,
             stale: [false, false],
             history: HistoryAccount::default(),
+            keep_from: KEEP_ALL,
             rows_read: AtomicU64::new(0),
         };
         grid.sync_history();
@@ -1244,6 +1256,15 @@ impl CanonicalGrid {
             given_up += 1;
         }
         let keep = self.history.charges.len().saturating_sub(given_up);
+        self.keep_newest(keep);
+        true
+    }
+
+    /// Keeps the `keep` newest retained rows and gives up the others.
+    ///
+    /// The library evicts as it scrolls, so the count it keeps is lowered to `keep` for one scroll by
+    /// nothing and then put back.
+    fn keep_newest(&mut self, keep: usize) {
         let current = self.configuration.scrollback_rows.load(Ordering::Relaxed);
         // There is no floor: the retained rows are a cache, and at a wide geometry even a screen's
         // worth of them can pass the bound on its own. Keeping none of them is the right answer
@@ -1271,32 +1292,74 @@ impl CanonicalGrid {
                 .fetch_add(1, Ordering::Relaxed);
         }
         self.sync_history();
-        true
     }
 
-    /// Gives up every retained row above the screen and keeps the screen as it is.
+    /// Keeps no row from now on: every row that is above the screen is given up as soon as it is
+    /// there ([`Self::give_up_unkept_rows`]), and the rows that are on the screen are given up when
+    /// they leave it.
+    pub fn keep_no_rows(&mut self) {
+        self.keep_from = KEEP_NONE;
+    }
+
+    /// Keeps rows again from the first row that comes onto the screen after this call.
     ///
-    /// Returns whether the rows could be reached. The retained rows are the primary buffer's, and
-    /// the library lends out only the screen that is showing for writing, so while the alternate
-    /// buffer is showing nothing is done and the answer is no. The caller asks again once the
-    /// primary buffer is back.
+    /// The rows the primary buffer holds now, on the screen or above it, are not kept: they are
+    /// given up as they are or when they leave the screen. The row the cursor is on is among them,
+    /// though it can hold output of both intervals. This asks the primary screen through the shared
+    /// access, so it is the same while the alternate buffer shows. It does nothing unless rows were
+    /// not being kept.
+    pub fn keep_rows_again(&mut self) {
+        if self.keep_from == KEEP_NONE {
+            self.keep_from = self.primary_end();
+        }
+    }
+
+    /// Gives up every retained row above the screen that is below the first row that may be kept,
+    /// and keeps the screen as it is.
     ///
-    /// The rows that are showing are the last rows the screen holds and are not read, moved or
-    /// rewritten: the oldest rows are taken off the front, and the identifiers of the rows that
-    /// remain do not change. The cursor, the margins and the pen are in screen coordinates and are
-    /// not touched either.
-    pub fn discard_history(&mut self) -> bool {
-        if self.alternate_active() {
-            return false;
+    /// Rows are numbered by the library's stable row index, which only moves forward as rows are
+    /// given up. The rows that are showing are the last rows the screen holds and are not read,
+    /// moved or rewritten: the oldest rows are taken off the front, and the identifiers of the rows
+    /// that remain do not change. The cursor, the margins and the pen are in screen coordinates and
+    /// are not touched either.
+    ///
+    /// The retained rows are the primary buffer's, and the library lends out only the screen that is
+    /// showing for writing, so while the alternate buffer shows nothing is done. The mark waits, and
+    /// this is called again once the primary buffer is back, before any reader can read a row.
+    ///
+    /// The mark ends when the screen holds no row below it.
+    pub fn give_up_unkept_rows(&mut self) {
+        if self.keep_from == KEEP_ALL || self.alternate_active() {
+            return;
         }
-        let rows = self.size.rows as usize;
-        let screen = self.terminal.screen_mut();
-        // The library subtracts the screen's rows from what it holds, so there has to be more.
-        if screen.scrollback_rows() > rows {
-            screen.erase_scrollback();
+        let (oldest, _) = self.stable_range();
+        let top = self.visible_top_row();
+        let below = self.keep_from.min(top).saturating_sub(oldest);
+        if below > 0 {
+            let held = usize::try_from(top.saturating_sub(oldest)).unwrap_or(0);
+            let count = usize::try_from(below).unwrap_or(held);
+            if count >= held {
+                // The library subtracts the screen's rows from what it holds, so there has to be more.
+                let rows = self.size.rows as usize;
+                let screen = self.terminal.screen_mut();
+                if screen.scrollback_rows() > rows {
+                    screen.erase_scrollback();
+                }
+                self.sync_history();
+            } else {
+                self.keep_newest(held - count);
+            }
         }
-        self.sync_history();
-        true
+        if top >= self.keep_from {
+            self.keep_from = KEEP_ALL;
+        }
+    }
+
+    /// The stable row index one past the last row of the primary buffer.
+    fn primary_end(&self) -> i64 {
+        let screen = self.primary_screen();
+        let oldest = i64::try_from(screen.phys_to_stable_row_index(0)).unwrap_or(0);
+        oldest.saturating_add(i64::try_from(screen.scrollback_rows()).unwrap_or(0))
     }
 
     /// Drops the rows that are now past the scrollback bound, without waiting for more output.
@@ -1351,6 +1414,12 @@ impl CanonicalGrid {
         // account is carrying describes rows that no longer exist.
         self.history.stale = true;
         self.normalise_storage();
+        // A reflow joins and splits rows, and the library numbers them by where they sit, so a row
+        // is not the row of that number any more. What the primary buffer holds now counts as held
+        // before the mark: this gives up more than the rows before it, and never fewer.
+        if self.keep_from != KEEP_ALL && self.keep_from != KEEP_NONE {
+            self.keep_from = self.primary_end();
+        }
         budget.commit_geometry(footprint);
         Ok(())
     }

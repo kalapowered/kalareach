@@ -137,15 +137,12 @@ fn nothing_is_held_between_two_calls_and_nothing_is_recorded_as_cut() {
 }
 
 #[test]
-fn the_history_is_kept_again_from_the_moment_it_is_turned_on() {
+fn the_history_is_kept_again_from_the_first_row_that_comes_onto_the_screen() {
     let mut engine = engine(20, 4);
     engine.feed(printed("before", 0, 20).as_bytes(), 0);
     engine.set_history_kept(false);
     engine.feed(printed("while", 0, 20).as_bytes(), 0);
     assert!(retained(&engine).is_empty());
-
-    // The live screen is not changed, so its rows leave it later like any other.
-    let on_screen = text_of(&engine.grid().visible_rows());
 
     engine.set_history_kept(true);
     assert!(
@@ -157,9 +154,33 @@ fn the_history_is_kept_again_from_the_moment_it_is_turned_on() {
     let rows = retained(&engine);
     assert!(rows.iter().any(|row| row.contains("after")));
     assert!(
-        rows.iter()
-            .all(|row| row.contains("after") || on_screen.contains(row)),
-        "nothing from before the interval comes back but what was on the screen: {rows:?}"
+        rows.iter().all(|row| row.contains("after")),
+        "nothing that was on the screen when it was turned on is kept: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("after 0")),
+        "the row the cursor was on is given up with the rest: {rows:?}"
+    );
+}
+
+#[test]
+fn a_resize_does_not_let_the_rows_on_the_screen_be_kept() {
+    // Rows of eighteen columns on a screen of twenty. Narrowed to ten, each splits in two, so the
+    // library's numbers of rows move and the mark has to move with them.
+    let mut engine = engine(20, 4);
+    engine.feed(printed("before 0123456", 0, 20).as_bytes(), 0);
+    engine.set_history_kept(false);
+    engine.feed(printed("while 0123456", 0, 6).as_bytes(), 0);
+    engine.set_history_kept(true);
+
+    engine.resize(GridSize::new(10, 4), 0).expect("narrower");
+    engine.feed(printed("after", 0, 20).as_bytes(), 0);
+
+    let rows = retained(&engine);
+    assert!(rows.iter().any(|row| row.contains("after")));
+    assert!(
+        rows.iter().all(|row| row.contains("after")),
+        "no half of a row that was on the screen is kept: {rows:?}"
     );
 }
 
@@ -209,7 +230,6 @@ fn rows_owed_are_still_owed_when_the_history_is_turned_on_before_the_program_lea
     let mut engine = engine(20, 4);
     engine.feed(printed("before", 0, 20).as_bytes(), 0);
     engine.feed(ENTER_ALTERNATE.as_bytes(), 0);
-    let on_screen = text_of(&engine.grid().inactive_rows());
     engine.set_history_kept(false);
     engine.set_history_kept(true);
     assert!(
@@ -228,8 +248,7 @@ fn rows_owed_are_still_owed_when_the_history_is_turned_on_before_the_program_lea
         "rows printed afterwards are kept"
     );
     assert!(
-        rows.iter()
-            .all(|row| row.contains("after") || on_screen.contains(row)),
-        "no row from before comes back but what was on the screen: {rows:?}"
+        rows.iter().all(|row| row.contains("after")),
+        "no row from before comes back, those on the screen included: {rows:?}"
     );
 }
