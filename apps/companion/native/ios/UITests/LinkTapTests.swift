@@ -326,6 +326,50 @@ final class LinkTapTests: HarnessTestCase {
         LinkTapRules.parseLit(String(recordText("TAPLIT").dropFirst("TAPLIT".count)))
     }
 
+    /// The page's own text selection, from the record's `TAPSEL` line: whether it is a range that holds characters, and the line.
+    private func selection() -> (range: Bool, text: String) {
+        let text = recordText("TAPSEL")
+        let fields = text.split(separator: " ")
+        return (fields.count >= 3 && fields[1] == "Range" && (Int(fields[2]) ?? 0) > 0, text)
+    }
+
+    /// A change of the page's selection into a range or out of one, as the record's `S` line has it.
+    private struct SelectionChange {
+        /// The number of events that the record had counted when the selection changed.
+        let after: Int
+        let range: Bool
+        let type: String
+        let length: Int
+        /// How many selection changes of any kind the page had seen by then.
+        let changes: Int
+        /// The link that had the look once the page's own listeners had run on the change, or nil.
+        let lit: String?
+        /// The page's clock at the change, in milliseconds.
+        let at: Double
+    }
+
+    /// The changes of the selection into a range or out of one that the record holds, oldest first.
+    private func selectionChanges() -> [SelectionChange] {
+        recordText("TAPLOG").dropFirst("TAPLOG".count).components(separatedBy: " ; ").compactMap { part in
+            let fields = part.split(separator: " ")
+            guard fields.count == 8, fields[0] == "S", let after = Int(fields[1]), let length = Int(fields[4]),
+                fields[5].hasPrefix("n="), let changes = Int(fields[5].dropFirst(2)),
+                fields[6].hasPrefix("lit="), fields[7].hasPrefix("t="), let at = Double(fields[7].dropFirst(2))
+            else { return nil }
+            let lit = String(fields[6].dropFirst(4))
+            return SelectionChange(after: after, range: fields[2] == "range", type: String(fields[3]), length: length, changes: changes, lit: lit == "-" ? nil : lit, at: at)
+        }
+    }
+
+    /// Whether the pointer down of a pointer was a primary pointer's, from the record's `C` lines, or nil where the record has none of it.
+    private func isPrimary(_ pointer: String) -> Bool? {
+        for part in recordText("TAPLOG").dropFirst("TAPLOG".count).components(separatedBy: " ; ") {
+            let fields = part.split(separator: " ")
+            if fields.count == 8, fields[0] == "C", fields[3] == "id=\(pointer)" { return fields[4] == "primary=1" }
+        }
+        return nil
+    }
+
     /// The links of the conversation, in the page's own units: a point of the page is a point of the screen.
     private func links() -> [Link] {
         recordText("TAPLINKS").dropFirst("TAPLINKS".count).components(separatedBy: " ; ").compactMap { part in
@@ -403,6 +447,9 @@ final class LinkTapTests: HarnessTestCase {
     /// What every tap's release-to-click time was, on the page's clock, for the summary at the run's end.
     private var clickDelays: [(label: String, delay: Double)] = []
 
+    /// The page's selection line as the last drag's gesture left it, read before the drag's own wait.
+    private var selectionAfterDrag = ""
+
     private func screenPoint(_ point: CGPoint, _ shift: CGVector) -> XCUICoordinate {
         app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: point.x + shift.dx, dy: point.y + shift.dy))
     }
@@ -456,6 +503,7 @@ final class LinkTapTests: HarnessTestCase {
         let end = screenPoint(CGPoint(x: point.x + distance.dx, y: point.y + distance.dy), shift)
         // A swipe at the system's own speed, which the page takes for a scroll.
         start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .default, thenHoldForDuration: 0)
+        selectionAfterDrag = recordText("TAPSEL")
         Thread.sleep(forTimeInterval: 1.2)
         let last = record()
         let seen = last.events.filter { $0.order > before }
@@ -919,6 +967,29 @@ final class LinkTapTests: HarnessTestCase {
         // the system sends a click that far.
         for name in ["at-start", "at-end"] { tapAround(scroll(to: name), named: named) }
 
+        // A drag that starts on a link's words, from a state with no selection and with no held press on the link before it: the pointer down
+        // lights the link, the page scrolls with the finger, the pointer ends by a cancel or an up, no look is left at the end, nothing is
+        // clicked and nothing opens.
+        let clean = scroll(to: "table-2")
+        let cleanWords = clean.words[0]
+        let cleanShift = offset(of: clean)
+        let cleanPlace = pane()
+        let cleanBy: CGFloat = cleanPlace.top + 180 <= cleanPlace.most ? -180 : 180
+        let cleanSelection = selection()
+        say("LINKTAP \(named): a drag from a state with no selection: the page's selection before it: \(cleanSelection.text); room \(cleanPlace.room), scrolled \(Int(cleanPlace.top)) of \(Int(cleanPlace.most)), the finger asked to move \(Int(cleanBy))")
+        XCTAssertFalse(cleanSelection.range, "\(named): a drag from a state with no selection: the page's selection is a range before it: \(cleanSelection.text)")
+        let cleanDrag = drag("\(named): a drag that scrolls, started on a link, from a state with no selection", from: CGPoint(x: cleanWords.midX, y: cleanWords.midY), by: CGVector(dx: 0, dy: cleanBy), shift: cleanShift)
+        // Toward the end of the conversation where the finger moved up, and toward its start where it moved down.
+        let cleanScrolled = (pane().top - cleanPlace.top) * (cleanBy < 0 ? 1 : -1)
+        let cleanEnds = cleanDrag.events.map(\.type).filter { $0 == "pointercancel" || $0 == "pointerup" }
+        say("LINKTAP \(named): a drag from a state with no selection: the page scrolled \(Int(cleanScrolled)) points with the finger, the pointer ended by \(cleanEnds), the look at the pointer down \(pressLook(cleanDrag) ?? "none"), lit at the end \(litNow()), the page's selection right after the gesture \(selectionAfterDrag)")
+        XCTAssertEqual(pressLook(cleanDrag), clean.name, "\(cleanDrag.label): the drag's pointer down names the lit link \(pressLook(cleanDrag) ?? "none"), not \(clean.name): \(cleanDrag.events.map(\.type))")
+        XCTAssertGreaterThan(cleanScrolled, abs(cleanBy) / 2, "\(cleanDrag.label): the page scrolled \(cleanScrolled) points with the finger, which asked \(cleanBy): \(cleanDrag.events.map(\.type))")
+        XCTAssertFalse(cleanEnds.isEmpty, "\(cleanDrag.label): the page saw neither a pointer cancel nor a pointer up: \(cleanDrag.events.map(\.type))")
+        XCTAssertTrue(litNow().isEmpty, "\(cleanDrag.label): a look is left at the end: \(litNow())")
+        XCTAssertFalse(cleanDrag.events.contains { $0.type == "click" }, "\(cleanDrag.label): a click came")
+        XCTAssertTrue(cleanDrag.opened.isEmpty, "\(cleanDrag.label): opened \(cleanDrag.opened)")
+
         // A press of one second on a link's words: what the platform does with it stands, and the page adds nothing.
         let pressed = scroll(to: "table-2")
         let held = tap(
@@ -932,22 +1003,57 @@ final class LinkTapTests: HarnessTestCase {
         XCTAssertEqual(held.opened.count, heldClicks, "\(held.label): \(heldClicks) clicks of the system's, \(held.opened.count) links opened")
         XCTAssertFalse(held.events.contains { $0.type == "click" && !$0.trusted }, "\(held.label): the page added a click")
 
-        // A drag that scrolls, started on a link's words: pointercancel, no click, nothing opened.
+        // The held press leaves the system's own selection of the words under the finger. A touch's look and the page's selection never show
+        // together, so the held link's look is out when the selection comes: out at the release when the selection came first. A selection
+        // that comes after the release is held to the look of 150 ms that the release gives, and is not read as a fault.
+        let afterHold = selection()
+        let holdDown = LinkTapRules.pressOf(held)
+        let holdUp = LinkTapRules.releaseOf(held)
+        let firstRange = selectionChanges().first { $0.range && $0.after >= (holdDown?.order ?? Int.max) }
+        let againstRelease = firstRange.flatMap { change in holdUp?.at.map { change.at - $0 } }
+        say("LINKTAP \(named): after the held press: the page's selection \(afterHold.text); first range selection change \(firstRange.map { "at \($0.at) ms with \($0.length) characters, the look then \($0.lit ?? "out")" } ?? "none"), the release at \(holdUp?.at.map { String(format: "%.1f", $0) } ?? "-") ms, so the change came \(againstRelease.map { String(format: "%.1f", $0) } ?? "-") ms against the release (negative: before it); the release names \(holdUp?.lit ?? "no lit link"); lit now \(litNow())")
+        XCTAssertTrue(afterHold.range, "\(held.label): the page's selection is not a range after the hold: \(afterHold.text)")
+        if let firstRange, let againstRelease, againstRelease <= 0 {
+            XCTAssertNil(firstRange.lit, "\(held.label): the look was on at the first range selection change: \(firstRange.lit ?? "")")
+            XCTAssertNil(holdUp?.lit, "\(held.label): the release names the lit link \(holdUp?.lit ?? "") although the selection came before it")
+        }
+        XCTAssertTrue(litNow().isEmpty, "\(held.label): a look is left after the hold: \(litNow())")
+
+        // A drag that starts on the link's words right after the held press. Where the system holds the words as a selection the drag is
+        // its own, and the page need not scroll or see the pointer end. What holds: nothing is clicked, nothing opens, no look comes on
+        // through the drag or in the 1.2 seconds after it, and a tap elsewhere reaches the page and lights nothing. Where the hold left no
+        // range (the line above says it did not), the drag is held to the look and open lines of the drag from a clean state instead.
         let dragged = scroll(to: "table-2")
         let draggedShift = offset(of: dragged)
         let draggedWords = dragged.words[0]
         // Toward the end of the conversation if it has room that way, and toward its start if not.
         let place = pane()
         let by: CGFloat = place.top + 180 <= place.most ? -180 : 180
-        say("LINKTAP \(named): the conversation before the drag: room \(place.room), scrolled \(Int(place.top)) of \(Int(place.most))")
-        let result = drag("\(named): a drag that scrolls, started on a link", from: CGPoint(x: draggedWords.midX, y: draggedWords.midY), by: CGVector(dx: 0, dy: by), shift: draggedShift)
-        // WebKit ends a pan with pointercancel at some sizes and with pointerup at others; what matters is that the page scrolled.
-        XCTAssertTrue(
-            result.events.contains { $0.type == "pointercancel" } || abs(pane().top - place.top) > 20,
-            "\(result.label): the page did not scroll and no pointercancel came: \(result.events.map(\.type))"
-        )
+        say("LINKTAP \(named): the conversation before the drag: room \(place.room), scrolled \(Int(place.top)) of \(Int(place.most)); the page's selection \(selection().text)")
+        let result = drag("\(named): a drag that starts on a link, right after a held press", from: CGPoint(x: draggedWords.midX, y: draggedWords.midY), by: CGVector(dx: 0, dy: by), shift: draggedShift)
+        let afterDrag = selection()
+        let draggedMoved = pane().top - place.top
+        let dragChanges = selectionChanges().filter { $0.after >= (LinkTapRules.pressOf(result)?.order ?? Int.max) }
+        say("LINKTAP \(named): the drag right after a held press: events \(result.events.map(\.type)), the page scrolled \(Int(draggedMoved)) points (the finger asked \(Int(by))), the page's selection right after the gesture \(selectionAfterDrag) and 1.2 s after it \(afterDrag.text); selection changes of the drag: \(dragChanges.map { "\($0.range ? "range" : "collapsed") \($0.type) \($0.length) at \($0.at) ms, look \($0.lit ?? "out")" }); the look at the pointer down \(pressLook(result) ?? "none"); looks \(result.looks.map { "\($0.on ? "on" : "off")(\($0.name))" }); lit now \(litNow())")
         XCTAssertFalse(result.events.contains { $0.type == "click" }, "\(result.label): a click came")
         XCTAssertTrue(result.opened.isEmpty, "\(result.label): opened \(result.opened)")
+        XCTAssertTrue(litNow().isEmpty, "\(result.label): lit 1.2 s after the drag: \(litNow())")
+        if afterHold.range {
+            XCTAssertNil(pressLook(result), "\(result.label): the drag's pointer down names the lit link \(pressLook(result) ?? ""), with a range selected")
+            XCTAssertFalse(result.looks.contains { $0.on }, "\(result.label): a look came on through the drag: \(result.looks)")
+        } else {
+            XCTAssertEqual(pressLook(result), dragged.name, "\(result.label): the hold left no range and the drag's pointer down names \(pressLook(result) ?? "none"), not \(dragged.name)")
+        }
+        if let away = awayFromLinks() {
+            let elsewhere = tap("\(named): a tap elsewhere, after the drag that followed a held press", at: away, shift: offset(of: link("table-2")))
+            let elsewherePrimary = LinkTapRules.pressOf(elsewhere).flatMap { isPrimary($0.pointer) }
+            say("LINKTAP \(named): the tap elsewhere: events \(elsewhere.events.map(\.type)), its pointer primary: \(elsewherePrimary.map { $0 ? "yes" : "no" } ?? "unknown"), looks \(elsewhere.looks.map { "\($0.on ? "on" : "off")(\($0.name))" }), opened \(elsewhere.opened), the page's selection after it \(selection().text), lit now \(litNow())")
+            XCTAssertFalse(elsewhere.looks.contains { $0.on }, "\(elsewhere.label): a look came on: \(elsewhere.looks)")
+            XCTAssertTrue(elsewhere.opened.isEmpty, "\(elsewhere.label): opened \(elsewhere.opened)")
+            XCTAssertTrue(litNow().isEmpty, "\(elsewhere.label): lit at its end: \(litNow())")
+        } else {
+            XCTFail("no point of the conversation lies a line away from every link: \(pane().room)")
+        }
 
         // A link tapped while the composer has focus: the link opens once, and the report says where the focus is
         // and whether the keyboard is still up.
