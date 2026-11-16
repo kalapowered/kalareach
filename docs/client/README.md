@@ -38,11 +38,21 @@ and words, in place of a connection that ended. A later error with that identifi
 nothing, and neither does an answer with it that succeeds. A client tells a refusal from an end by
 that code, never by its words: a transient one, such as a host that cannot take another connection
 from this device now, is asked again.
-A session that the owner closes after the host ended the connection, but before the reader handed
-that end on, ends as the owner's own close, `Finished`, and the host's cause is not told: closing
-this side's connection writes over the cause the host left. A caller that must know why the host
-ended the connection reads the refusal (`Session::connection_refusal`) or the ended item before it
-closes.
+
+A session that the owner closes after the host ended the connection, but before the reader read
+that end, ends as the owner's own close, `Finished`, and the host's cause is not told: the reader
+stops at the owner's close before it reads the end that the host left. Once the reader has read the
+end, the session delivers it with the host's cause, whatever the owner does after. A caller that
+must know why the host ended the connection reads the refusal (`Session::connection_refusal`) or
+the ended item before it closes.
+
+A frame that does not belong on a client's ingress ends the session, on a paired connection as on a
+local one: the reader closes the connection and every waiting call is answered as an end. A request,
+a mutation and the frames that only a host's own endpoints exchange are such frames. The companion's
+terminal view reads through this one reader, so a host that sends one ends the view as lost, once.
+While the view opens, the person is told "the host sent a frame this application does not read".
+Once the view shows a screen, the person is told what is told of every lost link, that the
+connection ended, with no cause.
 
 The same refusal answers a call whose own write fails after it arrived: the write fails because the
 host closed the connection, and the call, a read or a mutation, gets the refusal and not the
