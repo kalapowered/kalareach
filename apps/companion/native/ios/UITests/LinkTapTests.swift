@@ -1180,7 +1180,7 @@ final class LinkTapTests: HarnessTestCase {
     /// A click that WebKit moves onto the composer focuses it and raises the keyboard, which moves the pane and the gap with it. The
     /// harness's own way of putting the keyboard away (`putTheKeyboardAway`: a tap at the screen's left edge, where no text field and no link
     /// lies, and a wait for the keyboard to go) ends the focus; a tap on the pane cannot, since with the keyboard up the page moves under the
-    /// finger and the click can land on the text field again (run 7: a press on `p` got its click on the `textarea`). Then the conversation is
+    /// finger and the click can land on the text field again (a tap on a paragraph of the pane has had its click named on the `textarea`). Then the conversation is
     /// scrolled to its end and the gap's geometry is read again, so that the next tap in the gap is a tap in the gap.
     private func settleBelowThePane() -> (shift: CGVector, room: CGRect, words: CGRect) {
         putTheKeyboardAway()
