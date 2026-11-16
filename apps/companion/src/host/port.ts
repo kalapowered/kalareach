@@ -620,6 +620,13 @@ interface FailureCommon {
    * The page shows each as text and never builds one.
    */
   readonly alternatives?: readonly string[]
+  /**
+   * Present, and true, only when the attempt failed after the host had locked its invitation to it:
+   * the host then consumes the invitation as expired, and the same code is refused. Sent only for an
+   * attempt made through a rendezvous service. A direct invitation, an attempt that never reached
+   * the host and one that was resumed after a restart do not carry it.
+   */
+  readonly invitation_spent?: true
 }
 
 /**

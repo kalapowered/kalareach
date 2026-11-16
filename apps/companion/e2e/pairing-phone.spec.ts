@@ -160,6 +160,35 @@ test('lists the paths of a pairing the managed relay could not take as text, ins
   expect(await overrunning(page, '.pairing-column'), 'nothing runs past the screen').toEqual([])
 })
 
+// A code attempt that the managed relay could not take, after the host locked its invitation, says that
+// the invitation can no longer be used and offers to start again; the code that was typed is gone from
+// the field, so the spent code is not offered again.
+test('says a spent invitation needs a new one, and lets the typed code go', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.goto('/harness.html?surface=ios&tab=hosts&scan=both')
+  await expect(page.locator('.m-shell')).toBeVisible()
+  const field = page.getByLabel('Pairing code')
+  await field.fill('AbCd-EfG-H23')
+  await expect(field).toHaveValue('AbCd-EfG-H23')
+  await page.evaluate(() => {
+    window.krTestHost?.setPairing({
+      state: {
+        state: 'ended',
+        failure: { kind: 'relay_capacity', tries_left: null, retry_after_seconds: 90, invitation_spent: true },
+        mode: 'code',
+        service: null
+      }
+    })
+  })
+  await expect(page.getByTestId('failure-sentence')).toHaveText(
+    "The managed relay could not take this pairing now, and this invitation can no longer be used. Ask the host for a new invitation in about 2 minutes, or bring this device onto the host's network and ask for one now."
+  )
+  const action = page.getByTestId('failure-action')
+  await expect(action).toHaveText('Start again')
+  await action.click()
+  await expect(field).toHaveValue('')
+})
+
 // A request the host asks a phone to confirm keeps the words the whole width of the
 // row at the default text size on a phone 390 points wide, and the buttons go under them: beside
 // the words they took most of the row, and the title ran a word to a line.

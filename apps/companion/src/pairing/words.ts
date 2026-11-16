@@ -10,8 +10,12 @@ import type { PairingFailure, PairingSources, WaitlessKind } from '../host/port'
 
 /** What the words of a failure are made from: its kind, and for the two relay kinds the wait. */
 export type FailureSubject =
-  | { readonly kind: WaitlessKind }
-  | { readonly kind: 'relay_capacity' | 'relay_fault'; readonly retry_after_seconds: number }
+  | { readonly kind: WaitlessKind; readonly invitation_spent?: true }
+  | {
+      readonly kind: 'relay_capacity' | 'relay_fault'
+      readonly retry_after_seconds: number
+      readonly invitation_spent?: true
+    }
 
 /** What the person can do next, after an attempt ends. */
 export type NextAction =
@@ -57,7 +61,10 @@ export function failureWords(
   mode: AttemptMode = 'code',
   reading: Reading = 'pasteboard'
 ): { readonly sentence: string; readonly action: NextAction } {
-  const words = codeWords(failure, service, reading)
+  // An invitation that a failed attempt has spent is said to be one only for a code, and only when
+  // native code marked the failure: without the mark the words and the action stay as they were.
+  const spent = mode === 'code' && failure.invitation_spent === true
+  const words = codeWords(failure, service, reading, spent)
   if (mode === 'code') return words
   // A direct invitation reaches no service and holds no code, and native code lets it go once the
   // attempt ends: it is tried again only by bringing it in again.
@@ -81,7 +88,8 @@ export function failureWords(
 function codeWords(
   failure: FailureSubject,
   service: string,
-  reading: Reading
+  reading: Reading,
+  spent: boolean
 ): { readonly sentence: string; readonly action: NextAction } {
   switch (failure.kind) {
     case 'malformed':
@@ -128,7 +136,12 @@ function codeWords(
         action: 'start_again'
       }
     case 'timed_out':
-      return { sentence: 'The host did not finish the exchange in time. Try again.', action: 'try_again' }
+      // The exchange may have reached the host or not, so the words allow for both.
+      return {
+        sentence:
+          'The host did not finish the exchange in time. Try again, or ask the host for a new invitation.',
+        action: 'try_again'
+      }
     case 'declined':
       return { sentence: 'The owner declined this device on the host.', action: 'done' }
     case 'withdrawn':
@@ -144,23 +157,39 @@ function codeWords(
         action: 'done'
       }
     case 'host_unreachable':
-      return {
-        sentence:
-          "The host could not be reached. Check that this device is on the host's network, or that the host is online.",
-        action: 'try_again'
-      }
+      return spent
+        ? {
+            sentence:
+              "The host could not be reached, and this invitation can no longer be used. Check that this device is on the host's network, or that the host is online, then ask the host for a new invitation.",
+            action: 'start_again'
+          }
+        : {
+            sentence:
+              "The host could not be reached. Check that this device is on the host's network, or that the host is online.",
+            action: 'try_again'
+          }
     case 'relay_capacity':
-      return {
-        // The managed relay is the product's own, so the failure is not the host's, and it is said
-        // to be neither. The way round it that fits both ways of pairing is the host's own network.
-        sentence: `The managed relay could not take this pairing now. Try again in about ${waitInWords(failure.retry_after_seconds)}, or bring this device onto the host's network.`,
-        action: 'try_again'
-      }
+      // The managed relay is the product's own, so the failure is not the host's, and it is said
+      // to be neither. The way round it that fits both ways of pairing is the host's own network.
+      return spent
+        ? {
+            sentence: `The managed relay could not take this pairing now, and this invitation can no longer be used. Ask the host for a new invitation in about ${waitInWords(failure.retry_after_seconds)}, or bring this device onto the host's network and ask for one now.`,
+            action: 'start_again'
+          }
+        : {
+            sentence: `The managed relay could not take this pairing now. Try again in about ${waitInWords(failure.retry_after_seconds)}, or bring this device onto the host's network.`,
+            action: 'try_again'
+          }
     case 'relay_fault':
-      return {
-        sentence: `The managed relay service could not admit this pairing now. This is not a fault of the host. Try again in about ${waitInWords(failure.retry_after_seconds)}, or bring this device onto the host's network.`,
-        action: 'try_again'
-      }
+      return spent
+        ? {
+            sentence: `The managed relay service could not admit this pairing now, and this invitation can no longer be used. This is not a fault of the host. Ask the host for a new invitation in about ${waitInWords(failure.retry_after_seconds)}, or bring this device onto the host's network and ask for one now.`,
+            action: 'start_again'
+          }
+        : {
+            sentence: `The managed relay service could not admit this pairing now. This is not a fault of the host. Try again in about ${waitInWords(failure.retry_after_seconds)}, or bring this device onto the host's network.`,
+            action: 'try_again'
+          }
     case 'host_mismatch':
       return {
         sentence: 'The host did not match its invitation, so KalaReach stopped before pairing.',
