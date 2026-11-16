@@ -976,6 +976,29 @@ fn jobs_of(workflow: &str) -> Vec<String> {
         .collect()
 }
 
+/// A step of the plan builds the report's own package again, and Windows does not let the program
+/// that is running be replaced, so the report never runs from the file the build wrote. No job of
+/// the conformance workflow starts it with `cargo run`, and the Windows job runs a copy of it.
+#[test]
+fn no_job_of_the_conformance_workflow_runs_the_report_from_the_file_the_build_wrote() {
+    let report = fs::read_to_string(repository().join(".github/workflows/conformance.yml"))
+        .expect("the conformance workflow");
+    for line in report
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+    {
+        assert!(
+            !(line.contains("cargo run") && line.contains("kr-conformance")),
+            "the conformance workflow starts the report with cargo run: {line}"
+        );
+    }
+    let starting = steps_holding(&job(&report, "windows"), "kr-conformance.exe");
+    assert!(
+        starting.iter().all(|step| step.contains("Copy-Item")),
+        "the Windows job runs the report's program without copying it first"
+    );
+}
+
 /// The report builds every suite's test programs in turn into one directory, with no build cache,
 /// and the debug information is the greater part of what that directory holds. A run of the
 /// Windows job that built with it filled the drive near the end, and the last two suites failed to

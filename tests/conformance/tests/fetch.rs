@@ -1,11 +1,12 @@
 //! The fetch of the pinned applications: what the script says when a release cannot be fetched,
-//! what it builds then, and what it takes from an archive the cache already holds.
+//! what it builds then, what it takes from an archive the cache already holds, and where the
+//! report's program runs from.
 //!
 //! Each case runs `scripts/run-conformance.sh --group applications` as it is committed, from a copy
 //! of the tree that holds the script and a lock of its own. `curl` is replaced by a program that
 //! serves the files of one directory and refuses every other address as a host that answers 504
 //! does, and `cargo` and the report's own program by programs that do nothing, so that the run ends
-//! when the fetch has.
+//! when the fetch has; the last case's program says where it ran from instead.
 
 #![cfg(unix)]
 
@@ -426,5 +427,55 @@ fn an_archive_the_cache_holds_is_used_only_when_it_is_the_pinned_bytes() {
     assert!(
         !stage.path("cache/tampered/1.0").exists(),
         "bytes that are not the pin's are not installed: {text}"
+    );
+}
+
+/// The report's program is run from a copy, in a folder of the run's own under the temporary
+/// directory, and never from the file the build wrote, which a step of the plan can build again
+/// while the program runs. The folder is gone when the run ends, and the program's exit status is
+/// the script's.
+#[test]
+fn the_report_runs_from_a_copy_outside_the_build_directory_and_the_copy_is_removed() {
+    let stage = Stage::new();
+    stage.write_lock(&lock_of(&stage));
+    let seen = stage.path("seen-path");
+    stage.program(
+        "target/debug/kr-conformance",
+        &format!("#!/bin/sh\necho \"$0\" > '{}'\nexit 3\n", seen.display()),
+    );
+
+    let output = stage.run();
+    let text = said(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "the program's status is the script's: {text}"
+    );
+
+    let ran = PathBuf::from(fs::read_to_string(&seen).expect("the program ran").trim());
+    assert!(
+        ran.starts_with(stage.path("tmp")),
+        "the program ran from {}, which is not under the temporary directory",
+        ran.display()
+    );
+    assert!(
+        !ran.starts_with(stage.path("target")),
+        "the program ran from {}, inside the build directory",
+        ran.display()
+    );
+    let left: Vec<String> = fs::read_dir(stage.path("tmp"))
+        .expect("the temporary directory")
+        .map(|entry| {
+            entry
+                .expect("an entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| name.starts_with("kr-conformance-start"))
+        .collect();
+    assert!(
+        left.is_empty(),
+        "the run's folder was left behind: {left:?}"
     );
 }
