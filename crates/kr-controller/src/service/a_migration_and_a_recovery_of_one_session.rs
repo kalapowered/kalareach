@@ -965,8 +965,9 @@ async fn a_later_look_gives_a_reason_that_rests_on_a_fact_the_first_look_could_n
 
 /// A repeat close's retry of a record of this daemon's own is a look at the worker's end, and a look
 /// that records nothing, because another recovery holds the session, starts the watch, which looks
-/// again until the session is free. The session's ownership is held while the retry runs and
-/// released after it; nothing else asks, and the registry must then hold the closure.
+/// again until the session is free. The session's ownership is held until the retry's look has
+/// returned with nothing recorded, and released after it; nothing else asks, and the registry must
+/// then hold the closure, which only the watch can record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_retry_whose_look_records_nothing_is_followed_by_the_watch() {
     let temp = TempHost::create();
@@ -1009,14 +1010,15 @@ async fn a_retry_whose_look_records_nothing_is_followed_by_the_watch() {
         controller.knows_how_it_ended(session_id),
         "a repeat close finds the record that the first look kept"
     );
+    // The session is let go only once the retry's look has returned with nothing recorded, while
+    // the ownership is still held.
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        while controller.reconciliations_for_tests(session_id) == 0 {
+        while controller.retries_that_recorded_nothing_for_tests(session_id) == 0 {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("the retry's look runs");
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    .expect("the retry's look ends with nothing recorded while another recovery holds the session");
     drop(recovery);
 
     let recorded = tokio::time::timeout(std::time::Duration::from_secs(20), async {
