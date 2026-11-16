@@ -137,14 +137,20 @@ async fn controller_client(host: &Host, generation: u64) -> BoundLink {
         .expect("connects");
     let identity = Arc::clone(&host.controller);
     let boot = host.boot.clone();
-    client
-        .present_generation(move |nonce| {
+    // Bounded: a worker that takes the presentation for a peer that has gone sends no answer, and a
+    // setup that waits for one would stop the program there. At a free boundary the answer takes
+    // milliseconds.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.present_generation(move |nonce| {
             identity
                 .generation_token(ControllerGeneration::new(generation), &boot, nonce)
                 .map_err(kr_ipc::IpcError::from)
-        })
-        .await
-        .expect("the worker accepts the generation");
+        }),
+    )
+    .await
+    .expect("the worker did not answer the presentation of the generation within 10 s")
+    .expect("the worker accepts the generation");
     client
 }
 
