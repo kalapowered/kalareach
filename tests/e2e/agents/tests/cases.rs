@@ -4992,7 +4992,9 @@ impl Watch {
     /// one and goes on with it. A stopped view then cannot hide what the screen shows. A fresh view
     /// starts from an empty terminal, so the watch applies what arrives to it until its screen
     /// shows something (within [`FRESH_SCREEN_WITHIN`]) before it goes on: a resynchronisation in
-    /// the watch's last slice then leaves the caller a screen to read, not blank rows.
+    /// the watch's last slice then leaves the caller a screen to read, not blank rows. A fresh view
+    /// that is told to resynchronise while its rows are blank has stopped as well, so the wait
+    /// replaces it with another and goes on with that one.
     fn watch_for(&mut self, stage: &Stage<'_, '_>, session: &Session, within: Duration) {
         let until = std::time::Instant::now() + within;
         while std::time::Instant::now() < until {
@@ -5005,6 +5007,10 @@ impl Watch {
                     && std::time::Instant::now() < bound
                 {
                     self.pump(stage, Duration::from_millis(200));
+                    if self.view.kinds().iter().any(|kind| kind == RESYNC) {
+                        let stale = std::mem::replace(self, Self::open(stage, session));
+                        stale.close(stage);
+                    }
                 }
             }
         }
