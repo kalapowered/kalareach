@@ -1260,6 +1260,8 @@ test.describe('the end of a press at every pointer down', () => {
       await expect.poll(() => pressedLooks(page), 'the pressed look after the mouse’s right button went down').toBe(0)
       await page.mouse.up({ button: 'right' })
       await touch('touchEnd')
+      // A right button press selects the word under it in some engines, and a selection of the page keeps a touch's look out.
+      await selectAt(page, OTHER, 'none')
       await touch('touchStart')
       expect(await pressedLooks(page), 'the pressed look of a second held touch, before the pen’s barrel').toBe(1)
       await barrel('mousePressed')
@@ -1270,6 +1272,172 @@ test.describe('the end of a press at every pointer down', () => {
       // The touch is on the link's own words and is lifted in place: the browser's click opens the link, as it does for
       // any such tap, and the handler adds no click of its own.
       expect(handlers(await clicksSeen(page)), 'clicks that the page added for a touch that a mouse button or a pen ended').toEqual([])
+    })
+  }
+})
+
+/** Makes the page's selection a range over the paragraph of the link `href`, or a caret at its start, or none; returns once the page has heard the selection change. */
+async function selectAt(page: Page, href: string, as: 'range' | 'caret' | 'none'): Promise<void> {
+  await page.evaluate(
+    ({ target, how }) =>
+      new Promise<void>((resolve) => {
+        // A change that the page does not hear (none changed) ends by this limit.
+        const limit = window.setTimeout(resolve, 1000)
+        document.addEventListener(
+          'selectionchange',
+          () => {
+            window.clearTimeout(limit)
+            window.setTimeout(resolve, 0)
+          },
+          { once: true }
+        )
+        const selection = window.getSelection()
+        selection?.removeAllRanges()
+        if (how === 'none') return
+        const paragraph = document.querySelector<HTMLElement>(`.m-node .md-link[title="${target}"]`)?.parentElement
+        if (!paragraph) throw new Error(`the page shows no paragraph for ${target}`)
+        const range = document.createRange()
+        range.selectNodeContents(paragraph)
+        if (how === 'caret') range.collapse(true)
+        selection?.addRange(range)
+      }),
+    { target: href, how: as }
+  )
+}
+
+/** Scrolls the pane by `by` px and returns once the page has heard the scroll. */
+async function scrollPaneBy(page: Page, by: number): Promise<void> {
+  await page.evaluate(
+    (px) =>
+      new Promise<void>((resolve) => {
+        const limit = window.setTimeout(resolve, 1000)
+        document.addEventListener(
+          'scroll',
+          () => {
+            window.clearTimeout(limit)
+            window.setTimeout(resolve, 0)
+          },
+          { capture: true, once: true }
+        )
+        document.querySelector('.m-pane')?.scrollBy(0, px)
+      }),
+    by
+  )
+}
+
+/** The two links with room above and below them, so that the pane scrolls. */
+const longTwo = (): string[] => [...Array.from({ length: 12 }, () => PLAIN), ...TWO_LINKS, ...Array.from({ length: 12 }, () => PLAIN)]
+
+// KR-REQ-13.19: while the page's selection is not collapsed, a touch's or a pen's press lights nothing at its pointer
+// down, a selection that comes during the press puts the look out, and the press and its record stay. The selection is
+// made by the page's script; the system's own selection is the native test's.
+test.describe('a touch’s or a pen’s press while the page’s selection is not collapsed', () => {
+  test.use({ hasTouch: true })
+  for (const surface of SURFACES) {
+    test(`lights nothing at the pointer down of a tap on a link's words with a selection in another paragraph, and gives the look at the click, which opens the link once, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface, { only: TWO_LINKS })
+      const words = await pointOnWords(page, DOCS)
+      await selectAt(page, OTHER, 'range')
+      const made = await tapAndRead(page, words.x, words.y)
+      expect(made.lit, 'the link lit at the pointer down').toEqual([null])
+      expect(made.litAtClick, 'the link lit at the click').toEqual([DOCS])
+      expect(made.opened, 'links opened by the tap').toEqual([DOCS])
+    })
+
+    test(`opens the link for a tap on the text after it with a selection over its paragraph, and lights it at the click, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface, { only: TWO_LINKS })
+      const after = await pointOnTextAfter(page, DOCS)
+      await selectAt(page, DOCS, 'range')
+      const made = await tapAndRead(page, after.x, after.y)
+      expect(made.lit, 'the link lit at the pointer down').toEqual([null])
+      expect(made.opened, 'links opened by the tap on plain text').toEqual([DOCS])
+      expect(made.litAtClick, 'the link lit at the click').toEqual([DOCS])
+    })
+
+    test(`lights the link at the pointer down with a selection inside a text field, which leaves the page's selection collapsed, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface, { only: TWO_LINKS })
+      const words = await pointOnWords(page, DOCS)
+      const collapsed = await page.evaluate(() => {
+        const field = document.createElement('textarea')
+        field.value = 'a draft of a message'
+        field.style.cssText = 'position: fixed; left: 0; bottom: 0; width: 40px; height: 20px; opacity: 0.01;'
+        document.body.append(field)
+        field.focus()
+        field.select()
+        return window.getSelection()?.isCollapsed ?? true
+      })
+      expect(collapsed, 'the page’s selection while a text field holds a selection').toBe(true)
+      const made = await tapAndRead(page, words.x, words.y)
+      expect(made.lit, 'the link lit at the pointer down').toEqual([DOCS])
+    })
+
+    test(`lights a mouse press on a link's own words with a selection in the page, and puts the look out at the release, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface, { only: TWO_LINKS })
+      const words = await pointOnWords(page, DOCS)
+      await selectAt(page, OTHER, 'range')
+      await page.mouse.move(words.x, words.y)
+      await page.mouse.down()
+      expect(await pressedLooks(page), 'the pressed look of a mouse press with a selection in the page').toBe(1)
+      await page.mouse.up()
+      expect(await pressedLooks(page), 'the pressed look after the release').toBe(0)
+    })
+
+    test(`puts out the look of a held touch when a selection comes, does not give it back at a scroll of 3 px, and gives it at the browser's click, on ${surface}`, async ({ page, browserName }) => {
+      test.skip(browserName !== 'chromium', 'the touch is held through the Chromium protocol: WebKit has no tool for a held touch')
+      await pressPage(page, surface, { only: longTwo() })
+      const words = await pointOnWords(page, DOCS)
+      const { session } = await touchSession(page)
+      const touch = (type: 'touchStart' | 'touchEnd'): Promise<unknown> =>
+        session.send('Input.dispatchTouchEvent', { type, touchPoints: type === 'touchStart' ? [{ x: words.x, y: words.y }] : [] })
+      const mark = await marked(page)
+      await touch('touchStart')
+      expect(await pressedLooks(page), 'the pressed look of a held touch with no selection').toBe(1)
+      await selectAt(page, OTHER, 'range')
+      expect(await pressedLooks(page), 'the pressed look after a selection came').toBe(0)
+      await scrollPaneBy(page, 3)
+      expect(await pressedLooks(page), 'the pressed look after a scroll of 3 px').toBe(0)
+      await touch('touchEnd')
+      const made = await recordedSince(page, mark, 5000)
+      expect(made.arrived, 'the browser’s click for the held touch').toBe(true)
+      expect(made.opened, 'links opened by the held touch').toEqual([DOCS])
+      expect(
+        made.clicks.filter((click) => click.phase === 'bubble' && click.trusted).map((click) => click.lit),
+        'the link lit at the click'
+      ).toEqual([DOCS])
+    })
+
+    test(`keeps the open of a held touch on plain text when a selection comes: the release opens the link by the rule, on ${surface}`, async ({ page, browserName }) => {
+      test.skip(browserName !== 'chromium', 'the touch is held through the Chromium protocol: WebKit has no tool for a held touch')
+      await pressPage(page, surface, { only: longTwo() })
+      const after = await pointOnTextAfter(page, DOCS)
+      const { session } = await touchSession(page)
+      const touch = (type: 'touchStart' | 'touchEnd'): Promise<unknown> =>
+        session.send('Input.dispatchTouchEvent', { type, touchPoints: type === 'touchStart' ? [{ x: after.x, y: after.y }] : [] })
+      const mark = await marked(page)
+      await touch('touchStart')
+      await selectAt(page, OTHER, 'range')
+      await touch('touchEnd')
+      const made = await recordedSince(page, mark, 5000)
+      expect(made.arrived, 'the browser’s click for the held touch').toBe(true)
+      expect(made.opened, 'links opened by the held touch on plain text').toEqual([DOCS])
+      expect(
+        made.clicks.filter((click) => click.phase === 'bubble' && click.trusted).map((click) => click.lit),
+        'the link lit at the click'
+      ).toEqual([DOCS])
+    })
+
+    test(`keeps the look of a held touch when the selection becomes a caret or none, on ${surface}`, async ({ page, browserName }) => {
+      test.skip(browserName !== 'chromium', 'the touch is held through the Chromium protocol: WebKit has no tool for a held touch')
+      await pressPage(page, surface, { only: longTwo() })
+      const words = await pointOnWords(page, DOCS)
+      const { session } = await touchSession(page)
+      await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: words.x, y: words.y }] })
+      expect(await pressedLooks(page), 'the pressed look of a held touch').toBe(1)
+      await selectAt(page, OTHER, 'caret')
+      expect(await pressedLooks(page), 'the pressed look after the selection became a caret').toBe(1)
+      await selectAt(page, OTHER, 'none')
+      expect(await pressedLooks(page), 'the pressed look after the selection went').toBe(1)
+      await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
     })
   }
 })

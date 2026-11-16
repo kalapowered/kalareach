@@ -10,7 +10,8 @@
  * - At the pointer down of a primary pointer's main button the pane writes a record of the press: its
  *   pointer type, where it went down, and the link it names, with what that link opens. A press on a link's own element names that
  *   link for every pointer type, whatever the words' rectangles say, since the browser sends its click to
- *   that element, and lights it at once; a press on another control names nothing; a press on plain text
+ *   that element, and lights it at once, except a touch's or a pen's while the page's selection is not
+ *   collapsed; a press on another control names nothing; a press on plain text
  *   names the link that `linkAt` returns at that point, and only for a pointer that `opensByRule` (a
  *   touch or a pen): a mouse's click on plain text opens nothing, so its press keeps no record. A press on
  *   plain text lights nothing: the engine may still send its click to another link, and a look that names
@@ -32,12 +33,26 @@
  *   button is released and goes to the engine's target, so its look follows the pointer, at each move and
  *   at each scroll: lit while the pointer lies in the link's own element, out where it has left it (within
  *   the slop), lit again where it is back, and out at the release.
+ * - A touch's or a pen's press and the page's selection. While the page's selection is not collapsed, a
+ *   touch's or a pen's press lights nothing at its pointer down, on a link's own element too, and a live
+ *   press's look goes out when such a selection appears; a scroll that leaves the press live does not give
+ *   it back. The page's selection is read whole: the selected words are not tested against the press.
+ *   iOS selects the words under a held finger and sends no click at the release, and a drag that starts on
+ *   that selection is the system's own: the page gets that drag's pointer down alone. The press lives on
+ *   with its record, so a click that does come is decided as for any press, and its look comes at the
+ *   click, as for a press on plain text, with the selection as it stands. A selection inside a text field
+ *   leaves the page's selection collapsed and changes nothing, and a mouse's press is not changed. What
+ *   this leaves: a touch that the system takes with no end, that went down on a link's own element while
+ *   the selection was collapsed and makes none, keeps its look until the next pointer down, a scroll that
+ *   moves the link from its point, the window's blur or the page's hiding. None is known. A selection that
+ *   comes after the release leaves the look that the release holds until `LOOK_HOLD` ends it.
  * - The look at the click. The pointer's type of the last primary press (in the pane or outside it) is kept apart from the
  *   record, so that the record's end does not clear it. At each trusted click in the pane the look is set
  *   to the link that `lookAt` gives and to no other: where the last press was a touch or a pen, the link
  *   the click names, or the link that `decide` opens from plain text; a lit link that the click does not
  *   open goes out. On plain text near a link the look therefore comes at the click, on the link that opens,
- *   and a press on a link's own element keeps the look it got at the pointer down. A touch's or a
+ *   and a press on a link's own element keeps the look it got at the pointer down (none, for a touch or a
+ *   pen while the page's selection is not collapsed: its click gives it). A touch's or a
  *   pen's look ends `LOOK_HOLD` after the click, or after a release that gets no click, and at once at any
  *   end of the handler and at the next pointer down. It has no motion. The click that this handler makes inside
  *   the first one is untrusted and leaves the look as the first one set it.
@@ -51,7 +66,7 @@
  * the pointer down and the click. A press outside the pane must end the pane's record and its look, so
  * the pointer down is not on the pane; from a press that keeps a record to its end stand the pointer move,
  * up and cancel, the loss of the pointer's capture, the page's visibility change, the window's blur, the
- * scroll of any box (a scroll does not bubble, so only the capture phase on the document hears every box)
+ * page's selection change, the scroll of any box (a scroll does not bubble, so only the capture phase on the document hears every box)
  * and the visual viewport's scroll and resize (a release or a cancel can come outside the pane when the
  * finger slides out), and `stop` removes every one of them at every end, the release's among them, so that
  * a lost capture that follows a touch's release cannot end the record before its click; a press that
@@ -143,6 +158,12 @@ export function startLinkPress(element: HTMLElement): () => void {
   const here = (target: EventTarget | null): boolean => target instanceof Node && element.contains(target)
   const away = (event: PointerEvent): boolean =>
     press !== null && Math.hypot(event.clientX - press.at.x, event.clientY - press.at.y) > SLOP
+  // Whether the look of a press of this pointer type stays out: a touch or a pen while the page's selection is not
+  // collapsed. The system takes a held touch for its own selection of words and may give the page no end of the
+  // touch, so a look that shows with a selection could stay on a link that no click opens. The whole selection is
+  // read, whatever it covers; a selection inside a text field leaves the page's selection collapsed. A mouse's look
+  // follows its pointer and is not held back.
+  const withheld = (type: string): boolean => opensByRule(type) && document.getSelection()?.isCollapsed === false
 
   // A press is live or dead. It lives from a primary pointer down to the pointer's up, and it dies at the
   // first of: a move past the slop, a pointer cancel, the loss of the pointer's capture, the window's loss
@@ -183,7 +204,12 @@ export function startLinkPress(element: HTMLElement): () => void {
     // lives on, and its look follows the pointer as at a move, out where a release would open nothing, lit again
     // where the pointer is back. Only a press on the link's own element has a look.
     if (!opens && opensByRule(press.pointerType)) die()
-    else if (press.own) light(opens ? press.start.link : null)
+    else if (press.own) light(opens && !withheld(press.pointerType) ? press.start.link : null)
+  }
+  // A selection that is not collapsed puts out the look of a touch or a pen that is down. The press and its record
+  // stay: a click that does come is decided as for any press, and its look comes at the click.
+  const selected = (): void => {
+    if (press !== null && withheld(press.pointerType)) out()
   }
   // The pointer's capture was taken from the pointer, the window is no longer in front or the page is
   // no longer shown: no release will come to this press.
@@ -203,6 +229,7 @@ export function startLinkPress(element: HTMLElement): () => void {
     document.removeEventListener('lostpointercapture', lost)
     document.removeEventListener('visibilitychange', hide)
     window.removeEventListener('blur', blur)
+    document.removeEventListener('selectionchange', selected)
     document.removeEventListener('scroll', recheck, true)
     window.visualViewport?.removeEventListener('scroll', recheck)
     window.visualViewport?.removeEventListener('resize', recheck)
@@ -251,14 +278,16 @@ export function startLinkPress(element: HTMLElement): () => void {
     }
     // Only a press on the link's own element is lit at the pointer down: the browser's click goes to that
     // element, whatever the point. Where the press is on plain text the click may go to another link, so
-    // the look waits for the click.
-    if (found.own) light(found.id)
+    // the look waits for the click. A touch's or a pen's press lights nothing while the page's selection is not
+    // collapsed; the press keeps its record, and the click gives the look.
+    if (found.own && !withheld(event.pointerType)) light(found.id)
     document.addEventListener('pointermove', move)
     document.addEventListener('pointerup', up)
     document.addEventListener('pointercancel', cancel)
     document.addEventListener('lostpointercapture', lost)
     document.addEventListener('visibilitychange', hide)
     window.addEventListener('blur', blur)
+    document.addEventListener('selectionchange', selected)
     document.addEventListener('scroll', recheck, true)
     window.visualViewport?.addEventListener('scroll', recheck)
     window.visualViewport?.addEventListener('resize', recheck)
