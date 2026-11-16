@@ -726,6 +726,91 @@ mod tests {
         );
     }
 
+    /// A write on the bounded path that has handed part of a frame to a peer that reads nothing,
+    /// when the peer goes: its error says that the peer has gone, so the connection is not closed,
+    /// the peer's last frames are read, then its end, and no frame can be written from then on.
+    ///
+    /// It holds on every platform, and every pause in it is a state that the case confirms. The
+    /// bounded path writes a frame in pieces and stops while the peer takes no more, whatever a
+    /// socket or a pipe holds, so a frame far over what either holds is left in flight. The writer
+    /// is lent to the write meanwhile, so the case asks the peer's end of the connection what has
+    /// reached it: bytes that nobody has read are part of the frame, and the peer goes only then.
+    /// The wait for that state has a bound, which only a fault reaches.
+    #[tokio::test]
+    async fn a_bounded_write_in_flight_to_a_peer_that_has_gone_leaves_what_it_sent_to_be_read() {
+        use kr_protocol::envelope::{Outcome, Response};
+        use kr_protocol::error::{ErrorCode, ProtocolError};
+
+        let (transport, peer_reader, mut peer_writer, _tree) = over_a_raw_connection().await;
+        let transport = std::sync::Arc::new(transport);
+        let big = request(1, 900_000);
+        let sending = tokio::spawn({
+            let transport = std::sync::Arc::clone(&transport);
+            async move {
+                let not_after = Instant::now() + Duration::from_secs(120);
+                transport.send_before(&big, not_after, &|| true).await
+            }
+        });
+        let bound = Instant::now() + Duration::from_secs(30);
+        while !matches!(
+            peer_writer.peer_state(),
+            kr_ipc::framed::PeerState::Unread(_)
+        ) {
+            assert!(
+                !sending.is_finished(),
+                "the frame went whole, so no part of it was left in flight"
+            );
+            assert!(
+                Instant::now() < bound,
+                "[wait] no byte of the frame reached the peer"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        for frame in [
+            ControlFrame::Response(Response {
+                request_id: RequestId::new(7),
+                outcome: Outcome::Ok(ParamsValue::empty()),
+            }),
+            ControlFrame::Response(Response {
+                request_id: RequestId::new(0),
+                outcome: Outcome::Error(ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "this connection is refused",
+                )),
+            }),
+        ] {
+            peer_writer.write_message(&frame).await.expect("the frame");
+        }
+        // The peer goes with part of the frame unread.
+        drop((peer_reader, peer_writer));
+        let failed = tokio::time::timeout(Duration::from_secs(8), sending)
+            .await
+            .expect("[wait] the write ended")
+            .expect("the task");
+        assert!(
+            matches!(&failed, Err(ClientError::Ipc(kr_ipc::IpcError::PeerClosed))),
+            "{failed:?}"
+        );
+        assert!(
+            !transport.is_closed(),
+            "the connection stands, for its reader to read to the peer's end"
+        );
+        assert!(!transport.can_send(), "nothing can be written any more");
+        let mut read = Vec::new();
+        loop {
+            match transport.recv().await {
+                Ok(Some(frame)) => read.push(request_id_of(&frame)),
+                Err(ClientError::Ipc(kr_ipc::IpcError::PeerClosed)) => break,
+                other => panic!("a read that is neither a frame nor the peer's end: {other:?}"),
+            }
+        }
+        assert_eq!(
+            read,
+            [RequestId::new(7), RequestId::new(0)],
+            "every frame the peer sent before it went is read"
+        );
+    }
+
     /// The case that needs a socket which takes part of a frame of 900,000 bytes from a peer that
     /// reads nothing. A Unix socket does. A Windows named pipe does not: its write takes the whole
     /// slice it is offered, and the unbounded write that a send without a limit makes offers the
