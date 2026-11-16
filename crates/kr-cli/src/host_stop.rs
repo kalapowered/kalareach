@@ -513,6 +513,8 @@ enum AfterRequest {
     NotShown,
     /// The process has gone and something that is not shown to be a daemon holds the environment.
     StillHeld,
+    /// The environment is held, and nothing shows whether the daemon that was told or another holds it.
+    HeldNotShown,
     /// The lock could not be read: why.
     Unlooked(Shown),
 }
@@ -533,6 +535,7 @@ fn said_after_the_request(end: End, request: &Request) -> Said<AfterRequest> {
             }
             Why::NotShown => Said::new(AfterRequest::NotShown, Exit::Unfinished, asked),
             Why::Held => Said::new(AfterRequest::StillHeld, Exit::Unfinished, asked),
+            Why::HeldNotShown => Said::new(AfterRequest::HeldNotShown, Exit::Unfinished, asked),
             Why::Unlooked(why) => Said::new(AfterRequest::Unlooked(why), Exit::Unfinished, asked),
         },
     }
@@ -1311,6 +1314,7 @@ fn words_after_the_request(
         }
         AfterRequest::NotShown => not_shown(id, not_known),
         AfterRequest::StillHeld => still_held(environment, id),
+        AfterRequest::HeldNotShown => held_not_shown(id, not_known),
         AfterRequest::Unlooked(why) => unlooked(id, not_known, why),
     }
 }
@@ -1772,6 +1776,31 @@ fn not_ended(
     )
 }
 
+/// The words where the environment's own lock was still held at the bound and nothing showed what
+/// holds it: the process of the daemon asked could not be read, and no look showed that daemon
+/// answering. The holder can be the daemon that was told, a daemon that is starting, or another
+/// command's brief look, so the words say only that the end is not confirmed.
+fn held_not_shown(id: EnvironmentId, not_known: Option<&Shown>) -> Shown {
+    match not_known {
+        None => shown!(
+            "The control daemon for environment {} was told to stop. After {} seconds the \
+             environment was still held, and the command could not show what holds it, so it \
+             could not confirm the end. Run kr host stop again in a moment; it looks again.",
+            id,
+            END_BOUND.as_secs()
+        ),
+        Some(failure) => shown!(
+            "The control daemon for environment {} did not show whether it took the stop ({}). \
+             After {} seconds the environment was still held, and the command could not show \
+             what holds it, so it could not confirm the end. Run kr host stop again in a \
+             moment; it looks again.",
+            id,
+            *failure,
+            END_BOUND.as_secs()
+        ),
+    }
+}
+
 /// The environment after the daemon's process was seen to have gone, and still held when the wait
 /// ended: what is said is that the process has gone and that something holds the environment which
 /// is not shown to be a control daemon. It does not say that the daemon ended: the daemon ended only
@@ -1814,7 +1843,7 @@ fn unlooked(id: EnvironmentId, not_known: Option<&Shown>, why: &Shown) -> Shown 
 /// Why the daemon had not ended when the wait did.
 #[derive(Clone, Debug)]
 enum Why {
-    /// Its process runs, or the lock is held: the daemon is told to stop and goes on.
+    /// Its process runs: the daemon is told to stop and goes on.
     Running,
     /// The last look of the last round showed a daemon of the generation asked answering, whatever
     /// else the round read: a daemon answers, so it has not ended.
@@ -1825,6 +1854,11 @@ enum Why {
     NotShown,
     /// Its process has gone and something holds the environment that nothing shows to be a daemon.
     Held,
+    /// The lock is held, and there is no usable reading of the process (none was possible, or the
+    /// system did not say) and no proved answer of the daemon asked: the environment is held, and
+    /// nothing shows by whom. The daemon that was told may still be stopping, and another may be
+    /// starting.
+    HeldNotShown,
     /// The lock could not be looked at.
     Unlooked(Shown),
 }
@@ -2023,8 +2057,9 @@ fn what_the_round_shows(round: &Round, at_bound: bool) -> Option<End> {
                     a_successor_by_the_endpoint(round, at_bound, Why::Held)
                 }
             },
-            Process::Running | Process::Unreadable => bound_shows(round, at_bound, Why::Running),
-            Process::NoIdentity => a_successor_by_the_endpoint(round, at_bound, Why::Running),
+            Process::Running => bound_shows(round, at_bound, Why::Running),
+            Process::Unreadable => bound_shows(round, at_bound, Why::HeldNotShown),
+            Process::NoIdentity => a_successor_by_the_endpoint(round, at_bound, Why::HeldNotShown),
         },
         Lock::Unreadable(why) => match round.process {
             Process::NoIdentity | Process::Unreadable | Process::Ended => {
@@ -2508,8 +2543,8 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(waited, End::NotEnded(Why::Running, _)),
-            "a held lock with nothing to show for a successor is not an end"
+            matches!(waited, End::NotEnded(Why::HeldNotShown, _)),
+            "a held lock with nothing to show for a successor is not an end, and shows no daemon"
         );
         drop(held);
 
@@ -2903,6 +2938,7 @@ mod tests {
             End::NotEnded(Why::Answers, _) => "not ended, answers".to_owned(),
             End::NotEnded(Why::NotShown, _) => "not ended, not shown".to_owned(),
             End::NotEnded(Why::Held, _) => "not ended, held".to_owned(),
+            End::NotEnded(Why::HeldNotShown, _) => "not ended, held, not shown".to_owned(),
             End::NotEnded(Why::Unlooked(_), _) => "not ended, not looked at".to_owned(),
         }
     }
@@ -3258,7 +3294,7 @@ mod tests {
             (Ok(false), Endpoint::Same(an_answer()), "not ended, answers"),
             (Ok(false), Endpoint::Unclear, "not ended, not shown"),
             (Ok(true), Endpoint::Another, "successor None"),
-            (Ok(true), Endpoint::Nobody, "not ended, running"),
+            (Ok(true), Endpoint::Nobody, "not ended, held, not shown"),
             (Ok(true), Endpoint::Same(an_answer()), "not ended, answers"),
             (
                 Err(Shown::said("the lock could not be taken")),
@@ -4110,6 +4146,61 @@ mod tests {
         }
     }
 
+    /// With the environment's lock read as held and no usable reading of the process, and no proved
+    /// answer of the daemon asked, the command says that the environment was still held and that
+    /// it could not show what holds it: exit 1, the whole text, and the `stop` member of a told
+    /// request or of one whose outcome was not shown.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_lock_with_no_usable_reading_of_the_process_says_what_the_lock_shows() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let paths = temp.environment();
+        let id = paths.environment_id();
+        let failure = Shown::said("the connection was lost");
+        for (request, expected, stop) in [
+            (
+                Request::Told,
+                format!(
+                    "The control daemon for environment {id} was told to stop. After 30 seconds \
+                     the environment was still held, and the command could not show what holds \
+                     it, so it could not confirm the end. Run kr host stop again in a moment; it \
+                     looks again."
+                ),
+                "told",
+            ),
+            (
+                Request::MaybeAsked(failure),
+                format!(
+                    "The control daemon for environment {id} did not show whether it took the \
+                     stop (the connection was lost). After 30 seconds the environment was still \
+                     held, and the command could not show what holds it, so it could not confirm \
+                     the end. Run kr host stop again in a moment; it looks again."
+                ),
+                "maybe_asked",
+            ),
+        ] {
+            for look in [
+                Endpoint::Nobody,
+                Endpoint::Unproved(an_answer()),
+                Endpoint::Unclear,
+            ] {
+                let supplied = Supplied::new()
+                    .held(vec![at_once(Ok(true))])
+                    .look(vec![at_once(look)]);
+                let ended = wait_for_the_end(&supplied, None, END_BOUND).await;
+                assert_eq!(said(&ended), "not ended, held, not shown", "{look:?}");
+                let said = said_after_the_request(ended, &request);
+                assert_eq!((said.exit, said.stop.word()), (Exit::Unfinished, stop));
+                let words =
+                    words_after_the_request(&said.sentence, &request, &paths, id, None, None);
+                let error = Exit::Unfinished
+                    .failure(words)
+                    .expect("a failure that the command reports");
+                assert_eq!(error.exit_code(), 1);
+                assert_eq!(error.to_string(), expected, "{look:?}");
+            }
+        }
+    }
+
     /// The last look that shows the same daemon, with the lock free, is a sign of life and an
     /// answer: the daemon has not ended, and the words say so.
     #[tokio::test(start_paused = true)]
@@ -4822,14 +4913,15 @@ mod tests {
     /// A lock that was free in an earlier round is no sign of life at a bound where the last
     /// round read it as held, and the other way round: the marks are the last round's. With no
     /// identity, a lock that is free in the first round and held in every later one is a held lock
-    /// to the bound, which is running, and not a free lock with a look that showed nothing.
+    /// to the bound, which shows that the environment is held and not by whom, and not a free lock
+    /// with a look that showed nothing.
     #[tokio::test(start_paused = true)]
     async fn a_lock_that_was_free_in_an_earlier_round_is_read_as_the_last_round_reads_it() {
         let supplied = Supplied::new()
             .held(vec![at_once(Ok(false)), at_once(Ok(true))])
             .look(vec![at_once(Endpoint::Unclear)]);
         let ended = wait_for_the_end(&supplied, None, END_BOUND).await;
-        assert_eq!(said(&ended), "not ended, running");
+        assert_eq!(said(&ended), "not ended, held, not shown");
         let supplied = Supplied::new()
             .held(vec![at_once(Ok(true)), at_once(Ok(false))])
             .look(vec![at_once(Endpoint::Unclear)]);
@@ -5205,6 +5297,7 @@ mod tests {
                 Self::Answers => "answers",
                 Self::NotShown => "not_shown",
                 Self::Held => "held",
+                Self::HeldNotShown => "held_not_shown",
                 Self::Unlooked(_) => "unlooked",
             }
             .to_owned()
@@ -5237,6 +5330,7 @@ mod tests {
                 Self::NotEnded => "not_ended",
                 Self::NotShown => "not_shown",
                 Self::StillHeld => "still_held",
+                Self::HeldNotShown => "held_not_shown",
                 Self::Unlooked(_) => "unlooked",
             }
             .to_owned()
@@ -5538,5 +5632,325 @@ mod tests {
             .collect();
         assert_eq!(made.iter().map(readings).collect::<Vec<_>>(), kept);
         assert!(made.len() < all.len());
+    }
+
+    // The properties of the end's decision, asserted over every row of the table. They are written
+    // from the principle that the command at its end says only what its own readings showed, and
+    // its last readings decide (not from the table): each reads the words that a row says, and
+    // the readings of the round, and judges one against the other.
+
+    /// A row of the whole product: a round at the bound, the request that came before it, what is
+    /// said and the words.
+    struct Composed {
+        round: Round,
+        request: Request,
+        said: Said<AfterRequest>,
+        text: String,
+    }
+
+    /// The rows for `rounds` and both requests, with the words that the command prints. Where
+    /// `unproved_is_proved` the round is decided as if an answer with no proved generation were a
+    /// proved one (the base of this change): the readings of the row stay as they were.
+    fn composed_rows(rounds: &[Round], unproved_is_proved: bool) -> Vec<Composed> {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = temp.environment();
+        let id = environment.environment_id();
+        let mut rows = Vec::new();
+        for round in rounds {
+            let mut read = round.clone();
+            if let (true, Some(Endpoint::Unproved(answered))) = (unproved_is_proved, read.look) {
+                read.look = Some(Endpoint::Same(answered));
+            }
+            for request in every::<Request>() {
+                let end =
+                    what_the_round_shows(&read, true).expect("a round at the bound shows an end");
+                let said = said_after_the_request(end, &request);
+                let old = (round.process != Process::NoIdentity).then(asked_process);
+                let text = words_after_the_request(
+                    &said.sentence,
+                    &request,
+                    &environment,
+                    id,
+                    old.as_ref(),
+                    None,
+                )
+                .to_string();
+                rows.push(Composed {
+                    round: round.clone(),
+                    request,
+                    said,
+                    text,
+                });
+            }
+        }
+        rows
+    }
+
+    fn lock_free(round: &Round) -> bool {
+        matches!(round.lock, Lock::Free)
+    }
+
+    fn lock_held(round: &Round) -> bool {
+        matches!(round.lock, Lock::Held)
+    }
+
+    fn lock_unreadable(round: &Round) -> bool {
+        matches!(round.lock, Lock::Unreadable(_))
+    }
+
+    /// The last look proved that the daemon asked answers, by the generation that it reports.
+    fn proved_same(round: &Round) -> bool {
+        matches!(round.look, Some(Endpoint::Same(_)))
+    }
+
+    /// There is no usable reading of the process: none was possible, or the system did not say.
+    fn no_usable_process(round: &Round) -> bool {
+        matches!(round.process, Process::NoIdentity | Process::Unreadable)
+    }
+
+    /// Another daemon holds the environment, shown by the lock file naming another process that is a
+    /// daemon, or by a daemon of another generation answering where the lock and the process leave
+    /// room for one.
+    fn successor_shown(round: &Round) -> bool {
+        let named = lock_held(round)
+            && round.process == Process::Ended
+            && matches!(round.holder, Holder::Other(_));
+        let another_generation = matches!(round.look, Some(Endpoint::Another))
+            && ((lock_free(round) && no_usable_process(round))
+                || (lock_held(round)
+                    && matches!(round.process, Process::Ended | Process::NoIdentity)));
+        named || another_generation
+    }
+
+    /// The end is shown: the process has gone and the lock is free; nobody listens, the lock is free
+    /// and no process can be read; or a successor is shown.
+    fn end_shown(round: &Round) -> bool {
+        let gone = lock_free(round) && round.process == Process::Ended;
+        let nobody_listens = lock_free(round)
+            && no_usable_process(round)
+            && matches!(round.look, Some(Endpoint::Nobody));
+        gone || nobody_listens || successor_shown(round)
+    }
+
+    /// The rows that break a property, each as a line that names the property, the readings, the
+    /// request and the words.
+    fn violations(rows: &[Composed]) -> Vec<String> {
+        let mut broken = Vec::new();
+        for row in rows {
+            let (round, text) = (&row.round, &row.text);
+            let code = code_of(row.said.exit);
+            let mut broke = |property: &str| {
+                broken.push(format!(
+                    "{property}: {} request={} says: {text}",
+                    readings(round),
+                    row.request.label()
+                ));
+            };
+            // P1: "has not ended" only where the last round proved that the same daemon answers by
+            // its generation, or that its process runs.
+            if text.contains("has not ended")
+                && !(proved_same(round) || round.process == Process::Running)
+            {
+                broke("P1 has not ended");
+            }
+            // P2: "has ended" and "Stopped" only where the end is shown by the process gone with
+            // the lock free, or by nobody listening with the lock free and no process to read.
+            if (text.contains("and it has ended") || text.contains("Stopped the control daemon"))
+                && !(lock_free(round)
+                    && (round.process == Process::Ended
+                        || (no_usable_process(round)
+                            && matches!(round.look, Some(Endpoint::Nobody)))))
+            {
+                broke("P2 has ended");
+            }
+            // P3: the words of a told stop only where the request was told, and the words of one
+            // not shown only where it was not.
+            if (text.contains("was told to stop") || text.contains("Stopped the control daemon"))
+                && !matches!(row.request, Request::Told)
+            {
+                broke("P3 told words");
+            }
+            if text.contains("did not show whether it took the stop")
+                && !matches!(row.request, Request::MaybeAsked(_))
+            {
+                broke("P3 not-shown words");
+            }
+            // P4: a process number only where a process is named: the asked process (4000) where an
+            // identity exists, the process that the lock file names (4001) where it names one, and
+            // the process of a look that showed another generation (5000).
+            if text.contains("process 4000") && round.process == Process::NoIdentity {
+                broke("P4 the asked process");
+            }
+            if text.contains("process 4001") && !matches!(round.holder, Holder::Other(_)) {
+                broke("P4 the holder");
+            }
+            if text.contains("process 5000") && !matches!(round.look, Some(Endpoint::Another)) {
+                broke("P4 the successor of a look");
+            }
+            // P5: exit 0 only where the end is shown, and where it is shown, exit 0.
+            if code == 0 && !end_shown(round) {
+                broke("P5 exit 0");
+            }
+            if end_shown(round) && code != 0 {
+                broke("P5 the end is shown and the exit is not 0");
+            }
+            // P6: exit 3 only where nothing was sent: a request that was written never ends with 3.
+            if code == 3 {
+                broke("P6 exit 3");
+            }
+            // P7: a held lock's words only where the lock was read as held.
+            if (text.contains("still holds") || text.contains("still held")) && !lock_held(round) {
+                broke("P7 held lock");
+            }
+            // P8: "could not be read" only where a reading failed.
+            if text.contains("could not be read") && !lock_unreadable(round) {
+                broke("P8 could not be read");
+            }
+            // P9: "showed neither that the daemon still runs nor that it had gone" only with the lock
+            // free and no usable reading of the process.
+            if text.contains("showed neither") && !(lock_free(round) && no_usable_process(round)) {
+                broke("P9 showed neither");
+            }
+            // P10: "has gone, and something" only where the process was read as ended.
+            if text.contains("has gone, and something") && round.process != Process::Ended {
+                broke("P10 the process has gone");
+            }
+            // P11: a successor's words only where a successor is shown.
+            if text.contains("now holds") && !successor_shown(round) {
+                broke("P11 successor");
+            }
+            // P12: the stop member says `ended` where the exit is 0, and only there.
+            if (row.said.stop == Knows::Ended) != (code == 0) {
+                broke("P12 the stop member");
+            }
+            // P13: "could not show what holds it" only where the lock was read as held (the
+            // environment's own lock) and neither the same daemon was proved nor its process read as
+            // running or as ended; and in every such round that shows no successor, those words.
+            let holds_unshown = lock_held(round) && no_usable_process(round) && !proved_same(round);
+            if text.contains("could not show what holds it") && !holds_unshown {
+                broke("P13 held and not shown");
+            }
+            if holds_unshown
+                && !successor_shown(round)
+                && !text.contains("could not show what holds it")
+            {
+                broke("P13 the held lock is not said");
+            }
+        }
+        broken
+    }
+
+    /// The properties hold over every combination of the readings: the whole product of the sets,
+    /// the combinations that the wait can make among them, and a request that was told and one
+    /// whose outcome was not shown.
+    #[test]
+    fn the_properties_hold_over_every_row() {
+        let all = every_round();
+        let happen = the_rounds_that_happen();
+        assert_eq!((all.len(), happen.len()), (288, 39));
+        let rows = composed_rows(&all, false);
+        assert_eq!(rows.len(), 288 * 2);
+        assert_eq!(violations(&rows), Vec::<String>::new());
+        let rows = composed_rows(&happen, false);
+        assert_eq!(rows.len(), 39 * 2);
+        assert_eq!(violations(&rows), Vec::<String>::new());
+    }
+
+    /// The properties have teeth. Read as the base of this change read it, with an answer of no
+    /// proved generation taken for the same daemon, the cell that the twelfth read found (an ended
+    /// process, a held lock, a holder that is not named, such an answer, a told stop) says "has
+    /// not ended" and breaks the first property; so does the same cell for a request whose outcome
+    /// was not shown.
+    #[test]
+    fn the_properties_fail_where_an_answer_with_no_proved_generation_is_read_as_the_same_daemon() {
+        let broken = violations(&composed_rows(&the_rounds_that_happen(), true));
+        for request in ["told", "maybe_asked"] {
+            let cell = format!(
+                "P1 has not ended: lock=held process=ended holder=nobody look=unproved request={request} says: "
+            );
+            assert!(
+                broken.iter().any(|line| line.starts_with(&cell)),
+                "{request}: {broken:#?}"
+            );
+        }
+    }
+
+    /// The properties hold for what is said where a request could not be made and at the start.
+    #[test]
+    fn the_properties_hold_for_a_request_that_could_not_be_made_and_for_the_start() {
+        // What the wait decides: an answer at the last look is an answer, and only that.
+        for round in every_round() {
+            let end = what_the_round_shows(&round, true).expect("an end at the bound");
+            let shown = end_shown(&round);
+            let answered = matches!(round.look, Some(Endpoint::Same(_) | Endpoint::Unproved(_)));
+            match decided_by_the_wait(end) {
+                Decided::Answers(_) => assert!(answered && !shown, "{}", readings(&round)),
+                Decided::Ended(_) => assert!(shown, "{}", readings(&round)),
+                Decided::NotShown => assert!(!shown && !answered, "{}", readings(&round)),
+            }
+        }
+        // What is said: exit 3 only where nothing was sent, a held lock's words only where the
+        // lock read again was held, and an end only where the daemon ended.
+        for lock in every::<Lock>() {
+            for before in every::<Before>() {
+                let label = before.label();
+                let accepted = matches!(before, Before::Silent { accepted: true });
+                let said = said_before_the_request(before, || lock.clone());
+                let code = code_of(said.exit);
+                let held = matches!(lock, Lock::Held);
+                match said.sentence {
+                    BeforeRequest::Ended { .. } => assert_eq!((code, said.stop), (0, Knows::Ended)),
+                    BeforeRequest::HoldsAndSilent => assert!(held && code == 1, "{label}"),
+                    BeforeRequest::Silent => assert!(!held && accepted && code == 1, "{label}"),
+                    BeforeRequest::Unmade(_) => {
+                        assert_eq!((code, said.stop), (3, Knows::NotAsked), "{label}");
+                    }
+                }
+                assert!(code != 3 || said.stop == Knows::NotAsked, "{label}");
+            }
+        }
+        // The start: "No control daemon runs" (exit 0) only where nothing listens and the lock is
+        // free; a held lock's words only where the lock was held; an unreadable lock only where it
+        // was unreadable.
+        for start in every::<Start>() {
+            for lock in every::<Lock>() {
+                let said = said_at_the_start(&start, || lock.clone());
+                let code = code_of(said.exit);
+                let free = matches!(lock, Lock::Free);
+                let held = matches!(lock, Lock::Held);
+                match said.sentence {
+                    AtStart::NoDaemon => {
+                        assert!(
+                            matches!(start, Start::NothingListening) && free && code == 0,
+                            "{}",
+                            start.label()
+                        );
+                    }
+                    AtStart::HoldsAndSilent => assert!(held && code == 1, "{}", start.label()),
+                    AtStart::LockUnreadable(_) => {
+                        assert!(matches!(lock, Lock::Unreadable(_)) && code == 1);
+                    }
+                    AtStart::Silent => assert!(!held && code == 1, "{}", start.label()),
+                    AtStart::OtherMajor => assert_eq!(code, 1),
+                }
+                assert!(code != 3 && (code != 0 || free));
+            }
+        }
+    }
+
+    /// Each kind of failure ends with the exit that the table says.
+    #[test]
+    fn each_exit_is_the_exit_of_its_failure() {
+        for (exit, code) in [
+            (Exit::Done, 0),
+            (Exit::Unfinished, 1),
+            (Exit::Failed, 1),
+            (Exit::Unavailable, 3),
+        ] {
+            assert_eq!(code_of(exit), code);
+        }
+        let id = an_environment();
+        let error = unmade_request(id, &Shown::said("a failure"), Unmade::OwnFault);
+        assert_eq!(error.exit_code(), code_of(Exit::Unavailable));
     }
 }
