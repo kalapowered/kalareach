@@ -741,6 +741,11 @@ pub struct Controller {
     /// this host's own tests. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     reconciliations: std::sync::Mutex<Vec<SessionId>>,
+    /// Every time the retry of a record of this daemon's own ended its look at a worker's end with
+    /// nothing recorded, by the worker's session, for this host's own tests. Compiled away in every
+    /// shipped build.
+    #[cfg(feature = "testing")]
+    retries_that_recorded_nothing: std::sync::Mutex<Vec<SessionId>>,
     /// How many challenges this daemon's recoveries have presented to workers, for this host's own
     /// tests. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -1441,6 +1446,19 @@ impl Controller {
     pub fn hold_the_pass_asks_for_tests(&self, held: bool) {
         self.pass_asks_held
             .store(held, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How many times the retry of a record of this daemon's own has ended its look at the end of
+    /// the worker of `session_id` with nothing recorded, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn retries_that_recorded_nothing_for_tests(&self, session_id: SessionId) -> usize {
+        self.retries_that_recorded_nothing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|ended| **ended == session_id)
+            .count()
     }
 
     /// How many times this daemon has asked whether the worker of `session_id` has ended, for this
