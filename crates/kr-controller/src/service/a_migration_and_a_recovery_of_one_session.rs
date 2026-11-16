@@ -674,3 +674,119 @@ async fn a_record_of_the_daemons_own_that_was_not_written_is_the_one_written_at_
         "and it is the one the registry holds"
     );
 }
+
+/// A worker that ended and left its own closure in its journal, after a first look at its end that
+/// could not read that journal and whose record of this daemon's own the registry refused.
+struct KeptRecordAndAJournalRead {
+    controller: std::sync::Arc<Controller>,
+    session_id: SessionId,
+    /// What the worker wrote for itself, which is not what this daemon writes of a worker that left
+    /// nothing.
+    wrote: ClosureRecord,
+    _temp: TempHost,
+}
+
+impl KeptRecordAndAJournalRead {
+    async fn made() -> Self {
+        let temp = TempHost::create();
+        let controller = daemon(&temp).await;
+        let session_id = recorded_ended_worker(&controller, &temp).await;
+        let identity = kr_ipc::identity::ended_process_identity(4_000_003);
+        refuse_closures(&controller);
+        // The first look: the worker's journal is not read (its endpoint could not be removed), so
+        // the record is this daemon's own, and the registry refuses it. It is kept.
+        let refused = controller
+            .record_final(
+                session_id,
+                ClosureReason::WorkerCrash,
+                &identity,
+                &crate::archive::Fenced::nothing(session_id),
+                Death::ConfirmedBeforeAFence,
+            )
+            .await;
+        assert!(
+            refused.is_err(),
+            "the first look's record is refused by the registry: {refused:?}"
+        );
+        assert!(
+            controller
+                .registry
+                .lock()
+                .await
+                .closure(session_id)
+                .expect("the registry answers")
+                .is_none(),
+            "and the registry holds no closure"
+        );
+        // The journal then gives the closure the worker wrote, and the registry takes closures.
+        let wrote = closure_of(session_id);
+        written_journal(&controller, session_id, Some(&wrote));
+        take_closures_again(&controller);
+        Self {
+            controller,
+            session_id,
+            wrote,
+            _temp: temp,
+        }
+    }
+
+    /// What the registry holds once a look or a retry has recorded a closure.
+    async fn recorded(&self) -> ClosureRecord {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                if let Some(closure) = self
+                    .controller
+                    .registry
+                    .lock()
+                    .await
+                    .closure(self.session_id)
+                    .expect("the registry answers")
+                {
+                    return closure;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a closure is recorded")
+    }
+}
+
+/// A look at the worker's end reads the worker's journal before it writes a record of this daemon's
+/// own that an earlier look kept: the journal could not be read then and can be now, and the
+/// registry must hold the closure the worker wrote, not this daemon's account of a worker that left
+/// none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_look_reads_the_journal_before_it_writes_the_record_an_earlier_look_kept() {
+    let world = KeptRecordAndAJournalRead::made().await;
+    let found = world
+        .controller
+        .reconcile(world.session_id)
+        .await
+        .expect("the registry answers")
+        .expect("the worker that ended is closed");
+    assert_eq!(found, world.wrote, "the closure the worker wrote stands");
+    assert_eq!(
+        world.recorded().await,
+        world.wrote,
+        "and it is the one recorded: the record that the first look kept is not written over it"
+    );
+}
+
+/// A repeat close asks first whether this daemon knows how the session ended (`knows_how_it_ended`,
+/// at the local door and at the device's), which starts the retry of a record that it kept. For a
+/// record of this daemon's own the retry is a look at the worker's end, which reads the worker's
+/// journal first, and the registry must hold the closure the worker wrote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repeat_close_retries_a_kept_record_through_a_look_that_reads_the_journal() {
+    let world = KeptRecordAndAJournalRead::made().await;
+    assert!(
+        world.controller.knows_how_it_ended(world.session_id),
+        "a repeat close finds the record that the first look kept"
+    );
+    assert_eq!(
+        world.recorded().await,
+        world.wrote,
+        "the retry recorded the closure the worker wrote, not the record that was kept"
+    );
+}
