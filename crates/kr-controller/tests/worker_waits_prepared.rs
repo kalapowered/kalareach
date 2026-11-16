@@ -320,8 +320,8 @@ async fn kr_req_23_30_a_prepared_action_whose_client_goes_under_the_session_is_r
 /// rejection finds the receipt no longer accepted and leaves it.
 ///
 /// The action is cancelled while its preparation is stopped, then waits for the boundary with the
-/// session held, and its client goes. The owner's entry names the revision of the receipt as it was
-/// accepted, and is done to no effect: the receipt keeps the cancellation's reason and revision.
+/// session held, and its client goes. The owner's entry names the journal's sequence of the
+/// acceptance, and is done to no effect: the receipt keeps the cancellation's reason and revision.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_a_cancellation_that_came_first_stays_when_the_owner_rejects_a_dropped_action()
 {

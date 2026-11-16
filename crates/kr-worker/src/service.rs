@@ -789,12 +789,13 @@ impl Drop for DispatchGuard<'_> {
     }
 }
 
-/// What clean-ups of connections whose peers have gone could not do without waiting for a lock,
-/// owed to the service.
+/// What clean-ups of connections whose peers have gone owe to the service.
 ///
 /// A connection whose peer has gone does what it can at once and gives its place in the worker's
-/// count back. What needs a lock that somebody else holds is entered here, and the service's own
-/// tasks do it when the lock comes free. The two kinds are kept apart by the lock each waits for,
+/// count back. What needs a lock is entered here, and the service's own tasks do it when the lock
+/// comes free. A detach and an unbind are entered when the lock is held by somebody else; the
+/// rejection of an accepted action is always entered, since the connection's path reads no journal
+/// and commits nothing. The two kinds are kept apart by the lock each waits for,
 /// so that a long hold of one never delays the other. Each kind is a set, so an entry owed twice is
 /// done once, and each has a wake that keeps its permit, so an entry made while a pass runs is
 /// not left until some other entry is made. A pass is one thread of the blocking pool, and the
@@ -5189,14 +5190,16 @@ impl WorkerService {
         }
     }
 
-    /// Whether a request only ends work that its own connection holds, so that its peer's end does
-    /// not take it back.
+    /// Whether a request only ends an action, so that its peer's end does not take it back.
     ///
-    /// A cancellation of an action takes nothing on and starts nothing: it ends what the client
-    /// offered. The client wrote it before it went, and the end behind it is read after it, so the
-    /// cancellation decides the action; dropping it would leave the action to be rejected as one
-    /// whose admission failed. Every other request starts or changes work, and is dropped when its
-    /// peer cannot take the answer.
+    /// A cancellation of an action takes nothing on and starts nothing: it ends an action, as a
+    /// rule the one its client offered. The client wrote it before it went, and the end behind it
+    /// is read after it, so the cancellation decides the action; dropping it would leave the action
+    /// to be rejected as one whose admission failed. The kind cannot tell the client's own offer
+    /// from an action of another actor, which the caller's authority may also cancel, so that
+    /// cancellation is carried out too. Every other request starts or changes work, or ends
+    /// something that its connection did not offer, and is dropped when its peer cannot take the
+    /// answer.
     fn only_ends_work(method: Method) -> bool {
         method == Method::ActionCancel
     }
