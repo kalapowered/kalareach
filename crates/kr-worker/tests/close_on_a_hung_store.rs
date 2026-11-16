@@ -1494,43 +1494,46 @@ fn ask_a_question_expiring(
         .expect("a verified source creates a question");
 }
 
-/// Facts that join while the publisher is on its way to the session are published as the latest
-/// the facts say: the first publication after the publisher is let go names the program that
-/// joined last, and not the one that woke it. The publisher is confirmed at its pause before the
-/// session is taken, which is where it reads nothing yet, so the case does not wait on a clock.
+/// A fact that joins after the publisher has taken the session and before it reads the facts is
+/// the one it publishes: the facts are read under the session, so what is published is the latest
+/// the facts say and not what they said when the publisher was told. The publisher is confirmed at
+/// its pause after the take and again at its pause before the send, so the case checks the FIRST
+/// publication while the publisher is held there (a channel that keeps only its latest value would
+/// hide it), and does not wait on a clock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_publication_that_waited_for_the_session_is_the_latest_the_facts_say() {
     let host = host().await;
     let producer = Producer::new(Arc::downgrade(&host.runtime));
-    let mut published = producer.subscribe();
-    let (arrived, let_go) = producer.pause_before_the_take();
+    let (took, let_go_after_the_take) = producer.pause_after_the_take();
     producer.observe_holder(Holder::Program(Some("first".to_owned())));
-    tokio::time::timeout(REACH, arrived)
+    tokio::time::timeout(REACH, took)
         .await
-        .expect("the publisher arrived at its pause within a bound")
+        .expect("the publisher took the session within a bound")
         .expect("the pause was dropped before it was reached");
-    // The publisher has been told and has not taken the session; the second fact joins now.
+    // The publisher has the session and has read nothing; the second fact joins now, and joining
+    // takes no session.
     producer.observe_holder(Holder::Program(Some("second".to_owned())));
-    assert_eq!(
-        host.runtime.published().latest().application,
-        None,
-        "nothing is published to the session before the publisher is let go"
-    );
-    let _ = let_go.send(());
-    tokio::time::timeout(REACH, published.changed())
+    let (about_to_send, let_go_before_the_send) = producer.pause_before_the_send();
+    let _ = let_go_after_the_take.send(());
+    tokio::time::timeout(REACH, about_to_send)
         .await
-        .expect("the publisher published within a bound")
-        .expect("the producer is there");
-    assert_eq!(
-        published.borrow_and_update().name.as_deref(),
-        Some("second"),
-        "the first publication after the release was not the latest the facts say"
-    );
-    producer.settle();
+        .expect("the publisher reached its send within a bound")
+        .expect("the pause was dropped before it was reached");
+    // What the first publication carries, while the publisher is held before telling anyone: the
+    // name it wrote into the session.
     assert_eq!(
         host.runtime.published().latest().application.as_deref(),
-        Some("second")
+        Some("second"),
+        "the first publication after the take was not the latest the facts say"
     );
+    assert_eq!(
+        producer.application().name,
+        None,
+        "nothing is shown to a receiver before the publisher sends"
+    );
+    let _ = let_go_before_the_send.send(());
+    producer.settle();
+    assert_eq!(producer.application().name.as_deref(), Some("second"));
 }
 
 /// A fact changes back to the value that is published while a publication of the other value is in
@@ -1547,18 +1550,31 @@ async fn a_change_back_to_the_published_value_while_a_publication_is_in_flight_i
         .await
         .expect("the publisher arrived at its pause within a bound")
         .expect("the pause was dropped before it was reached");
-    // The shell holds the terminal again: what the facts say is what was published before the
-    // publication in flight, which is still what the producer shows.
+    // What the case stands on: the publisher has written the program's name into the session and
+    // stands before it tells a receiver, so the producer still shows what it showed before.
+    assert_eq!(
+        host.runtime.published().latest().application.as_deref(),
+        Some("editor")
+    );
     assert_eq!(producer.application().name, None);
+    // The shell holds the terminal again: what the facts say is what the producer shows.
     producer.observe_holder(Holder::Shell);
     let _ = let_go.send(());
-    producer.settle();
-    assert_eq!(
-        producer.application().name,
-        None,
-        "the publication in flight left the older program standing"
-    );
-    assert_eq!(host.runtime.published().latest().application, None);
+    // The publication in flight goes out, and the change back is published after it. The case polls
+    // for the end state, so that a publisher that never makes the second publication fails the
+    // assertion here and not a wait of the test's own seam.
+    let began = Instant::now();
+    while producer.application().name.is_some()
+        || host.runtime.published().latest().application.is_some()
+    {
+        assert!(
+            began.elapsed() < CLOSURE_WAIT,
+            "the publication in flight left the older program standing: the producer shows {:?} and the session {:?}",
+            producer.application().name,
+            host.runtime.published().latest().application
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// A question that runs out of time stops counting without anything else waking the evidence loop.
