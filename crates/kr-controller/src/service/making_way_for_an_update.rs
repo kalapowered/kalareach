@@ -170,6 +170,38 @@ fn a_stopping_daemon_does_not_resume_and_a_resumed_one_does_not_stop() {
     drop(resumed.admit().expect("its gate is open"));
 }
 
+/// A stop whose attempt's hold ends while its admission is asked ends nothing: the admission is
+/// asked first and the hold's end is compared with the clock after it, immediately before the
+/// daemon is told to stop. The clock is the case's own. The control: where the hold has not ended
+/// once the admission has been asked, the same stop tells the daemon to stop.
+#[test]
+fn a_stop_whose_hold_ends_while_its_admission_is_asked_does_not_stop_the_daemon() {
+    use futures_util::FutureExt;
+    for ends in [false, true] {
+        let clock = kr_transport::clock::ManualClock::new();
+        let handover = Handover::on(Arc::new(clock.clone()));
+        let attempt = begin(&handover, Duration::from_secs(60));
+        let stopped = handover.stop(Some(attempt), || {
+            if ends {
+                clock.advance(Duration::from_secs(61));
+            }
+            Ok(())
+        });
+        let told = handover
+            .stopped_for(StopCause::Update)
+            .now_or_never()
+            .is_some();
+        if ends {
+            let refused = stopped.expect_err("a stop after its hold ended is refused");
+            assert_eq!(refused.code(), ErrorCode::ResourceUnavailable);
+            assert!(!told, "the daemon was not told to stop");
+        } else {
+            assert_eq!(stopped.expect("the control stops"), attempt);
+            assert!(told, "the control tells the daemon to stop");
+        }
+    }
+}
+
 /// A stop belongs to the attempt it names: after its update gave up, whatever came next, a late
 /// stop finds its attempt over and ends nothing, while the attempt that is open stops the daemon.
 #[test]
