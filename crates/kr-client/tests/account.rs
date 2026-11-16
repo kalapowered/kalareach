@@ -19,7 +19,7 @@ use kr_client::services::account::{
     AuthorisationRequest, Carrier, Client, Commit, Exchanged, ISSUER, IdentityRead, IssuedGrant,
     LEASE_SCOPE, ManagedAccountService, PendingAuthorisation, RELYING_PARTY_ID, REQUESTED_SCOPES,
     Redirect, RefreshToken, Refreshed, SignedInAccount, StoredGrant, TOKEN_PATH, USAGE_PATH,
-    USAGE_SCOPE, UsageLine, UsageResource, code_challenge, issuer_of,
+    USAGE_SCOPE, Unrevoked, UsageLine, UsageResource, code_challenge, issuer_of,
 };
 use kr_client::services::{ServiceFuture, ServiceHttpAnswer};
 use kr_crypto::store::{MemoryStore, SecretName, SecretStore};
@@ -2852,6 +2852,76 @@ async fn a_keep_whose_standing_ended_says_when_its_revocation_reached_neither_qu
             assert_eq!(signed_in.send_pending().await.expect("a send"), 0);
             assert_eq!(stub.revoked(), ["grant-c"], "the next send ends it");
         }
+    }
+}
+
+/// Ending the tokens of a sign-in that was withheld says what is owed and how the revocation
+/// failed, whichever of the queue, the store and the service refused: where neither the queue nor
+/// the service took the token it is held in memory and the revocation is owed; where the service
+/// took it, or the queue holds it, nothing is owed, and the failure says which; where nothing
+/// failed there is no failure to tell, though the service may not have been told yet.
+#[tokio::test]
+async fn ending_a_withheld_sign_ins_tokens_says_what_is_owed_and_how_the_revocation_failed() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    for (queue_refuses, send_fails, service_works, expected, failure) in [
+        (
+            true,
+            false,
+            false,
+            Commit::WithheldOwing,
+            Some("held in memory"),
+        ),
+        (
+            true,
+            false,
+            true,
+            Commit::Withheld,
+            Some("ended at the service"),
+        ),
+        (
+            false,
+            true,
+            false,
+            Commit::Withheld,
+            Some("held by the queue"),
+        ),
+        (
+            false,
+            true,
+            true,
+            Commit::Withheld,
+            Some("ended at the service"),
+        ),
+        (false, false, false, Commit::Withheld, None),
+        (false, false, true, Commit::Withheld, None),
+    ] {
+        let stub = Arc::new(Stub::new());
+        stub.revoke_works.store(service_works, Ordering::SeqCst);
+        let store = Arc::new(FaultyStore::new());
+        let signed_in = account_on(&stub, &store);
+        if queue_refuses {
+            store.queue_writes(&[true]);
+        }
+        if send_fails {
+            // The queue took the token, and the store cannot be read when the send begins.
+            store.session_reads(&[true]);
+        }
+        let (commit, unrevoked) = signed_in
+            .end_withheld(RefreshToken::new("grant-c").expect("a token"))
+            .await;
+        let told = match unrevoked {
+            None => None,
+            Some(Unrevoked::Held(_)) => Some("held in memory"),
+            Some(Unrevoked::Ended(_)) => Some("ended at the service"),
+            Some(Unrevoked::Queued(_)) => Some("held by the queue"),
+        };
+        let case = format!(
+            "the queue refused: {queue_refuses}, the send failed: {send_fails}, the service \
+             works: {service_works}"
+        );
+        assert_eq!(commit, expected, "{case}");
+        assert_eq!(told, failure, "{case}");
     }
 }
 

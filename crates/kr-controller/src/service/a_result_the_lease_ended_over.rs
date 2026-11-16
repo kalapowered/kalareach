@@ -596,11 +596,13 @@ async fn a_sign_in_ask_whose_lease_ends_while_the_fence_is_read_is_refused() {
         }
         go.send(()).expect("the ask goes on");
         let asked = asking.await.expect("the ask ends");
-        assert_eq!(
-            asked.is_err(),
-            ends,
-            "a lease that ended in the wait: {ends}: {asked:?}"
-        );
+        if ends {
+            let refused = asked.expect_err("a lease that ended in the wait stops the ask");
+            assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused:?}");
+            assert_eq!(refused.to_string(), LEASE_NOT_LIVE, "{refused:?}");
+        } else {
+            asked.expect("the control passes");
+        }
     }
 }
 
@@ -627,9 +629,90 @@ async fn a_sign_in_ask_whose_fence_comes_while_the_lease_is_read_is_refused() {
         controller.hold_fence(false);
         if owed {
             let refused = asked.expect_err("a fence owed in the wait stops the ask");
-            assert!(refused.to_string().contains("fence"), "{refused}");
+            assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused:?}");
+            assert_eq!(refused.to_string(), FENCE_OWED, "{refused:?}");
         } else {
             asked.expect("the control passes");
         }
     }
+}
+
+/// What a refusal of a request under a fence this host owes says, whole.
+const FENCE_OWED: &str = "this host withdrew authority and the fence that withdrawal owes could \
+     not be raised yet, so nothing admitted under it is dispatched; run kr doctor to see what \
+     stopped it";
+
+/// What a refusal of a held method says when the local owner's lease is not live, whole.
+const LEASE_NOT_LIVE: &str = "this host is exclusively organisation-managed and its local owner's \
+     membership lease is not live; present one with `kr organisation present`";
+
+/// KR-REQ-17.54: the lease's bound that a sign-in's ask read can move to another lineage before the
+/// question is asked: the lease was ended and established again. The question does not decide it:
+/// the lease is read again and the question is asked with what the new reading found. Where the
+/// new lineage has ended at the new reading, the ask is refused, as a lease that is not live is.
+/// The control: where the new lineage is live, the ask passes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_ask_whose_bound_moves_to_a_lineage_that_ended_at_the_new_reading_is_refused() {
+    for ended in [false, true] {
+        let (_temp, controller, continuous, presenter, _writer, _reader) =
+            connected_under_a_lease_that_can_be_presented_again().await;
+        let lasting = controller.sign_in_lasting(Method::AccountSignIn);
+        let (arrived, go) = controller.pause_before_the_last_fence_read();
+        let asking = tokio::task::spawn_blocking(move || lasting());
+        // The lease was read live, and the question is about to be asked.
+        tokio::task::spawn_blocking(move || {
+            arrived.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await
+        .expect("the wait ends")
+        .expect("the ask reaches its question");
+        // A lease that holds other rights ends the run of the bound that was read and begins a new
+        // one. Where `ended`, that lease has run out by the time the ask reads it again.
+        presenter.present(&[kr_protocol::rights::ActionRight::FilesRead]);
+        if ended {
+            continuous.advance(std::time::Duration::from_secs(16 * 60));
+        }
+        go.send(()).expect("the ask goes on");
+        let asked = asking.await.expect("the ask ends");
+        if ended {
+            let refused = asked.expect_err("a lineage that ended at the new reading stops the ask");
+            assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused:?}");
+            assert_eq!(refused.to_string(), LEASE_NOT_LIVE, "{refused:?}");
+        } else {
+            asked.expect("the control passes with the new lineage");
+        }
+    }
+}
+
+/// KR-REQ-17.54: the guard that a sign-in's ask gives holds the host and the footing the question
+/// was asked with, the lease's bound among them, until it is let go: the ask is made through it and
+/// nothing it holds is let go of between the question and the write that follows. The footing is
+/// counted through the host's copies that it holds, and the host through its own count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_guard_of_a_sign_in_ask_holds_the_host_and_the_footing_it_asked_with() {
+    let (_temp, controller, _continuous, _writer, _reader) = connected_under_a_lease().await;
+    let lasting = controller.sign_in_lasting(Method::AccountSignIn);
+    let host_before = Arc::strong_count(&controller);
+    let copies_before = Arc::strong_count(&controller.copies);
+    let guard = tokio::task::spawn_blocking(move || {
+        let guard = lasting().expect("the ask passes");
+        (lasting, guard)
+    })
+    .await
+    .expect("the ask ends");
+    let (lasting, guard) = guard;
+    assert_eq!(
+        Arc::strong_count(&controller),
+        host_before + 1,
+        "the guard holds the host"
+    );
+    assert_eq!(
+        Arc::strong_count(&controller.copies),
+        copies_before + 1,
+        "the guard holds the footing the question was asked with"
+    );
+    drop(guard);
+    assert_eq!(Arc::strong_count(&controller), host_before);
+    assert_eq!(Arc::strong_count(&controller.copies), copies_before);
+    drop(lasting);
 }
