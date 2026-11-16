@@ -184,33 +184,34 @@ const AUTHORITY_ENDED_PAGE: &str = "This host's authority for this sign-in ended
      sign in, start again on the host.";
 
 /// What the browser shows when the same happened and the revocation of what the service issued
-/// reached neither the service nor the queue: the token is in the process's memory alone, and is
-/// sent again the next time the host uses the account.
+/// reached neither the service nor the queue: the token is in the process's memory alone, and no
+/// send of it was acknowledged. The page says what the host knows: it could not confirm the
+/// revocation, and what was issued ends by itself.
 const AUTHORITY_ENDED_REVOCATION_OWED_PAGE: &str = "This host's authority for this sign-in ended \
-     while the sign-in waited for you. Nothing was signed in. The host could not yet revoke what the \
-     account service issued. The host tries again the next time it uses the account, and what was \
-     issued ends by itself when it expires. To sign in, start again on the host.";
+     while the sign-in waited for you. Nothing was signed in. The host could not confirm that the \
+     account service revoked what it issued. What was issued ends by itself when it expires. To \
+     sign in, start again on the host.";
 
 /// What the browser shows when a call opened while the sign-in's code was exchanged and the
-/// revocation of what the service issued reached neither the service nor the queue: the sentences
-/// of the page of a call that is open, and of the owed revocation, as they stand there.
+/// revocation of what the service issued reached neither the service nor the queue: the sentence
+/// of the page of a call that is open, and the sentences of the owed revocation.
 const CALL_OPEN_REVOCATION_OWED_PAGE: &str = "A voice call is open on this host. End it, then sign \
-     in again. The host could not yet revoke what the account service issued. The host tries again \
-     the next time it uses the account, and what was issued ends by itself when it expires.";
+     in again. The host could not confirm that the account service revoked what it issued. What \
+     was issued ends by itself when it expires.";
 
 /// What the browser shows when the grant could not be kept and the revocation of what the service
 /// issued reached neither the service nor the queue: the sentence of the page of a grant that was
-/// not kept, and the sentences of the owed revocation, as they stand there.
+/// not kept, and the sentences of the owed revocation.
 const NOT_KEPT_REVOCATION_OWED_PAGE: &str = "This host could not keep the sign-in. The host could \
-     not yet revoke what the account service issued. The host tries again the next time it uses \
-     the account, and what was issued ends by itself when it expires.";
+     not confirm that the account service revoked what it issued. What was issued ends by itself \
+     when it expires.";
 
 /// What the browser shows when the service did not sign the host in and left a token whose
 /// revocation reached neither the service nor the queue: the sentence of the page of a refused
-/// sign-in, and the sentences of the owed revocation, as they stand there.
+/// sign-in, and the sentences of the owed revocation.
 const SERVICE_REFUSED_REVOCATION_OWED_PAGE: &str = "The account service did not sign this host in. \
-     The host could not yet revoke what the account service issued. The host tries again the next \
-     time it uses the account, and what was issued ends by itself when it expires.";
+     The host could not confirm that the account service revoked what it issued. What was issued \
+     ends by itself when it expires.";
 
 /// Whose token a failed revocation was of, in each place that ends a token it does not keep: the
 /// words of the line begin with them.
@@ -1973,22 +1974,24 @@ mod revocation_orders;
 mod tests {
     /// A sign-in whose authority ended is told so in the browser, and what is said of the
     /// revocation is what the keep did: it is sent or queued (the host revokes what was issued),
-    /// or it reached neither the service nor the queue (the host could not yet revoke it, and
-    /// tries again the next time it uses the account).
+    /// or it reached neither the service nor the queue (the host could not confirm that the
+    /// service revoked what it issued, and what was issued ends by itself when it expires). Each
+    /// page is asserted whole.
     #[test]
     fn a_sign_in_whose_authority_ended_says_what_became_of_the_revocation() {
-        let queued = super::Outcome::withheld(super::Commit::Withheld).page();
-        let owed = super::Outcome::withheld(super::Commit::WithheldOwing).page();
-        assert!(
-            queued.contains("authority for this sign-in ended"),
-            "{queued}"
+        assert_eq!(
+            super::Outcome::withheld(super::Commit::Withheld).page(),
+            "This host's authority for this sign-in ended while the sign-in waited for you. \
+             Nothing was signed in. The host revokes what the account service issued. To sign \
+             in, start again on the host."
         );
-        assert!(queued.contains("The host revokes what the account service issued."));
-        assert!(!queued.contains("could not yet revoke"), "{queued}");
-        assert!(owed.contains("authority for this sign-in ended"), "{owed}");
-        assert!(owed.contains("could not yet revoke what the account service issued"));
-        assert!(owed.contains("tries again the next time it uses the account"));
-        assert!(!owed.contains("The host revokes what"), "{owed}");
+        assert_eq!(
+            super::Outcome::withheld(super::Commit::WithheldOwing).page(),
+            "This host's authority for this sign-in ended while the sign-in waited for you. \
+             Nothing was signed in. The host could not confirm that the account service revoked \
+             what it issued. What was issued ends by itself when it expires. To sign in, start \
+             again on the host."
+        );
     }
 
     use std::sync::atomic::{AtomicUsize, Ordering};
