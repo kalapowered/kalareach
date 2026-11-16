@@ -10347,32 +10347,8 @@ impl WorkerService {
     ) -> Result<ParamsValue> {
         let actor_id = &caller.actor_id;
         let params: kr_protocol::receipt::ActionReadParams = parse(params)?;
-        // A receipt is read from the journal under the session. When the session is held for
-        // longer than a read waits, the journal is not reachable now, and the answer says so.
-        let Some(mut session) = self.runtime.session_within(crate::published::TAKE_BOUND) else {
-            return Err(WorkerError::JournalUnavailable {
-                detail: "the session did not answer in time, so no receipt could be read"
-                    .to_owned(),
-            });
-        };
-        // A worker serves the receipts of the one session it owns. A read that names a session
-        // names this one, as every other state recovery read does.
-        if let Some(named) = params.session_id {
-            Self::check_session(&session, named)?;
-        }
-        let journal = session
-            .journal_mut()
-            .ok_or_else(|| WorkerError::JournalUnavailable {
-                detail: "this session retains no receipts, so none can be read".to_owned(),
-            })?;
-        let receipt = journal
-            .read(actor_id.clone(), params.action_id)?
-            .ok_or_else(|| {
-                WorkerError::InvalidArgument(format!("no receipt for action {}", params.action_id))
-            })?;
+        let (receipt, retained) = self.receipt_within_its_bound(actor_id, &params)?;
         let revision = receipt.revision.get();
-        let retained = journal.read_result(actor_id, params.action_id)?;
-        drop(session);
         // The daemon decided this read under `session.view` over the routed session.
         let disclosure = caller.disclosure(true);
         let result = retained
@@ -10417,6 +10393,81 @@ impl WorkerService {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .show(actor_id, params.action_id, revision);
         Ok(encoded)
+    }
+
+    /// Reads a receipt and the result it kept from the journal, waiting for the session no longer
+    /// than [`crate::published::TAKE_BOUND`] and for the store no longer than
+    /// [`crate::published::STORE_BOUND`].
+    ///
+    /// A receipt is read from the journal under the session. The read is made by a thread of its
+    /// own, which takes the session and asks the store, so that the caller can stop waiting for a
+    /// store that does not answer. That thread keeps the session, and stands in the store's call,
+    /// for as long as the store takes to answer, which is what the caller itself did before it
+    /// had a bound. Once the caller is refused, a read of the session answers from the published
+    /// summary and a second receipt read is refused at its take, so no second thread stands in the
+    /// store. The refusal says which wait ran out.
+    fn receipt_within_its_bound(
+        &self,
+        actor_id: &ActorId,
+        params: &kr_protocol::receipt::ActionReadParams,
+    ) -> Result<(kr_protocol::receipt::Receipt, Option<Vec<u8>>)> {
+        let (took_sender, took) = std::sync::mpsc::channel::<bool>();
+        let (read_sender, read) = std::sync::mpsc::channel();
+        let runtime = Arc::clone(&self.runtime);
+        let (actor_id, action_id, named) = (actor_id.clone(), params.action_id, params.session_id);
+        std::thread::spawn(move || {
+            let Some(mut session) = runtime.session_within(crate::published::TAKE_BOUND) else {
+                let _ = took_sender.send(false);
+                return;
+            };
+            let _ = took_sender.send(true);
+            let outcome = (|| -> Result<(kr_protocol::receipt::Receipt, Option<Vec<u8>>)> {
+                // A worker serves the receipts of the one session it owns. A read that names a
+                // session names this one, as every other state recovery read does.
+                if let Some(named) = named {
+                    Self::check_session(&session, named)?;
+                }
+                let journal =
+                    session
+                        .journal_mut()
+                        .ok_or_else(|| WorkerError::JournalUnavailable {
+                            detail: "this session retains no receipts, so none can be read"
+                                .to_owned(),
+                        })?;
+                let receipt = journal.read(actor_id.clone(), action_id)?.ok_or_else(|| {
+                    WorkerError::InvalidArgument(format!("no receipt for action {action_id}"))
+                })?;
+                let retained = journal.read_result(&actor_id, action_id)?;
+                Ok((receipt, retained))
+            })();
+            drop(session);
+            let _ = read_sender.send(outcome);
+        });
+        match took.recv_timeout(crate::published::TAKE_BOUND) {
+            Ok(true) => {}
+            Ok(false) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(WorkerError::JournalUnavailable {
+                    detail: "the session did not answer in time, so no receipt could be read"
+                        .to_owned(),
+                });
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the receipt read ended before it took the session")
+            }
+        }
+        match read.recv_timeout(crate::published::STORE_BOUND) {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err(WorkerError::JournalUnavailable {
+                    detail:
+                        "the session's store did not answer in time, so no receipt could be read"
+                            .to_owned(),
+                })
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the receipt read ended before it answered")
+            }
+        }
     }
 
     /// Reads one question back to the source that created it.
