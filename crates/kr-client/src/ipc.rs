@@ -425,7 +425,15 @@ impl ControlTransport for IpcTransport {
             // mean a session that was closed while its reader was parked kept the socket, and the
             // worker's attachment with it, for as long as anything held the session.
             let Some(mut reader) = self.reader.lock().await.take() else {
-                return Err(ClientError::ConnectionEnded);
+                // No reader: either this side's close took it (it stores the flag before it takes
+                // a half, so a slot that the close emptied always shows the flag, however the
+                // close fell between the check above and this access), which is the clean end; or
+                // an earlier read that failed or was cancelled left none, and nothing closed.
+                return if self.has_closed() {
+                    Ok(None)
+                } else {
+                    Err(ClientError::ConnectionEnded)
+                };
             };
             // A local frame reader reports the end of the stream as a failure rather than as an
             // absent message, because every local exchange has a next frame until the peer goes
@@ -447,9 +455,9 @@ impl ControlTransport for IpcTransport {
                     *held = Some(reader);
                     Ok(Some(frame))
                 }
-                // A read that fails after this side closed the connection failed because of the
-                // close.
-                Err(_) if self.has_closed() => Ok(None),
+                // This side's close causes no read error: it takes only the halves that are idle and
+                // abandons a read that waits, so a read that returned an error failed for its own
+                // reason, and keeps it, a close that follows or not.
                 Err(error) => Err(ClientError::Ipc(error)),
             }
         })
@@ -900,6 +908,70 @@ mod tests {
         ));
         assert!(the_next_item(&mut events).await.is_none());
         drop(session);
+    }
+
+    /// The order that the flag check at the entry cannot show: the owner closes after the entry's
+    /// check and before the slot is read, and takes the reader (the close stores its flag first).
+    /// The slot is then found absent with the flag set: the clean end. The slot's lock is held here
+    /// to hold that order, with no wait.
+    #[tokio::test]
+    async fn a_slot_the_owners_close_emptied_is_the_clean_end() {
+        let (transport, _peer_reader, _peer_writer, _tree) = over_a_raw_connection().await;
+        let transport = std::sync::Arc::new(transport);
+        let mut slot = transport.reader.lock().await;
+        let reading = tokio::spawn({
+            let transport = std::sync::Arc::clone(&transport);
+            async move { transport.recv().await }
+        });
+        // The read passes its flag check and waits for the slot.
+        tokio::task::yield_now().await;
+        transport.close();
+        slot.take();
+        drop(slot);
+        let read = tokio::time::timeout(WITHIN, reading)
+            .await
+            .expect("the read ended")
+            .expect("the task");
+        assert!(matches!(read, Ok(None)), "{read:?}");
+    }
+
+    /// A slot that no close emptied (an earlier read failed or was cancelled and left no reader) is
+    /// a failure with its words, and stays one.
+    #[tokio::test]
+    async fn a_slot_that_no_close_emptied_is_a_failure() {
+        let (transport, _peer_reader, _peer_writer, _tree) = over_a_raw_connection().await;
+        transport.reader.lock().await.take();
+        let read = tokio::time::timeout(WITHIN, transport.recv())
+            .await
+            .expect("the read ended");
+        assert!(
+            matches!(read, Err(ClientError::ConnectionEnded)),
+            "{read:?}"
+        );
+    }
+
+    /// An error that the read returned stays a failure when the owner's flag lands after it: this
+    /// side's close causes no read error, so no flag turns an error into the clean end. The flag is
+    /// raised alone, as the first step of a close, which holds the order with no wait.
+    #[tokio::test]
+    async fn an_error_the_read_returned_is_kept_when_the_flag_lands_after_it() {
+        let (transport, peer_reader, peer_writer, _tree) = over_a_raw_connection().await;
+        let transport = std::sync::Arc::new(transport);
+        let reading = tokio::spawn({
+            let transport = std::sync::Arc::clone(&transport);
+            async move { transport.recv().await }
+        });
+        tokio::task::yield_now().await;
+        transport.closed.store(true, Ordering::Release);
+        drop((peer_reader, peer_writer));
+        let read = tokio::time::timeout(WITHIN, reading)
+            .await
+            .expect("the read ended")
+            .expect("the task");
+        assert!(
+            matches!(read, Err(ClientError::Ipc(kr_ipc::IpcError::PeerClosed))),
+            "{read:?}"
+        );
     }
 
     /// The owner's own close, with the reader parked in a read of the real link, is the clean end.
