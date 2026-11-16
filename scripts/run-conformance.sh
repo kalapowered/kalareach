@@ -85,6 +85,7 @@ case "$(uname -s)" in
         echo "run-conformance: on Windows, start the report from PowerShell, from a copy of its program:" >&2
         echo "  pnpm install --frozen-lockfile" >&2
         echo "  cargo build --locked -p kr-conformance --bin kr-conformance" >&2
+        echo '  $folder = $null' >&2
         echo '  $folder = Join-Path (Get-Item $env:TEMP).FullName "kr-conformance-start-$([guid]::NewGuid())"' >&2
         echo '  if (New-Item -ItemType Directory -Path $folder -ErrorAction Stop) {' >&2
         echo '      Copy-Item target\debug\kr-conformance.exe $folder -ErrorAction Stop' >&2
