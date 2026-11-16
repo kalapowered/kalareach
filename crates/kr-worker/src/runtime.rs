@@ -1609,8 +1609,8 @@ impl SessionRuntime {
     /// Locks the session for one operation, waiting for it no longer than `bound`.
     ///
     /// Returns `None` when something else still holds the session after `bound`, which is what a
-    /// call that waits for a disk does to it. The wait blocks its thread, so it is made where
-    /// [`off_the_executor`] is.
+    /// call that waits for a disk does to it. The wait blocks its thread, so it is made on a
+    /// thread that the executor can do without, as a read's is.
     ///
     /// # Panics
     ///
