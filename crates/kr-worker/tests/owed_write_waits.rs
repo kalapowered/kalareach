@@ -834,12 +834,10 @@ fn a_reader_in(form: &str) -> Vec<String> {
         }
         _ => HISTORY_TREE.to_owned(),
     };
-    let elsewhere = (form == "another file").then(|| {
-        (
-            "crates/kr-worker/src/history/more.rs",
-            "impl OutputHistory { pub fn raw(&self) -> u64 { 0 } }",
-        )
-    });
+    let elsewhere = (form == "another file").then_some((
+        "crates/kr-worker/src/history/more.rs",
+        "impl OutputHistory { pub fn raw(&self) -> u64 { 0 } }",
+    ));
     let mut files = vec![(HISTORY.to_owned(), tree)];
     files.extend(
         elsewhere
