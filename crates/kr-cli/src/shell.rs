@@ -686,6 +686,8 @@ mod tests {
     #[cfg(unix)]
     mod question_table;
 
+    mod question_guide;
+
     /// The roots a test works in: none is a store's, so nothing is registered.
     fn host_paths() -> HostPaths {
         HostPaths::new(std::env::temp_dir(), std::env::temp_dir()).expect("roots")
