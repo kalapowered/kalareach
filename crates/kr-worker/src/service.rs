@@ -4576,6 +4576,10 @@ impl WorkerService {
     ///   does not turn is taken as there.
     /// - There is no bound of time or of count beside the question: a peer that stays and never
     ///   answers keeps its connection for as long as the hold lasts.
+    /// - A stop of the worker still waits for a hold. Every holder of the boundary runs on a thread
+    ///   of the runtime's own, and the runtime ends only when those threads do. Only presentations
+    ///   leave that wait: each is a task that the runtime drops at once, and holds no thread while
+    ///   it waits.
     async fn present_generation(
         &self,
         state: &mut ConnectionState,
