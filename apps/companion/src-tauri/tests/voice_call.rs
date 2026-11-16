@@ -3654,9 +3654,11 @@ async fn an_owner_that_fails_while_asking_what_became_of_a_start_leaves_the_star
         .await;
 
     assert!(refused.is_err(), "the owner failed before it could answer");
+    // The supervisor shows the end, and then records what it owes: the state is read once both
+    // are in it.
     let ended = scene
-        .state_where("the owner's failure", |state| {
-            state["ended"]["cause"] == "owner_failed"
+        .state_where("the owner's failure with the start owed", |state| {
+            state["ended"]["cause"] == "owner_failed" && state["owed"][0]["kind"] == "start_unknown"
         })
         .await;
     assert!(scene.platform.count("stop") >= 1, "the media is stopped");
@@ -4128,9 +4130,11 @@ async fn a_host_that_holds_no_such_call_settles_what_was_owed_to_it() {
     .await;
     // The call the host revoked ended with its revocation. The phone's own end then asks the host
     // about a voice session it no longer holds, and the host says it holds none: that owes nothing.
+    // The end is shown before the device has recorded what it owes, so the absence of an entry
+    // is read once the device holds nothing.
     let ended = scene
         .state_where("the call the host revoked, ended", |state| {
-            state["running"] == false && state["ended"].is_object()
+            state["running"] == false && state["ended"].is_object() && state["setting_up"] == false
         })
         .await;
     assert_eq!(ended["ended"]["host"]["kind"], "not_held", "{ended}");
