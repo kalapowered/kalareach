@@ -51,13 +51,24 @@ impl PublishedSummary {
     /// # Panics
     ///
     /// Panics when no summary was ever published, which a session does as it is made.
-    #[must_use]
-    pub fn latest(&self) -> SessionSummary {
+    fn copy(&self) -> SessionSummary {
         self.latest
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
             .expect("a session publishes its summary as it is made")
+    }
+
+    /// Returns the summary as it was last published, for this host's own tests. A read answers
+    /// through [`Self::answer`] and never gives the copy's own state.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no summary was ever published, which a session does as it is made.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn latest(&self) -> SessionSummary {
+        self.copy()
     }
 
     /// Returns the answer to a read that could not take the session: the published summary with
@@ -71,7 +82,7 @@ impl PublishedSummary {
     /// the domain's at one moment.
     #[must_use]
     pub fn answer(&self, input: &InputShared) -> Held {
-        let mut summary = self.latest();
+        let mut summary = self.copy();
         let domain = input.lock();
         summary.state = domain.state();
         let outstanding_launches = summary
