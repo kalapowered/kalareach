@@ -453,16 +453,30 @@ async fn stop(
         Reached::Refused(error) if startup::nothing_listening(&error) => {
             Ok(vacant(environment, &none, json, &earlier))
         }
-        Reached::Refused(error) => Ok(failed(
-            CliError::HostUnavailable(shown!(
-                "the control daemon for environment {} could not be reached: {}. No stop was \
-                 requested.",
+        Reached::Refused(error) => {
+            let operations = Real::of(host, &environment.paths, None);
+            let before = greeting_failed(
+                &operations,
+                &error,
+                lock_holder(&environment.paths).as_ref(),
                 id,
-                Shown::ipc(&error)
-            )),
-            &none,
-            json,
-        )),
+                tokio::time::Instant::now() + END_BOUND,
+            )
+            .await;
+            let ended = ended_by(before, environment, &none, json, &earlier);
+            Ok(ended.unwrap_or_else(|| {
+                failed(
+                    CliError::HostUnavailable(shown!(
+                        "the control daemon for environment {} could not be reached: {}. No stop \
+                         was requested.",
+                        id,
+                        Shown::ipc(&error)
+                    )),
+                    &none,
+                    json,
+                )
+            }))
+        }
     }
 }
 
@@ -847,6 +861,20 @@ async fn stop_the_daemon(
     .await
     {
         Ok(Ok(info)) => info,
+        Ok(Err(CliError::Ipc(error))) => {
+            let operations = Real::of(host, &environment.paths, None);
+            let before = host_info_failed(
+                &operations,
+                client,
+                &error,
+                lock_holder(&environment.paths).as_ref(),
+                id,
+                tokio::time::Instant::now() + END_BOUND,
+            )
+            .await;
+            let ended = ended_by(before, environment, &none, json, earlier);
+            return ended.unwrap_or_else(|| failed(CliError::Ipc(error), &none, json));
+        }
         Ok(Err(error)) => return failed(error, &none, json),
         Err(_) => return silent(environment, &none, json, startup::ANSWER_BOUND),
     };
@@ -894,7 +922,7 @@ async fn stop_the_daemon(
             let deadline = tokio::time::Instant::now() + END_BOUND;
             progress.remove_marker();
             let named = holder.as_ref().map(|holder| holder.pid.get());
-            let operations = Real::of(host, &environment.paths, info.generation);
+            let operations = Real::of(host, &environment.paths, Some(info.generation));
             if let Some(ended) =
                 ended_before_the_request(&operations, client, holder.as_ref(), closed, deadline)
                     .await
@@ -948,7 +976,7 @@ async fn stop_the_daemon(
     let named = old.map(|old| old.pid.get());
     // For `--json`: the process the answer gave, and otherwise the one the lock file named.
     let pid = pid.or_else(|| holder.as_ref().map(|holder| holder.pid.get()));
-    let operations = Real::of(host, &environment.paths, info.generation);
+    let operations = Real::of(host, &environment.paths, Some(info.generation));
     let ended = wait_for_the_end(&operations, old, END_BOUND).await;
     let result = |knows| Facts {
         knows,
@@ -1045,6 +1073,69 @@ async fn ended_before_the_request(
     match wait_for_the_end(operations, old, left).await {
         End::NotEnded(_) => None,
         ended => Some(ended),
+    }
+}
+
+/// How the failure of the command's connection to the daemon came out, where it failed before the
+/// command could make its request.
+#[expect(dead_code)]
+enum Before {
+    /// The daemon had ended: what the command says, and the process that it names.
+    Ended { said: Shown, pid: Option<u64> },
+    /// The daemon closed the connection and was not shown to have ended within the bound.
+    Silent,
+    /// The connection failed some other way, or the daemon still answers: the failure keeps its
+    /// own words.
+    Stays,
+}
+
+/// The command's greeting of the daemon failed with `error`: what the failure came to.
+async fn greeting_failed(
+    _operations: &impl Operations,
+    _error: &kr_ipc::IpcError,
+    _holder: Option<&ProcessStartIdentity>,
+    _id: EnvironmentId,
+    _deadline: tokio::time::Instant,
+) -> Before {
+    Before::Stays
+}
+
+/// The command's read of `host.info` failed with `error`: what the failure came to. The command
+/// owns `connection` and lets it go.
+async fn host_info_failed(
+    _operations: &impl Operations,
+    connection: impl Sized,
+    _error: &kr_ipc::IpcError,
+    _holder: Option<&ProcessStartIdentity>,
+    _id: EnvironmentId,
+    _deadline: tokio::time::Instant,
+) -> Before {
+    drop(connection);
+    Before::Stays
+}
+
+/// Ends the command by what a failed connection came to: with the daemon's end where it had
+/// ended, and as for a daemon that does not answer where it closed the connection and was not
+/// shown to have ended. It gives none where the failure keeps its own words.
+fn ended_by(
+    before: Before,
+    environment: &KnownEnvironment,
+    none: &Facts,
+    json: bool,
+    earlier: &Earlier,
+) -> Option<Completion> {
+    match before {
+        Before::Ended { said, pid } => {
+            let facts = Facts {
+                knows: Knows::Ended,
+                pid,
+                unsettled: None,
+                records: none.records.clone(),
+            };
+            Some(done(&said, &facts, json, earlier))
+        }
+        Before::Silent => Some(silent(environment, none, json, END_BOUND)),
+        Before::Stays => None,
     }
 }
 
@@ -1152,24 +1243,32 @@ async fn refused(
         startup::ANSWER_BOUND,
         client.request(Method::BackupStatus, &BackupStatusParams {}),
     )
-    .await;
+    .await
+    .ok()
+    .map(|read| read.map(|answer| answer.map(|_| ())));
+    failed(after_the_probe(id, error, probe), none, json)
+}
+
+/// What the probe's answer makes of a refusal that may be the daemon's own. `None` is a probe
+/// that was not answered in its bound.
+fn after_the_probe(
+    id: EnvironmentId,
+    refusal: ProtocolError,
+    probe: Option<std::result::Result<std::result::Result<(), ProtocolError>, kr_ipc::IpcError>>,
+) -> CliError {
     match probe {
-        Ok(Ok(Ok(_))) => failed(
-            CliError::Unfinished {
-                code: ErrorCode::EnvironmentUnavailable,
-                message: shown!(
-                    "The control daemon of environment {} is of another build and takes no stop \
-                     request. Nothing was stopped. kr host update or kr host rollback switches \
-                     this host to another release and replaces this daemon. Each checks the \
-                     stores for that release before it switches, and starts this daemon again if \
-                     it cannot switch.",
-                    id
-                ),
-            },
-            none,
-            json,
-        ),
-        Ok(Ok(Err(probe))) if probe.code == ErrorCode::PermissionDenied => failed(
+        Some(Ok(Ok(()))) => CliError::Unfinished {
+            code: ErrorCode::EnvironmentUnavailable,
+            message: shown!(
+                "The control daemon of environment {} is of another build and takes no stop \
+                 request. Nothing was stopped. kr host update or kr host rollback switches this \
+                 host to another release and replaces this daemon. Each checks the stores for \
+                 that release before it switches, and starts this daemon again if it cannot \
+                 switch.",
+                id
+            ),
+        },
+        Some(Ok(Err(probe))) if probe.code == ErrorCode::PermissionDenied => {
             CliError::refused_in_its_own_words(
                 ErrorCode::PermissionDenied,
                 shown!(
@@ -1178,13 +1277,11 @@ async fn refused(
                     id,
                     Shown::protocol(&probe)
                 ),
-            ),
-            none,
-            json,
-        ),
-        Ok(Ok(Err(other))) => failed(CliError::Refused(other), none, json),
-        Ok(Err(error)) => failed(CliError::Ipc(error), none, json),
-        Err(_) => failed(CliError::Refused(error), none, json),
+            )
+        }
+        Some(Ok(Err(other))) => CliError::Refused(other),
+        Some(Err(error)) => CliError::Ipc(error),
+        None => CliError::Refused(refusal),
     }
 }
 
@@ -1403,7 +1500,7 @@ enum Endpoint {
 /// by `within` and by one second, and treats a daemon that does not answer as unclear.
 async fn endpoint_look(
     environment: &EnvironmentPaths,
-    generation: ControllerGeneration,
+    generation: Option<ControllerGeneration>,
     within: Duration,
 ) -> Endpoint {
     let Ok(endpoint) = environment.controller_endpoint() else {
@@ -1418,7 +1515,9 @@ async fn endpoint_look(
                 Listed::Other(_) => Endpoint::Another,
                 Listed::Ours(mut client) => match client.request(Method::HostInfo, &()).await {
                     Ok(Ok(value)) => match value.to_typed::<HostInfoResult>() {
-                        Ok(now) if now.generation != generation => Endpoint::Another,
+                        Ok(now) if generation.is_some_and(|asked| now.generation != asked) => {
+                            Endpoint::Another
+                        }
                         Ok(_) => Endpoint::Same,
                         Err(_) => Endpoint::Unclear,
                     },
@@ -1500,14 +1599,17 @@ trait Operations {
 struct Real<'a> {
     installation: Installation,
     environment: &'a EnvironmentPaths,
-    generation: ControllerGeneration,
+    /// The generation of the daemon that was asked, where the command has read it: a command
+    /// whose connection failed before `host.info` was read does not know it, and a daemon that
+    /// answers then cannot be told from a successor by its generation.
+    generation: Option<ControllerGeneration>,
 }
 
 impl<'a> Real<'a> {
     fn of(
         host: &HostPaths,
         environment: &'a EnvironmentPaths,
-        generation: ControllerGeneration,
+        generation: Option<ControllerGeneration>,
     ) -> Self {
         Self {
             installation: Installation::of(host, environment),
@@ -1590,7 +1692,7 @@ mod tests {
         let waited = tokio::time::timeout(
             Duration::from_secs(60),
             wait_for_the_end(
-                &Real::of(&host, &environment, generation),
+                &Real::of(&host, &environment, Some(generation)),
                 Some(&own),
                 Duration::from_millis(300),
             ),
@@ -1604,7 +1706,7 @@ mod tests {
         drop(held);
         let ended = identity::ended_process_identity(std::process::id());
         let waited = wait_for_the_end(
-            &Real::of(&host, &environment, generation),
+            &Real::of(&host, &environment, Some(generation)),
             Some(&ended),
             Duration::from_secs(60),
         )
@@ -1640,7 +1742,7 @@ mod tests {
         let waited = tokio::time::timeout(
             Duration::from_secs(60),
             wait_for_the_end(
-                &Real::of(&host, &environment, generation),
+                &Real::of(&host, &environment, Some(generation)),
                 Some(&ended),
                 Duration::from_secs(30),
             ),
@@ -1656,7 +1758,7 @@ mod tests {
         let held = SingletonLock::hold(&environment.singleton_lock(), environment.environment_id())
             .expect("takes the lock again");
         let waited = wait_for_the_end(
-            &Real::of(&host, &environment, generation),
+            &Real::of(&host, &environment, Some(generation)),
             Some(&ended),
             Duration::from_millis(300),
         )
@@ -1679,7 +1781,7 @@ mod tests {
         let endpoint = environment.controller_endpoint().expect("an endpoint");
         let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
         let waited = wait_for_the_end(
-            &Real::of(&host, &environment, generation),
+            &Real::of(&host, &environment, Some(generation)),
             None,
             Duration::from_millis(300),
         )
@@ -1693,7 +1795,7 @@ mod tests {
         let held = SingletonLock::hold(&environment.singleton_lock(), environment.environment_id())
             .expect("takes the lock");
         let waited = wait_for_the_end(
-            &Real::of(&host, &environment, generation),
+            &Real::of(&host, &environment, Some(generation)),
             None,
             Duration::from_millis(300),
         )
@@ -1705,7 +1807,7 @@ mod tests {
         drop(held);
 
         let waited = wait_for_the_end(
-            &Real::of(&host, &environment, generation),
+            &Real::of(&host, &environment, Some(generation)),
             None,
             Duration::from_secs(30),
         )
