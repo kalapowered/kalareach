@@ -1080,10 +1080,18 @@ async fn a_read_of_a_receipt_while_the_session_is_held_is_answered_within_its_bo
         answered <= READ_BOUND,
         "the receipt read was answered after {answered:?}, past {READ_BOUND:?}"
     );
+    let refusal = held.expect_err("a receipt that cannot be read now is refused");
     assert_eq!(
-        held.map(|_| ()).map_err(|error| error.code),
-        Err(kr_protocol::error::ErrorCode::StorageUnavailable),
+        refusal.code,
+        kr_protocol::error::ErrorCode::StorageUnavailable,
         "a receipt that cannot be read now is said to be unreachable"
+    );
+    assert!(
+        refusal
+            .message
+            .contains("The session did not answer in time, so the receipt was not read."),
+        "a take that missed says that the session did not answer: {}",
+        refusal.message
     );
     // The stall let go, the same read gives the receipt again.
     let began = Instant::now();
@@ -1140,10 +1148,18 @@ async fn a_read_of_a_receipt_that_the_store_does_not_answer_is_answered_within_i
         answered <= READ_BOUND,
         "the receipt read was answered after {answered:?}, past {READ_BOUND:?}"
     );
+    let refusal = stalled.expect_err("a receipt that the store did not answer is refused");
     assert_eq!(
-        stalled.map(|_| ()).map_err(|error| error.code),
-        Err(kr_protocol::error::ErrorCode::StorageUnavailable),
+        refusal.code,
+        kr_protocol::error::ErrorCode::StorageUnavailable,
         "a receipt that the store did not answer is said to be unreachable"
+    );
+    assert!(
+        refusal
+            .message
+            .contains("The session's store did not answer in time, so the receipt was not read."),
+        "a read that ran past its bound says that the store did not answer: {}",
+        refusal.message
     );
     // What the stalled read still holds: the session, until the store answers.
     let (answered, held) =
