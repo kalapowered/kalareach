@@ -15,6 +15,7 @@ use kr_protocol::ids::RequestId;
 use kr_protocol::method::Method;
 
 use super::{Origin, Settled, may_have_taken_effect, names_a_reused_identifier};
+use crate::attention::LeaseAsked;
 use crate::authority::AdmissionLapse;
 use crate::error::ControllerError;
 use crate::grants::policy::HeldBound;
@@ -134,15 +135,26 @@ impl WrittenUnder {
     }
 
     /// The question, for a lease whose reading found `bound`: no lock is taken, nothing is awaited
-    /// and nothing is written ([`Footing::ask`]).
+    /// and nothing is written ([`Footing::ask`]). What it was asked with is returned, and the
+    /// writer lets it go after the transport's write: the bound's last reference can free memory.
     ///
     /// # Errors
     ///
     /// Returns the member that refuses, and a bound that moved as itself.
-    pub(crate) fn asked_holding(&self, bound: Option<HeldBound>) -> Result<(), LeasedLapse> {
+    pub(crate) fn asked_holding(
+        &self,
+        bound: Option<HeldBound>,
+    ) -> Result<LeaseAsked, LeasedLapse> {
         match bound {
-            Some(bound) => self.footing.clone().holding(bound).ask(self.ask),
-            None => Ok(self.footing.ask(self.ask)?),
+            Some(bound) => {
+                let leased = self.footing.clone().holding(bound);
+                leased.ask(self.ask)?;
+                Ok(LeaseAsked::with(leased))
+            }
+            None => {
+                self.footing.ask(self.ask)?;
+                Ok(LeaseAsked::default())
+            }
         }
     }
 
