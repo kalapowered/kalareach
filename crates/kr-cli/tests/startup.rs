@@ -5651,13 +5651,15 @@ enum OnStop {
     /// command cannot make its request, and the daemon has ended.
     CloseAfterTheLookAndEnd,
     /// Answers the first `host.info` and closes the connection with nothing else sent, so that the
-    /// command finds it closed; answers the looks that follow for one second, as a daemon that is
-    /// going may, and then stops listening.
-    CloseAndEndAfterASecond,
+    /// command finds it closed; answers the first two looks that follow on connections of their
+    /// own, as a daemon that is going may, and then stops listening. It has ended only once two
+    /// looks have followed its close, whatever the time between the events.
+    CloseAndEndAfterTwoLooks,
 }
 
-/// How long `OnStop::CloseAndEndAfterASecond` goes on answering after it has closed a connection.
-const LINGER: Duration = Duration::from_secs(1);
+/// How many `host.info` that follow its close `OnStop::CloseAndEndAfterTwoLooks` answers before it
+/// stops listening.
+const LOOKS_BEFORE_THE_END: u32 = 2;
 
 /// A daemon of this test's own that answers `host.info` and the probe the level documents, and
 /// does with a stop what the test says. It holds no lock and runs no session: it is what a person's
@@ -5666,8 +5668,8 @@ struct TestDaemon {
     received: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     release: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// When the daemon left its accept loop, so that it listens no more: taken before the listener
-    /// is let go, so that whatever sees the endpoint vacant sees it after this instant.
+    /// Set when the daemon left its accept loop, so that it listens no more: taken before the
+    /// listener is let go, so that whatever saw the endpoint vacant finds it set.
     stopped_listening: std::sync::Arc<std::sync::Mutex<Option<Instant>>>,
     thread: Option<std::thread::JoinHandle<()>>,
     socket: PathBuf,
@@ -5734,12 +5736,11 @@ impl TestDaemon {
         let socket = PathBuf::from(endpoint.as_text());
         let thread = std::thread::spawn(move || {
             runtime.block_on(async move {
-                // Where the daemon stops answering, after it has closed a connection and lingered.
-                let mut lingers_until: Option<Instant> = None;
+                // How many `host.info` the daemon has answered since it closed a connection, where it
+                // has closed one.
+                let mut looks_since_the_close: Option<u32> = None;
                 loop {
-                    if over.load(std::sync::atomic::Ordering::SeqCst)
-                        || lingers_until.is_some_and(|until| Instant::now() >= until)
-                    {
+                    if over.load(std::sync::atomic::Ordering::SeqCst) {
                         *stopped.lock().expect("the instant") = Some(Instant::now());
                         break;
                     }
@@ -5804,9 +5805,17 @@ impl TestDaemon {
                                     && match on_stop {
                                         OnStop::CloseAfterTheLook
                                         | OnStop::CloseAfterTheLookAndEnd => true,
-                                        OnStop::CloseAndEndAfterASecond => lingers_until.is_none(),
+                                        OnStop::CloseAndEndAfterTwoLooks => {
+                                            looks_since_the_close.is_none()
+                                        }
                                         _ => false,
                                     };
+                                if let Some(looks) = looks_since_the_close.as_mut()
+                                    && request.method.method() == Some(Method::HostInfo)
+                                {
+                                    *looks += 1;
+                                    then_end = *looks >= LOOKS_BEFORE_THE_END;
+                                }
                                 let outcome = match request.method.method() {
                                     Some(Method::HostInfo) => Outcome::Ok(
                                         ParamsValue::from_typed(&info).expect("encodes"),
@@ -5840,7 +5849,7 @@ impl TestDaemon {
                                     | OnStop::HoldTheLook
                                     | OnStop::CloseAfterTheLook
                                     | OnStop::CloseAfterTheLookAndEnd
-                                    | OnStop::CloseAndEndAfterASecond
+                                    | OnStop::CloseAndEndAfterTwoLooks
                                     | OnStop::RefuseAndHoldTheProbe => {
                                         ControlFrame::Response(Response {
                                             request_id: mutation.request_id,
@@ -5884,7 +5893,7 @@ impl TestDaemon {
                             _ => continue,
                         };
                         let written =
-                            if then_close && !matches!(on_stop, OnStop::CloseAndEndAfterASecond) {
+                            if then_close && !matches!(on_stop, OnStop::CloseAndEndAfterTwoLooks) {
                                 // The answer and a frame that cannot be read, in ONE write: the
                                 // command meets the unreadable frame whenever it next reads, whatever
                                 // the order of what follows this write.
@@ -5908,8 +5917,8 @@ impl TestDaemon {
                             if matches!(on_stop, OnStop::CloseAfterTheLookAndEnd) {
                                 over.store(true, std::sync::atomic::Ordering::SeqCst);
                             }
-                            if matches!(on_stop, OnStop::CloseAndEndAfterASecond) {
-                                lingers_until = Some(Instant::now() + LINGER);
+                            if matches!(on_stop, OnStop::CloseAndEndAfterTwoLooks) {
+                                looks_since_the_close = Some(0);
                             }
                             break;
                         }
@@ -6738,49 +6747,58 @@ fn the_end_of_a_daemon_that_closed_before_the_request_says_that_nothing_was_sent
     daemon.end();
 }
 
-/// KR-REQ-07.12 (a request that could not be made after a closed connection): a daemon that
-/// answers the look, closes the connection and goes on answering for a second before it stops
-/// listening is waited for to its end, with no look at the endpoint that would find it still
-/// answering and give up at once. The result is the end's: exit 0 and the text of the end of a
-/// request that was never made. Two events show what the case holds. The first is the sentence,
-/// which is the unmade request's own: it names why the request could not be made and says that the
-/// command sent nothing, and the line that says a request was asked, which a command that composed
-/// its request before it saw the close prints on the error stream, is not there. The second is the
-/// daemon's own record that it stopped listening before the command ended: a command that took a
-/// daemon that still answers for one that had ended would end while the daemon listened.
+/// KR-REQ-07.12 (a daemon that closed the connection and goes): a daemon that answers the look,
+/// closes the connection and goes on answering until two looks have followed its close is waited
+/// for to its end, and the command ends 0 with a sentence of its own. This case does not choose
+/// the path to that end, because a process cannot: where the close has reached the command when it
+/// composes its request, it makes no request and says so; where the command composed first it sent
+/// its request into the closed connection and waits for the daemon as one that may have taken it.
+/// So the case takes the sentence that its run came to, from the sentence itself, and holds what is
+/// true of the path it names: the unmade request's own sentence and no line that says a request
+/// was asked, or the told daemon's end; no request reached the daemon; no record stands; and the
+/// daemon had answered both looks and stopped listening, which a command that took a daemon that
+/// still answers for one that had ended could not have waited for, since it looks once. It can
+/// miss a fault of the closed-connection branch on a run that composed first, which the unit cases
+/// of the stop's decision hold.
 #[test]
-fn a_request_that_could_not_be_made_after_a_closed_connection_waits_for_the_daemons_end() {
+fn a_daemon_that_closed_the_connection_and_goes_is_waited_for_to_its_end_whichever_path_is_taken() {
     let host = Standalone::create();
     let mut daemon = TestDaemon::serve(
         &host,
         "kr-controller/9.9.9",
-        OnStop::CloseAndEndAfterASecond,
+        OnStop::CloseAndEndAfterTwoLooks,
         true,
     );
     let output = start(host.kr(&["host", "stop"])).finish("kr host stop");
-    let ended_at = Instant::now();
     let out = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "{out}");
-    assert!(
-        out.starts_with("The control daemon for environment "),
-        "{out}"
-    );
-    assert!(
-        out.contains(" ended, and this command could not make its request for it: "),
-        "{out}"
-    );
-    assert!(
-        out.trim_end().ends_with("This command sent nothing."),
-        "{out}"
-    );
     let said = String::from_utf8_lossy(&output.stderr);
-    assert!(!said.contains("Asked the control daemon"), "{said}");
-    let stopped_at = daemon
-        .stopped_listening_at()
-        .unwrap_or_else(|| panic!("the command ended while the daemon still listened: {out}"));
+    assert!(output.status.success(), "{out} {said}");
+    if out.starts_with("The control daemon for environment ") {
+        // The unmade request.
+        assert!(
+            out.contains(" ended, and this command could not make its request for it: "),
+            "{out}"
+        );
+        assert!(
+            out.trim_end().ends_with("This command sent nothing."),
+            "{out}"
+        );
+        assert!(!said.contains("Asked the control daemon"), "{said}");
+    } else {
+        // The request that was made into the closed connection.
+        assert!(
+            out.starts_with("Stopped the control daemon for environment "),
+            "neither path's sentence: {out}"
+        );
+    }
     assert!(
-        ended_at >= stopped_at,
-        "the command ended before the daemon stopped listening: {out}"
+        !daemon.received().iter().any(|method| method == "host.stop"),
+        "no request to stop reached the daemon: {:?}",
+        daemon.received()
+    );
+    assert!(
+        daemon.stopped_listening_at().is_some(),
+        "the command ended before the daemon had answered two looks after its close: {out}"
     );
     assert!(attempts(&host).is_empty(), "no record stands");
     daemon.end();
