@@ -876,7 +876,9 @@ fn gate(
 async fn a_frame_gate_reads_one_snapshot_and_never_waits_for_its_writer() {
     let temp = kr_ipc::testing::TempHost::create();
     let (continuous, wall, clocks) = super::super::tests::manual_clocks();
-    let controller = super::super::tests::daemon_on(&temp, clocks).await;
+    // The daemon's own first passes are over before the case moves the continuous clock: one that
+    // came after would raise the host's floor past the renewal's end.
+    let controller = super::super::tests::daemon_on_clocks_to_move(&temp, clocks).await;
     let now = wall.load(Ordering::SeqCst);
     let (organisation, grant, _connection, asked) = member(&controller, 0x41, now);
     let under = asked.decision.bounds();
@@ -3600,7 +3602,11 @@ async fn an_answer_whose_decision_is_lost_before_every_write_is_told_by_what_it_
     ] {
         let temp = kr_ipc::testing::TempHost::create();
         let (continuous, wall, clocks) = super::super::tests::manual_clocks();
-        let controller = super::super::tests::daemon_on(&temp, clocks).await;
+        // The daemon's own first passes read both clocks and raise the host's floor to the moment
+        // the continuous clock implies. They are over before the case moves that clock: a pass
+        // that came after a lapse would put the floor past the renewed lease's end, and the lease
+        // would be refused as ended.
+        let controller = super::super::tests::daemon_on_clocks_to_move(&temp, clocks).await;
         let now = wall.load(Ordering::SeqCst);
         let (organisation, grant, _connection, _asked) = member(&controller, 0x47, now);
         let organisation = Arc::new(organisation);
@@ -3610,9 +3616,19 @@ async fn an_answer_whose_decision_is_lost_before_every_write_is_told_by_what_it_
             recording: Arc::clone(&recording),
             tried: std::sync::atomic::AtomicUsize::new(0),
             attempts: super::RELAY_DECISIONS,
-            lapse: Hook(Box::new(move || {
-                // Past the end of the lease the frame was last decided under.
-                continuous.advance(Duration::from_secs(15 * 60 + 30));
+            lapse: Hook(Box::new({
+                let (controller, wall) = (Arc::clone(&controller), Arc::clone(&wall));
+                move || {
+                    // Past the end of the lease the frame was last decided under. Time passes on
+                    // both clocks, and no reader of them sees one moved without the other.
+                    controller
+                        .lifetimes()
+                        .clock_trust()
+                        .while_no_reader_reads(|| {
+                            continuous.advance(Duration::from_secs(15 * 60 + 30));
+                            wall.fetch_add(15 * 60_000 + 30_000, Ordering::SeqCst);
+                        });
+                }
             })),
             renew: Hook(Box::new({
                 let (controller, grant) = (Arc::clone(&controller), grant.clone());
@@ -3622,7 +3638,7 @@ async fn an_answer_whose_decision_is_lost_before_every_write_is_told_by_what_it_
                         &controller,
                         &organisation,
                         &grant,
-                        now + renewed * 60_000,
+                        wall.load(Ordering::SeqCst) + renewed * 60_000,
                         &[ActionRight::SessionView],
                     )
                     .expect("the renewal is written down")
