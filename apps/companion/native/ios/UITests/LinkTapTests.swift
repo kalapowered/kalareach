@@ -1068,8 +1068,11 @@ final class LinkTapTests: HarnessTestCase {
         summarizeClickDelays(named)
     }
 
-    /// Two links on lines one above the other: a sweep of points between their lines, then a walk in quarter points across the
-    /// place where the click's link changes. At every tap the light and the opening are the same link (`tap` holds it).
+    /// Two links on lines one above the other: a sweep of points between their lines, a halving search of the place where the click's
+    /// link changes, then a walk in quarter points away from it on both sides. At every tap the light and the opening are the same
+    /// link (`tap` holds it). The walk goes on until two steps past the band agree, and the band is measured in the simulator's touch
+    /// rows (a third of a point), the grid that every touch lands on: a width counted from requested steps would claim more than the
+    /// rows show.
     private func walkBetweenStackedLinks(named: String) {
         var upper = scroll(to: "upper", attempts: 40)
         var shift = offset(of: upper)
@@ -1095,7 +1098,7 @@ final class LinkTapTests: HarnessTestCase {
         say("LINKLOOK \(named): stacked links: the upper link's last line \(top), the lower link's first line \(bottom), columns \(columns)")
         var taps = 0
         var other = 0
-        var owners: [(y: CGFloat, name: String?)] = []
+        var owners: [(y: CGFloat, name: String)] = []
         let rows = 9
         for row in 0..<rows {
             let y = top.midY + (bottom.midY - top.midY) * CGFloat(row) / CGFloat(rows - 1)
@@ -1105,41 +1108,60 @@ final class LinkTapTests: HarnessTestCase {
                 let verdict = judge(result, among: all, what: what)
                 taps += 1
                 if verdict.other { other += 1 }
-                if x == middle { owners.append((y, verdict.opens)) }
+                if x == middle, let opens = verdict.opens { owners.append((y, opens)) }
             }
         }
         say("LINKLOOK \(named): stacked links sweep: \(taps) taps, \(other) at which the click named another link than the nearest words")
         // The border: where the middle column's opened link first changes from one link to the next, found to within a fraction
-        // of a point by halving the step that holds the change; or the middle of the gap between the two links' lines.
-        var border = (top.maxY + bottom.minY) / 2
-        for (before, after) in zip(owners, owners.dropFirst()) where before.name != nil && after.name != nil && before.name != after.name {
-            var low = before.y
-            var high = after.y
-            for halving in 0..<5 {
-                let y = (low + high) / 2
-                let what = "\(named): stacked links, halving \(halving + 1) of 5 between \(String(format: "%.2f", Double(low))) and \(String(format: "%.2f", Double(high)))"
-                let result = tap(what, at: CGPoint(x: middle, y: y), shift: shift, within: 4)
-                if judge(result, among: all, what: what).opens == before.name { low = y } else { high = y }
-            }
-            border = (low + high) / 2
-            break
+        // of a point by halving the step that holds the change. A sweep that shows no change fails: there is no border to walk across.
+        guard let change = LinkTapRules.firstChange(owners) else {
+            XCTFail("\(named): the sweep of the middle column shows no change from one opened link to the next: \(owners.map { "\(String(format: "%.2f", Double($0.y))) \($0.name)" })")
+            return
         }
+        var low = change.low
+        var high = change.high
+        for halving in 0..<5 {
+            let y = (low + high) / 2
+            let what = "\(named): stacked links, halving \(halving + 1) of 5 between \(String(format: "%.2f", Double(low))) and \(String(format: "%.2f", Double(high)))"
+            let result = tap(what, at: CGPoint(x: middle, y: y), shift: shift, within: 4)
+            if judge(result, among: all, what: what).opens == change.before { low = y } else { high = y }
+        }
+        let border = (low + high) / 2
+        // The walk: quarter points away from the border, down toward the lower link and then up toward the upper link, each side until two
+        // steps on two touch rows past the band have the pointer-down and the click on the link at that end. A side that does not get there
+        // in the most steps fails; so does a band that is not narrower than two touch rows.
         var walk: [String] = []
         var walkOther = 0
-        var band: [CGFloat] = []
-        for step in -4...4 {
-            let y = border + CGFloat(step) * 0.25
-            let what = "\(named): stacked links, walk across the border, \(String(format: "%+.2f", Double(step) * 0.25)) px from \(String(format: "%.2f", Double(border)))"
+        func sample(_ y: CGFloat) -> LinkTapRules.BandStep? {
+            let what = "\(named): stacked links, walk across the border, \(String(format: "%+.2f", Double(y - border))) px from \(String(format: "%.2f", Double(border)))"
             let result = tap(what, at: CGPoint(x: middle, y: y), shift: shift, within: 4)
             let verdict = judge(result, among: all, what: what)
             if verdict.other { walkOther += 1 }
-            if verdict.different { band.append(y) }
             walk.append(verdict.opens ?? "nothing")
+            return LinkTapRules.bandStep(of: result)
         }
-        let width = Double(band.count) * 0.25
-        say("LINKLOOK \(named): stacked links border: the pointer-down and the click named different links at \(band.count) of 9 steps of a quarter point (\(band.map { String(format: "%.2f", Double($0)) }.joined(separator: " "))): a band of about \(width) points, between \(max(0, width - 0.25)) and \(width + 0.25)")
-        XCTAssertLessThanOrEqual(width, 1.0, "\(named): the band in which the press and the click name different links is \(width) points wide: a product question")
-        say("LINKLOOK \(named): stacked links walk: the link that opened at each of nine steps of a quarter point: \(walk.joined(separator: " ")); \(walkOther) at which the click named another link than the nearest words")
+        let mostSteps = 24
+        var towardLower: [LinkTapRules.BandStep] = []
+        var pastLower = false
+        for index in 0...mostSteps {
+            guard let step = sample(border + CGFloat(index) * 0.25) else { break }
+            towardLower.append(step)
+            if LinkTapRules.pastTheBand(towardLower, far: lower.name) { pastLower = true; break }
+        }
+        var towardUpper: [LinkTapRules.BandStep] = []
+        var pastUpper = false
+        for index in 1...mostSteps {
+            guard let step = sample(border - CGFloat(index) * 0.25) else { break }
+            towardUpper.append(step)
+            if LinkTapRules.pastTheBand(towardUpper, far: upper.name) { pastUpper = true; break }
+        }
+        let walked = towardUpper.reversed() + towardLower
+        let differing = LinkTapRules.bandRows(walked)
+        say("LINKLOOK \(named): stacked links border: \(walked.count) steps of a quarter point walked (down \(towardLower.count), up \(towardUpper.count)) on \(Set(walked.map(\.row)).count) touch rows (a row is a third of a point); the pointer-down and the click named different links on \(differing.count) rows \(differing); two steps past the band agree: toward \(lower.name) \(pastLower), toward \(upper.name) \(pastUpper); \(differing.count < 2 ? "the band is narrower than two rows" : "the band is not narrower than two rows")")
+        XCTAssertTrue(pastLower, "\(named): the walk toward \(lower.name) did not reach two steps on two touch rows past the band in \(mostSteps) steps of a quarter point: \(towardLower)")
+        XCTAssertTrue(pastUpper, "\(named): the walk toward \(upper.name) did not reach two steps on two touch rows past the band in \(mostSteps) steps of a quarter point: \(towardUpper)")
+        if let disagreement = LinkTapRules.bandDisagreement(walked) { XCTFail("\(named): \(disagreement): a product question") }
+        say("LINKLOOK \(named): stacked links walk: the link that opened at each step, from the border downward and then upward: \(walk.joined(separator: " ")); \(walkOther) at which the click named another link than the nearest words")
     }
 
     /// A touch in the gap below the pane, next to the link at the pane's lower edge: the click that WebKit moves onto the link
