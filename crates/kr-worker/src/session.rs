@@ -1903,12 +1903,19 @@ impl Session {
     /// Renders the session for the wire.
     #[must_use]
     pub fn summary(&self) -> SessionSummary {
+        // The lifecycle state and what the application is doing are the domain's at one moment, and
+        // are read in one hold of it before the record is built, so that nothing in the record is
+        // built with the domain held.
+        let (state, application_state) = {
+            let input = self.input.lock();
+            (input.state(), input.application_state())
+        };
         SessionSummary {
             session_id: self.config.session_id,
             session_epoch: self.config.session_epoch,
             environment_id: self.config.environment_id,
             display_number: self.config.display_number,
-            state: self.state(),
+            state,
             shell_mode: self.config.shell_mode,
             shell_path: self.config.shell.program.clone(),
             cwd: self.config.shell.cwd.clone(),
@@ -1917,7 +1924,7 @@ impl Session {
             created_at_ms: self.created_at_ms,
             dimensions: self.attachments.dimensions(),
             attachment_count: U64::new(self.attachments.len() as u64),
-            application_state: Nullable(self.input.lock().application_state()),
+            application_state: Nullable(application_state),
             root_process: Nullable(self.root_identity()),
             closure: Nullable(self.closure.clone()),
             environment_sources: self.environment_sources,

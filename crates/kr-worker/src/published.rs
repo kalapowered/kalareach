@@ -11,9 +11,11 @@
 //! be admitted a moment before the copy says so. What the answer says about the lifecycle, what the
 //! application is doing, and how many launches wait for the reader, is for that reason read from
 //! the input domain, which holds all three as they are, and never from the copy. The application's
-//! producer writes what the application is doing there before it waits for the session, so a turn
-//! or a question that begins while a storage call holds the session is in the answer. A launch
-//! that begins then is not: it is registered under the session, which the request waits for.
+//! producer writes what the application is doing there as each fact joins, and the task that reads
+//! the fact waits for no storage call to do it, so a turn that begins while a storage call holds
+//! the session is in the answer from the evidence loop's next read of the broker. A question cannot
+//! begin then, because its creation runs with the session taken, and a launch that begins then is
+//! not in the answer: it is registered under the session, which the request waits for.
 //!
 //! Three things the answer does not follow:
 //!
