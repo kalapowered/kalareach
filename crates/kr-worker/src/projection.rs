@@ -396,6 +396,16 @@ impl TerminalEngine {
         self.clock.boot_elapsed_ms()
     }
 
+    /// Sets whether the rows that leave the live screen are kept.
+    ///
+    /// Turning it off gives up every row held above the live screen and keeps none from then on;
+    /// the live screen is not changed. A window above the live page is installed again by the next
+    /// publish, which holds the oldest row that survives ([`Self::projection_advance`]). Turning it
+    /// on starts a history with no rows.
+    pub fn set_history_kept(&mut self, kept: bool) {
+        self.engine.set_history_kept(kept);
+    }
+
     /// Returns the session's canonical dimensions.
     #[must_use]
     pub const fn canonical(&self) -> Dimensions {
