@@ -2033,8 +2033,14 @@ async fn a_living_presentation_is_decided_while_mutations_take_the_boundary_agai
     let decided = tokio::time::timeout(PRESENTATION_BOUND, living).await;
     let during = made.load(std::sync::atomic::Ordering::SeqCst) - before;
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    // A client whose mutation waits behind a wait that never tries again does not end by itself.
+    // All of them are given the time that a settle takes, together, and then left, so that the
+    // case ends with the presentation's own bound below and not with this wait.
+    let ends_by = tokio::time::Instant::now() + SETTLE;
     for stream in streams {
-        stream.await.expect("the mutating client ends");
+        if let Ok(ended) = tokio::time::timeout_at(ends_by, stream).await {
+            ended.expect("the mutating client ends");
+        }
     }
     let (mut link, answer) = decided
         .unwrap_or_else(|_| {
