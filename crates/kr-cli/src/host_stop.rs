@@ -3573,6 +3573,38 @@ mod tests {
         )
     }
 
+    /// Where the daemon that the request could not be made to has ended and another holds the
+    /// environment, the words are those of any end that finds a successor: the old process and the
+    /// new one where the command read them, and nothing of the request that could not be made.
+    /// Where the daemon is gone, the words say why the request could not be made.
+    #[test]
+    fn a_request_that_could_not_be_made_says_a_successor_by_the_words_of_any_end_that_finds_one() {
+        let id = an_environment();
+        let why = Shown::ipc(&kr_ipc::IpcError::PeerClosed);
+        let said =
+            |old, ended: &End| ended_before_the_request_said(id, old, ended, &why).to_string();
+        assert_eq!(
+            said(Some(4000), &End::Successor(Some(5000))),
+            format!(
+                "The control daemon (process 4000) ended; process 5000 now holds environment {id}, \
+                 so something started it again."
+            )
+        );
+        assert_eq!(
+            said(None, &End::Successor(None)),
+            format!(
+                "The control daemon ended; another control daemon now holds environment {id}, so \
+                 something started it again."
+            )
+        );
+        assert_eq!(
+            said(Some(4000), &End::Gone),
+            the_end_said_for(id, Some(4000), &kr_ipc::IpcError::PeerClosed)
+                .strip_prefix("ended (Some(4000)): ")
+                .expect("the words")
+        );
+    }
+
     /// The answer of a daemon of the first generation to a look.
     fn an_answer() -> Answered {
         Answered::for_a_case(ControllerGeneration::new(1))

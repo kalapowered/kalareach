@@ -5766,6 +5766,18 @@ enum OnStop {
     /// own, as a daemon that is going may, and then stops listening. It has ended only once two
     /// looks have followed its close, whatever the time between the events.
     CloseAndEndAfterTwoLooks,
+    /// Refuses `host.info`, the command's first request, with `code`: the command's own read of
+    /// the daemon is refused.
+    RefuseTheRead(kr_protocol::error::ErrorCode),
+    /// Answers `host.info` with a result that does not decode.
+    UndecodableRead,
+    /// Answers the request to stop with the error `code`, and ends where `end` is set.
+    AnswerTheStopWithError {
+        code: kr_protocol::error::ErrorCode,
+        end: bool,
+    },
+    /// Answers the hello with a version of another major than this program's.
+    AnotherMajor,
 }
 
 /// How many `host.info` that follow its close `OnStop::CloseAndEndAfterTwoLooks` answers before it
@@ -5869,7 +5881,14 @@ impl TestDaemon {
                         let answer = match frame {
                             ControlFrame::Hello(_) => ControlFrame::HelloAck(Box::new(
                                 kr_protocol::local::LocalHelloAck {
-                                    selected_version: kr_protocol::hello::PROTOCOL_VERSION,
+                                    selected_version: if matches!(on_stop, OnStop::AnotherMajor) {
+                                        kr_protocol::hello::ProtocolVersion::new(
+                                            kr_protocol::hello::PROTOCOL_VERSION.major + 1,
+                                            0,
+                                        )
+                                    } else {
+                                        kr_protocol::hello::PROTOCOL_VERSION
+                                    },
                                     role: kr_protocol::local::LocalRole::Controller,
                                     connection_id,
                                     environment_id,
@@ -5927,11 +5946,22 @@ impl TestDaemon {
                                     *looks += 1;
                                     then_end = *looks >= LOOKS_BEFORE_THE_END;
                                 }
-                                let outcome = match request.method.method() {
-                                    Some(Method::HostInfo) => Outcome::Ok(
+                                let outcome = match (request.method.method(), &on_stop) {
+                                    (Some(Method::HostInfo), OnStop::RefuseTheRead(code)) => {
+                                        Outcome::Error(kr_client::error::refusal(
+                                            *code,
+                                            kr_client::shown::Shown::said(
+                                                "this daemon refuses the read of its state",
+                                            ),
+                                        ))
+                                    }
+                                    (Some(Method::HostInfo), OnStop::UndecodableRead) => {
+                                        Outcome::Ok(ParamsValue::empty())
+                                    }
+                                    (Some(Method::HostInfo), _) => Outcome::Ok(
                                         ParamsValue::from_typed(&info).expect("encodes"),
                                     ),
-                                    Some(Method::BackupStatus) if probe_answered => {
+                                    (Some(Method::BackupStatus), _) if probe_answered => {
                                         Outcome::Ok(ParamsValue::empty())
                                     }
                                     _ => Outcome::Error(kr_client::error::refusal(
@@ -5961,6 +5991,9 @@ impl TestDaemon {
                                     | OnStop::CloseAfterTheLook
                                     | OnStop::CloseAfterTheLookAndEnd
                                     | OnStop::CloseAndEndAfterTwoLooks
+                                    | OnStop::RefuseTheRead(_)
+                                    | OnStop::UndecodableRead
+                                    | OnStop::AnotherMajor
                                     | OnStop::RefuseAndHoldTheProbe => {
                                         ControlFrame::Response(Response {
                                             request_id: mutation.request_id,
@@ -5968,6 +6001,18 @@ impl TestDaemon {
                                                 kr_protocol::error::ErrorCode::PermissionDenied,
                                                 kr_client::shown::Shown::said(
                                                     "this method is not in this host's registry",
+                                                ),
+                                            )),
+                                        })
+                                    }
+                                    OnStop::AnswerTheStopWithError { code, end } => {
+                                        then_end = *end;
+                                        ControlFrame::Response(Response {
+                                            request_id: mutation.request_id,
+                                            outcome: Outcome::Error(kr_client::error::refusal(
+                                                *code,
+                                                kr_client::shown::Shown::said(
+                                                    "this daemon cannot say what became of the stop",
                                                 ),
                                             )),
                                         })
@@ -6363,6 +6408,144 @@ fn a_stop_with_no_answer_is_an_unknown_outcome_and_the_command_looks_at_the_lock
     assert!(output.status.success(), "{stopped}");
     assert_eq!(stop_of(&stopped), "ended", "{stopped}");
     assert!(stopped["pid"].is_null(), "{stopped}");
+    daemon.end();
+}
+
+/// The first code whose retry category is `category`, and which is not the grant's own refusal.
+fn an_error_code_of(category: kr_protocol::error::RetryCategory) -> kr_protocol::error::ErrorCode {
+    kr_protocol::error::ErrorCode::ALL
+        .iter()
+        .copied()
+        .find(|code| {
+            *code != kr_protocol::error::ErrorCode::PermissionDenied
+                && code.retry_category() == category
+        })
+        .expect("a code of the category")
+}
+
+/// KR-REQ-07.12 (the command's own read of the daemon): a daemon that answers the hello and refuses
+/// the read of its state is refused as its own, and the command exits 8; a result of that read that
+/// does not decode is no refusal, and the command exits 1. Both end the command before any stop is
+/// asked, and say `not_asked`.
+#[test]
+fn a_refused_read_of_the_daemon_exits_8_and_one_that_does_not_decode_exits_1_with_no_stop_asked() {
+    for (on_stop, exit) in [
+        (
+            OnStop::RefuseTheRead(an_error_code_of(kr_protocol::error::RetryCategory::NoRetry)),
+            8,
+        ),
+        (OnStop::UndecodableRead, 1),
+    ] {
+        let host = Standalone::create();
+        let mut daemon = TestDaemon::serve(&host, "kr-controller/9.9.9", on_stop, true);
+        let output = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
+        let said = document(&output, "kr host stop");
+        assert_eq!(output.status.code(), Some(exit), "{said}");
+        assert_eq!(stop_of(&said), "not_asked", "{said}");
+        assert!(
+            !daemon.received().iter().any(|method| method == "host.stop"),
+            "no stop was asked: {:?}",
+            daemon.received()
+        );
+        assert!(attempts(&host).is_empty(), "no record of an attempt");
+        daemon.end();
+    }
+}
+
+/// KR-REQ-07.12 (a daemon of another major): the command offers its own major only, so a daemon
+/// that answers the hello with another major is a version that does not fit. The failure is the
+/// daemon's own reply: the command asks for no stop, says `not_asked` and exits 3, with no wait.
+#[test]
+fn a_daemon_that_answers_with_another_major_is_a_reply_and_no_stop_is_asked() {
+    let host = Standalone::create();
+    let mut daemon = TestDaemon::serve(&host, "kr-controller/9.9.9", OnStop::AnotherMajor, true);
+    let output = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
+    let said = document(&output, "kr host stop");
+    assert_eq!(output.status.code(), Some(3), "{said}");
+    assert_eq!(stop_of(&said), "not_asked", "{said}");
+    assert!(
+        !daemon.received().iter().any(|method| method == "host.stop"),
+        "no stop was asked: {:?}",
+        daemon.received()
+    );
+    daemon.end();
+}
+
+/// KR-REQ-07.12 (an unknown-outcome answer): a daemon that answers the stop with an error whose
+/// category is "outcome unknown" has not said that nothing was taken. The command waits for it as
+/// for one that took the stop and, seeing it end, says `ended`; a definite refusal of the stop
+/// would be `refused`.
+#[test]
+fn a_stop_answered_with_an_unknown_outcome_error_is_waited_for_and_not_refused() {
+    let host = Standalone::create();
+    let mut daemon = TestDaemon::serve(
+        &host,
+        "kr-controller/9.9.9",
+        OnStop::AnswerTheStopWithError {
+            code: an_error_code_of(kr_protocol::error::RetryCategory::OutcomeUnknown),
+            end: true,
+        },
+        true,
+    );
+    let output = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
+    let said = document(&output, "kr host stop");
+    assert!(output.status.success(), "{said}");
+    assert_eq!(stop_of(&said), "ended", "{said}");
+    daemon.end();
+}
+
+/// KR-REQ-07.12 (the record of the attempt): where the request may have left and no answer says
+/// that the daemon took it, the command's record of the attempt stays as one that asked, and the
+/// daemon not seen to end after 30 seconds is `maybe_asked`.
+#[test]
+fn the_record_of_a_stop_whose_outcome_is_unknown_is_not_told() {
+    let host = Standalone::create();
+    let mut daemon = TestDaemon::serve(
+        &host,
+        "kr-controller/9.9.9",
+        OnStop::AnswerTheStopWithError {
+            code: an_error_code_of(kr_protocol::error::RetryCategory::OutcomeUnknown),
+            end: false,
+        },
+        true,
+    );
+    let output = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
+    let said = document(&output, "kr host stop");
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    assert_eq!(stop_of(&said), "maybe_asked", "{said}");
+    let records = attempts(&host);
+    assert_eq!(records.len(), 1, "its own record stands");
+    assert_eq!(
+        records[0].attempt.phase,
+        kr_controller::attempt::Phase::Asking,
+        "an unknown outcome is not told"
+    );
+    daemon.end();
+}
+
+/// KR-REQ-07.12 (the record of the attempt): where the daemon answered that it took the stop and
+/// was not seen to end after 30 seconds, the command's record of the attempt says that the daemon
+/// was told.
+#[test]
+fn the_record_of_a_stop_that_the_daemon_took_and_has_not_ended_is_told() {
+    let host = Standalone::create();
+    let mut daemon = TestDaemon::serve(
+        &host,
+        "kr-controller/9.9.9",
+        OnStop::AnswerAndStay(std::process::id()),
+        true,
+    );
+    let output = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
+    let said = document(&output, "kr host stop");
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    assert_eq!(stop_of(&said), "told", "{said}");
+    let records = attempts(&host);
+    assert_eq!(records.len(), 1, "its own record stands");
+    assert_eq!(
+        records[0].attempt.phase,
+        kr_controller::attempt::Phase::Told,
+        "the daemon's answer is told"
+    );
     daemon.end();
 }
 
