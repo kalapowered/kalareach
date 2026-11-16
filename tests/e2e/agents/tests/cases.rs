@@ -4994,7 +4994,9 @@ impl Watch {
     /// shows something (within [`FRESH_SCREEN_WITHIN`]) before it goes on: a resynchronisation in
     /// the watch's last slice then leaves the caller a screen to read, not blank rows. A fresh view
     /// that is told to resynchronise while its rows are blank has stopped as well, so the wait
-    /// replaces it with another and goes on with that one.
+    /// replaces it with another and goes on with that one. The wait ends by its bound and leaves a
+    /// replacement that it opened last with what had already arrived for it applied, whatever the
+    /// opening and the closing of the stale view cost.
     fn watch_for(&mut self, stage: &Stage<'_, '_>, session: &Session, within: Duration) {
         let until = std::time::Instant::now() + within;
         while std::time::Instant::now() < until {
@@ -5012,6 +5014,11 @@ impl Watch {
                         stale.close(stage);
                     }
                 }
+                // Opening a replacement and closing the stale view take time that the bound does
+                // not count, so the bound can be spent before the replacement's first pump, while
+                // its whole snapshot already waits. What waits is applied once, with no wait, and
+                // the bound is not extended.
+                self.pump(stage, Duration::ZERO);
             }
         }
     }
