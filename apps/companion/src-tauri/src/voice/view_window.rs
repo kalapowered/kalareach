@@ -9,6 +9,25 @@
 //! read finds the end without its entry, in every schedule: the writer does not go on until the
 //! read has finished, and the read does not wait for anything the writer holds.
 //!
+//! The window is reserved while the view is still held: a hold records the end it shows when it
+//! takes the lock, and at its release, under the lock, it decides whether THIS hold wrote a new end
+//! and, if so, reserves the window; only then is the lock released and the wait begun. No other
+//! holder can take the window between the release and the reservation. The lock order is the
+//! view's lock, then the window's: the reservation takes the window's lock inside the view's hold,
+//! and no code takes the window's lock and then the view's (`arm` takes the view's lock alone and
+//! lets it go before it takes the window's; every other method takes the window's lock alone).
+//!
+//! The writer's wait gives its runtime worker back (`block_in_place`) where the thread is a worker
+//! of a multi-thread runtime, so that windows open at the same time cannot hold every worker of a
+//! runtime that cases share; elsewhere (a thread that no runtime owns) it is a plain wait. A
+//! current-thread runtime, which no case uses, would take a plain wait and block its one thread, so
+//! the read could not run and the writer would give up after its limit and fail the case.
+//!
+//! Two limits. A case that keeps its kept file unreadable until the end waits the whole limit and
+//! fails: the reader's `state()` takes the `keeping` lock to read the file again, and the writer
+//! holds `keeping` in the window. A case that fails after it armed the window and before its read
+//! holds one worker for the limit (60 s); the case has already failed.
+//!
 //! Compiled only for cases (`cfg(any(test, feature = "testing"))`): a shipped build holds the plain
 //! mutex under the same name.
 
@@ -123,29 +142,40 @@ impl ViewLock {
             .gave_up
     }
 
-    /// Called as a hold of the view is released, with the owner of the end that hold showed. Opens
-    /// the window if it is armed and the end is a new one, and waits in it for the case's read.
-    fn released(&self, shown: Option<u64>) {
-        let Some(owner) = shown else {
-            return;
-        };
-        if std::thread::panicking() {
-            return;
-        }
+    /// Called with the view still held, by a hold that wrote the end of the call `owner`: reserves
+    /// the window if it is armed and the end is a new one, so that no other holder can take it.
+    fn reserve(&self, owner: u64) -> bool {
         let mut window = self.window.lock().expect("the record is not poisoned");
         if !window.armed || window.seen == Some(owner) {
-            return;
+            return false;
         }
         window.armed = false;
         self.armed.store(false, Ordering::SeqCst);
-        window.open = true;
-        self.opened.notify_waiters();
-        let (mut window, timeout) = self
-            .changed
-            .wait_timeout_while(window, READ_WITHIN, |window| !window.finished)
-            .expect("the record is not poisoned");
-        if timeout.timed_out() {
-            window.gave_up = true;
+        true
+    }
+
+    /// Opens the window the caller reserved, with the view released, and waits in it for the case's
+    /// read to finish, giving the worker back where the thread is one of a multi-thread runtime.
+    fn wait_in_window(&self) {
+        let wait = || {
+            let mut window = self.window.lock().expect("the record is not poisoned");
+            window.open = true;
+            self.opened.notify_waiters();
+            let (mut window, timeout) = self
+                .changed
+                .wait_timeout_while(window, READ_WITHIN, |window| !window.finished)
+                .expect("the record is not poisoned");
+            if timeout.timed_out() {
+                window.gave_up = true;
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime)
+                if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+            {
+                tokio::task::block_in_place(wait);
+            }
+            _ => wait(),
         }
     }
 }
@@ -154,13 +184,17 @@ impl ViewLock {
 pub(super) struct ViewGuard<'a> {
     guard: Option<MutexGuard<'a, VoiceCallState>>,
     lock: &'a ViewLock,
+    /// The owner of the end the view showed when this hold took the lock.
+    entered: Option<u64>,
 }
 
 impl<'a> ViewGuard<'a> {
     fn new(guard: MutexGuard<'a, VoiceCallState>, lock: &'a ViewLock) -> Self {
+        let entered = guard.ended.as_ref().map(|ended| ended.owner);
         Self {
             guard: Some(guard),
             lock,
+            entered,
         }
     }
 }
@@ -181,15 +215,22 @@ impl DerefMut for ViewGuard<'_> {
 
 impl Drop for ViewGuard<'_> {
     fn drop(&mut self) {
-        let shown = if self.lock.armed.load(Ordering::SeqCst) {
-            self.guard
+        // Still under the view's lock: did this hold write a new end? If so, the window is
+        // reserved here, and the lock is released and the wait begun only after.
+        let mut reserved = false;
+        if !std::thread::panicking() && self.lock.armed.load(Ordering::SeqCst) {
+            let now = self
+                .guard
                 .as_ref()
-                .and_then(|view| view.ended.as_ref().map(|ended| ended.owner))
-        } else {
-            None
-        };
+                .and_then(|view| view.ended.as_ref().map(|ended| ended.owner));
+            if let Some(owner) = now.filter(|owner| Some(*owner) != self.entered) {
+                reserved = self.lock.reserve(owner);
+            }
+        }
         // The lock is released before the window is entered: the reader reads a free view.
         drop(self.guard.take());
-        self.lock.released(shown);
+        if reserved {
+            self.lock.wait_in_window();
+        }
     }
 }
