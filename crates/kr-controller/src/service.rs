@@ -811,9 +811,9 @@ pub struct Controller {
     /// Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     before_the_shares_lock: ThreadPause,
-    /// Where this host's own tests stop an admission check just before its last reading of the
-    /// fence, which takes the fence's lock, so that the deadline can pass in that wait. Compiled
-    /// away in every shipped build.
+    /// Where this host's own tests stop an admission check just before the footing's question,
+    /// which is its last reading, so that the deadline can pass at that pause. Compiled away in
+    /// every shipped build.
     #[cfg(feature = "testing")]
     before_the_last_fence_read: ThreadPause,
     /// Each reply the local door's sink consumed, with the request it answers, in the order they
