@@ -6453,10 +6453,12 @@ fn a_refused_read_of_the_daemon_exits_8_and_one_that_does_not_decode_exits_1_wit
 }
 
 /// KR-REQ-07.12 (a daemon of another major): the command offers its own major only, so a daemon
-/// that answers the hello with another major is a version that does not fit. The failure is the
-/// daemon's own reply: the command asks for no stop, says `not_asked` and exits 3, with no wait.
+/// that answers the hello with another major is a version that does not fit. The command asks for
+/// no stop, says `not_asked` and exits 3. Which way the failure goes (a daemon's reply is never
+/// looked at) is held by the library case that makes no look after such a failure; this case holds
+/// the refusal at the hello.
 #[test]
-fn a_daemon_that_answers_with_another_major_is_a_reply_and_no_stop_is_asked() {
+fn a_daemon_that_answers_the_hello_with_another_major_is_refused_with_exit_3_and_no_stop_asked() {
     let host = Standalone::create();
     let mut daemon = TestDaemon::serve(&host, "kr-controller/9.9.9", OnStop::AnotherMajor, true);
     let output = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
