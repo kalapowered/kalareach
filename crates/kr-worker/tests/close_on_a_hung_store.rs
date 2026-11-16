@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kr_ipc::client::LocalClient;
+use kr_ipc::clock::SharedClock as _;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::identity::{ProcessState, process_state};
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
@@ -90,6 +91,9 @@ const CLOSURE_WAIT: Duration = Duration::from_secs(20);
 /// How long a case waits for a question that was asked to run out of time on the loop's own timer,
 /// which is fifteen seconds.
 const QUESTION_WAIT: Duration = Duration::from_secs(30);
+/// How long a question that a case moves the clock for lives: an hour, on the session's clock and
+/// on the wall clock, so that only the case's move of the session's clock makes it due.
+const QUESTION_EXPIRY_MS: u64 = 3_600_000;
 
 fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
@@ -152,6 +156,16 @@ async fn host() -> Host {
 
 /// A session whose shell ends when it is asked to stop, or one that notes the request and goes on.
 async fn host_of(ends_when_asked: bool) -> Host {
+    host_on(ends_when_asked, Arc::new(kr_ipc::clock::SystemSharedClock)).await
+}
+
+/// As [`host`], for a session whose runtime reads the continuous clock `clock`, which a case may
+/// move by hand: a question's deadline on that clock passes when the case moves it.
+async fn host_on_a_clock(clock: &kr_ipc::clock::ManualSharedClock) -> Host {
+    host_on(false, Arc::new(clock.clone())).await
+}
+
+async fn host_on(ends_when_asked: bool, shared_clock: Arc<dyn kr_ipc::clock::SharedClock>) -> Host {
     let marks = tempfile::tempdir().expect("a directory on the internal disk");
     let ready = kr_worker::testing::shell_quoted(&marks.path().join("ready"));
     let script = if ends_when_asked {
@@ -209,10 +223,8 @@ async fn host_of(ends_when_asked: bool) -> Host {
     };
     let mut session = Session::open(config).expect("opens the session");
     session.launch().expect("launches the shell");
-    let runtime = Arc::new(
-        SessionRuntime::start(session, Arc::new(kr_ipc::clock::SystemSharedClock))
-            .expect("starts the runtime"),
-    );
+    let runtime =
+        Arc::new(SessionRuntime::start(session, shared_clock).expect("starts the runtime"));
     let endpoint = environment
         .worker_endpoint(DisplayNumber::new(1))
         .expect("an endpoint");
@@ -1461,6 +1473,27 @@ fn ask_a_question_expiring(
     request: &str,
     expiry_ms: Option<u64>,
 ) {
+    ask_a_question_at(
+        service,
+        session_id,
+        request,
+        expiry_ms,
+        kr_worker::questions::Now {
+            utc_ms: kr_ipc::now_ms(),
+            boot_ms: kr_ipc::clock::boot_elapsed_ms(),
+        },
+    );
+}
+
+/// As [`ask_a_question_expiring`], asked at `now`, whose continuous reading is the clock that the
+/// question's deadline on it is measured from.
+fn ask_a_question_at(
+    service: &WorkerService,
+    session_id: SessionId,
+    request: &str,
+    expiry_ms: Option<u64>,
+    now: kr_worker::questions::Now,
+) {
     let source = kr_worker::questions::VerifiedSource {
         process: kr_ipc::identity::current_process_start_identity().expect("a process identity"),
         executable: Some("/bin/agent".to_owned()),
@@ -1486,10 +1519,7 @@ fn ask_a_question_expiring(
                 }),
                 wait_ms: Nullable::null(),
             },
-            kr_worker::questions::Now {
-                utc_ms: kr_ipc::now_ms(),
-                boot_ms: kr_ipc::clock::boot_elapsed_ms(),
-            },
+            now,
         )
         .expect("a verified source creates a question");
 }
@@ -1577,49 +1607,70 @@ async fn a_change_back_to_the_published_value_while_a_publication_is_in_flight_i
     }
 }
 
-/// A question that runs out of time stops counting without anything else waking the evidence loop.
-/// The loop re-reads the ledger on a timer while a question is open, and it arms that timer when the
-/// ledger's reader says that a question is open, which is a wake of the reader's own. The case
-/// establishes that the loop waits with no open question BEFORE the reader records the change: the
-/// reader is held after it has read the ledger, and the case lets it go only once the loop has gone
-/// round and waits with the question fact still false, so the loop arms its timer only through the
-/// reader's wake.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_question_that_runs_out_of_time_stops_counting_with_no_other_wake() {
-    let host = host().await;
-    let producer = Arc::clone(host.service.application());
-    // The loop has gone round and waits, with no question open.
+/// Waits until the evidence loop has begun a round after round `after` and has come to its wait on
+/// its stream, with the facts it read in that round, and returns that round's number. A round is
+/// counted once it has made its subscriptions, so a wake that comes while the loop waits in a round
+/// that the count shows is one that the round hears.
+async fn the_loop_waits_after_round(producer: &Producer, after: usize, what: &str) -> usize {
     let began = Instant::now();
-    while {
+    loop {
         let (rounds, waits) = producer.loop_rounds();
-        rounds == 0 || rounds != waits
-    } {
+        if rounds > after && rounds == waits {
+            return rounds;
+        }
         assert!(
             began.elapsed() < CLOSURE_WAIT,
-            "the evidence loop did not come to a wait within {CLOSURE_WAIT:?}"
+            "the evidence loop did not go round and wait {what} within {CLOSURE_WAIT:?}"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let before = producer.loop_rounds().0;
+}
+
+/// A question that runs out of time stops counting without anything else waking the evidence loop.
+/// The loop re-reads the ledger on a timer while a question is open, and it arms that timer when the
+/// ledger's reader says that a question is open, which is a wake of the reader's own. The question
+/// lives an hour on the session's clock, which the case moves by hand, so it runs out of time when
+/// the case moves the clock and not before.
+///
+/// The order of events, each step confirmed by what the case observes and none by a delay:
+/// 1. the loop waits with no question open;
+/// 2. the reader is held after it has read the ledger, the question is asked, and the loop is shown
+///    to have gone round and to wait with the question fact still false, so that it can arm its
+///    timer only through the reader's wake;
+/// 3. the reader is let go and the session's domain says that a question is open;
+/// 4. the loop is shown to go round once more, on the reader's wake, and to wait with the open
+///    fact, so that its timer is armed with the clock still before the question's deadline;
+/// 5. only then does the clock move past the deadline. Nothing wakes the loop from there on but its
+///    timer, which reads the ledger, and the session stops counting the question.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_question_that_runs_out_of_time_stops_counting_with_no_other_wake() {
+    let clock = kr_ipc::clock::ManualSharedClock::new();
+    let host = host_on_a_clock(&clock).await;
+    let producer = Arc::clone(host.service.application());
+    let before = the_loop_waits_after_round(&producer, 0, "with no question open").await;
     let (read, let_go) = producer.pause_ledger_reader_before_its_fact();
-    ask_a_question_expiring(&host.service, host.session_id, "short", Some(3_000));
+    ask_a_question_at(
+        &host.service,
+        host.session_id,
+        "short",
+        Some(QUESTION_EXPIRY_MS),
+        kr_worker::questions::Now {
+            utc_ms: kr_ipc::now_ms(),
+            boot_ms: clock.boot_elapsed_ms(),
+        },
+    );
     tokio::time::timeout(REACH, read)
         .await
         .expect("the ledger's reader read the ledger within a bound")
         .expect("the pause was dropped before it was reached");
     // The question's creation woke the loop, which asked the reader and now waits with the question
     // fact false: the reader has not recorded what it found.
-    let began = Instant::now();
-    while {
-        let (rounds, waits) = producer.loop_rounds();
-        rounds <= before || rounds != waits
-    } {
-        assert!(
-            began.elapsed() < CLOSURE_WAIT,
-            "the evidence loop did not go round and wait after the question was asked"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let waiting = the_loop_waits_after_round(
+        &producer,
+        before,
+        "after the question was asked, with the reader held",
+    )
+    .await;
     assert_eq!(
         domain_application_state(&host),
         Some(ApplicationState::ShellReady),
@@ -1632,17 +1683,31 @@ async fn a_question_that_runs_out_of_time_stops_counting_with_no_other_wake() {
         "the question is open",
     )
     .await;
+    // The reader's wake takes the loop round again, and it arms its timer with the fact open.
+    the_loop_waits_after_round(
+        &producer,
+        waiting,
+        "after the reader recorded the open question: the reader's wake did not reach the loop",
+    )
+    .await;
+    assert_eq!(
+        domain_application_state(&host),
+        Some(ApplicationState::AwaitingInput),
+        "the question stopped counting before the clock moved"
+    );
+    clock.advance(Duration::from_millis(QUESTION_EXPIRY_MS + 1));
     let began = Instant::now();
     while domain_application_state(&host) == Some(ApplicationState::AwaitingInput) {
         assert!(
             began.elapsed() < QUESTION_WAIT,
-            "the session still counted a question that ran out of time {QUESTION_WAIT:?} after it opened"
+            "the session still counted a question that ran out of time {QUESTION_WAIT:?} after its deadline passed"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(
         domain_application_state(&host),
-        Some(ApplicationState::ShellReady)
+        Some(ApplicationState::ShellReady),
+        "the session's domain said something other than a shell at its prompt once the question had run out of time"
     );
 }
 
