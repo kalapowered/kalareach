@@ -6,7 +6,12 @@
  * code, the service or the host may be wrong, and saying which would be a guess.
  */
 
-import type { PairingFailure, PairingSources } from '../host/port'
+import type { PairingFailure, PairingSources, WaitlessKind } from '../host/port'
+
+/** What the words of a failure are made from: its kind, and for the two relay kinds the wait. */
+export type FailureSubject =
+  | { readonly kind: WaitlessKind }
+  | { readonly kind: 'relay_capacity' | 'relay_fault'; readonly retry_after_seconds: number }
 
 /** What the person can do next, after an attempt ends. */
 export type NextAction =
@@ -47,7 +52,7 @@ function bringItInAgain(reading: Reading): string {
  * host name of the service a code attempt went through.
  */
 export function failureWords(
-  failure: Pick<PairingFailure, 'kind' | 'retry_after_seconds'>,
+  failure: FailureSubject,
   service: string,
   mode: AttemptMode = 'code',
   reading: Reading = 'pasteboard'
@@ -74,7 +79,7 @@ export function failureWords(
 
 /** The words and the next action for one failure of a code attempt through `service`. */
 function codeWords(
-  failure: Pick<PairingFailure, 'kind' | 'retry_after_seconds'>,
+  failure: FailureSubject,
   service: string,
   reading: Reading
 ): { readonly sentence: string; readonly action: NextAction } {
@@ -221,14 +226,10 @@ const LONGEST_SAID_SECONDS = 24 * 60 * 60
 /**
  * How long a wait of `seconds` is said to be, in the one unit that fits it and rounded up, so that
  * a person is never told to try again before this device would. It is said as the host's own line
- * says it: a figure of 0 is "1 second", and one above a day is "24 hours". A figure that is no
- * finite number is said as the longest wait, never as a shorter one.
+ * says it: a figure of 0 is "1 second", and one above a day is "24 hours".
  */
-export function waitInWords(seconds: number | undefined): string {
-  const said =
-    seconds !== undefined && Number.isFinite(seconds)
-      ? Math.min(Math.max(Math.ceil(seconds), 1), LONGEST_SAID_SECONDS)
-      : LONGEST_SAID_SECONDS
+export function waitInWords(seconds: number): string {
+  const said = Math.min(Math.max(Math.ceil(seconds), 1), LONGEST_SAID_SECONDS)
   const minutes = Math.ceil(said / 60)
   if (said === 1) return '1 second'
   if (said < 60) return `${said} seconds`

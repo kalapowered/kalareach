@@ -184,7 +184,7 @@ impl PairingFailure {
                 retry_after_seconds,
             } => Self {
                 alternatives,
-                retry_after_seconds,
+                retry_after_seconds: Some(retry_after_seconds),
                 ..Self::new(
                     FailureKind::RelayCapacity,
                     "the managed relay has no free capacity to admit this device now",
@@ -193,7 +193,7 @@ impl PairingFailure {
             RelayRefusal::Fault {
                 retry_after_seconds,
             } => Self {
-                retry_after_seconds,
+                retry_after_seconds: Some(retry_after_seconds),
                 ..Self::new(
                     FailureKind::RelayFault,
                     "the managed relay service could not admit this device now",
@@ -345,7 +345,7 @@ mod tests {
         assert_eq!(
             sent(RelayRefusal::Capacity {
                 alternatives: named(),
-                retry_after_seconds: Some(90),
+                retry_after_seconds: 90,
             }),
             serde_json::json!({
                 "kind": "relay_capacity",
@@ -357,36 +357,15 @@ mod tests {
                 "retry_after_seconds": 90,
             })
         );
-        // No wait named, none said.
-        assert_eq!(
-            sent(RelayRefusal::Capacity {
-                alternatives: named(),
-                retry_after_seconds: None,
-            }),
-            serde_json::json!({
-                "kind": "relay_capacity",
-                "tries_left": null,
-                "alternatives": [
-                    "A path that this build has never heard of.",
-                    "Another path, in the service's words."
-                ],
-            })
-        );
         assert_eq!(
             sent(RelayRefusal::Fault {
-                retry_after_seconds: Some(30)
+                retry_after_seconds: 30
             }),
             serde_json::json!({
                 "kind": "relay_fault",
                 "tries_left": null,
                 "retry_after_seconds": 30,
             })
-        );
-        assert_eq!(
-            sent(RelayRefusal::Fault {
-                retry_after_seconds: None
-            }),
-            serde_json::json!({"kind": "relay_fault", "tries_left": null})
         );
     }
 }

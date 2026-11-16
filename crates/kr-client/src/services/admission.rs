@@ -751,7 +751,7 @@ impl PairingAdmissions {
                 .max()
                 .unwrap_or(now);
                 let left = asks_again.saturating_duration_since(now);
-                let wait = Some(left.as_secs() + u64::from(left.subsec_nanos() > 0));
+                let wait = left.as_secs() + u64::from(left.subsec_nanos() > 0);
                 Some(if alternatives.is_empty() {
                     RelayRefusal::Fault {
                         retry_after_seconds: wait,
@@ -777,17 +777,17 @@ pub enum RelayRefusal {
         /// The paths it named, each as it wrote it. At least one has text.
         alternatives: Alternatives,
         /// The device's own wait: seconds from now until it asks the service again, and not less
-        /// than what remains of the delay the service named, when it named one. Always present
-        /// here; at most a day, by the cache's own cap on a delay.
-        retry_after_seconds: Option<u64>,
+        /// than what remains of the delay the service named, when it named one. At most a day, by
+        /// the cache's own cap on a delay.
+        retry_after_seconds: u64,
     },
     /// The service failed on its side, and no capacity was refused. An answer that names no path,
     /// and a refusal in its envelope under a status of the 5xx class, are this.
     Fault {
         /// The device's own wait: seconds from now until it asks the service again, and not less
-        /// than what remains of the delay the service named, when it named one. Always present
-        /// here; at most a day, by the cache's own cap on a delay.
-        retry_after_seconds: Option<u64>,
+        /// than what remains of the delay the service named, when it named one. At most a day, by
+        /// the cache's own cap on a delay.
+        retry_after_seconds: u64,
     },
 }
 

@@ -14,7 +14,7 @@ import { App } from '../src/App'
 import { AppProvider } from '../src/app/state'
 import { fakeHost, type FakeHostControls } from '../src/host/fake'
 import type { AttemptState, PairingFailure } from '../src/host/port'
-import { failureAlternatives, failureWords, waitInWords } from '../src/pairing/words'
+import { failureAlternatives, waitInWords } from '../src/pairing/words'
 
 function start(): { controls: FakeHostControls } {
   const { port, controls } = fakeHost()
@@ -84,13 +84,6 @@ describe('a pairing that the managed relay could not take', () => {
     [1e300, '24 hours']
   ])('says a wait of %s seconds as "%s"', (seconds, said) => {
     expect(waitInWords(seconds)).toBe(said)
-  })
-
-  // The client sends a figure with both kinds. If it did not, the page would not say a shorter wait.
-  it('says a figure that is no number as the longest wait, never as a shorter one', () => {
-    expect(waitInWords(undefined)).toBe('24 hours')
-    expect(waitInWords(Number.NaN)).toBe('24 hours')
-    expect(waitInWords(Number.POSITIVE_INFINITY)).toBe('24 hours')
   })
 
   // KR-REQ-17.48
@@ -164,10 +157,6 @@ describe('a pairing that the managed relay could not take', () => {
       "The host could not be reached. Check that this device is on the host's network, or that the host is online. 2 tries left on this device."
     )
     expect(screen.queryByTestId('failure-alternatives')).toBeNull()
-    // A wait that a failure of another kind carries by mistake is not said.
-    expect(
-      failureWords({ kind: 'host_unreachable', retry_after_seconds: 90 }, 'reach.kala.to').sentence
-    ).not.toMatch(/about/)
   })
 
   it('says the tries that are left after the sentence, and the paths after that', async () => {
