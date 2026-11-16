@@ -10,6 +10,8 @@
 
 #![allow(dead_code, reason = "each suite uses the part of the script it needs")]
 
+pub mod host;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -334,8 +336,7 @@ impl ScriptedWorker {
                     continue;
                 }
                 let _ = handing.send(Link {
-                    reader,
-                    writer,
+                    wire: Wire::Ipc { reader, writer },
                     sequence: 0,
                     session_id,
                     connection_id,
@@ -387,13 +388,79 @@ impl ScriptedWorker {
 
 /// One view's connection to the scripted worker.
 pub struct Link {
-    reader: FrameReader,
-    writer: FrameWriter,
+    wire: Wire,
     /// The sequence of the next notification on the output stream.
     sequence: u64,
     session_id: SessionId,
     /// The identity the worker gave this connection when it answered the opening exchange.
     connection_id: ConnectionId,
+}
+
+/// The connection's two ends, as a view's connection to a local worker or to a paired host has them.
+enum Wire {
+    /// A local worker's socket.
+    Ipc {
+        reader: FrameReader,
+        writer: FrameWriter,
+    },
+    /// A paired host's control stream. The frames are read by a task of their own, so that a wait for
+    /// one that a case gives up leaves no half-read frame behind.
+    Quic {
+        frames: tokio::sync::mpsc::UnboundedReceiver<ControlFrame>,
+        writer: kr_transport::codec::FrameWriter,
+        pump: tokio::task::JoinHandle<()>,
+    },
+}
+
+impl Drop for Wire {
+    fn drop(&mut self) {
+        if let Self::Quic { pump, .. } = self {
+            pump.abort();
+        }
+    }
+}
+
+impl Wire {
+    /// A paired host's control stream.
+    fn quic(
+        mut reader: kr_transport::codec::FrameReader,
+        writer: kr_transport::codec::FrameWriter,
+    ) -> Self {
+        let (frames, received) = tokio::sync::mpsc::unbounded_channel();
+        let pump = tokio::spawn(async move {
+            while let Ok(Some(frame)) = reader.read_message::<ControlFrame>().await {
+                if frames.send(frame).is_err() {
+                    return;
+                }
+            }
+        });
+        Self::Quic {
+            frames: received,
+            writer,
+            pump,
+        }
+    }
+
+    /// The next frame, or none once the connection has ended.
+    async fn read(&mut self) -> Option<ControlFrame> {
+        match self {
+            Self::Ipc { reader, .. } => reader.read_message::<ControlFrame>().await.ok(),
+            Self::Quic { frames, .. } => frames.recv().await,
+        }
+    }
+
+    async fn write(&mut self, frame: &ControlFrame) -> Result<(), String> {
+        match self {
+            Self::Ipc { writer, .. } => writer
+                .write_message(frame)
+                .await
+                .map_err(|error| error.to_string()),
+            Self::Quic { writer, .. } => writer
+                .write_message(frame)
+                .await
+                .map_err(|error| error.to_string()),
+        }
+    }
 }
 
 /// How a call reached the worker: as a plain request, or as a mutation with an action identifier.
@@ -471,7 +538,7 @@ impl Link {
 
     /// The next call the view makes.
     pub async fn call(&mut self) -> Call {
-        let frame = tokio::time::timeout(WATCHDOG, self.reader.read_message::<ControlFrame>())
+        let frame = tokio::time::timeout(WATCHDOG, self.wire.read())
             .await
             .expect("the view called within the watchdog")
             .expect("the view's connection is open");
@@ -484,8 +551,8 @@ impl Link {
     pub fn call_now(&mut self) -> Option<Call> {
         use futures_util::FutureExt as _;
         let frame = self
-            .reader
-            .read_message::<ControlFrame>()
+            .wire
+            .read()
             .now_or_never()?
             .expect("the view's connection is open");
         Some(call_of(frame))
@@ -500,9 +567,7 @@ impl Link {
 
     /// Whether the view sends nothing more within `quiet`.
     pub async fn quiet_for(&mut self, quiet: Duration) -> bool {
-        tokio::time::timeout(quiet, self.reader.read_message::<ControlFrame>())
-            .await
-            .is_err()
+        tokio::time::timeout(quiet, self.wire.read()).await.is_err()
     }
 
     /// Waits for the view to close its connection, reading anything it still sends.
@@ -510,8 +575,8 @@ impl Link {
         let mut sent = Vec::new();
         let ended = tokio::time::timeout(WATCHDOG, async {
             loop {
-                match self.reader.read_message::<ControlFrame>().await {
-                    Ok(ControlFrame::Request(request)) => sent.push(Call {
+                match self.wire.read().await {
+                    Some(ControlFrame::Request(request)) => sent.push(Call {
                         request_id: request.request_id,
                         method: request.method.to_string(),
                         params: request.params,
@@ -520,7 +585,7 @@ impl Link {
                         action_id: None,
                         expected: None,
                     }),
-                    Ok(ControlFrame::Mutation(mutation)) => sent.push(Call {
+                    Some(ControlFrame::Mutation(mutation)) => sent.push(Call {
                         request_id: mutation.request_id,
                         method: mutation.method.to_string(),
                         params: mutation.params,
@@ -529,8 +594,8 @@ impl Link {
                         action_id: Some(mutation.action_id),
                         expected: Some(mutation.expected),
                     }),
-                    Ok(_) => {}
-                    Err(_) => return,
+                    Some(_) => {}
+                    None => return,
                 }
             }
         })
@@ -545,8 +610,8 @@ impl Link {
     /// Answers `call` with `value`.
     pub async fn answer<T: serde::Serialize>(&mut self, call: &Call, value: &T) {
         let payload = ParamsValue::from_typed(value).expect("an answer the protocol encodes");
-        self.writer
-            .write_message(&ControlFrame::Response(Response {
+        self.wire
+            .write(&ControlFrame::Response(Response {
                 request_id: call.request_id,
                 outcome: Outcome::Ok(payload),
             }))
@@ -562,8 +627,8 @@ impl Link {
 
     /// Refuses `call` with the host's `code` and `message`.
     pub async fn refuse_with(&mut self, call: &Call, code: ErrorCode, message: &str) {
-        self.writer
-            .write_message(&ControlFrame::Response(Response {
+        self.wire
+            .write(&ControlFrame::Response(Response {
                 request_id: call.request_id,
                 outcome: Outcome::Error(ProtocolError::new(code, message)),
             }))
@@ -581,8 +646,8 @@ impl Link {
     pub async fn push_raw(&mut self, event_type: &str, payload: ParamsValue) {
         let sequence = self.sequence;
         self.sequence += 1;
-        self.writer
-            .write_message(&ControlFrame::Notification(Notification {
+        self.wire
+            .write(&ControlFrame::Notification(Notification {
                 stream_id: StreamId::new(OUTPUT_STREAM).expect("a literal stream name"),
                 sequence: EventSequence::new(sequence),
                 event_type: EventType::new(event_type).expect("a literal event type"),
@@ -595,8 +660,8 @@ impl Link {
     /// Sends the view a request, a frame that a host never sends a client: the client library ends
     /// the session on it.
     pub async fn send_request(&mut self) {
-        self.writer
-            .write_message(&ControlFrame::Request(Request {
+        self.wire
+            .write(&ControlFrame::Request(Request {
                 request_id: RequestId::new(900),
                 method: Method::SessionOpen.into(),
                 method_version: MethodVersion::V1,

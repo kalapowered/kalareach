@@ -27,6 +27,7 @@ use kr_protocol::projection::{
 };
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
 use kr_protocol::session::Dimensions;
+use scripted_worker::host::{ScriptedHost, Takes};
 use scripted_worker::{
     CallKind, Challenge, Frame, Keys, Link, Mouse, Negotiated, ScriptedWorker, Stated, WATCHDOG,
     WorkerLease, delta, frame, frame_delta, keys_delta, mouse_delta, page as rows_page, reset, row,
@@ -5480,4 +5481,114 @@ async fn launches_whose_result_is_not_definite_stay_unresolved_at_the_session() 
         told = &mut pressing => told.expect("joins").expect_err("the session refuses it"),
     };
     assert_eq!(code(&told), "RESOURCE_UNAVAILABLE");
+}
+
+// ---- The network carrier: a paired view's typing on a stream of its own -----------------------
+
+/// The window that the scripted host says on the input stream: `frames` frames, and room for any
+/// of them.
+fn lane_window(frames: u32) -> kr_protocol::input::InputWindow {
+    kr_protocol::input::InputWindow {
+        frames,
+        bytes: kr_protocol::scalars::U64::new(512 * 1024),
+    }
+}
+
+impl Page {
+    /// The application whose next view opens on the connection of `host`, a paired host's: the view
+    /// opens the session on it as it does on a connection its device dialled.
+    fn over(host: &mut ScriptedHost) -> Self {
+        let page = Self::new(host.paths());
+        page.app
+            .state::<companion_tauri::terminal::TerminalViews>()
+            .over(host.transport());
+        page
+    }
+}
+
+/// A view of a paired host's session, attached and showing `at`, whose host takes the input stream
+/// and has seen it open.
+async fn paired(page: &Page, host: &mut ScriptedHost, channel: u32, at: &Frame) -> (String, Link) {
+    let view = page.open(host.session_id, at.window_columns, at.window_rows, channel);
+    let mut link = host.link().await;
+    link.attach().await;
+    host.takes(&mut link, Takes::Input).await;
+    frame(&mut link, at).await;
+    page.newest(channel, |state| state["state"] == "showing")
+        .await;
+    host.script
+        .until("the input stream's header", |seen| seen.headers.len() == 1)
+        .await;
+    (view, link)
+}
+
+/// A view as [`paired`] has it, which controls the program under the page's take 1.
+async fn paired_controlling(
+    page: &Page,
+    host: &mut ScriptedHost,
+    channel: u32,
+    at: &Frame,
+    lease: &mut WorkerLease,
+) -> (String, Link) {
+    let (view, mut link) = paired(page, host, channel, at).await;
+    page.take(&view, 1);
+    let acquire = link.expect(Method::InputAcquire).await;
+    lease.answer(&mut link, &acquire).await;
+    page.newest(channel, |state| {
+        control(state) == (1, "controlling".to_owned())
+    })
+    .await;
+    (view, link)
+}
+
+/// The frames that the host has read, as (epoch, sequence, text).
+fn read_by(host: &ScriptedHost) -> Vec<(u64, u64, String)> {
+    host.script
+        .frames()
+        .into_iter()
+        .map(|seen| {
+            (
+                seen.epoch,
+                seen.sequence,
+                String::from_utf8(seen.bytes).expect("typing the cases wrote"),
+            )
+        })
+        .collect()
+}
+
+/// The lane opens on a paired link once the attach is answered, with one stream under the
+/// attachment's header; the typing goes on that stream in order, under the epoch the acquire gave and
+/// numbers from 0, and none of it is a call on the control stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paired_views_lane_opens_after_the_attach_and_its_keys_go_on_the_stream_in_order() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    let kinds = host.script.seen(|seen| {
+        seen.headers
+            .iter()
+            .map(|header| header.kind)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(kinds, vec![kr_protocol::frame::StreamKind::TerminalInput]);
+    for key in ["a", "b", "c"] {
+        page.text(&view, 1, key).expect("the key is taken");
+    }
+    host.script
+        .until("three frames", |seen| seen.frames.len() == 3)
+        .await;
+    assert_eq!(
+        read_by(&host),
+        vec![
+            (1, 0, "a".to_owned()),
+            (1, 1, "b".to_owned()),
+            (1, 2, "c".to_owned())
+        ]
+    );
+    assert!(
+        link.quiet_for(QUIET).await,
+        "none of the typing is a call on the control stream"
+    );
 }
