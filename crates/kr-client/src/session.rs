@@ -37,6 +37,7 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 
 use crate::cursors::{Delivery, ReceiptTracker, StreamCursors};
 use crate::error::{ClientError, HostWord, Result};
+use crate::ordered::Ended;
 use crate::retry::{Attempts, Failure, Recovery, RequestClass};
 use crate::transport::{ControlTransport, Reach};
 
@@ -707,6 +708,9 @@ struct SessionState {
     /// other. Two locks would let a snapshot fall between the two writes and carry neither.
     outcomes: Mutex<Outcomes>,
     events: broadcast::Sender<Notification>,
+    /// Where the reader hands every notification, in order, when the session was started for an
+    /// ordered delivery ([`Session::start_ordered`]).
+    ordered: Option<crate::ordered::OrderedSender>,
     /// True once the connection has ended, which a holder of the session may wait for.
     ended: tokio::sync::watch::Sender<bool>,
     /// Raised each time the host answers a request on the connection with a word that
@@ -792,6 +796,41 @@ impl Session {
     ///
     /// As [`Session::start`].
     pub fn resume(transport: Arc<dyn ControlTransport>, cursors: StreamCursors) -> Result<Self> {
+        Self::begin(transport, cursors, None)
+    }
+
+    /// Starts a session whose owner takes every notification in the order the host sent it.
+    ///
+    /// The session's reader hands each notification, whole and unfiltered, to the returned
+    /// [`crate::ordered::OrderedEvents`] through one channel of `capacity` items, and waits while
+    /// the channel is full. A delivery that the host starts again at sequence 0 reaches the owner
+    /// as it came, which the broadcast would not give it. The end of the connection comes through
+    /// the same channel, behind every notification read before it, with how it ended
+    /// ([`crate::ordered::Ended`]). The owner is in place before the first frame is read, so none
+    /// is missed.
+    ///
+    /// The broadcast ([`Session::events`]) and the cursors work as they do on any session.
+    /// Answers, receipts and window renewals are the session's own and never reach the channel.
+    /// While the channel is full the reader reads nothing from the connection, so those wait
+    /// too: the owner keeps draining the channel while a call waits for its answer.
+    ///
+    /// # Errors
+    ///
+    /// As [`Session::start`].
+    pub fn start_ordered(
+        transport: Arc<dyn ControlTransport>,
+        capacity: usize,
+    ) -> Result<(Self, crate::ordered::OrderedEvents)> {
+        let (sender, events) = crate::ordered::channel(capacity);
+        let session = Self::begin(transport, StreamCursors::new(), Some(sender))?;
+        Ok((session, events))
+    }
+
+    fn begin(
+        transport: Arc<dyn ControlTransport>,
+        cursors: StreamCursors,
+        ordered: Option<crate::ordered::OrderedSender>,
+    ) -> Result<Self> {
         transport.claim_receiver()?;
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         let limits = transport.limits();
@@ -807,6 +846,7 @@ impl Session {
             cursors: Mutex::new(cursors),
             outcomes: Mutex::new(Outcomes::default()),
             events,
+            ordered,
             ended: tokio::sync::watch::channel(false).0,
             in_doubt: tokio::sync::Notify::new(),
             unsignalled: std::sync::Mutex::new(std::collections::BTreeSet::new()),
@@ -929,6 +969,17 @@ impl Session {
     /// transient code, under [`crate::retry`]'s bounded attempt count and jittered backoff. The
     /// caller sees the last answer rather than each attempt. Every other refusal comes straight
     /// back, and [`ClientError::decision`] says what the policy makes of it.
+    ///
+    /// # Dropping the call
+    ///
+    /// The caller polls the call to its end. A call is not safe to drop at an await. Dropped while
+    /// its frame is being written, it leaves what the transport leaves: on the network transport
+    /// the rest of the frame is written by the next write, so the request may reach the host with
+    /// no one waiting for its answer; on the local link a drop inside the write closes the
+    /// connection. Dropped while it waits for the answer, or for a retry, it leaves nothing: its
+    /// place among the waiting requests is given back, and an answer that comes later is ignored.
+    /// A read sent with [`Session::read_unsignalled`] keeps its identifier on the list of such reads
+    /// until its answer comes, so that a late answer raises nothing.
     ///
     /// # Errors
     ///
@@ -1120,6 +1171,17 @@ impl Session {
     /// identifier ([`Session::mutate_continuing`]), or composes it and sends it
     /// ([`Session::send`]); calling this again is a new intent under a new identifier. The host
     /// performs the identifier it is sent at most once.
+    ///
+    /// # Dropping the call
+    ///
+    /// The caller polls the call to its end. It is not safe to drop at an await, and it writes
+    /// nothing until it is polled. Dropped while its frame is being written, it leaves what the
+    /// transport leaves: on the network transport the rest of the frame is written by the next
+    /// write, so the request may reach the host with no one waiting for its answer; on the local
+    /// link a drop inside the write closes the connection. Dropped once the frame is written, it
+    /// gives back its place among the outstanding mutations and its waiter; the action stays on
+    /// the book as held and unresolved, whatever the answer was, until its owner settles it
+    /// ([`Session::settle`]). So does an action whose call was dropped inside the write.
     ///
     /// # Errors
     ///
@@ -1429,6 +1491,12 @@ impl Session {
     /// records it, and stays unresolved until the caller settles it ([`Session::settle`]),
     /// whatever the answer was.
     ///
+    /// # Dropping the call
+    ///
+    /// As [`Session::mutate`]: the caller polls the call to its end. A drop inside the write of the
+    /// frame leaves, on the network transport, a frame whose rest the next write sends, so the
+    /// request may reach the host with no one waiting; on the local link it closes the connection.
+    ///
     /// # Errors
     ///
     /// Returns a refusal when the mutation was composed on another connection, which cannot admit
@@ -1439,6 +1507,31 @@ impl Session {
             return Err(ClientError::Misdirected { repeating: false });
         }
         self.submit_composed(composed, None).await
+    }
+
+    /// Sends a composed mutation for the first time as [`Session::send`] does, and returns once its
+    /// frame is written whole to the connection, with the future that resolves at the host's
+    /// answer.
+    ///
+    /// For a request that must be on the connection before its owner closes it, as a view's
+    /// detach is: the owner waits for the write and not for the host, then closes
+    /// ([`Session::close`]). "Whole" says that the transport's writer took the frame; the library
+    /// cannot say that a peer has read it. A close ends the request's answer with the session's
+    /// end ([`ClientError::SubmissionUncertain`]): the action stays on the book as unresolved.
+    ///
+    /// # Dropping the call
+    ///
+    /// The caller polls the call to its end, as for [`Session::send`]; the answer's future, once
+    /// returned, is safe to drop and gives back the request's place among the outstanding ones.
+    ///
+    /// # Errors
+    ///
+    /// As [`Session::send`], for everything that happens before the frame is written.
+    pub async fn send_whole(&self, composed: &ComposedMutation) -> Result<Answering> {
+        if composed.composed_on != Some(self.id) {
+            return Err(ClientError::Misdirected { repeating: false });
+        }
+        self.submit_written(composed, None).await
     }
 
     /// Sends a composed mutation for the first time as [`Session::send`] does, and returns once its
@@ -1775,6 +1868,13 @@ impl Session {
         let _ = ended.wait_for(|ended| *ended).await;
     }
 
+    /// How many requests wait for an answer now, which a case reads to see what a dropped call left.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn waiting_requests(&self) -> usize {
+        self.state.waiters().pending.len()
+    }
+
     /// What the host refused the connection with, when it did: the first error it answered with
     /// request identifier zero. The session ended with it, and every call was answered with it as a
     /// host's answer to the call, so a caller that must tell a refusal of the connection from a
@@ -1891,20 +1991,28 @@ impl Drop for Waiter {
 
 /// Reads the control stream until it ends, routing what arrives.
 async fn read_loop(transport: Arc<dyn ControlTransport>, state: Arc<SessionState>) {
-    loop {
+    let ended = loop {
         let frame = match transport.recv().await {
             Ok(Some(frame)) => frame,
-            Ok(None) | Err(_) => break,
+            Ok(None) => break Ended::Finished,
+            Err(error) => break Ended::Failed(error),
         };
         if !route(&state, frame).await {
-            break;
+            // The host's refusal of the connection is recorded before the reader stops on it; a
+            // frame a client may not receive records nothing.
+            let refusal = state.waiters().refusal.clone();
+            break refusal.map_or(Ended::Unexpected, Ended::Refused);
         }
-    }
+    };
     // The control stream has ended, so the connection goes with it: closing revokes every data
     // stream it authorised and releases the transport rather than leaving queued traffic on a
     // connection nothing is reading. Every waiter learns that its answer is not coming.
     transport.close();
     state.end();
+    // Told last, behind every notification the owner of an ordered delivery was handed.
+    if let Some(ordered) = &state.ordered {
+        ordered.end(ended).await;
+    }
 }
 
 /// What a host's refusal of a mutation is, given the action the mutation carried.
@@ -2048,8 +2156,23 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
             // delivered, because a subscriber that is rebuilding wants to know why, but a duplicate
             // is not: a subscriber that already applied it would apply it twice.
             let delivery = state.cursors.lock().await.accept(&notification);
-            if delivery != Delivery::Duplicate {
-                let _ = state.events.send(notification);
+            let broadcast = delivery != Delivery::Duplicate;
+            match &state.ordered {
+                None => {
+                    if broadcast {
+                        let _ = state.events.send(notification);
+                    }
+                }
+                Some(ordered) => {
+                    // The broadcast and the cursors see it as on any session, and the owner of an
+                    // ordered delivery gets it whole after them, however it numbers: the owner
+                    // decides what a restarted sequence means. The wait for room in the owner's
+                    // channel holds no lock.
+                    if broadcast && state.events.receiver_count() > 0 {
+                        let _ = state.events.send(notification.clone());
+                    }
+                    ordered.deliver(notification).await;
+                }
             }
         }
         ControlFrame::Event(ControlEvent::ActionWindowRenewed(window)) => {

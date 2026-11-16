@@ -58,6 +58,7 @@ pub mod error;
 pub mod input;
 pub mod ipc;
 pub mod mailbox_reader;
+pub mod ordered;
 pub mod organisation;
 pub mod pairing;
 // The module documents itself. A doc comment here as well would be joined to its own, and the links
