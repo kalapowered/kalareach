@@ -1239,7 +1239,8 @@ fn message_of(error: &CryptoError) -> String {
 /// demonstration run takes [`Self::File`] and has to name it, on a command line or in the setup of
 /// the daemon it starts, every time. The selection is not recorded anywhere: it is the caller's,
 /// made at each start, and [`open_store`]'s own `.store-kind` record continues to answer for the
-/// host rather than for a run.
+/// host rather than for a run. A run that names [`Self::File`] over a record that names the
+/// platform store is refused, because the host's keys are not in the directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoreSelection {
     /// The operating system's credential store, with the fallback section 10 offers where it does.
@@ -1257,8 +1258,37 @@ impl StoreSelection {
     pub fn open(self, service: &str, directory: &Path) -> Result<OpenedStore> {
         match self {
             Self::Platform => open_store(service, directory),
-            Self::File => open_store_in(directory),
+            Self::File => {
+                refuse_the_directory_over_a_recorded_platform_store(directory)?;
+                open_store_in(directory)
+            }
         }
+    }
+}
+
+/// Refuses the directory store for a host whose record names the platform store.
+///
+/// The keys of a host that [`open_store`] recorded the platform store for are in that store. The
+/// directory store would find none there and make a new set, which is a new identity for the host,
+/// so the start that names it is refused. The record is written only where there is a choice to
+/// record, so on a platform with no fallback there is no record to read and nothing to refuse.
+///
+/// # Errors
+///
+/// Returns [`CryptoError::SecretStore`] when the record names the platform store, or when it
+/// cannot be read.
+fn refuse_the_directory_over_a_recorded_platform_store(directory: &Path) -> Result<()> {
+    if !FILE_FALLBACK_SUPPORTED {
+        return Ok(());
+    }
+    match read_recorded_kind(directory)? {
+        Some(StoreKind::Platform) => Err(CryptoError::SecretStore {
+            message: "This host keeps its keys in the system credential store, so it does not \
+                      start with `--secret-store file`. Start it without that option. No key was \
+                      made or changed."
+                .to_owned(),
+        }),
+        Some(StoreKind::FileFallback) | None => Ok(()),
     }
 }
 
