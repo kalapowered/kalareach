@@ -15,6 +15,7 @@ use kr_transport::window::AcceptedDeadline;
 
 use crate::config::ceilings::CeilingRefusal;
 use crate::grants::policy::HeldBound;
+use crate::service::Footing;
 use crate::service::net::lifetimes::GrantStanding;
 
 use super::acting::{Acting, Held};
@@ -40,15 +41,15 @@ pub(super) struct Asked {
     /// the method it was kept for, so the two differ there.
     pub(super) shown_as: Method,
     /// For an answer kept from an earlier submission of the action, which a device is shown only
-    /// as a read of what that submission produced, the revision of the authority the request was
+    /// as a read of what that submission produced, the footing of the authority the request was
     /// admitted under. The answer is written only while the standing it was checked under holds
     /// ([`Answers::Kept`]).
-    kept: Option<AuthorityRevision>,
-    /// For a mutation, the revision of the authority the request was admitted under. A reply that
+    kept: Option<Footing>,
+    /// For a mutation, the footing of the authority the request was admitted under. A reply that
     /// names a reused identifier is read from a record whatever door found it (the route, the
     /// door's own stores, a service), and is written only while the standing it was checked under
     /// holds ([`Answers::Conflict`]).
-    admitted: Option<AuthorityRevision>,
+    admitted: Option<Footing>,
     /// For a page of retained output, the privacy state it was read under, which the page is
     /// released under ([`RemoteConnection::write_answer`]).
     pub(super) read_under: Option<ReadUnder>,
@@ -63,8 +64,8 @@ impl Asked {
         }
     }
 
-    /// Returns the same decision, for a request admitted under the authority at `admitted`.
-    pub(super) fn admitted_under(self, admitted: AuthorityRevision) -> Self {
+    /// Returns the same decision, for a request admitted under the authority `admitted` stands on.
+    pub(super) fn admitted_under(self, admitted: Footing) -> Self {
         Self {
             admitted: Some(admitted),
             ..self
@@ -72,10 +73,10 @@ impl Asked {
     }
 
     /// Returns the same decision, for an answer kept from an earlier submission of the action
-    /// whose request was admitted under the authority at `admitted`.
-    pub(super) fn kept(self, admitted: AuthorityRevision) -> Self {
+    /// whose request was admitted under the authority `admitted` stands on.
+    pub(super) fn kept(self, admitted: Footing) -> Self {
         Self {
-            kept: Some(admitted),
+            kept: Some(admitted.clone()),
             admitted: Some(admitted),
             ..self
         }
@@ -92,12 +93,12 @@ impl Asked {
     fn answers(&self, frame: &ControlFrame) -> Answers {
         if self.shown_as.entry().effect != EffectClass::Write {
             Answers::Read
-        } else if let Some(admitted) = self.kept {
-            Answers::Kept(admitted)
-        } else if let Some(admitted) = self.admitted
+        } else if let Some(admitted) = &self.kept {
+            Answers::Kept(admitted.clone())
+        } else if let Some(admitted) = &self.admitted
             && crate::given::names_a_reused_identifier(frame)
         {
-            Answers::Conflict(admitted)
+            Answers::Conflict(admitted.clone())
         } else {
             Answers::Action
         }
@@ -213,13 +214,13 @@ impl RemoteConnection {
             // the device may not be shown. A reused identifier has no effect of its own, so the
             // device is told the refusal of the check that failed.
             match asked.answers(&frame) {
-                Answers::Kept(admitted) if self.admitted_to_answer(admitted).is_err() => {
+                Answers::Kept(admitted) if self.admitted_to_answer_under(&admitted).is_err() => {
                     return output
                         .send(&failure(request_id, super::outcome_not_shown()))
                         .await;
                 }
                 Answers::Conflict(admitted) => {
-                    if let Err(refusal) = self.admitted_to_answer(admitted) {
+                    if let Err(refusal) = self.admitted_to_answer_under(&admitted) {
                         return output.send(&failure(request_id, refusal)).await;
                     }
                 }
@@ -512,6 +513,34 @@ impl RemoteConnection {
                 deadline: None,
             })
             .map_err(|error| error.to_protocol_error())
+    }
+
+    /// [`Self::admitted_to_answer`], asked of the footing an answer carries.
+    fn admitted_to_answer_under(
+        &self,
+        standing: &Footing,
+    ) -> std::result::Result<(), ProtocolError> {
+        match standing.admitted_revision() {
+            Some(admitted) => self.admitted_to_answer(admitted),
+            // A footing that names no registration is refused as a registration that has gone.
+            None => Err(crate::service::Lapse::Admission(
+                crate::authority::AdmissionLapse::Deregistered,
+            )
+            .refusal()
+            .to_protocol_error()),
+        }
+    }
+
+    /// The footing of a request of this connection that was admitted under `admitted`: the
+    /// revision it was admitted under and the latch of this connection's write boundary, which is
+    /// the latch its registration holds. The boundary is built with the connection, before any
+    /// request is decided on it, so the registration has its latch when the footing is made.
+    pub(super) fn footing_of(&self, admitted: AuthorityRevision) -> Footing {
+        self.controller.footing_of_a_network_request(
+            self.connection_id,
+            admitted,
+            &self.authority.latch,
+        )
     }
 
     /// Resolves one method against the registry at this connection's ingress.
