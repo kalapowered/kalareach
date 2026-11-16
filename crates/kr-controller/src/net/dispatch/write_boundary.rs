@@ -4084,3 +4084,117 @@ async fn an_answer_whose_grant_expires_while_the_writer_waits_for_the_shares_loc
         drop(controller);
     }
 }
+
+/// When another device's barrier moves the revision, against the two calls of `admits` that the
+/// stream's sender makes before the first byte of a frame goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BarrierAt {
+    /// Never: the control.
+    Never,
+    /// Before the sender's first, empty call of `admits`.
+    BeforeTheFirstCall,
+    /// After that call, while the peer has room for none of the rest of the frame.
+    WhileThePeerHasNoRoom,
+}
+
+/// KR-REQ-09.12: the stream's sender calls `admits` twice for one frame: first with an empty
+/// attempt, before anything is written, and again with the bytes. The first call that passes
+/// counts as a byte that may have gone, so a refusal at the second call, which a revision that
+/// another device's barrier moved gives a kept answer admitted under the old one, resets the
+/// stream and closes the connection, where a refusal at the first call leaves the stream whole and
+/// the answer is decided again. This pins what the writer does for both, and the control writes
+/// the whole answer. The watch that polls while the write waits ends the write the same way when
+/// its poll comes first, so the second row holds whichever of the two sees the barrier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_after_the_senders_first_empty_call_closes_the_connection() {
+    use crate::service::Reach;
+
+    for barrier_at in [
+        BarrierAt::Never,
+        BarrierAt::BeforeTheFirstCall,
+        BarrierAt::WhileThePeerHasNoRoom,
+    ] {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = super::super::tests::daemon(&temp).await;
+        let stream = HeldStream::new(true);
+        let authority = authority_for(
+            &controller,
+            ActorId::new("device:test").expect("a principal"),
+        );
+        let footing = controller.footing_of_a_network_request(
+            authority.connection_id,
+            controller.policy().authority_revision(),
+            &authority.latch,
+        );
+        let output = Arc::new(RemoteOutput::writing_to(
+            Box::new(Arc::clone(&stream)),
+            authority,
+        ));
+        let writing = tokio::spawn({
+            let output = Arc::clone(&output);
+            async move {
+                output
+                    .write_held(&batch(), &[], None, Answers::Kept(footing), None)
+                    .await
+            }
+        });
+        let barrier = || async {
+            let other = DeviceId::new(kr_ipc::new_uuid());
+            let debt = controller
+                .owe_debt("the revocation of a device", Reach::Device(other))
+                .expect("the debt is written");
+            let own = controller.publish_debts(&[(debt, Reach::Device(other))]);
+            controller
+                .barrier(own)
+                .await
+                .expect("the barrier is raised");
+        };
+        // The writer has started to wait for the stream's writer.
+        stream.waited(1).await;
+        if barrier_at == BarrierAt::BeforeTheFirstCall {
+            barrier().await;
+        }
+        stream.writer.add_permits(1);
+        if barrier_at == BarrierAt::WhileThePeerHasNoRoom {
+            // The first call passed and the peer took the first part: the second wait.
+            stream.waited(1).await;
+            assert_eq!(stream.reached(), vec![Reached::Part]);
+            barrier().await;
+        }
+        if barrier_at != BarrierAt::BeforeTheFirstCall {
+            stream
+                .room
+                .as_ref()
+                .expect("the peer stops reading")
+                .add_permits(1);
+        }
+        let written = writing.await.expect("the write ends");
+        match barrier_at {
+            BarrierAt::Never => {
+                assert_eq!(written, Written::Sent, "the control");
+                assert_eq!(stream.frames(), vec![batch()]);
+                assert!(!stream.closed());
+            }
+            BarrierAt::BeforeTheFirstCall => {
+                assert_eq!(written, Written::Undecided, "refused at the first call");
+                assert!(stream.reached().is_empty());
+                assert!(!stream.closed(), "the stream is whole");
+            }
+            BarrierAt::WhileThePeerHasNoRoom => {
+                assert_eq!(
+                    written,
+                    Written::Withdrawn,
+                    "refused at the second call, after the first counted as begun"
+                );
+                assert_eq!(stream.reached(), vec![Reached::Part]);
+                assert!(
+                    stream.frames().is_empty(),
+                    "no frame reached the peer whole"
+                );
+                assert!(stream.closed(), "the connection is closed");
+            }
+        }
+        drop(output);
+        drop(controller);
+    }
+}
