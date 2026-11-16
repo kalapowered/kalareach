@@ -84,6 +84,16 @@ use user_manager::{STREAMS_DEADLINE, TEARDOWN_BOUND, bounded, read_aside, spawni
 /// happens.
 const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
 
+/// How long a case waits, once `kr` has said that the daemon it started did not answer within its
+/// own 30 seconds, for that daemon to answer.
+///
+/// The command's sentence is true and stays: a machine under load can take longer than the
+/// command's bound to bring a daemon up. The figure is the suite's long bound, the one every other
+/// wait of this suite for a daemon is given (a daemon started by hand is waited for as long), so
+/// that a start 30 seconds late is stood and a daemon that has still not answered 120 seconds
+/// after the command's report, 150 seconds after it was started, is not taken for a slow one.
+const SLOW_START_BOUND: Duration = LIVENESS_DEADLINE;
+
 /// The name the real daemon is placed under, beside the script `kr` runs as the daemon.
 const DAEMON_UNDER_TEST: &str = "kr-controller-under-test";
 
@@ -659,6 +669,80 @@ impl Standalone {
         ])
     }
 
+    /// Runs `command`, a `kr new` of this tree, to its end, for a case whose claim is not the start
+    /// of the daemon: the daemon is how the case gets a session.
+    ///
+    /// Where `kr` says that the daemon it started did not answer within its start bound, having
+    /// waited the whole of it, and the daemon is still coming up, this waits for it to answer, up
+    /// to [`SLOW_START_BOUND`], and runs the command again, which finds the daemon and does what it
+    /// was run for. The output of the command that ran last is returned. Any other outcome is
+    /// returned as it is: the cases that claim something about the start itself do not call this.
+    ///
+    /// A daemon that is not running, or that does not answer within the bound, fails the case with
+    /// what `kr` said and the end of the daemon's log.
+    fn finish_through_a_slow_start(&self, what: &str, command: impl Fn() -> Command) -> Output {
+        let began = Instant::now();
+        let output = start(command()).finish(what);
+        if !reports_the_start_was_slow(&output, began.elapsed()) {
+            return output;
+        }
+        self.wait_for_the_started_daemon(what, &output);
+        start(command()).finish(what)
+    }
+
+    /// Waits until the daemon `kr` started answers, for at most [`SLOW_START_BOUND`], and fails the
+    /// case, with what `kr` said, as soon as nothing this tree started is running any more: every
+    /// supervisor has ended, or every daemon the supervisors started has.
+    ///
+    /// A supervisor records itself before it can do anything else, so one that has not recorded
+    /// itself by the time the stream deadline has passed is not there. One that is waiting out a
+    /// delay has recorded itself and has no daemon yet, which is a daemon still to come.
+    fn wait_for_the_started_daemon(&self, what: &str, said: &Output) {
+        let ended = |identity: &kr_protocol::identity::ProcessStartIdentity| {
+            kr_ipc::identity::process_state(identity) == ProcessState::Ended
+        };
+        let begun = Instant::now();
+        loop {
+            if self.answers() {
+                return;
+            }
+            let (supervisors, _) = self.identities(STARTS);
+            let (daemons, _) = self.identities(LAUNCHED);
+            let reason = if supervisors.is_empty() && begun.elapsed() >= STREAMS_DEADLINE {
+                Some("no process this command started has recorded itself".to_owned())
+            } else if !supervisors.is_empty() && supervisors.iter().all(ended) {
+                Some("every process this command started has ended".to_owned())
+            } else if !daemons.is_empty()
+                && daemons.len() >= supervisors.len()
+                && daemons.iter().all(ended)
+            {
+                Some("every daemon this command started has ended".to_owned())
+            } else if begun.elapsed() >= SLOW_START_BOUND {
+                Some(format!(
+                    "the daemon did not answer within {SLOW_START_BOUND:?} after the command said it was slow"
+                ))
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                let log = std::fs::read_to_string(
+                    self.tree
+                        .environment()
+                        .state_dir()
+                        .join(kr_cli::startup::LOG_FILE),
+                )
+                .unwrap_or_default();
+                let lines: Vec<&str> = log.lines().collect();
+                let tail = lines[lines.len().saturating_sub(20)..].join("\n");
+                panic!(
+                    "{what}: {reason}; it said {}; the end of the daemon's log:\n{tail}",
+                    String::from_utf8_lossy(&said.stdout)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// The row of `kr doctor`'s effective configuration that names `key`.
     fn doctor_row(&self, key: &str) -> Value {
         let output = start(self.kr(&["--json", "doctor"])).finish("kr doctor");
@@ -944,6 +1028,23 @@ fn document(output: &Output, what: &str) -> Value {
             String::from_utf8_lossy(&output.stderr)
         )
     })
+}
+
+/// Whether a command's outcome is the one `kr` ends with when the daemon it started did not answer
+/// within its start bound: exit 1 and the document of an unfinished command, code
+/// `ENVIRONMENT_UNAVAILABLE`, after the command had run for the whole of the product's own start
+/// bound. A command that reports the same at once has not waited and is not a slow start. Its
+/// words are not read; the caller establishes that the daemon is still coming up from the
+/// processes this test's tree started.
+fn reports_the_start_was_slow(output: &Output, took: Duration) -> bool {
+    let Ok(said) = serde_json::from_slice::<Value>(&output.stdout) else {
+        return false;
+    };
+    took >= kr_cli::startup::START_BOUND
+        && output.status.code() == Some(1)
+        && said["ok"] == false
+        && said["exit_code"] == 1
+        && said["code"] == "ENVIRONMENT_UNAVAILABLE"
 }
 
 /// Every path under `root`, and the content of every file, in order.
@@ -1919,7 +2020,8 @@ fn a_session_made_with_no_shell_mode_takes_the_hosts_default_in_the_order_sectio
     host.select_standalone();
 
     // Nothing chosen: the product default, a managed shell, which `/bin/sh` cannot be.
-    let refused = start(host.new_session_with_no_shell_mode()).finish("kr new");
+    let refused =
+        host.finish_through_a_slow_start("kr new", || host.new_session_with_no_shell_mode());
     let failed = document(&refused, "kr new");
     assert!(!refused.status.success(), "{failed}");
     assert_eq!(failed["code"], "SHELL_INTEGRATION_UNSUPPORTED", "{failed}");
@@ -1942,7 +2044,8 @@ fn a_session_made_with_no_shell_mode_takes_the_hosts_default_in_the_order_sectio
         host.document().display().to_string(),
         "{row}"
     );
-    let output = start(host.new_session_with_no_shell_mode()).finish("kr new");
+    let output =
+        host.finish_through_a_slow_start("kr new", || host.new_session_with_no_shell_mode());
     let created = document(&output, "kr new");
     assert!(output.status.success(), "{created}");
     assert_eq!(created["shell_mode"], "native_compat", "{created}");
@@ -1978,7 +2081,7 @@ fn kr_host_shell_mode_chooses_and_clears_the_default_for_new_sessions() {
     host.select_standalone();
     // The command asks the running daemon what is in force, so one is started the way a person's
     // first `kr new` starts it.
-    let output = start(host.new_session()).finish("kr new");
+    let output = host.finish_through_a_slow_start("kr new", || host.new_session());
     let created = document(&output, "kr new");
     assert!(output.status.success(), "{created}");
     let shell_mode = |arguments: &[&str]| {
@@ -2110,7 +2213,7 @@ fn kr_req_26_42_an_ordinary_user_with_no_account_and_no_managed_service_runs_a_h
 fn kr_host_push_gateways_lists_and_clears_the_gateways_a_credential_may_name() {
     let host = Standalone::create();
     host.select_standalone();
-    let output = start(host.new_session()).finish("kr new");
+    let output = host.finish_through_a_slow_start("kr new", || host.new_session());
     let created = document(&output, "kr new");
     assert!(output.status.success(), "{created}");
     let push_gateways = |arguments: &[&str]| {
@@ -2236,7 +2339,7 @@ fn kr_host_push_gateways_with_nothing_to_change_fails_when_the_host_did_not_put_
     )
     .expect("writes the configuration document");
     host.hold_a_credential_issued_by(gateway);
-    let output = start(host.new_session()).finish("kr new");
+    let output = host.finish_through_a_slow_start("kr new", || host.new_session());
     let created = document(&output, "kr new");
     assert!(output.status.success(), "{created}");
     let show = || {
@@ -2540,7 +2643,7 @@ fn kr_host_push_gateways_says_a_restart_is_needed_when_the_document_put_right_is
 fn status_reports_each_terminal_attachments_presentation_and_its_reason() {
     let host = Standalone::create();
     host.select_standalone();
-    let output = start(host.new_session()).finish("kr new");
+    let output = host.finish_through_a_slow_start("kr new", || host.new_session());
     let created = document(&output, "kr new");
     assert!(output.status.success(), "{created}");
     let session_id: SessionId = created["session_id"]
@@ -5360,7 +5463,7 @@ impl Typing {
 fn a_host_with_a_session() -> (Standalone, SessionId, Value, u32) {
     let host = Standalone::create();
     host.select_standalone();
-    let output = start(host.new_session()).finish("kr new");
+    let output = host.finish_through_a_slow_start("kr new", || host.new_session());
     let created = document(&output, "kr new");
     assert!(output.status.success(), "{created}");
     let session_id: SessionId = created["session_id"]
