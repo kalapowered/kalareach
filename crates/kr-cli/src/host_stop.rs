@@ -7614,4 +7614,6 @@ mod tests {
         let error = unmade_request(id, &Shown::said("a failure"), Unmade::OwnFault);
         assert_eq!(error.exit_code(), code_of(Exit::Unavailable));
     }
+
+    mod guide;
 }
