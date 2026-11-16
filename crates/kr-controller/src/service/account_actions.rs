@@ -230,12 +230,15 @@ impl Controller {
     /// not asked: that request has answered, and its connection ends with the command.
     ///
     /// The lease is read first, which waits for the policy lock that a policy commit holds across
-    /// its storage writes. The footing's one question is asked after that, with the bound of the
-    /// lease that reading found, and reads atomics and clocks alone: nothing but instructions
-    /// stands between it and the write that the caller goes on to. A bound whose cell moved to
-    /// another lineage between the reading and the question is not decided by the question: the
-    /// lease is read again and the question asked with the new bound. Where the sign-in stands,
-    /// the host is given to the caller as the guard to hold until its write has returned.
+    /// its storage writes. The guard is made next, from the host and the lease's bound that the
+    /// reading found, and the footing's one question is asked through it. The question reads
+    /// atomics and clocks alone. Nothing is allocated and nothing is freed between it and the write
+    /// that the caller goes on to: the guard takes what it is given, holds the host and the
+    /// footing with its bound, and is returned as it is made. The host's count is lowered once
+    /// when this call returns, and never to zero, because the guard holds it. A bound whose cell
+    /// moved to another lineage between the reading and the question is not decided by the
+    /// question: the lease is read again and a guard made with the new bound. Where the sign-in
+    /// stands, the guard is given to the caller to hold until its write has returned.
     pub(super) fn sign_in_lasting(self: &Arc<Self>, method: Method) -> crate::account::Lasting {
         let controller = Arc::downgrade(self);
         Arc::new(move || {
@@ -245,19 +248,19 @@ impl Controller {
                     .ok_or_else(|| ControllerError::PermissionDenied {
                         detail: "this host is stopping".to_owned(),
                     })?;
-            let footing = Footing::untargeted(Arc::clone(&controller.copies));
             loop {
                 let held = controller
                     .local_hold(method)
                     .map_err(ControllerError::from)?;
                 #[cfg(feature = "testing")]
                 controller.before_the_last_fence_read.wait();
-                let asked = match held.bound {
-                    Some(bound) => footing.clone().holding(bound).ask(Ask::SIGN_IN),
-                    None => footing.ask(Ask::SIGN_IN).map_err(LeasedLapse::from),
-                };
-                match asked {
-                    Ok(()) => return Ok(crate::account::Guard::new(controller)),
+                let guard = crate::account::Guard::holding(
+                    Arc::clone(&controller),
+                    Footing::untargeted(Arc::clone(&controller.copies)),
+                    held.bound,
+                );
+                match guard.ask(Ask::SIGN_IN) {
+                    Ok(()) => return Ok(guard),
                     Err(LeasedLapse::BoundMoved) => {}
                     Err(LeasedLapse::Lapse(lapse)) => return Err(lapse.refusal()),
                 }

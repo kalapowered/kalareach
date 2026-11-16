@@ -1442,7 +1442,7 @@ async fn an_open_call_holds_the_managed_account_and_not_the_storage_account() {
     storage
         .sign_in(
             &|| Ok(()),
-            std::sync::Arc::new(|| Ok(kr_controller::account::Guard::new(()))),
+            std::sync::Arc::new(|| Ok(kr_controller::account::Guard::none())),
         )
         .await
         .expect("the storage account's sign-in is not held by the call");

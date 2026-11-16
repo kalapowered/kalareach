@@ -623,7 +623,7 @@ async fn a_sign_in_ends_a_waiting_sign_in_of_either_account_and_never_a_grant() 
     managed_account
         .sign_in(
             &|| Ok(()),
-            std::sync::Arc::new(|| Ok(kr_controller::account::Guard::new(()))),
+            std::sync::Arc::new(|| Ok(kr_controller::account::Guard::none())),
         )
         .await
         .expect("the managed sign-in starts");
@@ -634,7 +634,7 @@ async fn a_sign_in_ends_a_waiting_sign_in_of_either_account_and_never_a_grant() 
     storage_account
         .sign_in(
             &|| Ok(()),
-            std::sync::Arc::new(|| Ok(kr_controller::account::Guard::new(()))),
+            std::sync::Arc::new(|| Ok(kr_controller::account::Guard::none())),
         )
         .await
         .expect("the storage sign-in starts and takes the address");
@@ -658,7 +658,7 @@ async fn a_sign_in_ends_a_waiting_sign_in_of_either_account_and_never_a_grant() 
     managed_account
         .sign_in(
             &|| Ok(()),
-            std::sync::Arc::new(|| Ok(kr_controller::account::Guard::new(()))),
+            std::sync::Arc::new(|| Ok(kr_controller::account::Guard::none())),
         )
         .await
         .expect("the managed sign-in starts again and takes the address");
@@ -673,7 +673,7 @@ async fn a_sign_in_ends_a_waiting_sign_in_of_either_account_and_never_a_grant() 
     managed_account
         .sign_in(
             &|| Ok(()),
-            std::sync::Arc::new(|| Ok(kr_controller::account::Guard::new(()))),
+            std::sync::Arc::new(|| Ok(kr_controller::account::Guard::none())),
         )
         .await
         .expect("a third managed sign-in starts");
