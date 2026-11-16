@@ -248,9 +248,9 @@ impl Producer {
     /// session that something holds finds it.
     ///
     /// It is made as the fact joins the others, before the session is waited for, and with the
-    /// facts locked, so the writes go in the order the facts were joined in. A turn, a question or
-    /// a launch that begins while a storage call holds the session is therefore in the answer of
-    /// a read that cannot take the session. The domain's lock is taken last, for the write alone.
+    /// facts locked, so the writes go in the order the facts were joined in. A turn or a question
+    /// that begins while a storage call holds the session is therefore in the answer of a read
+    /// that cannot take the session. The domain's lock is taken last, for the write alone.
     fn record(&self, held: &Held) {
         let Some(runtime) = self.runtime.upgrade() else {
             return;

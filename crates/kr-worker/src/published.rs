@@ -11,17 +11,19 @@
 //! be admitted a moment before the copy says so. What the answer says about the lifecycle, what the
 //! application is doing, and how many launches wait for the reader, is for that reason read from
 //! the input domain, which holds all three as they are, and never from the copy. The application's
-//! producer writes what the application is doing there before it waits for the session, so a turn,
-//! a question or a launch that begins while a storage call holds the session is in the answer.
+//! producer writes what the application is doing there before it waits for the session, so a turn
+//! or a question that begins while a storage call holds the session is in the answer. A launch
+//! that begins then is not: it is registered under the session, which the request waits for.
 //!
 //! Three things the answer does not follow:
 //!
 //! - A root that exits while a storage call holds the session stays `Live` in the answer. Only the
 //!   supervision sees the exit, and it waits for the session, so the domain still says `Live`, and
 //!   the answer says so with the `root_process` of the root that has ended.
-//! - An answer given between the domain's change to `Closed` and the copy's publication of the
-//!   closure says `Closed` with no closure record, and the application name the copy had; and the
-//!   domain's application state, which the closure clears, can be the one it had before.
+//! - An answer given between the domain's change to `Closed` and the closure's publication says
+//!   `Closed` with no closure record, and with the application name the copy had. The application
+//!   state, which the closure clears in the statement after it sets `Closed`, can in that moment
+//!   be the one the session had before. For the host's sleep demand that is more demand, not less.
 //! - A record of what a worker said, kept by a reader that asks again and again, can take an older
 //!   copy of the same stage in the place of a newer one, because two answers of one stage are not
 //!   ordered by anything the answer carries.
