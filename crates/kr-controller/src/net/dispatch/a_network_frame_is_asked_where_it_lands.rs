@@ -464,11 +464,11 @@ async fn a_kept_answer_is_not_written_when_the_grant_ends_while_the_feed_waits_f
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AtTheBound {
     /// A restrictive change ends the bound at its cell.
-    ItsCellEnds,
+    CellEnds,
     /// The bound's deadline passes on the continuous clock.
-    ItsDeadlinePasses,
+    DeadlinePasses,
     /// The lease is renewed, which publishes another snapshot of the cell.
-    ItsCellPublishesAnew,
+    CellPublishesAnew,
 }
 
 /// How a write ends, and what was handed to the stream, when `at` happens to the lease's bound of
@@ -531,9 +531,9 @@ async fn written_with_the_bound_changed(
         .expect("the wait ends")
         .expect("the writer reaches the pause after it copied the cell");
     match at {
-        AtTheBound::ItsCellEnds => cell.end(),
-        AtTheBound::ItsDeadlinePasses => continuous.advance(Duration::from_secs(15 * 60 + 30)),
-        AtTheBound::ItsCellPublishesAnew => {
+        AtTheBound::CellEnds => cell.end(),
+        AtTheBound::DeadlinePasses => continuous.advance(Duration::from_secs(15 * 60 + 30)),
+        AtTheBound::CellPublishesAnew => {
             let held = cell.load();
             cell.publish(
                 held.identity,
@@ -559,8 +559,7 @@ async fn written_with_the_bound_changed(
 /// found ended by the clock read that follows the copy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_bound_is_judged_by_the_copy_taken_before_the_first_clock_read() {
-    let (first, second, frames) =
-        written_with_the_bound_changed(AtTheBound::ItsCellEnds, false).await;
+    let (first, second, frames) = written_with_the_bound_changed(AtTheBound::CellEnds, false).await;
     assert_eq!(
         first,
         Written::Sent,
@@ -570,7 +569,7 @@ async fn a_bound_is_judged_by_the_copy_taken_before_the_first_clock_read() {
     assert_eq!(frames.len(), 1, "only the first write reached the stream");
 
     let (first, second, frames) =
-        written_with_the_bound_changed(AtTheBound::ItsCellPublishesAnew, true).await;
+        written_with_the_bound_changed(AtTheBound::CellPublishesAnew, true).await;
     assert_eq!(
         first,
         Written::Sent,
@@ -581,7 +580,7 @@ async fn a_bound_is_judged_by_the_copy_taken_before_the_first_clock_read() {
 
     for relayed in [false, true] {
         let (first, second, frames) =
-            written_with_the_bound_changed(AtTheBound::ItsDeadlinePasses, relayed).await;
+            written_with_the_bound_changed(AtTheBound::DeadlinePasses, relayed).await;
         assert_eq!(
             first,
             Written::Undecided,
