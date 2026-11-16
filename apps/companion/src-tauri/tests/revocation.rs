@@ -3413,6 +3413,50 @@ async fn kr_req_17_48_a_publication_turned_back_for_want_of_capacity_names_the_a
     }
 }
 
+/// What the Devices page is sent when a publication is turned back, as the golden file the page's
+/// own cases read too holds it: the whole text, and the action the page adds a line for.
+fn devices_page_sent(kind: &str) -> Value {
+    let all: Value =
+        serde_json::from_str(include_str!("../../test/fixtures/capacity-refusals.json"))
+            .expect("the golden file reads");
+    all["devices_page"][kind].clone()
+}
+
+/// KR-REQ-17.48: a publication turned back for want of capacity is sent to the page as one text
+/// that carries the service's own delay and list, and asks nothing more of the page, so a person
+/// never reads a second instruction chosen by the code after it. A refusal that names neither a
+/// delay nor a list is a plain failure, whose action the page still adds a line for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_17_48_a_publication_that_says_its_own_wait_is_sent_with_no_action_beside_it() {
+    const NAMED: [&str; 2] = [
+        "An authority feed service that you run yourself.",
+        "A path this version has never heard of.",
+    ];
+    for (kind, moment) in [
+        ("delay", short_budget(503, "SERVICE_UNAVAILABLE", 120, &[])),
+        (
+            "both",
+            short_budget(503, "SERVICE_UNAVAILABLE", 120, &NAMED),
+        ),
+        (
+            "plain",
+            Moment::Refuse {
+                status: 503,
+                code: "SERVICE_UNAVAILABLE",
+                retry_after_seconds: None,
+            },
+        ),
+    ] {
+        let rig = Rig::start().await;
+        rig.sharing_with_the_phone().await;
+        let lost = revoke_with_the_publication(&rig, moment).await;
+        let sent = devices_page_sent(kind);
+        assert_eq!(lost["message"], sent["message"], "{kind}");
+        assert_eq!(lost["user_action"], sent["user_action"], "{kind}");
+        assert_eq!(lost["code"], sent["code"], "{kind}");
+    }
+}
+
 /// A request waits in the feed at one service, and the sync service this computer uses is changed:
 /// the feed at the new service shows nothing of it, which is not the request gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
