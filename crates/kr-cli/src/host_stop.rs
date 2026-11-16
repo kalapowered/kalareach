@@ -1553,8 +1553,8 @@ mod answered {
     use kr_protocol::ids::ControllerGeneration;
 
     /// What shows that a daemon answered: its answer to a look (the generation that it reported),
-    /// or its reply to the greeting that cannot be used. Nothing else builds one, so no result that
-    /// says "a host still answers" can be made without an answer in hand.
+    /// or a reply of its own that cannot be used. Nothing else builds one, so no result that says
+    /// "a host still answers" can be made without an answer in hand.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) struct Answered {
         /// The generation that the answering daemon reported; none for an unusable reply.
@@ -1569,14 +1569,14 @@ mod answered {
             }
         }
 
-        /// The daemon's own reply, where `error` is one: a frame that cannot be read, a message of
-        /// another kind, a version that does not fit, or a rejection. A closure or a fault of the
-        /// socket is no reply.
+        /// The daemon's own reply, where `error` is one: a message of another kind, a version that
+        /// does not fit, or a rejection. A closure, a fault of the socket and a frame that cannot
+        /// be read are no reply: a daemon that goes can leave a frame that is cut or spoiled, and
+        /// that is judged by a look at the daemon's end.
         pub(super) fn of_reply(error: &IpcError) -> Option<Self> {
             matches!(
                 error,
-                IpcError::Frame(_)
-                    | IpcError::UnexpectedMessage(_)
+                IpcError::UnexpectedMessage(_)
                     | IpcError::VersionMismatch { .. }
                     | IpcError::PeerRejected { .. }
                     | IpcError::PeerUnknown { .. }
