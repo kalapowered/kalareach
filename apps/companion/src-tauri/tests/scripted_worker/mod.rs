@@ -545,6 +545,13 @@ impl Link {
         call_of(frame)
     }
 
+    /// The next call the view makes, and none if it makes none within `bound`: a case that must
+    /// fail by an assertion of its own, and not by the watchdog, asks for a call this way.
+    pub async fn call_within(&mut self, bound: Duration) -> Option<Call> {
+        let frame = tokio::time::timeout(bound, self.wire.read()).await.ok()??;
+        Some(call_of(frame))
+    }
+
     /// The next call the view made, if it is already on the connection, and none if it is not: this
     /// never waits. A frame is written whole by one write, so a call that the view's write
     /// returned from is readable here.

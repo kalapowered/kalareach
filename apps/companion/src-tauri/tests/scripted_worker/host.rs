@@ -13,11 +13,15 @@
 
 use std::sync::Arc;
 
-use kr_client::transport::{ControlTransport, NetworkTransport};
+use kr_client::transport::{
+    ControlTransport, DeviceEnd, NetworkTransport, StreamOpener, TransportFuture,
+};
 use kr_ipc::paths::EnvironmentPaths;
 use kr_ipc::testing::TempHost;
+use kr_protocol::envelope::ControlFrame;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::frame::StreamKind;
+use kr_protocol::hello::{ActionWindow, ReceiveLimits};
 use kr_protocol::ids::{ConnectionId, EnvironmentId, GrantId, SessionId};
 use kr_protocol::input::InputWindow;
 use kr_protocol::method::Method;
@@ -48,6 +52,63 @@ pub enum Takes {
     Refuses(ErrorCode, &'static str),
 }
 
+/// The view's connection as it writes on it: every frame that a send took whole is kept, in order,
+/// for a case that must see what the view wrote and cannot read it back from a connection that the
+/// view then closes at once.
+#[derive(Debug)]
+struct Recorded {
+    inner: Arc<dyn ControlTransport>,
+    sent: Arc<std::sync::Mutex<Vec<ControlFrame>>>,
+}
+
+impl ControlTransport for Recorded {
+    fn connection_id(&self) -> ConnectionId {
+        self.inner.connection_id()
+    }
+    fn limits(&self) -> ReceiveLimits {
+        self.inner.limits()
+    }
+    fn initial_action_window(&self) -> ActionWindow {
+        self.inner.initial_action_window()
+    }
+    fn ended_by_this_device(&self) -> Option<DeviceEnd> {
+        self.inner.ended_by_this_device()
+    }
+    fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()> {
+        Box::pin(async move {
+            let sent = self.inner.send(frame).await;
+            if sent.is_ok() {
+                self.sent
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(frame.clone());
+            }
+            sent
+        })
+    }
+    fn claim_receiver(&self) -> kr_client::Result<()> {
+        self.inner.claim_receiver()
+    }
+    fn stream_opener(&self) -> Option<Arc<dyn StreamOpener>> {
+        self.inner.stream_opener()
+    }
+    fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>> {
+        self.inner.recv()
+    }
+    fn revoke_streams(&self) {
+        self.inner.revoke_streams();
+    }
+    fn close(&self) {
+        self.inner.close();
+    }
+    fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+    fn can_send(&self) -> bool {
+        self.inner.can_send()
+    }
+}
+
 /// One paired host's scripted end of one connection.
 pub struct ScriptedHost {
     /// What the input stream's side of the host saw, and what it writes next.
@@ -56,6 +117,7 @@ pub struct ScriptedHost {
     pub environment_id: EnvironmentId,
     pub connection_id: ConnectionId,
     links: tokio::sync::mpsc::UnboundedReceiver<Wire>,
+    sent: Arc<std::sync::Mutex<Vec<ControlFrame>>>,
     transport: Option<Arc<dyn ControlTransport>>,
     host: lane_host::Side,
     _client: lane_host::Side,
@@ -90,29 +152,42 @@ impl ScriptedHost {
                 }
             },
         );
-        let transport: Arc<dyn ControlTransport> = Arc::new(
-            NetworkTransport::connect(
-                &client.endpoint,
-                lane_host::direct_addr(&host),
-                &client.identity,
-                &host.record,
-                SendLimits::default(),
-            )
-            .await
-            .expect("an authorised connection"),
-        );
+        let sent = Arc::default();
+        let transport: Arc<dyn ControlTransport> = Arc::new(Recorded {
+            inner: Arc::new(
+                NetworkTransport::connect(
+                    &client.endpoint,
+                    lane_host::direct_addr(&host),
+                    &client.identity,
+                    &host.record,
+                    SendLimits::default(),
+                )
+                .await
+                .expect("an authorised connection"),
+            ),
+            sent: Arc::clone(&sent),
+        });
         Self {
             script,
             session_id: SessionId::new(kr_ipc::new_uuid()),
             environment_id: temp.environment_id(),
             connection_id: transport.connection_id(),
             links,
+            sent,
             transport: Some(transport),
             host,
             _client: client,
             serving,
             temp,
         }
+    }
+
+    /// Every control frame that the view's connection took whole, in order.
+    pub fn written(&self) -> Vec<ControlFrame> {
+        self.sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The host tree's environment, which the application's registry reads, though a paired view reads
