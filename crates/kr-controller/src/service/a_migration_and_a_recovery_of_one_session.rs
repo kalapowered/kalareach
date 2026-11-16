@@ -879,3 +879,86 @@ async fn a_kept_record_of_the_daemons_own_gives_its_reason_and_a_later_look_give
         "and the registry holds it"
     );
 }
+
+/// A look at the worker's end whose own pass establishes a reason from a fact that the first look
+/// could not have gives that reason, and not the reason of the record that the first look kept: the
+/// worker's own record of its processes names an earlier boot, which a first look that could not
+/// read it did not know (main records the host's restart), or the platform says only now that the
+/// worker's desktop has gone. The host's restart outranks the desktop, and a look's default does
+/// not replace a reason that rests on a fact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_later_look_gives_a_reason_that_rests_on_a_fact_the_first_look_could_not_have() {
+    // The kept reason, the reason this look's pass establishes, whether the pass names an earlier
+    // boot, and the reason that is written.
+    for (first, later, earlier_boot, written) in [
+        (
+            ClosureReason::WorkerCrash,
+            ClosureReason::HostShutdown,
+            true,
+            ClosureReason::HostShutdown,
+        ),
+        (
+            ClosureReason::WorkerCrash,
+            ClosureReason::DesktopLost,
+            false,
+            ClosureReason::DesktopLost,
+        ),
+        (
+            ClosureReason::HostShutdown,
+            ClosureReason::DesktopLost,
+            false,
+            ClosureReason::HostShutdown,
+        ),
+        (
+            ClosureReason::DesktopLost,
+            ClosureReason::WorkerCrash,
+            false,
+            ClosureReason::DesktopLost,
+        ),
+    ] {
+        let temp = TempHost::create();
+        let controller = daemon(&temp).await;
+        let session_id = recorded_ended_worker(&controller, &temp).await;
+        let identity = kr_ipc::identity::ended_process_identity(4_000_003);
+        refuse_closures(&controller);
+        let refused = controller
+            .record_final(
+                session_id,
+                first,
+                &identity,
+                &crate::archive::Fenced::unfenced(session_id, "Permission denied"),
+                Death::ConfirmedBeforeAFence,
+            )
+            .await;
+        assert!(
+            refused.is_err(),
+            "the first look's record is refused by the registry: {refused:?}"
+        );
+        assert!(
+            controller
+                .registry
+                .lock()
+                .await
+                .closure(session_id)
+                .expect("the registry answers")
+                .is_none(),
+            "and the registry holds no closure"
+        );
+
+        written_journal(&controller, session_id, None);
+        take_closures_again(&controller);
+        let pass = if earlier_boot {
+            crate::archive::Fenced::of_an_earlier_boot(session_id)
+        } else {
+            crate::archive::Fenced::nothing(session_id)
+        };
+        let record = controller
+            .record_final(session_id, later, &identity, &pass, Death::Confirmed)
+            .await
+            .expect("the registry takes the record");
+        assert_eq!(
+            record.reason, written,
+            "a first look's {first:?} and a later look's {later:?} give {written:?}: {record:?}"
+        );
+    }
+}
