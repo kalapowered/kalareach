@@ -167,10 +167,10 @@ pub struct Producer {
     /// publisher makes a publication, and a change back to a value already published can join
     /// while an older one is in flight.
     owed: std::sync::mpsc::SyncSender<Wake>,
-    /// Stand before the publisher takes the session and before it sends what it has read, for this
-    /// host's own tests.
+    /// Stand after the publisher has taken the session, before it reads the facts, and before it
+    /// sends what it has read, for this host's own tests.
     #[cfg(feature = "testing")]
-    before_the_take: crate::testing::Stall,
+    after_the_take: crate::testing::Stall,
     #[cfg(feature = "testing")]
     before_the_send: crate::testing::Stall,
     /// How many helper threads of this producer are alive: its publisher, and the reader of the
@@ -258,7 +258,7 @@ impl Producer {
                 published,
                 owed,
                 #[cfg(feature = "testing")]
-                before_the_take: crate::testing::Stall::default(),
+                after_the_take: crate::testing::Stall::default(),
                 #[cfg(feature = "testing")]
                 before_the_send: crate::testing::Stall::default(),
                 #[cfg(feature = "testing")]
@@ -393,10 +393,10 @@ impl Producer {
         let Some(runtime) = self.runtime.upgrade() else {
             return;
         };
-        #[cfg(feature = "testing")]
-        self.before_the_take.stand();
         let application = {
             let mut session = runtime.session();
+            #[cfg(feature = "testing")]
+            self.after_the_take.stand();
             if !session.state().accepts_input() {
                 // A session that is not live has nothing to describe, and closing cleared what it
                 // had. What was held waits for a session that is.
@@ -420,18 +420,19 @@ impl Producer {
         self.published.send_replace(application);
     }
 
-    /// Stops the next publication before the publisher takes the session, for this host's own
-    /// tests. Returns the end that says the publisher has arrived there and the end that lets it
-    /// go on; the stop fires once.
+    /// Stops the next publication after the publisher has taken the session and before it reads the
+    /// facts, for this host's own tests. Returns the end that says the publisher has arrived there
+    /// and the end that lets it go on; the stop fires once. Facts that join while it stands there
+    /// are the ones the publication must carry.
     #[cfg(feature = "testing")]
     #[must_use]
-    pub fn pause_before_the_take(
+    pub fn pause_after_the_take(
         &self,
     ) -> (
         tokio::sync::oneshot::Receiver<()>,
         std::sync::mpsc::Sender<()>,
     ) {
-        self.before_the_take.arm_blocking()
+        self.after_the_take.arm_blocking()
     }
 
     /// Stops the next publication after the publisher has read the facts and written the name, and
