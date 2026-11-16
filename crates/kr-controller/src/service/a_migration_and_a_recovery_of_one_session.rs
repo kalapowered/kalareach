@@ -336,12 +336,72 @@ struct AccountThatWasRefused {
     account: ClosureRecord,
 }
 
+/// Puts a directory back as it was, whatever the case ends with.
+#[cfg(unix)]
+struct Writable(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Drop for Writable {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
 impl AccountThatWasRefused {
     async fn made() -> Self {
         let temp = TempHost::create();
         let controller = daemon(&temp).await;
         let session_id = recorded_ended_worker(&controller, &temp).await;
-        let display = controller
+        let display = Self::display_of(&controller, session_id).await;
+        Self::refused(temp, controller, session_id, display).await
+    }
+
+    /// As [`Self::made`], with the worker's endpoint published in a directory that cannot be
+    /// written, so that a recovery cannot remove it. The endpoint is made before the first write is
+    /// refused: that refusal starts the watch over the worker, and a watch that looks at an
+    /// endpoint it can remove removes it.
+    #[cfg(unix)]
+    async fn made_with_an_endpoint_that_cannot_be_removed() -> (Self, Writable) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = TempHost::create();
+        let controller = daemon(&temp).await;
+        let session_id = recorded_ended_worker(&controller, &temp).await;
+        let display = Self::display_of(&controller, session_id).await;
+        // The session's lock file is made before the directory is made unwritable. Another task of
+        // the daemon may hold the session at this moment, so it is asked for until it is free.
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while controller
+                .archive()
+                .own_closed(session_id, || Ok(false))
+                .is_err()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the session's lock is made");
+        let endpoint = controller
+            .paths
+            .worker_endpoint(display)
+            .expect("an endpoint");
+        let directory = endpoint
+            .as_path()
+            .parent()
+            .expect("a directory")
+            .to_path_buf();
+        std::fs::create_dir_all(&directory).expect("the directory");
+        std::fs::write(endpoint.as_path(), b"a socket").expect("publishes the endpoint");
+        let writable = Writable(directory.clone());
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500))
+            .expect("makes the directory unwritable");
+        let world = Self::refused(temp, controller, session_id, display).await;
+        (world, writable)
+    }
+
+    async fn display_of(controller: &Controller, session_id: SessionId) -> DisplayNumber {
+        controller
             .registry
             .lock()
             .await
@@ -350,7 +410,20 @@ impl AccountThatWasRefused {
             .into_iter()
             .find(|row| row.session_id == session_id)
             .expect("the worker is recorded")
-            .display_number;
+            .display_number
+    }
+
+    /// Gives the daemon the worker's account while the registry refuses a closure, and proves
+    /// that the first write of it was refused: the write is stopped before the answer is settled,
+    /// let go once it has arrived, and the registry's lock, which the write holds until the
+    /// registry has answered it, is taken and finds no closure. A write that is refused later than
+    /// this would record the account itself, and what a recovery prefers would not show.
+    async fn refused(
+        temp: TempHost,
+        controller: std::sync::Arc<Controller>,
+        session_id: SessionId,
+        display: DisplayNumber,
+    ) -> Self {
         let account = ClosureRecord {
             durability: Durability::Volatile,
             ..closure_of(session_id)
@@ -362,6 +435,7 @@ impl AccountThatWasRefused {
                  BEGIN SELECT RAISE(ABORT, 'the registry keeps no closure'); END;",
             )
             .expect("the registry is made to refuse the write that records a closure");
+        let (arrived, release) = controller.stall_the_next_closure_write();
         controller
             .settle_close_answer(
                 session_id,
@@ -374,6 +448,29 @@ impl AccountThatWasRefused {
                 },
             )
             .await;
+        let reached = tokio::task::spawn_blocking(move || {
+            arrived.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await;
+        // Let go before any assertion, so that a write that did not arrive holds nothing.
+        let _ = release.send(());
+        reached
+            .expect("the wait for the write ends")
+            .expect("the account's write reaches the registry");
+        let registry = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            controller.registry.lock(),
+        )
+        .await
+        .expect("the registry is free once its write has been refused");
+        assert!(
+            registry
+                .closure(session_id)
+                .expect("the registry answers")
+                .is_none(),
+            "the first write of the account was refused: the registry holds no closure"
+        );
+        drop(registry);
         Self {
             _temp: temp,
             controller,
@@ -431,47 +528,13 @@ impl AccountThatWasRefused {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_endpoint_that_cannot_be_removed_does_not_replace_the_account_a_worker_gave() {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    /// Puts the directory back as it was, whatever the case ends with.
-    struct Writable(std::path::PathBuf);
-    impl Drop for Writable {
-        fn drop(&mut self) {
-            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
-        }
-    }
-
-    let world = AccountThatWasRefused::made().await;
-    // The session's lock file is made before the directory is made unwritable. The watch that the
-    // refused write started may hold the session at this moment, so it is asked for until it is
-    // free.
-    tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        while let Err(held) = world
-            .controller
-            .archive()
-            .own_closed(world.session_id, || Ok(false))
-        {
-            let _ = held;
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("the session's lock is made");
+    let (world, _writable) =
+        AccountThatWasRefused::made_with_an_endpoint_that_cannot_be_removed().await;
     let endpoint = world
         .controller
         .paths
         .worker_endpoint(world.display)
         .expect("an endpoint");
-    let directory = endpoint
-        .as_path()
-        .parent()
-        .expect("a directory")
-        .to_path_buf();
-    std::fs::create_dir_all(&directory).expect("the directory");
-    std::fs::write(endpoint.as_path(), b"a socket").expect("publishes the endpoint");
-    let _writable = Writable(directory.clone());
-    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500))
-        .expect("makes the directory unwritable");
 
     world.the_registry_takes_closures_again();
     let found = world
@@ -479,6 +542,10 @@ async fn an_endpoint_that_cannot_be_removed_does_not_replace_the_account_a_worke
         .await
         .expect("the registry answers")
         .expect("the worker that ended is closed");
+    assert!(
+        endpoint.as_path().exists(),
+        "the recovery took the path of an endpoint that cannot be removed: it left the endpoint"
+    );
     assert_eq!(found, world.account, "the account the worker gave stands");
     assert_eq!(
         world.recorded().await,
