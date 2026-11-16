@@ -1758,13 +1758,13 @@ async fn a_read_of_a_receipt_that_the_store_does_not_answer_is_answered_within_i
 /// A receipt read of a held session is refused at its take, and the thread that made the take ends
 /// with the bound of its own take. Without that bound the thread waits for the session for as long as
 /// the hold lasts, so on a store that has stopped for good the threads grow with each read. Each such
-/// thread holds one reference to the runtime, which the case counts while the hold stands.
+/// thread is counted by the service from its start to its end, and the case counts those threads
+/// while the hold stands, whatever else holds a reference to the runtime.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_receipt_read_of_a_held_session_leaves_no_thread_waiting_for_the_session() {
     let host = host().await;
     let (holder, mut reader) = (host.client().await, host.client().await);
     let standing = stall(&host, Stalled::Prune, holder).await;
-    let standing_count = Arc::strong_count(&host.runtime);
     for read in 1..=3 {
         let (_, refused) = receipt_within_its_bound(
             &mut reader,
@@ -1779,14 +1779,11 @@ async fn a_receipt_read_of_a_held_session_leaves_no_thread_waiting_for_the_sessi
     }
     // The threads end a step after their refusal; the session is still held.
     let began = Instant::now();
-    loop {
-        let waiting = Arc::strong_count(&host.runtime).saturating_sub(standing_count);
-        if waiting == 0 {
-            break;
-        }
+    while host.service.receipt_threads_alive() != 0 {
         assert!(
             began.elapsed() < READ_BOUND,
-            "{waiting} receipt threads still wait for the held session {READ_BOUND:?} after their refusals"
+            "{} receipt threads still wait for the held session {READ_BOUND:?} after their refusals",
+            host.service.receipt_threads_alive()
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
