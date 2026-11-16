@@ -4777,23 +4777,23 @@ impl WorkerService {
     /// tries and not of a lock that blocks: a presentation that finds the boundary held asks the
     /// operating system whether its peer has gone, and tries again after a pause that starts at
     /// five milliseconds and doubles to a quarter of a second, and that each release of the
-    /// boundary cuts short. A release wakes every presentation that waits, which then tries at once.
-    /// That makes a presentation eligible at each release and promises it nothing: another holder
-    /// can win every race for the boundary, and there is no bound on how many releases a stream of
-    /// mutations can win. The pause is the interval at which a presentation asks its peer when
-    /// nothing wakes it, and no deadline for a release. A release makes the waiting presentation
-    /// eligible and wakes it, and promises it no time while a mutation always waits: how soon it
-    /// gets in against a stream of clients depends on how fast the machine runs. The case
+    /// boundary cuts short. A release wakes every presentation that waits, which then tries as soon
+    /// as the scheduler runs its task. That makes a presentation eligible at each release and
+    /// promises it nothing: another holder can win every race for the boundary, and there is no
+    /// bound on how many releases a stream of mutations can win. The pause is the interval at which
+    /// a presentation asks its peer when nothing wakes it, and no deadline for a release. A release
+    /// makes the waiting presentation eligible and wakes it, and promises it no time while a
+    /// mutation always waits. The case
     /// `a_living_presentation_is_decided_in_a_gap_shorter_than_its_pause` shows the wake, and the
     /// case `a_living_presentation_keeps_trying_through_mutations_and_is_decided_when_they_stop`
     /// shows that the presentation keeps trying through a stream and is decided when it stops. A
-    /// peer that has gone ends the presentation there. No acceptance runs for it, and its connection is read to its end at once
-    /// and its place in the worker's count of connections is given back, where a blocking wait
-    /// would keep both, and a thread, until the hold ended. A peer that is there waits for the whole
-    /// hold, however long, and tries for the boundary as soon as the holder lets go. The try, the
-    /// question to the system and the
-    /// acceptance are one step that returns no guard, so nothing is held across a pause. Once the
-    /// boundary is taken, the question is asked once more before anything is changed.
+    /// peer that has gone ends the presentation there. No acceptance runs for it, and its
+    /// connection is read to its end at once and its place in the worker's count of connections is
+    /// given back, where a blocking wait would keep both, and a thread, until the hold ended. A
+    /// peer that is there waits for the whole hold, however long, and tries for the boundary as
+    /// soon as the holder lets go. The try, the question to the system and the acceptance are one
+    /// step that returns no guard, so nothing is held across a pause. Once the boundary is taken,
+    /// the question is asked once more before anything is changed.
     ///
     /// What this leaves open, as limits to know:
     ///
