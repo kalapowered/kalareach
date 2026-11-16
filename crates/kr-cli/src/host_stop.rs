@@ -2326,17 +2326,22 @@ fn gave_by_the_read(
     }
 }
 
+/// What a daemon that answered the greeting gives: a daemon that states another major is another
+/// daemon, whatever it would say to a read, and one that states this command's major is asked
+/// `host.info`. A look offers no other major, so the first never answers a look over a real link.
+async fn gave_after_the_greeting(listed: Listed) -> Gave {
+    match listed {
+        Listed::Other(_) => Gave::GreetingOfAnotherMajor,
+        Listed::Ours(mut client) => gave_by_the_read(client.request(Method::HostInfo, &()).await),
+    }
+}
+
 /// The connection, the greeting and the read of `host.info`, as the exchange of a look.
 async fn the_exchange(endpoint: &kr_ipc::paths::Endpoint, within: Duration) -> Gave {
     match startup::reach(endpoint, within, &[]).await {
         Reached::Silent => Gave::NothingInTime,
         Reached::Refused(error) => gave_by_the_greeting(&error),
-        Reached::Answered(listed) => match *listed {
-            Listed::Other(_) => Gave::GreetingOfAnotherMajor,
-            Listed::Ours(mut client) => {
-                gave_by_the_read(client.request(Method::HostInfo, &()).await)
-            }
-        },
+        Reached::Answered(listed) => gave_after_the_greeting(*listed).await,
     }
 }
 
@@ -4690,7 +4695,7 @@ mod tests {
     /// The functions whose syntax the check reads: the decisions over the readings of a round and
     /// what is said from them, the look's label and the producers of its value, and the decisions
     /// that stand beside them.
-    const SCANNED: [&str; 19] = [
+    const SCANNED: [&str; 20] = [
         "what_the_round_shows",
         "the_endpoint_decides",
         "a_successor_by_the_endpoint",
@@ -4703,6 +4708,7 @@ mod tests {
         "label_of",
         "gave_by_the_greeting",
         "gave_by_the_read",
+        "gave_after_the_greeting",
         "the_exchange",
         "the_look_gave",
         "endpoint_look",
@@ -5176,6 +5182,8 @@ mod tests {
         NobodyListens,
         /// It accepts the connection, reads the hello and says nothing.
         SaysNothingToTheHello,
+        /// It reads the hello and closes the connection before it answers.
+        ClosesBeforeTheHello,
         /// It answers the hello with a refusal.
         RefusesTheHello,
         /// It answers the hello with a version that does not fit.
@@ -5244,6 +5252,16 @@ mod tests {
                     .await
                     .expect("a hello");
                 std::future::pending::<()>().await;
+            }
+            Peer::ClosesBeforeTheHello => {
+                let (connection, _peer) = listener.accept().await.expect("a connection");
+                let (mut reader, writer) =
+                    kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+                reader
+                    .read_message::<ControlFrame>()
+                    .await
+                    .expect("a hello");
+                drop(writer);
             }
             Peer::RefusesTheHello | Peer::AnswersTheHelloWithAnotherKind => {
                 let (connection, _peer) = listener.accept().await.expect("a connection");
@@ -5379,6 +5397,12 @@ mod tests {
         vec![
             (Peer::NobodyListens, Some(1), "nothing_listens", "nobody"),
             (
+                Peer::ClosesBeforeTheHello,
+                Some(1),
+                "link_failed",
+                "unclear",
+            ),
+            (
                 Peer::SaysNothingToTheHello,
                 Some(1),
                 "nothing_in_time",
@@ -5498,6 +5522,98 @@ mod tests {
                 ),
                 "asked {asked:?}"
             );
+        }
+    }
+
+    /// The producers give a value by the source of a failure and by what an answer is, whatever
+    /// made the failure: a connection that found nothing listening, a reply of the daemon's, a
+    /// closure and this side's own fault, at the greeting and at the read.
+    #[test]
+    fn the_producers_give_a_value_by_the_source_of_a_failure() {
+        use kr_ipc::IpcError;
+
+        for kind in [
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::NotFound,
+        ] {
+            let nothing = IpcError::socket("connect", std::io::Error::from(kind));
+            assert_eq!(gave_by_the_greeting(&nothing).label(), "nothing_listens");
+        }
+        let replies = [
+            the_hellos_refusal(),
+            IpcError::LinkFenced {
+                detail: "the worker refused the link".to_owned(),
+            },
+            IpcError::UnexpectedMessage("a frame of another kind"),
+            IpcError::VersionMismatch {
+                host: "1.0".to_owned(),
+                offered: "2.0".to_owned(),
+            },
+        ];
+        let failures = [
+            IpcError::PeerClosed,
+            a_frame_cut_by_the_end(),
+            a_spoiled_frame(),
+        ];
+        for reply in &replies {
+            assert_eq!(
+                gave_by_the_greeting(reply).label(),
+                "greeting_replied",
+                "{reply}"
+            );
+            assert_eq!(
+                gave_by_the_read(Err(IpcError::UnexpectedMessage("x"))).label(),
+                "read_replied"
+            );
+        }
+        for failure in failures.iter().chain(own_faults().iter()) {
+            assert_eq!(
+                gave_by_the_greeting(failure).label(),
+                "link_failed",
+                "{failure}"
+            );
+        }
+        for failure in failures {
+            assert_eq!(gave_by_the_read(Err(failure)).label(), "link_failed");
+        }
+        for fault in own_faults() {
+            assert_eq!(gave_by_the_read(Err(fault)).label(), "link_failed");
+        }
+        for reply in replies {
+            assert_eq!(gave_by_the_read(Err(reply)).label(), "read_replied");
+        }
+        assert_eq!(
+            gave_by_the_read(Ok(Err(a_refusal()))).label(),
+            "read_refused"
+        );
+        let empty = kr_protocol::envelope::ParamsValue::empty();
+        assert_eq!(gave_by_the_read(Ok(Ok(empty))).label(), "read_undecodable");
+        let info = kr_protocol::envelope::ParamsValue::from_typed(&host_info_of(
+            ControllerGeneration::new(7),
+        ))
+        .expect("a host.info result");
+        match gave_by_the_read(Ok(Ok(info))) {
+            Gave::Reported(generation) => assert_eq!(generation, ControllerGeneration::new(7)),
+            other => panic!("the generation that the daemon reports is the value, not {other:?}"),
+        }
+    }
+
+    /// A daemon that states another major answers the greeting of a look that offered that major:
+    /// the look gives another daemon, as the label says. The look itself offers no major, so this
+    /// answer is read from the real client here and no look over a real link meets it.
+    #[tokio::test]
+    async fn a_daemon_of_another_major_that_answers_the_greeting_is_another_daemon() {
+        let other = kr_protocol::hello::PROTOCOL_VERSION.major + 1;
+        let (_temp, environment, within, daemon) = a_stand_in_for(Peer::AnswersAnotherVersion);
+        let endpoint = environment.controller_endpoint().expect("an endpoint");
+        let Reached::Answered(listed) = startup::reach(&endpoint, within, &[other]).await else {
+            panic!("the daemon answers the greeting and the look offers its major");
+        };
+        let gave = gave_after_the_greeting(*listed).await;
+        assert_eq!(gave.label(), "greeting_of_another_major");
+        assert!(matches!(label_of(None, gave), Endpoint::Another));
+        if let Some(daemon) = daemon {
+            daemon.abort();
         }
     }
 
