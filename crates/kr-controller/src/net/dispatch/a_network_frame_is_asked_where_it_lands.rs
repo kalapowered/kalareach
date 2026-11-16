@@ -3,8 +3,9 @@
 //! A kept answer, and a conflict that names a reused identifier, are read from a record and go only
 //! while the standing their request was admitted under holds. The writer reads the authority
 //! feed's refusal last among the reads that take a lock, copies the cells of the bounds the answer
-//! is written under, and then asks, once and with no lock, those bounds by their copies, the
-//! request's footing, and last the grant's own end. Each case stops the writer where the feed has
+//! is written under, asks the feed's refusal again of the grants it took with that reading, with no
+//! lock, and then asks, once and with no lock, those bounds by their copies, the request's
+//! footing, and last the grant's own end. Each case stops the writer where the feed has
 //! been read and the cells copied, before that question, ends the standing there, and finds that
 //! none of the answer was handed to the stream; the cases of a lease's bound find that it is
 //! judged by its copy.
@@ -256,8 +257,9 @@ async fn the_connection_ends_and_the_stream_is_handed_nothing(record: Record, en
 
 /// A feed refusal that rises in the pause after the copies stops an answer read from a record: the
 /// writer asks the refusal again of the grants it took with the first reading, with no lock, so
-/// none of the answer is handed to the stream, and the device is told what the decision made again
-/// says, which is a refusal of its own and not the answer.
+/// none of the answer is handed to the stream, and the device is told a refusal and not the
+/// answer: for a kept answer that its outcome is not shown, for a conflict the refusal of the
+/// feed's standing in the words of the door's own check.
 async fn the_feed_refuses_after_the_copies_and_the_stream_is_handed_none_of_the_answer(
     record: Record,
 ) {
