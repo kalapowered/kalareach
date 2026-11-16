@@ -48,6 +48,68 @@ struct Page {
     app: tauri::App<MockRuntime>,
     windows: BTreeMap<String, tauri::WebviewWindow<MockRuntime>>,
     published: Arc<Mutex<BTreeMap<u32, Vec<Value>>>>,
+    /// Holds the page's publication, and so the view's own task, while a case needs the view slower
+    /// than the host.
+    gate: Arc<Gate>,
+}
+
+/// A gate in the page's publication. Open, a state passes at once. Closed, a state the view
+/// publishes is recorded and then waits inside the publication, which holds the view's task, until
+/// the gate lets it pass: the view is as slow as the case makes it.
+#[derive(Default)]
+struct Gate {
+    /// None while the gate is open, and otherwise how many more states may pass.
+    passes: Mutex<Option<usize>>,
+    changed: std::sync::Condvar,
+}
+
+impl Gate {
+    fn pass(&self) {
+        let mut passes = self.passes.lock().expect("the gate");
+        loop {
+            match *passes {
+                None => return,
+                Some(0) => passes = self.changed.wait(passes).expect("the gate"),
+                Some(left) => {
+                    *passes = Some(left - 1);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn open(&self) {
+        *self.passes.lock().expect("the gate") = None;
+        self.changed.notify_all();
+    }
+}
+
+/// Closes the page's gate, and opens it again when dropped, also when the case fails: a view held
+/// at a closed gate would otherwise keep the runtime from ending.
+struct Held {
+    gate: Arc<Gate>,
+}
+
+impl Held {
+    fn new(gate: &Arc<Gate>) -> Self {
+        *gate.passes.lock().expect("the gate") = Some(0);
+        Self {
+            gate: Arc::clone(gate),
+        }
+    }
+
+    /// Lets `states` more states pass.
+    fn let_pass(&self, states: usize) {
+        let mut passes = self.gate.passes.lock().expect("the gate");
+        *passes = Some(passes.unwrap_or(0) + states);
+        self.gate.changed.notify_all();
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.gate.open();
+    }
 }
 
 impl Page {
@@ -59,6 +121,8 @@ impl Page {
     fn with_pages(paths: kr_ipc::paths::EnvironmentPaths, labels: &[&str]) -> Self {
         let published: Arc<Mutex<BTreeMap<u32, Vec<Value>>>> = Arc::default();
         let heard = Arc::clone(&published);
+        let gate = Arc::new(Gate::default());
+        let gated = Arc::clone(&gate);
         let builder = tauri::test::mock_builder()
             .manage(companion_tauri::AppState::new())
             .channel_interceptor(move |_webview, callback, _index, body| {
@@ -70,6 +134,9 @@ impl Page {
                         .entry(callback.0)
                         .or_default()
                         .push(state);
+                    // The wait holds the view's task, and the runtime is told that this worker waits so
+                    // that the session's reader, which the view does not hold, goes on reading.
+                    tokio::task::block_in_place(|| gated.pass());
                 }
                 true
             })
@@ -101,6 +168,7 @@ impl Page {
             app,
             windows,
             published,
+            gate,
         }
     }
 
@@ -4805,5 +4873,191 @@ async fn a_call_waiting_for_its_answer_survives_everything_the_loop_does_meanwhi
     assert_eq!(
         after["attachment"]["presentation_reason"], "size_mismatch",
         "the answer of a call that waited through all that is applied"
+    );
+}
+
+/// The screens of the states a view published from index `from` on, one text for each screen: the
+/// second row's text, with a state that only changes control (it shows the screen before it again)
+/// counted once.
+fn flood_texts(states: &[Value], from: usize) -> Vec<String> {
+    let mut texts: Vec<String> = states[from..]
+        .iter()
+        .filter(|state| state["state"] == "showing")
+        .map(|state| text_of(state)[1].clone())
+        .collect();
+    texts.dedup();
+    texts
+}
+
+/// A flood of screens that the page takes slowly, with two calls the host has not answered and a
+/// command of the page behind them. The view keeps the host's order between a screen and an answer
+/// (every screen the host sent before an answer is shown before the answer's effect), the page's
+/// command leaves in the turn that takes it while the page still holds the view and the view's queue
+/// holds what the channel held, and that queue never holds more than the session's channel and what
+/// was ready in one look.
+///
+/// The page is held by the gate of its publication: the view's own task waits inside a state until
+/// the case lets it pass. The host writes 262 screens, the answer to the take's acquire, ten
+/// notices that draw nothing, the answer to a launch surface read, and then ten notices and one
+/// screen more: the channel holds 256, the first answer waits behind it, and the second answer is
+/// read only once the first look has made room, so it is ready while the queue is still full.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flood_the_page_takes_slowly_keeps_the_hosts_order_and_holds_back_no_command() {
+    const FLOOD: u64 = 262;
+    // The notices between the answers and after them draw nothing, and are small enough for the
+    // socket to hold while the channel is full.
+    const BETWEEN_NOTICES: u64 = 10;
+    const AFTER_NOTICES: u64 = 10;
+    const CHANNEL: usize = 256;
+    const CALLS_IN_FLIGHT: usize = 3;
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let mut lease = WorkerLease::default();
+    let (view, mut link) = showing(&page, &mut worker, 3).await;
+    let views = page.app.state::<companion_tauri::terminal::TerminalViews>();
+    // Two calls that the host has not answered when the flood begins.
+    page.take(&view, 1);
+    let acquire = link.expect(Method::InputAcquire).await;
+    page.newest(3, |state| control(state) == (1, "taking".to_owned()))
+        .await;
+    let reading = page.invoke_later("terminal_view_launch_surface", json!({ "view": view }));
+    let surface = link.expect(Method::ShellLaunchSurface).await;
+    let first = page.states(3).len();
+    let held = Held::new(&page.gate);
+    for number in 0..FLOOD {
+        link.push(
+            PROJECTION_DELTA_EVENT,
+            &delta(
+                1,
+                40 + number,
+                41 + number,
+                10,
+                2,
+                0,
+                vec![row(1, &format!("flood {number}"))],
+            ),
+        )
+        .await;
+    }
+    lease.answer(&mut link, &acquire).await;
+    let notice = json!({"requested_cursor": "10", "oldest_retained_cursor": "20"});
+    for _ in 0..BETWEEN_NOTICES {
+        link.push("session.gap", &notice).await;
+    }
+    link.answer(&surface, &a_surface_held_here(worker.session_id))
+        .await;
+    for _ in 0..AFTER_NOTICES {
+        link.push("session.gap", &notice).await;
+    }
+    link.push(
+        PROJECTION_DELTA_EVENT,
+        &delta(1, 40 + FLOOD, 41 + FLOOD, 10, 2, 0, vec![row(1, "after")]),
+    )
+    .await;
+    // The view is inside the first state of the flood, and holds nothing else.
+    page.state(3, first).await;
+    // The page takes states one at a time until a look has moved what the channel held into the
+    // view's queue.
+    let mut recorded = first + 1;
+    for _ in 0..60 {
+        if views.queue_peak(&view).expect("the view is open") >= CHANNEL - CHANNEL / 8 {
+            break;
+        }
+        held.let_pass(1);
+        page.state(3, recorded).await;
+        recorded += 1;
+    }
+    // A command of the page, while the view is held in the middle of that queue: a size report,
+    // which nothing in flight stops. One state passes, and the command leaves in the turn that
+    // takes it, with the rest of the queue still waiting.
+    page.resize(&view, 12, 3);
+    held.let_pass(1);
+    page.state(3, recorded).await;
+    let report = link
+        .call_now()
+        .expect("the size report is on the wire while the page still holds the view");
+    assert_eq!(report.method, Method::AttachmentViewport.to_string());
+    assert_eq!(
+        report
+            .params::<kr_protocol::attachment::AttachmentViewportParams>()
+            .dimensions,
+        Dimensions::new(12, 3),
+        "the report is the command's"
+    );
+    assert!(
+        link.call_now().is_none(),
+        "the command made one request, and nothing else was owed"
+    );
+    drop(held);
+    page.newest(3, |state| {
+        state["state"] == "showing" && text_of(state)[1] == "after"
+    })
+    .await;
+    let states = page.states(3);
+    let expected: Vec<String> = (0..FLOOD)
+        .map(|number| format!("flood {number}"))
+        .chain(["after".to_owned()])
+        .collect();
+    assert_eq!(
+        flood_texts(&states, first),
+        expected,
+        "every screen is shown, in the order the host sent it"
+    );
+    let controlling = states
+        .iter()
+        .position(|state| control(state) == (1, "controlling".to_owned()))
+        .expect("the acquire's answer is served");
+    assert!(
+        flood_texts(&states[..controlling], first).contains(&format!("flood {}", FLOOD - 1)),
+        "every screen the host sent before the answer is shown before the answer's effect"
+    );
+    let peak = views.queue_peak(&view).expect("the view is open");
+    assert!(
+        peak > CHANNEL / 2,
+        "a look moved what the channel held into the queue: {peak}"
+    );
+    assert!(
+        peak <= CHANNEL + CALLS_IN_FLIGHT,
+        "the queue never held more than the channel's size and what was ready in one look: {peak}"
+    );
+    let told = reading.await.expect("joins").expect("the surface is read");
+    assert_eq!(told["state"], "served", "{told}");
+}
+
+/// More than sixty-four notifications, the session's close and then a definite refusal of the subscription
+/// that was waiting: the host sent the close first, so the view ends with the close's words, not
+/// with the refusal's, although the refusal's call is complete when the view looks at its calls.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refusal_that_follows_the_sessions_close_does_not_end_the_view_first() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let (_view, mut link) = showing(&page, &mut worker, 3).await;
+    link.push("session.resync", &resync_marker(60)).await;
+    let subscribe = link.expect(Method::EventsSubscribe).await;
+    let first = page.states(3).len();
+    let held = Held::new(&page.gate);
+    link.restart_stream();
+    // Twenty-two screens of three notifications each: more than the sixty-four in a row that the
+    // view once took before it looked at its calls.
+    for number in 0..22_u64 {
+        screen(
+            &mut link,
+            number + 2,
+            60 + number,
+            vec![row(0, &format!("screen {number}"))],
+            0,
+        )
+        .await;
+    }
+    link.push("session.closed", &json!({"reason": "exited"}))
+        .await;
+    link.refuse(&subscribe, "the subscription is refused").await;
+    // The view is inside the first state it published after the marker.
+    page.state(3, first).await;
+    drop(held);
+    let ended = page.newest(3, |state| state["state"] == "ended").await;
+    assert_eq!(
+        ended["reason"], "This session has closed.",
+        "the close came first on the wire"
     );
 }

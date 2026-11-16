@@ -21,8 +21,10 @@
 //! screen that says the program reads a form the view does not produce ends control at once. A
 //! change of control is told to the page at once.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll, Waker};
 
 use futures_util::future::BoxFuture;
 use futures_util::stream::FuturesUnordered;
@@ -52,6 +54,7 @@ use kr_protocol::session::{
 };
 use kr_protocol::worker::WorkerDescriptor;
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::connection::{Asked, Unopened};
 use crate::error::CommandError;
@@ -181,6 +184,7 @@ pub(super) async fn run(
     dimensions: Dimensions,
     mut commands: UnboundedReceiver<Command>,
     publish: &Publish,
+    queue_peak: Arc<AtomicUsize>,
 ) -> Cause {
     // The window's reports, which take the page's sizes and moves while the view is opening too, and
     // control of the program, which a take made while it opens asks for once it is attached.
@@ -289,7 +293,8 @@ pub(super) async fn run(
         told: 0,
         last: None,
         heard_in_flight: false,
-        events_in_a_row: 0,
+        heard: VecDeque::new(),
+        queue_peak,
         publish: publish.clone(),
     };
     view.publish_state();
@@ -785,9 +790,6 @@ struct Barred {
     call: link::Call,
 }
 
-/// How many notifications the loop takes in a row before it looks at the page's commands first.
-const EVENTS_IN_A_ROW: u32 = 64;
-
 /// One open, attached view.
 struct View {
     link: Link,
@@ -853,32 +855,46 @@ struct View {
     last: Option<TerminalViewState>,
     /// Whether the session said anything since the report in flight was sent.
     heard_in_flight: bool,
-    /// Notifications taken in a row, so that a flood of output never keeps the page's commands
-    /// waiting.
-    events_in_a_row: u32,
+    /// What the loop has heard and not yet served, in the order the host sent it.
+    heard: VecDeque<Heard>,
+    /// The most items the queue has held at one time, which a test reads to see that the queue is
+    /// bounded.
+    queue_peak: Arc<AtomicUsize>,
     publish: Publish,
 }
 
-/// What the loop reads next.
-enum Next {
-    Done(Done),
+/// What the loop has heard and not yet served.
+enum Heard {
+    /// A notification of the session, its end, or none when its channel closed.
     Event(Option<Ordered>),
+    /// A call that completed.
+    Done(Done),
+    /// An event of the lane, or none when the lane's events ended.
+    Lane(Option<InputEvent>),
+}
+
+/// What the loop's wait ended with.
+enum Woke {
+    Event(Option<Ordered>),
+    Done(Done),
     Lane(Option<InputEvent>),
     Command(Option<Command>),
 }
 
-/// What the loop reads next when it does not read a notification: a call that completed, which the
-/// loop polls before the page's next command, the lane's next event, or the page's next command.
-async fn next_but_events(
+/// Waits for the next of the session's notifications, a call that completed, the lane's event or
+/// the page's command. The loop waits only when it has nothing heard and not served.
+async fn wake(
+    events: &mut Events,
     requests: &mut FuturesUnordered<BoxFuture<'static, Done>>,
     lane_events: &mut Option<InputEvents>,
     commands: &mut UnboundedReceiver<Command>,
-) -> Next {
+) -> Woke {
     tokio::select! {
         biased;
-        Some(done) = requests.next() => Next::Done(done),
-        event = next_lane_event(lane_events) => Next::Lane(event),
-        command = commands.recv() => Next::Command(command),
+        item = events.recv() => Woke::Event(item),
+        Some(done) = requests.next() => Woke::Done(done),
+        event = next_lane_event(lane_events) => Woke::Lane(event),
+        command = commands.recv() => Woke::Command(command),
     }
 }
 
@@ -897,13 +913,18 @@ impl View {
         Ending::lost(self.link.ended_by_this_device())
     }
 
-    /// Serves the session's notifications, the lane's events and the page's commands until the view
-    /// ends.
+    /// Serves what the session says, what the calls the view started came to, the lane's events and
+    /// the page's commands until the view ends.
     ///
-    /// The notifications come first, then the calls the view has started, the lane's events and
-    /// the page's commands last: every call is polled before the next command is taken, a
-    /// notification is applied before a key is spelled by the screen it holds, and nothing is
-    /// awaited inside a command.
+    /// What the loop has heard waits in its own queue, in the order the host sent it, and the loop
+    /// serves it one item a turn and takes one command a turn, so a flood of output holds back
+    /// neither an answer nor the page. It looks at the calls and at the lane only when the queue is
+    /// empty: whatever completed is taken, and what the session's channel holds at that moment goes
+    /// into the queue before it. The queue then holds at most the channel's size and what was ready
+    /// in one look, and the channel stays what pushes back on the host. A notification that came
+    /// before an answer on the wire is in the channel when the answer's call completes, since the
+    /// session's reader hands a notification on before it reads the next frame, so it is served
+    /// before that answer.
     async fn serve(&mut self, commands: &mut UnboundedReceiver<Command>) -> Ending {
         loop {
             // What goes next is asked after every event, so nothing owed waits on an event that
@@ -911,75 +932,129 @@ impl View {
             if let Some(ended) = self.dispatch().await {
                 return ended;
             }
-            // After a long run of notifications the rest is looked at first, once, so that a flood of
-            // output never keeps an answer or the page's commands waiting.
-            let urgent = if self.events_in_a_row >= EVENTS_IN_A_ROW {
-                self.events_in_a_row = 0;
-                next_but_events(&mut self.requests, &mut self.lane_events, commands).now_or_never()
-            } else {
+            if self.heard.is_empty() {
+                self.look();
+            }
+            if let Some(heard) = self.heard.pop_front() {
+                if let Some(ended) = self.serve_heard(heard).await {
+                    return ended;
+                }
+                if let Some(ended) = self.dispatch().await {
+                    return ended;
+                }
+                let command = match commands.try_recv() {
+                    Ok(command) => Some(command),
+                    Err(TryRecvError::Empty) => continue,
+                    Err(TryRecvError::Disconnected) => None,
+                };
+                if let Some(ended) = self.serve_command(command).await {
+                    return ended;
+                }
+                continue;
+            }
+            let woke = wake(
+                &mut self.events,
+                &mut self.requests,
+                &mut self.lane_events,
+                commands,
+            )
+            .await;
+            match woke {
+                Woke::Event(item) => self.queue([Heard::Event(item)]),
+                Woke::Done(done) => {
+                    self.take_what_the_session_said();
+                    self.queue([Heard::Done(done)]);
+                }
+                Woke::Lane(event) => {
+                    self.take_what_the_session_said();
+                    self.queue([Heard::Lane(event)]);
+                }
+                Woke::Command(command) => {
+                    if let Some(ended) = self.serve_command(command).await {
+                        return ended;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Takes every call that completed and every event the lane holds, without waiting, and puts
+    /// them in the queue behind what the session's channel holds.
+    fn look(&mut self) {
+        let mut taken = Vec::new();
+        while let Some(Some(done)) = self.requests.next().now_or_never() {
+            taken.push(Heard::Done(done));
+        }
+        if let Some(events) = self.lane_events.as_mut() {
+            while let Some(event) = events.try_recv() {
+                taken.push(Heard::Lane(Some(event)));
+            }
+        }
+        if !taken.is_empty() {
+            self.take_what_the_session_said();
+            self.queue(taken);
+        }
+    }
+
+    /// Moves what the session's channel holds now into the queue, without waiting, so that it is
+    /// served before the answer or the lane event that was taken after it.
+    fn take_what_the_session_said(&mut self) {
+        let ready = self.events.ready();
+        self.queue(ready.into_iter().map(Heard::Event));
+    }
+
+    /// Puts `heard` at the end of the queue.
+    fn queue(&mut self, heard: impl IntoIterator<Item = Heard>) {
+        self.heard.extend(heard);
+        self.queue_peak
+            .fetch_max(self.heard.len(), Ordering::Relaxed);
+    }
+
+    /// Serves one item of the queue.
+    async fn serve_heard(&mut self, heard: Heard) -> Option<Ending> {
+        // Whatever the session says lets a size it did not take for now go again.
+        let said = match &heard {
+            Heard::Done((_, Completed::Call(Ok(_))))
+            | Heard::Event(Some(Ordered::Notification(_))) => true,
+            Heard::Done((_, Completed::Call(Err(failed)))) => refusal_of(failed).is_some(),
+            _ => false,
+        };
+        if said {
+            self.window.heard();
+        }
+        if matches!(heard, Heard::Event(Some(Ordered::Notification(_)))) {
+            self.heard_in_flight = true;
+        }
+        match heard {
+            Heard::Event(Some(Ordered::Notification(notification))) => {
+                self.notification(notification)
+            }
+            Heard::Event(Some(Ordered::Ended(_)) | None) => Some(self.lost()),
+            Heard::Lane(Some(event)) => self.lane_event(event),
+            Heard::Lane(None) => {
+                self.lane_events = None;
                 None
-            };
-            let next = if let Some(next) = urgent {
-                next
-            } else {
-                tokio::select! {
-                    biased;
-                    // The notifications first: an answer and a notification reach the loop by two
-                    // paths, and the host sent the notification before the answer if it is in the
-                    // channel when the answer's call completes, since the reader hands a
-                    // notification on before it reads the next frame.
-                    item = self.events.recv() => Next::Event(item),
-                    next = next_but_events(&mut self.requests, &mut self.lane_events, commands) => next,
-                }
-            };
-            self.events_in_a_row = if matches!(next, Next::Event(_)) {
-                self.events_in_a_row + 1
-            } else {
-                0
-            };
-            // Whatever the session says lets a size it did not take for now go again.
-            let heard = match &next {
-                Next::Done((_, Completed::Call(Ok(_))))
-                | Next::Event(Some(Ordered::Notification(_))) => true,
-                Next::Done((_, Completed::Call(Err(failed)))) => refusal_of(failed).is_some(),
-                _ => false,
-            };
-            if heard {
-                self.window.heard();
             }
-            if matches!(next, Next::Event(Some(Ordered::Notification(_)))) {
-                self.heard_in_flight = true;
+            Heard::Done((tag, done)) => self.completed(tag, done).await,
+        }
+    }
+
+    /// Serves one command of the page, or the end of the page's channel.
+    async fn serve_command(&mut self, command: Option<Command>) -> Option<Ending> {
+        match command {
+            Some(Command::Resize(size)) => {
+                self.window.measured(size);
+                None
             }
-            let ended = match next {
-                Next::Command(Some(Command::Resize(size))) => {
-                    self.window.measured(size);
-                    None
-                }
-                Next::Command(Some(Command::Move(asked))) => {
-                    self.window.take(asked);
-                    None
-                }
-                Next::Command(Some(Command::Input(input, taken))) => self.input(input, taken),
-                Next::Command(Some(Command::LaunchSurface(reply))) => self.launch_surface(reply),
-                Next::Command(Some(Command::Launch(press, reply))) => {
-                    self.launch(press, reply).await
-                }
-                Next::Command(Some(Command::Lose)) => Some(self.lost()),
-                Next::Command(Some(Command::Close) | None) => Some(Ending::CLOSED),
-                Next::Event(Some(Ordered::Notification(notification))) => {
-                    self.notification(notification)
-                }
-                Next::Event(Some(Ordered::Ended(_)) | None) => Some(self.lost()),
-                Next::Lane(Some(event)) => self.lane_event(event),
-                Next::Lane(None) => {
-                    self.lane_events = None;
-                    None
-                }
-                Next::Done((tag, done)) => self.completed(tag, done).await,
-            };
-            if let Some(ended) = ended {
-                return ended;
+            Some(Command::Move(asked)) => {
+                self.window.take(asked);
+                None
             }
+            Some(Command::Input(input, taken)) => self.input(input, taken),
+            Some(Command::LaunchSurface(reply)) => self.launch_surface(reply),
+            Some(Command::Launch(press, reply)) => self.launch(press, reply).await,
+            Some(Command::Lose) => Some(self.lost()),
+            Some(Command::Close) | None => Some(Ending::CLOSED),
         }
     }
 
@@ -1763,11 +1838,26 @@ impl View {
         }
     }
 
-    /// Starts `call` under `tag`: the loop polls it before it takes anything else, and gives its
-    /// answer back under `tag`.
-    fn start(&mut self, tag: RequestId, call: link::Call) {
-        self.requests
-            .push(Box::pin(async move { (tag, Completed::Call(call.await)) }));
+    /// Starts `call` under `tag` and gives its answer back under `tag`.
+    ///
+    /// The call is polled once here, in the turn that starts it, so that its request is written at
+    /// once and not behind what the loop has queued: the session's call takes its lock on the
+    /// outcomes and then writes its frame, and a first poll that cannot do either (the lock is held
+    /// by the reader at that instant, or the transport does not take the frame yet) leaves the
+    /// write to the loop's next look at its calls. A call that completes in that poll (one that
+    /// failed before anything was sent) is put in the set as completed, so it is taken as any
+    /// answer is, behind what the session's channel held when it was taken.
+    fn start(&mut self, tag: RequestId, mut call: link::Call) {
+        let mut context = Context::from_waker(Waker::noop());
+        match call.as_mut().poll(&mut context) {
+            Poll::Ready(answered) => self.requests.push(Box::pin(std::future::ready((
+                tag,
+                Completed::Call(answered),
+            )))),
+            Poll::Pending => self
+                .requests
+                .push(Box::pin(async move { (tag, Completed::Call(call.await)) })),
+        }
     }
 
     /// Starts a mutation on the session's target and returns the view's number for it.
@@ -1870,11 +1960,23 @@ impl View {
     /// The call that failed took the link with it, or the link failed under it: reads on to the
     /// end of the session, which is where what the host sent before it ended is, and says the view
     /// is lost, with the account's words when this device ended the link. The host's refusal of the
-    /// connection comes before the end, and is kept.
+    /// connection comes before the end, and is kept. What the session said that the loop has
+    /// queued is read first, in its order.
     async fn link_failed(&mut self) -> Ending {
+        let mut queued: VecDeque<Option<Ordered>> = std::mem::take(&mut self.heard)
+            .into_iter()
+            .filter_map(|heard| match heard {
+                Heard::Event(item) => Some(item),
+                Heard::Done(_) | Heard::Lane(_) => None,
+            })
+            .collect();
         let drained = tokio::time::timeout(REFUSAL_WAIT, async {
             loop {
-                match self.events.recv().await {
+                let item = match queued.pop_front() {
+                    Some(item) => item,
+                    None => self.events.recv().await,
+                };
+                match item {
                     Some(Ordered::Notification(notification)) => {
                         if let Some(ended) = self.notification(notification) {
                             return Some(ended);

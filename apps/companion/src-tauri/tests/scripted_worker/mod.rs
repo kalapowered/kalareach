@@ -428,6 +428,31 @@ impl Call {
     }
 }
 
+/// The call that `frame` is.
+fn call_of(frame: ControlFrame) -> Call {
+    match frame {
+        ControlFrame::Request(request) => Call {
+            request_id: request.request_id,
+            method: request.method.to_string(),
+            params: request.params,
+            kind: CallKind::Request,
+            target: None,
+            action_id: None,
+            expected: None,
+        },
+        ControlFrame::Mutation(mutation) => Call {
+            request_id: mutation.request_id,
+            method: mutation.method.to_string(),
+            params: mutation.params,
+            kind: CallKind::Mutation,
+            target: Some(mutation.target),
+            action_id: Some(mutation.action_id),
+            expected: Some(mutation.expected),
+        },
+        other => panic!("the view sent {other:?} rather than a call"),
+    }
+}
+
 /// The bytes an `input.write` carries. The view writes nothing else.
 pub fn written(asked: &kr_protocol::input::InputWriteParams) -> &[u8] {
     match &asked.input {
@@ -450,27 +475,20 @@ impl Link {
             .await
             .expect("the view called within the watchdog")
             .expect("the view's connection is open");
-        match frame {
-            ControlFrame::Request(request) => Call {
-                request_id: request.request_id,
-                method: request.method.to_string(),
-                params: request.params,
-                kind: CallKind::Request,
-                target: None,
-                action_id: None,
-                expected: None,
-            },
-            ControlFrame::Mutation(mutation) => Call {
-                request_id: mutation.request_id,
-                method: mutation.method.to_string(),
-                params: mutation.params,
-                kind: CallKind::Mutation,
-                target: Some(mutation.target),
-                action_id: Some(mutation.action_id),
-                expected: Some(mutation.expected),
-            },
-            other => panic!("the view sent {other:?} rather than a call"),
-        }
+        call_of(frame)
+    }
+
+    /// The next call the view made, if it is already on the connection, and none if it is not: this
+    /// never waits. A frame is written whole by one write, so a call that the view's write
+    /// returned from is readable here.
+    pub fn call_now(&mut self) -> Option<Call> {
+        use futures_util::FutureExt as _;
+        let frame = self
+            .reader
+            .read_message::<ControlFrame>()
+            .now_or_never()?
+            .expect("the view's connection is open");
+        Some(call_of(frame))
     }
 
     /// The next call, which has to be `method`.
