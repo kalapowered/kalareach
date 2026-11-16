@@ -237,6 +237,16 @@ fn service_with(origin: &str, deadlines: HttpDeadlines) -> Service {
     )
 }
 
+/// Says, when it is dropped, that a case's read in the window has finished, so that a case that
+/// fails during the read never leaves the writer waiting.
+struct ReadFinished<'a>(&'a Calls);
+
+impl Drop for ReadFinished<'_> {
+    fn drop(&mut self) {
+        self.0.the_read_has_finished();
+    }
+}
+
 /// Everything one test holds.
 struct Scene {
     /// The daemon, until a test stops it.
@@ -321,7 +331,7 @@ impl Scene {
         .unwrap_or_else(|_| panic!("the call never showed {what}: {}", self.state()))
     }
 
-    /// Opens a window at the next end that the call records, for [`Self::read_in_the_window`].
+    /// Opens a window at the next end the call shows, for [`Self::read_in_the_window`].
     fn open_a_window_at_the_next_end(&self) {
         self.phone
             .companion
@@ -331,19 +341,25 @@ impl Scene {
     }
 
     /// Reads the call's state once, in the window that [`Self::open_a_window_at_the_next_end`]
-    /// opened: at the moment the end has been written and what it owes has not yet been added. The
-    /// writer waits in the window for this read to begin and to finish. Where the end and what it
-    /// owes are two updates, the view is free there and the read finds the end without its entry;
-    /// where they are one, the view is held until both are in, the read waits for them, and finds
-    /// both.
+    /// opened: when the first hold of the view that shows the end has been released, wherever in
+    /// the call's supervision that hold is. The view is free, and the writer waits for this read to
+    /// finish. Where the end and what it owes are written in one hold, the read finds both; where
+    /// the end is written in a hold of its own and what it owes in a later one, the read finds the
+    /// end without its entry, whatever the processor does meanwhile. The case fails if the writer
+    /// stopped waiting before the read had finished.
     async fn read_in_the_window(&self) -> serde_json::Value {
         let calls = self.phone.companion.app.state::<Calls>();
         tokio::time::timeout(WATCHDOG, calls.until_an_end_is_being_recorded())
             .await
-            .expect("an end was recorded");
-        calls.a_read_begins();
-        let state = self.state();
-        calls.the_read_has_finished();
+            .expect("an end was shown");
+        let state = {
+            let _finished = ReadFinished(&*calls);
+            self.state()
+        };
+        assert!(
+            !calls.the_writer_gave_up(),
+            "the writer stopped waiting before the read in the window had finished"
+        );
         state
     }
 
@@ -1224,8 +1240,8 @@ async fn a_token_of_another_account_ends_the_call_and_a_warning_stands_before_th
 }
 
 /// The end of a call that the service has no record of is never read without the warning that
-/// stands before the next start: a read made at the moment the end has been written, and the
-/// update that carries it is not yet over, finds both.
+/// stands before the next start: a read made when the end is first shown, with the view free,
+/// finds both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_end_a_service_without_the_call_causes_is_never_read_without_its_warning() {
     let mut scene = scene().await;
@@ -3057,8 +3073,7 @@ async fn forgetting_the_host_ends_the_call_and_owes_the_revocation() {
 }
 
 /// The end that the person's forgetting of the host causes is never read without the revocation it
-/// owes: a read made at the moment the end has been written, and what it owes has not yet been
-/// added, finds both.
+/// owes: a read made when the end is first shown, with the view free, finds both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_end_a_forgotten_host_causes_is_never_shown_without_the_revocation_it_owes() {
     let timings = Timings {
@@ -3092,7 +3107,7 @@ async fn the_end_a_forgotten_host_causes_is_never_shown_without_the_revocation_i
 }
 
 /// The end of a start the host never answers is never read without the start it owes: a read made
-/// at the moment the end has been written, and what it owes has not yet been added, finds both.
+/// when the end is first shown, with the view free, finds both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_end_of_a_start_the_host_never_answers_is_never_shown_without_the_start_it_owes() {
     let timings = Timings {
@@ -3788,7 +3803,7 @@ async fn an_owner_that_fails_while_asking_what_became_of_a_start_leaves_the_star
         .await;
 
     assert!(refused.is_err(), "the owner failed before it could answer");
-    // The read made between the supervisor's end and the start it owes finds both.
+    // The read made when the supervisor's end is first shown finds the start it owes with it.
     let ended = scene
         .end_with_what_it_owes("owner_failed", "start_unknown")
         .await;
