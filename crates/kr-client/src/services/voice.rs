@@ -1872,6 +1872,28 @@ mod tests {
         assert_eq!(refusal.alternatives.len(), 1);
     }
 
+    /// KR-REQ-17.48: the words of a refused start and each path it names are shown text, so what a
+    /// terminal acts on is removed from the words and from every path alike, and the rest stays as
+    /// the service wrote it.
+    #[test]
+    fn kr_req_17_48_a_refused_starts_words_and_paths_lose_what_a_terminal_acts_on() {
+        let answer = ServiceHttpAnswer {
+            status: 503,
+            body: br#"{"ok":false,"error":{"code":"INTERNAL","reason":"service_capacity",
+                "message":"Managed capacity\u001b[31m is spent.",
+                "alternatives":["Use \u001b[2Jyour own provider credential.","A path of its own."]}}"#
+                .to_vec(),
+        };
+        let VoiceStart::Refused(refusal) = read_start_answer(&answer) else {
+            panic!("a refusal");
+        };
+        assert_eq!(refusal.message, "Managed capacity[31m is spent.");
+        assert_eq!(
+            refusal.alternatives,
+            ["Use [2Jyour own provider credential.", "A path of its own."]
+        );
+    }
+
     #[test]
     fn a_reason_this_build_does_not_know_is_recorded_rather_than_guessed_at() {
         let answer = ServiceHttpAnswer {

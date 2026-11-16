@@ -270,7 +270,9 @@ describe('starting a call', () => {
     expect(screen.getByRole('button', { name: 'Mute microphone' })).toBeEnabled()
   })
 
-  // An answer that is not a call is shown in the host's own words, and no call screen appears.
+  // An answer that is not a call is shown in the host's own words and, after them, "Until then:" and
+  // each path the service named as it wrote it, as the other pages say a refusal's list; no call
+  // screen appears.
   it('shows an unavailable answer and stays on the choice', async () => {
     const person = userEvent.setup()
     const { controls } = start()
@@ -280,7 +282,11 @@ describe('starting a call', () => {
     await person.click(screen.getByRole('button', { name: 'Start voice session' }))
 
     await waitFor(() => {
-      expect(screen.getByText('Managed voice cannot be started right now.')).toBeInTheDocument()
+      expect(
+        screen.getByText(
+          'Managed voice cannot be started right now. Until then: Type to the session instead.'
+        )
+      ).toBeInTheDocument()
     })
     expect(screen.queryByRole('heading', { name: 'Voice session' })).not.toBeInTheDocument()
   })

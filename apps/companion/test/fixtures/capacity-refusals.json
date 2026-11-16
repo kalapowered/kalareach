@@ -32,5 +32,21 @@
       "user_action": "nothing",
       "page": "Managed capacity for new names is not available now. (retry after 600s) Until then: A settings sync service that you run yourself. A path this version has never heard of."
     }
+  },
+  "inbox": {
+    "lease_wait": {
+      "code": "RATE_LIMITED",
+      "message": "your organisation's service asks this device to wait 60 minutes before it asks for the lease this host needs",
+      "user_action": "nothing",
+      "page": "your organisation's service asks this device to wait 60 minutes before it asks for the lease this host needs",
+      "row": "your organisation's service asks this device to wait 60 minutes before it asks for the lease this host needs. It answered, so contact is not lost. Its sessions may still be running; nothing here says they are not."
+    },
+    "refusal_by_code": {
+      "code": "RESOURCE_UNAVAILABLE",
+      "message": "this device could not ask your organisation's service for the lease just now",
+      "user_action": "wait",
+      "page": "this device could not ask your organisation's service for the lease just now. Wait a moment and try again.",
+      "row": "this device could not ask your organisation's service for the lease just now. Wait a moment and try again. It answered, so contact is not lost. Its sessions may still be running; nothing here says they are not."
+    }
   }
 }

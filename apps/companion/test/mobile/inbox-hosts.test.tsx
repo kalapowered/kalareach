@@ -19,6 +19,7 @@ import { AppProvider } from '../../src/app/state'
 import { fakeHost, type FakeHostControls } from '../../src/host/fake'
 import type { HostError, HostInbox, HostRow, RefusedRequest } from '../../src/host/port'
 import { MobileApp } from '../../src/mobile/MobileApp'
+import capacityRefusals from '../fixtures/capacity-refusals.json'
 
 afterEach(() => {
   cleanup()
@@ -272,6 +273,31 @@ describe('the inbox of a phone paired with two hosts', () => {
       expect(refusal, request).toHaveTextContent('It answered, so contact is not lost')
     }
   })
+
+  // A failure that says its own wait says it once. Native code sends the words and an action of
+  // `nothing` when they carry the wait, and the code's own action when they do not; the row adds a
+  // line only for the second.
+  it.each(Object.entries(capacityRefusals.inbox))(
+    'tells the whole text native code sent for a refused connection, with a line of the page only where none was said: %s',
+    async (_kind, sent) => {
+      const { controls } = start()
+      await waitFor(() => {
+        expect(rowsOf('laptop')).toHaveLength(2)
+      })
+      controls.setInboxHosts([
+        refusingLaptop(
+          { code: sent.code, message: sent.message, user_action: sent.user_action, retry: 'transient' },
+          'connection'
+        )
+      ])
+      readNow()
+      await waitFor(() => {
+        expect(screen.getByTestId('inbox-refusal')).toHaveAttribute('data-refused', 'connection')
+      })
+      const detail = screen.getByTestId('inbox-refusal').querySelector('.m-row-detail')
+      expect(detail?.textContent).toBe(sent.row)
+    }
+  )
 
   it('stops drawing the refusal once the host shows its inbox again', async () => {
     const { controls } = start()

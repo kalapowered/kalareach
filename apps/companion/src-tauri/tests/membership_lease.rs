@@ -37,6 +37,9 @@
 //! | KR-REQ-17.53 | `a_kept_visit_goes_on_when_the_host_distrusts_its_clock_at_the_new_lease` |
 //! | KR-REQ-17.53 | `a_visit_that_cannot_get_a_lease_says_why_and_is_not_out_of_contact` |
 //! | KR-REQ-17.53 | `a_sign_in_made_since_clears_what_was_held_against_the_account` |
+//! | KR-REQ-17.48 | `a_kept_visit_the_service_asks_to_wait_is_sent_with_its_own_wait_and_no_action_beside_it` |
+//! | KR-REQ-17.48 | `a_new_visit_the_service_asks_to_wait_is_sent_with_its_own_wait_and_no_action_beside_it` |
+//! | KR-REQ-17.48 | `a_membership_refusal_that_names_no_wait_keeps_the_line_of_its_code` |
 //! | KR-REQ-17.53 | `a_visit_does_not_ask_for_the_chain_of_keys_while_the_service_asks_for_a_wait` |
 //! | KR-REQ-17.53 | `a_reused_lease_lasts_until_the_first_refresh_of_the_connection_that_keeps_it` |
 //! | KR-REQ-17.53 | `a_presentation_its_caller_cuts_off_while_the_service_is_silent_holds_the_service_off` |
@@ -1859,6 +1862,105 @@ async fn a_kept_visit_goes_on_when_the_host_distrusts_its_clock_at_the_new_lease
         held,
         "the host holds the lease it held"
     );
+}
+
+/// What native code sent the page for the inbox's refusal `kind`, from the golden file the page's
+/// own cases read, so that both sides hold the same whole text.
+fn inbox_sent(kind: &str) -> serde_json::Value {
+    let all: serde_json::Value =
+        serde_json::from_str(include_str!("../../test/fixtures/capacity-refusals.json"))
+            .expect("the golden file reads");
+    all["inbox"][kind].clone()
+}
+
+/// The failure the inbox's row holds, as the page is sent it: its code, its words and its action.
+fn as_sent(row: &HostInbox) -> serde_json::Value {
+    let refusal = serde_json::to_value(row.refusal.as_ref().expect("the reason")).expect("a value");
+    json!({
+        "code": refusal["code"],
+        "message": refusal["message"],
+        "user_action": refusal["user_action"],
+    })
+}
+
+/// The part of the golden file native code sends, without the page's text.
+fn native_part(sent: &serde_json::Value) -> serde_json::Value {
+    json!({
+        "code": sent["code"],
+        "message": sent["message"],
+        "user_action": sent["user_action"],
+    })
+}
+
+/// KR-REQ-17.53 and KR-REQ-17.48: a kept visit whose lease is due, which the service asks to wait
+/// an hour for the next, is sent to the page as one sentence that says how long this device waits,
+/// and asks nothing more of the page: the person never reads a second wait chosen by the code after
+/// the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kept_visit_the_service_asks_to_wait_is_sent_with_its_own_wait_and_no_action_beside_it() {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    let _elsewhere = rig.uses_another_host().await;
+    let desk = Arc::new(InboxDesk::default());
+    let first = rig.inbox_of(&desk).await;
+    assert_eq!(first.state, HostInboxState::Read, "{:?}", first.refusal);
+
+    // Less than the margin is left on the lease the host holds, so a wait the service asks for is
+    // no longer one the lease lasts out.
+    rig.waits.time_passes(Duration::from_secs(14 * 60 + 45));
+    rig.refuses_the_next_lease(Moment::Refuse {
+        status: 429,
+        code: "RATE_LIMITED",
+        retry_after_seconds: Some(3600),
+    });
+    let row = rig.inbox_of(&desk).await;
+    assert_eq!(row.state, HostInboxState::Refused, "{row:?}");
+    assert_eq!(as_sent(&row), native_part(&inbox_sent("lease_wait")));
+}
+
+/// KR-REQ-17.53 and KR-REQ-17.48: a visit that opens its own connection to a host whose service
+/// has asked this device to wait an hour says that wait once, as a kept visit does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_visit_the_service_asks_to_wait_is_sent_with_its_own_wait_and_no_action_beside_it() {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    rig.waits.until_asked(1).await;
+    rig.refuses_the_next_lease(Moment::Refuse {
+        status: 429,
+        code: "RATE_LIMITED",
+        retry_after_seconds: Some(3600),
+    });
+    let rig = rig.restarted().await;
+    // The application's own connection asks first and is told to wait; the visit then finds the
+    // same stop held against the service.
+    let _ = rig.down_because("wait").await;
+    let _elsewhere = rig.uses_another_host().await;
+
+    let row = rig.inbox_of(&Arc::new(InboxDesk::default())).await;
+    assert_eq!(row.state, HostInboxState::Refused, "{row:?}");
+    assert_eq!(as_sent(&row), native_part(&inbox_sent("lease_wait")));
+}
+
+/// KR-REQ-17.53 and KR-REQ-17.48: a refusal to give the host the lease that comes with no stop of
+/// the lease to say what to do (here, a presentation that fails with a code and words that name no
+/// wait) keeps the line its code gives, so a person who is told to try later is still told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_membership_refusal_that_names_no_wait_keeps_the_line_of_its_code() {
+    let rig = Rig::start().await;
+    rig.connection(true).await;
+    let _elsewhere = rig.uses_another_host().await;
+    let desk = Arc::new(InboxDesk::default());
+    let first = rig.inbox_of(&desk).await;
+    assert_eq!(first.state, HostInboxState::Read, "{:?}", first.refusal);
+
+    let sent = inbox_sent("refusal_by_code");
+    rig.control.fail_presentation(Some(ProtocolError::new(
+        ErrorCode::ResourceUnavailable,
+        sent["message"].as_str().expect("the words"),
+    )));
+    let row = rig.inbox_of(&desk).await;
+    assert_eq!(row.state, HostInboxState::Refused, "{row:?}");
+    assert_eq!(as_sent(&row), native_part(&sent));
 }
 
 /// KR-REQ-17.53: a visit that cannot give the host the device's lease says why. A host that is
