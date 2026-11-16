@@ -2608,9 +2608,17 @@ impl Owner {
             )],
             _ => Vec::new(),
         };
+        // A call that the service has no record of is noted in the end's own update, so that the
+        // end is never shown without the warning that stands before the next start.
+        let no_such_call =
+            matches!(cause, Cause::Control(ControlEnd::NoSuchCall)).then(|| self.note_key());
+        let shared = &self.shared;
         self.shared.record_end(
             self.id,
             |state| {
+                if let Some(key) = no_such_call {
+                    shared.note_no_such_call(key);
+                }
                 state.running = false;
                 state.session = None;
                 state.control = "none".to_owned();
@@ -2641,7 +2649,7 @@ impl Owner {
             owed,
         );
         if matches!(cause, Cause::Control(ControlEnd::NoSuchCall)) {
-            self.shared.remember_no_such_call(self.note_key());
+            self.shared.keep();
         }
         // Another call can be started from here; this one is only finalising at the service.
         self.release();

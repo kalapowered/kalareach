@@ -599,14 +599,13 @@ impl Shared {
         }
     }
 
-    pub(crate) fn remember_no_such_call(&self, key: NoteKey) {
-        {
-            let mut note = self.note.lock().expect("the note lock is not poisoned");
-            self.note_changed
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            *note = Some(key);
-        }
-        self.keep();
+    /// Notes, in memory, that the call found no such call at the voice service. Called by the end's
+    /// own update, so that the end is never shown without it; the file is written after.
+    pub(crate) fn note_no_such_call(&self, key: NoteKey) {
+        let mut note = self.note.lock().expect("the note lock is not poisoned");
+        self.note_changed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *note = Some(key);
     }
 
     /// Reads what the launches before this one kept again, when the first read was refused, and
