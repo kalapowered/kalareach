@@ -8816,7 +8816,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 [[package]]
 name = "simple-dns"
 version = "0.12.0"
-source = "git+https://github.com/kalapowered/simple-dns?rev=c94a367cb3f6c81dba995de875647137b62d164e#c94a367cb3f6c81dba995de875647137b62d164e"
+source = "git+https://github.com/kalapowered/simple-dns?rev=def27859a02d7f38391f0e3f9d9fcf33e51d05ce#def27859a02d7f38391f0e3f9d9fcf33e51d05ce"
 dependencies = [
  "bitflags 2.13.2",
 ]
