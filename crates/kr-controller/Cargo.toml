@@ -118,7 +118,9 @@ kr-protocol = { workspace = true, features = ["testing"] }
 # The change-set tests stop an apply where a crash would stop it, which the service compiles only
 # for them.
 kr-changeset = { workspace = true, features = ["fault-injection"] }
-kr-crypto.workspace = true
+# The stand-in the key store cases put in the platform credential store's place, so that no case
+# opens the machine's own.
+kr-crypto = { workspace = true, features = ["testing"] }
 kr-ipc = { workspace = true, features = ["testing"] }
 # The bundle a test seeds a catalogue from is made of files of its own, trusting what the test names.
 kr-plugin-catalogue = { workspace = true, features = ["testing"] }
