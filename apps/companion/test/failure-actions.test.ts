@@ -11,6 +11,7 @@ import { describe, expect, it } from 'vitest'
 import { failureMessage, USER_ACTIONS } from '../src/host/port'
 
 import retrySource from '../../../crates/kr-client/src/retry.rs?raw'
+import capacityRefusals from './fixtures/capacity-refusals.json'
 
 describe('the words for a failure', () => {
   it('offer the direct action its code translates to, and never the code', () => {
@@ -42,8 +43,8 @@ describe('the words for a failure', () => {
       })
     ).toBe('this application is not connected to a host. Wait a moment and try again.')
     expect(
-      failureMessage({ code: 'RATE_LIMITED', message: 'slow down (retry after 30s)', user_action: 'wait' })
-    ).toBe('slow down (retry after 30s). Wait a moment and try again.')
+      failureMessage({ code: 'RATE_LIMITED', message: 'slow down', user_action: 'wait' })
+    ).toBe('slow down. Wait a moment and try again.')
   })
 
   it('leave out the code the client library puts in front of a host’s words, as native code sends it', () => {
@@ -102,5 +103,39 @@ describe('the words for a failure', () => {
       if (sentence !== '') described[key] = sentence
     }
     expect(described).toEqual(USER_ACTIONS)
+  })
+})
+
+describe('a refusal that says its own wait', () => {
+  /** Every refusal native code sends for want of capacity, as the golden file holds it. */
+  const sent = Object.entries(capacityRefusals).flatMap(([surface, kinds]) =>
+    Object.entries(kinds).map(([kind, one]) => ({ name: `${surface} ${kind}`, ...one }))
+  )
+
+  it('is read as the whole text that native code composed, with no line of the page’s own after it', () => {
+    expect(sent.length).toBeGreaterThanOrEqual(5)
+    for (const one of sent) {
+      const said = failureMessage({ code: one.code, message: one.message, user_action: one.user_action })
+      expect(said, one.name).toBe(one.page)
+      if (one.user_action === 'nothing') {
+        expect(said, one.name).not.toContain(USER_ACTIONS.wait)
+      } else {
+        expect(said, one.name).toMatch(/ Wait a moment and try again\.$/)
+      }
+    }
+  })
+
+  const files = import.meta.glob('../src/**/*.{ts,tsx}', {
+    query: '?raw',
+    import: 'default',
+    eager: true
+  })
+
+  it('meets one reader of the action, so that no second reader adds a line after the first', () => {
+    const readers = Object.entries(files)
+      .filter(([path]) => !/\/src\/host\/fake[^/]*\.ts$|\.\.\/src\/host\/fake[^/]*\.ts$/.test(path))
+      .filter(([, text]) => /\.user_action\b|USER_ACTIONS/.test(text))
+      .map(([path]) => path)
+    expect(readers).toEqual(['../src/host/port.ts'])
   })
 })

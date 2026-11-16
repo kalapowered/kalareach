@@ -2432,6 +2432,46 @@ async fn kr_req_17_48_a_spent_keyless_budget_at_turn_on_names_the_alternatives_a
     );
 }
 
+/// What the Sync panel is sent when the service turns the start back for want of capacity, as
+/// the golden file the page's own cases read too holds it: the whole text, and the action the
+/// page adds a line for.
+fn sync_panel_sent(kind: &str) -> Value {
+    let all: Value =
+        serde_json::from_str(include_str!("../../test/fixtures/capacity-refusals.json"))
+            .expect("the golden file reads");
+    all["sync_panel"][kind].clone()
+}
+
+/// KR-REQ-17.48: a start that the service turned back for want of capacity is sent to the page
+/// as one text that carries the service's own delay and list, and asks nothing more of the page,
+/// so a person never reads a second instruction chosen by the code after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_17_48_a_start_that_says_its_own_wait_is_sent_with_no_action_beside_it() {
+    const NAMED: [&str; 2] = [
+        "A settings sync service that you run yourself.",
+        "A path this version has never heard of.",
+    ];
+    for (kind, named) in [("delay", &[][..]), ("both", &NAMED[..])] {
+        let computer = Computer::new().await;
+        let page = computer.start();
+        page.choose("dark");
+        for nth in 1..=8 {
+            computer.served.web().fail(
+                SYNC_PATH,
+                nth,
+                short_budget(429, "RATE_LIMITED", 600, named),
+            );
+        }
+        let refused = page
+            .call("settings_sync_turn_on", json!({}))
+            .expect_err("the service turned the start back");
+        let sent = sync_panel_sent(kind);
+        assert_eq!(refused["message"], sent["message"], "{kind}");
+        assert_eq!(refused["user_action"], sent["user_action"], "{kind}");
+        assert_eq!(refused["code"], sent["code"], "{kind}");
+    }
+}
+
 /* -------------------------------------------------------------------------- */
 /* Keeping in step                                                             */
 /* -------------------------------------------------------------------------- */

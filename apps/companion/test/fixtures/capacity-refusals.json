@@ -1,0 +1,36 @@
+{
+  "devices_page": {
+    "delay": {
+      "code": "SERVICE_CAPACITY",
+      "message": "SERVICE_CAPACITY: Managed capacity for new names is not available now. (retry after 120s). The request did not reach the host. This computer no longer shares its settings with that device.",
+      "user_action": "nothing",
+      "page": "Managed capacity for new names is not available now. (retry after 120s). The request did not reach the host. This computer no longer shares its settings with that device."
+    },
+    "both": {
+      "code": "SERVICE_CAPACITY",
+      "message": "SERVICE_CAPACITY: Managed capacity for new names is not available now. (retry after 120s) Until then: An authority feed service that you run yourself. A path this version has never heard of. The request did not reach the host. This computer no longer shares its settings with that device.",
+      "user_action": "nothing",
+      "page": "Managed capacity for new names is not available now. (retry after 120s) Until then: An authority feed service that you run yourself. A path this version has never heard of. The request did not reach the host. This computer no longer shares its settings with that device."
+    },
+    "plain": {
+      "code": "SERVICE_CAPACITY",
+      "message": "SERVICE_CAPACITY: The service refuses that request for now. The request did not reach the host. This computer no longer shares its settings with that device.",
+      "user_action": "wait",
+      "page": "The service refuses that request for now. The request did not reach the host. This computer no longer shares its settings with that device. Wait a moment and try again."
+    }
+  },
+  "sync_panel": {
+    "delay": {
+      "code": "RATE_LIMITED",
+      "message": "RATE_LIMITED: Managed capacity for new names is not available now. (retry after 600s)",
+      "user_action": "nothing",
+      "page": "Managed capacity for new names is not available now. (retry after 600s)"
+    },
+    "both": {
+      "code": "RATE_LIMITED",
+      "message": "RATE_LIMITED: Managed capacity for new names is not available now. (retry after 600s) Until then: A settings sync service that you run yourself. A path this version has never heard of.",
+      "user_action": "nothing",
+      "page": "Managed capacity for new names is not available now. (retry after 600s) Until then: A settings sync service that you run yourself. A path this version has never heard of."
+    }
+  }
+}

@@ -3577,7 +3577,22 @@ async fn a_service_that_keeps_asking_for_quiet_stops_the_run_after_five_waits_an
     assert!(!ended.status.success());
     let said = text(&ended.stderr);
     assert_eq!(said.matches("Waiting 1 s,").count(), 5, "{said}");
-    assert!(said.contains("try again after"), "{said}");
+    // What the person reads after the last wait is the command's one sentence, and no line that
+    // the code chooses follows it: the sentence says when to try again.
+    let after_the_last_wait: Vec<&str> = said
+        .lines()
+        .skip_while(|line| !line.contains("wait 5 of 5"))
+        .skip(1)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(
+        after_the_last_wait,
+        [
+            "kr: the storage service still asks this host to wait about 1 more seconds after 5 \
+             waits; try again after that, and nothing was kept"
+        ],
+        "{said}"
+    );
     assert!(
         names(&fixture.into).is_empty(),
         "the run removed what it wrote"

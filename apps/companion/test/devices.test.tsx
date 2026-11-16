@@ -24,6 +24,7 @@ import type {
   RevocationView
 } from '../src/host/port'
 import { Devices } from '../src/views/Devices'
+import capacityRefusals from './fixtures/capacity-refusals.json'
 import recorded from './fixtures/revocation-view.json'
 
 const FEED: RevocationFeed = {
@@ -234,6 +235,27 @@ describe('revoking a device', () => {
     })
     expect(screen.getByTestId('devices-heard')).toHaveTextContent('Revoking the-phone did not finish')
   })
+
+  it.each(Object.entries(capacityRefusals.devices_page))(
+    'tells a revocation that a service turned back as the whole text native code sent, with no line of the page after it: %s',
+    async (_kind, sent) => {
+      const person = userEvent.setup()
+      const { port } = screenOf(view([host()]))
+      vi.spyOn(port, 'revocationRevoke').mockRejectedValue({
+        code: sent.code,
+        message: sent.message,
+        user_action: sent.user_action,
+        retry: 'transient'
+      })
+      const row = await rowOf('the-phone')
+      await person.click(within(row).getByRole('button', { name: /^Revoke with Touch ID/ }))
+      await waitFor(() => {
+        expect(within(row).getByTestId('devices-failure').textContent).toBe(
+          `Revoking the-phone did not finish. ${sent.page}`
+        )
+      })
+    }
+  )
 
   it('does not claim that nothing changed when the request may have reached its host, and looks again', async () => {
     const person = userEvent.setup()
@@ -540,6 +562,20 @@ describe('reading the mailbox where the service has no capacity for a new one', 
       'The sync service has no managed capacity for new mailboxes now, which is a limit of the service and not a fault of this computer. Until then: A path of its own. A second path of its own. Answers to revocations are still read from each feed.'
     )
     expect(line).not.toHaveTextContent(/delay|minute|seconds|hour/i)
+  })
+})
+
+describe('a feed this computer could not read', () => {
+  // KR-REQ-17.48: the line is the service's own words and the page's own sentence, which is a fact
+  // and not an instruction, so a person reads one wait and no second line.
+  it('says the service’s words whole, then that a request sent earlier may be waiting, and no more', async () => {
+    const problem = 'Managed capacity for new authority feeds is not available now. (retry after 120s)'
+    screenOf(view([host({ feed: { ...FEED, read: false, problem } })]))
+    const line = await screen.findByTestId('devices-feed')
+    expect(line.textContent).toBe(
+      `This computer could not read the feed: ${problem}. A request sent earlier may be waiting there.`
+    )
+    expect(screen.getAllByTestId('devices-feed')).toHaveLength(1)
   })
 })
 
