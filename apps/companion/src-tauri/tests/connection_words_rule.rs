@@ -539,8 +539,8 @@ const EXCEPTIONS: [Exception; 63] = [
         file: "terminal/input.rs",
         function: "answered",
         needle: COMPARED,
-        lines: 1,
-        reason: "the refusal of an input lease request, answered on a connection that is open; it decides nothing about a connection that was not opened",
+        lines: 3,
+        reason: "the refusal of an input lease request or of a release, answered on a connection that is open: a refused write, a release of a lease already lost, and a release refused for the typing before it; it decides nothing about a connection that was not opened",
     },
     Exception {
         file: "terminal/input.rs",
