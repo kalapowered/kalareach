@@ -486,8 +486,10 @@ impl Controller {
     /// # Errors
     ///
     /// Returns [`ControllerError::UnknownSession`] when no closure is known or recorded, and
-    /// [`ControllerError::Uncertain`] when the registry does not answer before `budget`, the
-    /// instant the close this answers must be over by.
+    /// [`ControllerError::Uncertain`] when no closure is known and the registry's record cannot be
+    /// read: the registry does not answer before `budget`, the instant the close this answers
+    /// must be over by, or its read fails, or the thread that made it is lost, or this daemon is
+    /// being let go.
     pub(super) async fn answer_from_the_closure(
         &self,
         session_id: SessionId,
