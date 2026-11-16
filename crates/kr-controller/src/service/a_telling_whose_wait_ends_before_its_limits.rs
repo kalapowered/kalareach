@@ -277,6 +277,9 @@ async fn the_link_went_back_whole(silent: &Silent, heard: &Heard) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_limit_that_ends_near_the_deadline_finds_the_link_already_given_back() {
     let (silent, heard) = answered().await;
+    // The worker is pending, so the daemon's own pass would ask it too, and send a notice of its own
+    // that the count of frames and the slot would take for this ask's.
+    silent.controller.hold_the_pass_asks_for_tests(true);
     let controller = Arc::clone(&silent.controller);
     let session_id = silent.session_id;
     let (let_go, held_until) = tokio::sync::oneshot::channel::<()>();
