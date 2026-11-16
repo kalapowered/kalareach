@@ -22,7 +22,7 @@ use kr_protocol::attachment::{
     AttachMode, AttachmentSummary, GeometryState, SessionAttachParams, SessionAttachResult,
     TerminalPresentationMode,
 };
-use kr_protocol::envelope::{ControlFrame, Notification, Outcome, ParamsValue, Response};
+use kr_protocol::envelope::{ControlFrame, Notification, Outcome, ParamsValue, Request, Response};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::{
@@ -34,7 +34,7 @@ use kr_protocol::ids::{
     EventType, GeometryEpoch, RequestId, SessionEpoch, SessionId, StreamId,
 };
 use kr_protocol::local::{LocalBuild, LocalHelloAck, LocalPeer, LocalRole};
-use kr_protocol::method::Method;
+use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::projection::{
     CellRendition, CellRun, CharsetState, KittyKeyboardState, MarginState, PaletteProvenance,
     PaletteState, ProjectedBuffer, ProjectedCursor, ProjectedKeyboard, ProjectedRow,
@@ -590,6 +590,20 @@ impl Link {
             }))
             .await
             .expect("the event is written");
+    }
+
+    /// Sends the view a request, a frame that a host never sends a client: the client library ends
+    /// the session on it.
+    pub async fn send_request(&mut self) {
+        self.writer
+            .write_message(&ControlFrame::Request(Request {
+                request_id: RequestId::new(900),
+                method: Method::SessionOpen.into(),
+                method_version: MethodVersion::V1,
+                params: ParamsValue::empty(),
+            }))
+            .await
+            .expect("the request is written");
     }
 
     /// Starts the stream again, as a new subscription's delivery does: the next event is at 0.

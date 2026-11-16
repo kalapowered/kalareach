@@ -4744,6 +4744,79 @@ async fn a_connection_lost_during_the_attach_says_how_the_link_ended() {
     );
 }
 
+/// What the page's commands to a view that has ended are answered with, as on any lost link.
+fn refused_after_the_end(page: &Page, view: &str) {
+    for (what, answer) in [
+        ("text", page.text(view, 1, "q")),
+        ("a key", page.input(view, key(1, "q", &[], "press"))),
+    ] {
+        let refusal = answer.expect_err(what);
+        assert_eq!(code(&refusal), "LEASE_LOST", "{what}");
+        assert_eq!(
+            refusal["message"], "This view has ended, and took nothing.",
+            "{what}"
+        );
+    }
+}
+
+/// A host that sends a client a frame that a client may not receive is not one this application
+/// reads: the client library ends the session on it, by its one rule for every connection, and the
+/// view reads through that library alone. While the view opens, the page is told why, once; the
+/// connection is closed, and a command that follows is refused as on any lost link.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_frame_a_client_may_not_receive_during_the_attach_ends_the_open_with_its_cause() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let view = page.open(worker.session_id, 10, 2, 3);
+    let mut link = worker.link().await;
+    link.expect(Method::SessionAttach).await;
+    link.send_request().await;
+    let ended = page.state(3, 0).await;
+    assert_eq!(ended["state"], "ended");
+    assert_eq!(
+        ended["reason"],
+        "The connection to this session ended: the host sent a frame this application does not read"
+    );
+    page.held_becomes(0).await;
+    assert_eq!(
+        page.states(3).len(),
+        1,
+        "the page is told once, and nothing follows: {:?}",
+        page.states(3)
+    );
+    assert!(
+        link.closed().await.is_empty(),
+        "the view closed its connection and wrote nothing more"
+    );
+    refused_after_the_end(&page, &view);
+}
+
+/// The same frame while the view shows: the view ends as lost, once, and the page is told what it
+/// is told of every lost link, which carries no cause; the connection is closed, and a command that
+/// follows is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_frame_a_client_may_not_receive_while_the_view_shows_ends_it_as_lost() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let (view, mut link) = showing(&page, &mut worker, 3).await;
+    link.send_request().await;
+    let ended = page.state(3, 2).await;
+    assert_eq!(ended["state"], "ended");
+    assert_eq!(ended["reason"], "The connection to this session ended.");
+    page.held_becomes(0).await;
+    assert_eq!(
+        page.states(3).len(),
+        3,
+        "the page is told once, and nothing follows: {:?}",
+        page.states(3)
+    );
+    assert!(
+        link.closed().await.is_empty(),
+        "the view closed its connection and wrote nothing more"
+    );
+    refused_after_the_end(&page, &view);
+}
+
 /// A delivery that restarts is told from the one it replaces by its first notification at 0:
 /// everything of the old stream that still arrives, before the subscription's answer and after it,
 /// is dropped, and the page never shows it.
