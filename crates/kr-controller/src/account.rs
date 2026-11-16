@@ -78,7 +78,7 @@ use kr_client::services::account::{
     AccountHttp, AccountService, AccountStatus, AccountTokenSource, Answer, AnswerFault,
     AuthorisationGrant, AuthorisationRequest, BACKUP_WRITE_SCOPE, Client, Commit, Exchanged,
     IdentityRead, ManagedAccountService, PendingAuthorisation, RELAY_LEASE_SCOPE, Redirect,
-    SignedInAccount, TokenOfAccount,
+    SignedInAccount, TokenOfAccount, Unrevoked,
 };
 use kr_client::services::{AccountToken, HttpDeadlines, ServiceFuture};
 use kr_crypto::store::SecretStore;
@@ -197,6 +197,31 @@ const AUTHORITY_ENDED_REVOCATION_OWED_PAGE: &str = "This host's authority for th
 const CALL_OPEN_REVOCATION_OWED_PAGE: &str = "A voice call is open on this host. End it, then sign \
      in again. The host could not yet revoke what the account service issued. The host tries again \
      the next time it uses the account, and what was issued ends by itself when it expires.";
+
+/// The line that records a failed revocation of the token of a `whose` sign-in: what the queue and
+/// the service are known to have done, with "may have" where a write can have landed before it was
+/// reported as failed.
+fn failed_revocation_line(whose: &str, unrevoked: &Unrevoked) -> String {
+    let (said, error) = match unrevoked {
+        Unrevoked::Queued(error) => (
+            "the queue took the token and sending the queue failed, and a send of the token \
+             alone was not taken; the service may have taken the token in the first send, and \
+             the queue holds its entry",
+            error,
+        ),
+        Unrevoked::Ended(error) => (
+            "the service took the token by a send of its own; the queue of revocations failed, \
+             and may still hold its entry",
+            error,
+        ),
+        Unrevoked::Held(error) => (
+            "the service did not take the token and the queue's write failed, which may have \
+             left its entry in place; the token is held in memory for the next send",
+            error,
+        ),
+    };
+    format!("kr-controller: {whose} sign-in's token: {said}: {error}")
+}
 
 /// What a waiting sign-in came to.
 #[derive(Clone, Copy)]
@@ -1617,7 +1642,7 @@ impl Inner {
                     // is told as the keep tells them, so a revocation that is still owed is said.
                     let (commit, unrevoked) = held.signed_in.end_withheld(refresh).await;
                     if let Some(unrevoked) = unrevoked {
-                        eprintln!("kr-controller: a withheld sign-in's token: {unrevoked}");
+                        eprintln!("{}", failed_revocation_line("a withheld", &unrevoked));
                     }
                     return Outcome::withheld(commit);
                 };
@@ -1629,7 +1654,7 @@ impl Inner {
                     // revocation that is still owed as it is there.
                     let (commit, unrevoked) = held.signed_in.end_withheld(refresh).await;
                     if let Some(unrevoked) = unrevoked {
-                        eprintln!("kr-controller: a refused sign-in's token: {unrevoked}");
+                        eprintln!("{}", failed_revocation_line("a refused", &unrevoked));
                     }
                     return Outcome::call_open(commit);
                 };
@@ -1894,6 +1919,47 @@ mod tests {
         assert!(owed.contains("could not yet revoke what the account service issued"));
         assert!(owed.contains("tries again the next time it uses the account"));
         assert!(!owed.contains("The host revokes what"), "{owed}");
+    }
+
+    /// What the line of a failed revocation says is what the revocation knows, whole, in each state:
+    /// where the queue took the token and the send failed, where the service took it by a send of
+    /// its own, and where only memory holds it (a queue write that was reported as failed may have
+    /// landed).
+    #[test]
+    fn the_line_of_a_failed_revocation_says_no_more_than_the_revocation_knows() {
+        use kr_client::error::ClientError;
+        use kr_client::services::account::Unrevoked;
+        let failed = || {
+            ClientError::Host(kr_protocol::error::ProtocolError::new(
+                kr_protocol::error::ErrorCode::UpstreamUnavailable,
+                "the service cannot be reached".to_owned(),
+            ))
+        };
+        let error = failed().to_string();
+        assert_eq!(
+            super::failed_revocation_line("a withheld", &Unrevoked::Queued(failed())),
+            format!(
+                "kr-controller: a withheld sign-in's token: the queue took the token and sending \
+                 the queue failed, and a send of the token alone was not taken; the service may \
+                 have taken the token in the first send, and the queue holds its entry: {error}"
+            )
+        );
+        assert_eq!(
+            super::failed_revocation_line("a refused", &Unrevoked::Ended(failed())),
+            format!(
+                "kr-controller: a refused sign-in's token: the service took the token by a send \
+                 of its own; the queue of revocations failed, and may still hold its entry: \
+                 {error}"
+            )
+        );
+        assert_eq!(
+            super::failed_revocation_line("a withheld", &Unrevoked::Held(failed())),
+            format!(
+                "kr-controller: a withheld sign-in's token: the service did not take the token \
+                 and the queue's write failed, which may have left its entry in place; the \
+                 token is held in memory for the next send: {error}"
+            )
+        );
     }
 
     use std::sync::atomic::{AtomicUsize, Ordering};

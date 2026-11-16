@@ -2931,15 +2931,15 @@ async fn ending_a_withheld_sign_ins_tokens_says_what_is_owed_and_how_the_revocat
     }
 }
 
-/// What the line that records a failed revocation says is what the revocation knows, in the two
-/// orders in which more could be said than is known. A queue write can install its entry and then
-/// be reported as failed: where the service does not take the token either, the token is held in
-/// memory, and the line says that the entry may have been left in place. A send of the queue can
-/// reach the service and then fail to clean the queue up: where a send of the token alone is then
-/// not taken, the token is in the queue, and the line says that the service may have taken it in
-/// the first send. Both lines are asserted whole.
+/// The two orders in which a failed revocation can leave more done than its first reading says. A
+/// queue write can install its entry and then be reported as failed: where the service does not
+/// take the token either, the token is held in memory, and the failure says `Held`, which the
+/// daemon's line words as an entry that may have been left in place. A send of the queue can reach
+/// the service and then fail to clean the queue up: where a send of the token alone is then not
+/// taken, the token is in the queue, and the failure says `Queued`, which the daemon's line words
+/// as a service that may have taken it in the first send.
 #[tokio::test]
-async fn the_line_of_a_failed_revocation_says_no_more_than_the_revocation_knows() {
+async fn a_failed_revocation_says_where_the_token_stands_in_the_two_orders_that_leave_more_done() {
     let _clock = CLOCK.lock().await;
     rewind();
     // The queue's write lands and is reported as failed, and the service takes nothing.
@@ -2953,15 +2953,9 @@ async fn the_line_of_a_failed_revocation_says_no_more_than_the_revocation_knows(
         .end_withheld(RefreshToken::new("grant-c").expect("a token"))
         .await;
     assert_eq!(commit, Commit::WithheldOwing);
-    let Some(Unrevoked::Held(error)) = &unrevoked else {
-        panic!("neither took the token: {unrevoked:?}");
-    };
-    assert_eq!(
-        unrevoked.as_ref().expect("a failure").to_string(),
-        format!(
-            "the service did not take the token and the queue's write failed, which may have \
-             left its entry in place; the token is held in memory for the next send: {error}"
-        )
+    assert!(
+        matches!(unrevoked, Some(Unrevoked::Held(_))),
+        "neither took the token: {unrevoked:?}"
     );
 
     // The send of the queue reaches the service, its clean-up fails, and the send of the token
@@ -2976,16 +2970,9 @@ async fn the_line_of_a_failed_revocation_says_no_more_than_the_revocation_knows(
         .await;
     assert_eq!(commit, Commit::Withheld);
     assert_eq!(stub.revoked(), ["grant-d"], "the service took it once");
-    let Some(Unrevoked::Queued(error)) = &unrevoked else {
-        panic!("the queue holds the token: {unrevoked:?}");
-    };
-    assert_eq!(
-        unrevoked.as_ref().expect("a failure").to_string(),
-        format!(
-            "the queue took the token and sending the queue failed, and a send of the token \
-             alone was not taken; the service may have taken the token in the first send, and \
-             the queue holds its entry: {error}"
-        )
+    assert!(
+        matches!(unrevoked, Some(Unrevoked::Queued(_))),
+        "the queue holds the token: {unrevoked:?}"
     );
 }
 
