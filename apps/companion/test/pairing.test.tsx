@@ -163,9 +163,7 @@ describe('pairing with a host', () => {
       'service_not_pairing',
       'no_host_answered',
       'not_authenticated',
-      'host_tries_used',
       'timed_out',
-      'declined',
       'approval_unknown'
     ]
     const { controls } = start()
@@ -187,26 +185,35 @@ describe('pairing with a host', () => {
     )
   })
 
-  // The tries line counts tries of the code that was charged. After an ending that starts again the
-  // code can no longer be used, so no line says how many tries are left on it.
-  it.each<[string, PairingFailure]>([
-    ['an invitation the host consumed as expired', { kind: 'expired', tries_left: 3 }],
-    ['a host that restarted', { kind: 'host_restarted', tries_left: 3 }],
+  // The tries line counts tries of the code that was charged. After an ending at which the invitation
+  // can no longer be used, the code is spent, so no line says how many tries are left on it: not after
+  // an ending that starts again, and not after one at which the host consumed or ended the invitation.
+  it.each<[string, PairingFailure, string]>([
+    ['an invitation the host consumed as expired', { kind: 'expired', tries_left: 3 }, 'Start again'],
+    ['a host that restarted', { kind: 'host_restarted', tries_left: 3 }, 'Start again'],
     [
       'a dial lost after the host locked the invitation',
-      { kind: 'host_unreachable', tries_left: 4, invitation_spent: true }
+      { kind: 'host_unreachable', tries_left: 4, invitation_spent: true },
+      'Start again'
+    ],
+    ['an owner who declined this device', { kind: 'declined', tries_left: 3 }, 'Done'],
+    ['an owner who withdrew the invitation', { kind: 'withdrawn', tries_left: 3 }, 'Done'],
+    [
+      'a host that ended the invitation for too many wrong codes',
+      { kind: 'host_tries_used', tries_left: 3 },
+      'Enter a new code'
     ]
-  ])('has no tries line after %s, which starts again', async (_name, failure) => {
+  ])('has no tries line after %s', async (_name, failure, label) => {
     const { controls } = start()
     await screen.findByLabelText('Pairing code')
     attempt(controls, { state: 'ended', failure, mode: 'code', service: null })
     const sentence = await screen.findByTestId('failure-sentence')
-    expect(screen.getByTestId('failure-action').textContent).toBe('Start again')
+    expect(screen.getByTestId('failure-action').textContent).toBe(label)
     expect(sentence.textContent).not.toMatch(/tr(y|ies) left/)
     expect(sentence.textContent).toBe(failureWords(failure, 'reach.kala.to').sentence)
   })
 
-  it('keeps the tries line after an ending that does not start again', async () => {
+  it('keeps the tries line after an ending at which the invitation can still be used', async () => {
     const { controls } = start()
     await screen.findByLabelText('Pairing code')
     attempt(controls, ended('timed_out', 3))
