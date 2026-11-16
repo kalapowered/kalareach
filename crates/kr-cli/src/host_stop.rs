@@ -3084,6 +3084,129 @@ mod tests {
         );
     }
 
+    /// A frame that cannot be read (cut or spoiled) is no answer of a daemon: a daemon that goes
+    /// can leave one. It is looked at once, as a fault is, and the daemon's end decides: the end
+    /// where the daemon has gone, and an answer only from the look that a daemon answered.
+    #[tokio::test(start_paused = true)]
+    async fn a_frame_that_cannot_be_read_is_no_answer_of_a_daemon() {
+        let id = an_environment();
+        let process = asked_process();
+        let spoiled = kr_ipc::IpcError::Frame(kr_protocol::frame::FrameError::EmptyPayload);
+        for at_the_read in [false, true] {
+            let supplied = Supplied::new()
+                .process(vec![at_once(ProcessState::Ended)])
+                .look(vec![at_once(Endpoint::Nobody)]);
+            let before = if at_the_read {
+                host_info_failed(
+                    &supplied,
+                    supplied.connection(),
+                    &spoiled,
+                    Some(&process),
+                    id,
+                    the_deadline(),
+                )
+                .await
+            } else {
+                greeting_failed(&supplied, &spoiled, Some(&process), id, the_deadline()).await
+            };
+            assert_eq!(
+                before_said(&before),
+                the_end_said_for(id, Some(4000), &spoiled),
+                "a daemon that has gone is the end, at the read {at_the_read}"
+            );
+            assert_eq!(supplied.looks(), 1, "one look, at the read {at_the_read}");
+
+            let supplied = Supplied::new().look(vec![at_once(Endpoint::Same(an_answer()))]);
+            let before = if at_the_read {
+                host_info_failed(
+                    &supplied,
+                    supplied.connection(),
+                    &spoiled,
+                    None,
+                    id,
+                    the_deadline(),
+                )
+                .await
+            } else {
+                greeting_failed(&supplied, &spoiled, None, id, the_deadline()).await
+            };
+            assert_eq!(before_said(&before), "answers", "at the read {at_the_read}");
+            assert_eq!(
+                supplied.looks(),
+                1,
+                "the answer comes from a look, at the read {at_the_read}"
+            );
+        }
+    }
+
+    /// The compose arm ends through the one decision: a request that could not be made on a
+    /// connection that the daemon closed, with the daemon not shown to have ended in the bound, is
+    /// exit 1 with the silence sentence and not the unmade request's words; and a fault with a
+    /// daemon that answers a look is still exit 3 with those words.
+    #[tokio::test(start_paused = true)]
+    async fn an_unmade_request_on_a_closed_connection_not_shown_ended_is_exit_1_with_silence() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let paths = temp.environment();
+        let id = paths.environment_id();
+        let _held = SingletonLock::hold(&paths.singleton_lock(), id).expect("takes the lock");
+        let environment = KnownEnvironment {
+            environment_id: id,
+            paths,
+        };
+        let earlier = Earlier::read(&environment.paths);
+        let none = Facts::none(Vec::new());
+        let process = asked_process();
+
+        let closed = kr_ipc::IpcError::PeerClosed;
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same(an_answer()))]);
+        let before = failed_before_the_request(
+            &supplied,
+            supplied.connection(),
+            Some(&process),
+            &closed,
+            id,
+            the_deadline(),
+        )
+        .await;
+        match unmade_ended(before, &closed, id, &environment, &none, true, &earlier) {
+            Completion::Reported(error) => {
+                assert_eq!(error.exit_code(), 1);
+                let said = error.to_string();
+                assert!(
+                    said.contains("does not answer, so it may be starting or stopping")
+                        && said.contains("No stop was requested"),
+                    "{said}"
+                );
+                assert!(!said.contains("could not make its request"), "{said}");
+            }
+            _ => panic!("a silent end is a failure that the command has reported"),
+        }
+
+        let fault = a_fault_of_the_socket();
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same(an_answer()))]);
+        let before = failed_before_the_request(
+            &supplied,
+            supplied.connection(),
+            None,
+            &fault,
+            id,
+            the_deadline(),
+        )
+        .await;
+        match unmade_ended(before, &fault, id, &environment, &none, true, &earlier) {
+            Completion::Reported(error) => {
+                assert_eq!(error.exit_code(), 3);
+                assert!(
+                    error
+                        .to_string()
+                        .contains("could not make its request for the control daemon"),
+                    "{error}"
+                );
+            }
+            _ => panic!("an answered request's failure is a failure that the command has reported"),
+        }
+    }
+
     fn a_refusal() -> ProtocolError {
         ProtocolError::new(
             ErrorCode::PermissionDenied,
