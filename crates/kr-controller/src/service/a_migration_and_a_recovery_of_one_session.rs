@@ -628,11 +628,11 @@ async fn a_record_of_the_daemons_own_does_not_replace_the_account_a_worker_gave(
     );
 }
 
-/// A record of this daemon's own that its registry refused is the one it writes at the next look
-/// at the worker's end, and not a new one from that look, so that the registry gets the same record
-/// whichever retry runs first.
+/// A record of this daemon's own that its registry refused gives its reason, and its reason alone,
+/// to the record that the next look at the worker's end writes: that record is built from the next
+/// look's own pass, and its reason is the kept record's, not the one that look was given.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_record_of_the_daemons_own_that_was_not_written_is_the_one_written_at_the_next_look() {
+async fn a_record_of_the_daemons_own_that_was_not_written_gives_its_reason_at_the_next_look() {
     let temp = TempHost::create();
     let controller = daemon(&temp).await;
     let session_id = recorded_ended_worker(&controller, &temp).await;
@@ -661,7 +661,7 @@ async fn a_record_of_the_daemons_own_that_was_not_written_is_the_one_written_at_
     assert_eq!(
         written.reason,
         ClosureReason::WorkerCrash,
-        "the record of the first look is the one written at the next: {written:?}"
+        "the reason of the first look's record is the one written at the next look: {written:?}"
     );
     assert_eq!(
         controller
