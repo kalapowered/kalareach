@@ -34,8 +34,25 @@ struct Host {
     environment_id: kr_protocol::ids::EnvironmentId,
     // Ends the serving task when the fixture is dropped, whether or not a case closed it.
     _serving: kr_ipc::testing::Serving,
+    // The runtime a host serves on when it has one of its own, ended after the serving task has
+    // been asked to stop and before the directory goes.
+    _apart: HostRuntime,
     // Declared last: the directory is removed after every field above has let go of its files.
     _temp: kr_ipc::testing::TempHost,
+}
+
+/// The runtime that a host serves on when its case gives it one, so that a worker thread that a
+/// mutant blocks does not stop the case's own timers.
+struct HostRuntime(Option<tokio::runtime::Runtime>);
+
+/// Ended without waiting for a thread that is still blocked in it: the case has failed by then, and
+/// its holder has let go.
+impl Drop for HostRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            runtime.shutdown_background();
+        }
+    }
 }
 
 fn build() -> BuildId {
@@ -47,6 +64,14 @@ async fn host(generation: u64) -> Host {
 }
 
 async fn host_producing(generation: u64, script: &str) -> Host {
+    host_built(generation, script, false).await
+}
+
+/// A host over a session that runs `script`. With `attention_journal` the worker can read the
+/// session's journal for the attention link, which an attention link's first statement needs: a
+/// worker that cannot read it takes its attention link down as soon as it has written the
+/// statement.
+async fn host_built(generation: u64, script: &str, attention_journal: bool) -> Host {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
@@ -113,7 +138,7 @@ async fn host_producing(generation: u64, script: &str) -> Host {
                 controller_public_key: *controller.public_key(),
                 controller_generation: ControllerGeneration::new(generation),
                 build_id: build(),
-                journal_path: None,
+                journal_path: attention_journal.then(|| environment.journal_database(session_id)),
             },
         )
         .expect("a worker service"),
@@ -121,6 +146,7 @@ async fn host_producing(generation: u64, script: &str) -> Host {
     let serving = kr_ipc::testing::Serving::spawn(Arc::clone(&service).serve(listener));
     Host {
         _serving: serving,
+        _apart: HostRuntime(None),
         _temp: temp,
         service,
         session_id,
@@ -1327,13 +1353,15 @@ enum Hold {
     Authority,
     BoundaryAndSession,
     BoundaryAndAuthority,
+    Fence,
 }
 
 /// Holds some of the worker's locks on a thread of its own until it is released: the dispatch
 /// boundary, the authority record or the session.
 struct Held {
     release: Option<std::sync::mpsc::Sender<()>>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    // Whether the attention fence still named a connection when the holder let go of it.
+    thread: Option<std::thread::JoinHandle<bool>>,
 }
 
 impl Held {
@@ -1357,6 +1385,11 @@ impl Held {
         Self::take(host, Hold::BoundaryAndAuthority).await
     }
 
+    /// The fence's own lock, which a statement holds while it reads the journal.
+    async fn fence(host: &Host) -> Self {
+        Self::take(host, Hold::Fence).await
+    }
+
     async fn take(host: &Host, hold: Hold) -> Self {
         let (release, wait) = std::sync::mpsc::channel::<()>();
         let (held, confirmed) = tokio::sync::oneshot::channel::<()>();
@@ -1371,8 +1404,11 @@ impl Held {
                 matches!(hold, Hold::BoundaryAndSession).then(|| service.runtime().session());
             let _authority = matches!(hold, Hold::Authority | Hold::BoundaryAndAuthority)
                 .then(|| service.hold_the_authority_for_tests());
+            let fence =
+                matches!(hold, Hold::Fence).then(|| service.hold_the_attention_fence_for_tests());
             let _ = held.send(());
             let _ = wait.recv();
+            fence.is_some_and(|fence| fence.current_connection().is_some())
         });
         tokio::time::timeout(WAIT, confirmed)
             .await
@@ -1384,11 +1420,17 @@ impl Held {
         }
     }
 
-    fn release(mut self) {
+    fn release(self) {
+        self.release_naming_the_fence();
+    }
+
+    /// Lets go, and says whether the fence still named a connection at the moment it was let go.
+    fn release_naming_the_fence(mut self) -> bool {
         drop(self.release.take());
-        if let Some(thread) = self.thread.take() {
-            thread.join().expect("the holding thread finishes");
-        }
+        self.thread
+            .take()
+            .map(|thread| thread.join().expect("the holding thread finishes"))
+            .unwrap_or_default()
     }
 }
 
@@ -2169,6 +2211,25 @@ fn a_worker_stopped_while_presentations_wait_ends_without_the_hold() {
 
 // ---- Requests whose clients have gone, and the clean-up of a connection whose peer has gone.
 
+/// As [`host_ready`], serving on a runtime of its own (see [`HostRuntime`]).
+async fn host_ready_apart(attention_journal: bool) -> Host {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("a runtime for the host");
+    let mut host = runtime
+        .spawn(host_built(1, "sleep 30", attention_journal))
+        .await
+        .expect("the host starts");
+    host._apart = HostRuntime(Some(runtime));
+    assert!(
+        settle(|| host.service.maintenance_passes_for_tests() >= 1).await,
+        "the first maintenance pass finishes"
+    );
+    host
+}
+
 /// A host whose first maintenance pass has finished: that pass takes the dispatch boundary as the
 /// host starts serving, and a hold that came before it would keep it waiting.
 async fn host_ready() -> Host {
@@ -2244,7 +2305,7 @@ async fn clients_go(clients: Vec<tokio::task::JoinHandle<()>>) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mutations_whose_clients_have_gone_do_not_keep_their_connections_while_the_boundary_is_held()
  {
-    let host = host_ready().await;
+    let host = host_ready_apart(false).await;
     let service = &host.service;
     let boundary = Held::boundary(&host).await;
     let start = service.connections_held_for_tests();
@@ -2375,7 +2436,7 @@ async fn a_waiting_request_asks_its_timer_for_a_quarter_of_a_second_at_most() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_controller_link_that_goes_while_the_authority_is_held_is_unbound_once_when_it_is_let_go()
 {
-    let host = host_ready().await;
+    let host = host_ready_apart(false).await;
     let service = &host.service;
     let link = controller_client(&host, 1).await;
     let start = service.connections_held_for_tests();
@@ -2409,7 +2470,7 @@ async fn a_controller_link_that_goes_while_the_authority_is_held_is_unbound_once
 async fn connections_that_keep_detached_identifiers_do_not_keep_their_places_while_the_session_is_held()
  {
     use kr_protocol::attachment::{SessionAttachResult, SessionDetachParams};
-    let host = host_ready().await;
+    let host = host_ready_apart(false).await;
     let service = &host.service;
     let mut owner = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
         .await
@@ -2536,4 +2597,521 @@ async fn a_presentation_whose_peer_hung_up_with_bytes_behind_its_token_ends_at_o
         service.connections_held_for_tests() - start
     );
     boundary.release();
+}
+
+// ---- The fence, a repeat after the clean-up, clients that stay, and the cap.
+
+/// The attention link that goes while the fence's own lock is held gives its connection back, and
+/// the fence forgets it when the lock is let go.
+///
+/// The authority record is free, so the first try of the clean-up removes the link from it, and the
+/// fence's lock is what it cannot take: the owner does the whole unbind once the lock is let go.
+/// The case waits for the link's first statement before it takes the lock, so that nothing the
+/// connection does for its own acceptance meets the held lock, and it reads the fence's state from
+/// the holder's own thread, since a read of the fence from the case would wait for the lock too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attention_link_that_goes_while_the_fence_is_held_is_forgotten_when_it_is_let_go() {
+    let host = host_ready_apart(true).await;
+    let service = &host.service;
+    let mut link = declared(&host, ControllerConnectionRole::Attention).await;
+    present(&mut link, host.signer(), 1)
+        .await
+        .expect("the attention link is accepted");
+    let statement = match tokio::time::timeout(SETTLE, link.recv()).await {
+        Ok(Ok(ControlFrame::AttentionBarrier(statement))) => statement,
+        other => panic!("the link's first statement did not arrive: {other:?}"),
+    };
+    // The worker's loop for this link waits for the daemon to acknowledge its statement and reads
+    // nothing else until then, so a link that goes before the acknowledgement is not seen to go.
+    // The acknowledgement, and an answer to a request sent after it, show that the loop is reading.
+    link.send(&ControlFrame::AttentionBarrierAcknowledged(
+        kr_protocol::attention::AttentionBarrierAcknowledged {
+            request_id: statement.request_id,
+            sequence: statement.sequence,
+        },
+    ))
+    .await
+    .expect("acknowledges the statement");
+    link.send(&ControlFrame::Request(kr_protocol::envelope::Request {
+        request_id: kr_protocol::ids::RequestId::new(9),
+        method: Method::SessionRead.into(),
+        method_version: kr_protocol::method::MethodVersion::V1,
+        params: kr_protocol::envelope::ParamsValue::from_typed(&SessionReadParams {
+            session_id: host.session_id,
+        })
+        .expect("encodes"),
+    }))
+    .await
+    .expect("sends a request");
+    loop {
+        match tokio::time::timeout(SETTLE, link.recv()).await {
+            Ok(Ok(ControlFrame::Response(_))) => break,
+            Ok(Ok(_)) => {}
+            other => panic!("the link's loop did not answer after the acknowledgement: {other:?}"),
+        }
+    }
+    assert!(
+        service.attention_connection_for_tests().is_some(),
+        "the fence speaks through the attention link"
+    );
+    let start = service.connections_held_for_tests();
+    let holder = Held::fence(&host).await;
+    drop(link);
+    let given_back = settle(|| service.connections_held_for_tests() == start - 1).await;
+    assert!(
+        given_back,
+        "the connection of the link that went is given back while the fence is held: {} held, {start} at the start",
+        service.connections_held_for_tests()
+    );
+    assert_eq!(
+        service.owed_done_for_tests().2,
+        0,
+        "nothing is unbound while the fence is held"
+    );
+    assert!(
+        holder.release_naming_the_fence(),
+        "the fence still names the link while its lock is held"
+    );
+    assert!(
+        settle(|| service.owed_done_for_tests().2 == 1).await,
+        "the owner unbinds the link when the fence's lock is let go: {:?}",
+        service.owed_done_for_tests()
+    );
+    assert!(
+        service.attention_connection_for_tests().is_none(),
+        "the fence forgets the link when its lock is let go"
+    );
+    assert_eq!(service.owed_done_for_tests().2, 1, "once");
+}
+
+/// A local client that composes one Blocking mutation, hands the composed request to the case,
+/// sends it, and waits for the answer. Ending the task is the client going away.
+fn composing_once(
+    host: &Host,
+    action_id: kr_protocol::ids::ActionId,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::oneshot::Receiver<kr_protocol::envelope::MutationRequest>,
+) {
+    let endpoint = host.endpoint.clone();
+    let (environment_id, session_id) = (host.environment_id, host.session_id);
+    let (kept, composed) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = tokio::time::timeout(WAIT, async {
+            let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+                .await
+                .expect("connects");
+            let mutation = client
+                .compose(
+                    Method::SessionAttach,
+                    action_id,
+                    target(environment_id, session_id),
+                    &attach_params(session_id),
+                )
+                .await
+                .expect("composes");
+            let _ = kept.send(mutation.clone());
+            let _ = client
+                .send(&ControlFrame::Mutation(Box::new(mutation)))
+                .await;
+            let _ = client.recv().await;
+        })
+        .await;
+    });
+    (task, composed)
+}
+
+/// A repeat of a dropped mutation on a new connection is refused, the worker holds no receipt for
+/// it, and a new request for the same action is applied once.
+///
+/// The composed request quotes the window of the connection that went, which the new connection
+/// was never given, so a repeat of it is refused with `PERMISSION_DENIED` and nothing is made for
+/// it. `action.read` says that the worker holds no receipt, and a request composed on the new
+/// connection, with its own window, is admitted for the first time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_after_the_clean_up_is_refused_and_a_new_request_is_applied_once() {
+    let host = host_ready().await;
+    let service = &host.service;
+    let start = service.connections_held_for_tests();
+    let action_id = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+    let boundary = Held::boundary(&host).await;
+    let (client, composed) = composing_once(&host, action_id);
+    let composed = tokio::time::timeout(SETTLE, composed)
+        .await
+        .expect("the client composes its request in time")
+        .expect("the client hands over its composed request");
+    settle(|| service.mutations_waiting_for_tests() == 1).await;
+    assert_eq!(
+        service.mutations_waiting_for_tests(),
+        1,
+        "the mutation waits at the held boundary"
+    );
+    clients_go(vec![client]).await;
+    assert!(
+        settle(|| service.connections_held_for_tests() == start
+            && service.mutations_waiting_for_tests() == 0)
+        .await,
+        "the connection of the client that went is given back while the boundary is held"
+    );
+    boundary.release();
+    assert!(
+        !receipt_exists(&host, action_id).await,
+        "a receipt was written for a client that was not there"
+    );
+
+    let mut later = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let refused = later
+        .repeat(&composed)
+        .await
+        .expect("the worker answers")
+        .expect_err("a repeat quotes the window of the connection that went");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied);
+    let read = later
+        .request(
+            Method::ActionRead,
+            &kr_protocol::receipt::ActionReadParams {
+                action_id,
+                session_id: None,
+            },
+        )
+        .await
+        .expect("the worker answers")
+        .expect_err("the worker holds no receipt");
+    assert!(
+        read.message.contains("no receipt for action"),
+        "the worker's refusal is {read:?}"
+    );
+    later
+        .mutate(
+            Method::SessionAttach,
+            action_id,
+            target(host.environment_id, host.session_id),
+            &attach_params(host.session_id),
+        )
+        .await
+        .expect("the worker answers")
+        .expect("a request with the new window is applied");
+    assert!(
+        receipt_exists(&host, action_id).await,
+        "the new request has its receipt"
+    );
+    assert_eq!(
+        service.runtime().session().attachments().len(),
+        1,
+        "the action was applied once"
+    );
+}
+
+/// Dead clients' places are given back while a living client waits at the same boundary, and the
+/// living client's request is carried out at the release.
+///
+/// Thirty local clients send a Blocking mutation and go; one stays. The count falls to what the
+/// living client keeps, and after the release its request is answered and has its receipt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dead_clients_places_are_given_back_while_a_living_client_waits_and_is_served_at_the_release()
+ {
+    let host = host_ready().await;
+    let service = &host.service;
+    let boundary = Held::boundary(&host).await;
+    let living_id = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+    let mut living = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let mutation = living
+        .compose(
+            Method::SessionAttach,
+            living_id,
+            target(host.environment_id, host.session_id),
+            &attach_params(host.session_id),
+        )
+        .await
+        .expect("composes");
+    living
+        .send(&ControlFrame::Mutation(Box::new(mutation)))
+        .await
+        .expect("sends");
+    settle(|| service.mutations_waiting_for_tests() == 1).await;
+    let start = service.connections_held_for_tests();
+    let ids: Vec<_> = (0..30)
+        .map(|_| kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()))
+        .collect();
+    let dead: Vec<_> = ids.iter().map(|id| attaching_once(&host, *id)).collect();
+    settle(|| service.mutations_waiting_for_tests() == 31).await;
+    assert_eq!(
+        service.mutations_waiting_for_tests(),
+        31,
+        "the living client's request and the thirty others wait at the held boundary"
+    );
+    clients_go(dead).await;
+    assert!(
+        settle(|| service.connections_held_for_tests() == start
+            && service.mutations_waiting_for_tests() == 1)
+        .await,
+        "the dead clients' places are given back and the living client's request still waits: {} held, {start} at the start, {} waiting",
+        service.connections_held_for_tests(),
+        service.mutations_waiting_for_tests()
+    );
+    boundary.release();
+    let answered = tokio::time::timeout(WAIT, living.recv())
+        .await
+        .expect("the living client is answered after the release")
+        .expect("the connection is read");
+    let ControlFrame::Response(response) = answered else {
+        panic!("the worker answered {answered:?}");
+    };
+    assert!(
+        matches!(response.outcome, kr_protocol::envelope::Outcome::Ok(_)),
+        "the living client's request is carried out: {:?}",
+        response.outcome
+    );
+    assert!(
+        receipt_exists(&host, living_id).await,
+        "the living client's request has its receipt"
+    );
+    for id in ids {
+        assert!(
+            !receipt_exists(&host, id).await,
+            "a receipt was written for a client that was not there"
+        );
+    }
+}
+
+/// A client that stopped waiting for its answer but keeps its connection still holds its place, and
+/// its request is carried out at the release.
+///
+/// This is the named limit: the worker cannot tell a client that stopped waiting from one that is
+/// slow, and a connection that is still there is served. The wait has gone through its tries up to
+/// the cap before the holder lets go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_stopped_waiting_but_keeps_its_connection_is_served_at_the_release() {
+    let host = host_ready().await;
+    let service = &host.service;
+    let start = service.connections_held_for_tests();
+    let action_id = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+    let boundary = Held::boundary(&host).await;
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let mutation = client
+        .compose(
+            Method::SessionAttach,
+            action_id,
+            target(host.environment_id, host.session_id),
+            &attach_params(host.session_id),
+        )
+        .await
+        .expect("composes");
+    client
+        .send(&ControlFrame::Mutation(Box::new(mutation)))
+        .await
+        .expect("sends");
+    settle(|| service.mutations_waiting_for_tests() == 1).await;
+    assert_eq!(service.mutations_waiting_for_tests(), 1);
+    assert!(
+        settle(|| {
+            service.largest_boundary_step_for_tests() >= std::time::Duration::from_millis(250)
+        })
+        .await,
+        "the wait never reached the cap: {:?}",
+        service.largest_boundary_step_for_tests()
+    );
+    assert_eq!(
+        service.connections_held_for_tests(),
+        start + 1,
+        "the connection that is still there keeps its place"
+    );
+    boundary.release();
+    assert!(
+        settle(|| service.mutations_waiting_for_tests() == 0).await,
+        "the request is taken at the release"
+    );
+    assert!(
+        receipt_exists(&host, action_id).await,
+        "the request of the client that is still there was carried out"
+    );
+    drop(client);
+}
+
+/// What an Independent mutation whose client has gone comes to while the boundary is held.
+///
+/// The request is a viewport report, which leaves keys alone, so the loop serves keys beside it
+/// with a task that reads the connection ahead. With `blocking_behind` a Blocking mutation follows
+/// it, which is where that task stops reading, and the peer's close is then the next thing on the
+/// socket. The report waits at the held boundary, and its connection is given back when the client
+/// goes, with no receipt for it.
+async fn an_independent_mutation_whose_client_goes(blocking_behind: bool) {
+    let host = host_ready_apart(false).await;
+    let service = &host.service;
+    let start = service.connections_held_for_tests();
+    let boundary = Held::boundary(&host).await;
+    let report_id = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+    let behind_id = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let report = client
+        .compose(
+            Method::AttachmentViewport,
+            report_id,
+            target(host.environment_id, host.session_id),
+            &kr_protocol::attachment::AttachmentViewportParams {
+                attachment_id: kr_protocol::ids::AttachmentId::new(kr_ipc::new_uuid()),
+                dimensions: Dimensions::new(80, 24),
+                position: Nullable::null(),
+                column: kr_protocol::scalars::U64::new(0),
+            },
+        )
+        .await
+        .expect("composes the report");
+    client
+        .send(&ControlFrame::Mutation(Box::new(report)))
+        .await
+        .expect("sends the report");
+    settle(|| service.mutations_waiting_for_tests() == 1).await;
+    assert_eq!(
+        service.mutations_waiting_for_tests(),
+        1,
+        "the report waits at the held boundary"
+    );
+    if blocking_behind {
+        let behind = client
+            .compose(
+                Method::SessionAttach,
+                behind_id,
+                target(host.environment_id, host.session_id),
+                &attach_params(host.session_id),
+            )
+            .await
+            .expect("composes the attach");
+        client
+            .send(&ControlFrame::Mutation(Box::new(behind)))
+            .await
+            .expect("sends the attach");
+    }
+    drop(client);
+    assert!(
+        settle(|| service.connections_held_for_tests() == start
+            && service.mutations_waiting_for_tests() == 0)
+        .await,
+        "the connection of the client that went is given back while the boundary is held: {} held, {start} at the start, {} waiting",
+        service.connections_held_for_tests(),
+        service.mutations_waiting_for_tests()
+    );
+    boundary.release();
+    assert!(
+        !receipt_exists(&host, report_id).await,
+        "a receipt was written for the report of a client that was not there"
+    );
+    assert!(
+        !receipt_exists(&host, behind_id).await,
+        "a receipt was written for the request behind it"
+    );
+}
+
+/// An Independent mutation whose client goes is dropped at the held boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_independent_mutation_whose_client_goes_is_dropped() {
+    an_independent_mutation_whose_client_goes(false).await;
+}
+
+/// An Independent mutation whose reading task stopped at a Blocking mutation behind it is dropped
+/// when its client goes.
+///
+/// Unix only. The Blocking mutation is read by the task that reads ahead or is still queued on the
+/// socket when the client closes. A Windows pipe counts what is queued as waiting and takes its
+/// peer as there until it is read, which this worker does not do at the wait, so on Windows the
+/// request would wait for the release. The rule without a frame behind it is
+/// `an_independent_mutation_whose_client_goes_is_dropped`, which holds on every platform.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_independent_mutation_with_a_blocking_one_behind_it_is_dropped_when_its_client_goes() {
+    an_independent_mutation_whose_client_goes(true).await;
+}
+
+/// A waiting request among a stream of mutations asks for its pause up to the cap, and is taken
+/// soon after the release.
+///
+/// Four clients attach and detach back to back, and a fifth sends one attach, all while the boundary
+/// is held. The case waits until the largest pause the wait asked its timer for is the cap, lets go,
+/// and takes the time until the fifth is answered. The pause asked for is a value and is asserted;
+/// the time to the answer is printed and has only the bound of a liveness check, since it depends
+/// on the machine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_waiting_request_among_a_stream_of_mutations_is_taken_soon_after_the_release() {
+    let host = host_ready().await;
+    let service = &host.service;
+    let boundary = Held::boundary(&host).await;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let made = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let streams: Vec<_> = (0..4)
+        .map(|_| {
+            tokio::spawn(mutating(
+                host.endpoint.clone(),
+                host.environment_id,
+                host.session_id,
+                Arc::clone(&stop),
+                Arc::clone(&made),
+            ))
+        })
+        .collect();
+    let mut probe = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let probe_id = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+    let composed = probe
+        .compose(
+            Method::SessionAttach,
+            probe_id,
+            target(host.environment_id, host.session_id),
+            &attach_params(host.session_id),
+        )
+        .await
+        .expect("composes");
+    probe
+        .send(&ControlFrame::Mutation(Box::new(composed)))
+        .await
+        .expect("sends");
+    settle(|| service.mutations_waiting_for_tests() == 5).await;
+    assert_eq!(
+        service.mutations_waiting_for_tests(),
+        5,
+        "the stream and the probe wait at the held boundary"
+    );
+    assert!(
+        settle(|| {
+            service.largest_boundary_step_for_tests() >= std::time::Duration::from_millis(250)
+        })
+        .await,
+        "the wait never reached the cap: {:?}",
+        service.largest_boundary_step_for_tests()
+    );
+    let released = tokio::time::Instant::now();
+    boundary.release();
+    let answered = tokio::time::timeout(std::time::Duration::from_secs(10), probe.recv())
+        .await
+        .expect("the probe is answered within ten seconds of the release")
+        .expect("the connection is read");
+    eprintln!(
+        "the probe was answered {:?} after the release; the stream made {} calls so far",
+        released.elapsed(),
+        made.load(std::sync::atomic::Ordering::SeqCst)
+    );
+    let ControlFrame::Response(response) = answered else {
+        panic!("the worker answered {answered:?}");
+    };
+    assert!(matches!(
+        response.outcome,
+        kr_protocol::envelope::Outcome::Ok(_)
+    ));
+    assert!(
+        service.largest_boundary_step_for_tests() <= std::time::Duration::from_millis(250),
+        "a pause of more than a quarter of a second was asked for: {:?}",
+        service.largest_boundary_step_for_tests()
+    );
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    for stream in streams {
+        let _ = tokio::time::timeout(WAIT, stream).await;
+    }
 }
