@@ -655,7 +655,7 @@ async fn a_record_of_the_daemons_own_that_was_not_written_gives_its_reason_at_th
         "the write of the daemon's own record fails with the registry: {refused:?}"
     );
     take_closures_again(&controller);
-    let written = look(ClosureReason::HostShutdown)
+    let written = look(ClosureReason::CloseRequested)
         .await
         .expect("the registry takes the record");
     assert_eq!(
@@ -843,7 +843,7 @@ async fn a_kept_record_of_the_daemons_own_gives_its_reason_and_a_later_look_give
     let written = controller
         .record_final(
             session_id,
-            ClosureReason::HostShutdown,
+            ClosureReason::CloseRequested,
             &identity,
             &pass,
             Death::Confirmed,
