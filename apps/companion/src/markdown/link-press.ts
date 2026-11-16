@@ -27,7 +27,7 @@
  *   button is released and goes to the engine's target, so its look follows the pointer, at each move and
  *   at each scroll: lit while the pointer lies in the link's own element, out where it has left it (within
  *   the slop), lit again where it is back, and out at the release.
- * - The look at the click. The pointer's type of the last primary press in the pane is kept apart from the
+ * - The look at the click. The pointer's type of the last primary press (in the pane or outside it) is kept apart from the
  *   record, so that the record's end does not clear it. At each trusted click in the pane the look is set
  *   to the link that `lookAt` gives and to no other: where the last press was a touch or a pen, the link
  *   the click names, or the link that `decide` opens from plain text; a lit link that the click does not
@@ -103,8 +103,10 @@ export function useLinkPress(pane: RefObject<HTMLElement | null>): void {
 export function startLinkPress(element: HTMLElement): () => void {
   let press: Recorded | null = null
   let lit: HTMLElement | null = null
-  // The pointer type of the last primary press in the pane, or null where the last one was outside it. It is
-  // kept apart from the record: no end of a press clears it, since the click that follows an end reads it.
+  // The pointer type of the last primary press anywhere, or null before the first. It is kept apart from the
+  // record: no end of a press clears it, since the click that follows an end reads it. A touch that goes down
+  // just outside the pane can get its click moved onto a link at the pane's edge, so a press outside the pane
+  // sets it too; the click's own test limits the look to the pane.
   let kind: string | null = null
   // The timer that ends the look of a touch or a pen after the click, or after a release that gets no click.
   let ending: ReturnType<typeof setTimeout> | null = null
@@ -221,8 +223,8 @@ export function startLinkPress(element: HTMLElement): () => void {
     if (!event.isPrimary || event.button !== 0) return
     // Every primary press ends the one before it, in the pane or outside it.
     die()
-    kind = here(event.target) ? event.pointerType : null
-    if (kind === null) return
+    kind = event.pointerType
+    if (!here(event.target)) return
     const found = pressedLink(element, event)
     // A press that names no link opens nothing and has no look to keep: it keeps no record and registers
     // no listener, so no end has to reach it (a lost capture, a blur or a hidden page would otherwise

@@ -1661,8 +1661,8 @@ describe('the look at a click', () => {
     expect(isLit(links[3]?.[1]), 'the second link at the click').toBe(true)
   })
 
-  it('is none for a click that no touch or pen made: a mouse’s press, a click with a detail of 0, a click with no press in the pane', () => {
-    const { pane, links, texts } = conversation(6, 3)
+  it('is none for a click that no touch or pen made: a mouse’s press and a click with a detail of 0', () => {
+    const { pane, links } = conversation(6, 3)
     start(pane)
     clock(100, 130)
     fire('pointerdown', pointer(links[3]?.[0], { clientX: 18, clientY: y, pointerType: 'mouse' }))
@@ -1674,10 +1674,19 @@ describe('the look at a click', () => {
     expect(isLit(links[3]?.[0]), 'the look of a touch between the release and the click').toBe(true)
     fire('click', click(links[3]?.[0], { clientX: 18, clientY: y, detail: 0 }))
     expect(isLit(links[3]?.[0]), 'the look at a click with a detail of 0').toBe(false)
+  })
+
+  it('is on the link that a click names after a touch pressed outside the pane, which the engine can move onto a link at the pane’s edge, and none after a mouse pressed there', () => {
+    const { pane, links } = conversation(6, 3)
+    start(pane)
+    clock(100, 130)
     fire('pointerdown', pointer(document.body, { clientX: 5, clientY: 5 }))
     fire('click', click(links[3]?.[0], { clientX: 18, clientY: y }))
-    expect(isLit(links[3]?.[0]), 'the look at a click after a press outside the pane').toBe(false)
-    expect(texts.length).toBe(6)
+    expect(isLit(links[3]?.[0]), 'the look at a click after a touch pressed outside the pane').toBe(true)
+    fire('pointerdown', pointer(document.body, { clientX: 5, clientY: 5, pointerType: 'mouse' }))
+    expect(isLit(links[3]?.[0]), 'the look after the next press, outside the pane').toBe(false)
+    fire('click', click(links[3]?.[0], { clientX: 18, clientY: y }))
+    expect(isLit(links[3]?.[0]), 'the look at a click after a mouse pressed outside the pane').toBe(false)
   })
 
   it('is none for a link that cannot be measured', () => {

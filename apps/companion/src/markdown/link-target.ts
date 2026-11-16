@@ -334,8 +334,8 @@ export interface NamedLink<L> {
  * The link that gets the pressed look at a click, or null when none does. The look at a click is what a
  * person sees of the link that opens, so it names that link and no other:
  *
- * - none for a click that no touch or pen made: `kind` is the pointer type of the last primary press in
- *   the pane, and a mouse's look follows its pointer and goes at its release;
+ * - none for a click that no touch or pen made: `kind` is the pointer type of the last primary press, and
+ *   a mouse's look follows its pointer and goes at its release;
  * - none for an untrusted click and for one with a detail of 0 (a keyboard's or an assistive
  *   activation's): nothing pressed the link;
  * - the link the click names, whatever `decide` says of the click (its detail, a move, the time since the

@@ -1099,6 +1099,43 @@ test.describe('a tap on the plain text near a link of a message', () => {
       expect(await pressedLooks(page), 'the pressed look after the press on the sheet').toBe(0)
       expect(made.opened, 'links of the pane opened by a tap on the sheet').toEqual([])
     })
+
+    test(`gives the look at the click to a link at the pane's bottom edge that the browser's click names after a touch in the gap below the pane, on ${surface}`, async ({
+      page,
+      browserName
+    }) => {
+      await pressPage(page, surface, { only: [...Array.from({ length: 14 }, () => PLAIN), LAST_LINE] })
+      await wordsOf(page, LAST)
+      await page.evaluate(() => {
+        const pane = document.querySelector<HTMLElement>('.m-pane')
+        if (pane) pane.scrollTop = pane.scrollHeight
+      })
+      const words = await wordsOf(page, LAST)
+      const pane = await paneBox(page)
+      // Points below the pane's bottom edge at which the page's hit test names something outside the pane: the grid's gap between
+      // the pane and the row below it.
+      const gap: number[] = []
+      for (let below = 1; below <= 14; below += 1) {
+        const outside = await page.evaluate(({ x, y }) => document.elementFromPoint(x, y)?.closest('.m-pane') == null, { x: words.x, y: pane.bottom + below })
+        if (outside) gap.push(below)
+      }
+      expect(gap.length, 'points below the pane at which the page names something outside the pane').toBeGreaterThan(0)
+      let moved = 0
+      const disagreements: string[] = []
+      for (const below of gap) {
+        const made = await tapAndRead(page, words.x, pane.bottom + below)
+        const disagreement = lookDisagrees(made)
+        if (disagreement !== null) disagreements.push(`${String(below)} px below the pane: ${disagreement}`)
+        // Where the engine moves the click onto the link at the pane's edge, the link opens once and has the look at the click.
+        if (browsers(made.clicks)[0]?.named === `link ${LAST}`) {
+          moved += 1
+          if (made.opened.length !== 1 || made.litAtClick[0] !== LAST) disagreements.push(`${String(below)} px below the pane: the click named the link, opened ${made.opened.join(',') || 'nothing'}, lit ${String(made.litAtClick[0])}`)
+        }
+        expect(handlers(made.clicks), `clicks that the page added ${String(below)} px below the pane`).toEqual([])
+      }
+      console.log(`gap ${browserName} ${surface}: ${String(gap.length)} taps in the gap below the pane (${String(gap[0])} to ${String(gap[gap.length - 1])} px), the click named the link at ${String(moved)}`)
+      expect(disagreements, 'taps in the gap at which the look and the opening disagree').toEqual([])
+    })
   }
 })
 
