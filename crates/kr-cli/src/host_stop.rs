@@ -1037,8 +1037,9 @@ fn unmade_ended(
     }
 }
 
-/// The failure of a greeting that a daemon answers with a failure: that the daemon could not be
-/// reached and that no stop was requested. A daemon's answer is the proof, as for an unmade request.
+/// The failure of a greeting that could not be completed: that the daemon could not be reached
+/// and that no stop was requested. A daemon's reply or this side's own fault makes it, and the
+/// words are the failure's own.
 fn unreached(id: EnvironmentId, error: &kr_ipc::IpcError, _cause: Unmade) -> CliError {
     CliError::HostUnavailable(shown!(
         "the control daemon for environment {} could not be reached: {}. No stop was requested.",
@@ -1047,9 +1048,9 @@ fn unreached(id: EnvironmentId, error: &kr_ipc::IpcError, _cause: Unmade) -> Cli
     ))
 }
 
-/// The failure of a request that could not be made while a daemon answers: what was not made and
-/// that the stop was not asked. A daemon's answer is the proof that it stays, and nothing builds
-/// this failure without one.
+/// The failure of a request that could not be made: what was not made and that the stop was not
+/// asked. A daemon's answer or this side's own fault makes it, and the words are the failure's
+/// own; `Unmade` says which.
 fn unmade_request(id: EnvironmentId, why: &Shown, _cause: Unmade) -> CliError {
     CliError::HostUnavailable(shown!(
         "kr host stop could not make its request for the control daemon of environment {}: {}. \
