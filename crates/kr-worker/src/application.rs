@@ -175,8 +175,9 @@ pub struct Producer {
     /// what it found, for this host's own tests.
     #[cfg(feature = "testing")]
     before_the_fact: crate::testing::Stall,
-    /// How many rounds the evidence loop has begun and how many of them have come to a wait, for
-    /// this host's own tests: the two are equal while the loop waits.
+    /// How many rounds the evidence loop has begun, counted once a round has made its
+    /// subscriptions, and how many of them have come to a wait, for this host's own tests: the two
+    /// are equal while the loop waits.
     #[cfg(feature = "testing")]
     rounds: std::sync::atomic::AtomicUsize,
     #[cfg(feature = "testing")]
@@ -457,8 +458,10 @@ impl Producer {
     }
 
     /// Returns how many rounds the evidence loop has begun and how many of them have come to a wait
-    /// on its stream, for this host's own tests. While the two are equal the loop waits, with the
-    /// facts it last read.
+    /// on its stream, for this host's own tests. A round is counted once it has made its
+    /// subscriptions: a change made after a reading of the count is heard by the round that the
+    /// reading counted, or by a later one. While the two are equal the loop waits, with the facts it
+    /// last read.
     #[cfg(feature = "testing")]
     #[must_use]
     pub fn loop_rounds(&self) -> (usize, usize) {
@@ -555,15 +558,17 @@ pub async fn follow_evidence(
     let ledger_read = Arc::new(tokio::sync::Notify::new());
     let ask = read_the_ledger_apart(&producer, &questions, Arc::clone(&ledger_read), clock);
     loop {
-        #[cfg(feature = "testing")]
-        producer
-            .rounds
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let moved_questions = questions.subscribe();
         let moved_ledger = ledger_read.notified();
         let moved_journal = journal_changes.as_ref().map(|journal| journal.notified());
         let moved_broker = changes.notified();
         let moved_closed = runtime.closure_notified();
+        // Counted once the round hears every wake, so that a case which sees the count after its
+        // own change knows that the round it counted is one that has the change to hear.
+        #[cfg(feature = "testing")]
+        producer
+            .rounds
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let reading = deadlines.now();
         let facts = broker.application(reading);
         producer.observe_broker(facts.approval_pending, facts.turn_running);
