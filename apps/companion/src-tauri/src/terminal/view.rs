@@ -481,11 +481,12 @@ async fn open_paired(
         .await
         .map_err(|lost| OpenFailure::lost(&lost))?
         .map_err(|refusal| {
-            // The refusal the link kept as the host's answer to the connection is told by its
+            // The refusal the session kept as the host's answer to the connection is told by its
             // cause, as a refusal of a first call on any connection is; any other is the refusal of
             // this request.
+            let failed = ClientError::Host(refusal.clone());
             not_opened(
-                Unopened::of_kept_refusal(link.kept_refusal(), &refusal).unwrap_or_else(|| {
+                Unopened::of_connection(link.session(), &failed).unwrap_or_else(|| {
                     Unopened::Refused(Asked::SessionOpen, CommandError::from(refusal))
                 }),
             )

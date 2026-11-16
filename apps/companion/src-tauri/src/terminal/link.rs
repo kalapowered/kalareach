@@ -98,12 +98,6 @@ impl Link {
             .map(|refusal| refusal.message)
     }
 
-    /// The host's refusal of the connection, when the session has read it: the first error the
-    /// host answered with request identifier zero, which no request of the view carries.
-    pub(super) fn kept_refusal(&self) -> Option<ProtocolError> {
-        self.session.connection_refusal()
-    }
-
     /// Ends the connection and the session's reading, which the view's own end does after its last
     /// write.
     pub(super) fn close(&self) {
@@ -398,7 +392,7 @@ mod tests {
             .await
             .expect("the call is answered with the host's refusal, not with the connection ended");
         assert_eq!(answered.expect_err("the host refused"), refusal);
-        assert_eq!(wire.kept_refusal(), Some(refusal));
+        assert_eq!(wire.session().connection_refusal(), Some(refusal));
     }
 
     /// KR-REQ-19.08: a call whose write fails on a connection that ended with no refusal is told
@@ -411,6 +405,6 @@ mod tests {
             .await
             .expect_err("nothing answered the call");
         assert_eq!(lost.0, "the connection ended");
-        assert_eq!(wire.kept_refusal(), None);
+        assert_eq!(wire.session().connection_refusal(), None);
     }
 }
