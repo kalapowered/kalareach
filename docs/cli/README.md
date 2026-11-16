@@ -2659,7 +2659,9 @@ kr privacy delete <reference>   # ask the service to delete a copy that left thi
 ```
 
 Turning privacy mode on records a new privacy generation before anything else happens, and then
-stops, takes back and removes what the host's own services and each session hold. The answer says
+stops, takes back and removes what the host's own services and each session hold. In a session that
+includes the terminal's rows above the live screen: a scroll can no longer reach them, and rows
+printed while the mode is on are not kept. The screen itself is not cleared. The answer says
 whether that has finished. Until it has, `kr privacy on` prints what is still owed and exits with 1
 and `RESOURCE_UNAVAILABLE`, as a revocation still pending does, and `kr privacy status` reports how
 far it has got: work that had already left this host and has not been answered, and each session
