@@ -25,7 +25,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use kr_pairing::confirm::{
     ConfirmationExpectation, ConfirmationLedger, HostEnrolment, request_confirmation,
@@ -50,12 +50,14 @@ use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, Digest256, EndpointKe
 
 use super::devices::{CommitFn, DeviceDirectory, DeviceRecord};
 use super::invitations::{
-    ActionSubject, InvitationRows, PairingAction, TerminalStanding, another_subject, claim_effect,
-    consume, noted_as_a_copy,
+    ActionSubject, Admission, InvitationRows, PairingAction, TerminalStanding, another_subject,
+    claim_effect, consume, noted_as_a_copy,
 };
+use super::landing::{Landing, no_landing};
 use super::lifetimes::GrantLifetimes;
 use super::pairing::HostPairingClock;
 use crate::error::{ControllerError, Result};
+use crate::grants::policy::HeldBound;
 use crate::sharing::ConfirmedAction;
 
 /// Who is asking, as the host authenticated them.
@@ -78,16 +80,87 @@ pub struct Caller {
     pub confirms_recovery_only: bool,
     /// Asks whether the host's local owner has no live lease now, for a local caller the door
     /// decided as one that is served ([`Self::decided_now`]); none for any other caller.
-    closed_now: Option<ClosedNow>,
+    scope_now: Option<ScopeNow>,
+    /// What the door that decided this caller handed its mutation to land with: the authority
+    /// feed's ask, the footing made once at the door and the held bound of the local owner's lease
+    /// ([`Landing`]). A caller no door landed has none, and the records of an owner's request and
+    /// of its answer refuse it.
+    landing: Option<Landing>,
 }
 
-/// Whether the host's local owner has no live lease at this moment.
-#[derive(Clone)]
-struct ClosedNow(std::sync::Arc<dyn Fn() -> bool + Send + Sync>);
+/// What a reading of the host's local owner's lease finds: whether it has no live lease, and the
+/// held bound of the lease it chose when it chose one.
+#[derive(Debug)]
+pub struct LocalScope {
+    /// Whether the local owner has no live lease on an exclusively organisation-managed host.
+    pub closed: bool,
+    /// The bound of the lease that the reading chose, which a policy commit can end before the
+    /// lease's own time. A host that is not exclusively managed, and a local owner with no live
+    /// lease, hold none.
+    pub held: Option<HeldBound>,
+}
 
-impl std::fmt::Debug for ClosedNow {
+/// Reads the host's local owner's lease at this moment.
+#[derive(Clone)]
+struct ScopeNow(std::sync::Arc<dyn Fn() -> LocalScope + Send + Sync>);
+
+/// What a caller may be asked for, shown or answer: the two limits its request was decided under.
+///
+/// A scope is plain data, so deciding a subject again under another scope reads two flags and
+/// allocates nothing.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Scope {
+    clock_only: bool,
+    recovery_only: bool,
+}
+
+impl Scope {
+    /// This scope once the host's local owner has no live lease: the recovery set.
+    pub(crate) const fn closed(self) -> Self {
+        Self {
+            recovery_only: true,
+            ..self
+        }
+    }
+
+    /// Whether the confirmation `subject` names may be asked for, shown or answered under this
+    /// scope.
+    pub(crate) const fn may_confirm(self, subject: &ConfirmationSubject) -> bool {
+        match subject {
+            ConfirmationSubject::EstablishClock => true,
+            ConfirmationSubject::SetExclusiveManagement { exclusive: false } => !self.clock_only,
+            _ => !self.clock_only && !self.recovery_only,
+        }
+    }
+
+    /// Whether a challenge described as `display` may be shown or answered under this scope.
+    pub(crate) const fn may_confirm_display(self, display: &ConfirmationDisplay) -> bool {
+        match display {
+            ConfirmationDisplay::EstablishClock => true,
+            ConfirmationDisplay::ExclusiveManagement {
+                exclusive: false, ..
+            } => !self.clock_only,
+            _ => !self.clock_only && !self.recovery_only,
+        }
+    }
+
+    /// What a caller under this scope is told for a subject it may not confirm.
+    pub(crate) fn refusal(self) -> ControllerError {
+        if self.clock_only {
+            crate::grants::continuity_lost()
+        } else {
+            ControllerError::PermissionDenied {
+                detail: "a device that no membership lease serves confirms only the clock and \
+                         the end of exclusive management"
+                    .to_owned(),
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for ScopeNow {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("ClosedNow")
+        formatter.write_str("ScopeNow")
     }
 }
 
@@ -101,7 +174,8 @@ impl Caller {
             device: None,
             confirms_the_clock_only: false,
             confirms_recovery_only: false,
-            closed_now: None,
+            scope_now: None,
+            landing: None,
         }
     }
 
@@ -114,7 +188,8 @@ impl Caller {
             device: Some(record),
             confirms_the_clock_only: false,
             confirms_recovery_only: false,
-            closed_now: None,
+            scope_now: None,
+            landing: None,
         }
     }
 
@@ -136,44 +211,51 @@ impl Caller {
     }
 
     /// Marks a local caller as one whose scope is read again where its request is recorded or
-    /// answered: `closed_now` says whether the host's local owner has no live lease at that
-    /// moment ([`Self::decided_now`]).
+    /// answered: `scope_now` reads the host's local owner's lease at that moment
+    /// ([`Self::decided_now`]).
     #[must_use]
-    pub fn asking_again_whether_closed(
+    pub fn asking_again_where_it_stands(
         mut self,
-        closed_now: impl Fn() -> bool + Send + Sync + 'static,
+        scope_now: impl Fn() -> LocalScope + Send + Sync + 'static,
     ) -> Self {
-        self.closed_now = Some(ClosedNow(std::sync::Arc::new(closed_now)));
+        self.scope_now = Some(ScopeNow(std::sync::Arc::new(scope_now)));
         self
     }
 
-    /// This caller as the door decides it at this moment. A local caller the door decided as one
-    /// that is served is limited to the recovery set from the moment the host's local owner has no
-    /// live lease on an exclusively organisation-managed host, which it can come to in the waits
-    /// between the door's decision and the record of what the caller asked or answered. Any other
-    /// caller is as it was decided.
+    /// This caller as the door decides it at this moment, with the bound of the local owner's
+    /// lease that it was decided under. A local caller the door decided as one that is served is
+    /// limited to the recovery set from the moment the host's local owner has no live lease on an
+    /// exclusively organisation-managed host, which it can come to in the waits between the door's
+    /// decision and the record of what the caller asked or answered. Any other caller is as it was
+    /// decided, and holds no bound.
+    ///
+    /// This reads the policy, under its lock, so it is asked before the record's transaction and
+    /// never inside it.
     #[must_use]
     pub fn decided_now(&self) -> Self {
-        match &self.closed_now {
-            Some(closed) if !self.confirms_recovery_only && (closed.0)() => {
-                self.clone().confirming_recovery_only(true)
-            }
-            _ => self.clone(),
+        let mut now = self.clone();
+        if let Some(scope_now) = &self.scope_now
+            && !self.confirms_recovery_only
+        {
+            let LocalScope { closed, held } = (scope_now.0)();
+            now.confirms_recovery_only = closed;
+            now.landing = now.landing.map(|landing| landing.holding(held));
+        }
+        now
+    }
+
+    /// What this caller is limited to.
+    pub(crate) const fn scope(&self) -> Scope {
+        Scope {
+            clock_only: self.confirms_the_clock_only,
+            recovery_only: self.confirms_recovery_only,
         }
     }
 
     /// What the door tells a caller that may not confirm the subject it asked for or answered.
     #[must_use]
     pub fn refusal_to_confirm(&self) -> ControllerError {
-        if self.confirms_the_clock_only {
-            crate::grants::continuity_lost()
-        } else {
-            ControllerError::PermissionDenied {
-                detail: "a device that no membership lease serves confirms only the clock and \
-                         the end of exclusive management"
-                    .to_owned(),
-            }
-        }
+        self.scope().refusal()
     }
 
     /// Whether this caller may be asked for, shown or answer the confirmation `subject` names.
@@ -183,26 +265,48 @@ impl Caller {
     /// of ending exclusive management.
     #[must_use]
     pub fn may_confirm(&self, subject: &ConfirmationSubject) -> bool {
-        match subject {
-            ConfirmationSubject::EstablishClock => true,
-            ConfirmationSubject::SetExclusiveManagement { exclusive: false } => {
-                !self.confirms_the_clock_only
-            }
-            _ => !self.confirms_the_clock_only && !self.confirms_recovery_only,
-        }
+        self.scope().may_confirm(subject)
     }
 
     /// Whether this caller may be shown or answer a challenge that was described as `display`:
     /// [`Self::may_confirm`] for what the host described.
     #[must_use]
     pub fn may_confirm_display(&self, display: &ConfirmationDisplay) -> bool {
-        match display {
-            ConfirmationDisplay::EstablishClock => true,
-            ConfirmationDisplay::ExclusiveManagement {
-                exclusive: false, ..
-            } => !self.confirms_the_clock_only,
-            _ => !self.confirms_the_clock_only && !self.confirms_recovery_only,
-        }
+        self.scope().may_confirm_display(display)
+    }
+
+    /// This caller with the landing its door made, or none where the mutation carries no
+    /// freshness.
+    #[must_use]
+    pub(crate) fn landed(mut self, landing: Option<Landing>) -> Self {
+        self.landing = landing;
+        self
+    }
+
+    /// The landing the door made for this caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal of a mutation that carries no freshness where the caller has none.
+    pub(crate) fn landing(&self) -> Result<&Landing> {
+        self.landing.as_ref().ok_or_else(no_landing)
+    }
+
+    /// The admission of the pairing methods that ask their standing inside their own writes, from
+    /// this caller's landing; a caller with none is refused.
+    pub(crate) fn admission(&self) -> Admission {
+        self.landing.as_ref().map_or_else(
+            || Arc::new(|| Err(no_landing())) as Admission,
+            Landing::admission,
+        )
+    }
+
+    /// This caller with a landing that stands for ever, for a case of the pairing records that
+    /// runs no daemon.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn landed_for_ever(self) -> Self {
+        self.landed(Some(Landing::standing_for_ever()))
     }
 
     /// Returns the owner context an invitation this caller issues is bound to.

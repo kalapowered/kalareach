@@ -1815,7 +1815,9 @@ impl Controller {
         // changes. The step asks the footing's one question again under the gate's lock,
         // immediately before the gate changes: it reads atomics and clocks alone, so nothing waits
         // between it and the change.
-        let footing = self.footing_of_a_mutation(carried)?;
+        let footing = self
+            .footing_of_a_mutation(carried)
+            .map_err(super::footing::admission_refusal)?;
         footing.stands(super::footing::Ask::MUTATION)?;
         let still = || footing.stands(super::footing::Ask::MUTATION);
         let attempt = match params.step {
