@@ -309,3 +309,67 @@ describe('a refusal that says its own wait, and every stop of the lease', () => 
     expect(Object.keys(failure as object).sort()).toEqual(['code', 'line', 'message', 'retry'])
   })
 })
+
+describe('the native bridge is named in the boundary’s module alone', () => {
+  const BOUNDARY = '../src/host/tauri.ts'
+
+  /**
+   * The page's sources, as text. The rule reads text and nothing else: the names the bridge is
+   * reached by, its package path (`@tauri-apps`, for the core, the event and every plugin module)
+   * and its globals (`__TAURI…`, and the window's own channel that the shell sends a call down), in
+   * any file of the page other than the boundary's. An import of any form (static, dynamic, type
+   * only, a re-export, `require`), an alias, a destructuring or a call through a variable cannot hide
+   * the name, because the name is in the text. A name that a program assembles from pieces at run time
+   * is not in the text, and this rule does not claim to see it.
+   */
+  const NAMES: readonly RegExp[] = [/@tauri-apps/, /__TAURI/, /\bipc\s*\.\s*postMessage\b/, /\bmessageHandlers\b/, /chrome\s*\.\s*webview/]
+
+  const outside = (sources: Readonly<Record<string, string>>): string[] =>
+    Object.entries(sources)
+      .filter(([path, text]) => path !== BOUNDARY && NAMES.some((name) => name.test(text)))
+      .map(([path]) => path)
+
+  const files = import.meta.glob('../src/**/*.{ts,tsx,js,jsx,mjs,cjs}', {
+    query: '?raw',
+    import: 'default',
+    eager: true
+  })
+
+  it('holds in the page’s sources: the rule reads them all, and finds the names in the boundary only', () => {
+    expect(Object.keys(files).length).toBeGreaterThan(100)
+    expect(files[BOUNDARY]).toMatch(/@tauri-apps\/api\/core/)
+    expect(files[BOUNDARY]).toMatch(/@tauri-apps\/api\/event/)
+    expect(outside(files)).toEqual([])
+  })
+
+  it('fails on a plant of each way that another module can reach the bridge', () => {
+    const plants: readonly (readonly [string, string])[] = [
+      ['an import', "import { invoke } from '@tauri-apps/api/core'\nexport const ask = invoke"],
+      ['a type import', "import type { InvokeArgs } from '@tauri-apps/api/core'\nexport type Args = InvokeArgs"],
+      ['a side-effect import', "import '@tauri-apps/api/event'"],
+      ['a re-export', "export { listen } from '@tauri-apps/api/event'"],
+      ['a dynamic import', "export const core = () => import('@tauri-apps/api/core')"],
+      ['a dynamic import of a plugin', "export const dialog = () => import(\"@tauri-apps/plugin-dialog\")"],
+      ['a require', "const core = require('@tauri-apps/api/core')\nexport default core"],
+      ['a global', "export const ask = () => window.__TAURI_INTERNALS__.invoke('x')"],
+      ['the older global', "export const ask = () => (window as any).__TAURI__.core.invoke('x')"],
+      ['a global through globalThis', "export const ask = () => globalThis['__TAURI_INTERNALS__']"],
+      ['the shell’s own channel', "export const send = (m: string) => window.ipc.postMessage(m)"],
+      ['the webkit channel', "export const send = (m: string) => window.webkit.messageHandlers.ipc.postMessage(m)"]
+    ]
+    for (const [how, text] of plants) {
+      expect(outside({ '../src/other.ts': text, [BOUNDARY]: files[BOUNDARY] }), how).toEqual([
+        '../src/other.ts'
+      ])
+    }
+  })
+
+  it('passes a module that names neither the package nor a global', () => {
+    const texts = {
+      '../src/a.ts': "import { tauriPort } from './host/tauri'\nexport const port = tauriPort()",
+      '../src/b.ts': '// the desktop shell\nexport const shell = { ipc: 1 }',
+      [BOUNDARY]: "import { invoke } from '@tauri-apps/api/core'"
+    }
+    expect(outside(texts)).toEqual([])
+  })
+})
