@@ -341,6 +341,10 @@ pub(crate) struct Shared {
     /// in milliseconds: a case's way of making the clock disagree with the host's.
     #[cfg(any(test, feature = "testing"))]
     clock_ahead_ms: std::sync::atomic::AtomicU64,
+    /// A case's way of reading the call's state at the moment an end has been written and what it
+    /// owes has not yet been added.
+    #[cfg(any(test, feature = "testing"))]
+    read_window: ReadWindow,
 }
 
 /// What the owner has read and acted on. A case that has to act after the owner did, and not after
@@ -413,6 +417,96 @@ impl DeliveryHold {
 
     fn is(&self, is: Delivery) -> bool {
         *self.state.lock().expect("the record is not poisoned") == is
+    }
+}
+
+/// How long the writer of an end waits, in a case's window, for the case's read to begin.
+#[cfg(any(test, feature = "testing"))]
+const READ_BEGINS_WITHIN: Duration = Duration::from_secs(5);
+
+/// How long it then waits for that read to finish. A read that can finish while the writer waits
+/// has found the view free between two steps; a read that cannot is held by the view's lock, which
+/// the writer holds until it has added what the end owes.
+#[cfg(any(test, feature = "testing"))]
+const READ_FINISHES_WITHIN: Duration = Duration::from_millis(500);
+
+/// Where a case's read of the call's state stands against the next end that is recorded.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Default)]
+struct ReadWindowState {
+    /// The next end that is recorded is to open the window.
+    armed: bool,
+    /// An end has been written and the window is open.
+    open: bool,
+    /// The case's read has begun.
+    began: bool,
+    /// The case's read has finished.
+    finished: bool,
+}
+
+/// A case's hold on the moment between the writing of a call's end and the adding of what it owes,
+/// which a case reads the state in, from another thread, to show that a state with the end and
+/// without its entry cannot be read. The writer opens the window and waits for the case's read to
+/// begin, and then for it to finish, each for a bounded time: where the end and its entries are two
+/// updates the read finishes there and sees the end without its entry, and where they are one the
+/// read is held until the update is over, so the writer's wait ends by its bound and the read sees
+/// both.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Default)]
+struct ReadWindow {
+    state: Mutex<ReadWindowState>,
+    /// Told whenever the case's read begins or finishes, for the writer.
+    changed: std::sync::Condvar,
+    /// Told when the window opens, for the case.
+    opened: tokio::sync::Notify,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl ReadWindow {
+    fn arm(&self) {
+        *self.state.lock().expect("the record is not poisoned") = ReadWindowState {
+            armed: true,
+            ..ReadWindowState::default()
+        };
+    }
+
+    /// Opens the window if one is armed, and waits in it. Called after an end is written and
+    /// before what it owes is added.
+    fn pass(&self) {
+        let mut state = self.state.lock().expect("the record is not poisoned");
+        if !state.armed {
+            return;
+        }
+        state.armed = false;
+        state.open = true;
+        self.opened.notify_waiters();
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, READ_BEGINS_WITHIN, |state| !state.began)
+            .expect("the record is not poisoned");
+        if state.began {
+            let _ = self
+                .changed
+                .wait_timeout_while(state, READ_FINISHES_WITHIN, |state| !state.finished)
+                .expect("the record is not poisoned");
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        self.state.lock().expect("the record is not poisoned").open
+    }
+
+    fn begin(&self) {
+        self.state.lock().expect("the record is not poisoned").began = true;
+        self.changed.notify_all();
+    }
+
+    fn finish(&self) {
+        self.state
+            .lock()
+            .expect("the record is not poisoned")
+            .finished = true;
+        self.changed.notify_all();
     }
 }
 
@@ -636,6 +730,8 @@ impl Shared {
             let now = now_ms();
             let mut view = self.view.lock().expect("the view lock is not poisoned");
             end(&mut view);
+            #[cfg(any(test, feature = "testing"))]
+            self.read_window.pass();
             for each in entries {
                 view.owe(now, each);
             }
@@ -1141,6 +1237,8 @@ impl Calls {
                 delivery: DeliveryHold::default(),
                 #[cfg(any(test, feature = "testing"))]
                 clock_ahead_ms: std::sync::atomic::AtomicU64::new(0),
+                #[cfg(any(test, feature = "testing"))]
+                read_window: ReadWindow::default(),
             })),
         }
     }
@@ -1260,6 +1358,52 @@ impl Calls {
                 .iter()
                 .any(|known| known == id)
         })
+    }
+
+    /// Opens a window at the next end that is recorded, between the writing of the end and the
+    /// adding of what it owes, for a read of the state from another thread: see
+    /// [`Self::until_an_end_is_being_recorded`]. For cases that show no state has the end without
+    /// what it owes.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn open_a_window_at_the_next_end(&self) {
+        if let Some(shared) = self.shared.as_ref() {
+            shared.read_window.arm();
+        }
+    }
+
+    /// Waits until the window is open: an end is written and what it owes is not yet added. The
+    /// case then calls [`Self::a_read_begins`], reads the state, and calls
+    /// [`Self::the_read_has_finished`].
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn until_an_end_is_being_recorded(&self) {
+        let Some(shared) = self.shared.as_ref() else {
+            return;
+        };
+        loop {
+            let opened = shared.read_window.opened.notified();
+            tokio::pin!(opened);
+            opened.as_mut().enable();
+            if shared.read_window.is_open() {
+                return;
+            }
+            opened.await;
+        }
+    }
+
+    /// Says that the case's read of the state, in the window, is about to begin.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn a_read_begins(&self) {
+        if let Some(shared) = self.shared.as_ref() {
+            shared.read_window.begin();
+        }
+    }
+
+    /// Says that the case's read of the state, in the window, has finished.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn the_read_has_finished(&self) {
+        if let Some(shared) = self.shared.as_ref() {
+            shared.read_window.finish();
+        }
     }
 
     /// Whether an owner has acted on the answer to the capture proof the delegation `id` asked for:
