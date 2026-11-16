@@ -5221,6 +5221,8 @@ async fn a_device_that_is_refused_free_capacity_is_told_so_when_it_pairs_by_code
         .expect("the attempt ran")
         .expect_err("a relay that takes no session carries nothing");
     assert!(matches!(failure.kind, FailureKind::RelayCapacity(_)));
+    // The host locked its invitation to this attempt before the dial, so the code is spent.
+    assert!(failure.invitation_spent);
 }
 
 /// A link that counts what the host answers a device on the connections it opens, and the
