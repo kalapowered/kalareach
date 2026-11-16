@@ -5760,9 +5760,9 @@ still owes cleanup and whatever the daemon's privacy mode says by then, and it s
 a journal with such a record before then.
 
 Privacy mode reaches the canonical grid's rows above the live screen as well. The grid gives up the
-rows it held when the mode goes on and keeps none while the mode is on, so a scroll finds no row
-above the live screen. The last list in this section names the live screen, which is not cleared,
-and the other things the steps leave.
+rows it held when the mode goes on, also while a full-screen program shows its own screen, and keeps
+none while the mode is on, so a scroll finds no row above the live screen. The last list in this
+section names the live screen, which is not cleared, and the other things the steps leave.
 
 A cleanup that could not finish is not a cleanup that finished. A redaction the store refused and
 a spool file this host could not unlink are both content privacy mode was asked to remove and has
@@ -6071,8 +6071,13 @@ what it removes is exactly the thing a person cannot check for themselves.
   terminal attached to the session, and a paired device, still draw what is on it, and its rows
   leave it as new output pushes them off. A row that was on the screen when the mode went on is
   given up when it leaves the screen, and so is a row printed while the mode is on. A row that is on
-  the screen when the mode goes off is given up in the same way when it leaves the screen. The grid
-  keeps rows again from the first row that comes onto the screen after that.
+  the screen when the mode goes off is given up in the same way when it leaves the screen. After
+  that the grid keeps rows again. It still gives up two kinds of row that it could keep: a row
+  printed after the mode went off onto a line that was on the screen while the mode was on (after a
+  clear or a full reset that is every row, for at most one screen of rows), and a row that leaves
+  the screen while an older row from that time is still on the screen below it, as when a program
+  scrolls a region above a status line. A resize gives up nothing more, except the rest of a wrapped
+  line whose first part is given up.
 * **Application notices keep their content.** A notification's title and body are written to the
   host-event store, and privacy cleanup removes neither the rows already there nor later ones.
 * **An invitation keeps what its issuer was shown.** `grant.create` stores the visible lines of a
