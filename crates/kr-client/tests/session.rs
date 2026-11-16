@@ -597,6 +597,35 @@ async fn one_connection_carries_one_session() {
     serving.abort();
 }
 
+/// This side's own close ends a read of the paired transport that waits, and the read returns the
+/// clean end and no error: the transport says so by what its connection recorded as the cause of
+/// its end, so a session that reads the end need not guess it from a flag raised afterwards. A
+/// connection that the host closed first stays a failure that keeps its error (the case below).
+#[tokio::test]
+async fn this_sides_own_close_is_the_clean_end_of_a_paired_read() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let serving = spawn_host(&host, client.record, Arc::new(HostScript::default()), None);
+
+    let transport = Arc::new(dial(&client, &host).await);
+    let reading = tokio::spawn({
+        let transport = Arc::clone(&transport);
+        async move { kr_client::transport::ControlTransport::recv(&*transport).await }
+    });
+    // Time for the read to park on the control stream; the clean end does not depend on it.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    kr_client::transport::ControlTransport::close(&*transport);
+    let read = tokio::time::timeout(Duration::from_secs(30), reading)
+        .await
+        .expect("the close ends the read")
+        .expect("the read task");
+    assert!(
+        matches!(read, Ok(None)),
+        "this side's own close was not the clean end of the read: {read:?}"
+    );
+    serving.abort();
+}
+
 /// The paired transport answers "closed" for this side's close alone, and "can send" for neither
 /// side's close. A host that closes the connection is not this side closing it: the session's read
 /// loop reads what the host sent first, a refusal included, and ends the session after it, so a
