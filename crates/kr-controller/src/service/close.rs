@@ -80,10 +80,6 @@ pub(super) struct KnownClosure {
     record: ClosureRecord,
     /// Whose account the record is.
     whose: Whose,
-    /// Whether the record is a worker's volatile one, which its durable record may still replace.
-    /// A provisional record is held and never written: the registry's first record of a closure
-    /// is the one it keeps, so writing a volatile one would hide the durable one that follows.
-    provisional: bool,
     /// Whether a task of this daemon is writing the record to the registry now.
     writing: bool,
 }
@@ -103,7 +99,8 @@ impl KnownClosure {
 /// Whose account of a closure this daemon keeps until its registry has it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Whose {
-    /// The worker's own account, as it gave it. A durable one is also in the worker's journal.
+    /// The worker's own account, as it gave it, with the durability word it gave it. A durable
+    /// one is also in the worker's journal.
     Worker,
     /// This daemon's own account of a worker that ended and left none. Nothing but the registry
     /// holds it, so until the registry has committed it a close is told that the closure is not
@@ -530,37 +527,24 @@ impl Controller {
             .map(KnownClosure::said)
     }
 
-    /// Whether this daemon knows how `session_id` ended, finally: a closure that is not a worker's
-    /// volatile record, which a durable one may still replace. Where it does, the write of that
-    /// closure is started if no task of this daemon is writing it, and a close is answered from
-    /// the known closure.
+    /// Whether this daemon knows how `session_id` ended, from a closure that its registry may not
+    /// hold yet. Where it does, the write of that closure is started if no task of this daemon is
+    /// writing it, and a close is answered from the known closure.
     pub(crate) fn knows_how_it_ended(self: &Arc<Self>, session_id: SessionId) -> bool {
         let known = self
             .known_closures
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&session_id)
-            .is_some_and(|known| !known.provisional);
+            .contains_key(&session_id);
         if known {
             self.record_known_closure_soon(session_id);
         }
         known
     }
 
-    /// The volatile record that a worker handed this daemon for `session_id`, which no durable
-    /// record has replaced.
-    fn provisional_closure(&self, session_id: SessionId) -> Option<ClosureRecord> {
-        self.known_closures
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&session_id)
-            .filter(|known| known.provisional)
-            .map(|known| known.record.clone())
-    }
-
-    /// Keeps `record` as what a close of its session is answered with. A final record is not
-    /// replaced by a provisional one.
-    fn keep_known_closure(&self, record: &ClosureRecord, provisional: bool, whose: Whose) {
+    /// Keeps `record` as what a close of its session is answered with, until the registry holds a
+    /// record of the session.
+    fn keep_known_closure(&self, record: &ClosureRecord, whose: Whose) {
         let mut known = self
             .known_closures
             .lock()
@@ -568,14 +552,10 @@ impl Controller {
         let entry = known.entry(record.session_id).or_insert(KnownClosure {
             record: record.clone(),
             whose,
-            provisional,
             writing: false,
         });
-        if entry.provisional || !provisional {
-            entry.record = record.clone();
-            entry.whose = whose;
-            entry.provisional = provisional;
-        }
+        entry.record = record.clone();
+        entry.whose = whose;
     }
 
     /// Forgets what this daemon kept of a closure its registry now holds.
@@ -598,7 +578,7 @@ impl Controller {
             let Some(entry) = known.get_mut(&session_id) else {
                 return;
             };
-            if entry.provisional || entry.writing {
+            if entry.writing {
                 return;
             }
             entry.writing = true;
@@ -651,14 +631,12 @@ impl Controller {
     /// is settled here, before it goes, so none reaches its caller without this daemon knowing
     /// what it said.
     ///
-    /// An answer with the worker's own account of how its session ended is kept, and its record is
-    /// written on a task of its own, through the same boundary as every other closure so that
-    /// nothing this daemon writes afterwards can replace it: the answer is the worker's, and the
-    /// registry's write is not what the caller waits for. A volatile account is the worker's
-    /// provisional one, which its durable record may still replace: it is kept and not written,
-    /// and the worker stays in the directory with its links until the durable record is
-    /// collected or the worker has ended. One without a closure is the worker's acceptance: the
-    /// session is closing, as the worker's description in it says, until its closure is recorded
+    /// An answer with the worker's own account of how its session ended is kept, as the worker
+    /// gave it and with the durability word it gave it, and its record is written on a task of its
+    /// own, through the same boundary as every other closure so that nothing this daemon writes
+    /// afterwards can replace it: the answer is the worker's, and the registry's write is not what
+    /// the caller waits for. One without a closure is the worker's acceptance: the session is
+    /// closing, as the worker's description in it says, until its closure is recorded
     /// ([`Self::close_accepted`]). The answer itself is not changed.
     pub(crate) async fn settle_close_answer(
         self: &Arc<Self>,
@@ -666,13 +644,8 @@ impl Controller {
         answer: &SessionCloseResult,
     ) {
         match answer.closure.as_ref() {
-            Some(record) if record.durability == Durability::Volatile => {
-                self.keep_known_closure(record, true, Whose::Worker);
-                self.close_accepted(session_id, answer.session.as_ref())
-                    .await;
-            }
             Some(record) => {
-                self.keep_known_closure(record, false, Whose::Worker);
+                self.keep_known_closure(record, Whose::Worker);
                 self.record_known_closure_soon(session_id);
             }
             None => {
@@ -1132,14 +1105,6 @@ impl Controller {
             self.write_closure(&recovered, Whose::Worker).await?;
             return Ok(recovered);
         }
-        // The worker ended with no durable record of its own. What it said of its closure before
-        // it ended is its own account, volatile as it gave it, and it stands.
-        if death == Death::Confirmed
-            && let Some(provisional) = self.provisional_closure(session_id)
-        {
-            self.write_closure(&provisional, Whose::Worker).await?;
-            return Ok(provisional);
-        }
         // Nothing authoritative survived. What is written instead says so: the coverage is
         // incomplete and the root's result is absent rather than invented.
         // A worker this host saw end is terminated; one it did not is not, whatever else is true
@@ -1265,7 +1230,7 @@ impl Controller {
         // Known before the registry is written: a close of this session is answered from what is
         // kept here while the write stands, and the registry answers once it has the record. A
         // record that only this daemon holds is not said to be durable until it is.
-        self.keep_known_closure(record, false, whose);
+        self.keep_known_closure(record, whose);
         let mut registry = self.registry.lock().await;
         #[cfg(feature = "testing")]
         self.registry_write_stall.0.wait();

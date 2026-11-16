@@ -1,10 +1,11 @@
-//! A worker's volatile closure, at the daemon's two doors for a close.
+//! A worker's closure that its daemon has not recorded yet, at the daemon's two doors for a close.
 //!
-//! A worker that has drained its session and has not yet written its durable closure answers a
-//! close with the closure it has, volatile. That account is the answer to the close, and it does
-//! not stand in for the durable one: the daemon keeps it without recording it, keeps the worker
-//! and its links, and records the durable closure when the worker gives it. The same close at
-//! either door, before the worker's storage returns, is answered as often as it is sent.
+//! A worker answers a close with the closure it has, durable or volatile. That account is the
+//! answer to the close, and the daemon keeps it as the worker gave it, with the word it gave, and
+//! records it on a task of its own. A volatile closure keeps its word: until a durable record of
+//! the session says otherwise, the registry, what the daemon holds and both doors say volatile.
+//! The same close at either door, while the registry's write has not returned, is answered from
+//! what the daemon holds, without reaching the worker again.
 
 use kr_protocol::envelope::{ActionTarget, ControlFrame, Outcome, Response};
 use kr_protocol::ids::SessionEpoch;
@@ -108,58 +109,67 @@ async fn until_recorded_and_retired(world: &Silent) {
     .expect("the closure is recorded and the worker is retired");
 }
 
-/// A worker that answers a close with a durable closure is recorded durably, and one that answers
-/// with its volatile closure is not recorded until it gives the durable one: before then, the same
-/// close at the local door and from a paired device is answered with the volatile closure each time
-/// it is sent, the worker is still in the directory, and the close reaches it.
+/// A worker's closure, durable or volatile, is answered at once; while the registry's write of it
+/// stands, the same close at the local door and from a paired device is answered with the closure
+/// as the worker gave it, without reaching the worker; once the write is let go the registry holds
+/// the record with the word the worker gave it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_volatile_closure_is_answered_at_both_doors_and_the_durable_one_is_recorded_when_it_comes()
- {
-    for volatile_first in [false, true] {
+async fn a_closure_whose_write_stands_is_answered_at_both_doors_and_recorded_as_it_was_given() {
+    for volatile in [false, true] {
+        let given = if volatile {
+            Durability::Volatile
+        } else {
+            Durability::Durable
+        };
         let script = Scripted::new();
         script.accepts_with_its_closure();
-        script.its_closure_is_volatile(volatile_first);
+        script.its_closure_is_volatile(volatile);
         let world = scripted::scripted(&script).await;
         let controller = &world.controller;
         let (connection, _) = paired_connection(controller, 36, EVERY_RIGHT);
+        let (arrived, release) = controller.stall_the_next_closure_write();
 
-        if volatile_first {
-            let local = closed_at_the_local_door(&world).await;
-            assert_eq!(local.state, SessionState::Closing, "{local:?}");
-            assert_eq!(local.durability, Durability::Volatile, "{local:?}");
-            let paired = closed_at_the_paired_door(&world, &connection, 91).await;
-            assert_eq!(paired.durability, Durability::Volatile, "{paired:?}");
-            let again = closed_at_the_local_door(&world).await;
-            assert_eq!(again.durability, Durability::Volatile, "{again:?}");
-            assert_eq!(
-                script.forwarded().len(),
-                3,
-                "each close of a session whose closure is volatile reaches the worker"
-            );
-            assert_eq!(
-                recorded_durability(&world).await,
-                None,
-                "a volatile closure is not recorded"
-            );
-            assert!(
-                controller
-                    .directory
-                    .lock()
-                    .await
-                    .get(world.session_id)
-                    .is_some(),
-                "the worker stays in the directory until its durable closure is collected"
-            );
-            script.its_closure_is_volatile(false);
-        }
-
-        let collected = closed_at_the_local_door(&world).await;
-        assert_eq!(collected.durability, Durability::Durable, "{collected:?}");
+        let local = closed_at_the_local_door(&world).await;
+        assert_eq!(local.durability, given, "{local:?}");
+        tokio::task::spawn_blocking(move || {
+            arrived.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await
+        .expect("the wait for the write ends")
+        .expect("the closure's write reaches the registry");
+        let paired = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            closed_at_the_paired_door(&world, &connection, 91),
+        )
+        .await
+        .expect("a close from a paired device is answered while the write stands");
+        assert_eq!(
+            (paired.state, paired.durability),
+            (SessionState::Closed, given),
+            "{paired:?}"
+        );
+        let again = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            closed_at_the_local_door(&world),
+        )
+        .await
+        .expect("a close at the local door is answered while the write stands");
+        assert_eq!(
+            (again.state, again.durability),
+            (SessionState::Closed, given),
+            "{again:?}"
+        );
+        assert_eq!(
+            script.forwarded().len(),
+            1,
+            "only the first close reaches the worker, volatile {volatile}"
+        );
+        release.send(()).expect("the write is let go");
         until_recorded_and_retired(&world).await;
         assert_eq!(
             recorded_durability(&world).await,
-            Some(Durability::Durable),
-            "the closure the daemon holds is the durable one, volatile first: {volatile_first}"
+            Some(given),
+            "the registry holds the closure with the word the worker gave it, volatile {volatile}"
         );
         world.serving.abort();
     }
