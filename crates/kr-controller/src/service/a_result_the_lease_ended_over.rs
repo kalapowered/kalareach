@@ -228,7 +228,7 @@ async fn written_for(method: Method, exclusive: bool) -> ControlFrame {
                 &result(),
                 Some(method),
                 REQUEST,
-                &WrittenUnder::for_an_own_effect_case(footing),
+                &WrittenUnder::for_an_own_effect_case(footing, true),
             )
             .await,
         "the connection goes on"

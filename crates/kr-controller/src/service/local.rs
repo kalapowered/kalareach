@@ -384,7 +384,7 @@ impl Controller {
         let lapse = self
             .ask_where_a_frame_lands(Self::held_to_the_lease(method), under)
             .err()?;
-        Some(under.withheld(lapse, request_id, false, || {
+        Some(under.withheld(lapse, request_id, || {
             self.lease_ended_reply(request_id, method)
         }))
     }
@@ -452,12 +452,9 @@ impl Controller {
                             begun = false;
                         }
                         Err(lapse) => {
-                            let reply = under.withheld(
-                                lapse,
-                                request_id,
-                                crate::given::may_have_taken_effect(answer),
-                                || self.lease_ended_reply(request_id, method),
-                            );
+                            let reply = under.withheld(lapse, request_id, || {
+                                self.lease_ended_reply(request_id, method)
+                            });
                             return writer.write_message(&reply).await.is_ok();
                         }
                     }
