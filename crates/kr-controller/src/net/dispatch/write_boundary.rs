@@ -4113,7 +4113,10 @@ enum BarrierAt {
 /// stream and closes the connection, where a refusal at the first call leaves the stream whole and
 /// the answer is decided again. This pins what the writer does for both, and the control writes
 /// the whole answer. The watch that polls while the write waits ends the write the same way when
-/// its poll comes first, so the second row holds whichever of the two sees the barrier.
+/// its poll comes first, so the second row holds whichever of the two sees the barrier. The test
+/// stream records a first part at the peer after the first call; the production sender writes
+/// nothing in that call, so there the second call can refuse with no byte of the frame gone, and
+/// the codec still resets the stream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refusal_after_the_senders_first_empty_call_closes_the_connection() {
     use crate::service::Reach;
