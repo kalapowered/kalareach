@@ -8553,6 +8553,12 @@ impl WorkerService {
     /// say that a session is live while it is closing. The count is what the host's sleep demand
     /// reads, so a held session still shows its demand. The answer carries no session content, so a
     /// caller gets no more than the read that takes the session would give it.
+    ///
+    /// The answer follows the domain and the copy, and so says `Live` of a session whose root has
+    /// exited while a storage call holds the session: only the supervision sees the exit, and it
+    /// waits for the session. It can say `Closed` with no closure record in the moment between the
+    /// domain's change and the copy's publication. See [`crate::published`] for both, and for the
+    /// older copy of a stage that a reader's record of what it heard can take.
     fn session_read_while_held(&self, params: &SessionReadParams) -> Result<ParamsValue> {
         let held = self.runtime.published().answer(self.runtime.input());
         Self::check_owned_session(held.summary.session_id, params.session_id)?;
