@@ -2500,12 +2500,12 @@ impl SignedInAccount {
     /// cannot be taken, it is sent on its own; when sending the queue fails, it is sent on its own
     /// once more. A token that the queue refused and whose send on its own was not acknowledged is
     /// kept in memory for the next send, and is lost if the process stops before one runs. The
-    /// outcome is [`Commit::WithheldOwing`] when the token is held in memory afterwards, and
-    /// [`Commit::Withheld`] otherwise. Where the revocation failed, how it failed and where the
-    /// token stands is returned beside the outcome ([`Unrevoked`]). After an input or output
-    /// failure the state of the queue is uncertain: a write that failed at the last step of
-    /// installing the entry can have left it there, and the token is then sent again at the next
-    /// recovery, which the service does not mind.
+    /// outcome is [`Commit::WithheldOwing`] when this call put the token in memory, which is the
+    /// [`Unrevoked::Held`] outcome alone, and [`Commit::Withheld`] otherwise. Where the revocation
+    /// failed, how it failed and where the token stands is returned beside the outcome
+    /// ([`Unrevoked`]). After an input or output failure the state of the queue is uncertain: a
+    /// write that failed at the last step of installing the entry can have left it there, and the
+    /// token is then sent again at the next recovery, which the service does not mind.
     pub async fn end_withheld(&self, refresh_token: RefreshToken) -> (Commit, Option<Unrevoked>) {
         let queued = match self.hold().await {
             Ok(_held) => self.queue("unkept", refresh_token.clone()),
