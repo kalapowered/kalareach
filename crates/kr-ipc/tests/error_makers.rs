@@ -15,7 +15,11 @@
 //! `impl` of `IpcError`, each `Self::Variant`. A call of the constructors `io`, `socket` and
 //! `stream` is a maker of `Io` and of `Socket`. An occurrence is a pattern, and not a maker, when
 //! the token after it (and after its braces or parentheses, and any closing parentheses and commas) is `=>`,
-//! `|`, `=` or `if`, or when it stands in the second argument of a `matches!`. A conversion is a
+//! `|`, `=` or `if`. An occurrence inside the arguments of any macro (`matches!`, `assert!`,
+//! `format!`, `vec!`, a `macro_rules!` body, the delimiters that follow `name!`) is not classified:
+//! the scan cannot tell what the macro does with it, so it counts as a maker and a row names it.
+//! The row's source is the true source where the occurrence makes a value, and `pattern` where a
+//! person read it as a pattern (a `matches!` that tests a value and makes none). A conversion is a
 //! maker where it is written: each `impl .. for IpcError` that names a variant, and each `#[from]`
 //! in the enum.
 //!
@@ -24,9 +28,10 @@
 //! - where a conversion is used: a `?`, an `.into()` or a `map_err(Into::into)` that turns another
 //!   error into one of these makes a value at the conversion's place, and the roster names that
 //!   place only, with the sites of use in its note;
-//! - a construction that a macro writes, a type alias or an import that renames `IpcError`, and a
-//!   pattern that none of the tokens above ends (a pattern that stands in a macro other than
-//!   `matches!`);
+//! - a construction that a macro itself writes (inside its own definition's expansion), and a type
+//!   alias or an import that renames `IpcError`;
+//! - a pattern outside a macro that none of the tokens above ends: it counts as a maker and a row
+//!   names it, so the scan errs toward asking;
 //! - the code of a test build: a `#[cfg(test)]` item, a file under `tests`, and the `testing`
 //!   feature's own helpers are not makers that a control connection returns;
 //! - two functions of one name in one `impl` type of one file (the unix and the Windows module of
@@ -329,9 +334,9 @@ fn impl_type(code: &[u8], after_keyword: usize) -> String {
 }
 
 /// Whether the occurrence of a variant that spans `start..end` is a pattern: what follows it (past
-/// its group and any closing parentheses) is `=>`, `|`, `=` or `if`, or it is the second argument
-/// of a `matches!`.
-fn is_pattern(code: &[u8], start: usize, end: usize) -> bool {
+/// its group and any closing parentheses) is `=>`, `|`, `=` or `if`. The caller has already
+/// excluded an occurrence inside a macro's arguments, which this cannot classify.
+fn is_pattern(code: &[u8], end: usize) -> bool {
     let mut after = skip_space(code, end);
     if after < code.len() && (code[after] == b'{' || code[after] == b'(') {
         after = skip_space(code, group_end(code, after));
@@ -340,21 +345,54 @@ fn is_pattern(code: &[u8], start: usize, end: usize) -> bool {
         after = skip_space(code, after + 1);
     }
     let next = &code[after.min(code.len())..];
-    if next.starts_with(b"=>")
+    next.starts_with(b"=>")
         || next.starts_with(b"if ")
         || (next.starts_with(b"|") && !next.starts_with(b"||"))
         || (next.starts_with(b"=") && !next.starts_with(b"=="))
-    {
-        return true;
+}
+
+/// Whether the delimiter that opens at `open` begins the arguments of a macro: `name!(`, `name![`,
+/// `name!{`, or the body of `macro_rules! name {`.
+fn opens_a_macro(code: &[u8], open: usize) -> bool {
+    let mut at = open;
+    while at > 0 && code[at - 1].is_ascii_whitespace() {
+        at -= 1;
     }
-    let back = &code[start.saturating_sub(400)..start];
-    let mark = b"matches!(";
-    back.windows(mark.len())
-        .rposition(|w| w == mark)
-        .is_some_and(|at| {
-            let between = &back[at + mark.len()..];
-            between.contains(&b',') && !between.contains(&b';')
-        })
+    if at > 0 && code[at - 1] == b'!' {
+        return at > 1 && is_word(code[at - 2]);
+    }
+    let mut start = at;
+    while start > 0 && is_word(code[start - 1]) {
+        start -= 1;
+    }
+    if start == at {
+        return false;
+    }
+    while start > 0 && code[start - 1].is_ascii_whitespace() {
+        start -= 1;
+    }
+    start > 0 && code[start - 1] == b'!' && code[..start - 1].ends_with(b"macro_rules")
+}
+
+/// Whether `at` stands inside the arguments of a macro: some delimiter that encloses it opens one.
+/// The scan cannot tell what a macro does with what is inside, so an occurrence there is not
+/// classified: it counts as a maker, and a row names it.
+fn in_macro_arguments(code: &[u8], at: usize) -> bool {
+    let mut closed = 0usize;
+    for index in (0..at).rev() {
+        match code[index] {
+            b')' | b']' | b'}' => closed += 1,
+            b'(' | b'[' | b'{' => {
+                if closed > 0 {
+                    closed -= 1;
+                } else if opens_a_macro(code, index) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// A scope that a `{` opened: a function (its name) or an `impl` (its type).
@@ -458,7 +496,7 @@ fn occurrence(
     let (name, name_end) = word_at(code, end + 2);
     let variant = made_by(code, name, name_end)?;
     let is_constructor = name.chars().next().is_some_and(char::is_lowercase);
-    if !is_constructor && is_pattern(code, start, name_end) {
+    if !is_constructor && !in_macro_arguments(code, start) && is_pattern(code, name_end) {
         return None;
     }
     let function = scopes.iter().rev().find_map(|(_, scope)| match scope {
@@ -597,19 +635,35 @@ fn roster(text: &str) -> Result<Vec<Row>, String> {
         let count = count
             .parse()
             .map_err(|_| format!("line {}: n is no number", number + 1))?;
-        if !["own", "arrived", "connect", "stream", "conversion"].contains(&what) {
+        if !["own", "arrived", "connect", "stream", "conversion", "macro"].contains(&what) {
             return Err(format!(
-                "line {}: what `{what}` is none of the five",
+                "line {}: what `{what}` is none of the six",
                 number + 1
             ));
         }
-        if !["reply", "closure", "own", "by-kind", "closure+own"].contains(&source) {
+        if ![
+            "reply",
+            "closure",
+            "own",
+            "by-kind",
+            "closure+own",
+            "pattern",
+        ]
+        .contains(&source)
+        {
             return Err(format!(
-                "line {}: source `{source}` is none of the five",
+                "line {}: source `{source}` is none of the six",
                 number + 1
             ));
         }
-        if !["agrees", "differs", "by-kind"].contains(&function) {
+        if source == "pattern" {
+            if what != "macro" || control != "-" || function != "-" {
+                return Err(format!(
+                    "line {}: a pattern is read in a macro's arguments and makes no value, so its what is macro and its control and function are -",
+                    number + 1
+                ));
+            }
+        } else if !["agrees", "differs", "by-kind"].contains(&function) {
             return Err(format!(
                 "line {}: function `{function}` is none of the three",
                 number + 1
@@ -695,7 +749,7 @@ impl Client {
         match error {
             IpcError::PeerClosed | IpcError::TruncatedFrame { .. } => true,
             IpcError::Frame(_) if self.ready() => false,
-            _ => matches!(error, IpcError::HostRefused { .. }),
+            _ => false,
         }
     }
 }
@@ -760,6 +814,58 @@ mod tests {
     assert_eq!(
         said,
         vec!["a maker with no row: crates/x/src/client.rs | Client::more | Socket (made 1 times)"]
+    );
+}
+
+/// An occurrence inside a macro's arguments is not classified by the scan and counts as a maker: a
+/// `matches!` that tests a value, an `assert!`, a `format!` and the body of a `macro_rules!` are
+/// named, with the count of occurrences there. The delimiters of an earlier macro do not reach
+/// across its end: a construction in the block after `if matches!(flag, true)` is a maker of its
+/// own function, and so is one in a closure that no macro encloses.
+#[test]
+fn an_occurrence_inside_a_macro_is_a_maker_and_one_after_a_macro_is_read_for_itself() {
+    let text = "\
+impl Client {
+    fn after_a_macro(&self, flag: bool) -> Result<(), IpcError> {
+        if matches!(flag, true) {
+            return Err(IpcError::PeerClosed);
+        }
+        Ok(())
+    }
+    fn tests_a_value(&self, error: &IpcError) -> bool {
+        matches!(error, IpcError::TruncatedFrame { .. } | IpcError::PeerClosed)
+    }
+    fn names_one(&self, error: &IpcError) {
+        assert!(!matches!(error, IpcError::HostRefused { .. }), \"{}\", IpcError::LinkFenced { detail: String::new() });
+    }
+    fn in_a_loop(&self) -> Result<(), IpcError> {
+        let again = vec![1, 2].into_iter().map(|_| IpcError::UnexpectedMessage(\"x\")).count();
+        Err(IpcError::NotInLevel(String::new()))
+    }
+}
+macro_rules! make {
+    () => {
+        IpcError::OutsideLevel(String::new())
+    };
+}
+";
+    let found = makers(&[("crates/x/src/client.rs".to_owned(), text.to_owned())]);
+    let places: Vec<String> = found
+        .iter()
+        .map(|(place, count)| format!("{} x{count}", place.said()))
+        .collect();
+    assert_eq!(
+        places,
+        vec![
+            "crates/x/src/client.rs | - | OutsideLevel x1",
+            "crates/x/src/client.rs | Client::after_a_macro | PeerClosed x1",
+            "crates/x/src/client.rs | Client::in_a_loop | NotInLevel x1",
+            "crates/x/src/client.rs | Client::in_a_loop | UnexpectedMessage x1",
+            "crates/x/src/client.rs | Client::names_one | HostRefused x1",
+            "crates/x/src/client.rs | Client::names_one | LinkFenced x1",
+            "crates/x/src/client.rs | Client::tests_a_value | PeerClosed x1",
+            "crates/x/src/client.rs | Client::tests_a_value | TruncatedFrame x1",
+        ]
     );
 }
 
