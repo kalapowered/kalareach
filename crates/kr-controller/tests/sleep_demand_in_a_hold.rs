@@ -540,10 +540,18 @@ async fn a_question_whose_expiry_write_fails_beside_one_that_stays_open_keeps_th
         read.is_err(),
         "a read of the ledger said {read:?} while the hold stood: the expiry write did not meet the write lock"
     );
-    // The reader's own error is recorded as the probe's returns; the host counts the question
-    // that stays open for as long as the hold stands.
+    // The ledger's store admits one read at a time, so the reader's read and the probe's wait for
+    // each other, and whichever came second gives up a busy wait of five seconds after the first.
+    // The hold therefore stands for six seconds more, which holds both errors: the host counts
+    // the question that stays open for as long as the hold stands, and a scan that lowered its
+    // count on the reader's error would be seen doing it.
     rig.counts_stay(ASKED, "after the ledger's expiry write failed")
         .await;
+    rig.counts_stay(
+        ASKED,
+        "after the second read of the ledger gave up its busy wait",
+    )
+    .await;
     let _ = release.send(());
     pass.await.expect("the maintenance pass ended");
     rig.counts_become(ASKED, "after the hold ended: the long question is open")
