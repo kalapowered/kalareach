@@ -842,9 +842,18 @@ impl Shown {
     }
 
     /// A managed service's refusal message, which the service writes to be shown to a person.
+    ///
+    /// This is the one place a service's words, and each item of a list of alternatives it names,
+    /// become shown text, for a terminal and for a page alike, so it is the one place that keeps
+    /// them from carrying what a terminal acts on: every control character is removed (the C0 set,
+    /// the delete character and the C1 set), the characters that reorder what a terminal draws
+    /// (the bidirectional embeddings, overrides and isolates) and the invisible tag characters are
+    /// removed, and a run of line and tab characters becomes one space. Everything else stays as
+    /// the service wrote it: letters of every script, emoji with their joiners and selectors, and
+    /// ordinary spaces and punctuation.
     #[must_use]
     pub fn service(message: &ServiceMessage) -> Self {
-        Self::decided(message.0.clone())
+        Self::decided(without_controls(&message.0))
     }
 
     /// Text a package declares about one of its controls, written for the person the control is
@@ -1303,6 +1312,41 @@ fn identifier(part: &str) -> bool {
     };
     uuid || (part.len() >= 8 && part.len() <= 128 && hex(part))
         || (!part.is_empty() && part.len() <= 20 && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// Whether a character ends a line or separates a column, so that text around it is not run
+/// together when it is taken out.
+const fn separates(letter: char) -> bool {
+    matches!(
+        letter,
+        '\n' | '\r' | '\t' | '\u{b}' | '\u{c}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+    )
+}
+
+/// Whether a terminal or a line of text may be made to act on a character that a service wrote:
+/// a control character, one that reorders the text drawn around it, or an invisible tag.
+const fn removed(letter: char) -> bool {
+    letter.is_control()
+        || matches!(letter, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        || matches!(letter, '\u{e0000}'..='\u{e007f}')
+}
+
+/// A service's words as a person may be shown them: what [`Shown::service`] describes.
+fn without_controls(text: &str) -> String {
+    let mut shown = String::with_capacity(text.len());
+    let mut separated = false;
+    for letter in text.chars() {
+        if separates(letter) {
+            if !separated {
+                shown.push(' ');
+                separated = true;
+            }
+        } else if !removed(letter) {
+            separated = false;
+            shown.push(letter);
+        }
+    }
+    shown
 }
 
 /// A managed service's refusal message.
@@ -2188,5 +2232,91 @@ mod tests {
             "Counted {\n    count: 3,\n    ..\n}"
         );
         let _ = (holding.count, holding.text, counted.text);
+    }
+
+    /// What a person is shown of a service's words, for a service's refusal and for each item of
+    /// the list of alternatives it names.
+    fn service_words(text: &str) -> String {
+        Shown::service(&ServiceMessage::from_refusal(text.to_owned())).into_string()
+    }
+
+    fn service_item(text: &str) -> String {
+        crate::services::Alternatives::named(vec![text.to_owned()])
+            .as_given()
+            .remove(0)
+            .into_string()
+    }
+
+    /// A service's words and each item of its list reach a terminal and a page without a control
+    /// character, a character that reorders the text drawn around it or an invisible tag: for
+    /// every character there is, the one that must go is gone, a line or tab becomes one space, and
+    /// every other character stays exactly where the service put it.
+    #[test]
+    fn a_service_text_holds_no_character_a_terminal_acts_on_and_every_other_stays() {
+        let mut removed_count = 0_u32;
+        let mut separated_count = 0_u32;
+        for point in 0..=0x0010_FFFF_u32 {
+            let Some(letter) = char::from_u32(point) else {
+                continue;
+            };
+            let text = format!("a{letter}b");
+            let expected = if matches!(
+                point,
+                0x0a | 0x0d | 0x09 | 0x0b | 0x0c | 0x85 | 0x2028 | 0x2029
+            ) {
+                separated_count += 1;
+                "a b".to_owned()
+            } else if letter.is_control()
+                || (0x202a..=0x202e).contains(&point)
+                || (0x2066..=0x2069).contains(&point)
+                || (0xe0000..=0xe007f).contains(&point)
+            {
+                removed_count += 1;
+                "ab".to_owned()
+            } else {
+                text.clone()
+            };
+            assert_eq!(service_words(&text), expected, "U+{point:04X} in the words");
+            assert_eq!(
+                service_item(&text),
+                expected,
+                "U+{point:04X} in a list item"
+            );
+        }
+        // The C0 set but for the five line and tab controls, the delete character, the C1 set but
+        // for the next-line control, the five embeddings and overrides, the four isolates and the
+        // 128 tag characters.
+        assert_eq!(separated_count, 8);
+        assert_eq!(removed_count, (32 - 5) + 1 + (32 - 1) + 5 + 4 + 128);
+    }
+
+    /// A run of line and tab characters is one space whatever stands inside it that is removed,
+    /// and ordinary spaces are neither trimmed nor collapsed.
+    #[test]
+    fn a_run_of_line_characters_in_a_service_text_is_one_space() {
+        assert_eq!(service_words("a\r\n\t\x0b\x0cb"), "a b");
+        assert_eq!(service_words("a\n\x1b[31m\u{202e}\nb"), "a [31m b");
+        assert_eq!(service_words("a\n\x1bx\nb"), "a x b");
+        assert_eq!(service_words("  a \n b  "), "  a   b  ");
+        assert_eq!(service_words("\x1b]0;title\x07"), "]0;title");
+        assert_eq!(service_words(""), "");
+    }
+
+    /// Ordinary text of a service is shown as it wrote it: three scripts, an emoji sequence with a
+    /// joiner and one with a variation selector, a mark that keeps a right-to-left word in place,
+    /// a zero-width space, and the punctuation of a sentence.
+    #[test]
+    fn ordinary_text_of_a_service_is_shown_as_it_was_written() {
+        for text in [
+            "Managed capacity for new mailboxes is not available now.",
+            "Нет свободной ёмкости; попробуйте позже.",
+            "新しい名前の容量は今は利用できません。",
+            "السعة غير متاحة الآن\u{200f} (مؤقتًا).",
+            "\u{1f469}\u{1f3fd}\u{200d}\u{1f4bb} and \u{2764}\u{fe0f}, a\u{200b}b, a\u{200c}b",
+            "A \"quoted\" path: it's here; 100% - [one] {two} <three> (four) & more...",
+        ] {
+            assert_eq!(service_words(text), text);
+            assert_eq!(service_item(text), text);
+        }
     }
 }
