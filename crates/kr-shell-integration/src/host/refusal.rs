@@ -82,10 +82,11 @@ pub enum Refusal {
     StatementsChanged,
     /// The `using` statements or `param` block are not what they were.
     PrologueChanged,
-    /// PowerShell did not say where the entry goes: it did not answer in time or could not start.
+    /// PowerShell did not say where the entry goes: it did not answer in time, could not start or
+    /// ended with an error.
     PlacementUnanswered,
-    /// PowerShell did not check the profile with the entry in it: it did not answer in time or could
-    /// not start.
+    /// PowerShell did not check the profile with the entry in it: it did not answer in time, could
+    /// not start or ended with an error.
     CheckUnanswered,
     /// PowerShell's answer about where the entry goes was not understood.
     PlacementNotUnderstood,
@@ -223,12 +224,12 @@ impl fmt::Display for Refusal {
                  `kr shell remove` again, and sign the profile again",
             ),
             Self::PlacementUnanswered => formatter.write_str(
-                "PowerShell did not say where the entry goes: it did not answer in time or could not \
-                 start, so nothing was written",
+                "PowerShell did not say where the entry goes: it did not answer in time, could not \
+                 start or ended with an error, so nothing was written",
             ),
             Self::CheckUnanswered => formatter.write_str(
-                "PowerShell did not check the profile with the entry in it: it did not answer in time \
-                 or could not start, so nothing was written",
+                "PowerShell did not check the profile with the entry in it: it did not answer in time, \
+                 could not start or ended with an error, so nothing was written",
             ),
             Self::PlacementNotUnderstood => formatter.write_str(
                 "PowerShell's answer about where the entry goes was not understood, so nothing was \

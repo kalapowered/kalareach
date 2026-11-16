@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::contract::qualification::ShellKind;
 use crate::host::package::ShellPackage;
+use crate::host::question::{Ending, HostFault, Question, conclude};
 use crate::host::refusal::Refusal;
 
 /// The line that opens a KalaReach entry.
@@ -176,8 +177,8 @@ impl HomeLayout {
     /// start or ended with an error, and [`Refusal::ProfilesNotUnderstood`] when it ended without an
     /// answer or said something other than two full paths: an answer too long, one that does not
     /// decode and a path that is not full are that. Both are refusals of this host
-    /// ([`Refusal::of`]). Where this host could not read the shell's answer file, the error is its
-    /// own failure to read a file, and [`unread_answer`] names the file.
+    /// ([`Refusal::of`]). Where this host could not prepare the question or read the shell's answer
+    /// file, the error is its own failure with a file, and [`host_fault`](crate::host::question::host_fault) names the file.
     pub fn try_targets(&self, kind: ShellKind) -> std::io::Result<Vec<StartupTarget>> {
         self.targets_within(kind, PLACEMENT_DEADLINE)
     }
@@ -280,7 +281,7 @@ impl HomeLayout {
         //
         // Bounded, and written to a file rather than a pipe: `kr shell status` runs this, and a
         // shell that will not start must not hold that command open.
-        let said = ask_with(
+        let ending = ask_with(
             shell,
             &[
                 "-NoProfile",
@@ -291,15 +292,9 @@ impl HomeLayout {
             ],
             &[],
             allowed,
-        )
-        .ok_or(Refusal::ProfilesUnanswered)?;
-        match said {
-            Said::Text(text) => profiles_of(&text)
-                .map(Some)
-                .ok_or_else(|| Refusal::ProfilesNotUnderstood.into()),
-            Said::Unreadable => Err(Refusal::ProfilesNotUnderstood.into()),
-            Said::Unread(error) => Err(error),
-        }
+            profiles_of,
+        );
+        conclude(Question::Profiles, ending).map(Some)
     }
 
     /// Returns the login file Bash reads for this user, which is the first of three that exists.
@@ -420,46 +415,13 @@ const ASK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 /// there ends the install, and a start under load takes longer than the short time.
 const PLACEMENT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// What a program said when it was asked a question and ended with code 0 in time.
-enum Said {
-    /// Its answer, which is text.
-    Text(String),
-    /// An answer that is not read: longer than [`ANSWER_LIMIT`], or not text.
-    Unreadable,
-    /// This host could not read its own answer file: the error names the file ([`unread_answer`]).
-    Unread(std::io::Error),
-}
-
-/// The answer file of a question that this host could not read, and why.
-#[derive(Debug)]
-struct AnswerUnread {
-    file: PathBuf,
-    error: std::io::Error,
-}
-
-impl std::fmt::Display for AnswerUnread {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}: {}", self.file.display(), self.error)
-    }
-}
-
-impl std::error::Error for AnswerUnread {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.error)
-    }
-}
-
-/// Returns the file and the system's error where `error` is this host's own failure to read the
-/// answer file of a question it asked a shell, which is not the shell's refusal or failure to answer.
-#[must_use]
-pub fn unread_answer(error: &std::io::Error) -> Option<(&Path, &std::io::Error)> {
-    let unread = error.get_ref()?.downcast_ref::<AnswerUnread>()?;
-    Some((&unread.file, &unread.error))
-}
-
-/// Asks one program a question about some text and returns what it printed, or nothing when it did
-/// not end with code 0 in time: it could not start, it ended with another code or by a signal, or
-/// it outlasted `allowed`.
+/// Asks one program a question about some text and says how the question ended ([`Ending`]).
+///
+/// The program is asked in a call of its own: a folder, created here, that holds the answer, the
+/// inputs and the folders the program runs in, and that is gone when the question ends. A program
+/// that ended with code 0 in time has said what is in its answer file, and `understand` reads it:
+/// it returns what the question takes from it, or nothing for text that is not in the form the
+/// question asked for.
 ///
 /// The answer goes to a file rather than a pipe, so nothing has to read while the program runs and
 /// a descendant that inherited the handle holds nothing of this host's open. The wait is bounded,
@@ -469,12 +431,13 @@ pub fn unread_answer(error: &std::io::Error) -> Option<(&Path, &std::io::Error)>
 /// Each of `inputs` is a variable name and the text it stands for. The text is written to a file in
 /// the call's private directory and the variable holds the file's path, so the program reads the
 /// text exactly as it is, whatever it contains, and nothing has to be quoted into its arguments.
-fn ask_with(
+fn ask_with<T>(
     program: &PowerShell,
     arguments: &[&str],
     inputs: &[(&str, &str)],
     allowed: std::time::Duration,
-) -> Option<Said> {
+    understand: impl FnOnce(&str) -> Option<T>,
+) -> Ending<T> {
     // A directory of this call's own, created rather than opened and owner-only where the platform
     // has modes. `/tmp` is shared: a name another account can guess is a name it can pre-create,
     // and a file opened through it is a file this host writes on somebody else's behalf.
@@ -489,7 +452,14 @@ fn ask_with(
     };
     #[cfg(not(unix))]
     let builder = std::fs::DirBuilder::new();
-    builder.create(&directory).ok()?;
+    if let Err(error) = builder.create(&directory) {
+        return Ending::NotPrepared(HostFault::new(directory, error));
+    }
+    // The call's folder goes with whatever did not get made in it.
+    let unprepared = |file: PathBuf, error: std::io::Error| {
+        let _ = std::fs::remove_dir_all(&directory);
+        Ending::NotPrepared(HostFault::new(file, error))
+    };
     let said = directory.join("said");
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -499,16 +469,15 @@ fn ask_with(
 
         options.mode(0o600);
     }
-    let Ok(to) = options.open(&said) else {
-        let _ = std::fs::remove_dir_all(&directory);
-        return None;
+    let to = match options.open(&said) {
+        Ok(to) => to,
+        Err(error) => return unprepared(said, error),
     };
     let mut variables = Vec::new();
     for (name, text) in inputs {
         let file = directory.join(name);
-        if std::fs::write(&file, text).is_err() {
-            let _ = std::fs::remove_dir_all(&directory);
-            return None;
+        if let Err(error) = std::fs::write(&file, text) {
+            return unprepared(file, error);
         }
         variables.push((*name, file));
     }
@@ -552,30 +521,21 @@ fn ask_with(
             ("XDG_RUNTIME_DIR", "runtime"),
         ] {
             let own = directory.join(name);
-            if builder.create(&own).is_err() {
-                let _ = std::fs::remove_dir_all(&directory);
-                return None;
+            if let Err(error) = builder.create(&own) {
+                return unprepared(own, error);
             }
             command.env(variable, own);
         }
         command.env("POWERSHELL_TELEMETRY_OPTOUT", "1");
     }
-    let started = command.spawn();
-    let mut child = match started {
-        Ok(child) => child,
-        Err(_) => {
-            let _ = std::fs::remove_dir_all(&directory);
-            return None;
-        }
+    let Ok(mut child) = command.spawn() else {
+        let _ = std::fs::remove_dir_all(&directory);
+        return Ending::NotStarted;
     };
     let deadline = std::time::Instant::now() + allowed;
-    let mut ended = false;
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                ended = true;
-                break Some(status);
-            }
+            Ok(Some(status)) => break Some(status),
             Ok(None) => {}
             Err(_) => break None,
         }
@@ -584,46 +544,48 @@ fn ask_with(
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     };
-    if !ended {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    // A program that did not finish answered nothing, so nothing is read: a descendant can still
-    // be writing, and half an answer is worse than none. A successful one is read up to a bound.
-    let answer = status
-        .filter(std::process::ExitStatus::success)
-        .map(|_| read_answer(&said));
+    let ending = match status {
+        // A program that did not finish answered nothing, so nothing is read: a descendant can
+        // still be writing, and half an answer is worse than none. One that is ended here, because
+        // it outlasted its time or because this host could not wait for it, is reaped.
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Ending::TimedOut
+        }
+        // A successful one is read up to a bound.
+        Some(status) if status.success() => read_answer(&said, understand),
+        Some(status) if status.code().is_some() => Ending::Failed,
+        Some(_) => Ending::Signalled,
+    };
     let _ = std::fs::remove_dir_all(&directory);
-    answer
+    ending
 }
 
 /// The most one answer this host reads from a shell it asked a question of. A longer one is not
 /// read at all: cut at the limit, it could show a start that the rest of it would deny.
 const ANSWER_LIMIT: u64 = 64 * 1024;
 
-/// Reads what a shell answered: its text, or that the answer is not read ([`Said::Unreadable`]),
-/// or the error of this host's failure to read its own answer file ([`Said::Unread`]).
-fn read_answer(path: &Path) -> Said {
+/// Reads what a shell answered, and says how the question ended: the answer as `understand` takes
+/// it, an answer that is too long or not text or not in the form asked for, or this host's failure
+/// to read its own answer file.
+fn read_answer<T>(path: &Path, understand: impl FnOnce(&str) -> Option<T>) -> Ending<T> {
     use std::io::Read as _;
 
     let mut bytes = Vec::new();
     let read = std::fs::File::open(path)
         .and_then(|file| file.take(ANSWER_LIMIT + 1).read_to_end(&mut bytes));
     if let Err(error) = read {
-        return Said::Unread(std::io::Error::new(
-            error.kind(),
-            AnswerUnread {
-                file: path.to_owned(),
-                error,
-            },
-        ));
+        return Ending::Unread(HostFault::new(path.to_owned(), error));
     }
     match u64::try_from(bytes.len()) {
-        Ok(held) if held <= ANSWER_LIMIT => {
-            String::from_utf8(bytes).map_or(Said::Unreadable, Said::Text)
-        }
-        _ => Said::Unreadable,
+        Ok(held) if held <= ANSWER_LIMIT => {}
+        _ => return Ending::TooLong,
     }
+    let Ok(text) = String::from_utf8(bytes) else {
+        return Ending::NotText;
+    };
+    understand(&text).map_or(Ending::WrongForm, Ending::Used)
 }
 
 /// Returns the PowerShell this host would launch, when one is on the path.
@@ -1167,7 +1129,16 @@ const VERIFY_SCRIPT: &str = concat!(
 
 /// Returns the byte offset in `text` at which PowerShell says an entry goes.
 fn prologue_end(shell: &PowerShell, text: &str) -> std::io::Result<usize> {
-    let said = ask_with(
+    prologue_end_within(shell, text, PLACEMENT_DEADLINE)
+}
+
+/// [`prologue_end`], with the time PowerShell is given to say.
+fn prologue_end_within(
+    shell: &PowerShell,
+    text: &str,
+    allowed: std::time::Duration,
+) -> std::io::Result<usize> {
+    let ending = ask_with(
         shell,
         &[
             "-NoProfile",
@@ -1177,24 +1148,11 @@ fn prologue_end(shell: &PowerShell, text: &str) -> std::io::Result<usize> {
             PLACE_SCRIPT,
         ],
         &[("KR_PROFILE_TEXT", text)],
-        PLACEMENT_DEADLINE,
-    )
-    .ok_or(Refusal::PlacementUnanswered)?;
-    let said = match said {
-        Said::Text(said) => said,
-        Said::Unreadable => return Err(Refusal::PlacementNotUnderstood.into()),
-        Said::Unread(error) => return Err(error),
-    };
-    let said = said.trim();
-    if let Some(code) = said.strip_prefix("kr-refused ") {
-        return Err(Refusal::from_script(code)
-            .unwrap_or(Refusal::PlacementNotUnderstood)
-            .into());
-    }
-    let utf16 = said
-        .strip_prefix("kr-placed ")
-        .and_then(|offset| offset.parse::<usize>().ok())
-        .ok_or(Refusal::PlacementNotUnderstood)?;
+        allowed,
+        placement_said,
+    );
+    // A script's own refusal is an answer that was used: it says why the entry cannot go here.
+    let utf16 = conclude(Question::Placement, ending)??;
     // PowerShell counts UTF-16 code units. A count that falls inside a character is not one.
     let mut units = 0;
     for (index, character) in text.char_indices() {
@@ -1212,11 +1170,31 @@ fn prologue_end(shell: &PowerShell, text: &str) -> std::io::Result<usize> {
     Err(Refusal::PlacementOutsideTheProfile.into())
 }
 
+/// Returns what PowerShell said about where an entry goes: the offset it counts in UTF-16 code
+/// units, or the refusal its script reports. Nothing is returned for any other text.
+fn placement_said(said: &str) -> Option<Result<usize, Refusal>> {
+    let said = said.trim();
+    if let Some(code) = said.strip_prefix("kr-refused ") {
+        return Refusal::from_script(code).map(Err);
+    }
+    said.strip_prefix("kr-placed ")?.parse().ok().map(Ok)
+}
+
 /// Returns why an entry would not sit in a profile as whole statements, or nothing when it would.
 ///
 /// The reason is one of this host's own ([`Refusal`]): the scripts say a short code of their own and
 /// never a sentence, and a code this host does not know is a check that was not understood.
 fn entry_refused(old: &str, new: &str, placement: &Placement) -> std::io::Result<Option<Refusal>> {
+    entry_refused_within(old, new, placement, PLACEMENT_DEADLINE)
+}
+
+/// [`entry_refused`], with the time PowerShell is given to check.
+fn entry_refused_within(
+    old: &str,
+    new: &str,
+    placement: &Placement,
+    allowed: std::time::Duration,
+) -> std::io::Result<Option<Refusal>> {
     let Some(shell) = placement.shell() else {
         return Ok(None);
     };
@@ -1228,7 +1206,7 @@ fn entry_refused(old: &str, new: &str, placement: &Placement) -> std::io::Result
         Placement::AfterPrologue { .. } => "first",
         _ => "last",
     };
-    let said = ask_with(
+    let ending = ask_with(
         shell,
         &[
             "-NoProfile",
@@ -1250,22 +1228,23 @@ fn entry_refused(old: &str, new: &str, placement: &Placement) -> std::io::Result
             ("KR_END", markers.1),
             ("KR_ORDER", order),
         ],
-        PLACEMENT_DEADLINE,
-    )
-    .ok_or(Refusal::CheckUnanswered)?;
-    let said = match said {
-        Said::Text(said) => said,
-        Said::Unreadable => return Err(Refusal::CheckNotUnderstood.into()),
-        Said::Unread(error) => return Err(error),
-    };
+        allowed,
+        check_said,
+    );
+    conclude(Question::Check, ending)
+}
+
+/// Returns what PowerShell said about the profile with the entry in it: `Some(None)` where the entry
+/// sits as it should, the refusal its script reports otherwise. Nothing is returned for any other
+/// text.
+fn check_said(said: &str) -> Option<Option<Refusal>> {
     let said = said.trim();
     if said == "kr-verified" {
-        return Ok(None);
+        return Some(None);
     }
     said.strip_prefix("kr-refused ")
         .and_then(Refusal::from_script)
         .map(Some)
-        .ok_or_else(|| Refusal::CheckNotUnderstood.into())
 }
 
 /// Returns what removing the entries from a file with this text leaves, or `None` when it holds
@@ -2217,6 +2196,8 @@ fn read_or_empty(path: &Path) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::host::question::host_fault;
 
     /// Holds `record` as a program outside a store does, which holds nothing else.
     fn hold_the_record(record: &EntryRecord) -> Result<HeldRecord<'_>, RecordError> {
@@ -3008,7 +2989,9 @@ mod tests {
                 .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
                 .collect(),
         };
-        let Some(Said::Text(said)) = ask_with(&shell, &[], &[], ASK_DEADLINE) else {
+        let Ending::Used(said) =
+            ask_with(&shell, &[], &[], ASK_DEADLINE, |said| Some(said.to_owned()))
+        else {
             panic!("the program answers");
         };
         let mut lines = said.lines();
@@ -5311,8 +5294,7 @@ mod tests {
             .try_targets(ShellKind::PowerShell)
             .expect_err("the answer is not read");
         assert_eq!(Refusal::of(&failed), None, "{failed}");
-        let (file, source) =
-            unread_answer(&failed).expect("this host's own failure, with its file");
+        let (file, source) = host_fault(&failed).expect("this host's own failure, with its file");
         assert!(file.ends_with("said"), "{file:?}");
         assert_eq!(source.kind(), std::io::ErrorKind::NotFound, "{source}");
         assert!(
@@ -5468,6 +5450,133 @@ mod tests {
         );
     }
 
+    /// What an error of a question is, for comparing two of them: the refusal, or the file's name and
+    /// the kind of this host's own failure.
+    #[cfg(unix)]
+    fn the_shape_of(error: &std::io::Error) -> String {
+        if let Some(refusal) = Refusal::of(error) {
+            return format!("{refusal:?}");
+        }
+        if let Some((file, source)) = host_fault(error) {
+            return format!("fault in {:?}: {:?}", file.file_name(), source.kind());
+        }
+        format!("another failure: {error}")
+    }
+
+    /// Each question that a stand-in makes end in each of the ways that it can make, with a short
+    /// time to answer, ends in what [`conclude`] gives for that way at that question: the same
+    /// refusal, or this host's failure of the same file and kind. The ways that this case does not
+    /// make are named: a call that cannot be prepared needs a temporary folder that is not one, which
+    /// only a process of its own has, and the install's own table walks it; a wait that fails on a
+    /// child that this host started has no stand-in.
+    #[cfg(unix)]
+    #[test]
+    fn each_way_a_question_ends_in_is_what_conclude_says_at_each_question() {
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().expect("a directory");
+        let encode = |path: &str| {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(path)
+        };
+        let right = format!(
+            "case \"$5\" in\n*kr-verified*) printf kr-verified ;;\n*kr-placed*) printf 'kr-placed 0' ;;\n\
+             *) printf '%s\\n%s\\n' '{}' '{}' ;;\nesac",
+            encode("/a/one.ps1"),
+            encode("/a/two.ps1")
+        );
+        let ending_of = |way: &str| -> Ending<()> {
+            match way {
+                "used" => Ending::Used(()),
+                "too_long" => Ending::TooLong,
+                "not_text" => Ending::NotText,
+                "wrong_form" => Ending::WrongForm,
+                "timed_out" => Ending::TimedOut,
+                "not_started" => Ending::NotStarted,
+                "failed" => Ending::Failed,
+                "signalled" => Ending::Signalled,
+                "unread" => Ending::Unread(HostFault::new(
+                    PathBuf::from("said"),
+                    std::io::Error::from(std::io::ErrorKind::NotFound),
+                )),
+                other => panic!("no way is called {other}"),
+            }
+        };
+        let ways: [(&str, &str); 9] = [
+            ("used", right.as_str()),
+            ("too_long", "head -c 70000 /dev/zero | tr '\\0' a"),
+            ("not_text", "printf '\\377\\376'"),
+            ("wrong_form", "printf ''"),
+            ("timed_out", "sleep 30"),
+            ("not_started", ""),
+            ("failed", "exit 1"),
+            ("signalled", "kill -9 $$"),
+            ("unread", "rm -f \"$(dirname \"$XDG_CACHE_HOME\")/said\""),
+        ];
+        let short = Duration::from_millis(400);
+        for (way, body) in ways {
+            let shell = if way == "not_started" {
+                PowerShell::plain(root.path().join("not-there"))
+            } else {
+                program_that(root.path(), &format!("pwsh-{way}"), body)
+            };
+            let asking = HomeLayout {
+                powershell: Some(shell.clone()),
+                ..layout(root.path())
+            };
+            let at_last = Placement::Last {
+                shell: shell.clone(),
+            };
+            let got = [
+                (
+                    Question::Profiles,
+                    asking.powershell_profiles(short).map(|_| ()),
+                ),
+                (
+                    Question::Placement,
+                    prologue_end_within(&shell, "$x = 1\n", short).map(|_| ()),
+                ),
+                (
+                    Question::Check,
+                    entry_refused_within("$x = 1\n", "$x = 1\n", &at_last, short).map(|_| ()),
+                ),
+            ];
+            for (question, got) in got {
+                let said = conclude(question, ending_of(way));
+                assert_eq!(
+                    got.map_err(|error| the_shape_of(&error)),
+                    said.map_err(|error| the_shape_of(&error)),
+                    "{question:?} {way}"
+                );
+            }
+        }
+    }
+
+    /// The placement and the check wait for PowerShell longer than a report does: a stand-in that
+    /// answers after seven seconds is read by both, which are asked at the same time.
+    #[cfg(unix)]
+    #[test]
+    fn the_placement_and_the_check_wait_longer_than_a_report_does() {
+        let root = tempfile::tempdir().expect("a directory");
+        let placing = program_that(
+            root.path(),
+            "pwsh-slow-place",
+            "sleep 7; printf 'kr-placed 0'",
+        );
+        let checking = program_that(
+            root.path(),
+            "pwsh-slow-check",
+            "sleep 7; printf kr-verified",
+        );
+        let at_last = Placement::Last { shell: checking };
+        std::thread::scope(|scope| {
+            let placed = scope.spawn(|| prologue_end(&placing, "$x = 1\n"));
+            let checked = scope.spawn(|| entry_refused("$x = 1\n", "$x = 1\n", &at_last));
+            assert_eq!(placed.join().expect("ends").expect("waits"), 0);
+            assert_eq!(checked.join().expect("ends").expect("waits"), None);
+        });
+    }
+
     /// The call's folder is gone after a question that failed, whatever the way: a code other than
     /// 0, a signal and a time-out, and a program that outlasts its time is killed and the question
     /// does not wait for it. The program says where its cache folder is, which is inside it.
@@ -5490,9 +5599,15 @@ mod tests {
                 ),
             );
             let began = std::time::Instant::now();
-            let said = ask_with(&shell, &[], &[], std::time::Duration::from_millis(400));
+            let said = ask_with(
+                &shell,
+                &[],
+                &[],
+                std::time::Duration::from_millis(400),
+                |said| Some(said.to_owned()),
+            );
             assert!(
-                said.is_none(),
+                !matches!(said, Ending::Used(_)),
                 "{name}: a question that failed said something"
             );
             // A program that outlasts its time is killed, so the question ends with the time

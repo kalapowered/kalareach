@@ -18,6 +18,7 @@ use kr_shell_integration::contract::qualification::ShellKind;
 use kr_shell_integration::host::package::{
     PACKAGE_ROOT_VARIABLE, PackageSet, ShellPackage, default_package_root,
 };
+use kr_shell_integration::host::question::host_fault;
 use kr_shell_integration::host::refusal::Refusal;
 use kr_shell_integration::host::startup::{
     self, Change, ENTRY_WRITTEN, EntryRecord, HomeLayout, RecordError, StartupTarget,
@@ -301,7 +302,7 @@ pub fn install(
 ) -> Result<ShellReport> {
     let targets = layout
         .try_targets(package.kind())
-        .map_err(|error| profiles_failure(&error))?;
+        .map_err(|error| startup_failure(None, &error))?;
     install_targets(package, &targets, record, paths, nsh_bypass, dry_run)
 }
 
@@ -361,7 +362,7 @@ fn install_targets(
     // with its own body and placement by position and never by the file: one file can take two
     // entries.
     for ((entry, target), body) in reported.entries.iter_mut().zip(targets).zip(&bodies) {
-        let io_failure = |error: std::io::Error| startup_failure(&entry.file, &error);
+        let io_failure = |error: std::io::Error| startup_failure(Some(&entry.file), &error);
         let change = if dry_run {
             startup::plan(&entry.file, body, &target.placement).map_err(io_failure)?
         } else {
@@ -463,10 +464,10 @@ pub fn remove(
             .map_or(RECORDED, |target| target.reason);
         let change = match &held {
             None => startup::plan_removal(&file, kind)
-                .map_err(|error| startup_failure(&file, &error))?,
+                .map_err(|error| startup_failure(Some(&file), &error))?,
             Some(held) => {
                 let change = startup::remove(&file, record, kind)
-                    .map_err(|error| startup_failure(&file, &error))?;
+                    .map_err(|error| startup_failure(Some(&file), &error))?;
                 held.forget(kind, &file)
                     .map_err(|error| record_failure(record, &error))?;
                 change
@@ -501,31 +502,31 @@ pub fn remove(
     })
 }
 
-/// What a failure of the question about PowerShell's profiles says. A refusal is said alone, in the
-/// host's own words: it names no file, and says that nothing was written for PowerShell. A failure
-/// of this host to read the file that holds the answer is said as any failure of a file of this
-/// host's is: the file, and the system's error.
-fn profiles_failure(error: &std::io::Error) -> CliError {
-    match (Refusal::of(error), startup::unread_answer(error)) {
-        (Some(refusal), _) => CliError::Other(crate::shown::startup_refusal(refusal)),
-        (None, Some((file, source))) => startup_failure(file, source),
-        (None, None) => CliError::Other(Shown::io(error)),
-    }
-}
-
-/// What a failure to write into, or take out of, a startup file says: the file, and then why.
+/// What a failure to write into, or take out of, a startup file, or of a question asked of
+/// PowerShell about one, says.
 ///
 /// A refusal of the shell integration is said in its own words, which name what stopped the change
-/// and that the file is as it was. Any other failure is an ordinary one of the file system or of
-/// the process, and is said by its kind and its operating system code, as every such failure is.
-fn startup_failure(file: &std::path::Path, error: &std::io::Error) -> CliError {
-    match Refusal::of(error) {
-        Some(refusal) => CliError::Other(shown!(
+/// and that the file is as it was; behind the startup file it concerns, or alone where no file is
+/// known yet, as when PowerShell is asked where its profiles are. This host's own failure in a
+/// folder or file of the call that asked a question is said as any failure of a file of this host's
+/// is: the file and the system's error, and no startup file in front of it, because the startup
+/// file is not what failed. Any other failure is an ordinary one of the file system or of the
+/// process, and is said by its kind and its operating system code, as every such failure is.
+fn startup_failure(file: Option<&std::path::Path>, error: &std::io::Error) -> CliError {
+    if let Some((failed, source)) = host_fault(error) {
+        return CliError::Other(shown!("{}: {}", Shown::root(failed), Shown::io(source)));
+    }
+    match (Refusal::of(error), file) {
+        (Some(refusal), Some(file)) => CliError::Other(shown!(
             "{}: {}",
             Shown::root(file),
             crate::shown::startup_refusal(refusal)
         )),
-        None => CliError::Other(shown!("{}: {}", Shown::root(file), Shown::io(error))),
+        (Some(refusal), None) => CliError::Other(crate::shown::startup_refusal(refusal)),
+        (None, Some(file)) => {
+            CliError::Other(shown!("{}: {}", Shown::root(file), Shown::io(error)))
+        }
+        (None, None) => CliError::Other(Shown::io(error)),
     }
 }
 
@@ -1123,7 +1124,7 @@ mod tests {
         };
         assert_eq!(classes.iter().map(counted).sum::<usize>(), 23);
         for refusal in classes {
-            let said = startup_failure(file, &refusal.clone().into()).to_string();
+            let said = startup_failure(Some(file), &refusal.clone().into()).to_string();
             assert!(
                 said.starts_with(&format!("{spelled}: ")) && said.ends_with(&refusal.to_string()),
                 "{refusal:?} is said as {said:?}"
@@ -1132,7 +1133,7 @@ mod tests {
         }
         assert!(
             startup_failure(
-                file,
+                Some(file),
                 &Refusal::WouldReport(errors(&["MissingEndCurlyBrace", "UnexpectedToken"])).into()
             )
             .to_string()
@@ -1143,10 +1144,11 @@ mod tests {
         // The control: anything else is said as it always was, by its kind and its code, and a
         // sentence some other library put in one is not repeated.
         let marker = "kr-marker-4f2a-from-another-library";
-        let other = startup_failure(file, &std::io::Error::other(marker)).to_string();
+        let other = startup_failure(Some(file), &std::io::Error::other(marker)).to_string();
         assert_eq!(other, format!("{spelled}: other error"));
         assert!(!other.contains(marker));
-        let missing = startup_failure(file, &std::io::Error::from_raw_os_error(2)).to_string();
+        let missing =
+            startup_failure(Some(file), &std::io::Error::from_raw_os_error(2)).to_string();
         assert!(missing.contains("(os error 2)"), "{missing}");
     }
 
