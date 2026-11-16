@@ -174,15 +174,16 @@ pub const LATER_CONNECTION_HOLDS_AUTHORITY: &str =
 /// bound is the attachment limit with room to reconnect rather than the attachment limit exactly.
 pub const MAX_CONNECTIONS: usize = kr_protocol::limits::MAX_CONCURRENT_ATTACHMENTS * 2;
 
-/// How long a presentation that finds the dispatch boundary held waits before it tries again the
-/// first time. Each wait after it is twice the one before, up to [`PRESENTATION_RETRY_CAP`].
+/// How long a presentation that finds the dispatch boundary held waits, with no release to wake
+/// it, before it asks whether its peer has gone and tries again the first time. Each wait after it
+/// is twice the one before, up to [`PRESENTATION_RETRY_CAP`].
 const PRESENTATION_FIRST_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
 
-/// The longest a presentation waits between two tries for the dispatch boundary.
+/// The longest a presentation waits, with no release to wake it, between two tries for the
+/// dispatch boundary.
 ///
-/// It is also the longest, once the boundary is free, that a presentation whose peer is there can
-/// wait beyond a blocking wait, and the longest after its peer has gone that it keeps its
-/// connection, when the boundary is held throughout.
+/// It is the longest, after its peer has gone, that a presentation keeps its connection when the
+/// boundary is held throughout, apart from the time the system takes to run its task.
 const PRESENTATION_RETRY_CAP: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// The largest replay page one notification carries.
@@ -397,7 +398,7 @@ pub struct WorkerService {
     /// authority check, the admission, the revalidation, the dispatch marker and the effect — is
     /// what makes the check mean something by the time the effect happens. Authority changes take
     /// it too, so one cannot slip between the two halves of the other.
-    dispatch: Mutex<()>,
+    dispatch: DispatchBoundary,
     /// The number the next controller connection's hello is answered with.
     ///
     /// Only the order of two numbers is read, so it starts anywhere and is never reused. A
@@ -631,6 +632,84 @@ pub struct WorkerService {
     /// tests arm. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     evidence_forgotten: Mutex<std::collections::BTreeSet<u64>>,
+}
+
+/// The dispatch boundary: a lock that says so when it is let go.
+///
+/// Every holder takes it as an ordinary lock and drops its guard as one. Letting go wakes the
+/// presentations that wait for it, so that each tries at once and none waits out its pause while
+/// the boundary stands free between two mutations.
+#[derive(Debug)]
+struct DispatchBoundary {
+    lock: Mutex<()>,
+    released: tokio::sync::Notify,
+}
+
+impl DispatchBoundary {
+    fn new() -> Self {
+        Self {
+            lock: Mutex::new(()),
+            released: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Takes the boundary, waiting for whoever holds it.
+    fn lock(&self) -> std::sync::LockResult<DispatchGuard<'_>> {
+        self.lock
+            .lock()
+            .map(|guard| DispatchGuard::new(guard, &self.released))
+            .map_err(|poisoned| {
+                std::sync::PoisonError::new(DispatchGuard::new(
+                    poisoned.into_inner(),
+                    &self.released,
+                ))
+            })
+    }
+
+    /// Takes the boundary if nobody holds it, and never waits.
+    fn try_lock(&self) -> std::sync::TryLockResult<DispatchGuard<'_>> {
+        self.lock
+            .try_lock()
+            .map(|guard| DispatchGuard::new(guard, &self.released))
+            .map_err(|refused| match refused {
+                std::sync::TryLockError::Poisoned(poisoned) => {
+                    std::sync::TryLockError::Poisoned(std::sync::PoisonError::new(
+                        DispatchGuard::new(poisoned.into_inner(), &self.released),
+                    ))
+                }
+                std::sync::TryLockError::WouldBlock => std::sync::TryLockError::WouldBlock,
+            })
+    }
+
+    /// Completes when the boundary is next let go. It is created before a try, so a release that
+    /// comes between the try and the wait is not missed.
+    fn released(&self) -> tokio::sync::futures::Notified<'_> {
+        self.released.notified()
+    }
+}
+
+/// The dispatch boundary, held. Letting go of it wakes the presentations waiting for it.
+#[derive(Debug)]
+pub struct DispatchGuard<'a> {
+    guard: Option<std::sync::MutexGuard<'a, ()>>,
+    released: &'a tokio::sync::Notify,
+}
+
+impl<'a> DispatchGuard<'a> {
+    const fn new(guard: std::sync::MutexGuard<'a, ()>, released: &'a tokio::sync::Notify) -> Self {
+        Self {
+            guard: Some(guard),
+            released,
+        }
+    }
+}
+
+impl Drop for DispatchGuard<'_> {
+    fn drop(&mut self) {
+        // The lock goes first, so that a woken presentation finds it free.
+        drop(self.guard.take());
+        self.released.notify_waiters();
+    }
 }
 
 /// What one try of a presentation came to.
@@ -963,7 +1042,7 @@ impl WorkerService {
                 acknowledged: None,
             }),
             connection_order: std::sync::atomic::AtomicU64::new(0),
-            dispatch: Mutex::new(()),
+            dispatch: DispatchBoundary::new(),
             expired: expired.0,
             expired_receiver: Mutex::new(Some(expired.1)),
             connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1500,7 +1579,7 @@ impl WorkerService {
     ///
     /// The guard is taken on the calling thread and has to be dropped on it.
     #[cfg(feature = "testing")]
-    pub fn hold_the_dispatch_boundary(&self) -> std::sync::MutexGuard<'_, ()> {
+    pub fn hold_the_dispatch_boundary(&self) -> DispatchGuard<'_> {
         self.dispatch
             .lock()
             .expect("the dispatch barrier is not poisoned")
@@ -1979,7 +2058,7 @@ impl WorkerService {
     /// Takes the boundary for the announcement that is to find it held, where one is armed.
     /// Compiled away in every shipped build.
     #[cfg(feature = "testing")]
-    fn hold_the_boundary_for_this_announcement(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+    fn hold_the_boundary_for_this_announcement(&self) -> Option<DispatchGuard<'_>> {
         if self
             .refusing_announcements
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -4496,12 +4575,15 @@ impl WorkerService {
     /// waits for the boundary, so no request is ever fenced half way through. The wait is made of
     /// tries and not of a lock that blocks: a presentation that finds the boundary held asks the
     /// operating system whether its peer has gone, and tries again after a pause that starts at
-    /// five milliseconds and doubles to a quarter of a second. A peer that has gone ends the
+    /// five milliseconds and doubles to a quarter of a second, and that each release of the
+    /// boundary cuts short. A release wakes every presentation that waits, which then tries at once:
+    /// a stream of mutations that take the boundary again as soon as they let go of it cannot keep
+    /// a presentation out for as long as a pause. A peer that has gone ends the
     /// presentation there. No acceptance runs for it, and its connection is read to its end at once
     /// and its place in the worker's count of connections is given back, where a blocking wait
     /// would keep both, and a thread, until the hold ended. A peer that is there waits for the whole
-    /// hold, however long, and takes the boundary at its first try after the holder lets go, which
-    /// is at most one pause after the release. The try, the question to the system and the
+    /// hold, however long, and tries for the boundary as soon as the holder lets go. The try, the
+    /// question to the system and the
     /// acceptance are one step that returns no guard, so nothing is held across a pause. Once the
     /// boundary is taken, the question is asked once more before anything is changed.
     ///
@@ -4543,13 +4625,20 @@ impl WorkerService {
         let waiting = PresentationWaiting::begin(&self.presentations_waiting);
         let mut pause = PRESENTATION_FIRST_RETRY;
         let decided = loop {
+            // Created before the try, so that a release between the try and the wait wakes it.
+            let released = self.dispatch.released();
+            tokio::pin!(released);
             match self.present_once(state, &nonce, token) {
                 Presentation::Decided(answer) => break Some(answer),
                 Presentation::PeerGone => break None,
                 Presentation::Held => {}
             }
-            tokio::time::sleep(pause).await;
-            pause = (pause * 2).min(PRESENTATION_RETRY_CAP);
+            tokio::select! {
+                () = &mut released => {}
+                () = tokio::time::sleep(pause) => {
+                    pause = (pause * 2).min(PRESENTATION_RETRY_CAP);
+                }
+            }
         };
         #[cfg(feature = "testing")]
         drop(waiting);
