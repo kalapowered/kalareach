@@ -87,6 +87,9 @@ const MARGIN: Duration = Duration::from_secs(2);
 const READ_BOUND: Duration = TAKE_BOUND.saturating_add(MARGIN);
 /// How long a case waits for a session that was asked to stop to record its closure.
 const CLOSURE_WAIT: Duration = Duration::from_secs(20);
+/// How long a case waits for a question that was asked to run out of time on the loop's own timer,
+/// which is fifteen seconds.
+const QUESTION_WAIT: Duration = Duration::from_secs(30);
 
 fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
@@ -1198,6 +1201,9 @@ async fn a_fact_the_producer_takes_during_the_hold_is_in_the_read_of_the_held_se
     let host = host().await;
     let producer = Producer::new(Arc::downgrade(&host.runtime));
     producer.observe_holder(Holder::Program(Some("an editor".to_owned())));
+    // The publication that names the program has been made, so that none that follows it changes
+    // what the session published, whichever the order of the two facts.
+    producer.settle();
     producer.observe_broker(false, true);
     producer.observe_broker(false, false);
     producer.settle();
@@ -1272,7 +1278,7 @@ async fn a_read_of_a_held_session_says_the_new_turn_when_a_turn_ended_and_a_new_
 
 /// A turn that the daemon's last scan saw ends before a storage call holds the session, and the
 /// host's evidence loop reads the end. The read of the held session says what the application is
-/// doing now, and not the turn that the summary the session published last still carries.
+/// doing now.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_read_of_a_held_session_says_that_the_turn_ended_before_the_hold() {
     let host = host().await;
@@ -1379,6 +1385,17 @@ async fn a_read_of_a_held_session_says_the_turn_while_a_question_commit_stands_i
     let mut reader = host.client().await;
     let (held, hold) = host.runtime.hold_the_session();
     reached(held, "the session's hold").await;
+    // What the case stands on: the stalled commit holds the ledger's lock, so a read of the
+    // ledger on a thread of the case's own does not return while the commit stands.
+    let probe = {
+        let service = Arc::clone(&host.service);
+        std::thread::spawn(move || {
+            let _ = service.questions().any_open(kr_worker::questions::Now {
+                utc_ms: kr_ipc::now_ms(),
+                boot_ms: kr_ipc::clock::boot_elapsed_ms(),
+            });
+        })
+    };
     agent.says(TURN_7_STARTED).await;
     let began = held_application_state_becomes(
         &mut reader,
@@ -1405,9 +1422,14 @@ async fn a_read_of_a_held_session_says_the_turn_while_a_question_commit_stands_i
         "held read after the next turn began while the ledger's commit stands",
     )
     .await;
+    assert!(
+        !probe.is_finished(),
+        "a read of the ledger returned while the commit stood: the ledger's lock was not held"
+    );
     let _ = let_go.send(());
     let _ = hold.send(());
     asking.join().expect("the question's thread ended");
+    probe.join().expect("the probe's thread ended");
     assert_eq!(
         (began, ended, again),
         (
@@ -1472,78 +1494,43 @@ fn ask_a_question_expiring(
         .expect("a verified source creates a question");
 }
 
-/// Facts that join while the publisher waits for the session are published once the session is
-/// let go, and what reaches the session is the latest the facts say: the name that joined while the
-/// publisher already waited, not the one that woke it.
+/// Facts that join while the publisher is on its way to the session are published as the latest
+/// the facts say: the first publication after the publisher is let go names the program that
+/// joined last, and not the one that woke it. The publisher is confirmed at its pause before the
+/// session is taken, which is where it reads nothing yet, so the case does not wait on a clock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_publication_that_waited_for_the_held_session_is_the_latest_the_facts_say() {
+async fn a_publication_that_waited_for_the_session_is_the_latest_the_facts_say() {
     let host = host().await;
     let producer = Producer::new(Arc::downgrade(&host.runtime));
-    let standing = stall(&host, Stalled::Prune, host.client().await).await;
+    let mut published = producer.subscribe();
+    let (arrived, let_go) = producer.pause_before_the_take();
     producer.observe_holder(Holder::Program(Some("first".to_owned())));
-    // The publisher has been told and waits for the session; the second fact joins after that.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::timeout(REACH, arrived)
+        .await
+        .expect("the publisher arrived at its pause within a bound")
+        .expect("the pause was dropped before it was reached");
+    // The publisher has been told and has not taken the session; the second fact joins now.
     producer.observe_holder(Holder::Program(Some("second".to_owned())));
     assert_eq!(
         host.runtime.published().latest().application,
         None,
-        "nothing is published to the session while it is held"
+        "nothing is published to the session before the publisher is let go"
     );
-    let _ = standing.release.send(());
-    let began = Instant::now();
-    while host.runtime.published().latest().application.as_deref() != Some("second") {
-        assert!(
-            began.elapsed() < CLOSURE_WAIT,
-            "the session was not told the latest name within {CLOSURE_WAIT:?} of its release: {:?}",
-            host.runtime.published().latest().application
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let _ = let_go.send(());
+    tokio::time::timeout(REACH, published.changed())
+        .await
+        .expect("the publisher published within a bound")
+        .expect("the producer is there");
+    assert_eq!(
+        published.borrow_and_update().name.as_deref(),
+        Some("second"),
+        "the first publication after the release was not the latest the facts say"
+    );
     producer.settle();
-    assert_eq!(producer.application().name.as_deref(), Some("second"));
-}
-
-/// Two questions are open, and the maintenance pass's prune holds the session inside a write
-/// transaction of the file that the question ledger shares. One question runs out of time, so the
-/// ledger's reader writes its expiry, which fails after its busy wait. The other question stays
-/// open, and the question fact keeps its last value: a read of the held session still says that a
-/// question waits, where a reader that took the error for "no question" says that nothing does.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_question_fact_that_cannot_be_read_keeps_its_last_value() {
-    let host = host().await;
-    let mut agent = bind_agent(&host).await;
-    agent.selects_a_thread().await;
-    ask_a_question_expiring(&host.service, host.session_id, "short", Some(4_000));
-    ask_a_question_expiring(&host.service, host.session_id, "long", None);
-    domain_application_state_becomes(
-        &host,
-        Some(ApplicationState::AwaitingInput),
-        "the questions are open",
-    )
-    .await;
-    let (holder, mut reader) = (host.client().await, host.client().await);
-    let standing = stall(&host, Stalled::Prune, holder).await;
-    // The short question is due. A wake of the loop asks the ledger's reader, whose expiry write
-    // meets the write lock that the prune holds and fails after five seconds.
-    tokio::time::sleep(Duration::from_millis(4_500)).await;
-    agent.says(TURN_7_STARTED).await;
-    agent.says(TURN_7_ENDED).await;
-    let began = Instant::now();
-    let mut said = None;
-    while began.elapsed() < Duration::from_secs(9) {
-        let (_, read) =
-            read_within_its_bound(&mut reader, &host, "held read after the write failed").await;
-        said = read.session.application_state.0;
-        assert_eq!(
-            said,
-            Some(ApplicationState::AwaitingInput),
-            "the read of a held session said {said:?} {:?} after the ledger's expiry write was asked for, with a question still open",
-            began.elapsed()
-        );
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    let _ = standing.release.send(());
-    assert_eq!(said, Some(ApplicationState::AwaitingInput));
+    assert_eq!(
+        host.runtime.published().latest().application.as_deref(),
+        Some("second")
+    );
 }
 
 /// A fact changes back to the value that is published while a publication of the other value is in
@@ -1572,6 +1559,33 @@ async fn a_change_back_to_the_published_value_while_a_publication_is_in_flight_i
         "the publication in flight left the older program standing"
     );
     assert_eq!(host.runtime.published().latest().application, None);
+}
+
+/// A question that runs out of time stops counting without anything else waking the evidence loop.
+/// The loop re-reads the ledger on a timer while a question is open, and it arms that timer when
+/// the ledger's reader says that a question is open, which is a wake of the reader's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_question_that_runs_out_of_time_stops_counting_with_no_other_wake() {
+    let host = host().await;
+    ask_a_question_expiring(&host.service, host.session_id, "short", Some(3_000));
+    domain_application_state_becomes(
+        &host,
+        Some(ApplicationState::AwaitingInput),
+        "the question is open",
+    )
+    .await;
+    let began = Instant::now();
+    while domain_application_state(&host) == Some(ApplicationState::AwaitingInput) {
+        assert!(
+            began.elapsed() < QUESTION_WAIT,
+            "the session still counted a question that ran out of time {QUESTION_WAIT:?} after it opened"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        domain_application_state(&host),
+        Some(ApplicationState::ShellReady)
+    );
 }
 
 /// Two questions are open, and the maintenance pass's prune holds the session inside a write
