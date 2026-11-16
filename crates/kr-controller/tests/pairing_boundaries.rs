@@ -905,7 +905,6 @@ fn racing_request(
                         subject: ConfirmationSubject::EstablishClock,
                     },
                     (action, Digest256::from_bytes([9; 32])),
-                    &|| Ok(()),
                     &AtomicBool::new(false),
                 )
                 .expect("the request records the identifier first");
@@ -945,7 +944,7 @@ async fn an_issue_whose_identifier_is_spent_meanwhile_spends_no_confirmation() {
     .expect("answered");
 
     let pairing = host.network().pairing();
-    let caller = Caller::local(ActorId::new("local:test").expect("a principal"));
+    let caller = Caller::local(ActorId::new("local:test").expect("a principal")).landed_for_ever();
     let action = ActionId::new(kr_ipc::new_uuid());
     let refused = pairing.invite(
         &caller,
@@ -986,7 +985,7 @@ async fn a_confirmation_whose_identifier_is_spent_meanwhile_spends_no_confirmati
     let owner = Signer::OwnerDevice(&owner_keys);
     let grant = viewer();
     let pairing = host.network().pairing();
-    let caller = Caller::local(ActorId::new("local:test").expect("a principal"));
+    let caller = Caller::local(ActorId::new("local:test").expect("a principal")).landed_for_ever();
     let admitted: Admission = Arc::new(|| Ok(()));
 
     calls::confirm_subject(
@@ -1097,7 +1096,7 @@ async fn a_repeated_confirmation_is_answered_as_a_copy_of_its_record() {
     let owner = Signer::OwnerDevice(&owner_keys);
     let grant = viewer();
     let pairing = host.network().pairing();
-    let caller = Caller::local(ActorId::new("local:test").expect("a principal"));
+    let caller = Caller::local(ActorId::new("local:test").expect("a principal")).landed_for_ever();
     let admitted: Admission = Arc::new(|| Ok(()));
 
     calls::confirm_subject(
@@ -1224,7 +1223,7 @@ async fn a_repeated_withdrawal_is_answered_as_a_copy_of_its_record() {
     let owner = Signer::OwnerDevice(&owner_keys);
     let grant = viewer();
     let pairing = host.network().pairing();
-    let caller = Caller::local(ActorId::new("local:test").expect("a principal"));
+    let caller = Caller::local(ActorId::new("local:test").expect("a principal")).landed_for_ever();
     let admitted: Admission = Arc::new(|| Ok(()));
 
     calls::confirm_subject(
@@ -1364,7 +1363,6 @@ mod a_repeat_the_owner_authority_answers {
             &caller,
             &params,
             (action.0, Digest256::from_bytes([32; 32])),
-            &|| Ok(()),
             &reused,
         );
         assert!(is_id_conflict(&refused), "{refused:?}");
@@ -1390,7 +1388,6 @@ mod a_repeat_the_owner_authority_answers {
                 &caller,
                 resolved(Digest256::from_bytes([7; 32])),
                 action,
-                &|| Ok(()),
                 &performed,
             )
             .expect("the request is answered with a challenge");
@@ -1401,7 +1398,6 @@ mod a_repeat_the_owner_authority_answers {
                 &caller,
                 resolved(Digest256::from_bytes([7; 32])),
                 action,
-                &|| Ok(()),
                 &copied,
             )
             .expect("the repeat is answered");
@@ -1415,7 +1411,6 @@ mod a_repeat_the_owner_authority_answers {
             &caller,
             resolved(Digest256::from_bytes([7; 32])),
             (action.0, Digest256::from_bytes([33; 32])),
-            &|| Ok(()),
             &reused,
         );
         assert!(is_id_conflict(&refused), "{refused:?}");
@@ -1430,7 +1425,6 @@ mod a_repeat_the_owner_authority_answers {
             &caller,
             resolved(Digest256::from_bytes([7; 32])),
             (action.0, Digest256::from_bytes([36; 32])),
-            &|| Ok(()),
             &by_the_owner,
         );
         assert!(is_id_conflict(&refused), "{refused:?}");
@@ -1482,7 +1476,6 @@ mod a_repeat_the_owner_authority_answers {
             &caller,
             &params,
             (action.0, Digest256::from_bytes([34; 32])),
-            &|| Ok(()),
             &reused,
         );
         assert!(is_id_conflict(&refused), "{refused:?}");
