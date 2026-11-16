@@ -214,6 +214,13 @@ impl Ask {
 
     /// The local close: the registration, the fence and the revision. A deadline that has run out
     /// passes, since the worker that owns the session knows whether it holds the close's receipt.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the local close asks it from landing C, which converts the close's checks"
+        )
+    )]
     pub(crate) const LOCAL_CLOSE: Self = Self {
         flag: true,
         revision: Revision::Admitted,
@@ -223,6 +230,13 @@ impl Ask {
     };
 
     /// The network close's claim of its route: the latch alone, which is what its admission asked.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the network close's claim of its route asks it from landing C"
+        )
+    )]
     pub(crate) const NETWORK_CLOSE_CLAIM: Self = Self {
         flag: false,
         revision: Revision::Unasked,
@@ -246,6 +260,13 @@ impl Ask {
 
     /// A sign-in's keep: the fence and the lease's bound alone. The revision the sign-in began
     /// under is not asked, since a barrier in its wait does not end it.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the sign-in's keep asks it from landing B, which converts the account actions"
+        )
+    )]
     pub(crate) const SIGN_IN: Self = Self {
         flag: true,
         revision: Revision::Unasked,

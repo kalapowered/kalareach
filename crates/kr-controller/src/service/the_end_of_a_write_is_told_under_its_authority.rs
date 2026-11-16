@@ -227,7 +227,7 @@ async fn the_four_modules_first_admissions_are_told_under_the_authority_they_end
         let withdrawn = leg(|controller, connection_id| controller.deregister(connection_id)).await;
         let fenced = leg(|controller, _| controller.hold_fence(true)).await;
         let restamped = leg(|controller, _| {
-            another_devices_restamp(&controller);
+            another_devices_restamp(controller);
         })
         .await;
         // A result, and a word that does not say the action was not done, may be of an effect that
