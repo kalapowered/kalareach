@@ -53,3 +53,47 @@ exempt evictions it is what retention took, which a discard does not touch
 exempt spool_peak_bytes it is the most the spool held, which a discard does not touch
 exempt discard_deferred it says whether a discard met a write in flight, and holds no retained output
 exempt deferred_discard_watch it hands out a watch on the write in flight, and holds no retained output
+
+# Every other method of every inherent block of the history's type that takes `&self` or `&mut self`,
+# whatever its visibility: the appenders and the waits, which the sites above list; the history's own
+# passes, which work on what is held and answer no reader; and the setters, the discard and the seam.
+exempt standing it is the one helper every reader asks
+exempt append it is the appender, which the sites above list
+exempt append_deferred it is the appender, which the sites above list
+exempt wait_for_the_spool_write it is a wait, which the sites above list
+exempt wait_for_owed_write it is a wait, which the sites above list
+exempt oldest_held_cursor it is the raw accessor of the history's own passes, which work on what is held
+exempt held_bytes it is the raw accessor of the history's own passes, which work on what is held
+exempt oldest_held_written_at_ms it is the raw accessor of the history's own passes, which work on what is held
+exempt cause_of it is given the standing by the page reader, which asks for it
+exempt read_held it reads the bytes for the page, which asks for the standing first, and it copies none while a discard is owed
+exempt set_clock_proven it sets what the next output's time records and holds no retained output
+exempt set_discard_owed it sets the fence and holds no retained output
+exempt settle_spool_write it settles a write that failed and returns no retained output
+exempt try_resume it is the history's own resumption of a stopped spool
+exempt bound_past_suspension it is the history's own retention pass over what is held
+exempt record_eviction it records what retention took and returns no retained output
+exempt trim_marks it is the history's own pass over the resident window's marks
+exempt apply_retention it is the history's own retention pass over what is held
+exempt apply_retention_to_host it is the history's own retention pass over what is held
+exempt evict_expired it is the history's own retention pass over what is held
+exempt note_withheld_strings it is the history's own pass over what is held
+exempt stop_retaining it stops retention and returns no retained output
+exempt resume_retaining it starts retention again and returns no retained output
+exempt discard_retained it is the discard itself
+exempt discard_window_and_spool it is the discard itself
+exempt discard_times it is the discard of the time index
+exempt pause_next_spool_write it is a seam compiled only with the testing feature
+
+# The functions that read what a receipt carries as its caller's content (the intent envelope and the
+# result), by file and name: each asks the journal's one decision, `withheld_now`, and answers as it
+# will after the removal while the removal is owed or the privacy state is unread. The scan finds a
+# function by a string literal in its body that selects a column named `intent` or `result`.
+#
+# content_reader <file> <function> via <the journal method it asks>
+# content_exempt <file> <function> <why no caller is shown what it reads>
+content_reader crates/kr-worker/src/journal.rs read_intent via withheld_now
+content_reader crates/kr-worker/src/journal.rs read_result via withheld_now
+content_reader crates/kr-worker/src/journal.rs uncertain_for_subject_matching via withheld_now
+content_exempt crates/kr-worker/src/journal.rs backfill_subjects it derives each receipt's subject from its envelope when a store is opened and gives no envelope to anybody
+content_exempt crates/kr-worker/src/persistence/import.rs check_results it checks that each result a store holds decodes before the store is imported and gives none to anybody

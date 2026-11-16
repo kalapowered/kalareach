@@ -1,20 +1,28 @@
 //! The spool's owed write has one appender, no waiter that holds the session, and no reader that is
-//! told of retained output while a discard of it is owed.
+//! told of retained output while a discard of it is owed or of a settled receipt's content while its
+//! removal is owed.
 //!
 //! `owed_write_waits.txt` lists, against the source of this crate, every call of the four ways to
 //! append output (`append_deferred`, `OutputHistory::append`, `ingest_output_deferring_the_spool`
 //! and `ingest_output`) and of every wait for the write that is in flight, by file, function and
-//! callee, with how many there are; and every method of the history that reads it, with how it
-//! answers while a discard is owed. A call with no row, a row with no call, a different number of
-//! calls and a reader that does not answer through the history's one helper each fail the case.
+//! callee, with how many there are; every method of every inherent block of the history's type
+//! that takes `&self` or `&mut self`, whatever its visibility, with how it answers while a discard
+//! is owed; and every function that selects a receipt's intent or result, with the journal's
+//! decision that it asks. A call with no row, a row with no call, a different number of calls, a
+//! reader whose body never calls its helper and a content reader whose body never calls the
+//! journal's decision each fail the case, and so does a deferral whose look at the write in flight
+//! and whose mark do not stand under one lock.
 //!
 //! What this holds and what it does not. It reads source text with the comments, the string
-//! literals and the test modules taken out, and finds a call by the name that follows a `.` or a
-//! `::`. It does not follow a call into another function or tell the receiver's type: `append` is
-//! also a method of other types, and each of those has a row of its own, so that an `append` on an
-//! output history in a new place fails like any other new one. It does not see that a lock is not
-//! held across a wait: the two waits that may exist are listed, and a person's read decides what
-//! each holds.
+//! literals and the test modules taken out (the strings are read only to find the SQL that selects
+//! a receipt's content), and finds a call by the name that follows a `.` or a `::`. It does not
+//! follow a call into another function or tell the receiver's type: `append` is also a method of
+//! other types, and each of those has a row of its own, so that an `append` on an output history
+//! in a new place fails like any other new one. The check on a reader is a check that a call is
+//! present in its body: it does not see that the answer is built from what the call returned. It
+//! does not see that a lock is not held across a wait: the two waits that may exist are listed, and
+//! a person's read decides what each holds. A statement that selects a receipt's content from a
+//! constant is not found, and a method of the history that takes `self` by value is not read.
 //!
 //! The cases after the first run the scan over small trees of source text, so that each way it
 //! could miss a caller is shown by a caller it must find.
@@ -40,10 +48,18 @@ const HISTORY_TYPE: &str = "OutputHistory";
 
 /// Source text with its comments, string and character literals blanked, newlines kept.
 fn blank(source: &str) -> String {
+    blank_with(source, false)
+}
+
+/// Source text with its comments and character literals blanked and, unless `strings` says to keep
+/// them, its string literals too. The text is as long as the source, character for character, so
+/// an offset in one is the same place in the other.
+fn blank_with(source: &str, strings: bool) -> String {
     let bytes: Vec<char> = source.chars().collect();
     let mut out = String::with_capacity(source.len());
     let mut at = 0;
     let keep = |c: char| if c == '\n' { '\n' } else { ' ' };
+    let shown = |c: char| if strings { c } else { keep(c) };
     while at < bytes.len() {
         let c = bytes[at];
         let next = bytes.get(at + 1).copied();
@@ -92,23 +108,23 @@ fn blank(source: &str) -> String {
                 cursor += 1;
             }
             while at < cursor {
-                out.push(keep(bytes[at]));
+                out.push(shown(bytes[at]));
                 at += 1;
             }
         } else if c == '"' {
-            out.push(' ');
+            out.push(shown('"'));
             at += 1;
             while at < bytes.len() && bytes[at] != '"' {
                 if bytes[at] == '\\' {
-                    out.push(' ');
+                    out.push(shown('\\'));
                     at += 1;
                 }
                 if at < bytes.len() {
-                    out.push(keep(bytes[at]));
+                    out.push(shown(bytes[at]));
                     at += 1;
                 }
             }
-            out.push(' ');
+            out.push(shown('"'));
             at += 1;
         } else if c == '\'' && is_char_literal(&bytes, at) {
             let mut cursor = at + 1;
@@ -335,56 +351,98 @@ fn body_of(text: &[char], name: &str, from: usize, to: usize) -> Option<(usize, 
     None
 }
 
-/// The range of the `impl <HISTORY_TYPE> {` block of a file.
-fn impl_range(text: &[char], ty: &str) -> Option<(usize, usize)> {
+/// The range of every `impl <ty> {` block of a file, each from its opening brace to its closing one.
+fn impl_ranges(text: &[char], ty: &str) -> Vec<(usize, usize)> {
     let needle: Vec<char> = format!("impl {ty} {{").chars().collect();
-    let start = find(text, &needle, 0)?;
-    let open = start + needle.len() - 1;
-    let mut depth = 0;
-    for (offset, c) in text[open..].iter().enumerate() {
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some((open, open + offset));
+    let mut ranges = Vec::new();
+    let mut cursor = 0;
+    while let Some(start) = find(text, &needle, cursor) {
+        let open = start + needle.len() - 1;
+        let mut depth = 0;
+        let mut close = text.len() - 1;
+        for (offset, c) in text[open..].iter().enumerate() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = open + offset;
+                        break;
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
+        ranges.push((open, close));
+        cursor = close;
     }
-    None
+    ranges
 }
 
-/// The methods of the history type that take `&self`, public or not, with the text of their bodies.
-fn history_methods(source: &str) -> Vec<(String, String)> {
+/// The methods of every inherent block of `ty` in a file that take `&self` or `&mut self`, with
+/// whatever visibility, and the text of their bodies.
+fn methods_of(source: &str, ty: &str) -> Vec<(String, String)> {
     let text: Vec<char> = without_test_modules(&blank(source)).chars().collect();
-    let Some((from, to)) = impl_range(&text, HISTORY_TYPE) else {
-        return Vec::new();
-    };
     let mut methods = Vec::new();
-    let words = idents(&text[from..to]);
-    for (index, (at, word)) in words.iter().enumerate() {
-        if word != "fn" {
-            continue;
-        }
-        let at = at + from;
-        let Some((_, name)) = words.get(index + 1) else {
-            continue;
-        };
-        let header: String = text[at..(at + 400).min(to)].iter().collect();
-        let header = header.split(['{', ';']).next().unwrap_or("").to_owned();
-        let before: String = text[..at].iter().collect();
-        let before = before.trim_end();
-        let public = before.ends_with("pub") || before.ends_with("pub const");
-        if !header.contains("&self") || !public {
-            continue;
-        }
-        if let Some((open, close)) = body_of(&text, name, from, to) {
-            methods.push((name.clone(), text[open..=close].iter().collect()));
+    for (from, to) in impl_ranges(&text, ty) {
+        let words = idents(&text[from..to]);
+        for (index, (at, word)) in words.iter().enumerate() {
+            if word != "fn" {
+                continue;
+            }
+            let at = at + from;
+            let Some((_, name)) = words.get(index + 1) else {
+                continue;
+            };
+            let header: String = text[at..(at + 400).min(to)].iter().collect();
+            let header = header.split(['{', ';']).next().unwrap_or("");
+            if !header.contains("&self") && !header.contains("&mut self") {
+                continue;
+            }
+            if let Some((open, close)) = body_of(&text, name, from, to) {
+                methods.push((name.clone(), text[open..=close].iter().collect()));
+            }
         }
     }
     methods
+}
+
+/// Every function of a file, by name, whose body holds a string literal that selects a column
+/// named `intent` or `result`: the SQL that reads what a receipt carries as its caller's content.
+/// A statement held in a constant is not found; the function that formats the constant into its
+/// own query is. Functions of one name in one file are read together.
+fn content_readers(file: &str, source: &str) -> Vec<(String, String, String)> {
+    let text: Vec<char> = without_test_modules(&blank(source)).chars().collect();
+    let kept: Vec<char> = without_test_modules(&blank_with(source, true))
+        .chars()
+        .collect();
+    // Each function's text twice: with its strings, to read the SQL, and without, to find calls.
+    let mut bodies: BTreeMap<String, (String, String)> = BTreeMap::new();
+    for ((name, with_strings), without_strings) in
+        function_at(&text).into_iter().zip(&kept).zip(&text)
+    {
+        if let Some(name) = name {
+            let entry = bodies.entry(name).or_default();
+            entry.0.push(*with_strings);
+            entry.1.push(*without_strings);
+        }
+    }
+    bodies
+        .into_iter()
+        .filter(|(_, (with_strings, _))| {
+            with_strings.split('"').skip(1).step_by(2).any(|literal| {
+                let words: Vec<String> = idents(&literal.chars().collect::<Vec<_>>())
+                    .into_iter()
+                    .map(|(_, word)| word)
+                    .collect();
+                words.iter().any(|word| word == "SELECT")
+                    && words
+                        .iter()
+                        .any(|word| word == "intent" || word == "result")
+            })
+        })
+        .map(|(name, (_, without_strings))| (file.to_owned(), name, without_strings))
+        .collect()
 }
 
 /// What the roster says.
@@ -393,6 +451,9 @@ struct Roster {
     sites: BTreeMap<Site, usize>,
     readers: BTreeMap<String, String>,
     exempt: BTreeMap<String, String>,
+    /// The functions that read a receipt's content, by file and name, and what they ask.
+    content_readers: BTreeMap<(String, String), String>,
+    content_exempt: BTreeMap<(String, String), String>,
 }
 
 fn parse(roster: &str) -> Roster {
@@ -417,6 +478,16 @@ fn parse(roster: &str) -> Roster {
             }
             ["exempt", name, reason @ ..] if !reason.is_empty() => {
                 parsed.exempt.insert((*name).to_owned(), reason.join(" "));
+            }
+            ["content_reader", file, name, "via", via] => {
+                parsed
+                    .content_readers
+                    .insert(((*file).to_owned(), (*name).to_owned()), (*via).to_owned());
+            }
+            ["content_exempt", file, name, reason @ ..] if !reason.is_empty() => {
+                parsed
+                    .content_exempt
+                    .insert(((*file).to_owned(), (*name).to_owned()), reason.join(" "));
             }
             other => panic!("a roster line this scan cannot read: {other:?}"),
         }
@@ -455,11 +526,13 @@ fn violations(files: &[(String, String)], roster: &Roster) -> Vec<String> {
         }
     }
 
-    // The readers of the history.
+    // The readers of the history: every method of every inherent block of its type, in every file,
+    // with whatever visibility and a shared or an exclusive receiver.
     let history = files.iter().find(|(name, _)| name == HISTORY);
-    let methods = history
-        .map(|(_, source)| history_methods(source))
-        .unwrap_or_default();
+    let methods: Vec<(String, String)> = files
+        .iter()
+        .flat_map(|(_, source)| methods_of(source, HISTORY_TYPE))
+        .collect();
     let known: Vec<&str> = methods.iter().map(|(name, _)| name.as_str()).collect();
     for (name, body) in &methods {
         let through = if let Some(via) = roster.readers.get(name) {
@@ -472,7 +545,7 @@ fn violations(files: &[(String, String)], roster: &Roster) -> Vec<String> {
                 continue;
             }
             Some(format!(
-                "the reader {name} does not answer through {via}: it never calls {needle}"
+                "the reader {name} never calls {via}: {needle} is not in its body"
             ))
         } else if roster.exempt.contains_key(name) {
             continue;
@@ -484,6 +557,41 @@ fn violations(files: &[(String, String)], roster: &Roster) -> Vec<String> {
     for name in roster.readers.keys().chain(roster.exempt.keys()) {
         if history.is_some() && !known.contains(&name.as_str()) {
             out.push(format!("a row for a method that is not there: {name}"));
+        }
+    }
+
+    // The functions that read what a receipt carries as its caller's content, and what each asks.
+    let mut content = BTreeMap::new();
+    for (name, source) in files {
+        for (file, function, body) in content_readers(name, source) {
+            content.insert((file, function), body);
+        }
+    }
+    for ((file, function), body) in &content {
+        let key = (file.clone(), function.clone());
+        if let Some(via) = roster.content_readers.get(&key) {
+            let needle = format!("self.{via}()");
+            if !body.contains(&needle) {
+                out.push(format!(
+                    "the content reader {function} in {file} never calls {via}: {needle} is not \
+                     in its body"
+                ));
+            }
+        } else if !roster.content_exempt.contains_key(&key) {
+            out.push(format!(
+                "a function that reads a receipt's content has no row: {function} in {file}"
+            ));
+        }
+    }
+    for (file, function) in roster
+        .content_readers
+        .keys()
+        .chain(roster.content_exempt.keys())
+    {
+        if !content.contains_key(&(file.clone(), function.clone())) {
+            out.push(format!(
+                "a row for a content reader that is not there: {function} in {file}"
+            ));
         }
     }
 
@@ -501,6 +609,24 @@ fn violations(files: &[(String, String)], roster: &Roster) -> Vec<String> {
                 if body.contains(wait) {
                     out.push(format!("discard_window_and_spool waits: it calls {wait}"));
                 }
+            }
+        }
+        // The look at the write in flight and the mark that a discard is owed are one step under
+        // one lock, so that a write either is in flight and marked, or has ended and the caller
+        // may discard.
+        if let Some((open, close)) = body_of(&text, "defer_discard_if_in_flight", 0, text.len()) {
+            let body: String = text[open..=close].iter().collect();
+            let locks = body.matches(".lock()").count();
+            if locks != 1 || !body.contains(".discard_deferred = true") {
+                out.push(format!(
+                    "the look and the mark of defer_discard_if_in_flight do not stand under one \
+                     lock: it takes {locks} and sets the mark {}",
+                    if body.contains(".discard_deferred = true") {
+                        "in its body"
+                    } else {
+                        "nowhere"
+                    }
+                ));
             }
         }
     }
@@ -564,6 +690,12 @@ impl OutputHistory {
     pub fn page_within(&self) -> u8 { self.page() }
     pub fn next_cursor(&self) -> u64 { 0 }
 }
+impl OwedWrite {
+    fn defer_discard_if_in_flight(&self) -> bool {
+        let mut state = self.lock();
+        if state.in_flight.is_some() { state.discard_deferred = true; true } else { false }
+    }
+}
 "#;
 
 const CLEAN_ROSTER: &str = "
@@ -572,6 +704,9 @@ site crates/kr-worker/src/history.rs wait_for_owed_write wait_idle 1
 reader page via standing
 reader page_within via page
 exempt next_cursor it is the session's own position and a discard leaves it
+exempt append_deferred it is the appender
+exempt wait_for_owed_write it is a wait
+exempt discard_window_and_spool it is the discard itself
 ";
 
 fn small(extra: &[(&str, &str)], roster: &str) -> Vec<String> {
@@ -663,13 +798,159 @@ fn the_wait_put_back_into_the_discard_is_found() {
 }
 
 #[test]
-fn a_reader_that_does_not_answer_through_the_helper_is_found() {
+fn a_reader_with_no_call_of_the_helper_is_found() {
     let bare = HISTORY_TREE.replace("self.standing().oldest", "0");
     let found = violations(&[(HISTORY.to_owned(), bare)], &parse(CLEAN_ROSTER));
     assert!(
         found
             .iter()
-            .any(|line| line.contains("reader page does not answer")),
+            .any(|line| line.contains("reader page never calls")),
+        "{found:?}"
+    );
+}
+
+/// A method that reads the history, written in the forms the scan once passed: a narrower
+/// visibility, none, a mutable receiver, a second block of the type, and a block in another file.
+fn a_reader_in(form: &str) -> Vec<String> {
+    let tree = match form {
+        "crate" => HISTORY_TREE.replace(
+            "pub fn next_cursor",
+            "pub(crate) fn raw(&self) -> u64 { 0 }\n    pub fn next_cursor",
+        ),
+        "super" => HISTORY_TREE.replace(
+            "pub fn next_cursor",
+            "pub(super) fn raw(&self) -> u64 { 0 }\n    pub fn next_cursor",
+        ),
+        "private" => HISTORY_TREE.replace(
+            "pub fn next_cursor",
+            "fn raw(&self) -> u64 { 0 }\n    pub fn next_cursor",
+        ),
+        "mutable" => HISTORY_TREE.replace(
+            "pub fn next_cursor",
+            "pub fn raw(&mut self) -> u64 { 0 }\n    pub fn next_cursor",
+        ),
+        "second block" => {
+            format!("{HISTORY_TREE}\nimpl OutputHistory {{ pub fn raw(&self) -> u64 {{ 0 }} }}\n")
+        }
+        _ => HISTORY_TREE.to_owned(),
+    };
+    let elsewhere = (form == "another file").then(|| {
+        (
+            "crates/kr-worker/src/history/more.rs",
+            "impl OutputHistory { pub fn raw(&self) -> u64 { 0 } }",
+        )
+    });
+    let mut files = vec![(HISTORY.to_owned(), tree)];
+    files.extend(
+        elsewhere
+            .into_iter()
+            .map(|(name, source)| (name.to_owned(), source.to_owned())),
+    );
+    violations(&files, &parse(CLEAN_ROSTER))
+}
+
+#[test]
+fn a_reader_in_a_form_the_scan_once_passed_is_found() {
+    for form in [
+        "crate",
+        "super",
+        "private",
+        "mutable",
+        "second block",
+        "another file",
+    ] {
+        let found = a_reader_in(form);
+        assert!(
+            found
+                .iter()
+                .any(|line| line.contains("a method of the history with no row: raw")),
+            "{form}: {found:?}"
+        );
+    }
+    assert_eq!(a_reader_in("none"), Vec::<String>::new());
+}
+
+#[test]
+fn a_deferral_whose_look_and_mark_take_two_locks_is_found() {
+    let two = HISTORY_TREE.replace(
+        "let mut state = self.lock();\n        if state.in_flight.is_some() { state.discard_deferred = true; true } else { false }",
+        "let in_flight = self.lock().in_flight.is_some();\n        if in_flight { self.lock().discard_deferred = true; }\n        in_flight",
+    );
+    let found = violations(&[(HISTORY.to_owned(), two)], &parse(CLEAN_ROSTER));
+    assert!(
+        found
+            .iter()
+            .any(|line| line.contains("do not stand under one lock")),
+        "{found:?}"
+    );
+}
+
+const JOURNAL: &str = "crates/kr-worker/src/journal.rs";
+
+const JOURNAL_TREE: &str = r#"
+impl Journal {
+    pub fn read_result(&self) -> u8 {
+        self.connection.query_row(&format!("SELECT result FROM results WHERE {}", state_list(self.withheld_now())), []);
+        0
+    }
+}
+"#;
+
+const CONTENT_ROSTER: &str =
+    "content_reader crates/kr-worker/src/journal.rs read_result via withheld_now\n";
+
+#[test]
+fn a_content_reader_the_roster_describes_has_no_violation() {
+    let roster = format!("{CLEAN_ROSTER}{CONTENT_ROSTER}");
+    assert_eq!(
+        small(&[(JOURNAL, JOURNAL_TREE)], &roster),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_content_reader_with_no_row_is_found() {
+    let found = small(&[(JOURNAL, JOURNAL_TREE)], CLEAN_ROSTER);
+    assert!(
+        found
+            .iter()
+            .any(|line| line.contains("has no row: read_result")),
+        "{found:?}"
+    );
+    // Another form of the same reader: the envelope, in a function of another file, with the
+    // statement spread over lines.
+    let envelope = "fn peek(c: &C) { c.query(\"SELECT actor_id,\n intent FROM receipts\"); }";
+    let found = small(
+        &[("crates/kr-worker/src/service.rs", envelope)],
+        CLEAN_ROSTER,
+    );
+    assert!(
+        found.iter().any(|line| line.contains("has no row: peek")),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_content_reader_that_never_asks_the_decision_is_found() {
+    let roster = format!("{CLEAN_ROSTER}{CONTENT_ROSTER}");
+    let unfenced = JOURNAL_TREE.replace("state_list(self.withheld_now())", "state_list(&[])");
+    let found = small(&[(JOURNAL, unfenced.as_str())], &roster);
+    assert!(
+        found
+            .iter()
+            .any(|line| line.contains("content reader read_result") && line.contains("never calls")),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_row_for_a_content_reader_that_is_not_there_is_found() {
+    let roster = format!("{CLEAN_ROSTER}{CONTENT_ROSTER}");
+    let found = small(&[], &roster);
+    assert!(
+        found
+            .iter()
+            .any(|line| line.contains("a row for a content reader that is not there")),
         "{found:?}"
     );
 }
