@@ -21,6 +21,8 @@ use kr_protocol::update::{
     PathVariable, ReleaseName, STOP_SETTLE_MS,
 };
 
+use kr_transport::clock::{ContinuousClock, ContinuousInstant};
+
 use crate::error::{ControllerError, Result};
 use crate::given::Given;
 
@@ -1398,6 +1400,9 @@ fn whoami() -> String {
 #[derive(Debug)]
 pub(super) struct Handover {
     gate: std::sync::Mutex<Gate>,
+    /// The continuous clock an attempt's hold is measured on: this daemon's own, so that what a
+    /// step compares the hold with is the time its admission was asked against.
+    clock: Arc<dyn ContinuousClock>,
     /// Signalled whenever a create under way settles.
     settled: tokio::sync::Notify,
     /// Why this daemon has been told to stop, once it has been.
@@ -1435,7 +1440,7 @@ enum Reason {
         /// The release the host is being updated to.
         target: ReleaseName,
         /// When the attempt's hold lapses and the gate opens again by itself.
-        until: std::time::Instant,
+        until: ContinuousInstant,
     },
     /// A stop requested on the local socket. The gate does not open again: the daemon stops.
     Stop,
@@ -1448,6 +1453,17 @@ pub(super) enum StopCause {
     Update,
     /// A stop was requested on the local socket and its answer has been written.
     Request,
+}
+
+/// What a stop is told when this daemon was not prepared for its handover, or the preparation
+/// lapsed, or it is over.
+fn not_prepared() -> ControllerError {
+    ControllerError::Refused {
+        code: ErrorCode::ResourceUnavailable,
+        detail: "this control daemon was not prepared for this handover, or the preparation \
+                 lapsed, or it is over; prepare it again"
+            .to_owned(),
+    }
 }
 
 /// What a daemon that has been told to stop says to a step that would keep it.
@@ -1470,8 +1486,17 @@ fn stopping(cause: StopCause) -> ControllerError {
 }
 
 impl Default for Handover {
+    /// A handover on the system's continuous clock.
     fn default() -> Self {
+        Self::on(Arc::new(kr_transport::clock::SystemContinuousClock::new()))
+    }
+}
+
+impl Handover {
+    /// A handover whose attempts hold on `clock`.
+    pub(super) fn on(clock: Arc<dyn ContinuousClock>) -> Self {
         Self {
+            clock,
             gate: std::sync::Mutex::default(),
             settled: tokio::sync::Notify::new(),
             stopping: tokio::sync::watch::channel(None).0,
@@ -1525,7 +1550,7 @@ impl Handover {
             match &closed.reason {
                 Reason::Stop => return Err(stopping(StopCause::Request)),
                 Reason::Update { target, until } => {
-                    if std::time::Instant::now() < *until {
+                    if self.clock.now() < *until {
                         return Err(ControllerError::Refused {
                             code: ErrorCode::ResourceUnavailable,
                             detail: format!(
@@ -1606,11 +1631,12 @@ impl Handover {
             return Err(stopping(cause));
         }
         let attempt = kr_ipc::new_uuid();
+        let now = self.clock.now();
         let closed = Closed {
             attempt,
             reason: Reason::Update {
                 target: target.clone(),
-                until: std::time::Instant::now() + hold,
+                until: now.checked_add(hold).unwrap_or(now),
             },
         };
         still()?;
@@ -1623,7 +1649,7 @@ impl Handover {
     pub(super) fn is_current(&self, attempt: Uuid) -> bool {
         self.lock().closed.as_ref().is_some_and(|closed| {
             closed.attempt == attempt
-                && matches!(&closed.reason, Reason::Update { until, .. } if std::time::Instant::now() < *until)
+                && matches!(&closed.reason, Reason::Update { until, .. } if self.clock.now() < *until)
         })
     }
 
@@ -1732,8 +1758,14 @@ impl Handover {
             Some(Closed {
                 attempt: held,
                 reason: Reason::Update { until, .. },
-            }) if *held == attempt && std::time::Instant::now() < *until => {
+            }) if *held == attempt => {
+                // The admission is asked first and the hold's end compared with the clock after it,
+                // immediately before the daemon is told to stop: the hold can end while the
+                // admission is asked, and a stop that comes after its hold has ended is refused.
                 still()?;
+                if self.clock.now() >= *until {
+                    return Err(not_prepared());
+                }
                 self.stopping.send_if_modified(|cause| {
                     let changes = cause.is_none();
                     if changes {
@@ -1743,12 +1775,7 @@ impl Handover {
                 });
                 Ok(attempt)
             }
-            _ => Err(ControllerError::Refused {
-                code: ErrorCode::ResourceUnavailable,
-                detail: "this control daemon was not prepared for this handover, or the \
-                         preparation lapsed, or it is over; prepare it again"
-                    .to_owned(),
-            }),
+            _ => Err(not_prepared()),
         }
     }
 
@@ -1797,10 +1824,13 @@ impl Controller {
             (HandoverStep::Prepare, Err(error)) => return Err(error),
             (_, Err(_)) => StartedLike::default(),
         };
-        // An early refusal, before anything waits or changes; the step asks again under the gate's
-        // lock, immediately before the gate changes.
-        self.check_registration(carried)?;
-        let still = || self.check_registration(carried);
+        // The footing of the request, made once here; an early refusal, before anything waits or
+        // changes. The step asks the footing's one question again under the gate's lock,
+        // immediately before the gate changes: it reads atomics and clocks alone, so nothing waits
+        // between it and the change.
+        let footing = self.footing_of_a_mutation(carried)?;
+        footing.stands(super::footing::Ask::MUTATION)?;
+        let still = || footing.stands(super::footing::Ask::MUTATION);
         let attempt = match params.step {
             HandoverStep::Prepare => {
                 let attempt = self.handover.close(

@@ -1164,6 +1164,7 @@ impl Controller {
             wall.clone(),
             Arc::clone(&utc_floor),
         ));
+        let handover = super::host::Handover::on(Arc::clone(&clock));
         let controller = Arc::new_cyclic(|me| Self {
             me: me.clone(),
             registry: Mutex::new(registry),
@@ -1447,7 +1448,7 @@ impl Controller {
             crash_flights: std::sync::Mutex::new(std::collections::HashMap::new()),
             left_by_an_earlier_boot: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             collection: crate::collection::Collection::default(),
-            handover: super::host::Handover::default(),
+            handover,
             machine,
             lock,
         });
