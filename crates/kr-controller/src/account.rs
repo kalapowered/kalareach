@@ -78,7 +78,7 @@ use kr_client::services::account::{
     AccountHttp, AccountService, AccountStatus, AccountTokenSource, Answer, AnswerFault,
     AuthorisationGrant, AuthorisationRequest, BACKUP_WRITE_SCOPE, Client, Commit, Exchanged,
     IdentityRead, ManagedAccountService, PendingAuthorisation, RELAY_LEASE_SCOPE, Redirect,
-    SignedInAccount, TokenOfAccount,
+    SignedInAccount, TokenOfAccount, Unrevoked,
 };
 use kr_client::services::{AccountToken, HttpDeadlines, ServiceFuture};
 use kr_crypto::store::SecretStore;
@@ -1577,14 +1577,26 @@ impl Inner {
                 let Ok(guard) = lasting() else {
                     // The authority the sign-in was started under ended while the person was in the
                     // browser or the exchange was out, so no change is begun: what the service
-                    // issued is revoked, queued before it is sent, and nothing is kept.
-                    if let Err(error) = held.signed_in.revoke_unkept(refresh).await {
-                        eprintln!(
-                            "kr-controller: a withheld sign-in's token was sent to the service, \
-                             but the store failed: {error}"
-                        );
+                    // issued is revoked, queued before it is sent, and nothing is kept. The person
+                    // is told as the keep tells them, so a revocation that is still owed is said.
+                    let (commit, unrevoked) = held.signed_in.end_withheld(refresh).await;
+                    match unrevoked {
+                        None => {}
+                        Some(Unrevoked::Queued(error)) => eprintln!(
+                            "kr-controller: a withheld sign-in's token is in the queue of \
+                             revocations and the service could not be told yet: {error}"
+                        ),
+                        Some(Unrevoked::Ended(error)) => eprintln!(
+                            "kr-controller: a withheld sign-in's token was ended at the service, \
+                             but the queue of revocations failed: {error}"
+                        ),
+                        Some(Unrevoked::Held(error)) => eprintln!(
+                            "kr-controller: a withheld sign-in's token reached neither the queue \
+                             nor the service, so the host holds it in memory and sends it the next \
+                             time it uses the account: {error}"
+                        ),
                     }
-                    return Outcome::withheld(Commit::Withheld);
+                    return Outcome::withheld(commit);
                 };
                 let change = self.begin_change();
                 drop(guard);
