@@ -745,10 +745,10 @@ impl PairingAdmissions {
                 // What a person is told to wait is the device's own wait: what is left until it asks
                 // the service again (the retry time, which a failed request moves later, the end of
                 // the ask window when the asks are used up, the end of a stop of requests), whether
-                // or not the service named a
-                // delay, and never less than what is left of the delay it named. The answer is kept
-                // past its delay while the cache will not ask again, and every try before then fails
-                // in the same way. At most a day, by the cache's own cap on a delay.
+                // or not the service named a delay, and never less than what is left of the delay
+                // it named. The answer is kept past its delay while the cache will not ask again,
+                // and every try before then fails in the same way. At most a day, by the cache's
+                // own cap on a delay.
                 let asks_again = [
                     Some(*retry_at),
                     retry_after_seconds.map(|named| *answered_at + named_time(named)),
