@@ -2517,6 +2517,226 @@ mod tests {
         }
     }
 
+    // The failures of the command's connection before it made its request: the greeting, and the
+    // read of `host.info`. Each is decided on supplied operations with the paused clock.
+
+    /// What a case shows of a decision about a failed connection.
+    fn before_said(before: &Before) -> String {
+        match before {
+            Before::Ended { said, pid } => format!("ended ({pid:?}): {said}"),
+            Before::Silent => "silent".to_owned(),
+            Before::Stays => "stays".to_owned(),
+        }
+    }
+
+    /// The words of a daemon that ended and whose closed connection stopped this command's request.
+    fn the_end_said(id: EnvironmentId, pid: Option<u64>) -> String {
+        let process = pid.map_or_else(String::new, |pid| format!(" (process {pid})"));
+        format!(
+            "ended ({pid:?}): The control daemon for environment {id}{process} ended, and this \
+             command could not make its request for it: the peer closed the connection. This \
+             command sent nothing."
+        )
+    }
+
+    fn a_fault_of_the_socket() -> kr_ipc::IpcError {
+        kr_ipc::IpcError::socket("read the control frame", std::io::Error::other("a fault"))
+    }
+
+    fn the_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + END_BOUND
+    }
+
+    fn an_environment() -> EnvironmentId {
+        kr_ipc::testing::TempHost::create()
+            .environment()
+            .environment_id()
+    }
+
+    /// A daemon that closes the greeting as it ends is the daemon's end, with the process named
+    /// where it is known, and not a stop that this command made: it sent nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_greeting_closed_by_a_daemon_that_ends_is_the_daemons_end() {
+        let id = an_environment();
+        let process = asked_process();
+        for (old, named) in [(Some(&process), Some(4000)), (None, None)] {
+            let supplied = Supplied::new()
+                .process(vec![at_once(ProcessState::Ended)])
+                .look(vec![at_once(Endpoint::Nobody)]);
+            let before = greeting_failed(
+                &supplied,
+                &kr_ipc::IpcError::PeerClosed,
+                old,
+                id,
+                the_deadline(),
+            )
+            .await;
+            assert_eq!(before_said(&before), the_end_said(id, named), "{old:?}");
+            assert_eq!(supplied.start.elapsed(), Duration::ZERO, "{old:?}");
+        }
+    }
+
+    /// A greeting that fails some other way than a closed peer (a rejection, a mismatch, a fault)
+    /// says nothing of an end: nothing is looked at, and the failure keeps its words.
+    #[tokio::test(start_paused = true)]
+    async fn a_greeting_that_fails_other_than_by_a_closed_peer_is_not_judged() {
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Nobody)]);
+        let before = greeting_failed(
+            &supplied,
+            &a_fault_of_the_socket(),
+            None,
+            an_environment(),
+            the_deadline(),
+        )
+        .await;
+        assert_eq!(before_said(&before), "stays");
+        assert!(supplied.calls().is_empty(), "{:?}", supplied.calls());
+    }
+
+    /// A daemon that closed the greeting and is not shown to have ended at the deadline is the
+    /// command's silence, as for a daemon that does not answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_greeting_closed_by_a_daemon_that_does_not_end_is_silence_at_the_deadline() {
+        let process = asked_process();
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same)]);
+        let before = greeting_failed(
+            &supplied,
+            &kr_ipc::IpcError::PeerClosed,
+            Some(&process),
+            an_environment(),
+            the_deadline(),
+        )
+        .await;
+        assert_eq!(before_said(&before), "silent");
+        assert_eq!(
+            supplied.start.elapsed(),
+            END_BOUND,
+            "it waits to the deadline"
+        );
+    }
+
+    /// A read of `host.info` that the daemon closes as it ends is the daemon's end, and the
+    /// command's connection is let go before anything is looked at.
+    #[tokio::test(start_paused = true)]
+    async fn a_host_info_closed_by_a_daemon_that_ends_is_the_daemons_end() {
+        let id = an_environment();
+        let process = asked_process();
+        for (old, named) in [(Some(&process), Some(4000)), (None, None)] {
+            let supplied = Supplied::new()
+                .process(vec![at_once(ProcessState::Ended)])
+                .look(vec![at_once(Endpoint::Nobody)]);
+            let before = host_info_failed(
+                &supplied,
+                supplied.connection(),
+                &kr_ipc::IpcError::PeerClosed,
+                old,
+                id,
+                the_deadline(),
+            )
+            .await;
+            assert_eq!(before_said(&before), the_end_said(id, named), "{old:?}");
+            assert_eq!(
+                supplied.calls()[0].1,
+                Call::ConnectionLetGo,
+                "the connection is let go first, {old:?}"
+            );
+            assert_eq!(supplied.start.elapsed(), Duration::ZERO, "{old:?}");
+        }
+    }
+
+    /// A fault of the read that is not a closed peer is judged as the unmade request is: one look,
+    /// and the failure keeps its words where a daemon of the same start still answers, and a daemon
+    /// that has gone is the end.
+    #[tokio::test(start_paused = true)]
+    async fn a_host_info_that_fails_on_the_socket_is_judged_by_one_look() {
+        let id = an_environment();
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same)]);
+        let before = host_info_failed(
+            &supplied,
+            supplied.connection(),
+            &a_fault_of_the_socket(),
+            None,
+            id,
+            the_deadline(),
+        )
+        .await;
+        assert_eq!(before_said(&before), "stays");
+        assert_eq!(
+            supplied.calls(),
+            vec![
+                (Duration::ZERO, Call::ConnectionLetGo),
+                (Duration::ZERO, Call::Look(startup::ANSWER_BOUND)),
+            ]
+        );
+
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Nobody)]);
+        let before = host_info_failed(
+            &supplied,
+            supplied.connection(),
+            &a_fault_of_the_socket(),
+            None,
+            id,
+            the_deadline(),
+        )
+        .await;
+        assert!(
+            before_said(&before).starts_with("ended (None): The control daemon for environment"),
+            "{}",
+            before_said(&before)
+        );
+    }
+
+    /// A daemon that closed the read of `host.info` and is not shown to have ended at the deadline
+    /// is the command's silence.
+    #[tokio::test(start_paused = true)]
+    async fn a_host_info_closed_by_a_daemon_that_does_not_end_is_silence_at_the_deadline() {
+        let process = asked_process();
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same)]);
+        let before = host_info_failed(
+            &supplied,
+            supplied.connection(),
+            &kr_ipc::IpcError::PeerClosed,
+            Some(&process),
+            an_environment(),
+            the_deadline(),
+        )
+        .await;
+        assert_eq!(before_said(&before), "silent");
+        assert_eq!(
+            supplied.start.elapsed(),
+            END_BOUND,
+            "it waits to the deadline"
+        );
+    }
+
+    fn a_refusal() -> ProtocolError {
+        ProtocolError::new(
+            ErrorCode::PermissionDenied,
+            "the daemon will not take a stop",
+        )
+    }
+
+    /// A probe whose connection fails is no answer to the probe, as one that is not answered in its
+    /// bound is none: the daemon's refusal is the result, and nothing was stopped.
+    #[test]
+    fn a_probe_that_fails_on_its_connection_leaves_the_daemons_refusal() {
+        let id = an_environment();
+        for probe in [None, Some(Err(kr_ipc::IpcError::PeerClosed))] {
+            match after_the_probe(id, a_refusal(), probe) {
+                CliError::Refused(refusal) => {
+                    assert_eq!(refusal.code, ErrorCode::PermissionDenied);
+                }
+                other => panic!("the refusal is the result, not {other}"),
+            }
+        }
+        match after_the_probe(id, a_refusal(), Some(Ok(Ok(())))) {
+            CliError::Unfinished { message, .. } => {
+                assert!(message.to_string().contains("takes no stop request"));
+            }
+            other => panic!("a daemon that answers the probe is of another build, not {other}"),
+        }
+    }
+
     /// What `ask` makes of a request it cannot compose on a connection whose daemon says its hello
     /// and then closes the connection, with a frame that cannot be read before the close where
     /// `bad_frame`: the `closed` that it gives, from the real failure of the real client.
