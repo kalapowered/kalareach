@@ -316,7 +316,7 @@ async fn the_stop_is_watched(
     let mut seen = Seen::default();
     let mut looked_at_the_daemon = false;
     let mut daemon_while_it_stood = String::new();
-    let mut step = |seen: &mut Seen| {
+    let step = |seen: &mut Seen| {
         let now = started.elapsed();
         if seen.first.is_none() {
             seen.first = look(first);
