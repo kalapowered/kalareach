@@ -277,6 +277,7 @@ fn readers_and_system_shell() -> Vec<Reader> {
 }
 
 /// The shell readers of [`readers_and_system_shell`], made with no look for PowerShell.
+#[cfg(unix)]
 fn shell_readers_and_system_shell() -> Vec<Reader> {
     let mut readers = shell_readers();
     if system_shell().is_some() {
