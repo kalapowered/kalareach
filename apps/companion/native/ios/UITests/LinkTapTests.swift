@@ -37,6 +37,17 @@ final class LinkTapTests: HarnessTestCase {
         /// At a pointer down and at a click: the name of the link that the page's press handling had lit by then, or nil.
         /// The click's is the look at the click, which plain text gets only there; a press on plain text lights nothing.
         let lit: String?
+        /// The page's clock when the record read the event, in milliseconds: the clock of the page's own press handling.
+        let at: Double?
+    }
+
+    /// One change of the pressed look that the page saw: a link got it (`on`) or lost it, after the event with the
+    /// number `after`, at `at` milliseconds on the page's clock.
+    private struct Look: Hashable {
+        let after: Int
+        let on: Bool
+        let name: String
+        let at: Double
     }
 
     /// One link of the conversation as the page lays it out now: its box, the rectangles of its words and its view,
@@ -59,20 +70,31 @@ final class LinkTapTests: HarnessTestCase {
         tokens.compactMap { Double($0) }.map { CGFloat($0) }
     }
 
-    /// The events of the record, oldest first.
-    private func events() -> [Seen] {
-        recordText("TAPLOG").dropFirst("TAPLOG".count).components(separatedBy: " ; ").compactMap { part in
+    private func time(_ field: Substring) -> Double? {
+        field.hasPrefix("t=") ? Double(field.dropFirst(2)) : nil
+    }
+
+    /// The page's tap record: its events and the changes of the look, oldest first.
+    private func record() -> (events: [Seen], looks: [Look]) {
+        var events: [Seen] = []
+        var looks: [Look] = []
+        for part in recordText("TAPLOG").dropFirst("TAPLOG".count).components(separatedBy: " ; ") {
             let fields = part.split(separator: " ")
+            if fields.count == 5, fields[0] == "V", let after = Int(fields[1]), let at = time(fields[4]) {
+                looks.append(Look(after: after, on: fields[2] == "on", name: String(fields[3]), at: at))
+                continue
+            }
             guard fields.count >= 11, fields[0] == "E", let order = Int(fields[1]), let detail = Int(fields[5]),
                 let x = Double(fields[6]), let y = Double(fields[7])
-            else { return nil }
+            else { continue }
             let lit = fields.count > 11 && fields[11].hasPrefix("lit=") ? String(fields[11].dropFirst(4)) : "-"
-            return Seen(
+            events.append(Seen(
                 order: order, type: String(fields[2]), target: String(fields[3]), trusted: fields[4] == "1", detail: detail,
                 point: CGPoint(x: x, y: y), kind: String(fields[8]), pointer: String(fields[9]), pointerType: String(fields[10]),
-                lit: lit == "-" ? nil : lit
-            )
+                lit: lit == "-" ? nil : lit, at: fields.count > 12 ? time(fields[12]) : nil
+            ))
         }
+        return (events, looks)
     }
 
     /// The links of the conversation, in the page's own units: a point of the page is a point of the screen.
@@ -153,9 +175,13 @@ final class LinkTapTests: HarnessTestCase {
     private struct Result {
         let label: String
         let events: [Seen]
+        let looks: [Look]
         let opened: [String]
         let focus: String
     }
+
+    /// What every tap's release-to-click time was, on the page's clock, for the summary at the run's end.
+    private var clickDelays: [(label: String, delay: Double)] = []
 
     private func screenPoint(_ point: CGPoint, _ shift: CGVector) -> XCUICoordinate {
         app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: point.x + shift.dx, dy: point.y + shift.dy))
@@ -168,7 +194,9 @@ final class LinkTapTests: HarnessTestCase {
     /// from the point than that on either axis, so a calibration that is wrong fails the tap and does not move the samples.
     /// `clickExpected` is false for a press that the platform may leave without a click (a long press).
     private func tap(_ label: String, at point: CGPoint, shift: CGVector, hold: TimeInterval = 0, clickExpected: Bool = true, within tolerance: CGFloat? = nil) -> Result {
-        let before = events().last?.order ?? 0
+        let first = record()
+        let before = first.events.last?.order ?? 0
+        let looksBefore = Set(first.looks)
         let openedBefore = opened().count
         if hold > 0 {
             screenPoint(point, shift).press(forDuration: hold)
@@ -176,9 +204,10 @@ final class LinkTapTests: HarnessTestCase {
             screenPoint(point, shift).tap()
         }
         Thread.sleep(forTimeInterval: 1.2)
-        let seen = events().filter { $0.order > before }
+        let last = record()
+        let seen = last.events.filter { $0.order > before }
         let now = opened()
-        let result = Result(label: label, events: seen, opened: Array(now.dropFirst(openedBefore)), focus: recordText("TAPFOCUS"))
+        let result = Result(label: label, events: seen, looks: last.looks.filter { !looksBefore.contains($0) }, opened: Array(now.dropFirst(openedBefore)), focus: recordText("TAPFOCUS"))
         report(result, at: point)
         if let tolerance {
             if let down = seen.first(where: { $0.type == "pointerdown" }) {
@@ -199,25 +228,60 @@ final class LinkTapTests: HarnessTestCase {
 
     /// Drags from a point of the page to another, slowly enough for the page to scroll with the finger.
     private func drag(_ label: String, from point: CGPoint, by distance: CGVector, shift: CGVector) -> Result {
-        let before = events().last?.order ?? 0
+        let first = record()
+        let before = first.events.last?.order ?? 0
+        let looksBefore = Set(first.looks)
         let openedBefore = opened().count
         let start = screenPoint(point, shift)
         let end = screenPoint(CGPoint(x: point.x + distance.dx, y: point.y + distance.dy), shift)
         // A swipe at the system's own speed, which the page takes for a scroll.
         start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .default, thenHoldForDuration: 0)
         Thread.sleep(forTimeInterval: 1.2)
-        let seen = events().filter { $0.order > before }
-        let result = Result(label: label, events: seen, opened: Array(opened().dropFirst(openedBefore)), focus: "\(recordText("TAPFOCUS")) scrolled \(Int(pane().top))")
+        let last = record()
+        let seen = last.events.filter { $0.order > before }
+        let result = Result(label: label, events: seen, looks: last.looks.filter { !looksBefore.contains($0) }, opened: Array(opened().dropFirst(openedBefore)), focus: "\(recordText("TAPFOCUS")) scrolled \(Int(pane().top))")
         report(result, at: point)
         return result
     }
 
     /// Says what one tap did, one line, where the run's log can be read for it.
     private func report(_ result: Result, at point: CGPoint) {
+        if let delay = releaseToClick(result) { clickDelays.append((result.label, delay)) }
         let list = result.events.map {
             "\($0.type)(\($0.target),\($0.trusted ? "trusted" : "synthetic"),detail \($0.detail),\($0.kind) pointer \($0.pointer) \($0.pointerType),at \(String(format: "%.1f %.1f", $0.point.x, $0.point.y)))"
         }.joined(separator: " ")
-        say("LINKTAP \(result.label) at (\(Int(point.x)), \(Int(point.y))): \(list.isEmpty ? "no events" : list) | the click named: \(named(result)) | lit at the press: \(pressLook(result) ?? "nothing") | lit at the click: \(clickLook(result) ?? "nothing") | press-to-click(\(clickKind(result))): \(away(result).map { String(format: "%.1f", $0) } ?? "no click") | pointer point off by \(pointerOff(result, at: point)) | opened: \(result.opened.isEmpty ? "nothing" : result.opened.joined(separator: " ")) | \(result.focus)")
+        say("LINKTAP \(result.label) at (\(Int(point.x)), \(Int(point.y))): \(list.isEmpty ? "no events" : list) | the click named: \(named(result)) | lit at the press: \(pressLook(result) ?? "nothing") | lit at the click: \(clickLook(result) ?? "nothing") | press-to-click(\(clickKind(result))): \(away(result).map { String(format: "%.1f", $0) } ?? "no click") | \(timing(result)) | pointer point off by \(pointerOff(result, at: point)) | opened: \(result.opened.isEmpty ? "nothing" : result.opened.joined(separator: " ")) | \(result.focus)")
+    }
+
+    /// How long after the pointer's release the system's click came, in milliseconds on the page's clock, or nil where
+    /// no click came. A click later than the look's hold (150 ms) after the release finds the look gone and lights it again.
+    private func releaseToClick(_ result: Result) -> Double? {
+        guard let up = result.events.first(where: { $0.type == "pointerup" })?.at,
+            let click = result.events.first(where: { $0.type == "click" && $0.trusted })?.at
+        else { return nil }
+        return click - up
+    }
+
+    /// The page's clock at the release and the click, in milliseconds after the press, and when the look went on and off.
+    private func timing(_ result: Result) -> String {
+        let down = result.events.first(where: { $0.type == "pointerdown" })?.at
+        func since(_ at: Double?) -> String {
+            guard let at, let down else { return "-" }
+            return String(format: "%.1f", at - down)
+        }
+        let up = result.events.first(where: { $0.type == "pointerup" })?.at
+        let click = result.events.first(where: { $0.type == "click" && $0.trusted })?.at
+        let looks = result.looks.map { "\($0.on ? "on" : "off")(\($0.name)) \(since($0.at))" }.joined(separator: ", ")
+        let delay = releaseToClick(result).map { String(format: "%.1f", $0) } ?? "no click"
+        return "page clock, ms after the press: release \(since(up)), click \(since(click)), release-to-click \(delay) | looks: \(looks.isEmpty ? "none" : looks)"
+    }
+
+    /// Says how long every tap of the run took from its release to its click, and how many were later than the hold.
+    private func summarizeClickDelays(_ named: String) {
+        let late = clickDelays.filter { $0.delay > 150 }
+        let detail = late.map { "\($0.label) \(String(format: "%.1f", $0.delay))" }.joined(separator: "; ")
+        let largest = clickDelays.map(\.delay).max().map { String(format: "%.1f", $0) } ?? "none"
+        say("LINKTAP \(named): release-to-click on the page's clock: \(clickDelays.count) taps got a click, largest \(largest) ms, later than 150 ms: \(late.count) \(detail)")
     }
 
     /// What the system's click landed on, for the two distances that are logged apart: `element` (a link's button or another
@@ -505,6 +569,7 @@ final class LinkTapTests: HarnessTestCase {
         }
         let atBottom = tap("\(named): the pane's bottom row", at: CGPoint(x: words.midX, y: room.maxY - 1), shift: shift)
         XCTAssertTrue(atBottom.opened.isEmpty, "\(atBottom.label): opened \(atBottom.opened)")
+        summarizeClickDelays(named)
     }
 
     /// The link on the conversation's last line, at the end of the conversation: the pane's bottom cuts the area under its words.
@@ -514,6 +579,7 @@ final class LinkTapTests: HarnessTestCase {
         say("LINKTAP size \(named)")
         scrollToEnd()
         tapAround(link("last-line"), named: named)
+        summarizeClickDelays(named)
     }
 
 
@@ -708,6 +774,202 @@ final class LinkTapTests: HarnessTestCase {
             focused.focus.contains("active=div.m-pane") || focused.focus.contains("active=button.md-link(reconnect)"),
             "\(focused.label): the focus is \(focused.focus)"
         )
+        summarizeClickDelays(named)
+    }
+
+    // MARK: The look
+
+    /// The distance from a point to a rectangle, zero inside it.
+    private func distance(from point: CGPoint, to rect: CGRect) -> CGFloat {
+        hypot(max(rect.minX - point.x, 0, point.x - rect.maxX), max(rect.minY - point.y, 0, point.y - rect.maxY))
+    }
+
+    /// The link whose words lie nearest a point, which is what the page's rule picks on plain text.
+    private func nearest(_ point: CGPoint, among all: [Link]) -> String? {
+        func gap(_ link: Link) -> CGFloat { link.words.map { distance(from: point, to: $0) }.min() ?? .infinity }
+        return all.min { gap($0) < gap($1) }?.name
+    }
+
+    /// A tap on plain text that opens a link: no look before the release, and the look stays at least 150 ms from the click
+    /// (the page's clock; the look's end is the first change after the click).
+    private func expectTheLookAtTheRelease(_ result: Result, _ name: String, file: StaticString = #filePath, line: UInt = #line) {
+        guard let down = result.events.first(where: { $0.type == "pointerdown" }),
+            let up = result.events.first(where: { $0.type == "pointerup" })?.at,
+            let click = result.events.first(where: { $0.type == "click" && $0.trusted })?.at
+        else {
+            XCTFail("\(result.label): the record has no press, release or click with a time", file: file, line: line)
+            return
+        }
+        guard let firstOn = result.looks.first(where: { $0.on && $0.name == name }) else {
+            XCTFail("\(result.label): the look never went on for \(name): \(result.looks)", file: file, line: line)
+            return
+        }
+        if isPlainText(down.target) {
+            XCTAssertGreaterThanOrEqual(firstOn.at, up, "\(result.label): the look went on before the release of a press on plain text", file: file, line: line)
+        }
+        if let off = result.looks.first(where: { !$0.on && $0.name == name && $0.at > click }) {
+            XCTAssertGreaterThanOrEqual(off.at - click, 140, "\(result.label): the look ended \(off.at - click) ms after the click", file: file, line: line)
+        } else {
+            XCTFail("\(result.label): the look did not end after the click: \(result.looks)", file: file, line: line)
+        }
+    }
+
+    /// A press held on plain text: no look at touch-down, none at the end of the hold, none turned on between.
+    private func expectNoLookDuringTheHold(_ result: Result, file: StaticString = #filePath, line: UInt = #line) {
+        guard let down = result.events.first(where: { $0.type == "pointerdown" }),
+            let up = result.events.first(where: { $0.type == "pointerup" })
+        else {
+            XCTFail("\(result.label): the record has no press or release", file: file, line: line)
+            return
+        }
+        XCTAssertNil(down.lit, "\(result.label): the look at touch-down", file: file, line: line)
+        XCTAssertNil(up.lit, "\(result.label): the look at the end of the hold", file: file, line: line)
+        let during = result.looks.filter { $0.on && $0.at <= (up.at ?? .infinity) }
+        XCTAssertTrue(during.isEmpty, "\(result.label): the look went on during the hold: \(during)", file: file, line: line)
+        if let from = down.at, let to = up.at { XCTAssertGreaterThan(to - from, 800, "\(result.label): the press was held \(to - from) ms", file: file, line: line) }
+    }
+
+    /// What a tap between links did, for the log: the press's target, the click's, the link the nearest-words rule picks at the
+    /// press's point, and whether the click named another link. The light and the opening are held by `tap` (the look at the
+    /// click is the link that opens); here at most one link opens, and a click that names a link opens that link.
+    private func judge(_ result: Result, among all: [Link], what: String) -> (opens: String?, other: Bool) {
+        guard let down = result.events.first(where: { $0.type == "pointerdown" }), let click = result.events.first(where: { $0.type == "click" && $0.trusted }) else {
+            say("LINKLOOK \(what): no press or no trusted click: \(result.events.map(\.type))")
+            return (nil, false)
+        }
+        let named = click.target.contains("md-link") ? linkName(of: click.target) : nil
+        let pick = nearest(down.point, among: all)
+        let other = named != nil && named != pick
+        XCTAssertLessThanOrEqual(result.opened.count, 1, "\(result.label): the links that opened: \(result.opened)")
+        if let named { XCTAssertTrue(result.opened.count == 1 && result.opened[0].hasSuffix("/" + named), "\(result.label): the click named \(named), opened \(result.opened)") }
+        let opens = result.opened.last.map { String($0.split(separator: "/").last ?? "") }
+        say("LINKLOOK \(what): press target \(down.target) at \(String(format: "%.2f %.2f", down.point.x, down.point.y)), click target \(click.target), nearest words \(pick ?? "none"), the click named the other link: \(other), lit at the press \(down.lit ?? "nothing"), lit at the click \(click.lit ?? "nothing"), opened \(opens ?? "nothing")")
+        return (opens, other)
+    }
+
+    /// The look at every point of one text size that the part (a) rule gives it: touch-down on a link's words, no look under a
+    /// held press 15 px past the words, the look at the release, two stacked links where the click names the other link, a
+    /// sub-pixel walk across the border of two links, and a touch in the gap below the pane next to a link at the pane's edge.
+    private func runLook(size: String?, named: String) {
+        continueAfterFailure = true
+        start(size: size)
+        say("LINKTAP size \(named)")
+
+        // The look at touch-down: a press on a link's own words lights the link at once, and it has the look at the click.
+        let table1 = scroll(to: "table-1")
+        let onWords = table1.words[0]
+        let touched = tap("\(named): look at touch-down: a press on the link's words", at: CGPoint(x: onWords.midX, y: onWords.midY), shift: offset(of: table1))
+        expectOpened(touched, "table-1")
+        XCTAssertEqual(pressLook(touched), "table-1", "\(touched.label): the look at touch-down")
+        XCTAssertEqual(clickLook(touched), "table-1", "\(touched.label): the look at the click")
+        say("LINKLOOK \(named): touch-down on the words: press look \(pressLook(touched) ?? "nothing"), click look \(clickLook(touched) ?? "nothing"); \(timing(touched))")
+
+        // The release: plain text 16 to 20 px past a link's words gets no look at touch-down, and the link that opens has it from the click.
+        _ = scroll(to: "docs")
+        for beside in [16, 18, 20] as [CGFloat] {
+            let docs = link("docs")
+            let words = docs.words[docs.words.count - 1]
+            let released = tap("\(named): look at the release: plain text \(Int(beside)) px past the words", at: CGPoint(x: words.maxX + beside, y: words.midY), shift: offset(of: docs))
+            expectOpened(released, "docs")
+            expectTheLookAtTheRelease(released, "docs")
+            say("LINKLOOK \(named): release after a press \(Int(beside)) px past the words: press look \(pressLook(released) ?? "nothing"), click look \(clickLook(released) ?? "nothing"); \(timing(released))")
+        }
+
+        // A press held 15 px past the words: no look while the finger is down.
+        let docs = link("docs")
+        let past = docs.words[docs.words.count - 1]
+        let held = tap("\(named): a held press 15 px past the words", at: CGPoint(x: past.maxX + 15, y: past.midY), shift: offset(of: docs), hold: 1.0, clickExpected: false)
+        expectNoLookDuringTheHold(held)
+        say("LINKLOOK \(named): held press 15 px past the words: press look \(pressLook(held) ?? "nothing"), look before the release \(held.events.first(where: { $0.type == "pointerup" })?.lit ?? "nothing"), opened \(held.opened.isEmpty ? "nothing" : held.opened.joined(separator: " ")); \(timing(held))")
+
+        walkBetweenStackedLinks(named: named)
+        tapBelowThePane(named: named)
+        summarizeClickDelays(named)
+    }
+
+    /// Two links on lines one above the other: a sweep of points between their lines, then a walk in quarter points across the
+    /// place where the click's link changes. At every tap the light and the opening are the same link (`tap` holds it).
+    private func walkBetweenStackedLinks(named: String) {
+        var upper = scroll(to: "upper")
+        var shift = offset(of: upper)
+        let first = upper.words[0]
+        let calibration = tap("\(named): stacked links: the upper link's words, to place the taps", at: CGPoint(x: first.minX + min(12, first.width / 2), y: first.midY), shift: shift, within: 4)
+        if let down = calibration.events.first(where: { $0.type == "pointerdown" }) {
+            shift = CGVector(dx: shift.dx + first.minX + min(12, first.width / 2) - down.point.x, dy: shift.dy + first.midY - down.point.y)
+        }
+        expectOpened(calibration, "upper")
+        upper = link("upper")
+        let lower = link("lower")
+        let top = upper.words[upper.words.count - 1]
+        let bottom = lower.words[0]
+        let all = links()
+        let left = max(top.minX, bottom.minX)
+        let right = min(top.maxX, bottom.maxX)
+        let columns: [CGFloat] = right - left > 30 ? [left + 12, (left + right) / 2, right - 12] : [(left + right) / 2]
+        let middle = columns[columns.count / 2]
+        say("LINKLOOK \(named): stacked links: the upper link's last line \(top), the lower link's first line \(bottom), columns \(columns)")
+        var taps = 0
+        var other = 0
+        var owners: [(y: CGFloat, name: String?)] = []
+        let rows = 9
+        for row in 0..<rows {
+            let y = top.midY + (bottom.midY - top.midY) * CGFloat(row) / CGFloat(rows - 1)
+            for (index, x) in columns.enumerated() {
+                let what = "\(named): stacked links, sweep row \(row) of \(rows - 1), column \(index)"
+                let result = tap(what, at: CGPoint(x: x, y: y), shift: shift, within: 4)
+                let verdict = judge(result, among: all, what: what)
+                taps += 1
+                if verdict.other { other += 1 }
+                if x == middle { owners.append((y, verdict.opens)) }
+            }
+        }
+        say("LINKLOOK \(named): stacked links sweep: \(taps) taps, \(other) at which the click named another link than the nearest words")
+        // The border: where the middle column's opened link first changes from one link to the next, or the middle of the gap.
+        var border = (top.maxY + bottom.minY) / 2
+        for (before, after) in zip(owners, owners.dropFirst()) where before.name != nil && after.name != nil && before.name != after.name {
+            border = (before.y + after.y) / 2
+            break
+        }
+        var walk: [String] = []
+        var walkOther = 0
+        for step in -4...4 {
+            let y = border + CGFloat(step) * 0.25
+            let what = "\(named): stacked links, walk across the border, \(String(format: "%+.2f", Double(step) * 0.25)) px from \(String(format: "%.2f", Double(border)))"
+            let result = tap(what, at: CGPoint(x: middle, y: y), shift: shift, within: 4)
+            let verdict = judge(result, among: all, what: what)
+            if verdict.other { walkOther += 1 }
+            walk.append(verdict.opens ?? "nothing")
+        }
+        say("LINKLOOK \(named): stacked links walk: the link that opened at each of nine steps of a quarter point: \(walk.joined(separator: " ")); \(walkOther) at which the click named another link than the nearest words")
+    }
+
+    /// A touch in the gap below the pane, next to the link at the pane's lower edge: the click that WebKit moves onto the link
+    /// opens it, and it has the look at the click.
+    private func tapBelowThePane(named: String) {
+        scrollToEnd()
+        let last = link("last-line")
+        let shift = offset(of: last)
+        let room = pane().room
+        let words = last.words[last.words.count - 1]
+        let composerTop = composer.frame.minY - shift.dy
+        let gap = composerTop - room.maxY
+        say("LINKLOOK \(named): the gap below the pane: the pane ends at \(room.maxY), the composer's frame starts at \(composerTop), \(gap) px between them; the last link's words \(words)")
+        XCTAssertGreaterThan(gap, 3, "\(named): no gap below the pane to tap in")
+        let all = links()
+        var moved = 0
+        for below in [1, 3, 5, 7, 9, 11] as [CGFloat] where below < gap - 1 {
+            let what = "\(named): the gap, \(Int(below)) px below the pane, next to the last link"
+            let result = tap(what, at: CGPoint(x: words.midX, y: room.maxY + below), shift: shift, clickExpected: false)
+            _ = judge(result, among: all, what: what)
+            if let click = result.events.first(where: { $0.type == "click" && $0.trusted }), click.target.contains("md-link") {
+                moved += 1
+                XCTAssertEqual(clickLook(result), "last-line", "\(what): the look at the click that the engine moved onto the link")
+            } else {
+                XCTAssertTrue(result.opened.isEmpty, "\(what): opened \(result.opened) with a click that did not name the link")
+            }
+        }
+        say("LINKLOOK \(named): the gap below the pane: \(moved) taps at which the click named the last link")
+        XCTAssertGreaterThan(moved, 0, "\(named): no tap in the gap below the pane got a click that named the link at the pane's edge")
     }
 
     func testTapsAtTheDefaultTextSize() {
@@ -732,5 +994,13 @@ final class LinkTapTests: HarnessTestCase {
 
     func testTheLastLineAtTheLargestTextSize() {
         runLastLine(size: Self.largest, named: "largest size")
+    }
+
+    func testTheLookAtTheDefaultTextSize() {
+        runLook(size: nil, named: "default size")
+    }
+
+    func testTheLookAtTheLargestTextSize() {
+        runLook(size: Self.largest, named: "largest size")
     }
 }
