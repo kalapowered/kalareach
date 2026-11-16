@@ -145,11 +145,10 @@ fn is_raw_string(bytes: &[char], at: usize) -> bool {
 
 /// Whether the quote at `at` opens a character literal and not a lifetime.
 fn is_char_literal(bytes: &[char], at: usize) -> bool {
-    match (bytes.get(at + 1), bytes.get(at + 2)) {
-        (Some('\\'), _) => true,
-        (Some(_), Some('\'')) => true,
-        _ => false,
-    }
+    matches!(
+        (bytes.get(at + 1), bytes.get(at + 2)),
+        (Some('\\'), _) | (Some(_), Some('\''))
+    )
 }
 
 /// Blanks every `#[cfg(test)]` module, so that a call a test makes is not a shipped one.
