@@ -1848,9 +1848,9 @@ const AUTHORITY_ENDED_PAGE: &str = "This host's authority for this sign-in ended
 /// What the browser is shown when the same happened and the revocation reached neither the service
 /// nor the queue.
 const AUTHORITY_ENDED_REVOCATION_OWED_PAGE: &str = "This host's authority for this sign-in ended \
-     while the sign-in waited for you. Nothing was signed in. The host could not yet revoke what the \
-     account service issued. The host tries again the next time it uses the account, and what was \
-     issued ends by itself when it expires. To sign in, start again on the host.";
+     while the sign-in waited for you. Nothing was signed in. The host could not confirm that the \
+     account service revoked what it issued. What was issued ends by itself when it expires. To \
+     sign in, start again on the host.";
 
 /// What the browser is shown when a call opened while a sign-in's code was exchanged.
 const CALL_OPEN_PAGE: &str = "A voice call is open on this host. End it, then sign in again.";
@@ -1858,20 +1858,28 @@ const CALL_OPEN_PAGE: &str = "A voice call is open on this host. End it, then si
 /// What the browser is shown when the same happened and the revocation of what the service issued
 /// reached neither the service nor the queue.
 const CALL_OPEN_REVOCATION_OWED_PAGE: &str = "A voice call is open on this host. End it, then sign \
-     in again. The host could not yet revoke what the account service issued. The host tries again \
-     the next time it uses the account, and what was issued ends by itself when it expires.";
+     in again. The host could not confirm that the account service revoked what it issued. What \
+     was issued ends by itself when it expires.";
+
+/// What the browser is shown when the grant could not be kept and the revocation of what the
+/// service issued was queued or sent.
+const NOT_KEPT_PAGE: &str = "This host could not keep the sign-in.";
 
 /// What the browser is shown when the grant could not be kept and the revocation of what the
 /// service issued reached neither the service nor the queue.
 const NOT_KEPT_REVOCATION_OWED_PAGE: &str = "This host could not keep the sign-in. The host could \
-     not yet revoke what the account service issued. The host tries again the next time it uses \
-     the account, and what was issued ends by itself when it expires.";
+     not confirm that the account service revoked what it issued. What was issued ends by itself \
+     when it expires.";
+
+/// What the browser is shown when the service refused the exchange after issuing a token, and the
+/// revocation of that token was queued or sent.
+const SERVICE_REFUSED_PAGE: &str = "The account service did not sign this host in.";
 
 /// What the browser is shown when the service refused the exchange after issuing a token, and the
 /// revocation of that token reached neither the service nor the queue.
 const SERVICE_REFUSED_REVOCATION_OWED_PAGE: &str = "The account service did not sign this host in. \
-     The host could not yet revoke what the account service issued. The host tries again the next \
-     time it uses the account, and what was issued ends by itself when it expires.";
+     The host could not confirm that the account service revoked what it issued. What was issued \
+     ends by itself when it expires.";
 
 /// The words of the one paragraph in the page the daemon answered a browser with, which is the
 /// whole of what the page tells the person.
@@ -2273,6 +2281,52 @@ async fn a_sign_in_the_service_refuses_after_issuing_a_token_owes_a_revocation_t
             .any(|request| request.path == "/auth/oauth2/revoke"
                 && request.body["token"] == broker.refresh(2).as_str()),
         "the token was sent to the service at once, and refused"
+    );
+    std::fs::remove_dir(&queue).expect("the queue's place is given back");
+    host.stop().await;
+}
+
+/// KR-REQ-17.23: a sign-in the service refuses after issuing a token, whose revocation the queue
+/// cannot take and the service takes by a send of the token alone, is not owed: the revocation is
+/// ended. The same order as the case above with a service that takes the revocation: the queue
+/// cannot be read from the moment the exchange is held. The attempt is reported as refused by the
+/// service, the token was ended at the service, and the browser is shown the whole of the plain
+/// page, with none of the owed sentences.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_the_service_refuses_after_issuing_a_token_the_queue_cannot_take_shows_the_plain_page()
+ {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    listen_for_sign_ins(&host);
+    sign_in_with(&host, broker.issue_grant(600)).await;
+    let (url, address) = start_sign_in(&host).await;
+    broker.expect_sign_in(&url);
+    let kept = account_item_in(&host.tree().environment().secrets_dir(), "session");
+    let queue = kept.with_file_name("revoke");
+    broker.answer_with_another_nonce();
+    let exchange = broker.hold("/auth/oauth2/token");
+
+    let (page, ()) = tokio::join!(browser_answers(&address, &url, "the-code"), async {
+        exchange.reached().await;
+        std::fs::create_dir(&queue).expect("a directory in the queue's place");
+        exchange.release();
+    });
+    let report = settled(&host).await;
+    assert_eq!(
+        page_words(&page),
+        SERVICE_REFUSED_PAGE,
+        "the revocation is not owed, so the browser is told of the refusal alone"
+    );
+    assert_eq!(
+        report.last_attempt.as_ref(),
+        Some(&AccountAttempt::ServiceRefused)
+    );
+    assert_eq!(
+        broker.revoked(),
+        [broker.refresh(2)],
+        "the token was ended at the service by a send of its own"
     );
     std::fs::remove_dir(&queue).expect("the queue's place is given back");
     host.stop().await;
@@ -3279,7 +3333,9 @@ async fn a_turned_away_grant_the_queue_cannot_hold_is_still_sent_to_the_service(
 }
 
 /// KR-REQ-17.23: a sign-in the host cannot keep (its store cannot be read where the grant goes) is
-/// ended at the service: the token the exchange brought is queued or sent, and not dropped.
+/// ended at the service: the token the exchange brought is queued or sent, and not dropped. The
+/// queue's send fails at the grant's read and the token's own send is taken, so the revocation is
+/// not owed and the browser is shown the whole of the plain page, with none of the owed sentences.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sign_in_the_host_cannot_keep_is_sent_to_the_service_to_be_ended() {
     let broker = Broker::start().await;
@@ -3298,8 +3354,13 @@ async fn a_sign_in_the_host_cannot_keep_is_sent_to_the_service_to_be_ended() {
     std::fs::remove_file(&kept).expect("the grant is set aside");
     std::fs::create_dir(&kept).expect("a directory in its place");
 
-    let _ = browser_answers(&address, &url, "the-code").await;
+    let page = browser_answers(&address, &url, "the-code").await;
     let report = settled(&host).await;
+    assert_eq!(
+        page_words(&page),
+        NOT_KEPT_PAGE,
+        "the revocation is not owed, so the browser is told of the grant alone"
+    );
     assert_eq!(report.last_attempt.as_ref(), Some(&AccountAttempt::NotKept));
     assert_eq!(
         broker.revoked(),
