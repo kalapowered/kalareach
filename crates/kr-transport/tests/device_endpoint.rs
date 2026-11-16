@@ -784,7 +784,13 @@ async fn the_device_endpoint_sends_no_relay_token() {
     inside.close().await;
 }
 
-/// KR-REQ-10.02: an introduction on a closed endpoint is refused and changes nothing.
+/// KR-REQ-10.02: an introduction on a closed endpoint is refused and changes nothing: the map
+/// keeps its relays, and the host is not recorded either.
+///
+/// The record is read through the gate on the task that sets the map. `forget` starts that task
+/// for a host that the table holds with relays and for no other, so a hold that a `forget` of B
+/// does not reach shows that the table does not hold B, and a `forget` of A, which was
+/// introduced, reaches it, so the hold does see a recorded host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_closed_device_endpoint_refuses_an_introduction() {
     let (r1, r2) = (LocalRelay::spawn().await, LocalRelay::spawn().await);
@@ -805,6 +811,21 @@ async fn a_closed_device_endpoint_refuses_an_introduction() {
         BTreeSet::from([r1.url.clone()]),
         "B's relay did not enter the map"
     );
+
+    let (key_a, key_b) = (a.key(), b.key());
+    let mut hold = device.hold_next_map_task();
+    tokio::select! {
+        biased;
+        forgotten = device.forget(&key_b) => {
+            forgotten.expect("forgetting a host that is not recorded");
+        }
+        () = hold.reached() => panic!("B was recorded: forgetting it started a task for its relay"),
+    }
+    tokio::select! {
+        biased;
+        _ = device.forget(&key_a) => panic!("A's task ended while the hold is on it"),
+        () = hold.reached() => {}
+    }
 }
 
 /// KR-REQ-10.02: a caller that stops waiting for an introduction leaves the change to finish. The
@@ -870,5 +891,35 @@ async fn a_forgotten_hosts_relay_is_not_put_back_by_an_earlier_introduction() {
         "the late task did not put B's relay back"
     );
     assert_registry_has_nothing_for(&device, b.id()).await;
+    device.close().await;
+}
+
+/// What a task that ended in a panic said, for a case that expects the panic.
+fn panic_message(ended: Result<(), tokio::task::JoinError>) -> String {
+    let payload = ended.expect_err("the task ended in a panic").into_panic();
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_default()
+}
+
+/// KR-REQ-10.02: a hold that the gate dropped fails both of its waits where the case sees it,
+/// instead of letting the case go on as if a task had been held. Arming a second hold drops the
+/// hold that was armed before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hold_that_the_gate_dropped_fails_both_its_waits() {
+    let device = device(&[], false).await;
+    let mut for_reached = device.hold_next_map_task();
+    let for_release = device.hold_next_map_task();
+    let _last = device.hold_next_map_task();
+
+    let waiting = tokio::spawn(async move { for_reached.reached().await });
+    let message = panic_message(waiting.await);
+    assert!(message.contains("gate dropped the hold"), "{message:?}");
+
+    let releasing = tokio::spawn(for_release.release());
+    let message = panic_message(releasing.await);
+    assert!(message.contains("gate dropped the hold"), "{message:?}");
     device.close().await;
 }
