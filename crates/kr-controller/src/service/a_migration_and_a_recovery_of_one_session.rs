@@ -346,13 +346,14 @@ fn take_closures_again(controller: &Controller) {
 /// A worker that ended after the account it gave when it was asked to close, with a registry that
 /// refused the write that records it.
 struct AccountThatWasRefused {
-    _temp: TempHost,
     controller: std::sync::Arc<Controller>,
     session_id: SessionId,
     display: DisplayNumber,
     /// What the worker said of its closure: volatile, and not what this daemon would write of a
     /// worker that left nothing.
     account: ClosureRecord,
+    /// Declared last: the directory is removed after everything that holds a file in it.
+    _temp: TempHost,
 }
 
 /// Puts a directory back as it was, whatever the case ends with.
