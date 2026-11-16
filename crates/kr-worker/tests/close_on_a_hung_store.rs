@@ -38,12 +38,12 @@ use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
 use kr_protocol::scalars::Nullable;
 use kr_protocol::session::{
-    Dimensions, DisplayNumber, SessionCloseParams, SessionCloseResult, SessionReadParams,
-    SessionReadResult, SessionState, ShellMode,
+    ApplicationState, Dimensions, DisplayNumber, SessionCloseParams, SessionCloseResult,
+    SessionReadParams, SessionReadResult, SessionState, ShellMode,
 };
 use kr_shell_integration::contract::fence::LeaseView;
 use kr_shell_integration::contract::requests::LaunchTransactionId;
-use kr_worker::application::{Evidence, Holder, Producer};
+use kr_worker::application::{Holder, Producer};
 use kr_worker::fence::FenceDriver;
 use kr_worker::published::TAKE_BOUND;
 use kr_worker::runtime::SessionRuntime;
@@ -903,6 +903,7 @@ async fn a_read_of_a_held_session_says_what_the_application_is_doing_and_the_lau
     ));
     let producer = Producer::new(Arc::downgrade(&host.runtime));
     producer.observe_holder(Holder::Program(Some("an editor".to_owned())));
+    producer.settle();
     let named = host.runtime.published().latest();
     assert_eq!(named.application.as_deref(), Some("an editor"));
     assert_eq!(named.application_state.0, None);
@@ -914,10 +915,8 @@ async fn a_read_of_a_held_session_says_what_the_application_is_doing_and_the_lau
                 .register_launch(LaunchTransactionId::new(kr_ipc::new_uuid()))
         })
         .collect();
-    producer.observe_evidence(Evidence {
-        turn_running: true,
-        ..Evidence::default()
-    });
+    producer.observe_broker(false, true);
+    producer.settle();
     // What the case stands on: the domain holds the state, and the name is the one it was.
     assert_eq!(
         host.runtime.published().latest().application,
@@ -964,44 +963,35 @@ async fn a_read_of_a_held_session_says_what_the_application_is_doing_and_the_lau
     drop(waiting);
 }
 
-/// A turn ends and is published, a storage call then holds the session, and a new turn starts
-/// during the hold. The producer cannot take the session to publish it, but it has written the state
-/// to the input domain, so the read of the held session says the new turn: the host's sleep demand
-/// reads it, and a session that shows no demand under a turn lets the host sleep.
+/// A fact that the producer takes while a storage call holds the session is written where a read of
+/// the held session finds it, and taking it does not wait for the session. The case calls the
+/// producer itself, with no evidence loop and no broker: it shows the producer's own contract and
+/// not the order in which the product's loop meets a hold, which the cases that run the loop show.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_read_of_a_held_session_says_the_turn_that_began_during_the_hold() {
+async fn a_fact_the_producer_takes_during_the_hold_is_in_the_read_of_the_held_session() {
     let host = host().await;
     let producer = Producer::new(Arc::downgrade(&host.runtime));
     producer.observe_holder(Holder::Program(Some("an editor".to_owned())));
-    producer.observe_evidence(Evidence {
-        turn_running: true,
-        ..Evidence::default()
-    });
-    producer.observe_evidence(Evidence::default());
+    producer.observe_broker(false, true);
+    producer.observe_broker(false, false);
+    producer.settle();
     // What the case stands on: the turn has ended and the session says nothing is happening.
     assert_eq!(domain_application_state(&host), None);
     assert_eq!(host.runtime.published().latest().application_state.0, None);
     let (holder, mut reader) = (host.client().await, host.client().await);
     let standing = stall(&host, Stalled::Prune, holder).await;
-    // The new turn starts while the session is held. The producer waits for the session to
-    // publish it, so it runs on a thread of its own, and it has written the state before it waits.
-    let beginning = {
-        let producer = Arc::clone(&producer);
-        std::thread::spawn(move || {
-            producer.observe_evidence(Evidence {
-                turn_running: true,
-                ..Evidence::default()
-            });
-        })
-    };
+    // The new turn is taken while the session is held, and taking it returns at once.
     let began = Instant::now();
-    while domain_application_state(&host).is_none() {
-        assert!(
-            began.elapsed() < CLOSURE_WAIT,
-            "the producer did not write the new turn's state within {CLOSURE_WAIT:?} while the session was held"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    producer.observe_broker(false, true);
+    assert!(
+        began.elapsed() < READ_BOUND,
+        "the producer waited {:?} for the held session to take a fact",
+        began.elapsed()
+    );
+    assert_eq!(
+        domain_application_state(&host),
+        Some(ApplicationState::AgentBusy)
+    );
     let (answered, read) = read_within_its_bound(&mut reader, &host, "held new turn").await;
     let _ = standing.release.send(());
     assert!(
@@ -1014,10 +1004,10 @@ async fn a_read_of_a_held_session_says_the_turn_that_began_during_the_hold() {
     );
     assert_eq!(
         read.session.application_state.0,
-        Some(kr_protocol::session::ApplicationState::AgentBusy),
-        "a held session says the turn that began during the hold"
+        Some(ApplicationState::AgentBusy),
+        "a held session says the turn that the producer took during the hold"
     );
-    beginning.join().expect("the producer's thread ended");
+    producer.settle();
 }
 
 /// A read that names another session is refused whether or not the session is held.

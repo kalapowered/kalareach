@@ -1731,6 +1731,15 @@ impl SessionRuntime {
         }
     }
 
+    /// Returns what is woken when the session has finished closing.
+    ///
+    /// It takes nothing that the session's lock guards, so a task that waits for the end of the
+    /// session with it never waits behind a storage call that holds the session. A wake says to
+    /// read the lifecycle state again, which the input domain holds.
+    pub fn closure_notified(&self) -> impl std::future::Future<Output = ()> + '_ {
+        self.closed.notified()
+    }
+
     /// Waits, for at most `within`, until every attachment has been sent how the session closed.
     ///
     /// Returns whether all of them were. Each attachment is sent the record on its own stream,
