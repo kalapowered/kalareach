@@ -533,30 +533,34 @@ fn ask_with<T>(
         return Ending::NotStarted;
     };
     let deadline = std::time::Instant::now() + allowed;
-    let status = loop {
+    let waited = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
+            Ok(Some(status)) => break Ok(Some(status)),
             Ok(None) => {}
-            Err(_) => break None,
+            Err(error) => break Err(error),
         }
         if std::time::Instant::now() >= deadline {
-            break None;
+            break Ok(None);
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     };
-    let ending = match status {
+    let ending = match waited {
+        // This host could not wait for the program: whether it answered, ended or is running is
+        // not known, so nothing is read and nothing is ended (the program is not necessarily this
+        // host's child any more).
+        Err(error) => Ending::WaitFailed(HostFault::new(program.executable.clone(), error)),
         // A program that did not finish answered nothing, so nothing is read: a descendant can
-        // still be writing, and half an answer is worse than none. One that is ended here, because
-        // it outlasted its time or because this host could not wait for it, is reaped.
-        None => {
+        // still be writing, and half an answer is worse than none. One that outlasted its time is
+        // ended and reaped here.
+        Ok(None) => {
             let _ = child.kill();
             let _ = child.wait();
             Ending::TimedOut
         }
         // A successful one is read up to a bound.
-        Some(status) if status.success() => read_answer(&said, understand),
-        Some(status) if status.code().is_some() => Ending::Failed,
-        Some(_) => Ending::Signalled,
+        Ok(Some(status)) if status.success() => read_answer(&said, understand),
+        Ok(Some(status)) if status.code().is_some() => Ending::Failed,
+        Ok(Some(_)) => Ending::Signalled,
     };
     let _ = std::fs::remove_dir_all(&directory);
     ending
@@ -5474,9 +5478,9 @@ mod tests {
     /// Each question that a stand-in makes end in each of the ways that it can make, with a short
     /// time to answer, ends in what [`conclude`] gives for that way at that question: the same
     /// refusal, or this host's failure of the same file and kind. The ways that this case does not
-    /// make are named: a call that cannot be prepared needs a temporary folder that is not one, which
-    /// only a process of its own has, and the install's own table walks it; a wait that fails on a
-    /// child that this host started has no stand-in.
+    /// make need a state of the whole process, which only a run of its own has (a temporary folder
+    /// that is not one, and a signal for an ended child that is ignored), and the install's walk
+    /// makes them: `not_prepared` and `wait_failed`.
     #[cfg(unix)]
     #[test]
     fn each_way_a_question_ends_in_is_what_conclude_says_at_each_question() {

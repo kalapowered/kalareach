@@ -27,11 +27,15 @@ const HEADER: &str = "\
 # questions: profiles (where PowerShell's two profiles are: said alone, because no profile is known yet), placement (where the entry goes in a profile)
 #   and check (the check of the profile with the entry in it), the last two said behind the profile that they concern (here /home/person/profile.ps1).
 # ways: used (the answer is read and understood), too_long (code 0 and an answer over the limit), not_text (code 0 and an answer that is not text),
-#   wrong_form (code 0 and text that is not in the form that the question asked for), timed_out (no answer in time, and also where this host could not
-#   wait for the program), not_started (the program could not be started), failed (a code other than 0), signalled (ended by a signal),
-#   not_prepared (this host could not prepare the call: its folder, the file for the answer, a file for an input or one of the program's folders) and
-#   unread (code 0 and this host could not read the answer file). A failure of this host names the file and the system's error, with no profile in
-#   front of it, because the profile is not what failed; `/tmp/kr-shell-ask-ID` is the call's folder.
+#   wrong_form (code 0 and text that is not in the form that the question asked for), timed_out (the program did not end in time: it is ended and reaped),
+#   not_started (the program could not be started), failed (a code other than 0), signalled (ended by a signal), wait_failed (this host could not wait for
+#   the program: nothing is known of it, so nothing is read and it is not ended), not_prepared (this host could not prepare the call: its folder, the
+#   file for the answer, a file for an input or one of the program's folders) and unread (code 0 and this host could not read the answer file). A
+#   failure of this host (wait_failed, not_prepared, unread) names the path that failed and the system's error, with no profile in front of it, because
+#   the profile is not what failed; `/tmp/kr-shell-ask-ID` is the call's folder and `/tmp/walk/pwsh` the program that this host could not wait for.
+# what the install leaves: for each row the second section says what a failed question leaves: nothing written for PowerShell at the profile question,
+#   the profile as it was at the other two (the walk compares the home with what it was for every way that it makes), and that the install goes on where
+#   the answer is used.
 # outside the table: the answers that a script gives as refusals of the profile (`kr-refused <code>`), and a placement that is not inside the profile,
 #   are answers that are used; each has its own sentence about the profile, and none depends on how a question ended. This file is made on Unix.
 ";
@@ -67,6 +71,7 @@ fn way_name(way: &Ending<()>) -> &'static str {
         Ending::NotStarted => "not_started",
         Ending::Failed => "failed",
         Ending::Signalled => "signalled",
+        Ending::WaitFailed(_) => "wait_failed",
         Ending::NotPrepared(_) => "not_prepared",
         Ending::Unread(_) => "unread",
     }
@@ -88,7 +93,8 @@ fn way_after(way: &Ending<()>) -> Option<Ending<()>> {
         Ending::TimedOut => Ending::NotStarted,
         Ending::NotStarted => Ending::Failed,
         Ending::Failed => Ending::Signalled,
-        Ending::Signalled => {
+        Ending::Signalled => Ending::WaitFailed(a_failure_of_this_host("/tmp/walk/pwsh", 10)),
+        Ending::WaitFailed(_) => {
             Ending::NotPrepared(a_failure_of_this_host("/tmp/kr-shell-ask-ID", 20))
         }
         Ending::NotPrepared(_) => {
@@ -116,20 +122,24 @@ fn said_for(question: Question, way: Ending<()>) -> String {
     }
 }
 
+/// What the install leaves where `question` ended in `way`: nothing written for PowerShell at the
+/// question that has no profile yet, the profile as it was at the others, and where the answer is
+/// used the install goes on. The walk compares the home with what it was for every way that it makes.
+fn left_after(question: Question, way: Ending<()>) -> &'static str {
+    match (conclude(question, way), question) {
+        (Ok(()), _) => "the install goes on",
+        (Err(_), Question::Profiles) => "nothing written for PowerShell",
+        (Err(_), Question::Placement | Question::Check) => "the profile as it was",
+    }
+}
+
 /// The ways that the walk does not make through the install, with the reason.
-const NOT_MADE: &[(&str, &str)] = &[
-    (
-        "timed_out",
-        "the install gives each question sixty seconds, and each of the three would wait them; a case of kr-shell-integration \
+const NOT_MADE: &[(&str, &str)] = &[(
+    "timed_out",
+    "the install gives each question sixty seconds, and each of the three would wait them; a case of kr-shell-integration \
          ends each question by a limit of 400 ms and compares the error with the one that this table's row comes from, \
          and a case there shows that the install gives each question more than the five seconds of a report",
-    ),
-    (
-        "timed_out (this host could not wait for the program)",
-        "no stand-in makes a failed wait on a child that this host started; the question ends as a time-out does, \
-         the program is ended and reaped, so \"did not answer in time\" is true of it",
-    ),
-];
+)];
 
 /// The table, whole.
 fn the_table() -> String {
@@ -142,6 +152,17 @@ fn the_table() -> String {
                 "question={} way={name} -> {}\n",
                 question_name(question),
                 said_for(question, way)
+            ));
+        }
+    }
+    out.push_str("\n## what the install leaves\n");
+    for question in QUESTIONS {
+        for way in every_way() {
+            let name = way_name(&way);
+            out.push_str(&format!(
+                "question={} way={name} -> {}\n",
+                question_name(question),
+                left_after(question, way)
             ));
         }
     }
@@ -253,6 +274,11 @@ fn stands() -> Vec<Stand> {
             "rm -f \"$(dirname \"$XDG_CACHE_HOME\")/said\"",
         ));
         all.push(own("not_started", "is not there to be started", "exit 0"));
+        all.push(own(
+            "wait_failed",
+            "another thread of the process takes the program's end before this host's wait sees it, so the wait fails (a process of its own)",
+            "exit 0",
+        ));
         all.push(own(
             "not_prepared",
             "the temporary folder is a file, so the call's folder cannot be made (a process of its own)",
@@ -410,7 +436,7 @@ fn the_install_says(
 /// What the install said, as the table says it: the home is `/home/person`, and the call's folder is
 /// `/tmp/kr-shell-ask-ID`, under `temporary`.
 fn as_the_table_says(text: &str, ground: &Ground, temporary: &Path) -> String {
-    let mut text = text.replace(&ground.home.to_string_lossy().into_owned(), "/home/person");
+    let mut text = text.to_owned();
     let prefix = temporary.join("kr-shell-ask-").display().to_string();
     while let Some(at) = text.find(&prefix) {
         let name = at + prefix.len();
@@ -419,7 +445,8 @@ fn as_the_table_says(text: &str, ground: &Ground, temporary: &Path) -> String {
             .map_or(text.len(), |offset| name + offset);
         text.replace_range(at..ends, "/tmp/kr-shell-ask-ID");
     }
-    text
+    text.replace(&ground.home.to_string_lossy().into_owned(), "/home/person")
+        .replace(&ground.root.to_string_lossy().into_owned(), "/tmp/walk")
 }
 
 /// Makes every way that a stand-in can make in this process at every question, through the install,
@@ -429,7 +456,7 @@ fn as_the_table_says(text: &str, ground: &Ground, temporary: &Path) -> String {
 fn the_install_says_what_the_table_says_for_every_way_that_the_walk_makes() {
     let temporary = std::env::temp_dir();
     for stand in stands() {
-        if stand.way == "not_prepared" {
+        if stand.way == "not_prepared" || stand.way == "wait_failed" {
             continue;
         }
         for dry_run in [true, false] {
@@ -509,12 +536,12 @@ fn every_way_of_every_question_is_made_by_the_walk_or_named() {
     }
 }
 
-/// The helper of [`a_call_that_cannot_be_prepared_says_the_file_and_the_error`]: it asks the install
-/// the question that `KR_WALK_QUESTION` names, in a process whose temporary folder is a file, and
-/// writes what the install said.
+/// The helper of [`a_call_that_this_host_cannot_make_says_the_path_and_the_error`]: it asks the
+/// install the question that `KR_WALK_QUESTION` names, in a process of its own, and writes what the
+/// install said.
 #[test]
-#[ignore = "run in a process of its own by a_call_that_cannot_be_prepared_says_the_file_and_the_error"]
-fn the_install_where_the_temporary_folder_is_a_file() {
+#[ignore = "run in a process of its own by a_call_that_this_host_cannot_make_says_the_path_and_the_error"]
+fn the_install_in_a_process_of_its_own() {
     let (Some(root), Some(named)) = (
         std::env::var_os("KR_WALK_ROOT").map(PathBuf::from),
         std::env::var("KR_WALK_QUESTION").ok(),
@@ -525,6 +552,19 @@ fn the_install_where_the_temporary_folder_is_a_file() {
         .into_iter()
         .find(|question| question_name(*question) == named)
         .expect("a question of the table");
+    if std::env::var_os("KR_WALK_REAP").is_some() {
+        // A thread that takes the end of every child of this process, as a program that waits for
+        // any child does. This host's wait for its program then finds no such child (`ECHILD`),
+        // which is the way that a wait for a child that this host started can fail. Nothing else
+        // runs in this process, so no other child is taken.
+        std::thread::spawn(|| {
+            loop {
+                if rustix::process::wait(rustix::process::WaitOptions::empty()).is_err() {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        });
+    }
     let ground = Ground {
         _root: tempfile::tempdir_in(&root).expect("a directory"),
         root: root.clone(),
@@ -535,45 +575,66 @@ fn the_install_where_the_temporary_folder_is_a_file() {
     std::fs::write(root.join("said.txt"), said).expect("writes what was said");
 }
 
-/// A call that this host cannot prepare is said as the failure of this host, the file and the
-/// system's error, at each question. The temporary folder is a file, which only a process of its own
-/// can have: each question is asked in a run of this test program that is given one.
+/// What the install says where this host cannot make a call is the failure of this host, the path
+/// that failed and the system's error, at each question. Two ways need a state of the whole process,
+/// so each question is asked in a run of this test program that is given it:
+///
+/// - `not_prepared`: the temporary folder is a regular file, so the call's folder cannot be made;
+/// - `wait_failed`: another thread of the process takes the end of every child before this host's
+///   wait sees it (`KR_WALK_REAP`), so the wait for the program fails with `ECHILD`. The program
+///   answers rightly after a second and ends with code 0, so a wait that is read as a time-out
+///   would show the sentence for a PowerShell that did not answer, with a complete answer in the
+///   file.
 #[test]
-fn a_call_that_cannot_be_prepared_says_the_file_and_the_error() {
+fn a_call_that_this_host_cannot_make_says_the_path_and_the_error() {
     for stand in stands()
         .into_iter()
-        .filter(|stand| stand.way == "not_prepared")
+        .filter(|stand| stand.way == "not_prepared" || stand.way == "wait_failed")
     {
         let ground = ground();
-        let program = a_program_that(&ground.root, &stand.body);
+        let name = format!("{} {}", question_name(stand.question), stand.way);
+        let body = if stand.way == "wait_failed" {
+            format!("sleep 1\n{}", the_right_answers(&ground.home))
+        } else {
+            stand.body.clone()
+        };
+        let program = a_program_that(&ground.root, &body);
         assert!(program.is_file());
         let temporary = ground.root.join("not-a-folder");
-        std::fs::write(&temporary, "").expect("a file");
-        let ran = std::process::Command::new(std::env::current_exe().expect("this program"))
+        let mut run = std::process::Command::new(std::env::current_exe().expect("this program"));
+        if stand.way == "wait_failed" {
+            run.env("KR_WALK_REAP", "1");
+        } else {
+            std::fs::write(&temporary, "").expect("a file");
+            run.env("TMPDIR", &temporary);
+        }
+        let ran = run
             .args([
                 "--exact",
-                "shell::tests::question_table::the_install_where_the_temporary_folder_is_a_file",
+                "shell::tests::question_table::the_install_in_a_process_of_its_own",
                 "--ignored",
                 "--test-threads=1",
             ])
             .env("KR_WALK_ROOT", &ground.root)
             .env("KR_WALK_QUESTION", question_name(stand.question))
-            .env("TMPDIR", &temporary)
             .stdin(std::process::Stdio::null())
             .output()
             .expect("starts this test program");
         assert!(
             ran.status.success(),
-            "{}: {}",
-            question_name(stand.question),
+            "{name}: {}",
             String::from_utf8_lossy(&ran.stdout)
         );
         let said = std::fs::read_to_string(ground.root.join("said.txt")).expect("what was said");
+        let temporary = if stand.way == "wait_failed" {
+            std::env::temp_dir()
+        } else {
+            temporary
+        };
         assert_eq!(
             as_the_table_says(&said, &ground, &temporary),
-            cell(stand.question, "not_prepared"),
-            "{}",
-            question_name(stand.question)
+            cell(stand.question, stand.way),
+            "{name}"
         );
     }
 }

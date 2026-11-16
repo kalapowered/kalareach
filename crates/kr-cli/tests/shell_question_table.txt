@@ -4,11 +4,15 @@
 # questions: profiles (where PowerShell's two profiles are: said alone, because no profile is known yet), placement (where the entry goes in a profile)
 #   and check (the check of the profile with the entry in it), the last two said behind the profile that they concern (here /home/person/profile.ps1).
 # ways: used (the answer is read and understood), too_long (code 0 and an answer over the limit), not_text (code 0 and an answer that is not text),
-#   wrong_form (code 0 and text that is not in the form that the question asked for), timed_out (no answer in time, and also where this host could not
-#   wait for the program), not_started (the program could not be started), failed (a code other than 0), signalled (ended by a signal),
-#   not_prepared (this host could not prepare the call: its folder, the file for the answer, a file for an input or one of the program's folders) and
-#   unread (code 0 and this host could not read the answer file). A failure of this host names the file and the system's error, with no profile in
-#   front of it, because the profile is not what failed; `/tmp/kr-shell-ask-ID` is the call's folder.
+#   wrong_form (code 0 and text that is not in the form that the question asked for), timed_out (the program did not end in time: it is ended and reaped),
+#   not_started (the program could not be started), failed (a code other than 0), signalled (ended by a signal), wait_failed (this host could not wait for
+#   the program: nothing is known of it, so nothing is read and it is not ended), not_prepared (this host could not prepare the call: its folder, the
+#   file for the answer, a file for an input or one of the program's folders) and unread (code 0 and this host could not read the answer file). A
+#   failure of this host (wait_failed, not_prepared, unread) names the path that failed and the system's error, with no profile in front of it, because
+#   the profile is not what failed; `/tmp/kr-shell-ask-ID` is the call's folder and `/tmp/walk/pwsh` the program that this host could not wait for.
+# what the install leaves: for each row the second section says what a failed question leaves: nothing written for PowerShell at the profile question,
+#   the profile as it was at the other two (the walk compares the home with what it was for every way that it makes), and that the install goes on where
+#   the answer is used.
 # outside the table: the answers that a script gives as refusals of the profile (`kr-refused <code>`), and a placement that is not inside the profile,
 #   are answers that are used; each has its own sentence about the profile, and none depends on how a question ended. This file is made on Unix.
 
@@ -21,6 +25,7 @@ question=profiles way=timed_out -> PowerShell did not say where its profiles are
 question=profiles way=not_started -> PowerShell did not say where its profiles are: it did not answer in time, could not start or ended with an error, so nothing was written for PowerShell
 question=profiles way=failed -> PowerShell did not say where its profiles are: it did not answer in time, could not start or ended with an error, so nothing was written for PowerShell
 question=profiles way=signalled -> PowerShell did not say where its profiles are: it did not answer in time, could not start or ended with an error, so nothing was written for PowerShell
+question=profiles way=wait_failed -> /tmp/walk/pwsh: uncategorized error (os error 10)
 question=profiles way=not_prepared -> /tmp/kr-shell-ask-ID: not a directory (os error 20)
 question=profiles way=unread -> /tmp/kr-shell-ask-ID/said: entity not found (os error 2)
 question=placement way=used -> (nothing is said; the install goes on)
@@ -31,6 +36,7 @@ question=placement way=timed_out -> /home/person/profile.ps1: PowerShell did not
 question=placement way=not_started -> /home/person/profile.ps1: PowerShell did not say where the entry goes: it did not answer in time, could not start or ended with an error, so nothing was written
 question=placement way=failed -> /home/person/profile.ps1: PowerShell did not say where the entry goes: it did not answer in time, could not start or ended with an error, so nothing was written
 question=placement way=signalled -> /home/person/profile.ps1: PowerShell did not say where the entry goes: it did not answer in time, could not start or ended with an error, so nothing was written
+question=placement way=wait_failed -> /tmp/walk/pwsh: uncategorized error (os error 10)
 question=placement way=not_prepared -> /tmp/kr-shell-ask-ID: not a directory (os error 20)
 question=placement way=unread -> /tmp/kr-shell-ask-ID/said: entity not found (os error 2)
 question=check way=used -> (nothing is said; the install goes on)
@@ -41,8 +47,44 @@ question=check way=timed_out -> /home/person/profile.ps1: PowerShell did not che
 question=check way=not_started -> /home/person/profile.ps1: PowerShell did not check the profile with the entry in it: it did not answer in time, could not start or ended with an error, so nothing was written
 question=check way=failed -> /home/person/profile.ps1: PowerShell did not check the profile with the entry in it: it did not answer in time, could not start or ended with an error, so nothing was written
 question=check way=signalled -> /home/person/profile.ps1: PowerShell did not check the profile with the entry in it: it did not answer in time, could not start or ended with an error, so nothing was written
+question=check way=wait_failed -> /tmp/walk/pwsh: uncategorized error (os error 10)
 question=check way=not_prepared -> /tmp/kr-shell-ask-ID: not a directory (os error 20)
 question=check way=unread -> /tmp/kr-shell-ask-ID/said: entity not found (os error 2)
+
+## what the install leaves
+question=profiles way=used -> the install goes on
+question=profiles way=too_long -> nothing written for PowerShell
+question=profiles way=not_text -> nothing written for PowerShell
+question=profiles way=wrong_form -> nothing written for PowerShell
+question=profiles way=timed_out -> nothing written for PowerShell
+question=profiles way=not_started -> nothing written for PowerShell
+question=profiles way=failed -> nothing written for PowerShell
+question=profiles way=signalled -> nothing written for PowerShell
+question=profiles way=wait_failed -> nothing written for PowerShell
+question=profiles way=not_prepared -> nothing written for PowerShell
+question=profiles way=unread -> nothing written for PowerShell
+question=placement way=used -> the install goes on
+question=placement way=too_long -> the profile as it was
+question=placement way=not_text -> the profile as it was
+question=placement way=wrong_form -> the profile as it was
+question=placement way=timed_out -> the profile as it was
+question=placement way=not_started -> the profile as it was
+question=placement way=failed -> the profile as it was
+question=placement way=signalled -> the profile as it was
+question=placement way=wait_failed -> the profile as it was
+question=placement way=not_prepared -> the profile as it was
+question=placement way=unread -> the profile as it was
+question=check way=used -> the install goes on
+question=check way=too_long -> the profile as it was
+question=check way=not_text -> the profile as it was
+question=check way=wrong_form -> the profile as it was
+question=check way=timed_out -> the profile as it was
+question=check way=not_started -> the profile as it was
+question=check way=failed -> the profile as it was
+question=check way=signalled -> the profile as it was
+question=check way=wait_failed -> the profile as it was
+question=check way=not_prepared -> the profile as it was
+question=check way=unread -> the profile as it was
 
 ## the stand-ins of the walk, and the way that each makes
 question=profiles way=too_long stand-in=an answer of 70000 letters
@@ -51,6 +93,7 @@ question=profiles way=failed stand-in=ends with code 1
 question=profiles way=signalled stand-in=ends by SIGKILL
 question=profiles way=unread stand-in=takes the answer file away and ends with code 0
 question=profiles way=not_started stand-in=is not there to be started
+question=profiles way=wait_failed stand-in=another thread of the process takes the program's end before this host's wait sees it, so the wait fails (a process of its own)
 question=profiles way=not_prepared stand-in=the temporary folder is a file, so the call's folder cannot be made (a process of its own)
 question=placement way=too_long stand-in=an answer of 70000 letters
 question=placement way=not_text stand-in=bytes that are not UTF-8
@@ -58,6 +101,7 @@ question=placement way=failed stand-in=ends with code 1
 question=placement way=signalled stand-in=ends by SIGKILL
 question=placement way=unread stand-in=takes the answer file away and ends with code 0
 question=placement way=not_started stand-in=is not there to be started
+question=placement way=wait_failed stand-in=another thread of the process takes the program's end before this host's wait sees it, so the wait fails (a process of its own)
 question=placement way=not_prepared stand-in=the temporary folder is a file, so the call's folder cannot be made (a process of its own)
 question=check way=too_long stand-in=an answer of 70000 letters
 question=check way=not_text stand-in=bytes that are not UTF-8
@@ -65,6 +109,7 @@ question=check way=failed stand-in=ends with code 1
 question=check way=signalled stand-in=ends by SIGKILL
 question=check way=unread stand-in=takes the answer file away and ends with code 0
 question=check way=not_started stand-in=is not there to be started
+question=check way=wait_failed stand-in=another thread of the process takes the program's end before this host's wait sees it, so the wait fails (a process of its own)
 question=check way=not_prepared stand-in=the temporary folder is a file, so the call's folder cannot be made (a process of its own)
 question=profiles way=wrong_form stand-in=no answer
 question=profiles way=wrong_form stand-in=blank lines
@@ -84,4 +129,3 @@ question=check way=wrong_form stand-in=a refusal that this host does not know
 
 ## ways that the walk through the install does not make
 way=timed_out: the install gives each question sixty seconds, and each of the three would wait them; a case of kr-shell-integration ends each question by a limit of 400 ms and compares the error with the one that this table's row comes from, and a case there shows that the install gives each question more than the five seconds of a report
-way=timed_out (this host could not wait for the program): no stand-in makes a failed wait on a child that this host started; the question ends as a time-out does, the program is ended and reaped, so "did not answer in time" is true of it
