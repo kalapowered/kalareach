@@ -5309,7 +5309,7 @@ mod tests {
     /// either. It writes nothing: it asks and reads.
     #[cfg(windows)]
     #[test]
-    #[ignore = "needs an edition of PowerShell on the search path; the Windows machine runs it with --ignored (tasks/T-SHELL-PS-4-scripts/win-cases-real.txt)"]
+    #[ignore = "needs an edition of PowerShell on the search path; the Windows machine runs it with --ignored --nocapture (tasks/T-SHELL-PS-4-scripts/win-cases-real.txt)"]
     fn each_edition_that_is_found_names_its_profiles_as_it_names_them_plainly() {
         let path = std::env::var_os("PATH").expect("a search path");
         let mut found = Vec::new();
@@ -5318,6 +5318,7 @@ mod tests {
                 .map(|directory| directory.join(name))
                 .find(|candidate| candidate.is_file())
             else {
+                println!("edition {name}: not on the search path, not asked");
                 continue;
             };
             let root = tempfile::tempdir().expect("a directory");
@@ -5364,8 +5365,15 @@ mod tests {
                 ],
                 "{name}: the product's question and the plain one name different profiles"
             );
+            println!(
+                "edition {name} at {}: asked, and named {} and {}",
+                executable.display(),
+                all_hosts.display(),
+                current_host.display()
+            );
             found.push(name);
         }
+        println!("editions asked: {found:?}");
         assert!(
             !found.is_empty(),
             "no edition of PowerShell is on the search path"
