@@ -681,11 +681,14 @@ fn a_blank_row_that_holds_a_link_is_given_up_when_a_narrower_screen_rebuilds_it(
     let mut engine = engine(20, 4);
     engine.set_history_kept(false);
     feed(&mut engine, &printed("while", 0, 20));
-    // The link covers twelve columns, more than the ten of the narrower screen, so the row is wider
-    // than the screen it is handed back to and the grid rebuilds it.
+    // The link covers all twenty columns, so the row the narrower screen is handed back is as wide as
+    // the screen was and wider than the screen is now, and the grid rebuilds it.
     feed(
         &mut engine,
-        "\x1b]8;;https://link.example/\x1b\\            \x1b]8;;\x1b\\\r\n",
+        &format!(
+            "\x1b]8;;https://link.example/\x1b\\{}\x1b]8;;\x1b\\\r\n",
+            " ".repeat(20)
+        ),
     );
     engine.set_history_kept(true);
 
