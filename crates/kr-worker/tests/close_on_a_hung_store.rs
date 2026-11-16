@@ -1357,10 +1357,11 @@ async fn a_read_of_a_held_session_says_that_the_turn_ended_in_the_hold_when_none
 }
 
 /// A question's commit stands in the question ledger and holds the ledger's lock, as a commit to a
-/// disk that has stopped does, while a storage call holds the session. A turn starts. The evidence
-/// loop reads the broker's facts although the ledger's reader is blocked, so the read of the held
-/// session says that the agent works. Once the commit returns, the ledger's reader says the
-/// question.
+/// disk that has stopped does, while a storage call holds the session. A turn starts, ends, and
+/// another starts. The evidence loop reads each of them from the broker although the ledger's
+/// reader is blocked (a loop that read the ledger itself would stand in the commit after the first
+/// and read no further), so the read of the held session says what the agent does after each. Once
+/// the commit returns, the ledger's reader says the question.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_read_of_a_held_session_says_the_turn_while_a_question_commit_stands_in_the_ledger() {
     let host = host().await;
@@ -1379,20 +1380,42 @@ async fn a_read_of_a_held_session_says_the_turn_while_a_question_commit_stands_i
     let (held, hold) = host.runtime.hold_the_session();
     reached(held, "the session's hold").await;
     agent.says(TURN_7_STARTED).await;
-    let said = held_application_state_becomes(
+    let began = held_application_state_becomes(
         &mut reader,
         &host,
         Some(ApplicationState::AgentBusy),
-        "held read while the ledger's commit stands",
+        "held read after the turn began while the ledger's commit stands",
+    )
+    .await;
+    // The loop has read the first turn and asked its reader, which stands in the commit. The turn
+    // ends and another begins, and the loop must read both.
+    agent.says(TURN_7_ENDED).await;
+    let ended = held_application_state_becomes(
+        &mut reader,
+        &host,
+        Some(ApplicationState::ShellReady),
+        "held read after the turn ended while the ledger's commit stands",
+    )
+    .await;
+    agent.says(TURN_8_STARTED).await;
+    let again = held_application_state_becomes(
+        &mut reader,
+        &host,
+        Some(ApplicationState::AgentBusy),
+        "held read after the next turn began while the ledger's commit stands",
     )
     .await;
     let _ = let_go.send(());
     let _ = hold.send(());
     asking.join().expect("the question's thread ended");
     assert_eq!(
-        said,
-        Some(ApplicationState::AgentBusy),
-        "the read of a held session said {said:?} for a turn that began while a commit stood in the ledger"
+        (began, ended, again),
+        (
+            Some(ApplicationState::AgentBusy),
+            Some(ApplicationState::ShellReady),
+            Some(ApplicationState::AgentBusy)
+        ),
+        "the reads of a held session while a commit stood in the ledger said these states after a turn began, ended and another began"
     );
     domain_application_state_becomes(
         &host,
