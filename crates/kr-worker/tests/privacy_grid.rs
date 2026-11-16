@@ -10,7 +10,8 @@
 //! case gives it and no step waits for anything: a scroll is answered when it is asked for.
 
 use kr_protocol::attachment::{
-    AttachMode, AttachmentCapability, SessionAttachParams, ViewportPosition,
+    AttachMode, AttachmentCapability, SessionAttachParams, TerminalPresentationMode,
+    ViewportPosition,
 };
 use kr_protocol::error::ErrorCode;
 use kr_protocol::identity::{DesktopBinding, WorkerProfile};
@@ -33,6 +34,11 @@ const ON_SCREEN: usize = LINES - (ROWS as usize - 1);
 
 const ENTER_ALTERNATE: &str = "\x1b[?1049h";
 const LEAVE_ALTERNATE: &str = "\x1b[?1049l";
+
+/// The same buffer switch without a saved cursor: a screen that the host can restore completely, so
+/// the host's own terminal is served the raw stream while the program shows.
+const ENTER_ALTERNATE_PLAIN: &str = "\x1b[?1047h";
+const LEAVE_ALTERNATE_PLAIN: &str = "\x1b[?1047l";
 
 /// The session's own size.
 fn dimensions() -> Dimensions {
@@ -569,5 +575,381 @@ fn a_window_above_the_live_page_when_privacy_mode_goes_on_is_installed_again() {
     assert!(
         shows_only_the_screen(&installed, "before"),
         "and what it holds is the live screen: {installed:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// A resize while a full-screen program shows the alternate buffer.
+//
+// After `Session::resize` the host's own terminal is told what it needs to draw the screen from the
+// session in one of two ways. A terminal that is served the raw stream (the owner of the size, of
+// exactly the screen's size, with a qualified profile) is told to resynchronise and asks for its
+// screen, which is `Session::restoration`: the bytes that put its terminal into the current screen,
+// with the rows of the primary buffer that the program has covered. Any other terminal is
+// installed again in band, with a snapshot and its pages. Neither is handed a row from above the
+// screen, but the primary buffer's own screen can hold rows that a taller resize pulls in from
+// above it, so both are read right after the resize and again when the program has left.
+// ---------------------------------------------------------------------------------------------
+
+/// What a stream was sent: its projection events, how many times it was told to resynchronise, and
+/// how many deliveries were bytes or a rendered screen.
+struct Sent {
+    events: Vec<ProjectionEvent>,
+    resyncs: usize,
+    stream_deliveries: usize,
+}
+
+fn sent(stream: &mut OutputStream) -> Sent {
+    let mut sent = Sent {
+        events: Vec::new(),
+        resyncs: 0,
+        stream_deliveries: 0,
+    };
+    while let Some(delivery) = stream.try_recv() {
+        stream.written(delivery.len());
+        match delivery {
+            OutputDelivery::Projection { event, .. } => sent.events.push(*event),
+            OutputDelivery::Resync(_) => sent.resyncs += 1,
+            OutputDelivery::Bytes { .. } | OutputDelivery::Screen { .. } => {
+                sent.stream_deliveries += 1;
+            }
+            _ => {}
+        }
+    }
+    sent
+}
+
+/// The numbers that follow `word` in the bytes that put a terminal into a screen.
+fn numbers_in(bytes: &[u8], word: &str) -> Vec<usize> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut rest = text.as_ref();
+    let mut found = Vec::new();
+    while let Some(at) = rest.find(word) {
+        rest = &rest[at + word.len()..];
+        let digits: String = rest
+            .trim_start_matches(' ')
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        if let Ok(number) = digits.parse() {
+            found.push(number);
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+/// The screen is this tall after the taller resize, and this tall after the shorter one.
+const TALLER: u64 = ROWS + 8;
+const SHORTER: u64 = ROWS - 6;
+
+/// The window the second terminal looks through: as wide and as tall as the taller screen, from
+/// the top of the live page, so that every row of the primary buffer's screen is in it.
+fn whole_page() -> Dimensions {
+    Dimensions::new(80, TALLER)
+}
+
+/// A session whose host's own terminal owns the size and is exactly that size, with a qualified
+/// profile: the session serves it the raw stream. A second terminal declares a profile that this
+/// build has not qualified, so it is served a projection of the same screen.
+struct Owned {
+    session: Session,
+    host: AttachmentId,
+    host_stream: OutputStream,
+    viewer: AttachmentId,
+    viewer_stream: OutputStream,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _temp: kr_ipc::testing::TempHost,
+}
+
+impl Owned {
+    fn open() -> Self {
+        let temp = kr_ipc::testing::TempHost::create();
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let mut session = Session::open(config(&temp, session_id)).expect("opens the session");
+
+        let mut requested = CanonicalSet::new();
+        requested.insert(AttachmentCapability::ObserveTerminal);
+        requested.insert(AttachmentCapability::Geometry);
+        let params = SessionAttachParams {
+            session_id,
+            mode: AttachMode::Terminal,
+            claim_geometry: true,
+            dimensions: Nullable::some(dimensions()),
+            terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+            requested,
+        };
+        let host = AttachmentId::new(kr_ipc::new_uuid());
+        session
+            .attach(&params, params.requested.clone(), host)
+            .expect("the host attaches and owns the size");
+        session.join(host).expect("joins");
+        let host_stream = session.subscribe(host).expect("subscribes");
+
+        let mut requested = CanonicalSet::new();
+        requested.insert(AttachmentCapability::ObserveTerminal);
+        let params = SessionAttachParams {
+            session_id,
+            mode: AttachMode::Terminal,
+            claim_geometry: false,
+            dimensions: Nullable::some(whole_page()),
+            terminal_profile_id: Nullable::some("vt100".to_owned()),
+            requested,
+        };
+        let viewer = AttachmentId::new(kr_ipc::new_uuid());
+        session
+            .attach(&params, params.requested.clone(), viewer)
+            .expect("the second terminal attaches");
+        session.join(viewer).expect("joins");
+        let viewer_stream = session.subscribe(viewer).expect("subscribes");
+        session
+            .viewport(
+                viewer,
+                whole_page(),
+                Some(ViewportPosition::Line(U64::new(0))),
+                0,
+            )
+            .expect("the top of the live page");
+        session.install_projection(viewer).expect("installs");
+
+        let mut owned = Self {
+            session,
+            host,
+            host_stream,
+            viewer,
+            viewer_stream,
+            _temp: temp,
+        };
+        // The host's terminal asks for its screen when it attaches, as a terminal does.
+        owned.session.restoration(host).expect("the first screen");
+        owned.settle();
+        owned
+    }
+
+    fn print(&mut self, bytes: &str) {
+        let _ = self.session.ingest_output(bytes.as_bytes());
+    }
+
+    fn enable(&mut self) {
+        self.session
+            .enable_privacy(PrivacyGeneration::new(1), &mut [])
+            .expect("privacy mode goes on");
+        assert!(self.session.privacy().is_enabled());
+    }
+
+    fn disable(&mut self) {
+        self.session
+            .disable_privacy(PrivacyGeneration::new(2))
+            .expect("privacy mode goes off")
+            .expect("it was on");
+        assert!(!self.session.privacy().is_enabled());
+    }
+
+    /// Reads what both streams were sent so far, so that the next read is only what follows.
+    fn settle(&mut self) -> (Sent, Sent) {
+        (sent(&mut self.host_stream), sent(&mut self.viewer_stream))
+    }
+
+    /// The owner resizes the session, as the host's own terminal does when its window changes.
+    fn resize(&mut self, rows: u64) {
+        let epoch = self.session.geometry().epoch.get();
+        self.session
+            .resize(self.host, Dimensions::new(80, rows), epoch)
+            .expect("the owner resizes the session");
+    }
+
+    /// What a host's terminal does when it is told to resynchronise: it subscribes again, which is
+    /// what lets the session tell it a second time, and asks for its screen.
+    fn host_asks_for_its_screen(&mut self) {
+        self.host_stream = self.session.subscribe(self.host).expect("subscribes again");
+        self.host_restoration();
+        self.settle();
+    }
+
+    /// How the session serves the host's terminal now.
+    fn host_presentation(&mut self) -> TerminalPresentationMode {
+        self.session
+            .viewport(self.host, dimensions(), None, 0)
+            .expect("the host's own report")
+            .presentation
+    }
+
+    /// The bytes that put the host's terminal into the screen as it is now.
+    fn host_restoration(&mut self) -> Vec<u8> {
+        self.session
+            .restoration(self.host)
+            .expect("the restoration")
+            .1
+    }
+}
+
+/// The text of every primary-buffer row that a terminal is installed with in band, after checking
+/// that it was installed over its stream and not told to ask for a screen.
+fn installed_in_band(sent: Sent) -> Vec<String> {
+    assert!(
+        sent.events
+            .iter()
+            .any(|event| matches!(event, ProjectionEvent::Snapshot(_))),
+        "the terminal is installed again over its stream"
+    );
+    assert_eq!(sent.resyncs, 0, "and it is not told to ask for a screen");
+    installed_rows(sent.events)
+}
+
+/// The sequence of review 1's first order: rows above the screen, a full-screen program, privacy
+/// mode on while it shows.
+fn before_the_program_then_the_enabling(enter: &str) -> Owned {
+    let mut rig = Owned::open();
+    rig.print(&run("before"));
+    rig.print(enter);
+    rig.enable();
+    rig
+}
+
+#[test]
+fn a_host_served_the_raw_stream_is_handed_no_earlier_row_when_a_resize_comes_under_a_full_screen_program()
+ {
+    // The control: without privacy mode the same resize pulls rows of the primary buffer in from
+    // above its screen, and the host is handed them, so the reading below can see a row.
+    let mut control = Owned::open();
+    control.print(&run("before"));
+    control.print(ENTER_ALTERNATE_PLAIN);
+    control.resize(TALLER);
+    let pulled_in = numbers_in(&control.host_restoration(), "before");
+    assert!(
+        pulled_in.iter().any(|number| *number < ON_SCREEN),
+        "without privacy mode the screen the host is handed holds earlier rows: {pulled_in:?}"
+    );
+
+    let mut rig = before_the_program_then_the_enabling(ENTER_ALTERNATE_PLAIN);
+    rig.host_asks_for_its_screen();
+    assert_eq!(
+        rig.host_presentation(),
+        TerminalPresentationMode::Direct,
+        "the host's terminal is served the raw stream"
+    );
+    rig.resize(TALLER);
+    let (host, _) = rig.settle();
+    assert_eq!(host.resyncs, 1, "the host is told to ask for its screen");
+    assert!(
+        host.events.is_empty() && host.stream_deliveries == 0,
+        "and it is installed with nothing in band"
+    );
+
+    let handed = numbers_in(&rig.host_restoration(), "before");
+    assert!(
+        !handed.is_empty(),
+        "the rows that were on the screen at the enabling are still the screen's: {handed:?}"
+    );
+    assert!(
+        handed.iter().all(|number| *number >= ON_SCREEN),
+        "no row from above the screen at the enabling is handed to the host: {handed:?}"
+    );
+
+    rig.print(LEAVE_ALTERNATE_PLAIN);
+    let handed = numbers_in(&rig.host_restoration(), "before");
+    assert!(
+        handed.iter().all(|number| *number >= ON_SCREEN),
+        "nor when the program has left: {handed:?}"
+    );
+    rig.disable();
+    let handed = numbers_in(&rig.host_restoration(), "before");
+    assert!(
+        handed.iter().all(|number| *number >= ON_SCREEN),
+        "nor when privacy mode has gone off: {handed:?}"
+    );
+}
+
+#[test]
+fn a_terminal_installed_in_band_is_given_no_earlier_row_when_a_resize_comes_under_a_full_screen_program()
+ {
+    let mut control = Owned::open();
+    control.print(&run("before"));
+    control.print(ENTER_ALTERNATE);
+    control.settle();
+    control.resize(TALLER);
+    let (_, viewer) = control.settle();
+    let installed = installed_in_band(viewer);
+    assert!(
+        numbers(&installed, "before")
+            .iter()
+            .any(|number| *number < ON_SCREEN),
+        "without privacy mode the install holds earlier rows: {installed:?}"
+    );
+
+    let mut rig = before_the_program_then_the_enabling(ENTER_ALTERNATE);
+    rig.host_asks_for_its_screen();
+    rig.resize(TALLER);
+    let (host, viewer) = rig.settle();
+    // A program that saves the cursor as it starts leaves the host's own terminal on a projection
+    // too, because a restoration cannot carry the saved cursor of the other buffer.
+    for (who, sent) in [
+        ("the second terminal", viewer),
+        ("the host's terminal", host),
+    ] {
+        let installed = installed_in_band(sent);
+        assert!(
+            !numbers(&installed, "before").is_empty(),
+            "{who}: the rows that were on the screen at the enabling are still the screen's: {installed:?}"
+        );
+        assert!(
+            shows_only_the_screen(&installed, "before"),
+            "{who}: no row from above the screen at the enabling is in the install: {installed:?}"
+        );
+    }
+
+    rig.print(LEAVE_ALTERNATE);
+    rig.session
+        .install_projection(rig.viewer)
+        .expect("installs again");
+    let installed = installed_rows(sent(&mut rig.viewer_stream).events);
+    assert!(!numbers(&installed, "before").is_empty(), "{installed:?}");
+    assert!(
+        shows_only_the_screen(&installed, "before"),
+        "nor when the program has left: {installed:?}"
+    );
+}
+
+#[test]
+fn rows_a_shorter_resize_pushed_above_the_screen_are_not_handed_back_by_a_taller_one() {
+    let mut rig = Owned::open();
+    rig.print(&run("before"));
+    rig.enable();
+    rig.print(&run("while"));
+    rig.print(ENTER_ALTERNATE);
+    rig.settle();
+
+    rig.resize(SHORTER);
+    rig.resize(TALLER);
+
+    // A shorter screen moved the top rows of the primary buffer above it, and they are rows of the
+    // private interval: a taller one must not bring them back.
+    let first_kept = ON_SCREEN + (ROWS - SHORTER) as usize;
+    let handed = numbers_in(&rig.host_restoration(), "while");
+    assert!(
+        !handed.is_empty(),
+        "the rows still on the screen are handed: {handed:?}"
+    );
+    assert!(
+        handed.iter().all(|number| *number >= first_kept),
+        "no row that the shorter screen pushed above it is handed back: {handed:?}"
+    );
+    assert!(numbers_in(&rig.host_restoration(), "before").is_empty());
+    let (_, viewer) = rig.settle();
+    let installed = installed_in_band(viewer);
+    assert!(
+        numbers(&installed, "while")
+            .iter()
+            .all(|number| *number >= first_kept),
+        "nor is the second terminal installed with one: {installed:?}"
+    );
+    assert!(numbers(&installed, "before").is_empty(), "{installed:?}");
+
+    rig.print(LEAVE_ALTERNATE);
+    let handed = numbers_in(&rig.host_restoration(), "while");
+    assert!(
+        handed.iter().all(|number| *number >= first_kept),
+        "nor when the program has left: {handed:?}"
     );
 }
