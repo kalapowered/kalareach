@@ -1721,15 +1721,44 @@ async fn after_barriers_that_need_several_notices(
     pass
 }
 
+/// Has another connection to the registry's file hold its write lock for `hold`, on a thread of its
+/// own, as the device directory does while it records the host's clock. Answers once the lock is
+/// held, with the handle of the thread, which ends when the lock has been let go.
+async fn a_writer_ahead_on_the_registry_file(
+    controller: &Controller,
+    hold: Duration,
+) -> tokio::task::JoinHandle<()> {
+    let path = controller.paths().registry_database();
+    let (taken, held) = tokio::sync::oneshot::channel();
+    let writer = tokio::task::spawn_blocking(move || {
+        let connection = rusqlite::Connection::open(path).expect("a second connection to the file");
+        connection
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("the file's write lock is held");
+        let _ = taken.send(());
+        std::thread::sleep(hold);
+        connection
+            .execute_batch("ROLLBACK;")
+            .expect("the file's write lock is let go");
+    });
+    held.await.expect("the writer ahead took the lock");
+    writer
+}
+
 /// One ask of fifteen seconds, whose first notice begins after another operation has held the
 /// registry for six. The worker answers that notice only once the case holds the registry again,
 /// so the ask can record the answer, and send a second notice, only when the case lets the registry
 /// go `release_at` after the ask began. The worker would answer a second notice four seconds after
 /// it was sent. Returns what the ask said.
+///
+/// With `file_held_until`, another connection to the registry's file also holds its write lock,
+/// from before the case lets the registry go until then after the ask began, so that the daemon's
+/// write of the answer waits for the file, inside one poll, once the registry is let go.
 async fn a_telling_that_waits_for_the_registry_between_its_notices(
     silent: &Silent,
     heard: &Heard,
     release_at: Duration,
+    file_held_until: Option<Duration>,
 ) -> Asked {
     let controller = &silent.controller;
     let session_id = silent.session_id;
@@ -1766,8 +1795,17 @@ async fn a_telling_that_waits_for_the_registry_between_its_notices(
             // The answer is given only now, so that the ask meets the held registry however late
             // this task came to it.
             let _ = open.send(());
+            let writer = if let Some(until) = file_held_until {
+                let hold = (began + until).saturating_duration_since(tokio::time::Instant::now());
+                Some(a_writer_ahead_on_the_registry_file(controller, hold).await)
+            } else {
+                None
+            };
             tokio::time::sleep_until(began + release_at).await;
             drop(held);
+            if let Some(writer) = writer {
+                writer.await.expect("the writer ahead let the file go");
+            }
         },
     );
     asked
@@ -1814,6 +1852,7 @@ async fn a_second_notice_that_would_begin_with_too_little_time_is_not_sent() {
         &silent,
         &heard,
         Duration::from_secs(12),
+        None,
     )
     .await;
     the_second_notice_was_not_sent(&silent, &heard, asked).await;
@@ -1835,6 +1874,31 @@ async fn a_wait_for_the_registry_between_two_notices_that_runs_past_the_deadline
         &silent,
         &heard,
         Duration::from_secs(17),
+        None,
+    )
+    .await;
+    the_second_notice_was_not_sent(&silent, &heard, asked).await;
+    silent.serving.abort();
+}
+
+/// KR-REQ-09.12: a notice after the first begins only with an exchange's time left, asked after a
+/// wait for the registry that ended past the instant the wait is cut at.
+///
+/// The case lets the registry go at eight seconds of the ask's fifteen, before the cut at ten, but
+/// another connection to the registry's file holds its write lock until eleven. The daemon's write
+/// of the first answer waits for the file inside one poll, and the timeout that cuts the wait polls
+/// the wait before it looks at its timer, so it finds the wait done and cuts nothing. Only the check
+/// made after the wait stops a second notice, which would begin with four seconds left, inside the
+/// five an exchange takes. So nothing more is sent, and the link goes back whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_notice_is_not_sent_when_the_registry_file_holds_the_write_past_the_cut() {
+    let (silent, heard) = answered().await;
+    let _pass = after_barriers_that_need_several_notices(&silent).await;
+    let asked = a_telling_that_waits_for_the_registry_between_its_notices(
+        &silent,
+        &heard,
+        Duration::from_secs(8),
+        Some(Duration::from_secs(11)),
     )
     .await;
     the_second_notice_was_not_sent(&silent, &heard, asked).await;
