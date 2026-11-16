@@ -138,6 +138,15 @@ impl InputShared {
         writes.all()
     }
 
+    /// Returns how many batches of a lease's keys have entered the queue for the terminal, for
+    /// this host's own tests: a key that was accepted counts whether or not it was written.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn lease_batches_queued(&self) -> u64 {
+        let writes = Arc::clone(&self.lock().writer().terminal_writes);
+        writes.lease_batches_queued()
+    }
+
     /// Asks the pump to take the session and do what is owed.
     pub fn wake_pump(&self) {
         self.pump.notify_one();
@@ -903,6 +912,8 @@ impl InputDomain {
             .fetch_add(batch.len(), Ordering::AcqRel);
         if let InputBatch::Lease { epoch, .. } = batch {
             self.writer.queued_lease_bytes.add(epoch, batch.len());
+            #[cfg(feature = "testing")]
+            self.writer.terminal_writes.queued_a_lease_batch();
         }
         self.pending.insert(at, Queued::Batch(batch));
     }

@@ -566,6 +566,9 @@ pub struct TerminalWrite {
 pub struct TerminalWrites {
     log: std::sync::Mutex<Vec<TerminalWrite>>,
     of_a_lease: std::sync::atomic::AtomicBool,
+    /// How many batches of a lease's keys have entered the input domain's queue, whether the
+    /// writer wrote them or dropped them.
+    lease_batches_queued: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(feature = "testing")]
@@ -574,6 +577,19 @@ impl TerminalWrites {
     pub(crate) fn of_a_lease(&self, yes: bool) {
         self.of_a_lease
             .store(yes, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Counts one batch of a lease's keys that entered the queue for the terminal.
+    pub(crate) fn queued_a_lease_batch(&self) {
+        self.lease_batches_queued
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Returns how many batches of a lease's keys have entered the queue so far.
+    #[must_use]
+    pub fn lease_batches_queued(&self) -> u64 {
+        self.lease_batches_queued
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Keeps one write.
