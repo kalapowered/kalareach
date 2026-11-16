@@ -2563,12 +2563,25 @@ mod tests {
 
     /// The words of a daemon that ended and whose closed connection stopped this command's request.
     fn the_end_said(id: EnvironmentId, pid: Option<u64>) -> String {
+        the_end_said_for(id, pid, &kr_ipc::IpcError::PeerClosed)
+    }
+
+    /// The same words for the failure `error`.
+    fn the_end_said_for(id: EnvironmentId, pid: Option<u64>, error: &kr_ipc::IpcError) -> String {
         let process = pid.map_or_else(String::new, |pid| format!(" (process {pid})"));
         format!(
             "ended ({pid:?}): The control daemon for environment {id}{process} ended, and this \
-             command could not make its request for it: the peer closed the connection. This \
-             command sent nothing."
+             command could not make its request for it: {}. This command sent nothing.",
+            Shown::ipc(error)
         )
+    }
+
+    /// A frame that the daemon's end cut: the end of the stream, or a reset, inside a frame.
+    fn a_frame_cut_by_the_end() -> kr_ipc::IpcError {
+        kr_ipc::IpcError::TruncatedFrame {
+            received: 3,
+            expected: 16,
+        }
     }
 
     fn a_fault_of_the_socket() -> kr_ipc::IpcError {
@@ -2741,6 +2754,97 @@ mod tests {
         );
     }
 
+    /// A greeting cut inside a frame by a daemon that ends is the daemon's end, as a closed peer is:
+    /// the end of the stream inside a frame is the daemon going.
+    #[tokio::test(start_paused = true)]
+    async fn a_greeting_cut_inside_a_frame_by_a_daemon_that_ends_is_the_daemons_end() {
+        let id = an_environment();
+        let process = asked_process();
+        let cut = a_frame_cut_by_the_end();
+        for (old, named) in [(Some(&process), Some(4000)), (None, None)] {
+            let supplied = Supplied::new()
+                .process(vec![at_once(ProcessState::Ended)])
+                .look(vec![at_once(Endpoint::Nobody)]);
+            let before = greeting_failed(&supplied, &cut, old, id, the_deadline()).await;
+            assert_eq!(
+                before_said(&before),
+                the_end_said_for(id, named, &cut),
+                "{old:?}"
+            );
+            assert_eq!(supplied.start.elapsed(), Duration::ZERO, "{old:?}");
+        }
+    }
+
+    /// A greeting cut inside a frame by a daemon that is not shown to have ended at the deadline is
+    /// the command's silence, as for a closed peer.
+    #[tokio::test(start_paused = true)]
+    async fn a_greeting_cut_inside_a_frame_by_a_daemon_that_does_not_end_is_silence() {
+        let process = asked_process();
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same)]);
+        let before = greeting_failed(
+            &supplied,
+            &a_frame_cut_by_the_end(),
+            Some(&process),
+            an_environment(),
+            the_deadline(),
+        )
+        .await;
+        assert_eq!(before_said(&before), "silent");
+        assert_eq!(
+            supplied.start.elapsed(),
+            END_BOUND,
+            "it waits to the deadline"
+        );
+    }
+
+    /// A read of `host.info` cut inside a frame is waited for as a closed peer is: no look comes
+    /// before the wait, and a daemon that is not shown to have ended is the command's silence.
+    #[tokio::test(start_paused = true)]
+    async fn a_host_info_cut_inside_a_frame_is_waited_for_as_a_closed_peer_is() {
+        let process = asked_process();
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same)]);
+        let before = host_info_failed(
+            &supplied,
+            supplied.connection(),
+            &a_frame_cut_by_the_end(),
+            Some(&process),
+            an_environment(),
+            the_deadline(),
+        )
+        .await;
+        assert_eq!(before_said(&before), "silent");
+        let calls = supplied.calls();
+        assert_eq!(
+            calls[..2],
+            [
+                (Duration::ZERO, Call::ConnectionLetGo),
+                (Duration::ZERO, Call::Held(END_BOUND)),
+            ],
+            "the wait follows the let-go connection, with no look between"
+        );
+        assert_eq!(
+            supplied.start.elapsed(),
+            END_BOUND,
+            "it waits to the deadline"
+        );
+
+        let id = an_environment();
+        let cut = a_frame_cut_by_the_end();
+        let supplied = Supplied::new()
+            .process(vec![at_once(ProcessState::Ended)])
+            .look(vec![at_once(Endpoint::Nobody)]);
+        let before = host_info_failed(
+            &supplied,
+            supplied.connection(),
+            &cut,
+            Some(&process),
+            id,
+            the_deadline(),
+        )
+        .await;
+        assert_eq!(before_said(&before), the_end_said_for(id, Some(4000), &cut));
+    }
+
     fn a_refusal() -> ProtocolError {
         ProtocolError::new(
             ErrorCode::PermissionDenied,
@@ -2753,13 +2857,33 @@ mod tests {
     #[test]
     fn a_probe_that_fails_on_its_connection_leaves_the_daemons_refusal() {
         let id = an_environment();
-        for probe in [None, Some(Err(kr_ipc::IpcError::PeerClosed))] {
+        for probe in [
+            None,
+            Some(Err(kr_ipc::IpcError::PeerClosed)),
+            Some(Err(a_frame_cut_by_the_end())),
+            Some(Err(a_fault_of_the_socket())),
+            Some(Err(kr_ipc::IpcError::UnexpectedMessage(
+                "a frame of another kind",
+            ))),
+        ] {
             match after_the_probe(id, a_refusal(), probe) {
                 CliError::Refused(refusal) => {
                     assert_eq!(refusal.code, ErrorCode::PermissionDenied);
                 }
                 other => panic!("the refusal is the result, not {other}"),
             }
+        }
+        let withheld = ProtocolError::new(ErrorCode::PermissionDenied, "the check is refused too");
+        let said = after_the_probe(id, a_refusal(), Some(Ok(Err(withheld)))).to_string();
+        assert!(
+            said.contains("takes no stop request or refuses it")
+                && said.contains("Nothing was stopped"),
+            "the check's own refusal is shown in this command's words: {said}"
+        );
+        let another = ProtocolError::new(ErrorCode::ResourceUnavailable, "the daemon is busy");
+        match after_the_probe(id, a_refusal(), Some(Ok(Err(another)))) {
+            CliError::Refused(refusal) => assert_eq!(refusal.code, ErrorCode::ResourceUnavailable),
+            other => panic!("another refusal of the probe is shown as it is, not {other}"),
         }
         match after_the_probe(id, a_refusal(), Some(Ok(Ok(())))) {
             CliError::Unfinished { message, .. } => {
@@ -2769,65 +2893,96 @@ mod tests {
         }
     }
 
+    /// The daemon's side of a greeting: accepts the next connection, reads its hello and answers it.
+    async fn greet(
+        listener: &kr_ipc::endpoint::Listener,
+        id: EnvironmentId,
+    ) -> (kr_ipc::framed::FrameReader, kr_ipc::framed::FrameWriter) {
+        use kr_protocol::scalars::CanonicalSet;
+
+        let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+        let boot_epoch = kr_ipc::identity::boot_epoch(&boot).expect("a boot epoch");
+        let (connection, peer) = listener.accept().await.expect("a connection");
+        let (mut reader, mut writer) =
+            kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+        let connection_id = kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid());
+        let hello = reader
+            .read_message::<ControlFrame>()
+            .await
+            .expect("a hello");
+        assert!(
+            matches!(hello, ControlFrame::Hello(_)),
+            "the client says hello"
+        );
+        let ack = kr_protocol::local::LocalHelloAck {
+            selected_version: kr_protocol::hello::PROTOCOL_VERSION,
+            role: kr_protocol::local::LocalRole::Controller,
+            connection_id,
+            environment_id: id,
+            boot_identity: boot,
+            peer: peer.to_wire(),
+            action_window: kr_protocol::hello::ActionWindow {
+                action_window_id: kr_protocol::ids::ActionWindowId::new("test-daemon")
+                    .expect("a window identifier"),
+                connection_id,
+                boot_epoch,
+                issued_at_ms: kr_protocol::scalars::TimestampMs::new(0),
+                valid_for_ms: kr_protocol::scalars::DurationMs::new(600_000),
+            },
+            capabilities: CanonicalSet::new(),
+            max_receive: kr_protocol::hello::ReceiveLimits::default(),
+            build: Some(kr_protocol::local::LocalBuild {
+                build_id: crate::build_id(),
+                protocol_version: kr_protocol::hello::PACKAGE_VERSION,
+            }),
+        };
+        writer
+            .write_message(&ControlFrame::HelloAck(Box::new(ack)))
+            .await
+            .expect("the ack");
+        (reader, writer)
+    }
+
+    /// How a daemon closes the connection after its hello.
+    #[derive(Clone, Copy)]
+    enum Closure {
+        /// With nothing more to say: the end of the stream at a frame boundary.
+        Clean,
+        /// After a frame that cannot be read.
+        BadFrame,
+        /// After a frame of which the last bytes are missing: the end of the stream inside a frame.
+        HalfFrame,
+    }
+
     /// What `ask` makes of a request it cannot compose on a connection whose daemon says its hello
-    /// and then closes the connection, with a frame that cannot be read before the close where
-    /// `bad_frame`: the `closed` that it gives, from the real failure of the real client.
-    async fn closed_after_the_hello(bad_frame: bool) -> bool {
+    /// and then closes the connection as `closure` says: the `closed` that it gives, from the real
+    /// failure of the real client.
+    async fn closed_after_the_hello(closure: Closure) -> bool {
         use kr_ipc::client::LocalClient;
         use kr_protocol::local::LocalClientKind;
-        use kr_protocol::scalars::CanonicalSet;
 
         let temp = kr_ipc::testing::TempHost::create();
         let environment = temp.environment();
         let id = environment.environment_id();
         let endpoint = environment.controller_endpoint().expect("an endpoint");
         let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
-        let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
-        let boot_epoch = kr_ipc::identity::boot_epoch(&boot).expect("a boot epoch");
         let daemon = tokio::spawn(async move {
-            let (connection, peer) = listener.accept().await.expect("a connection");
-            let (mut reader, mut writer) =
-                kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
-            let connection_id = kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid());
-            let hello = reader
-                .read_message::<ControlFrame>()
-                .await
-                .expect("a hello");
-            assert!(
-                matches!(hello, ControlFrame::Hello(_)),
-                "the client says hello"
-            );
-            let ack = kr_protocol::local::LocalHelloAck {
-                selected_version: kr_protocol::hello::PROTOCOL_VERSION,
-                role: kr_protocol::local::LocalRole::Controller,
-                connection_id,
-                environment_id: id,
-                boot_identity: boot,
-                peer: peer.to_wire(),
-                action_window: kr_protocol::hello::ActionWindow {
-                    action_window_id: kr_protocol::ids::ActionWindowId::new("test-daemon")
-                        .expect("a window identifier"),
-                    connection_id,
-                    boot_epoch,
-                    issued_at_ms: kr_protocol::scalars::TimestampMs::new(0),
-                    valid_for_ms: kr_protocol::scalars::DurationMs::new(600_000),
-                },
-                capabilities: CanonicalSet::new(),
-                max_receive: kr_protocol::hello::ReceiveLimits::default(),
-                build: Some(kr_protocol::local::LocalBuild {
-                    build_id: crate::build_id(),
-                    protocol_version: kr_protocol::hello::PACKAGE_VERSION,
-                }),
-            };
-            writer
-                .write_message(&ControlFrame::HelloAck(Box::new(ack)))
-                .await
-                .expect("the ack");
-            if bad_frame {
-                let codec =
-                    kr_protocol::frame::FrameCodec::new(kr_protocol::frame::StreamKind::Control);
-                let bytes = codec.encode(&[0xff, 0xff]).expect("frames");
-                writer.write_frame(&bytes).await.expect("the bad frame");
+            let (_reader, mut writer) = greet(&listener, id).await;
+            let codec =
+                kr_protocol::frame::FrameCodec::new(kr_protocol::frame::StreamKind::Control);
+            match closure {
+                Closure::Clean => {}
+                Closure::BadFrame => {
+                    let bytes = codec.encode(&[0xff, 0xff]).expect("frames");
+                    writer.write_frame(&bytes).await.expect("the bad frame");
+                }
+                Closure::HalfFrame => {
+                    let bytes = codec.encode(&[0_u8; 16]).expect("frames");
+                    writer
+                        .write_frame(&bytes[..bytes.len() - 3])
+                        .await
+                        .expect("half a frame");
+                }
             }
             // The connection closes here, with the answer and the frame already written.
         });
@@ -2851,14 +3006,104 @@ mod tests {
     /// of the real client's compose.
     #[tokio::test]
     async fn the_failure_of_a_closed_peer_is_a_closed_connection() {
-        assert!(closed_after_the_hello(false).await);
+        assert!(closed_after_the_hello(Closure::Clean).await);
         assert!(closed_by_the_daemon(&kr_ipc::IpcError::PeerClosed));
+    }
+
+    /// A frame that the daemon's end cut is a closed connection too: the end of the stream inside
+    /// a frame is the daemon going, from the real failure of the real client.
+    #[tokio::test]
+    async fn the_failure_of_a_frame_cut_by_the_close_is_a_closed_connection() {
+        assert!(closed_after_the_hello(Closure::HalfFrame).await);
+        assert!(closed_by_the_daemon(&a_frame_cut_by_the_end()));
     }
 
     /// A frame that cannot be read is not a close: the command takes the daemon for one that
     /// stays and looks at its endpoint.
     #[tokio::test]
     async fn the_failure_of_a_bad_frame_is_not_a_closed_connection() {
-        assert!(!closed_after_the_hello(true).await);
+        assert!(!closed_after_the_hello(Closure::BadFrame).await);
+        assert!(!closed_by_the_daemon(&kr_ipc::IpcError::UnexpectedMessage(
+            "a frame of another kind"
+        )));
+    }
+
+    /// What the daemon does to the connection that `host_info` opens again after the first was
+    /// refused for a withdrawn authority.
+    #[derive(Clone, Copy)]
+    enum Retry {
+        /// The daemon has ended: nothing listens when the command connects again.
+        Gone,
+        /// The daemon accepts the new connection and closes it before it answers the hello.
+        Closes,
+    }
+
+    /// What `host_info` gives where a daemon refuses its first request for a withdrawn authority
+    /// and then ends or closes the connection that the retry opens: the real failure of the real
+    /// client.
+    async fn host_info_whose_retry_meets(retry: Retry) -> Result<HostInfoResult> {
+        use kr_ipc::client::LocalClient;
+        use kr_protocol::local::LocalClientKind;
+
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = temp.environment();
+        let id = environment.environment_id();
+        let endpoint = environment.controller_endpoint().expect("an endpoint");
+        let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
+        let daemon = tokio::spawn(async move {
+            let (mut reader, mut writer) = greet(&listener, id).await;
+            let ControlFrame::Request(request) = reader
+                .read_message::<ControlFrame>()
+                .await
+                .expect("the read request")
+            else {
+                panic!("the command asks for host.info");
+            };
+            // A daemon that has ended is not listening when the answer reaches the command.
+            let listener = match retry {
+                Retry::Gone => {
+                    drop(listener);
+                    None
+                }
+                Retry::Closes => Some(listener),
+            };
+            writer
+                .write_message(&ControlFrame::Response(kr_protocol::envelope::Response {
+                    request_id: request.request_id,
+                    outcome: Outcome::Error(ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "the authority behind this connection was withdrawn",
+                    )),
+                }))
+                .await
+                .expect("the refusal");
+            if let Some(listener) = listener {
+                let (connection, _peer) = listener.accept().await.expect("the new connection");
+                drop(connection);
+            }
+        });
+        let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, crate::build_id())
+            .await
+            .expect("connects");
+        let read = host_info(&mut client, &environment).await;
+        daemon.await.expect("the daemon has done its part");
+        read
+    }
+
+    /// The connection that `host_info` opens again keeps its transport error where the daemon has
+    /// ended or closes it, so that the command judges it by the daemon's end before anything says
+    /// that no host runs.
+    #[tokio::test]
+    async fn the_retry_of_the_host_info_read_keeps_its_transport_error() {
+        match host_info_whose_retry_meets(Retry::Gone).await {
+            Err(CliError::Ipc(_)) => {}
+            Err(other) => panic!("a daemon that has gone leaves the transport error, not {other}"),
+            Ok(_) => panic!("the read was refused"),
+        }
+        match host_info_whose_retry_meets(Retry::Closes).await {
+            Err(CliError::Ipc(error)) => assert!(closed_by_the_daemon(&error), "{error}"),
+            Err(other) => panic!("a closed connection leaves the transport error, not {other}"),
+            Ok(_) => panic!("the read was refused"),
+        }
     }
 }
