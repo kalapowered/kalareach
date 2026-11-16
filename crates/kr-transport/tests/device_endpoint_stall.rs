@@ -2,10 +2,11 @@
 //!
 //! The device's one endpoint has one relay actor for all of its relay clients, and that actor takes
 //! a datagram for one relay only while no send of its own is pending. This case tries to make that
-//! happen: several hosts, each with the product's budget of connections, sit on one relay that
-//! stops reading and writing, and a host on a healthy relay is asked a small question every 100
-//! milliseconds before, during and after. It prints what it measured and asserts conditions alone:
-//! the healthy host's connection stays open and every question is answered. It asserts no time.
+//! happen: several hosts, each with 32 connections that each carry a sender, sit on one relay that
+//! stops reading, and a host on a healthy relay is asked a small question every 100 milliseconds
+//! before, during and after. That is a stress load, above what the product shows a host using. It
+//! prints what it measured and asserts conditions alone: the healthy host's connection stays open
+//! and every question is answered. It asserts no time.
 //!
 //! It is outside the default suite: it runs for minutes and is a figure to be read, so it is
 //! asked for by name with `--ignored --nocapture`.
@@ -38,7 +39,8 @@ const LIMIT_MS: u64 = 2000;
 /// How often the case looks at a count that no future announces.
 const LOOK: Duration = Duration::from_millis(50);
 
-/// Connections to each host on the stopped relay: the product's budget for one host.
+/// Connections to each host on the stopped relay, each with a sender: a stress load, above what the
+/// product shows one host using.
 const CONNECTIONS_PER_HOST: usize = 32;
 
 /// How much each sender writes on one stream.
@@ -480,10 +482,10 @@ async fn arrangement(hosts: usize) -> (Vec<String>, bool, usize, Option<String>)
 }
 
 /// The case that tries to fill the queue of a relay that has stopped: K = 3 hosts and then K = 6,
-/// each with 32 connections on the relay, which stops reading and writing, also stalls the
-/// connections that are made after the stop, and resumes. A host on a healthy relay is asked a
-/// small question every 100 ms throughout. The figures and the outcome lines are printed first;
-/// then the conditions are asserted.
+/// each with 32 connections on the relay, which stops reading and also stalls the connections that
+/// are made after the stop, and resumes. A host on a healthy relay is asked a small question every
+/// 100 ms throughout. The figures and the outcome lines are printed first; then the conditions are
+/// asserted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "a figure to be read, run by name: --ignored --nocapture"]
 async fn a_relay_that_stops_taking_data_does_not_hold_a_host_on_another_relay() {

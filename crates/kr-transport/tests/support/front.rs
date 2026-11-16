@@ -152,11 +152,12 @@ impl RelayFront {
     /// Starts a front that passes every byte to `relay` and back until it is told to stall, with
     /// a receive buffer of a few KiB of its own.
     ///
-    /// Stalled, it reads and writes nothing on any connection that it holds, so the sockets stay
-    /// open and the device's side of each fills. It goes on accepting connections that are made
-    /// after the switch and leaves each of them alone, so that a client dialling it again meets a
-    /// connection that never completes its handshake and not a refusal. On resume it passes again,
-    /// bytes and new connections alike; what it held was never read, so no byte is lost.
+    /// Stalled, it starts no read and no write on any connection that it holds, so the sockets stay
+    /// open and the device's side of each fills. A write that is under way when the switch is made
+    /// can end after it. It goes on accepting connections that are made after the switch and leaves
+    /// each of them alone, so that a client dialling it again meets a connection that never
+    /// completes its handshake and not a refusal. On resume it passes again, bytes and new
+    /// connections alike; what it held was never read, so no byte is lost.
     pub fn stalling(relay: &LocalRelay) -> Self {
         let upstream = authority(&relay.url);
         let (switch, gate) = watch::channel(false);
@@ -203,7 +204,8 @@ impl RelayFront {
         }
     }
 
-    /// Stops a stalling front reading and writing.
+    /// Stops a stalling front starting a read or a write; a write that is under way can end after
+    /// the switch.
     pub fn stall(&self) {
         self.switch
             .as_ref()
@@ -276,8 +278,9 @@ async fn carry(
     );
 }
 
-/// Copies `from` to `to` a chunk at a time, and reads nothing while the front is stalled. A read
-/// that the switch interrupts has taken nothing, so the stream continues intact on resume.
+/// Copies `from` to `to` a chunk at a time, and starts no read while the front is stalled. A read
+/// that the switch interrupts has taken nothing, so the stream continues intact on resume; a write
+/// of a chunk that was already read is not interrupted and can end after the switch.
 async fn pump(
     mut from: OwnedReadHalf,
     mut to: OwnedWriteHalf,
