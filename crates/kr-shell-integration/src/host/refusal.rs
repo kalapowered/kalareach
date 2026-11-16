@@ -93,6 +93,12 @@ pub enum Refusal {
     PlacementOutsideTheProfile,
     /// PowerShell's check of the profile with the entry in it was not understood.
     CheckNotUnderstood,
+    /// PowerShell, which was found, did not say where its profiles are: it did not answer in time,
+    /// could not start or ended with an error.
+    ProfilesUnanswered,
+    /// PowerShell, which was found, ended without saying where its profiles are, or said something
+    /// other than two paths.
+    ProfilesNotUnderstood,
 }
 
 impl Refusal {
@@ -181,7 +187,9 @@ impl Refusal {
             | Self::CheckUnanswered
             | Self::PlacementNotUnderstood
             | Self::PlacementOutsideTheProfile
-            | Self::CheckNotUnderstood => return None,
+            | Self::CheckNotUnderstood
+            | Self::ProfilesUnanswered
+            | Self::ProfilesNotUnderstood => return None,
         })
     }
 }
@@ -232,6 +240,15 @@ impl fmt::Display for Refusal {
             Self::CheckNotUnderstood => formatter.write_str(
                 "PowerShell's check of the profile with the entry in it was not understood, so \
                  nothing was written",
+            ),
+            Self::ProfilesUnanswered => formatter.write_str(
+                "PowerShell did not say where its profiles are: it did not answer in time, could \
+                 not start or ended with an error, so nothing was written for PowerShell",
+            ),
+            Self::ProfilesNotUnderstood => formatter.write_str(
+                "PowerShell's answer about where its profiles are was not understood: it ended \
+                 without an answer or said something other than two paths, so nothing was \
+                 written for PowerShell",
             ),
             _ => Ok(()),
         }
@@ -304,6 +321,8 @@ mod tests {
             (Refusal::PlacementNotUnderstood, None),
             (Refusal::PlacementOutsideTheProfile, None),
             (Refusal::CheckNotUnderstood, None),
+            (Refusal::ProfilesUnanswered, None),
+            (Refusal::ProfilesNotUnderstood, None),
         ]
     }
 

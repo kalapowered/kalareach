@@ -153,9 +153,28 @@ impl HomeLayout {
     /// file it reads when that file does not already source `.bashrc`. Fish uses a guarded
     /// `conf.d` entry, which runs after the user's own configuration. PowerShell uses the user's
     /// profile.
+    ///
+    /// This is the reading for what never depends on PowerShell's answer, `kr shell status` and
+    /// removal: a PowerShell that is found and cannot be asked gets no target here, so a broken one
+    /// never stops a removal. An install uses [`Self::try_targets`], which says why.
     #[must_use]
     pub fn targets(&self, kind: ShellKind) -> Vec<StartupTarget> {
-        match kind {
+        self.try_targets(kind).unwrap_or_default()
+    }
+
+    /// Returns where this shell's guarded entry goes, or why PowerShell could not say where its
+    /// profiles are.
+    ///
+    /// Where no PowerShell is installed there is no target and no fault. Where one is found and the
+    /// question fails in any way, nothing is written for it and the refusal says what happened.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Refusal::ProfilesUnanswered`] when the shell did not answer in time, could not
+    /// start or ended with an error, and [`Refusal::ProfilesNotUnderstood`] when it ended without an
+    /// answer or said something other than two paths.
+    pub fn try_targets(&self, kind: ShellKind) -> Result<Vec<StartupTarget>, Refusal> {
+        Ok(match kind {
             ShellKind::Zsh => vec![StartupTarget {
                 kind,
                 path: self
@@ -209,16 +228,13 @@ impl HomeLayout {
             // before anything the person wrote there or in the second can ask a question of a shell
             // whose input the session would refuse; what the second ends with is checked once
             // everything the person configured has run.
-            ShellKind::PowerShell => self
-                .powershell
-                .as_ref()
-                .and_then(|shell| {
-                    self.powershell_profiles().map(|(all_hosts, current_host)| {
-                        powershell_targets(shell, all_hosts, current_host)
-                    })
-                })
-                .unwrap_or_default(),
-        }
+            ShellKind::PowerShell => match (&self.powershell, self.powershell_profiles()?) {
+                (Some(shell), Some((all_hosts, current_host))) => {
+                    powershell_targets(shell, all_hosts, current_host)
+                }
+                _ => Vec::new(),
+            },
+        })
     }
 
     /// Returns the two per-user profiles PowerShell reads on this host, the one every host reads
@@ -229,8 +245,14 @@ impl HomeLayout {
     /// under whatever directory the user's documents have been redirected to; a path this host
     /// derived could be a file PowerShell never reads, and an entry in a file nothing reads is an
     /// installation that reports success and integrates nothing.
-    fn powershell_profiles(&self) -> Option<(PathBuf, PathBuf)> {
-        let shell = self.powershell.as_ref()?;
+    ///
+    /// Nothing is returned where no PowerShell is installed. A PowerShell that is found and does not
+    /// answer with its two profiles is a refusal, whatever way it failed: an exit of 0 with no
+    /// answer is one, since a shell with a damaged cache can end that way without having run.
+    fn powershell_profiles(&self) -> Result<Option<(PathBuf, PathBuf)>, Refusal> {
+        let Some(shell) = self.powershell.as_ref() else {
+            return Ok(None);
+        };
         // The shell's own answer, read from a shell started with no profile of its own so that
         // nothing a user wrote decides where their profile is: one path on each of two lines.
         //
@@ -245,12 +267,11 @@ impl HomeLayout {
                 "-Command",
                 "$PROFILE.CurrentUserAllHosts; $PROFILE.CurrentUserCurrentHost",
             ],
-        )?;
-        let mut lines = said.lines().map(str::trim).filter(|line| !line.is_empty());
-        let all_hosts = PathBuf::from(lines.next()?);
-        let current_host = PathBuf::from(lines.next()?);
-        // A shell that named one profile, or more than two, answered something else.
-        lines.next().is_none().then_some((all_hosts, current_host))
+        )
+        .ok_or(Refusal::ProfilesUnanswered)?;
+        profiles_of(&said)
+            .map(Some)
+            .ok_or(Refusal::ProfilesNotUnderstood)
     }
 
     /// Returns the login file Bash reads for this user, which is the first of three that exists.
@@ -277,6 +298,21 @@ impl HomeLayout {
             }
         }
         self.home.join(".bash_profile")
+    }
+}
+
+/// Returns the two profiles a shell's answer names: one absolute path on each of two lines, and
+/// nothing else. An answer of any other form names no profile, and a path that is not absolute is
+/// not a file this host may write to, whatever directory it would be taken to be relative to.
+fn profiles_of(said: &str) -> Option<(PathBuf, PathBuf)> {
+    let mut lines = said.lines().map(str::trim).filter(|line| !line.is_empty());
+    match (lines.next(), lines.next(), lines.next()) {
+        (Some(all_hosts), Some(current_host), None)
+            if Path::new(all_hosts).is_absolute() && Path::new(current_host).is_absolute() =>
+        {
+            Some((PathBuf::from(all_hosts), PathBuf::from(current_host)))
+        }
+        _ => None,
     }
 }
 
@@ -3002,7 +3038,8 @@ mod tests {
             };
             let (all_hosts, current_host) = layout
                 .powershell_profiles()
-                .expect("PowerShell names its profiles");
+                .expect("PowerShell names its profiles")
+                .expect("a PowerShell is there");
             let held: Vec<_> = std::fs::read_dir(&home)
                 .expect("the home reads")
                 .map(|entry| entry.expect("an entry").file_name())
@@ -4751,6 +4788,185 @@ mod tests {
         kr_ipc::testing::place_and_start_once(&text, &path, &["--version"]);
         std::fs::remove_file(&text).expect("the program's text goes once it is in place");
         PowerShell::plain(path)
+    }
+
+    /// A shell's answer names two profiles when it is one absolute path on each of two lines, and
+    /// names none otherwise: a path that is not absolute is never written to.
+    #[test]
+    fn the_profile_answer_is_two_absolute_paths_on_two_lines() {
+        let (all_hosts, current_host) = if cfg!(windows) {
+            (
+                r"C:\Users\a\Documents\PowerShell\profile.ps1",
+                r"C:\Users\a\Documents\PowerShell\Microsoft.PowerShell_profile.ps1",
+            )
+        } else {
+            (
+                "/home/a/.config/powershell/profile.ps1",
+                "/home/a/.config/powershell/Microsoft.PowerShell_profile.ps1",
+            )
+        };
+        for said in [
+            format!("{all_hosts}\n{current_host}\n"),
+            format!("{all_hosts}\r\n{current_host}\r\n"),
+            format!("\n {all_hosts} \n\n{current_host}"),
+        ] {
+            assert_eq!(
+                profiles_of(&said),
+                Some((PathBuf::from(all_hosts), PathBuf::from(current_host))),
+                "{said:?}"
+            );
+        }
+        for said in [
+            String::new(),
+            "\n \n".to_owned(),
+            all_hosts.to_owned(),
+            format!("{all_hosts}\n{current_host}\n{all_hosts}"),
+            format!("{all_hosts}\nMicrosoft.PowerShell_profile.ps1"),
+            format!("profile.ps1\n{current_host}"),
+            "profile.ps1\nMicrosoft.PowerShell_profile.ps1".to_owned(),
+            "./profile.ps1\n./Microsoft.PowerShell_profile.ps1".to_owned(),
+            "-NoProfile -NonInteractive -NoLogo -Command".to_owned(),
+        ] {
+            assert_eq!(profiles_of(&said), None, "{said:?}");
+        }
+    }
+
+    /// The system's own program of this name, which is a stand-in for a PowerShell that ends the
+    /// way that program does: `true` ends with code 0 and prints nothing, `false` with code 1, and
+    /// `echo` prints its arguments on one line.
+    #[cfg(unix)]
+    fn system_program(name: &str) -> PathBuf {
+        ["/usr/bin", "/bin"]
+            .iter()
+            .map(|directory| Path::new(directory).join(name))
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| panic!("the system has no {name}"))
+    }
+
+    /// Asks the profile question of one stand-in for PowerShell, and returns what it refused with.
+    #[cfg(unix)]
+    fn what_the_profile_question_refuses(shell: PowerShell) -> Refusal {
+        let root = tempfile::tempdir().expect("a directory");
+        let asking = HomeLayout {
+            powershell: Some(shell),
+            ..layout(root.path())
+        };
+        let refused = asking
+            .try_targets(ShellKind::PowerShell)
+            .expect_err("the question is refused");
+        assert!(
+            asking.targets(ShellKind::PowerShell).is_empty(),
+            "the tolerant reading, which status and removal use, still has no target"
+        );
+        refused
+    }
+
+    /// The profile question that ends with code 0 and no answer, or with an answer that is not two
+    /// paths on two lines, is a failed start, said in words of its own, and no profile is guessed.
+    /// A PowerShell with a damaged cache can end that way without having run its script.
+    #[cfg(unix)]
+    #[test]
+    fn an_answer_that_did_not_come_is_a_refused_question_and_no_profile_is_guessed() {
+        let root = tempfile::tempdir().expect("a directory");
+        let not_understood = "PowerShell's answer about where its profiles are was not understood: it \
+                              ended without an answer or said something other than two paths, so \
+                              nothing was written for PowerShell";
+        let asked_in_vain = "PowerShell did not say where its profiles are: it did not answer in \
+                             time, could not start or ended with an error, so nothing was written \
+                             for PowerShell";
+        // Code 0 and nothing printed: the system's own `true`, as a PowerShell that ended without
+        // running its script.
+        for (what, shell) in [
+            (
+                "ends with code 0 and prints nothing",
+                PowerShell::plain(system_program("true")),
+            ),
+            (
+                "prints one line, its arguments",
+                PowerShell::plain(system_program("echo")),
+            ),
+            ("prints a blank line", fake_powershell(root.path(), " ")),
+            (
+                "names one profile",
+                fake_powershell(root.path(), "/home/a/profile.ps1"),
+            ),
+            (
+                "names three",
+                fake_powershell(
+                    root.path(),
+                    "/home/a/one.ps1\n/home/a/two.ps1\n/home/a/three.ps1",
+                ),
+            ),
+            (
+                "names two that are not paths of files",
+                fake_powershell(root.path(), "profile.ps1\nMicrosoft.PowerShell_profile.ps1"),
+            ),
+            (
+                "names one path and one name",
+                fake_powershell(root.path(), "/home/a/profile.ps1\nprofile.ps1"),
+            ),
+        ] {
+            let refused = what_the_profile_question_refuses(shell);
+            assert_eq!(refused, Refusal::ProfilesNotUnderstood, "{what}");
+            assert_eq!(refused.to_string(), not_understood, "{what}");
+        }
+        // Another end: a code other than 0, a program that cannot start, a signal.
+        let killed = root.path().join("pwsh-killed");
+        let text = root.path().join("pwsh-killed.text");
+        std::fs::write(
+            &text,
+            "#!/bin/sh\n[ \"${1:-}\" = --version ] && exit 0\nkill -9 $$\n",
+        )
+        .expect("writes the program's text");
+        kr_ipc::testing::place_and_start_once(&text, &killed, &["--version"]);
+        std::fs::remove_file(&text).expect("the program's text goes once it is in place");
+        for (what, shell) in [
+            (
+                "ends with code 1",
+                PowerShell::plain(system_program("false")),
+            ),
+            (
+                "cannot start",
+                PowerShell::plain(root.path().join("no-such-program")),
+            ),
+            ("ends by a signal", PowerShell::plain(killed)),
+        ] {
+            let refused = what_the_profile_question_refuses(shell);
+            assert_eq!(refused, Refusal::ProfilesUnanswered, "{what}");
+            assert_eq!(refused.to_string(), asked_in_vain, "{what}");
+        }
+        // No PowerShell at all is no refusal: there is nothing to ask and nothing to write.
+        assert!(
+            layout(root.path())
+                .try_targets(ShellKind::PowerShell)
+                .expect("no refusal where there is no PowerShell")
+                .is_empty()
+        );
+    }
+
+    /// A question that runs past its time is answered by nothing, and it does not hold the command.
+    #[cfg(unix)]
+    #[test]
+    fn a_question_that_outlasts_its_time_is_answered_by_nothing() {
+        let root = tempfile::tempdir().expect("a directory");
+        let slow = root.path().join("pwsh-slow");
+        let text = root.path().join("pwsh-slow.text");
+        std::fs::write(
+            &text,
+            "#!/bin/sh\n[ \"${1:-}\" = --version ] && exit 0\nsleep 30\n",
+        )
+        .expect("writes the program's text");
+        kr_ipc::testing::place_and_start_once(&text, &slow, &["--version"]);
+        std::fs::remove_file(&text).expect("the program's text goes once it is in place");
+        let began = std::time::Instant::now();
+        let said = ask_with(
+            &PowerShell::plain(slow),
+            &[],
+            &[],
+            std::time::Duration::from_millis(300),
+        );
+        assert_eq!(said, None);
+        assert!(began.elapsed() < std::time::Duration::from_secs(20));
     }
 
     /// Every PowerShell this host runs for a package is started as the package's
