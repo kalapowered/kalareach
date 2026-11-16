@@ -191,6 +191,13 @@ const AUTHORITY_ENDED_REVOCATION_OWED_PAGE: &str = "This host's authority for th
      account service issued. The host tries again the next time it uses the account, and what was \
      issued ends by itself when it expires. To sign in, start again on the host.";
 
+/// What the browser shows when a call opened while the sign-in's code was exchanged and the
+/// revocation of what the service issued reached neither the service nor the queue: the sentences
+/// of the page of a call that is open, and of the owed revocation, as they stand there.
+const CALL_OPEN_REVOCATION_OWED_PAGE: &str = "A voice call is open on this host. End it, then sign \
+     in again. The host could not yet revoke what the account service issued. The host tries again \
+     the next time it uses the account, and what was issued ends by itself when it expires.";
+
 /// What a waiting sign-in came to.
 #[derive(Clone, Copy)]
 enum Outcome {
@@ -201,6 +208,9 @@ enum Outcome {
     AuthorityEnded,
     /// As [`Self::AuthorityEnded`], and the revocation of what the service issued is still owed.
     AuthorityEndedRevocationOwed,
+    /// A call opened while the sign-in's code was exchanged, so no grant was kept
+    /// ([`AccountAttempt::CallOpen`]); and the revocation of what the service issued is still owed.
+    CallOpenRevocationOwed,
 }
 
 impl Outcome {
@@ -214,11 +224,22 @@ impl Outcome {
         }
     }
 
+    /// What a sign-in came to when a call opened while its code was exchanged: `commit` says
+    /// whether the revocation of what the service issued reached neither the service nor the queue
+    /// ([`Commit::WithheldOwing`]).
+    const fn call_open(commit: Commit) -> Self {
+        match commit {
+            Commit::WithheldOwing => Self::CallOpenRevocationOwed,
+            _ => Self::Attempt(AccountAttempt::CallOpen),
+        }
+    }
+
     /// What the account's report names.
     const fn attempt(self) -> AccountAttempt {
         match self {
             Self::Attempt(attempt) => attempt,
             Self::AuthorityEnded | Self::AuthorityEndedRevocationOwed => AccountAttempt::NotKept,
+            Self::CallOpenRevocationOwed => AccountAttempt::CallOpen,
         }
     }
 
@@ -228,6 +249,7 @@ impl Outcome {
             Self::Attempt(attempt) => page(attempt),
             Self::AuthorityEnded => AUTHORITY_ENDED_PAGE,
             Self::AuthorityEndedRevocationOwed => AUTHORITY_ENDED_REVOCATION_OWED_PAGE,
+            Self::CallOpenRevocationOwed => CALL_OPEN_REVOCATION_OWED_PAGE,
         }
     }
 }
@@ -1598,15 +1620,14 @@ impl Inner {
                 let change = self.begin_change();
                 drop(guard);
                 let Ok(_change) = change else {
-                    // Queued before it is sent, so a service that cannot be reached is told again
-                    // when the daemon next starts.
-                    if let Err(error) = held.signed_in.revoke_unkept(refresh).await {
-                        eprintln!(
-                            "kr-controller: a refused sign-in's token was sent to the service, but \
-                             the store failed: {error}"
-                        );
+                    // A call opened while the exchange was out. The token is ended as a withheld
+                    // sign-in's is, queued before it is sent, and the browser is told of a
+                    // revocation that is still owed as it is there.
+                    let (commit, unrevoked) = held.signed_in.end_withheld(refresh).await;
+                    if let Some(unrevoked) = unrevoked {
+                        eprintln!("kr-controller: a refused sign-in's token: {unrevoked}");
                     }
-                    return Outcome::Attempt(AccountAttempt::CallOpen);
+                    return Outcome::call_open(commit);
                 };
                 // The sign-in waited for the person, up to the end of its time, and the authority
                 // it was started under can have ended in that wait: the fence this host owes and,
