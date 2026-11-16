@@ -260,13 +260,6 @@ impl Ask {
 
     /// A sign-in's keep: the fence and the lease's bound alone. The revision the sign-in began
     /// under is not asked, since a barrier in its wait does not end it.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the sign-in's keep asks it from landing B, which converts the account actions"
-        )
-    )]
     pub(crate) const SIGN_IN: Self = Self {
         flag: true,
         revision: Revision::Unasked,

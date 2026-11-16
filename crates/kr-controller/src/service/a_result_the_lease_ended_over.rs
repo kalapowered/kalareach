@@ -603,3 +603,33 @@ async fn a_sign_in_ask_whose_lease_ends_while_the_fence_is_read_is_refused() {
         );
     }
 }
+
+/// KR-REQ-09.09: a fence this host comes to owe in the wait that follows the reading of the owner's
+/// lease stops the sign-in's ask, which refuses in the fence's words, so nothing is kept. The
+/// control: with no fence owed the ask passes and gives the host as its guard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_ask_whose_fence_comes_while_the_lease_is_read_is_refused() {
+    for owed in [false, true] {
+        let (_temp, controller, _continuous, _writer, _reader) = connected_under_a_lease().await;
+        let lasting = controller.sign_in_lasting(Method::AccountSignIn);
+        let (arrived, go) = controller.pause_before_the_last_fence_read();
+        let asking = tokio::task::spawn_blocking(move || lasting());
+        // The lease was read live, and the question is about to be asked.
+        tokio::task::spawn_blocking(move || {
+            arrived.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await
+        .expect("the wait ends")
+        .expect("the ask reaches its question");
+        controller.hold_fence(owed);
+        go.send(()).expect("the ask goes on");
+        let asked = asking.await.expect("the ask ends");
+        controller.hold_fence(false);
+        if owed {
+            let refused = asked.expect_err("a fence owed in the wait stops the ask");
+            assert!(refused.to_string().contains("fence"), "{refused}");
+        } else {
+            asked.expect("the control passes");
+        }
+    }
+}
