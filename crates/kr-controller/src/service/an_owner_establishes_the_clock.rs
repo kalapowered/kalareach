@@ -702,6 +702,7 @@ async fn a_host_with_an_owner_and_no_network_is_not_asked_for_a_confirmation_nob
                 door.actor_id().clone(),
             ))
             .expect("the owner lists what it can answer")
+            .full
             .pending
             .len()
     };

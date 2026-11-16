@@ -34,7 +34,7 @@ use kr_transport::clock::ContinuousInstant;
 pub use super::devices::CommitFn;
 pub use super::invitations::Admission;
 use super::invitations::noted_as_a_copy;
-use super::owner::Caller;
+use super::owner::{Caller, Listed};
 use super::pairing::PairingHost;
 use super::rendezvous::Life;
 use crate::authority::AdmittedMutation;
@@ -154,14 +154,29 @@ impl Controller {
             // The challenges are the daemon's, networked or not.
             Method::OwnerConfirmationPending => {
                 let _: OwnerConfirmationPendingParams = decode(params)?;
-                let owner = Arc::clone(&self.owner);
-                blocking(move || owner.pending(&caller)).await
+                let listed = self.pairing_pending(caller).await?;
+                encode(&listed.full)
             }
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a read the pairing service serves",
                 method.as_str()
             ))),
         }
+    }
+
+    /// Lists the owner's outstanding confirmations for `caller`: both lists and the bound of the
+    /// lease the first was decided under, which the local door writes the reply under.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal of a caller without owner authority.
+    pub(crate) async fn pairing_pending(self: &Arc<Self>, caller: Caller) -> Result<Listed> {
+        let owner = Arc::clone(&self.owner);
+        tokio::task::spawn_blocking(move || owner.pending(&caller))
+            .await
+            .map_err(|_| ControllerError::Uncertain {
+                detail: "the pairing step stopped before it answered".to_owned(),
+            })?
     }
 
     /// Returns what a repeated pairing mutation is owed, when its action already has an outcome.

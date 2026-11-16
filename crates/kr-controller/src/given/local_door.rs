@@ -53,6 +53,30 @@ pub(crate) struct WrittenUnder {
     footing: Footing,
     ask: Ask,
     words: Words,
+    /// What a list that was decided under the local owner's lease is replaced by where that lease
+    /// has ended when the writer asks.
+    instead: Option<Instead>,
+}
+
+/// What a list is replaced by where the local owner's lease ended after the list was decided under
+/// it: the same list under the scope that no lease serves, and the bound of the lease the list was
+/// decided under.
+///
+/// The list and its replacement are made from the same entries by one function before any
+/// question is asked ([`Listed`](crate::net::owner::Listed)). The writer chooses between
+/// them with the footing's question asked with this bound and with nothing else: the replacement is
+/// written as it was prepared.
+#[derive(Clone)]
+pub(crate) struct Instead {
+    frame: ControlFrame,
+    bound: HeldBound,
+}
+
+impl Instead {
+    /// The replacement `frame` for a list decided under `bound`.
+    pub(crate) const fn new(frame: ControlFrame, bound: HeldBound) -> Self {
+        Self { frame, bound }
+    }
 }
 
 /// In whose words a frame that the writer's last question stopped is replaced.
@@ -80,6 +104,7 @@ impl WrittenUnder {
             footing,
             ask: Ask::READ,
             words: Words::Read,
+            instead: None,
         }
     }
 
@@ -91,6 +116,7 @@ impl WrittenUnder {
             footing,
             ask: Ask::READ,
             words: Words::OwnEffect { taken_effect },
+            instead: None,
         }
     }
 
@@ -107,6 +133,7 @@ impl WrittenUnder {
             footing,
             ask: withdrew.ask().and_the_lease(),
             words: Words::OwnEffect { taken_effect },
+            instead: None,
         }
     }
 
@@ -118,6 +145,7 @@ impl WrittenUnder {
             footing,
             ask: Ask::KEPT_ANSWER.and_the_lease(),
             words: Words::Record { conflict },
+            instead: None,
         }
     }
 
@@ -133,6 +161,18 @@ impl WrittenUnder {
         Self::of_an_own_effect(footing, taken_effect)
     }
 
+    /// This standing for a list that `instead` replaces where the lease it was decided under has
+    /// ended.
+    pub(crate) fn listing(mut self, instead: Option<Instead>) -> Self {
+        self.instead = instead;
+        self
+    }
+
+    /// The frame that replaces the list where the lease ended.
+    pub(crate) fn instead(&self) -> Option<&ControlFrame> {
+        self.instead.as_ref().map(|instead| &instead.frame)
+    }
+
     /// The question, for a lease whose reading found `bound`: no lock is taken, nothing is awaited
     /// and nothing is written ([`Footing::ask`]). What it was asked with is returned, and the
     /// writer lets it go after the transport's write: the bound's last reference can free memory.
@@ -144,11 +184,22 @@ impl WrittenUnder {
         &self,
         bound: Option<HeldBound>,
     ) -> Result<LeaseAsked, LeasedLapse> {
+        // A list decided under a lease is asked with the bound it was decided under where the
+        // writer's own reading of the lease found none.
+        let carried = bound.is_none();
+        let bound = bound.or_else(|| self.instead.as_ref().map(|instead| instead.bound.clone()));
         match bound {
             Some(bound) => {
                 let leased = self.footing.clone().holding(bound);
-                leased.ask(self.ask)?;
-                Ok(LeaseAsked::with(leased))
+                match leased.ask(self.ask) {
+                    Ok(()) => Ok(LeaseAsked::with(leased)),
+                    // The lease was presented again: the list was decided under a lease that is
+                    // not the one that stands, which is an ended lease's.
+                    Err(LeasedLapse::BoundMoved) if carried => {
+                        Err(LeasedLapse::Lapse(Lapse::LeaseEnded))
+                    }
+                    Err(lapse) => Err(lapse),
+                }
             }
             None => {
                 self.footing.ask(self.ask)?;
