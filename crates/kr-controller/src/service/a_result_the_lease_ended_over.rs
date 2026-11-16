@@ -691,6 +691,11 @@ async fn a_sign_in_ask_whose_bound_moves_to_a_lineage_that_ended_at_the_new_read
 /// question is refused in the lease's words, which only a guard that holds the footing and the
 /// bound it was asked with can do; a guard that held none, or a footing with no bound, lets it
 /// through. And the guard holds the host.
+///
+/// What it shows: a guard made without the host fails the first assertion; a guard made without
+/// the footing or the bound lets its question pass after the lease's end, and fails the last. What
+/// it does not show: no landing runs in it, so it cannot tell a guard that is held through a
+/// landing from one that is dropped before it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_guard_of_a_sign_in_ask_holds_the_host_and_the_footing_it_asked_with() {
     let (_temp, controller, continuous, _writer, _reader) = connected_under_a_lease().await;
