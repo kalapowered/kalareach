@@ -485,6 +485,7 @@ fn live_session() -> kr_protocol::session::SessionReadResult {
         last_command_block: Nullable::null(),
         outstanding_launches: Nullable::null(),
         metrics: None,
+        held: false,
     }
 }
 

@@ -205,6 +205,7 @@ impl RemoteConnection {
         }
         let narrowed = kr_protocol::session::SessionReadResult {
             last_command_block: kr_protocol::scalars::Nullable::null(),
+            held: false,
             ..read
         };
         match ParamsValue::from_typed(&narrowed) {
