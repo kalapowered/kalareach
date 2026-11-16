@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use kr_controller::service::{Controller, DEBT_PASS_INTERVAL};
 use kr_protocol::ids::{ActorId, SessionEpoch, SessionId};
+use kr_protocol::local::ControllerConnectionRole;
 use kr_protocol::method::Method;
 use kr_protocol::scalars::Nullable;
 use kr_protocol::sharing::{RoleSelection, SessionRole};
@@ -67,6 +68,63 @@ fn asks_of(controller: &Controller, session_id: SessionId) -> Vec<tokio::time::I
         .filter(|(asked, _)| *asked == session_id)
         .map(|(_, at)| at)
         .collect()
+}
+
+/// The presentations of a generation that connections of the daemon's authority role have begun at
+/// the worker, since it started. The daemon makes other presentations at a worker that this count
+/// leaves out, one for each of its readers, and the start's own is in it.
+fn authority_presentations(worker: &Worker) -> u64 {
+    worker
+        .service
+        .presentations_begun_for_tests(ControllerConnectionRole::Authority)
+}
+
+/// The authority presentations begun at a worker since a count taken earlier.
+fn authority_presentations_since(worker: &Worker, baseline: u64) -> u64 {
+    authority_presentations(worker) - baseline
+}
+
+/// Every role's count of presentations begun at a worker, for what a failed assertion prints.
+fn presentations_by_role(worker: &Worker) -> String {
+    [
+        ControllerConnectionRole::Authority,
+        ControllerConnectionRole::Proxy,
+        ControllerConnectionRole::Attention,
+        ControllerConnectionRole::Descriptions,
+        ControllerConnectionRole::Checks,
+    ]
+    .map(|role| {
+        format!(
+            "{} {}",
+            role.as_str(),
+            worker.service.presentations_begun_for_tests(role)
+        )
+    })
+    .join(", ")
+}
+
+/// The count of authority presentations at a worker, taken at a point that an event settles: the
+/// daemon's one link to the worker is up.
+///
+/// The daemon keeps one link to a worker, and whatever needs it waits for the opening that is under
+/// way and begins none of its own. Taking the link returns once that opening is decided, so every
+/// presentation of the daemon's authority role at this worker so far has begun and is counted. With
+/// a link in the slot the daemon begins no other until a case closes it, so a count read here and
+/// a count read after the case has closed the link differ by the presentations that follow it.
+async fn authority_presentations_with_the_link_up(
+    controller: &Arc<Controller>,
+    worker: &Worker,
+) -> u64 {
+    let link = tokio::time::timeout(
+        Duration::from_secs(40),
+        controller.hold_a_worker_link_for_tests(worker.session_id),
+    )
+    .await
+    .expect("the daemon's link to the worker came up before the case's baseline")
+    .expect("the daemon reaches the worker");
+    let begun = authority_presentations(worker);
+    drop(link);
+    begun
 }
 
 /// A restriction made while the worker's dispatch boundary is held: the worker is pending.
@@ -702,7 +760,9 @@ async fn the_fence_is_owed_while_a_worker_is_pending_and_settled_when_the_pass_h
 /// opened another at each ask would begin a presentation at each ask. The real boundary is held for
 /// twenty passes with no link in the slot, and the worker's own count of the presentations begun
 /// is what shows how many the host made: the count of those waiting also falls when the host closes
-/// a link, so it cannot tell one opening from a series of them.
+/// a link, so it cannot tell one opening from a series of them. The count is the authority role's,
+/// and the case reads it with the daemon's link up, before the case closes that link, so that the
+/// presentations of the daemon's start are not among the ones it counts as its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_worker_whose_boundary_is_held_through_twenty_passes_holds_one_presentation_of_the_host()
 {
@@ -713,6 +773,8 @@ async fn a_worker_whose_boundary_is_held_through_twenty_passes_holds_one_present
     } = Adopted::start(1).await;
     let worker = &workers[0];
     let service = Arc::clone(&worker.service);
+    let begun_before_the_link_closed =
+        authority_presentations_with_the_link_up(host.controller(), worker).await;
     let held = restricted_while_the_boundary_is_held(host.controller(), worker).await;
     host.controller()
         .forget_the_worker_link_for_tests(worker.session_id)
@@ -743,9 +805,11 @@ async fn a_worker_whose_boundary_is_held_through_twenty_passes_holds_one_present
     // host that closed its waiting opening and began another would still show one waiting: what a
     // gone peer does not lower is the count of presentations begun.
     assert_eq!(
-        service.presentations_begun_for_tests(),
+        authority_presentations_since(worker, begun_before_the_link_closed),
         1,
-        "the presentations the host began at the held boundary in twenty passes"
+        "the authority presentations the host began at the held boundary in twenty passes, counted \
+         from {begun_before_the_link_closed} with the daemon's link up (now, by role: {})",
+        presentations_by_role(worker)
     );
     tokio::time::timeout(Duration::from_secs(10), worker.client())
         .await
@@ -1185,6 +1249,11 @@ async fn two_openings_waiting_at_held_boundaries_do_not_keep_a_stopped_daemon_al
         owner: _,
         workers,
     } = Adopted::start(2).await;
+    let mut begun_before_the_links_closed = Vec::new();
+    for worker in &workers {
+        begun_before_the_links_closed
+            .push(authority_presentations_with_the_link_up(host.controller(), worker).await);
+    }
     let mut held = Vec::new();
     for worker in &workers {
         held.push(worker.hold_the_dispatch_boundary().await);
@@ -1213,11 +1282,13 @@ async fn two_openings_waiting_at_held_boundaries_do_not_keep_a_stopped_daemon_al
         },
     )
     .await;
-    for worker in &workers {
+    for (worker, before) in workers.iter().zip(&begun_before_the_links_closed) {
         assert_eq!(
-            worker.service.presentations_begun_for_tests(),
+            authority_presentations_since(worker, *before),
             1,
-            "the host began one presentation at each held boundary"
+            "the authority presentations the host began at a held boundary, counted from {before} \
+             with the daemon's link up (now, by role: {})",
+            presentations_by_role(worker)
         );
     }
 
@@ -1390,6 +1461,8 @@ async fn the_pass_looks_at_a_worker_whose_presentation_is_waiting_and_asks_it_no
         workers,
     } = Adopted::start(1).await;
     let worker = &workers[0];
+    let begun_before_the_first_ask =
+        authority_presentations_with_the_link_up(host.controller(), worker).await;
     let held = restricted_while_the_boundary_is_held(host.controller(), worker).await;
     host.controller()
         .forget_the_worker_link_for_tests(worker.session_id)
@@ -1430,9 +1503,11 @@ async fn the_pass_looks_at_a_worker_whose_presentation_is_waiting_and_asks_it_no
         "the host's one presentation is still waiting"
     );
     assert_eq!(
-        worker.service.presentations_begun_for_tests(),
+        authority_presentations_since(worker, begun_before_the_first_ask),
         1,
-        "the host began no other presentation while it waited"
+        "the authority presentations the host began while one waited, counted from \
+         {begun_before_the_first_ask} with the daemon's link up (now, by role: {})",
+        presentations_by_role(worker)
     );
     held.release();
     until_nobody_is_pending(
