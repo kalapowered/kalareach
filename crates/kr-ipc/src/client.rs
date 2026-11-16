@@ -762,7 +762,9 @@ impl<C: Codec> Client<C> {
     /// A worker whose dispatch boundary is held answers a presentation only when the hold ends,
     /// which can take long, and while it waits it asks the operating system, at short intervals,
     /// whether this connection's peer has gone. A peer that has gone is not answered: the worker
-    /// ends the connection and decides nothing for it. A client that wants its answer therefore
+    /// ends the connection and decides nothing for it, as far as the system's report reaches. The
+    /// worker asks once more just before it changes anything, and a peer that goes after that
+    /// last question is still decided. A client that wants its answer therefore
     /// sends nothing after the token, and does not end the side it sends on, until the worker has
     /// answered. It ends the connection when it no longer wants the answer, and not before.
     ///
