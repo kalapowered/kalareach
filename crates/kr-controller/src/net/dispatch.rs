@@ -388,6 +388,9 @@ mod a_network_frame_is_asked_where_it_lands;
 mod an_owners_records_ask_the_feed_twice;
 
 #[cfg(test)]
+mod an_owners_records_ask_the_footing_after_the_feed;
+
+#[cfg(test)]
 mod a_share_a_device_holds;
 
 #[cfg(test)]
