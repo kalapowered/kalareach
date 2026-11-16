@@ -9291,7 +9291,7 @@ impl WorkerService {
             Ok(true) => {}
             Ok(false) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 return Err(WorkerError::JournalUnavailable {
-                    detail: "the session did not answer in time, so no receipt could be read"
+                    detail: "The session did not answer in time, so the receipt was not read."
                         .to_owned(),
                 });
             }
@@ -9304,7 +9304,7 @@ impl WorkerService {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 Err(WorkerError::JournalUnavailable {
                     detail:
-                        "the session's store did not answer in time, so no receipt could be read"
+                        "The session's store did not answer in time, so the receipt was not read."
                             .to_owned(),
                 })
             }
