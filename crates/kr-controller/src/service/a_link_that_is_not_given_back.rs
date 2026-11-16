@@ -1461,11 +1461,13 @@ async fn a_collection_whose_wait_for_the_link_left_too_little_time_gives_the_lin
 /// Another operation holds the link throughout. Two older revisions that the results read and the
 /// worker was not asked about, and then two whose pages are still owed, would each wait five
 /// seconds for it; with two seconds of the ask left, each returns at once.
+///
+/// The daemon's own pass is not held: it collects names at the registry's revision, which no
+/// revision of this case's reports reaches, so it sends this worker nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_collection_with_too_little_time_left_does_not_wait_for_the_link_for_each_older_revision()
 {
     let (silent, heard) = stalled().await;
-    let _pass = without_an_evidence_pass(&silent.controller).await;
     let controller = Arc::clone(&silent.controller);
     let session_id = silent.session_id;
     let (binding, newer, _older) =
@@ -1524,10 +1526,13 @@ async fn a_collection_with_too_little_time_left_does_not_wait_for_the_link_for_e
 /// report of it; revision 5 was then acknowledged with evidence that was whole, and its result
 /// reads 4. The ask's time ran out before 4's first exchange. The worker owes names no report
 /// says it owes, so the set the pass collects must hold it, or nothing asks again.
+///
+/// The daemon's own pass is not held: it collects names at the registry's revision, which no
+/// revision of this case's reports reaches, so it sends this worker nothing. The case makes the
+/// pass's collection itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_give_back_before_an_older_revisions_first_exchange_leaves_the_worker_owing_its_names() {
     let (silent, heard) = stalled().await;
-    let _pass = without_an_evidence_pass(&silent.controller).await;
     let controller = Arc::clone(&silent.controller);
     let session_id = silent.session_id;
     let (binding, newer, older) =
