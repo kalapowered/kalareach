@@ -14,7 +14,7 @@
 
 use kr_client::answers::{self, Quote};
 use kr_client::shown;
-use kr_client::shown::{Said, Shown};
+use kr_client::shown::Shown;
 use kr_ipc::client::LocalClient;
 use kr_ipc::error::IpcError;
 use kr_protocol::envelope::ActionTarget;
@@ -225,11 +225,14 @@ where
 /// What the command ends as when the worker refuses to show the receipt of the earlier action.
 ///
 /// The refusal is shown as it always was. One that the worker gives to an argument it cannot use is
-/// followed, where the command has a later request, by what the person does if the host holds no
-/// receipt for the action. Only the refusal's code decides that: the worker words that refusal for
-/// an action it has no receipt for, and also for other arguments it cannot use, and the sentence
-/// says what holds if it is the first.
-pub(crate) fn read_refused(
+/// shown in the worker's own words and then, where the command has a later request, by what the
+/// person does if the host holds no receipt for the action, with no action line from the code
+/// between them or after them: the standing action for that code names a version mismatch that the
+/// command did not read, and that the sentence contradicts when the host holds no receipt. Only the
+/// refusal's code decides that: the worker words that refusal for an action it has no receipt for,
+/// and also for other arguments it cannot use, and the sentence says what holds if it is the first.
+/// A `--json` failure keeps the message it had: the code and the worker's words.
+pub fn read_refused(
     refusal: ProtocolError,
     action: ActionId,
     what: &'static str,
@@ -241,18 +244,16 @@ pub(crate) fn read_refused(
     if refusal.code != ErrorCode::InvalidArgument {
         return CliError::Refused(refusal);
     }
-    let code = refusal.code;
-    CliError::refused_in_its_own_words(
-        code,
-        shown!(
-            "{}\nIf the host holds no receipt for action {}, there is nothing for a later {} to \
+    CliError::ReadRefused {
+        error: refusal,
+        then: shown!(
+            "If the host holds no receipt for action {}, there is nothing for a later {} to \
              name: {}.",
-            CliError::Refused(refusal).said(),
             action,
             what,
             later.asks_again.clone()
         ),
-    )
+    }
 }
 
 /// Reads the receipt of the earlier action a person names and shows it, which is also how the worker
@@ -267,10 +268,10 @@ pub(crate) fn read_refused(
 /// Returns a usage failure when the action is not a request for `method` whose outcome the worker
 /// could not establish, when its receipt could not be shown on standard error (nothing is sent: a
 /// later request names a result the person was shown), and the worker's refusal when it holds no
-/// such action. A refusal that says an argument cannot be used is shown with one sentence more,
-/// where the command has a later request: if the host holds no receipt for the action there is
-/// nothing to name, and the plain command asks again. The sentence is chosen by the refusal's code
-/// and by nothing it says.
+/// such action. A refusal that says an argument cannot be used is shown in the worker's words and
+/// one sentence, where the command has a later request: if the host holds no receipt for the action
+/// there is nothing to name, and the plain command asks again. The sentence is chosen by the
+/// refusal's code and by nothing it says.
 pub async fn earlier(
     client: &mut LocalClient,
     action: ActionId,
@@ -336,6 +337,7 @@ pub async fn earlier(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kr_client::shown::Said;
     use kr_protocol::scalars::Uuid;
 
     fn action() -> ActionId {
@@ -402,24 +404,35 @@ mod tests {
         );
     }
 
-    /// The refusal of an argument the worker cannot use is shown as it was, and one sentence says
-    /// what holds if the host has no receipt for the action.
+    /// The refusal of an argument the worker cannot use is shown in the worker's words and one
+    /// sentence of what holds if the host has no receipt for the action: no action line from the
+    /// code stands before it, and the `--json` message is the one it had.
     #[test]
     fn a_refusal_of_an_argument_adds_what_holds_where_the_host_has_no_receipt() {
         let worker = refusal(
             ErrorCode::InvalidArgument,
             shown!("no receipt for action {}", action()),
         );
-        let today = CliError::Refused(worker.clone()).said();
-        let said = read_refused(worker, action(), "cancellation", &cancelling()).said();
+        let ended = read_refused(worker.clone(), action(), "cancellation", &cancelling());
         assert_eq!(
-            said.as_str(),
+            ended.said().as_str(),
             format!(
-                "{today}\nIf the host holds no receipt for action {a}, there is nothing for a \
-                 later cancellation to name: `kr question cancel 11` asks again.",
+                "no receipt for action {a}\nIf the host holds no receipt for action {a}, there is \
+                 nothing for a later cancellation to name: `kr question cancel 11` asks again.",
                 a = action()
             )
         );
+        assert_eq!(
+            ended.machine_message().as_str(),
+            format!("INVALID_ARGUMENT: no receipt for action {}", action()),
+            "the message a script reads is what it was before the sentence"
+        );
+        assert_eq!(
+            ended.machine_message().as_str(),
+            CliError::Refused(worker).machine_message().as_str()
+        );
+        assert_eq!(ended.exit_code(), 8);
+        assert_eq!(ended.code(), ErrorCode::InvalidArgument);
     }
 
     /// A refusal with any other code is shown as it was, and so is any refusal where the command has
@@ -432,8 +445,15 @@ mod tests {
             ErrorCode::OutcomeUnknown,
         ] {
             let worker = refusal(code, Shown::said("the worker would not say"));
-            let said = read_refused(worker.clone(), action(), "cancellation", &cancelling()).said();
-            assert_eq!(said.as_str(), CliError::Refused(worker).said().as_str());
+            let ended = read_refused(worker.clone(), action(), "cancellation", &cancelling());
+            assert_eq!(
+                ended.said().as_str(),
+                CliError::Refused(worker.clone()).said().as_str()
+            );
+            assert_eq!(
+                ended.machine_message().as_str(),
+                CliError::Refused(worker).machine_message().as_str()
+            );
         }
         let worker = refusal(
             ErrorCode::InvalidArgument,
