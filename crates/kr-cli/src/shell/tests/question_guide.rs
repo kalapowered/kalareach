@@ -55,13 +55,11 @@ struct Row {
 #[derive(Clone)]
 struct Facts {
     rows: Vec<Row>,
-    header: String,
 }
 
 /// Reads the table.
 fn facts() -> Facts {
     let mut rows: Vec<Row> = Vec::new();
-    let mut header = String::new();
     let mut section = "";
     for line in TABLE.lines() {
         if let Some(name) = line.strip_prefix("## ") {
@@ -72,11 +70,6 @@ fn facts() -> Facts {
             } else {
                 ""
             };
-            continue;
-        }
-        if line.starts_with('#') {
-            header.push_str(line);
-            header.push(' ');
             continue;
         }
         let Some(rest) = line.strip_prefix("question=") else {
@@ -101,7 +94,7 @@ fn facts() -> Facts {
             _ => {}
         }
     }
-    Facts { rows, header }
+    Facts { rows }
 }
 
 impl Facts {
@@ -194,10 +187,12 @@ fn says_nothing_was_written(row: &Row) -> bool {
     row.text.contains("nothing was written")
 }
 
-/// Whether a row says, behind the profile that it concerns where there is one, that PowerShell did
-/// not answer, could not start or ended with an error (`phrase`) and that nothing was written.
+/// Whether a row says `phrase` and ends by saying that nothing was written: "so nothing was
+/// written", with "for PowerShell" after it at the profile question, which has no profile to name.
 fn says_so(row: &Row, phrase: &str) -> bool {
-    row.text.contains(phrase) && row.text.ends_with("so nothing was written")
+    row.text.contains(phrase)
+        && (row.text.ends_with("so nothing was written")
+            || row.text.ends_with("so nothing was written for PowerShell"))
 }
 
 /// One claim of the passage.
@@ -209,7 +204,7 @@ struct Claim {
     texts: &'static [&'static str],
     /// The property over the table that the claim says.
     holds: fn(&Facts) -> bool,
-    /// Doctored rows (or header) that each break the property: one for each promise that it checks.
+    /// Doctored rows that each break the property: one for each promise that it checks.
     doctors: &'static [fn(&mut Facts)],
 }
 
@@ -323,7 +318,9 @@ fn claims() -> Vec<Claim> {
                 |facts| facts.row_mut("profiles", "signalled").left = "written".to_owned(),
                 |facts| {
                     let other = facts.row("profiles", "too_long").text.clone();
-                    facts.row_mut("profiles", "not_prepared").text = other;
+                    for way in OWN {
+                        facts.row_mut("profiles", way).text = other.clone();
+                    }
                 },
             ],
         },
@@ -636,10 +633,10 @@ fn in_order(passage: &str) -> Result<(), String> {
         let at = passage
             .find(text)
             .ok_or_else(|| format!("this text is not in the passage: {text:?}"))?;
-        if let Some((last, before)) = placed.last() {
-            if at < *last {
-                return Err(format!("{text:?} stands before {before:?}"));
-            }
+        if let Some((last, before)) = placed.last()
+            && at < *last
+        {
+            return Err(format!("{text:?} stands before {before:?}"));
         }
         placed.push((at, text));
     }
