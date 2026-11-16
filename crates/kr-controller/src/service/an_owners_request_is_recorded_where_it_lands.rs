@@ -306,12 +306,26 @@ async fn recorded_with_the_bound_moving_inside(display: ConfirmationDisplay) -> 
     with_its_replay(found, &temp, again.0, again.1, action, shown).await
 }
 
+/// How the grant of the owner's device ends where the record is stopped.
+#[derive(Clone, Copy, Debug)]
+enum GrantEnd {
+    /// It stands: the control.
+    Stands,
+    /// The continuous clock passes the deadline the host anchored for the grant.
+    TheDeadline,
+    /// The wall clock passes the grant's expiry, and the continuous clock stays where it stood.
+    TheExpiry,
+}
+
 /// As [`recorded_with`], for a caller that is an owner's device on a host with no lease, whose
-/// grant ends in the last wait when `grant_ends` says so. The record is stopped at the end of the
-/// feed's locked ask, which is where its own owner check follows: the grant's end, measured on the
+/// grant ends where the record is stopped as `end` says. Stopped at the end of the feed's locked
+/// ask, which is where the record's own owner check follows, the grant's end, measured on the
 /// continuous clock the host anchored it on, is found by that check alone, since the landing's
-/// deadline is an hour away and the feed's refusal was read before the stop.
-async fn recorded_by_a_device(grant_ends: bool) -> Found {
+/// deadline is an hour away and the feed's refusal was read before the stop. Stopped once the
+/// first write has been made, the grant's end by the wall clock is found by that check asked
+/// again, immediately before the commit: nothing else of the last ask reads the grant, since the
+/// landing's deadline is an hour away and a local connection keeps no feed grants.
+async fn recorded_by_a_device(at: At, end: GrantEnd) -> Found {
     let temp = kr_ipc::testing::TempHost::create();
     let (continuous, wall, clocks) = crate::service::net::tests::manual_clocks();
     let controller = crate::service::net::tests::daemon_on(&temp, clocks).await;
@@ -348,7 +362,10 @@ async fn recorded_by_a_device(grant_ends: bool) -> Found {
         ActionId::new(kr_ipc::new_uuid()),
         Digest256::from_bytes([3; 32]),
     );
-    let (arrived, go) = controller.pause_after_the_record_asks_the_feed();
+    let (arrived, go) = match at {
+        At::TheFeedsAsk => controller.pause_after_the_record_asks_the_feed(),
+        At::TheFirstWrite => controller.pause_after_the_first_write(),
+    };
     let owner = Arc::clone(controller.owner_authority());
     let (again, shown) = ((Arc::clone(&owner), caller.clone()), establishing());
     let begun_at = kr_ipc::now_ms().get();
@@ -361,8 +378,15 @@ async fn recorded_by_a_device(grant_ends: bool) -> Found {
         .await
         .expect("the wait ends")
         .expect("the record reaches the end of the feed's ask");
-    if grant_ends {
-        continuous.advance(Duration::from_secs(11 * 60));
+    match end {
+        GrantEnd::Stands => {}
+        GrantEnd::TheDeadline => continuous.advance(Duration::from_secs(11 * 60)),
+        GrantEnd::TheExpiry => {
+            wall.store(
+                wall.load(Ordering::SeqCst) + 11 * 60 * 1000,
+                Ordering::SeqCst,
+            );
+        }
     }
     go.send(()).expect("the record goes on");
     let (answered, copied) = asking.await.expect("the request ends");
@@ -584,15 +608,10 @@ async fn a_request_whose_deadline_passes_while_its_write_stands_is_refused_at_th
     }
 }
 
-/// KR-REQ-17.54: the record's own owner check reads the device's grant after the feed's locked ask,
-/// inside the transaction: a grant that ends in the last wait is found by that check, the request
-/// is refused in the check's own words, whole, and no row is recorded and no write is made. The
-/// control: where the grant stands, the same request is recorded.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_request_from_a_device_whose_grant_ends_in_the_last_wait_is_refused_as_no_owners_and_records_nothing()
- {
-    written(&recorded_by_a_device(false).await);
-    let found = recorded_by_a_device(true).await;
+/// The refusal of a request whose caller is no longer the host's owner, in the owner check's own
+/// words, whole, with no row recorded. `reached` says where the record was refused, as for
+/// [`refused_as_a_caller_no_lease_serves`].
+fn refused_as_no_owner(found: &Found, reached: bool) {
     let refusal = found.answered.as_ref().expect_err("the request is refused");
     let not_the_owner = ControllerError::PermissionDenied {
         detail: "only this host's owner asks for an owner confirmation".to_owned(),
@@ -601,7 +620,38 @@ async fn a_request_from_a_device_whose_grant_ends_in_the_last_wait_is_refused_as
     assert_eq!(refusal.code(), not_the_owner.code());
     assert_eq!(found.rows, 0, "nothing is recorded");
     assert_eq!(
-        found.first_writes, 0,
-        "the record is refused before its first write"
+        found.first_writes,
+        usize::from(reached),
+        "the record is refused {} its first write",
+        if reached { "after" } else { "before" }
+    );
+}
+
+/// KR-REQ-17.54: the record's own owner check reads the device's grant after the feed's locked ask,
+/// inside the transaction: a grant that ends in the last wait is found by that check, the request
+/// is refused in the check's own words, whole, and no row is recorded and no write is made. The
+/// control: where the grant stands, the same request is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_from_a_device_whose_grant_ends_in_the_last_wait_is_refused_as_no_owners_and_records_nothing()
+ {
+    written(&recorded_by_a_device(At::TheFeedsAsk, GrantEnd::Stands).await);
+    refused_as_no_owner(
+        &recorded_by_a_device(At::TheFeedsAsk, GrantEnd::TheDeadline).await,
+        false,
+    );
+}
+
+/// KR-REQ-17.54: the owner check is asked again by the last ask, immediately before the commit: a
+/// device's grant that ends by the wall clock while the first write stands, with the landing's
+/// deadline an hour away, is refused at the commit in the check's own words, whole, the write is
+/// rolled back and no row is recorded. The control: where the grant stands, the same request is
+/// recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_from_a_device_whose_grant_ends_while_its_write_stands_is_refused_at_the_commit_and_records_nothing()
+ {
+    written(&recorded_by_a_device(At::TheFirstWrite, GrantEnd::Stands).await);
+    refused_as_no_owner(
+        &recorded_by_a_device(At::TheFirstWrite, GrantEnd::TheExpiry).await,
+        true,
     );
 }

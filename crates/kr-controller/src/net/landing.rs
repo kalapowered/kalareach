@@ -16,8 +16,9 @@
 //! the wait to its caller and reads the device directory first, which an open record holds, so it
 //! cannot raise during a record's transaction. A word one of the three sets after the second ask
 //! is met by the last ask, immediately before the commit ([`Landing::asks_before_the_commit`]),
-//! which asks the footing's question and the feed again and rolls the transaction back on a
-//! refusal; what stands outside it is the commit's own call, the rule's stated limit.
+//! which asks the subject's own checks again first, then the footing's question and the feed, and
+//! rolls the transaction back on a refusal; what stands outside it is the commit's own call, the
+//! rule's stated limit.
 //!
 //! A [`Landing`] is what a door gives the caller of such a mutation: the feed's ask, the footing
 //! made once at the door, and the held bound of the local owner's lease. The same parts give the
@@ -195,22 +196,26 @@ impl Landing {
         }
     }
 
-    /// The last ask of a record, immediately before its commit: the footing's question with a
-    /// copy of the bound taken now, where the bound ended or moved the subject decided again
-    /// under the scope that no lease serves, and the feed's refusal asked again of the kept grants
-    /// with no lock. A refusal here rolls the transaction back, so that nothing is recorded: the
-    /// asks before the first statement refuse early, and this one covers what lapsed while the
-    /// writes were made.
+    /// The last ask of a record, immediately before its commit: the subject's own checks, which
+    /// the record made before its first statement (`subject`), asked again first; then the
+    /// footing's question with a copy of the bound taken now, where the bound ended or moved the
+    /// subject decided again under the scope that no lease serves, and the feed's refusal asked
+    /// again of the kept grants with no lock. A refusal here rolls the transaction back, so that
+    /// nothing is recorded: the asks before the first statement refuse early, and this one covers
+    /// what lapsed while the writes were made, whether the writes' own waits ended a standing the
+    /// subject's checks read or one the footing and the feed read.
     ///
     /// # Errors
     ///
-    /// Returns the refusal of the footing, of the scope or of the feed.
+    /// Returns the refusal of the subject's checks, of the footing, of the scope or of the feed.
     pub(crate) fn asks_before_the_commit(
         &self,
         kept: &Kept,
         scope: Scope,
         display: &ConfirmationDisplay,
+        subject: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
+        subject()?;
         let copied = self.copies_the_bound();
         match self.asks(&copied) {
             Ok(()) => {}

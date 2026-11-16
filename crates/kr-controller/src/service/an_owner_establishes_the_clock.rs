@@ -304,6 +304,19 @@ pub(super) fn paired(
     rights: &[kr_protocol::rights::ActionRight],
     expiry: kr_protocol::grant::GrantExpiry,
 ) -> crate::service::net::devices::DeviceRecord {
+    paired_in(controller, keys, byte, rights, expiry, Nullable::null())
+}
+
+/// As [`paired`], for a grant that names `organisation`, which is what makes it rest on the
+/// authority feed.
+pub(super) fn paired_in(
+    controller: &Controller,
+    keys: &kr_crypto::keys::DeviceKeys,
+    byte: u8,
+    rights: &[kr_protocol::rights::ActionRight],
+    expiry: kr_protocol::grant::GrantExpiry,
+    organisation: Nullable<kr_protocol::grant::OrganisationRequirement>,
+) -> crate::service::net::devices::DeviceRecord {
     use kr_protocol::grant::{EnvironmentSelector, Grant, HistoryScope, SessionSelector};
     use kr_protocol::ids::{AuthorityRevision, DeviceKeyRevision, GrantId};
     use kr_protocol::pairing::{DeviceName, DevicePlatform};
@@ -335,7 +348,7 @@ pub(super) fn paired(
                 named_approvals: CanonicalSet::new(),
             },
             expiry,
-            organisation: Nullable::null(),
+            organisation,
         },
         paired_at_ms: TimestampMs::new(kr_ipc::now_ms().get()),
         revoked_at_ms: None,
