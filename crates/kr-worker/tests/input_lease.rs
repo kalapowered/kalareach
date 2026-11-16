@@ -5887,3 +5887,191 @@ async fn bytes_and_key_records_share_one_stream_and_a_refused_write_spends_no_nu
         "nothing of the refused write reached the terminal"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// A request whose client has gone does not serve the keys behind it, and a living one does.
+// ---------------------------------------------------------------------------------------------
+
+/// The worker's dispatch boundary, held on a thread of its own until it is let go: what a mutation
+/// that is under way holds. A holder that is dropped by a case that failed lets go too, so that the
+/// requests that wait for it end and the program ends with the case's own message.
+struct BoundaryHeld {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BoundaryHeld {
+    async fn take(service: &Arc<WorkerService>) -> Self {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (held, confirmed) = tokio::sync::oneshot::channel::<()>();
+        let service = Arc::clone(service);
+        let thread = std::thread::spawn(move || {
+            let _boundary = service.hold_the_dispatch_boundary();
+            let _ = held.send(());
+            let _ = wait.recv();
+        });
+        tokio::time::timeout(Duration::from_secs(60), confirmed)
+            .await
+            .expect("the boundary is held in time")
+            .expect("the holder ended without holding the boundary");
+        Self {
+            release: Some(release),
+            thread: Some(thread),
+        }
+    }
+
+    fn release(mut self) {
+        drop(self.release.take());
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("the holding thread finishes");
+        }
+    }
+}
+
+impl Drop for BoundaryHeld {
+    fn drop(&mut self) {
+        drop(self.release.take());
+    }
+}
+
+/// Waits until `settled` holds, or fifteen seconds have passed, and says whether it held.
+async fn settles(mut settled: impl FnMut() -> bool) -> bool {
+    let end = tokio::time::Instant::now() + Duration::from_secs(15);
+    while !settled() {
+        if tokio::time::Instant::now() >= end {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    true
+}
+
+/// A key sent behind a mutation that is alive waits through the hold of the boundary, and the
+/// mutation is answered before the key.
+///
+/// The mutation is Blocking, so the key keeps its place behind it: the application has nothing while
+/// the mutation waits, though the wait has gone through its tries up to the cap. At the release the
+/// mutation is carried out, then the key is accepted, and the application has the key. This is the
+/// rule that the next case's dropped mutation leaves, for a client that is still there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_behind_a_living_mutation_waits_through_the_hold_and_is_answered_after_it() {
+    let mut rig = Rig::start(HOST_EVENT_OUTPUT).await;
+    let service = Arc::clone(&rig.wired.service);
+    assert!(
+        settles(|| service.maintenance_passes_for_tests() >= 1).await,
+        "the first maintenance pass finishes"
+    );
+    let boundary = BoundaryHeld::take(&service).await;
+    let attach = terminal(rig.wired.session_id, Some("xterm-256color"));
+    let mutation = send_mutation(&mut rig, Method::SessionAttach, &attach).await;
+    let (key, _) = send_key(&mut rig, b"k").await;
+    assert!(
+        settles(|| service.mutations_waiting_for_tests() == 1).await,
+        "the mutation waits at the held boundary"
+    );
+    assert!(
+        settles(|| service.largest_boundary_step_for_tests() >= Duration::from_millis(250)).await,
+        "the wait never reached the cap: {:?}",
+        service.largest_boundary_step_for_tests()
+    );
+    let mut answers = Answers::default();
+    assert!(
+        answers
+            .until(&mut rig.client, key, Duration::from_millis(300))
+            .await
+            .is_none(),
+        "the key was answered while the mutation before it waited"
+    );
+    assert!(
+        rig.received().is_empty(),
+        "the key reached the application while the mutation before it waited: {:?}",
+        rig.received()
+    );
+    boundary.release();
+    let answered = answers
+        .until(&mut rig.client, mutation, LIVENESS_DEADLINE)
+        .await;
+    assert!(
+        matches!(answered, Some(kr_protocol::envelope::Outcome::Ok(_))),
+        "the mutation was answered {answered:?}"
+    );
+    let accepted = answers.until(&mut rig.client, key, LIVENESS_DEADLINE).await;
+    assert!(
+        matches!(accepted, Some(kr_protocol::envelope::Outcome::Ok(_))),
+        "the key was answered {accepted:?}"
+    );
+    assert_eq!(answers.order, vec![mutation, key]);
+    assert!(
+        rig.until_everything_typed_arrived().await.is_some(),
+        "the application did not receive the key: {:?}",
+        rig.received()
+    );
+    rig.close().await;
+}
+
+/// Keys sent behind a mutation whose client has gone do not reach the application.
+///
+/// Unix only. The client sends a Blocking mutation, more keys than the worker reads ahead of a key,
+/// and a last key frame cut part way, and then closes. The worker finds its peer gone beside the
+/// bytes that are still queued, drops the mutation and ends the connection, and serves none of the
+/// keys: the connection's place is given back while the boundary is held and the application has
+/// nothing. A Windows pipe counts the queued bytes as waiting and takes its peer as there until they
+/// are read, which the worker does not do at the wait, so there the request would wait for the
+/// release; the rule for a client that is there is
+/// `a_key_behind_a_living_mutation_waits_through_the_hold_and_is_answered_after_it`.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keys_behind_a_mutation_whose_client_has_gone_do_not_reach_the_application() {
+    let mut rig = Rig::start(HOST_EVENT_OUTPUT).await;
+    let service = Arc::clone(&rig.wired.service);
+    assert!(
+        settles(|| service.maintenance_passes_for_tests() >= 1).await,
+        "the first maintenance pass finishes"
+    );
+    let start = service.connections_held_for_tests();
+    let boundary = BoundaryHeld::take(&service).await;
+    let attach = terminal(rig.wired.session_id, Some("xterm-256color"));
+    let _ = send_mutation(&mut rig, Method::SessionAttach, &attach).await;
+    assert!(
+        settles(|| service.mutations_waiting_for_tests() == 1).await,
+        "the mutation waits at the held boundary"
+    );
+    for _ in 0..20 {
+        let _ = send_key(&mut rig, b"k").await;
+    }
+    let id = kr_protocol::ids::RequestId::new(OWN_REQUESTS + rig.sequence);
+    let frame = key_frame(&rig, id, b"z");
+    let bytes =
+        kr_ipc::framed::FrameWriter::encode(kr_protocol::frame::StreamKind::Control, &frame)
+            .expect("encodes");
+    let cut = 4 + (bytes.len() - 4) / 2;
+    rig.client
+        .writer()
+        .write_frame(&bytes[..cut])
+        .await
+        .expect("the first part of the last frame is written");
+    let Rig {
+        client,
+        received,
+        _kept,
+        wired: _wired,
+        ..
+    } = rig;
+    drop(client);
+    assert!(
+        settles(|| service.connections_held_for_tests() == start - 1
+            && service.mutations_waiting_for_tests() == 0)
+        .await,
+        "the connection of the client that went is given back while the boundary is held: {} held, {start} at the start, {} waiting",
+        service.connections_held_for_tests(),
+        service.mutations_waiting_for_tests()
+    );
+    boundary.release();
+    // A key that the worker had served would have been handed to the application before the
+    // connection ended, and the application keeps what it reads as it reads it.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        std::fs::read(&received).unwrap_or_default().is_empty(),
+        "a key behind a mutation whose client had gone reached the application"
+    );
+}

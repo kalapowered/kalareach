@@ -89,7 +89,19 @@ struct FenceState {
 #[cfg(feature = "testing")]
 #[derive(Debug)]
 pub struct FenceHeld<'a> {
-    _state: MutexGuard<'a, FenceState>,
+    state: MutexGuard<'a, FenceState>,
+}
+
+#[cfg(feature = "testing")]
+impl FenceHeld<'_> {
+    /// The attention connection the fence speaks through, read under the lock the test holds.
+    #[must_use]
+    pub fn current_connection(&self) -> Option<ConnectionId> {
+        self.state
+            .current
+            .as_ref()
+            .map(|current| current.connection_id)
+    }
 }
 
 #[derive(Debug)]
@@ -360,7 +372,7 @@ impl AttentionFence {
     #[cfg(feature = "testing")]
     pub fn hold_for_tests(&self) -> FenceHeld<'_> {
         FenceHeld {
-            _state: self.state(),
+            state: self.state(),
         }
     }
 
