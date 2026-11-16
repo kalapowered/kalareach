@@ -7,12 +7,13 @@
 //! the sequence, keeps within the host's window and its own bound, matches the host's words in order,
 //! counts every frame in one of four sets, and never writes a held key after the hold ended.
 
+mod lane_host;
+
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use iroh::{Endpoint, EndpointAddr};
 use kr_client::error::ClientError;
 use kr_client::input::{
     Count, EndCause, EpochKnown, InputEvent, InputEvents, InputLane, InputRefusal, InputTarget,
@@ -20,31 +21,22 @@ use kr_client::input::{
 };
 use kr_client::session::Session;
 use kr_client::transport::{ControlTransport, NetworkTransport, StreamOpener, TransportFuture};
-use kr_crypto::connect::{ChallengeLedger, PairedPeer};
-use kr_crypto::keys::DeviceKeys;
 use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Response};
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::frame::{StreamHeader, StreamKind};
+use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::{ActionWindow, ReceiveLimits};
 use kr_protocol::ids::{
-    AttachmentId, BootEpoch, BuildId, ClockEpoch, ConnectionId, DeviceId, DeviceKeyRevision,
-    EnvironmentId, InputLeaseEpoch, InputSequence, RequestId, SessionId,
+    AttachmentId, BootEpoch, ConnectionId, EnvironmentId, RequestId, SessionId,
 };
-use kr_protocol::input::{InputAck, InputFrame, InputWindow};
+use kr_protocol::input::InputWindow;
 use kr_protocol::method::Method;
-use kr_protocol::scalars::{EndpointKey, Nullable, U64, Uuid};
+use kr_protocol::scalars::{Nullable, U64, Uuid};
 use kr_protocol::transfer::{TransferStreamsParams, TransferStreamsResult};
-use kr_transport::clock::{ContinuousClock, ManualClock};
-use kr_transport::config::EndpointConfig;
+use kr_transport::codec::{FrameReader, FrameWriter};
 use kr_transport::deadlines::{DeadlineKind, ManualDeadlines};
-use kr_transport::handshake::{self, Admitted, HostEpochs, LocalIdentity, PairedDirectory};
 use kr_transport::scheduler::{SendLimits, StreamBudget, StreamClass};
-use kr_transport::streams::{PendingStream, StreamRegistry};
-use kr_transport::window::{ActionWindowIssuer, MAX_WINDOW_VALIDITY};
 
-/// How long a case waits for the host to see something that must happen: it fails a wait that never
-/// ends, and is not a measurement.
-const LIVENESS: Duration = Duration::from_secs(60);
+use lane_host::{LIVENESS, Out, Script, SeenFrame, Side, direct_addr, epoch, sequence, side};
 
 /// The most key bytes a frame holds at the floor of the negotiated limit, 1,024.
 const FLOOR_FRAME: usize = 977;
@@ -68,14 +60,6 @@ fn attachment() -> AttachmentId {
     AttachmentId::new(Uuid::from_bytes([9; 16]))
 }
 
-fn epoch(number: u64) -> InputLeaseEpoch {
-    InputLeaseEpoch::new(number)
-}
-
-fn sequence(number: u64) -> InputSequence {
-    InputSequence::new(number)
-}
-
 fn window(frames: u32) -> InputWindow {
     InputWindow {
         frames,
@@ -94,218 +78,6 @@ async fn within<T>(future: impl std::future::Future<Output = T>) -> T {
         .expect("the call ended in time")
 }
 
-/* ---------------------------------------------------------------------------------------- */
-/* Two endpoints                                                                             */
-/* ---------------------------------------------------------------------------------------- */
-
-struct Side {
-    identity: Arc<LocalIdentity>,
-    endpoint: Endpoint,
-    record: PairedPeer,
-}
-
-#[derive(Debug)]
-struct OneDevice {
-    endpoint_id: EndpointKey,
-    record: PairedPeer,
-}
-
-impl PairedDirectory for OneDevice {
-    fn paired_peer(&self, endpoint_id: &EndpointKey) -> Option<PairedPeer> {
-        (endpoint_id == &self.endpoint_id).then_some(self.record)
-    }
-}
-
-async fn side(device_byte: u8, listening: bool) -> Side {
-    let config = EndpointConfig {
-        bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
-        ..EndpointConfig::default()
-    };
-    let keys = DeviceKeys::generate().expect("device keys");
-    let endpoint = if listening {
-        kr_transport::endpoint::bind_listener(&config, &keys.transport)
-            .await
-            .expect("a listening endpoint")
-    } else {
-        kr_transport::endpoint::bind_dialer(&config, &keys.transport)
-            .await
-            .expect("a dialling endpoint")
-    };
-    let device_id = DeviceId::new(Uuid::from_bytes([device_byte; 16]));
-    let record = PairedPeer {
-        device_id,
-        device_key_revision: DeviceKeyRevision::new(1),
-        authorisation: *keys.authorisation.public(),
-        endpoint_id: *keys.transport.public(),
-    };
-    let identity = Arc::new(LocalIdentity::new(
-        device_id,
-        DeviceKeyRevision::new(1),
-        *keys.transport.public(),
-        keys.authorisation.clone(),
-        BuildId::new("kr/0.1.0+test").expect("a build identity"),
-    ));
-    Side {
-        identity,
-        endpoint,
-        record,
-    }
-}
-
-fn direct_addr(side: &Side) -> EndpointAddr {
-    let mut addr = EndpointAddr::new(side.endpoint.id());
-    for socket in side.endpoint.bound_sockets() {
-        addr = addr.with_ip_addr(socket);
-    }
-    addr
-}
-
-/* ---------------------------------------------------------------------------------------- */
-/* The scripted host                                                                          */
-/* ---------------------------------------------------------------------------------------- */
-
-/// A frame the host read.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SeenFrame {
-    epoch: u64,
-    sequence: u64,
-    bytes: Vec<u8>,
-}
-
-#[derive(Default)]
-struct Seen {
-    headers: Vec<StreamHeader>,
-    frames: Vec<SeenFrame>,
-    ended_streams: u64,
-    /// Streams whose end the host read as a clean finish, not a reset.
-    finished_streams: u64,
-    /// Streams whose end the host read as a reset or a failure.
-    reset_streams: u64,
-    methods: Vec<String>,
-}
-
-/// What the host writes next on the stream.
-enum Out {
-    Ack(InputAck),
-    /// Resets the stream, as a host does that ends it.
-    Reset,
-    /// Finishes the host's side of the stream, as a host does that has nothing more to say.
-    Finish,
-}
-
-struct Script {
-    streams: Mutex<Vec<StreamKind>>,
-    window: Mutex<InputWindow>,
-    seen: Mutex<Seen>,
-    changed: tokio::sync::Notify,
-    out: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Out>>>,
-    /// Frames the host writes on the control stream, as the host's own words to the connection.
-    control_out: tokio::sync::mpsc::UnboundedSender<ControlFrame>,
-    pending_control: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<ControlFrame>>>,
-}
-
-impl Script {
-    fn new(window: InputWindow, streams: Vec<StreamKind>) -> Arc<Self> {
-        let (control_out, pending) = tokio::sync::mpsc::unbounded_channel();
-        Arc::new(Self {
-            streams: Mutex::new(streams),
-            window: Mutex::new(window),
-            seen: Mutex::new(Seen::default()),
-            changed: tokio::sync::Notify::new(),
-            out: Mutex::new(None),
-            control_out,
-            pending_control: Mutex::new(Some(pending)),
-        })
-    }
-
-    fn seen<T>(&self, read: impl FnOnce(&Seen) -> T) -> T {
-        read(&self.seen.lock().expect("what the host saw"))
-    }
-
-    fn record(&self, write: impl FnOnce(&mut Seen)) {
-        write(&mut self.seen.lock().expect("what the host saw"));
-        self.changed.notify_waiters();
-    }
-
-    /// Waits until what the host saw satisfies `condition`: a condition of the host's state, never
-    /// of a time.
-    async fn until(&self, what: &str, condition: impl Fn(&Seen) -> bool) {
-        tokio::time::timeout(LIVENESS, self.reached(&condition))
-            .await
-            .unwrap_or_else(|_| panic!("the host never saw {what}"));
-    }
-
-    /// As [`Script::until`], for what the case needs within a few seconds of the step that makes it
-    /// happen: a lane that does not do it fails the case here, by this assertion, and not by the
-    /// liveness limit.
-    async fn until_soon(&self, what: &str, condition: impl Fn(&Seen) -> bool) {
-        let reached = tokio::time::timeout(Duration::from_secs(5), self.reached(&condition)).await;
-        assert!(
-            reached.is_ok(),
-            "five seconds after the step, the host had still not seen {what}"
-        );
-    }
-
-    async fn reached(&self, condition: &impl Fn(&Seen) -> bool) {
-        loop {
-            let changed = self.changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            if self.seen(condition) {
-                return;
-            }
-            changed.await;
-        }
-    }
-
-    fn frames(&self) -> Vec<SeenFrame> {
-        self.seen(|seen| seen.frames.clone())
-    }
-
-    fn say(&self, out: Out) {
-        self.out
-            .lock()
-            .expect("the stream's writer")
-            .as_ref()
-            .expect("a stream is open")
-            .send(out)
-            .expect("the stream's writer is alive");
-    }
-
-    fn accept(&self, epoch_number: u64, through: u64) {
-        self.say(Out::Ack(InputAck::Accepted {
-            epoch: epoch(epoch_number),
-            through: sequence(through),
-        }));
-    }
-
-    fn refuse(
-        &self,
-        epoch_number: u64,
-        first: u64,
-        accepted_through: Option<u64>,
-        code: ErrorCode,
-    ) {
-        self.say(Out::Ack(InputAck::Refused {
-            epoch: epoch(epoch_number),
-            sequence: sequence(first),
-            accepted_through: Nullable::from(accepted_through.map(sequence)),
-            error: ProtocolError::new(code, "refused"),
-        }));
-    }
-
-    fn marker(&self, launch: u32) {
-        self.say(Out::Ack(InputAck::LaunchReserved { launch }));
-    }
-
-    fn epoch_ended(&self, epoch_number: u64, fenced_bytes: u64) {
-        self.say(Out::Ack(InputAck::EpochEnded {
-            epoch: epoch(epoch_number),
-            fenced_bytes: U64::new(fenced_bytes),
-        }));
-    }
-}
-
 fn typed<T: serde::Serialize>(value: &T) -> Result<ParamsValue, ProtocolError> {
     ParamsValue::from_typed(value)
         .map_err(|error| ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()))
@@ -321,89 +93,31 @@ fn answer(request_id: RequestId, outcome: Result<ParamsValue, ProtocolError>) ->
     })
 }
 
-/// Serves connections: the control stream, and the input streams of each.
-fn spawn_host(
-    host: &Side,
-    client_record: PairedPeer,
-    script: Arc<Script>,
-) -> tokio::task::JoinHandle<()> {
-    let endpoint = host.endpoint.clone();
-    let identity = Arc::clone(&host.identity);
-    let directory: Arc<dyn PairedDirectory> = Arc::new(OneDevice {
-        endpoint_id: client_record.endpoint_id,
-        record: client_record,
-    });
-    tokio::spawn(async move {
-        loop {
-            let Some(incoming) = endpoint.accept().await else {
-                return;
-            };
-            let Ok(connection) = incoming.await else {
-                continue;
-            };
-            let identity = Arc::clone(&identity);
-            let directory = Arc::clone(&directory);
-            let script = Arc::clone(&script);
-            tokio::spawn(async move {
-                let clock: Arc<dyn ContinuousClock> = Arc::new(ManualClock::new());
-                let issuer = Arc::new(ActionWindowIssuer::new(clock, MAX_WINDOW_VALIDITY));
-                let challenges = Arc::new(std::sync::Mutex::new(ChallengeLedger::with_limit(16)));
-                let Ok(Admitted::Authorised(authorised)) = handshake::accept(
-                    &connection,
-                    &identity,
-                    HostEpochs {
-                        boot_epoch: BootEpoch::new(1),
-                        clock_epoch: ClockEpoch::new(1),
-                    },
-                    directory.as_ref(),
-                    &challenges,
-                    &issuer,
-                )
-                .await
-                else {
+/// Serves the control stream as the library's cases need it: the host's own words that a case sends, and a
+/// reply to each request.
+async fn control_host(script: Arc<Script>, mut reader: FrameReader, writer: FrameWriter) {
+    let writer = Arc::new(tokio::sync::Mutex::new(writer));
+    if let Some(mut words) = script.pending_control.lock().expect("the script").take() {
+        let writer = Arc::clone(&writer);
+        tokio::spawn(async move {
+            while let Some(frame) = words.recv().await {
+                if writer.lock().await.write_message(&frame).await.is_err() {
                     return;
-                };
-                connection.set_max_concurrent_bi_streams(iroh::endpoint::VarInt::from_u32(16));
-                let streams = StreamRegistry::new(
-                    authorised.connection_id,
-                    Arc::new(kr_transport::scheduler::StreamBudget::new(
-                        SendLimits::default(),
-                    )),
-                    None,
-                );
-                let accepting = Arc::clone(&script);
-                let taken = connection.clone();
-                tokio::spawn(async move {
-                    while let Ok(pending) = streams.accept_pending(&taken).await {
-                        tokio::spawn(serve_stream(Arc::clone(&accepting), pending));
-                    }
-                });
-                let mut reader = authorised.control_reader;
-                let writer = Arc::new(tokio::sync::Mutex::new(authorised.control_writer));
-                if let Some(mut words) = script.pending_control.lock().expect("the script").take() {
-                    let writer = Arc::clone(&writer);
-                    tokio::spawn(async move {
-                        while let Some(frame) = words.recv().await {
-                            if writer.lock().await.write_message(&frame).await.is_err() {
-                                return;
-                            }
-                        }
-                    });
                 }
-                loop {
-                    let frame = match reader.read_message::<ControlFrame>().await {
-                        Ok(Some(frame)) => frame,
-                        _ => return,
-                    };
-                    if let Some(reply) = control_reply(&script, frame)
-                        && writer.lock().await.write_message(&reply).await.is_err()
-                    {
-                        return;
-                    }
-                }
-            });
+            }
+        });
+    }
+    loop {
+        let frame = match reader.read_message::<ControlFrame>().await {
+            Ok(Some(frame)) => frame,
+            _ => return,
+        };
+        if let Some(reply) = control_reply(&script, frame)
+            && writer.lock().await.write_message(&reply).await.is_err()
+        {
+            return;
         }
-    })
+    }
 }
 
 fn control_reply(script: &Arc<Script>, frame: ControlFrame) -> Option<ControlFrame> {
@@ -431,78 +145,6 @@ fn control_reply(script: &Arc<Script>, frame: ControlFrame) -> Option<ControlFra
         )),
     };
     Some(answer(request.request_id, outcome))
-}
-
-/// Records that the host's side of a stream has ended.
-struct Ends(Arc<Script>);
-
-impl Drop for Ends {
-    fn drop(&mut self) {
-        self.0.record(|seen| seen.ended_streams += 1);
-    }
-}
-
-/// Takes one input stream: its header, the window it says, every frame read, and the words the
-/// case writes.
-async fn serve_stream(script: Arc<Script>, pending: PendingStream) {
-    let Ok(stream) = pending.open(&[StreamKind::TerminalInput]).await else {
-        return;
-    };
-    script.record(|seen| seen.headers.push(stream.header().clone()));
-    let ends = Arc::new(Ends(Arc::clone(&script)));
-    let (mut reader, mut writer) = stream.split();
-    let handle = reader.handle();
-    let (words, mut queued) = tokio::sync::mpsc::unbounded_channel();
-    *script.out.lock().expect("the stream's writer") = Some(words);
-    let ready = *script.window.lock().expect("the window");
-    if writer
-        .write_message(&InputAck::Ready { window: ready })
-        .await
-        .is_err()
-    {
-        return;
-    }
-    let reading = Arc::clone(&script);
-    let reading_ends = Arc::clone(&ends);
-    tokio::spawn(async move {
-        let _ends = reading_ends;
-        loop {
-            match reader.read_message::<InputFrame>().await {
-                Ok(Some(frame)) => reading.record(|seen| {
-                    seen.frames.push(SeenFrame {
-                        epoch: frame.epoch.get(),
-                        sequence: frame.sequence.get(),
-                        bytes: frame.bytes.into_vec(),
-                    });
-                }),
-                Ok(None) => {
-                    reading.record(|seen| seen.finished_streams += 1);
-                    break;
-                }
-                Err(_) => {
-                    reading.record(|seen| seen.reset_streams += 1);
-                    break;
-                }
-            }
-        }
-    });
-    while let Some(out) = queued.recv().await {
-        match out {
-            Out::Ack(ack) => {
-                if writer.write_message(&ack).await.is_err() {
-                    return;
-                }
-            }
-            Out::Reset => {
-                handle.revoke();
-                return;
-            }
-            Out::Finish => {
-                drop(writer);
-                return;
-            }
-        }
-    }
 }
 
 /* ---------------------------------------------------------------------------------------- */
@@ -592,7 +234,7 @@ async fn connect(
 ) {
     let host = side(1, true).await;
     let client = side(2, false).await;
-    let serving = spawn_host(&host, client.record, script);
+    let serving = lane_host::spawn_host(&host, client.record, script, control_host);
     let transport = NetworkTransport::connect(
         &client.endpoint,
         direct_addr(&host),
