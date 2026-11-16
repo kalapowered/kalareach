@@ -607,18 +607,25 @@ impl Shared {
     /// pending, and the entry opened for it is closed before native code is asked to stop.
     pub(crate) fn answered(&self, owner: u64) {
         self.start_was_answered(owner);
-        self.record_end(owner, Vec::new());
+        self.record_end(owner, |_| {}, Vec::new());
     }
 
-    /// Records how a call `owner` held ended, in one step: what the end owes is added to what is
-    /// owed, the host is no longer to be asked again by the supervisor, the entry the call stood on
-    /// is closed, and the file is written once. Recording and telling are one step, so an owner that
-    /// fails never leaves the supervisor without the host to ask and nothing owed.
+    /// Records how a call `owner` held ended, in one step: `end` shows the end and `entries`, what
+    /// it owes, are added to what is owed in one update of the view, so that no state shows an end
+    /// without the entry it owes. The host is no longer to be asked again by the supervisor, the
+    /// entry the call stood on is closed, and the file is written once. Recording and telling are
+    /// one step, so an owner that fails never leaves the supervisor without the host to ask and
+    /// nothing owed.
     ///
     /// The file is written when it can be read and something changed: the take-up of what an earlier
     /// launch kept, or an entry added or closed here. Whatever cannot be written is kept in memory
     /// and written with the next use.
-    pub(crate) fn record_end(&self, owner: u64, entries: Vec<OwedView>) {
+    pub(crate) fn record_end(
+        &self,
+        owner: u64,
+        end: impl FnOnce(&mut VoiceCallState),
+        entries: Vec<OwedView>,
+    ) {
         let _ordered = self
             .keeping
             .lock()
@@ -628,6 +635,7 @@ impl Shared {
         {
             let now = now_ms();
             let mut view = self.view.lock().expect("the view lock is not poisoned");
+            end(&mut view);
             for each in entries {
                 view.owe(now, each);
             }
@@ -945,57 +953,64 @@ impl Shared {
             (None, _) if kept.pending_start.is_some() => "unknown",
             (None, _) => "not_needed",
         };
-        {
-            let mut view = self.view.lock().expect("the view lock is not poisoned");
-            // A call that began after this one has its own record, which this does not touch.
-            if view.owner <= owner {
-                view.running = false;
-                view.session = None;
-                view.control = "none".to_owned();
-                view.host = "none".to_owned();
-                // The voice service's part is recorded after the host's, with what it owes, by
-                // `record_service`: it sets the word, so the entry exists before the word changes.
-                if view.ended.as_ref().is_none_or(|ended| ended.owner != owner) {
-                    view.ended = Some(EndedView {
-                        owner,
-                        cause: "owner_failed".to_owned(),
-                        // A call that may have acted cannot say that nothing was done: what the
-                        // owner had written to the host went with the owner.
-                        words: if self.accepts_host_delegations() {
-                            format!(
-                                "This device's call stopped working, so the call was ended. {}",
-                                owner::REQUESTS_UNSETTLED
-                            )
-                        } else {
-                            "This device's call stopped working, so the call was ended.".to_owned()
-                        },
-                        closed_locally,
-                        host: host_end.clone(),
-                        // A word that owes nothing is final at once; the one that owes a notice
-                        // waits for `record_service`, which adds the notice and then sets it.
-                        broker: if broker == "not_confirmed" {
-                            "pending"
-                        } else {
-                            broker
-                        }
-                        .to_owned(),
-                    });
-                }
-            }
-            if let (Some(words), Some(service), Some(id), Some(host), true) = (
-                host_end.owed_reason(),
-                &kept.service_call,
-                kept.voice_session_id,
-                &kept.host,
-                toward_host_asked,
-            ) {
-                owed.push(OwedView::revocation(words, id, service.until_ms, host));
-            }
-            if let (Some((action_id, until_ms)), Some(host)) = (kept.pending_start, &kept.host) {
-                owed.push(OwedView::start_unknown(action_id, until_ms, host));
-            }
+        if let (Some(words), Some(service), Some(id), Some(host), true) = (
+            host_end.owed_reason(),
+            &kept.service_call,
+            kept.voice_session_id,
+            &kept.host,
+            toward_host_asked,
+        ) {
+            owed.push(OwedView::revocation(words, id, service.until_ms, host));
         }
-        self.record_end(owner, owed);
+        if let (Some((action_id, until_ms)), Some(host)) = (kept.pending_start, &kept.host) {
+            owed.push(OwedView::start_unknown(action_id, until_ms, host));
+        }
+        // The end and what it owes are shown in one update.
+        let accepts = self.accepts_host_delegations();
+        self.record_end(
+            owner,
+            |view| {
+                // A call that began after this one has its own record, which this does not touch.
+                if view.owner <= owner {
+                    view.running = false;
+                    view.session = None;
+                    view.control = "none".to_owned();
+                    view.host = "none".to_owned();
+                    // The voice service's part is recorded after the host's, with what it owes, by
+                    // `record_service`: it sets the word, so the entry exists before the word
+                    // changes.
+                    if view.ended.as_ref().is_none_or(|ended| ended.owner != owner) {
+                        view.ended = Some(EndedView {
+                            owner,
+                            cause: "owner_failed".to_owned(),
+                            // A call that may have acted cannot say that nothing was done: what
+                            // the owner had written to the host went with the owner.
+                            words: if accepts {
+                                format!(
+                                    "This device's call stopped working, so the call was ended. {}",
+                                    owner::REQUESTS_UNSETTLED
+                                )
+                            } else {
+                                "This device's call stopped working, so the call was ended."
+                                    .to_owned()
+                            },
+                            closed_locally,
+                            host: host_end.clone(),
+                            // A word that owes nothing is final at once; the one that owes a
+                            // notice waits for `record_service`, which adds the notice and then
+                            // sets it.
+                            broker: if broker == "not_confirmed" {
+                                "pending"
+                            } else {
+                                broker
+                            }
+                            .to_owned(),
+                        });
+                    }
+                }
+            },
+            owed,
+        );
         self.record_service(owner, broker, kept.service_call.as_ref());
         self.release(owner);
     }

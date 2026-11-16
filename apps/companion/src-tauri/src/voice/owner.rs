@@ -709,7 +709,7 @@ impl Owner {
             host: HostEnd::NotNeeded,
         };
         self.close_inbox(&closed);
-        self.shared.record_end(self.id, Vec::new());
+        self.shared.record_end(self.id, |_| {}, Vec::new());
         self.shared.release(self.id);
     }
 
@@ -1028,30 +1028,31 @@ impl Owner {
                     })
                     .await;
                 let owner = self.id;
-                self.view(|state| {
-                    state.running = false;
-                    state.ended = Some(EndedView {
-                        owner,
-                        cause: "start_unknown".to_owned(),
-                        words: if local {
-                            "The host never said whether it created the call. Nothing is running \
-                             on this device."
-                                .to_owned()
-                        } else {
-                            "The host never said whether it created the call, and this device \
-                             could not confirm that the call's media stopped."
-                                .to_owned()
-                        },
-                        closed_locally: local,
-                        host: HostEnd::NotTold {
-                            words: "The host never said whether it created the call.".to_owned(),
-                        },
-                        // The service may hold a call this device cannot name.
-                        broker: "unknown".to_owned(),
-                    });
-                });
                 self.shared.record_end(
                     self.id,
+                    |state| {
+                        state.running = false;
+                        state.ended = Some(EndedView {
+                            owner,
+                            cause: "start_unknown".to_owned(),
+                            words: if local {
+                                "The host never said whether it created the call. Nothing is \
+                                 running on this device."
+                                    .to_owned()
+                            } else {
+                                "The host never said whether it created the call, and this device \
+                                 could not confirm that the call's media stopped."
+                                    .to_owned()
+                            },
+                            closed_locally: local,
+                            host: HostEnd::NotTold {
+                                words: "The host never said whether it created the call."
+                                    .to_owned(),
+                            },
+                            // The service may hold a call this device cannot name.
+                            broker: "unknown".to_owned(),
+                        });
+                    },
                     vec![OwedView::start_unknown(action_id, until_ms, &host)],
                 );
                 self.shared.start_was_answered(self.id);
@@ -2595,37 +2596,9 @@ impl Owner {
         // A request written to the host and not answered may have been carried out, and the aftermath
         // never says nothing was done.
         let unsettled = self.accepting && self.requests_unsettled();
-        self.view(|state| {
-            state.running = false;
-            state.session = None;
-            state.control = "none".to_owned();
-            state.host = "none".to_owned();
-            state.ended = Some(EndedView {
-                owner: id,
-                cause: cause.word().to_owned(),
-                words: if unsettled {
-                    format!("{} {REQUESTS_UNSETTLED}", cause.words())
-                } else {
-                    cause.words()
-                },
-                closed_locally,
-                host: host_end.clone(),
-                broker: if needs_broker {
-                    "pending"
-                } else {
-                    "not_needed"
-                }
-                .to_owned(),
-            });
-            // What the voice service did about the call arrives after this record may be another
-            // call's, and the screen is told so until it has.
-            if needs_broker {
-                state.finalising_owners.insert(id);
-            }
-        });
-        // What the end owes is recorded with the host being told, in one step. The grant may be
-        // live at the host until the moment the call was to close, by the host's reading of the
-        // clock.
+        // What the end owes is recorded with the end and with the host being told, in one step.
+        // The grant may be live at the host until the moment the call was to close, by the host's
+        // reading of the clock.
         let owed = match (host_end.owed_reason(), &self.descriptor, &self.host) {
             (Some(words), Some(descriptor), Some(host)) => vec![OwedView::revocation(
                 words,
@@ -2635,7 +2608,38 @@ impl Owner {
             )],
             _ => Vec::new(),
         };
-        self.shared.record_end(self.id, owed);
+        self.shared.record_end(
+            self.id,
+            |state| {
+                state.running = false;
+                state.session = None;
+                state.control = "none".to_owned();
+                state.host = "none".to_owned();
+                state.ended = Some(EndedView {
+                    owner: id,
+                    cause: cause.word().to_owned(),
+                    words: if unsettled {
+                        format!("{} {REQUESTS_UNSETTLED}", cause.words())
+                    } else {
+                        cause.words()
+                    },
+                    closed_locally,
+                    host: host_end.clone(),
+                    broker: if needs_broker {
+                        "pending"
+                    } else {
+                        "not_needed"
+                    }
+                    .to_owned(),
+                });
+                // What the voice service did about the call arrives after this record may be
+                // another call's, and the screen is told so until it has.
+                if needs_broker {
+                    state.finalising_owners.insert(id);
+                }
+            },
+            owed,
+        );
         if matches!(cause, Cause::Control(ControlEnd::NoSuchCall)) {
             self.shared.remember_no_such_call(self.note_key());
         }
