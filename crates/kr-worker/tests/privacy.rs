@@ -1507,3 +1507,208 @@ fn a_session_that_cannot_read_its_state_removes_its_history_when_it_reads_on() {
             .is_empty()
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// The receipts' fence: no reader is told a settled receipt's content while its removal is owed or
+// the privacy state cannot be read, and each outcome is the one a person would get without the wait
+// ---------------------------------------------------------------------------------------------
+
+/// What each reader of a receipt's content says of three receipts: the first settled `applied`
+/// with a result, the second settled `unknown` and still holds the supersession check back, and
+/// the third has only been accepted.
+#[derive(Debug, PartialEq, Eq)]
+struct ReceiptReads {
+    result_of_the_applied: Option<Vec<u8>>,
+    intent_of_the_applied: Option<Vec<u8>>,
+    intent_of_the_unknown: Option<Vec<u8>>,
+    intent_of_the_accepted: Option<Vec<u8>>,
+    /// The envelopes the supersession check offers for the subject of the unknown receipt.
+    offered_to_the_check: Vec<Option<Vec<u8>>>,
+}
+
+/// Puts two settled receipts in the session's journal: applied with a result, and unknown.
+fn settle_two_receipts(session: &mut Session) {
+    let id = |byte: u8| kr_worker::journal::action_id_from([byte; 16]);
+    let now = kr_ipc::now_ms();
+    let journal = session.journal_mut().expect("a journal");
+    for byte in 1..=2 {
+        journal.accept(&submission(byte)).expect("an action");
+    }
+    for byte in 1..=2 {
+        journal
+            .mark_dispatching(actor(), id(byte), now)
+            .expect("marks");
+    }
+    journal
+        .settle(
+            actor(),
+            id(1),
+            ReceiptState::Applied,
+            Some(b"what the action answered"),
+            None,
+            now,
+        )
+        .expect("settles");
+    journal
+        .settle(actor(), id(2), ReceiptState::Unknown, None, None, now)
+        .expect("settles unknown");
+}
+
+fn what_the_readers_say(journal: &kr_worker::journal::Journal) -> ReceiptReads {
+    let id = |byte: u8| kr_worker::journal::action_id_from([byte; 16]);
+    let intent = |byte: u8| journal.read_intent(&actor(), id(byte)).expect("reads");
+    let offered = std::cell::RefCell::new(Vec::new());
+    journal
+        .uncertain_for_subject_matching(
+            &actor(),
+            Method::AgentApprovalRespond,
+            Digest256::from_bytes([2; 32]),
+            |envelope| {
+                offered.borrow_mut().push(envelope.map(<[u8]>::to_vec));
+                false
+            },
+        )
+        .expect("the check reads");
+    ReceiptReads {
+        result_of_the_applied: journal.read_result(&actor(), id(1)).expect("reads"),
+        intent_of_the_applied: intent(1),
+        intent_of_the_unknown: intent(2),
+        intent_of_the_accepted: intent(3),
+        offered_to_the_check: offered.into_inner(),
+    }
+}
+
+/// What the store itself holds, which no reader's answer changes: a journal opened for reading
+/// only belongs to no session and owes nothing.
+fn what_the_store_holds(temp: &kr_ipc::testing::TempHost, session_id: SessionId) -> ReceiptReads {
+    what_the_readers_say(
+        &kr_worker::journal::Journal::open_read_only(
+            temp.environment().journal_database(session_id),
+        )
+        .expect("the journal opens"),
+    )
+}
+
+/// The reads of a receipt whose content the removal has taken: the result and the envelope of the
+/// two settled receipts are gone, the accepted receipt keeps the envelope recovery reads, and the
+/// supersession check is offered no envelope.
+fn after_the_removal() -> ReceiptReads {
+    ReceiptReads {
+        result_of_the_applied: None,
+        intent_of_the_applied: None,
+        intent_of_the_unknown: None,
+        intent_of_the_accepted: Some(b"the answer a person typed".to_vec()),
+        offered_to_the_check: vec![None],
+    }
+}
+
+/// The reads of a receipt whose content was never private.
+fn whole() -> ReceiptReads {
+    ReceiptReads {
+        result_of_the_applied: Some(b"what the action answered".to_vec()),
+        intent_of_the_applied: Some(b"the answer a person typed".to_vec()),
+        intent_of_the_unknown: Some(b"the answer a person typed".to_vec()),
+        intent_of_the_accepted: Some(b"the answer a person typed".to_vec()),
+        offered_to_the_check: vec![Some(b"the answer a person typed".to_vec())],
+    }
+}
+
+/// A session reopened with its privacy record unreadable and three receipts in its journal.
+fn reopened_unreadable_with_receipts() -> (kr_ipc::testing::TempHost, Session, SessionId) {
+    let (temp, mut session) = session_on_disk();
+    let session_id = session.summary().session_id;
+    settle_two_receipts(&mut session);
+    drop(session);
+    let journal = temp.environment().journal_database(session_id);
+    rusqlite::Connection::open(&journal)
+        .expect("the journal")
+        .execute(
+            "UPDATE privacy SET generation = 'unreadable' WHERE id = 1",
+            [],
+        )
+        .expect("the record is made unreadable");
+    let mut reopened = Session::open(config_at(&temp, session_id, journal)).expect("opens again");
+    // The open rejects an intent that was accepted and never dispatched, as it does after any
+    // restart, so the receipt that is still accepted is made now.
+    reopened
+        .journal_mut()
+        .expect("a journal")
+        .accept(&submission(3))
+        .expect("an action is accepted");
+    (temp, reopened, session_id)
+}
+
+fn reads(session: &Session) -> ReceiptReads {
+    what_the_readers_say(session.journal().expect("a journal"))
+}
+
+#[test]
+fn while_the_state_cannot_be_read_no_reader_of_a_receipt_is_told_its_content() {
+    let (temp, session, session_id) = reopened_unreadable_with_receipts();
+    assert!(session.privacy_cleanup_failure().is_some());
+    assert_eq!(what_the_store_holds(&temp, session_id), whole());
+    assert_eq!(reads(&session), after_the_removal());
+}
+
+#[test]
+fn a_state_that_reads_as_off_shows_every_receipt_whole_again() {
+    let (temp, mut session, session_id) = reopened_unreadable_with_receipts();
+    assert_eq!(reads(&session), after_the_removal());
+    put_the_privacy_record_right(&temp, session_id, 0, 0);
+    session.collect_expired();
+    assert!(session.privacy_cleanup_failure().is_none());
+    assert_eq!(reads(&session), whole());
+    assert_eq!(what_the_store_holds(&temp, session_id), whole());
+}
+
+#[test]
+fn a_state_that_reads_as_on_removes_the_content_and_every_reader_agrees() {
+    let (temp, mut session, session_id) = reopened_unreadable_with_receipts();
+    put_the_privacy_record_right(&temp, session_id, 1, 1);
+    session.collect_expired();
+    assert!(session.privacy_cleanup_failure().is_none());
+    assert_eq!(reads(&session), after_the_removal());
+    assert_eq!(
+        what_the_store_holds(&temp, session_id),
+        after_the_removal(),
+        "the store holds what the readers say"
+    );
+}
+
+#[test]
+fn while_the_removal_is_owed_no_reader_of_a_receipt_is_told_its_content_and_the_store_agrees_when_it_is_done()
+ {
+    let (temp, mut session) = session_on_disk();
+    let session_id = session.summary().session_id;
+    settle_two_receipts(&mut session);
+    session
+        .journal_mut()
+        .expect("a journal")
+        .accept(&submission(3))
+        .expect("an action is accepted");
+    // The store refuses to delete a result, so the removal is owed.
+    let refusing = rusqlite::Connection::open(temp.environment().journal_database(session_id))
+        .expect("the journal");
+    refusing
+        .execute_batch(
+            "CREATE TRIGGER refuse_removal BEFORE DELETE ON results
+             BEGIN SELECT RAISE(ABORT, 'the store refuses'); END;",
+        )
+        .expect("the store is made to refuse");
+    let enabling = session
+        .enable_privacy(PrivacyGeneration::new(1), &mut [])
+        .expect("enables");
+    assert!(enabling.unfinished("receipts").is_some());
+    assert_eq!(what_the_store_holds(&temp, session_id), whole());
+    assert_eq!(reads(&session), after_the_removal());
+
+    refusing
+        .execute_batch("DROP TRIGGER refuse_removal")
+        .expect("the store accepts again");
+    session
+        .enable_privacy(PrivacyGeneration::new(1), &mut [])
+        .expect("the same enabling again");
+    assert!(session.reconcile_privacy(&[]).is_complete());
+    assert_eq!(reads(&session), after_the_removal());
+    assert_eq!(what_the_store_holds(&temp, session_id), after_the_removal());
+}

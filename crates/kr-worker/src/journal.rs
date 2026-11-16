@@ -232,6 +232,13 @@ pub struct Journal {
     /// something to read, and this is what tells it there is. It is shared rather than owned, so
     /// the one waiting can hold it without holding the journal.
     attention_changes: std::sync::Arc<tokio::sync::Notify>,
+    /// Whether the removal of settled receipts' content is owed, or the session that owns this
+    /// journal cannot say whether privacy mode is on ([`Self::withheld_now`]).
+    ///
+    /// The session sets it where it owes that removal and clears it where the removal is done or
+    /// the state reads as off, so that a journal a session opens is fenced before any reader can
+    /// reach it. A journal opened for any other purpose owes nothing and reads whole.
+    content_owed: bool,
     /// Where this host's own tests stop the commit of a dispatch marker. Compiled away in every
     /// shipped build.
     #[cfg(feature = "testing")]
@@ -385,6 +392,7 @@ impl Journal {
                 .map(|boot| boot.value.as_slice().to_vec()),
             fenced_empty: std::collections::BTreeSet::new(),
             attention_changes: std::sync::Arc::new(tokio::sync::Notify::new()),
+            content_owed: false,
             #[cfg(feature = "testing")]
             marker_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
@@ -1518,6 +1526,9 @@ impl Journal {
 
     /// Reads the recoverable intent an action was accepted with.
     ///
+    /// While the removal of settled content is owed, a receipt that the removal strips has none
+    /// ([`Self::withheld_now`]).
+    ///
     /// # Errors
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
@@ -1527,7 +1538,11 @@ impl Journal {
         Ok(self
             .connection
             .query_row(
-                "SELECT intent FROM receipts WHERE actor_id = ?1 AND action_id = ?2",
+                &format!(
+                    "SELECT intent FROM receipts
+                     WHERE actor_id = ?1 AND action_id = ?2 AND state NOT IN ({})",
+                    state_list(self.withheld_now())
+                ),
                 params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
                 |row| row.get::<_, Option<Vec<u8>>>(0),
             )
@@ -1808,9 +1823,13 @@ const CONTENT_WITHHELD_STATES: [ReceiptState; 4] = [
     ReceiptState::Unknown,
 ];
 
-/// [`CONTENT_WITHHELD_STATES`] as the list a SQL `IN` takes.
-fn content_withheld_list() -> String {
-    CONTENT_WITHHELD_STATES
+/// Receipt states as the list a SQL `IN` takes.
+///
+/// The removal of settled content takes [`CONTENT_WITHHELD_STATES`] and a reader that answers as
+/// after the removal takes [`Journal::withheld_now`], which is that same list, so the two cannot
+/// name different receipts.
+fn state_list(states: &[ReceiptState]) -> String {
+    states
         .iter()
         .map(|state| format!("'{}'", state.as_str()))
         .collect::<Vec<_>>()
@@ -1879,7 +1898,7 @@ fn withhold_settled_content(
     health: &crate::persistence::fault::JournalHealth,
     transaction: &rusqlite::Transaction<'_>,
 ) -> Result<u64> {
-    let settled = content_withheld_list();
+    let settled = state_list(&CONTENT_WITHHELD_STATES);
     let results = transaction
         .execute(
             &format!(
@@ -2851,6 +2870,10 @@ impl Journal {
     /// nothing to derive one from) is offered to `matches` too, since the subject cannot say that
     /// it is another ask; its envelope may still say so.
     ///
+    /// While the removal of settled content is owed, the envelope is offered as it is after the
+    /// removal, which is none ([`Self::withheld_now`]), so every uncertain outcome of the subject
+    /// holds the request back.
+    ///
     /// # Errors
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
@@ -2869,11 +2892,13 @@ impl Journal {
                 Self::NEWEST_RECORDED_FIRST
             ))
             .map_err(|error| faulted(&self.health, error))?;
+        let uncertain = ReceiptState::Unknown;
+        let envelope_withheld = self.withheld_now().contains(&uncertain);
         let mut rows = statement
             .query(params![
                 actor_id.as_str(),
                 subject_digest.as_bytes().as_slice(),
-                ReceiptState::Unknown.as_str(),
+                uncertain.as_str(),
                 method.as_str()
             ])
             .map_err(|error| faulted(&self.health, error))?;
@@ -2883,7 +2908,7 @@ impl Journal {
                 row.get(1).map_err(|error| faulted(&self.health, error))?,
                 row.get(2).map_err(|error| faulted(&self.health, error))?,
             );
-            if matches(intent.as_deref()) {
+            if matches(intent.as_deref().filter(|_| !envelope_withheld)) {
                 return Ok(Some((
                     parse_action(&action)?,
                     u64::try_from(revision).unwrap_or_default(),
@@ -3531,13 +3556,24 @@ impl Journal {
 
     /// Reads the retained result of an action.
     ///
+    /// While the removal of settled content is owed, a receipt that the removal strips has none
+    /// ([`Self::withheld_now`]).
+    ///
     /// # Errors
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
     pub fn read_result(&self, actor_id: &ActorId, action_id: ActionId) -> Result<Option<Vec<u8>>> {
         self.connection
             .query_row(
-                "SELECT result FROM results WHERE actor_id = ?1 AND action_id = ?2",
+                &format!(
+                    "SELECT result FROM results
+                     WHERE actor_id = ?1 AND action_id = ?2
+                       AND NOT EXISTS (SELECT 1 FROM receipts AS r
+                                       WHERE r.actor_id = results.actor_id
+                                         AND r.action_id = results.action_id
+                                         AND r.state IN ({}))",
+                    state_list(self.withheld_now())
+                ),
                 params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
                 |row| row.get::<_, Vec<u8>>(0),
             )
@@ -3614,6 +3650,7 @@ impl Journal {
             boot: None,
             fenced_empty: std::collections::BTreeSet::new(),
             attention_changes: std::sync::Arc::new(tokio::sync::Notify::new()),
+            content_owed: false,
             #[cfg(feature = "testing")]
             marker_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
@@ -3780,6 +3817,31 @@ impl Journal {
                 host_events_head: u64::try_from(host_events_head).unwrap_or(u64::MAX),
             },
         ))
+    }
+
+    /// Says that the removal of settled receipts' content is owed, or no longer is.
+    ///
+    /// The session that owns this journal sets it, and sets it before any reader can reach the
+    /// journal: where a session opens under privacy mode or cannot read whether it is on, where an
+    /// enabling leaves the removal unfinished, and again where the removal is done or the state
+    /// reads as off.
+    pub(crate) fn set_content_owed(&mut self, owed: bool) {
+        self.content_owed = owed;
+    }
+
+    /// The receipt states whose content no reader is told of now, from the one place that says so.
+    ///
+    /// None while nothing is owed. While the removal of settled content is owed, or the state of
+    /// privacy mode cannot be read, the states the removal strips ([`CONTENT_WITHHELD_STATES`]):
+    /// every reader of a result or of an envelope answers as it will after the removal, so a
+    /// receipt that the removal leaves whole, one still `accepted` or `dispatching`, is read whole.
+    /// Every reader asks this and answers from it, and none checks the flag itself.
+    const fn withheld_now(&self) -> &'static [ReceiptState] {
+        if self.content_owed {
+            &CONTENT_WITHHELD_STATES
+        } else {
+            &[]
+        }
     }
 
     /// Removes the content a settled receipt carries, keeping the metadata.
