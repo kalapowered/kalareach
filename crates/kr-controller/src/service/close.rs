@@ -161,6 +161,20 @@ pub(crate) fn read_close_answer(
     Ok((encode(&receipt)?, None))
 }
 
+/// How far a closure's reason rests on a fact that a later look can find and an earlier look could
+/// not. The host's restart is the most: the worker's own record of its processes names an earlier
+/// boot, which a look reads only where it can read that record. The platform's word that the
+/// worker's desktop has gone is next: it is given only where the platform answers
+/// (`Controller::why_a_worker_is_gone`). Every other reason is the look's default, a worker that
+/// ended without its closure.
+const fn reason_rests_on_a_fact(reason: ClosureReason) -> u8 {
+    match reason {
+        ClosureReason::HostShutdown => 2,
+        ClosureReason::DesktopLost => 1,
+        _ => 0,
+    }
+}
+
 /// What this host knows of a worker's end when it records the closure of the worker's session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Death {
@@ -1173,7 +1187,11 @@ impl Controller {
         // 3. A record of this daemon's own that an earlier look could not write gives its reason
         //    alone. What a record says of the journal, the endpoint and the session's processes
         //    is what the look that built it could read, remove and stop, and this look has made
-        //    its own pass: no look writes an item that its own pass made false.
+        //    its own pass: no look writes an item that its own pass made false. The one reason
+        //    that does not stay is a reason that this look's own pass establishes from a fact
+        //    that the earlier look could not have ([`reason_rests_on_a_fact`]): the worker's own
+        //    record names an earlier boot, or the platform now says that the worker's desktop has
+        //    gone. That reason is given first, then the kept record's, then this look's default.
         // 4. A new record, built from this look's own pass, below.
         let kept = self.known_record(session_id);
         if let Some((account, Whose::Worker)) = &kept {
@@ -1187,7 +1205,11 @@ impl Controller {
             return Ok(recovered);
         }
         let reason = match kept {
-            Some((own, Whose::Daemon)) => own.reason,
+            Some((own, Whose::Daemon))
+                if reason_rests_on_a_fact(reason) <= reason_rests_on_a_fact(own.reason) =>
+            {
+                own.reason
+            }
             _ => reason,
         };
         // Nothing authoritative survived. What is written instead says so: the coverage is
