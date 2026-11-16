@@ -820,7 +820,9 @@ describe('a press for a pointer that can open, and the look it gives', () => {
     expect(lives(), 'the press after another finger moved').toBe(true)
     fire('pointermove', pointer(texts[3], { clientY: y - 40 }))
     expect(lives(), 'the press after its own finger moved').toBe(false)
-    expect(isLit(links[3]?.[0]), 'the look of a press on plain text').toBe(false)
+    fire('click', click(texts[3], { clientY: y - 40 }))
+    expect(opened, 'links opened by the click after the press ended').toEqual([])
+    expect(isLit(links[3]?.[0]), 'the look at that click').toBe(false)
   })
 
   it('keeps a press for a move of 9 px and ends it for a move of 11 px, the slop being 10', () => {
@@ -832,7 +834,9 @@ describe('a press for a pointer that can open, and the look it gives', () => {
     expect(lives(), 'the press after 9 px').toBe(true)
     fire('pointermove', pointer(texts[3], { clientY: y - 11 }))
     expect(lives(), 'the press after 11 px').toBe(false)
-    expect(isLit(links[3]?.[0]), 'the look of a press on plain text').toBe(false)
+    fire('click', click(texts[3], { clientY: y - 11 }))
+    expect(opened, 'links opened by the click after the press ended').toEqual([])
+    expect(isLit(links[3]?.[0]), 'the look at that click').toBe(false)
   })
 })
 
@@ -939,7 +943,7 @@ describe('the look of a mouse press on a link’s own element as the pointer mov
 describe('a scroll under a held press', () => {
   const y = 328
 
-  it('ends the look and the press where the link has moved away from the press’s point: nothing opens', () => {
+  it('ends the press where the link has moved away from the press’s point: nothing opens', () => {
     const { pane, links, texts } = conversation(6, 3)
     start(pane)
     clock(100)
@@ -1117,7 +1121,7 @@ describe('a scroll under a held press', () => {
     const press = { clientX: 90, clientY: 94 }
     const beside = { left: 60, top: 97, right: 96, bottom: 113 }
 
-    it('ends the look where a control that is not a link comes under the point, and keeps it where the control still lies below it: the button of an image that loads', () => {
+    it('ends the press where a control that is not a link comes under the point, and keeps it where the control still lies below it: the button of an image that loads', () => {
       const { pane, text, links } = between(words)
       const button = placed(text, 'm-other', beside)
       start(pane)
@@ -1172,7 +1176,7 @@ describe('a scroll under a held press', () => {
       expect(opened, 'the engine’s own click on the element').toEqual([links[0]])
     })
 
-    it('ends the look where the lit link’s own element comes under the point but opens another destination now', () => {
+    it('ends the press where the link’s own element comes under the point but opens another destination now', () => {
       const { pane, text, links } = between(words)
       start(pane)
       clock(100)
@@ -1185,21 +1189,24 @@ describe('a scroll under a held press', () => {
       expect(lives(), 'the press where the link now opens another destination').toBe(false)
     })
 
-    it('ends the look where another link of a message, not the lit one, comes under the point', () => {
+    it('ends the press where another link of a message, not the nearer one, comes under the point', () => {
       const { pane, text, links } = between(words, { left: 20, top: 100, right: 60, bottom: 117 })
       start(pane)
       clock(100)
       fire('pointerdown', pointer(text, press))
-      expect(isLit(links[0]), 'the look of the press on plain text').toBe(false)
       expect(lives(), 'the press: the first link’s words are the nearer').toBe(true)
       scrolled(8)
       scrolledSideways(-40)
       fire('scroll', {} as Event)
       expect(document.elementFromPoint(press.clientX, press.clientY), 'the element under the point').toBe(links[1])
       expect(lives(), 'the press where the other link lies under the point').toBe(false)
+      fire('click', click(text, press))
+      expect(opened, 'links opened by the click after the press ended').toEqual([])
+      expect(isLit(links[0]), 'the look at that click, on the first link').toBe(false)
+      expect(isLit(links[1]), 'the look at that click, on the second link').toBe(false)
     })
 
-    it('ends the look where another link comes under the point', () => {
+    it('ends the press where another link comes under the point', () => {
       const { pane, text } = between(words)
       // A link that no message holds, so the rule does not weigh it.
       const other = placed(pane, 'md-link m-other', beside)
@@ -1213,7 +1220,7 @@ describe('a scroll under a held press', () => {
       expect(lives(), 'the press after a scroll that put another link under the point').toBe(false)
     })
 
-    it('ends the look where an element outside the pane comes under the point, since a release there is not the pane’s', () => {
+    it('ends the press where an element outside the pane comes under the point, since a release there is not the pane’s', () => {
       const { pane, text, links } = between(words)
       const overlay = placed(document.body, 'overlay', { left: 0, top: 200, right: 390, bottom: 844 }, 'div')
       start(pane)
@@ -1224,7 +1231,9 @@ describe('a scroll under a held press', () => {
       scrolled(2)
       fire('scroll', {} as Event)
       expect(lives(), 'the press after an overlay came under the point').toBe(false)
-      expect(isLit(links[0]), 'the look of a press on plain text').toBe(false)
+      fire('click', click(text, press))
+      expect(opened, 'links opened by the click after the press ended').toEqual([])
+      expect(isLit(links[0]), 'the look at that click').toBe(false)
     })
   })
 })
@@ -1428,7 +1437,7 @@ describe('a link under a box whose view cannot be measured', () => {
     'content-visibility: hidden': { 'content-visibility': 'hidden' }
   }
 
-  it('gives a hidden link no area, as the scaled box of the review shows: a box of 200 by 100 at half size hides words that its client box would show', () => {
+  it('gives a hidden link no area, as a scaled box shows: a box of 200 by 100 at half size hides words that its client box would show', () => {
     // The box lies at (40,100) to (140,150) on the screen and has a client box of 200 by 100, so a handler
     // that laid the client size over the screen origin would see (40,100) to (240,200). The hidden words
     // are at (146,120) to (154,129) and the tap at (138,140), in the area that those words would have.

@@ -252,6 +252,8 @@ interface Look {
  * the link that is lit at it (null for none), in `window.looks`. The look at a pointer down is read by a
  * listener that was added after the pane's own, so the pane's handler has set it by then; the look at a
  * click is read by the window's listener of the bubble phase, after the pane's handler and the page's own.
+ * The look at each release (null for none) is read the same way in `window.releases`, before the click that the
+ * release makes can change it.
  */
 async function watchClicks(page: Page): Promise<void> {
   await page.evaluate(() => {
@@ -259,6 +261,11 @@ async function watchClicks(page: Page): Promise<void> {
     ;(window as unknown as { clicks: Clicked[] }).clicks = clicks
     const looks: Look[] = []
     ;(window as unknown as { looks: Look[] }).looks = looks
+    const releases: (string | null)[] = []
+    ;(window as unknown as { releases: (string | null)[] }).releases = releases
+    window.addEventListener('pointerup', () => {
+      releases.push(document.querySelector('.md-link[data-pressed]')?.getAttribute('title') ?? null)
+    })
     document.addEventListener(
       'pointerdown',
       (event) => {
@@ -304,6 +311,10 @@ async function watchClicks(page: Page): Promise<void> {
 const clicksSeen = (page: Page): Promise<Clicked[]> =>
   page.evaluate(() => (window as unknown as { clicks: Clicked[] }).clicks.slice())
 
+/** The link lit at each release of a pointer since the recorder began (null for none). */
+const releasesSeen = (page: Page): Promise<(string | null)[]> =>
+  page.evaluate(() => (window as unknown as { releases: (string | null)[] }).releases.slice())
+
 /** The clicks the browser made itself, seen before any handler: what the page was given. */
 const browsers = (clicks: readonly Clicked[]): Clicked[] => clicks.filter((click) => click.phase === 'capture' && click.trusted)
 /** The clicks that a handler of the page made. */
@@ -312,23 +323,34 @@ const handlers = (clicks: readonly Clicked[]): Clicked[] => clicks.filter((click
 /**
  * A pause long enough for a click's record to be old, made by the page being busy as the pointer comes
  * up: in a listener of the window's capture phase, which runs before the pane's handler sees the
- * release (`before`), or in one of its bubble phase, which runs after it (`after`).
+ * release (`before`), or in one of its bubble phase, which runs after it (`after`). The page keeps one
+ * listener of each phase, and a call sets how long that phase waits (the other phase waits none), so each
+ * call is the one pause that it names and an earlier call adds nothing to it.
  */
 async function busyAtPointerUp(page: Page, milliseconds: number, where: 'before' | 'after'): Promise<void> {
   await page.evaluate(
-    ({ busy, capture }) => {
-      window.addEventListener(
-        'pointerup',
-        () => {
-          const end = performance.now() + busy
-          while (performance.now() < end) {
-            // Busy.
-          }
-        },
-        capture
-      )
+    ({ busy, phase }) => {
+      const state = window as unknown as { busyFor?: Record<'before' | 'after', number> }
+      const installed = state.busyFor !== undefined
+      const wait = (state.busyFor ??= { before: 0, after: 0 })
+      if (!installed) {
+        for (const side of ['before', 'after'] as const) {
+          window.addEventListener(
+            'pointerup',
+            () => {
+              const end = performance.now() + wait[side]
+              while (performance.now() < end) {
+                // Busy.
+              }
+            },
+            side === 'before'
+          )
+        }
+      }
+      wait.before = phase === 'before' ? busy : 0
+      wait.after = phase === 'after' ? busy : 0
     },
-    { busy: milliseconds, capture: where === 'before' }
+    { busy: milliseconds, phase: where }
   )
 }
 
@@ -829,7 +851,7 @@ test.describe('a tap on the plain text near a link of a message', () => {
         expect(handlers(soon.clicks).length, 'clicks that the page added 1.7 s after the release').toBe(browsers(soon.clicks)[0]?.named.startsWith('text') ? 1 : 0)
         await busyAtPointerUp(page, 3200, where)
         const late = await tapAndRead(page, after.x, after.y, tapNow)
-        expect(late.opened, 'links opened by a click 4.9 s after the release, by a record that old').toEqual([])
+        expect(late.opened, 'links opened by a click 3.2 s after the release, by a record that old').toEqual([])
         expect(handlers(late.clicks), 'clicks that the page added to a click that came 3.2 s after the release').toEqual([])
         expect(late.clicks.filter((click) => click.phase === 'bubble' && click.trusted).length, 'the late click reached the page: nothing stopped it').toBe(1)
       })
@@ -1041,7 +1063,10 @@ test.describe('a tap on the plain text near a link of a message', () => {
       await page.mouse.move(own.x, own.y)
       await page.mouse.down()
       expect(await pressedLooks(page), 'the pressed look of a mouse press on the link’s own words').toBe(1)
+      const before = (await releasesSeen(page)).length
       await page.mouse.up()
+      // The click that the release makes clears the look of a mouse, so the look is read as the release reaches the window.
+      expect((await releasesSeen(page)).slice(before), 'the pressed look at the release of a mouse press on the link’s own words').toEqual([null])
       expect(await pressedLooks(page), 'the pressed look after the release').toBe(0)
     })
 
@@ -1813,7 +1838,7 @@ test.describe('the area in which a tap opens a link', () => {
             expect(soon.litAtClick, 'the look at that click').toEqual([found.named.slice('link '.length)])
             await busyAtPointerUp(page, 3200, where)
             const late = await tapAndRead(page, found.x, found.y, tapNow)
-            expect(lookDisagrees(late), `the look and the opening of a tap 4.9 s after the release at ${found.named}`).toBeNull()
+            expect(lookDisagrees(late), `the look and the opening of a tap 3.2 s after the release at ${found.named}`).toBeNull()
             expect(late.opened, 'links opened by the tap 3.2 s after the release, by the browser’s own click').toEqual([found.named.slice('link '.length)])
             expect(late.litAtClick, 'the look at the click 3.2 s after the release').toEqual([found.named.slice('link '.length)])
             expect(handlers(late.clicks), 'clicks that the page added to a click on a link').toEqual([])
@@ -2111,15 +2136,14 @@ test.describe('a link in a box inside a message that clips it', () => {
         // Outside the box, left of its edge: the words that the box hides take no part, and the target of the part in
         // view is held to the box, so the page adds no click there, though the full words' target would hold the point.
         // Where the browser's own click names the link (WebKit's adjustment reaches the part in view from there) it
-        // decides the open, and the page adds none; the look is the page's alone (it is written at the press, from the
-        // press's target and the rule, and the browser's click does not change it), so it is asserted whatever
-        // element the click names.
+        // opens the link, and the look at that click is on it; where the click names plain text nothing opens and
+        // nothing is lit. The look and the opening must agree at each tap (`lookDisagrees`).
         for (const outward of [3, 6, 12, 20]) {
           const outside = await tapAndRead(page, edge - outward, words.y)
           expect(handlers(outside.clicks), `clicks that the page added ${String(outward)} px outside the box’s edge`).toEqual([])
-          expect(outside.lit, `the pressed look ${String(outward)} px outside the box’s edge`).toEqual([null])
-          expect(outside.litAtClick, `the look at the click ${String(outward)} px outside the box’s edge`).toEqual([null])
+          expect(lookDisagrees(outside), `the look and the opening of a tap ${String(outward)} px outside the box’s edge`).toBeNull()
           if (browsers(outside.clicks).every((click) => click.named.startsWith('text'))) {
+            expect(outside.litAtClick, `the look at the click ${String(outward)} px outside the box’s edge`).toEqual([null])
             expect(outside.opened, `links opened by a tap ${String(outward)} px outside the box’s edge`).toEqual([])
           }
         }
