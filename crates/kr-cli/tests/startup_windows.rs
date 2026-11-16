@@ -1936,18 +1936,34 @@ impl DaemonThatEnds {
 /// connection and ends is seen to end by `kr host stop`, which lets go of its own end of the
 /// connection before it looks for the end. Where it kept the connection, the pipe's instance for
 /// it would stay for as long as the command held it, every new connection would meet a busy pipe,
-/// and the command could not see the daemon go.
+/// and the command could not see the daemon go. The text is the unmade request's own sentence: it
+/// names why the request could not be made and says that the command sent nothing, and the line
+/// that says a request was asked, which a command that composed its request before it saw the
+/// close prints on the error stream, is not there.
 #[test]
 fn kr_host_stop_sees_a_daemon_end_that_closed_the_connection_the_command_held() {
     let host = Host::create();
     let daemon = DaemonThatEnds::serve(&host);
-    let output = host.kr(&["--json", "host", "stop"]);
+    let output = host.kr(&["host", "stop"]);
     daemon.finish();
-    let said = document(&output, "kr host stop");
+    let out = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
-        "{said} {}",
+        "{out} {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(said["stop"], "ended", "{said}");
+    assert!(
+        out.starts_with("The control daemon for environment "),
+        "{out}"
+    );
+    assert!(
+        out.contains(" ended, and this command could not make its request for it: "),
+        "{out}"
+    );
+    assert!(
+        out.trim_end().ends_with("This command sent nothing."),
+        "{out}"
+    );
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(!said.contains("Asked the control daemon"), "{said}");
 }
