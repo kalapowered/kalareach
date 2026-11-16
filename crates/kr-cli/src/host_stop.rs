@@ -6492,42 +6492,70 @@ mod tests {
             .map_or(0, |error| error.exit_code())
     }
 
-    /// What a result says in the table: the kind of sentence, the exit code and the `stop` member.
+    /// What a result says in the table: the kind of sentence, the exit code, the code of the `--json`
+    /// failure beside it and the `stop` member.
     fn said_line<S: Label>(said: &Said<S>) -> String {
         format!(
-            "{} exit={} stop={}",
+            "{} exit={} code={} stop={}",
             said.sentence.label(),
             code_of(said.exit),
+            failure_code_of(said.exit),
             said.stop.word()
         )
     }
 
+    /// The code that the `--json` failure of a result carries, as `--json` spells it; `-` for a
+    /// success, which carries none.
+    fn failure_code_of(exit: Exit) -> String {
+        exit.failure(Shown::said("a failure"))
+            .map_or_else(|| "-".to_owned(), |error| error.code().to_string())
+    }
+
     /// What a round reads, in the table.
     fn readings(round: &Round) -> String {
+        let look = match (round.look, round.successor) {
+            (Some(Endpoint::Another), Some(pid)) => format!("another({pid})"),
+            (Some(Endpoint::Another), None) => "another(-)".to_owned(),
+            (look, _) => look.label(),
+        };
         format!(
-            "lock={} process={} holder={} look={}",
+            "lock={} process={} holder={} look={look}",
             round.lock.label(),
             round.process.label(),
             round.holder.label(),
-            round.look.label()
         )
     }
 
-    /// Every combination of what a round reads, with the successor that the lock file names after
-    /// a look of another generation.
+    /// The successors that the lock file can name after a look: for a look of another generation
+    /// its process (5000) and none (where the lock file cannot be read, as on Windows), and none
+    /// after any other look.
+    fn successors_after(look: Look) -> Vec<Option<u64>> {
+        match look {
+            Some(Endpoint::Another) => vec![Some(5000), None],
+            Some(
+                Endpoint::Nobody | Endpoint::Same(_) | Endpoint::Unproved(_) | Endpoint::Unclear,
+            )
+            | None => vec![None],
+        }
+    }
+
+    /// Every combination of what a round reads, with each successor that the lock file can name
+    /// after a look of another generation.
     fn every_round() -> Vec<Round> {
         let mut all = Vec::new();
         for lock in every::<Lock>() {
             for process in every::<Process>() {
                 for holder in every::<Holder>() {
                     for look in every::<Look>() {
-                        all.push(Round {
-                            lock: lock.clone(),
-                            process,
-                            holder,
-                            look,
-                            successor: matches!(look, Some(Endpoint::Another)).then_some(5000),
-                        });
+                        for successor in successors_after(look) {
+                            all.push(Round {
+                                lock: lock.clone(),
+                                process,
+                                holder,
+                                look,
+                                successor,
+                            });
+                        }
                     }
                 }
             }
@@ -6570,13 +6598,15 @@ mod tests {
                         vec![None]
                     };
                     for look in looks {
-                        all.push(Round {
-                            lock: lock.clone(),
-                            process,
-                            holder,
-                            look,
-                            successor: matches!(look, Some(Endpoint::Another)).then_some(5000),
-                        });
+                        for successor in successors_after(look) {
+                            all.push(Round {
+                                lock: lock.clone(),
+                                process,
+                                holder,
+                                look,
+                                successor,
+                            });
+                        }
                     }
                 }
             }
@@ -6591,7 +6621,9 @@ mod tests {
 #   whether the wait can make that round (`reachable`), and what the round shows: gone, successor(pid), go_on, or not_ended:<why> with
 #   whether something answered the last look (a proved generation or not).
 # after a request: the rounds that can happen, at the bound, for a told request and one whose outcome was not shown: the kind of
-#   sentence, the exit code and the `stop` member of `--json`.
+#   sentence, the exit code, the code of the `--json` failure beside it (`-` for a success) and the `stop` member of `--json`.
+# a look of another generation is walked twice: with the process that the lock file names (`another(5000)`) and with none
+#   (`another(-)`, which is what Windows gives, where the lock file cannot be read).
 # before a request: the decision of the wait for a request that could not be made, what is said for each way the failure came out
 #   (with the lock read again where the decision asks for it), the first look, and the start of the command.
 ";
@@ -6867,8 +6899,21 @@ mod tests {
             if text.contains("process 4001") && !matches!(round.holder, Holder::Other(_)) {
                 broke("P4 the holder");
             }
-            if text.contains("process 5000") && !matches!(round.look, Some(Endpoint::Another)) {
+            if text.contains("process 5000") && round.successor != Some(5000) {
                 broke("P4 the successor of a look");
+            }
+            // A successor that only a look showed, where the lock file named none, has no number: the
+            // words say another control daemon.
+            let named = lock_held(round)
+                && round.process == Process::Ended
+                && matches!(round.holder, Holder::Other(_));
+            if successor_shown(round)
+                && !named
+                && matches!(round.look, Some(Endpoint::Another))
+                && round.successor.is_none()
+                && !text.contains("another control daemon")
+            {
+                broke("P4 the successor without a number");
             }
             // P5: exit 0 only where the end is shown, and where it is shown, exit 0.
             if code == 0 && !end_shown(round) {
@@ -6906,6 +6951,15 @@ mod tests {
             if (row.said.stop == Knows::Ended) != (code == 0) {
                 broke("P12 the stop member");
             }
+            // P15: where the end is not shown, the stop member is the request's own: `told` only for
+            // a request that was told, and `maybe_asked` only for one whose outcome was not shown.
+            let own = match row.request {
+                Request::Told => Knows::Told,
+                Request::MaybeAsked(_) => Knows::MaybeAsked,
+            };
+            if row.said.stop != Knows::Ended && row.said.stop != own {
+                broke("P15 the stop member of an unfinished request");
+            }
             // P13: "could not show what holds it" only where the lock was read as held (the
             // environment's own lock) and neither the same daemon was proved nor its process read as
             // running or as ended; and in every such round that shows no successor, those words.
@@ -6919,6 +6973,11 @@ mod tests {
             {
                 broke("P13 the held lock is not said");
             }
+            // P14: a process that runs is a daemon that has not ended, whatever the lock says: the
+            // words say so, and say nothing else of the end.
+            if round.process == Process::Running && !text.contains("has not ended") {
+                broke("P14 a running process");
+            }
         }
         broken
     }
@@ -6930,12 +6989,12 @@ mod tests {
     fn the_properties_hold_over_every_row() {
         let all = every_round();
         let happen = the_rounds_that_happen();
-        assert_eq!((all.len(), happen.len()), (288, 39));
+        assert_eq!((all.len(), happen.len()), (336, 45));
         let rows = composed_rows(&all, false);
-        assert_eq!(rows.len(), 288 * 2);
+        assert_eq!(rows.len(), 336 * 2);
         assert_eq!(violations(&rows), Vec::<String>::new());
         let rows = composed_rows(&happen, false);
-        assert_eq!(rows.len(), 39 * 2);
+        assert_eq!(rows.len(), 45 * 2);
         assert_eq!(violations(&rows), Vec::<String>::new());
     }
 
@@ -6955,6 +7014,159 @@ mod tests {
                 broken.iter().any(|line| line.starts_with(&cell)),
                 "{request}: {broken:#?}"
             );
+        }
+    }
+
+    /// The row of the table with these readings and this request, as the code makes it.
+    fn the_row(readings_line: &str, request: &str) -> Composed {
+        composed_rows(&the_rounds_that_happen(), false)
+            .into_iter()
+            .find(|row| readings(&row.round) == readings_line && row.request.label() == request)
+            .unwrap_or_else(|| panic!("no row {readings_line} {request}"))
+    }
+
+    /// One case of the teeth: the property that it breaks, the readings and the request of the row
+    /// that it starts from, and how the row is changed.
+    type Tooth = (
+        &'static str,
+        &'static str,
+        &'static str,
+        Box<dyn Fn(&mut Composed)>,
+    );
+
+    /// Each property has teeth: a row that is made to break exactly that property, and no other,
+    /// fails exactly that property. The rows are those of the code, with the words or the result
+    /// changed in one place; the row as the code makes it breaks none.
+    #[test]
+    fn each_property_fails_for_a_row_that_breaks_exactly_that_property() {
+        let held_ended = "lock=held process=ended holder=nobody look=unclear";
+        let free_gone = "lock=free process=ended holder=not_read look=not_made";
+        let held_unreadable = "lock=held process=unreadable holder=not_read look=not_made";
+        let free_no_identity = "lock=free process=no_identity holder=not_read look=nobody";
+        let free_another_none = "lock=free process=no_identity holder=not_read look=another(-)";
+        let free_running = "lock=free process=running holder=not_read look=not_made";
+        let unreadable_running = "lock=unreadable process=running holder=not_read look=not_made";
+        let says = |text: &str| -> Box<dyn Fn(&mut Composed)> {
+            let text = text.to_owned();
+            Box::new(move |row| row.text.clone_from(&text))
+        };
+        let cases: Vec<Tooth> = vec![
+            ("P1 ", held_ended, "told", says("the daemon has not ended")),
+            ("P2 ", held_ended, "told", says("and it has ended")),
+            (
+                "P3 told words",
+                held_ended,
+                "maybe_asked",
+                says("was told to stop"),
+            ),
+            (
+                "P3 not-shown words",
+                held_ended,
+                "told",
+                says("did not show whether it took the stop"),
+            ),
+            (
+                "P4 the asked process",
+                free_no_identity,
+                "told",
+                says("process 4000"),
+            ),
+            ("P4 the holder", held_ended, "told", says("process 4001")),
+            (
+                "P4 the successor of a look",
+                held_ended,
+                "told",
+                says("process 5000"),
+            ),
+            (
+                "P4 the successor without a number",
+                free_another_none,
+                "told",
+                says("something"),
+            ),
+            (
+                "P5 exit 0",
+                held_ended,
+                "told",
+                Box::new(|row| {
+                    row.said.exit = Exit::Done;
+                    row.said.stop = Knows::Ended;
+                }),
+            ),
+            (
+                "P5 the end is shown",
+                free_gone,
+                "told",
+                Box::new(|row| {
+                    row.said.exit = Exit::Unfinished;
+                    row.said.stop = Knows::Told;
+                }),
+            ),
+            (
+                "P6 ",
+                held_ended,
+                "told",
+                Box::new(|row| row.said.exit = Exit::Unavailable),
+            ),
+            ("P7 ", free_gone, "told", says("still held")),
+            ("P8 ", held_ended, "told", says("could not be read")),
+            ("P9 ", held_ended, "told", says("showed neither")),
+            (
+                "P10 ",
+                free_no_identity,
+                "told",
+                says("has gone, and something"),
+            ),
+            ("P11 ", held_ended, "told", says("now holds")),
+            (
+                "P12 the stop member",
+                held_ended,
+                "told",
+                Box::new(|row| row.said.stop = Knows::Ended),
+            ),
+            (
+                "P13 held and not shown",
+                free_gone,
+                "told",
+                says("could not show what holds it"),
+            ),
+            (
+                "P13 the held lock is not said",
+                held_unreadable,
+                "told",
+                says("something"),
+            ),
+            ("P14 ", free_running, "told", says("something")),
+            (
+                "P14 ",
+                unreadable_running,
+                "told",
+                says("the lock could not be read"),
+            ),
+            (
+                "P15 ",
+                held_ended,
+                "told",
+                Box::new(|row| row.said.stop = Knows::MaybeAsked),
+            ),
+            (
+                "P15 ",
+                held_ended,
+                "maybe_asked",
+                Box::new(|row| row.said.stop = Knows::Told),
+            ),
+        ];
+        for (property, readings_line, request, doctor) in cases {
+            let clean = the_row(readings_line, request);
+            assert_eq!(
+                violations(std::slice::from_ref(&clean)),
+                Vec::<String>::new()
+            );
+            let mut row = the_row(readings_line, request);
+            doctor(&mut row);
+            let broken = violations(std::slice::from_ref(&row));
+            assert_eq!(broken.len(), 1, "{property}: {broken:?}");
+            assert!(broken[0].starts_with(property), "{property}: {broken:?}");
         }
     }
 
@@ -6983,8 +7195,20 @@ mod tests {
                 let held = matches!(lock, Lock::Held);
                 match said.sentence {
                     BeforeRequest::Ended { .. } => assert_eq!((code, said.stop), (0, Knows::Ended)),
-                    BeforeRequest::HoldsAndSilent => assert!(held && code == 1, "{label}"),
-                    BeforeRequest::Silent => assert!(!held && accepted && code == 1, "{label}"),
+                    BeforeRequest::HoldsAndSilent => {
+                        assert_eq!(
+                            (held, code, said.stop),
+                            (true, 1, Knows::NotAsked),
+                            "{label}"
+                        );
+                    }
+                    BeforeRequest::Silent => {
+                        assert_eq!(
+                            (!held && accepted, code, said.stop),
+                            (true, 1, Knows::NotAsked),
+                            "{label}"
+                        );
+                    }
                     BeforeRequest::Unmade(_) => {
                         assert_eq!((code, said.stop), (3, Knows::NotAsked), "{label}");
                     }
@@ -7001,6 +7225,14 @@ mod tests {
                 let code = code_of(said.exit);
                 let free = matches!(lock, Lock::Free);
                 let held = matches!(lock, Lock::Held);
+                // Nothing was asked at the start: every result carries `not_asked`, whatever its exit.
+                assert_eq!(
+                    said.stop,
+                    Knows::NotAsked,
+                    "{} {}",
+                    start.label(),
+                    lock.label()
+                );
                 match said.sentence {
                     AtStart::NoDaemon => {
                         assert!(

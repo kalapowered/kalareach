@@ -4,7 +4,9 @@
 #   whether the wait can make that round (`reachable`), and what the round shows: gone, successor(pid), go_on, or not_ended:<why> with
 #   whether something answered the last look (a proved generation or not).
 # after a request: the rounds that can happen, at the bound, for a told request and one whose outcome was not shown: the kind of
-#   sentence, the exit code and the `stop` member of `--json`.
+#   sentence, the exit code, the code of the `--json` failure beside it (`-` for a success) and the `stop` member of `--json`.
+# a look of another generation is walked twice: with the process that the lock file names (`another(5000)`) and with none
+#   (`another(-)`, which is what Windows gives, where the lock file cannot be read).
 # before a request: the decision of the wait for a request that could not be made, what is said for each way the failure came out
 #   (with the lock read again where the decision asks for it), the first look, and the start of the command.
 
@@ -17,8 +19,10 @@ lock=free process=no_identity holder=not_read look=same bound=no reachable=yes -
 lock=free process=no_identity holder=not_read look=same bound=yes reachable=yes -> not_ended:answers answered=yes
 lock=free process=no_identity holder=not_read look=unproved bound=no reachable=yes -> go_on
 lock=free process=no_identity holder=not_read look=unproved bound=yes reachable=yes -> not_ended:not_shown answered=yes
-lock=free process=no_identity holder=not_read look=another bound=no reachable=yes -> successor(5000)
-lock=free process=no_identity holder=not_read look=another bound=yes reachable=yes -> successor(5000)
+lock=free process=no_identity holder=not_read look=another(5000) bound=no reachable=yes -> successor(5000)
+lock=free process=no_identity holder=not_read look=another(5000) bound=yes reachable=yes -> successor(5000)
+lock=free process=no_identity holder=not_read look=another(-) bound=no reachable=yes -> successor(-)
+lock=free process=no_identity holder=not_read look=another(-) bound=yes reachable=yes -> successor(-)
 lock=free process=no_identity holder=not_read look=unclear bound=no reachable=yes -> go_on
 lock=free process=no_identity holder=not_read look=unclear bound=yes reachable=yes -> not_ended:not_shown answered=no
 lock=free process=no_identity holder=nobody look=not_made bound=no reachable=no -> go_on
@@ -29,8 +33,10 @@ lock=free process=no_identity holder=nobody look=same bound=no reachable=no -> g
 lock=free process=no_identity holder=nobody look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=free process=no_identity holder=nobody look=unproved bound=no reachable=no -> go_on
 lock=free process=no_identity holder=nobody look=unproved bound=yes reachable=no -> not_ended:not_shown answered=yes
-lock=free process=no_identity holder=nobody look=another bound=no reachable=no -> successor(5000)
-lock=free process=no_identity holder=nobody look=another bound=yes reachable=no -> successor(5000)
+lock=free process=no_identity holder=nobody look=another(5000) bound=no reachable=no -> successor(5000)
+lock=free process=no_identity holder=nobody look=another(5000) bound=yes reachable=no -> successor(5000)
+lock=free process=no_identity holder=nobody look=another(-) bound=no reachable=no -> successor(-)
+lock=free process=no_identity holder=nobody look=another(-) bound=yes reachable=no -> successor(-)
 lock=free process=no_identity holder=nobody look=unclear bound=no reachable=no -> go_on
 lock=free process=no_identity holder=nobody look=unclear bound=yes reachable=no -> not_ended:not_shown answered=no
 lock=free process=no_identity holder=asked look=not_made bound=no reachable=no -> go_on
@@ -41,8 +47,10 @@ lock=free process=no_identity holder=asked look=same bound=no reachable=no -> go
 lock=free process=no_identity holder=asked look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=free process=no_identity holder=asked look=unproved bound=no reachable=no -> go_on
 lock=free process=no_identity holder=asked look=unproved bound=yes reachable=no -> not_ended:not_shown answered=yes
-lock=free process=no_identity holder=asked look=another bound=no reachable=no -> successor(5000)
-lock=free process=no_identity holder=asked look=another bound=yes reachable=no -> successor(5000)
+lock=free process=no_identity holder=asked look=another(5000) bound=no reachable=no -> successor(5000)
+lock=free process=no_identity holder=asked look=another(5000) bound=yes reachable=no -> successor(5000)
+lock=free process=no_identity holder=asked look=another(-) bound=no reachable=no -> successor(-)
+lock=free process=no_identity holder=asked look=another(-) bound=yes reachable=no -> successor(-)
 lock=free process=no_identity holder=asked look=unclear bound=no reachable=no -> go_on
 lock=free process=no_identity holder=asked look=unclear bound=yes reachable=no -> not_ended:not_shown answered=no
 lock=free process=no_identity holder=other look=not_made bound=no reachable=no -> go_on
@@ -53,8 +61,10 @@ lock=free process=no_identity holder=other look=same bound=no reachable=no -> go
 lock=free process=no_identity holder=other look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=free process=no_identity holder=other look=unproved bound=no reachable=no -> go_on
 lock=free process=no_identity holder=other look=unproved bound=yes reachable=no -> not_ended:not_shown answered=yes
-lock=free process=no_identity holder=other look=another bound=no reachable=no -> successor(5000)
-lock=free process=no_identity holder=other look=another bound=yes reachable=no -> successor(5000)
+lock=free process=no_identity holder=other look=another(5000) bound=no reachable=no -> successor(5000)
+lock=free process=no_identity holder=other look=another(5000) bound=yes reachable=no -> successor(5000)
+lock=free process=no_identity holder=other look=another(-) bound=no reachable=no -> successor(-)
+lock=free process=no_identity holder=other look=another(-) bound=yes reachable=no -> successor(-)
 lock=free process=no_identity holder=other look=unclear bound=no reachable=no -> go_on
 lock=free process=no_identity holder=other look=unclear bound=yes reachable=no -> not_ended:not_shown answered=no
 lock=free process=running holder=not_read look=not_made bound=no reachable=yes -> go_on
@@ -65,8 +75,10 @@ lock=free process=running holder=not_read look=same bound=no reachable=no -> go_
 lock=free process=running holder=not_read look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=free process=running holder=not_read look=unproved bound=no reachable=no -> go_on
 lock=free process=running holder=not_read look=unproved bound=yes reachable=no -> not_ended:running answered=yes
-lock=free process=running holder=not_read look=another bound=no reachable=no -> go_on
-lock=free process=running holder=not_read look=another bound=yes reachable=no -> not_ended:running answered=no
+lock=free process=running holder=not_read look=another(5000) bound=no reachable=no -> go_on
+lock=free process=running holder=not_read look=another(5000) bound=yes reachable=no -> not_ended:running answered=no
+lock=free process=running holder=not_read look=another(-) bound=no reachable=no -> go_on
+lock=free process=running holder=not_read look=another(-) bound=yes reachable=no -> not_ended:running answered=no
 lock=free process=running holder=not_read look=unclear bound=no reachable=no -> go_on
 lock=free process=running holder=not_read look=unclear bound=yes reachable=no -> not_ended:running answered=no
 lock=free process=running holder=nobody look=not_made bound=no reachable=no -> go_on
@@ -77,8 +89,10 @@ lock=free process=running holder=nobody look=same bound=no reachable=no -> go_on
 lock=free process=running holder=nobody look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=free process=running holder=nobody look=unproved bound=no reachable=no -> go_on
 lock=free process=running holder=nobody look=unproved bound=yes reachable=no -> not_ended:running answered=yes
-lock=free process=running holder=nobody look=another bound=no reachable=no -> go_on
-lock=free process=running holder=nobody look=another bound=yes reachable=no -> not_ended:running answered=no
+lock=free process=running holder=nobody look=another(5000) bound=no reachable=no -> go_on
+lock=free process=running holder=nobody look=another(5000) bound=yes reachable=no -> not_ended:running answered=no
+lock=free process=running holder=nobody look=another(-) bound=no reachable=no -> go_on
+lock=free process=running holder=nobody look=another(-) bound=yes reachable=no -> not_ended:running answered=no
 lock=free process=running holder=nobody look=unclear bound=no reachable=no -> go_on
 lock=free process=running holder=nobody look=unclear bound=yes reachable=no -> not_ended:running answered=no
 lock=free process=running holder=asked look=not_made bound=no reachable=no -> go_on
@@ -89,8 +103,10 @@ lock=free process=running holder=asked look=same bound=no reachable=no -> go_on
 lock=free process=running holder=asked look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=free process=running holder=asked look=unproved bound=no reachable=no -> go_on
 lock=free process=running holder=asked look=unproved bound=yes reachable=no -> not_ended:running answered=yes
-lock=free process=running holder=asked look=another bound=no reachable=no -> go_on
-lock=free process=running holder=asked look=another bound=yes reachable=no -> not_ended:running answered=no
+lock=free process=running holder=asked look=another(5000) bound=no reachable=no -> go_on
+lock=free process=running holder=asked look=another(5000) bound=yes reachable=no -> not_ended:running answered=no
+lock=free process=running holder=asked look=another(-) bound=no reachable=no -> go_on
+lock=free process=running holder=asked look=another(-) bound=yes reachable=no -> not_ended:running answered=no
 lock=free process=running holder=asked look=unclear bound=no reachable=no -> go_on
 lock=free process=running holder=asked look=unclear bound=yes reachable=no -> not_ended:running answered=no
 lock=free process=running holder=other look=not_made bound=no reachable=no -> go_on
@@ -101,8 +117,10 @@ lock=free process=running holder=other look=same bound=no reachable=no -> go_on
 lock=free process=running holder=other look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=free process=running holder=other look=unproved bound=no reachable=no -> go_on
 lock=free process=running holder=other look=unproved bound=yes reachable=no -> not_ended:running answered=yes
-lock=free process=running holder=other look=another bound=no reachable=no -> go_on
-lock=free process=running holder=other look=another bound=yes reachable=no -> not_ended:running answered=no
+lock=free process=running holder=other look=another(5000) bound=no reachable=no -> go_on
+lock=free process=running holder=other look=another(5000) bound=yes reachable=no -> not_ended:running answered=no
+lock=free process=running holder=other look=another(-) bound=no reachable=no -> go_on
+lock=free process=running holder=other look=another(-) bound=yes reachable=no -> not_ended:running answered=no
 lock=free process=running holder=other look=unclear bound=no reachable=no -> go_on
 lock=free process=running holder=other look=unclear bound=yes reachable=no -> not_ended:running answered=no
 lock=free process=ended holder=not_read look=not_made bound=no reachable=yes -> gone
@@ -113,8 +131,10 @@ lock=free process=ended holder=not_read look=same bound=no reachable=no -> gone
 lock=free process=ended holder=not_read look=same bound=yes reachable=no -> gone
 lock=free process=ended holder=not_read look=unproved bound=no reachable=no -> gone
 lock=free process=ended holder=not_read look=unproved bound=yes reachable=no -> gone
-lock=free process=ended holder=not_read look=another bound=no reachable=no -> gone
-lock=free process=ended holder=not_read look=another bound=yes reachable=no -> gone
+lock=free process=ended holder=not_read look=another(5000) bound=no reachable=no -> gone
+lock=free process=ended holder=not_read look=another(5000) bound=yes reachable=no -> gone
+lock=free process=ended holder=not_read look=another(-) bound=no reachable=no -> gone
+lock=free process=ended holder=not_read look=another(-) bound=yes reachable=no -> gone
 lock=free process=ended holder=not_read look=unclear bound=no reachable=no -> gone
 lock=free process=ended holder=not_read look=unclear bound=yes reachable=no -> gone
 lock=free process=ended holder=nobody look=not_made bound=no reachable=no -> gone
@@ -125,8 +145,10 @@ lock=free process=ended holder=nobody look=same bound=no reachable=no -> gone
 lock=free process=ended holder=nobody look=same bound=yes reachable=no -> gone
 lock=free process=ended holder=nobody look=unproved bound=no reachable=no -> gone
 lock=free process=ended holder=nobody look=unproved bound=yes reachable=no -> gone
-lock=free process=ended holder=nobody look=another bound=no reachable=no -> gone
-lock=free process=ended holder=nobody look=another bound=yes reachable=no -> gone
+lock=free process=ended holder=nobody look=another(5000) bound=no reachable=no -> gone
+lock=free process=ended holder=nobody look=another(5000) bound=yes reachable=no -> gone
+lock=free process=ended holder=nobody look=another(-) bound=no reachable=no -> gone
+lock=free process=ended holder=nobody look=another(-) bound=yes reachable=no -> gone
 lock=free process=ended holder=nobody look=unclear bound=no reachable=no -> gone
 lock=free process=ended holder=nobody look=unclear bound=yes reachable=no -> gone
 lock=free process=ended holder=asked look=not_made bound=no reachable=no -> gone
@@ -137,8 +159,10 @@ lock=free process=ended holder=asked look=same bound=no reachable=no -> gone
 lock=free process=ended holder=asked look=same bound=yes reachable=no -> gone
 lock=free process=ended holder=asked look=unproved bound=no reachable=no -> gone
 lock=free process=ended holder=asked look=unproved bound=yes reachable=no -> gone
-lock=free process=ended holder=asked look=another bound=no reachable=no -> gone
-lock=free process=ended holder=asked look=another bound=yes reachable=no -> gone
+lock=free process=ended holder=asked look=another(5000) bound=no reachable=no -> gone
+lock=free process=ended holder=asked look=another(5000) bound=yes reachable=no -> gone
+lock=free process=ended holder=asked look=another(-) bound=no reachable=no -> gone
+lock=free process=ended holder=asked look=another(-) bound=yes reachable=no -> gone
 lock=free process=ended holder=asked look=unclear bound=no reachable=no -> gone
 lock=free process=ended holder=asked look=unclear bound=yes reachable=no -> gone
 lock=free process=ended holder=other look=not_made bound=no reachable=no -> gone
@@ -149,8 +173,10 @@ lock=free process=ended holder=other look=same bound=no reachable=no -> gone
 lock=free process=ended holder=other look=same bound=yes reachable=no -> gone
 lock=free process=ended holder=other look=unproved bound=no reachable=no -> gone
 lock=free process=ended holder=other look=unproved bound=yes reachable=no -> gone
-lock=free process=ended holder=other look=another bound=no reachable=no -> gone
-lock=free process=ended holder=other look=another bound=yes reachable=no -> gone
+lock=free process=ended holder=other look=another(5000) bound=no reachable=no -> gone
+lock=free process=ended holder=other look=another(5000) bound=yes reachable=no -> gone
+lock=free process=ended holder=other look=another(-) bound=no reachable=no -> gone
+lock=free process=ended holder=other look=another(-) bound=yes reachable=no -> gone
 lock=free process=ended holder=other look=unclear bound=no reachable=no -> gone
 lock=free process=ended holder=other look=unclear bound=yes reachable=no -> gone
 lock=free process=unreadable holder=not_read look=not_made bound=no reachable=no -> go_on
@@ -161,8 +187,10 @@ lock=free process=unreadable holder=not_read look=same bound=no reachable=yes ->
 lock=free process=unreadable holder=not_read look=same bound=yes reachable=yes -> not_ended:answers answered=yes
 lock=free process=unreadable holder=not_read look=unproved bound=no reachable=yes -> go_on
 lock=free process=unreadable holder=not_read look=unproved bound=yes reachable=yes -> not_ended:not_shown answered=yes
-lock=free process=unreadable holder=not_read look=another bound=no reachable=yes -> successor(5000)
-lock=free process=unreadable holder=not_read look=another bound=yes reachable=yes -> successor(5000)
+lock=free process=unreadable holder=not_read look=another(5000) bound=no reachable=yes -> successor(5000)
+lock=free process=unreadable holder=not_read look=another(5000) bound=yes reachable=yes -> successor(5000)
+lock=free process=unreadable holder=not_read look=another(-) bound=no reachable=yes -> successor(-)
+lock=free process=unreadable holder=not_read look=another(-) bound=yes reachable=yes -> successor(-)
 lock=free process=unreadable holder=not_read look=unclear bound=no reachable=yes -> go_on
 lock=free process=unreadable holder=not_read look=unclear bound=yes reachable=yes -> not_ended:not_shown answered=no
 lock=free process=unreadable holder=nobody look=not_made bound=no reachable=no -> go_on
@@ -173,8 +201,10 @@ lock=free process=unreadable holder=nobody look=same bound=no reachable=no -> go
 lock=free process=unreadable holder=nobody look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=free process=unreadable holder=nobody look=unproved bound=no reachable=no -> go_on
 lock=free process=unreadable holder=nobody look=unproved bound=yes reachable=no -> not_ended:not_shown answered=yes
-lock=free process=unreadable holder=nobody look=another bound=no reachable=no -> successor(5000)
-lock=free process=unreadable holder=nobody look=another bound=yes reachable=no -> successor(5000)
+lock=free process=unreadable holder=nobody look=another(5000) bound=no reachable=no -> successor(5000)
+lock=free process=unreadable holder=nobody look=another(5000) bound=yes reachable=no -> successor(5000)
+lock=free process=unreadable holder=nobody look=another(-) bound=no reachable=no -> successor(-)
+lock=free process=unreadable holder=nobody look=another(-) bound=yes reachable=no -> successor(-)
 lock=free process=unreadable holder=nobody look=unclear bound=no reachable=no -> go_on
 lock=free process=unreadable holder=nobody look=unclear bound=yes reachable=no -> not_ended:not_shown answered=no
 lock=free process=unreadable holder=asked look=not_made bound=no reachable=no -> go_on
@@ -185,8 +215,10 @@ lock=free process=unreadable holder=asked look=same bound=no reachable=no -> go_
 lock=free process=unreadable holder=asked look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=free process=unreadable holder=asked look=unproved bound=no reachable=no -> go_on
 lock=free process=unreadable holder=asked look=unproved bound=yes reachable=no -> not_ended:not_shown answered=yes
-lock=free process=unreadable holder=asked look=another bound=no reachable=no -> successor(5000)
-lock=free process=unreadable holder=asked look=another bound=yes reachable=no -> successor(5000)
+lock=free process=unreadable holder=asked look=another(5000) bound=no reachable=no -> successor(5000)
+lock=free process=unreadable holder=asked look=another(5000) bound=yes reachable=no -> successor(5000)
+lock=free process=unreadable holder=asked look=another(-) bound=no reachable=no -> successor(-)
+lock=free process=unreadable holder=asked look=another(-) bound=yes reachable=no -> successor(-)
 lock=free process=unreadable holder=asked look=unclear bound=no reachable=no -> go_on
 lock=free process=unreadable holder=asked look=unclear bound=yes reachable=no -> not_ended:not_shown answered=no
 lock=free process=unreadable holder=other look=not_made bound=no reachable=no -> go_on
@@ -197,8 +229,10 @@ lock=free process=unreadable holder=other look=same bound=no reachable=no -> go_
 lock=free process=unreadable holder=other look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=free process=unreadable holder=other look=unproved bound=no reachable=no -> go_on
 lock=free process=unreadable holder=other look=unproved bound=yes reachable=no -> not_ended:not_shown answered=yes
-lock=free process=unreadable holder=other look=another bound=no reachable=no -> successor(5000)
-lock=free process=unreadable holder=other look=another bound=yes reachable=no -> successor(5000)
+lock=free process=unreadable holder=other look=another(5000) bound=no reachable=no -> successor(5000)
+lock=free process=unreadable holder=other look=another(5000) bound=yes reachable=no -> successor(5000)
+lock=free process=unreadable holder=other look=another(-) bound=no reachable=no -> successor(-)
+lock=free process=unreadable holder=other look=another(-) bound=yes reachable=no -> successor(-)
 lock=free process=unreadable holder=other look=unclear bound=no reachable=no -> go_on
 lock=free process=unreadable holder=other look=unclear bound=yes reachable=no -> not_ended:not_shown answered=no
 lock=held process=no_identity holder=not_read look=not_made bound=no reachable=no -> go_on
@@ -209,8 +243,10 @@ lock=held process=no_identity holder=not_read look=same bound=no reachable=no ->
 lock=held process=no_identity holder=not_read look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=held process=no_identity holder=not_read look=unproved bound=no reachable=no -> go_on
 lock=held process=no_identity holder=not_read look=unproved bound=yes reachable=no -> not_ended:held_not_shown answered=yes
-lock=held process=no_identity holder=not_read look=another bound=no reachable=no -> successor(5000)
-lock=held process=no_identity holder=not_read look=another bound=yes reachable=no -> successor(5000)
+lock=held process=no_identity holder=not_read look=another(5000) bound=no reachable=no -> successor(5000)
+lock=held process=no_identity holder=not_read look=another(5000) bound=yes reachable=no -> successor(5000)
+lock=held process=no_identity holder=not_read look=another(-) bound=no reachable=no -> successor(-)
+lock=held process=no_identity holder=not_read look=another(-) bound=yes reachable=no -> successor(-)
 lock=held process=no_identity holder=not_read look=unclear bound=no reachable=no -> go_on
 lock=held process=no_identity holder=not_read look=unclear bound=yes reachable=no -> not_ended:held_not_shown answered=no
 lock=held process=no_identity holder=nobody look=not_made bound=no reachable=no -> go_on
@@ -221,8 +257,10 @@ lock=held process=no_identity holder=nobody look=same bound=no reachable=yes -> 
 lock=held process=no_identity holder=nobody look=same bound=yes reachable=yes -> not_ended:answers answered=yes
 lock=held process=no_identity holder=nobody look=unproved bound=no reachable=yes -> go_on
 lock=held process=no_identity holder=nobody look=unproved bound=yes reachable=yes -> not_ended:held_not_shown answered=yes
-lock=held process=no_identity holder=nobody look=another bound=no reachable=yes -> successor(5000)
-lock=held process=no_identity holder=nobody look=another bound=yes reachable=yes -> successor(5000)
+lock=held process=no_identity holder=nobody look=another(5000) bound=no reachable=yes -> successor(5000)
+lock=held process=no_identity holder=nobody look=another(5000) bound=yes reachable=yes -> successor(5000)
+lock=held process=no_identity holder=nobody look=another(-) bound=no reachable=yes -> successor(-)
+lock=held process=no_identity holder=nobody look=another(-) bound=yes reachable=yes -> successor(-)
 lock=held process=no_identity holder=nobody look=unclear bound=no reachable=yes -> go_on
 lock=held process=no_identity holder=nobody look=unclear bound=yes reachable=yes -> not_ended:held_not_shown answered=no
 lock=held process=no_identity holder=asked look=not_made bound=no reachable=no -> go_on
@@ -233,8 +271,10 @@ lock=held process=no_identity holder=asked look=same bound=no reachable=no -> go
 lock=held process=no_identity holder=asked look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=held process=no_identity holder=asked look=unproved bound=no reachable=no -> go_on
 lock=held process=no_identity holder=asked look=unproved bound=yes reachable=no -> not_ended:held_not_shown answered=yes
-lock=held process=no_identity holder=asked look=another bound=no reachable=no -> successor(5000)
-lock=held process=no_identity holder=asked look=another bound=yes reachable=no -> successor(5000)
+lock=held process=no_identity holder=asked look=another(5000) bound=no reachable=no -> successor(5000)
+lock=held process=no_identity holder=asked look=another(5000) bound=yes reachable=no -> successor(5000)
+lock=held process=no_identity holder=asked look=another(-) bound=no reachable=no -> successor(-)
+lock=held process=no_identity holder=asked look=another(-) bound=yes reachable=no -> successor(-)
 lock=held process=no_identity holder=asked look=unclear bound=no reachable=no -> go_on
 lock=held process=no_identity holder=asked look=unclear bound=yes reachable=no -> not_ended:held_not_shown answered=no
 lock=held process=no_identity holder=other look=not_made bound=no reachable=no -> go_on
@@ -245,8 +285,10 @@ lock=held process=no_identity holder=other look=same bound=no reachable=yes -> g
 lock=held process=no_identity holder=other look=same bound=yes reachable=yes -> not_ended:answers answered=yes
 lock=held process=no_identity holder=other look=unproved bound=no reachable=yes -> go_on
 lock=held process=no_identity holder=other look=unproved bound=yes reachable=yes -> not_ended:held_not_shown answered=yes
-lock=held process=no_identity holder=other look=another bound=no reachable=yes -> successor(5000)
-lock=held process=no_identity holder=other look=another bound=yes reachable=yes -> successor(5000)
+lock=held process=no_identity holder=other look=another(5000) bound=no reachable=yes -> successor(5000)
+lock=held process=no_identity holder=other look=another(5000) bound=yes reachable=yes -> successor(5000)
+lock=held process=no_identity holder=other look=another(-) bound=no reachable=yes -> successor(-)
+lock=held process=no_identity holder=other look=another(-) bound=yes reachable=yes -> successor(-)
 lock=held process=no_identity holder=other look=unclear bound=no reachable=yes -> go_on
 lock=held process=no_identity holder=other look=unclear bound=yes reachable=yes -> not_ended:held_not_shown answered=no
 lock=held process=running holder=not_read look=not_made bound=no reachable=yes -> go_on
@@ -257,8 +299,10 @@ lock=held process=running holder=not_read look=same bound=no reachable=no -> go_
 lock=held process=running holder=not_read look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=held process=running holder=not_read look=unproved bound=no reachable=no -> go_on
 lock=held process=running holder=not_read look=unproved bound=yes reachable=no -> not_ended:running answered=yes
-lock=held process=running holder=not_read look=another bound=no reachable=no -> go_on
-lock=held process=running holder=not_read look=another bound=yes reachable=no -> not_ended:running answered=no
+lock=held process=running holder=not_read look=another(5000) bound=no reachable=no -> go_on
+lock=held process=running holder=not_read look=another(5000) bound=yes reachable=no -> not_ended:running answered=no
+lock=held process=running holder=not_read look=another(-) bound=no reachable=no -> go_on
+lock=held process=running holder=not_read look=another(-) bound=yes reachable=no -> not_ended:running answered=no
 lock=held process=running holder=not_read look=unclear bound=no reachable=no -> go_on
 lock=held process=running holder=not_read look=unclear bound=yes reachable=no -> not_ended:running answered=no
 lock=held process=running holder=nobody look=not_made bound=no reachable=no -> go_on
@@ -269,8 +313,10 @@ lock=held process=running holder=nobody look=same bound=no reachable=no -> go_on
 lock=held process=running holder=nobody look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=held process=running holder=nobody look=unproved bound=no reachable=no -> go_on
 lock=held process=running holder=nobody look=unproved bound=yes reachable=no -> not_ended:running answered=yes
-lock=held process=running holder=nobody look=another bound=no reachable=no -> go_on
-lock=held process=running holder=nobody look=another bound=yes reachable=no -> not_ended:running answered=no
+lock=held process=running holder=nobody look=another(5000) bound=no reachable=no -> go_on
+lock=held process=running holder=nobody look=another(5000) bound=yes reachable=no -> not_ended:running answered=no
+lock=held process=running holder=nobody look=another(-) bound=no reachable=no -> go_on
+lock=held process=running holder=nobody look=another(-) bound=yes reachable=no -> not_ended:running answered=no
 lock=held process=running holder=nobody look=unclear bound=no reachable=no -> go_on
 lock=held process=running holder=nobody look=unclear bound=yes reachable=no -> not_ended:running answered=no
 lock=held process=running holder=asked look=not_made bound=no reachable=no -> go_on
@@ -281,8 +327,10 @@ lock=held process=running holder=asked look=same bound=no reachable=no -> go_on
 lock=held process=running holder=asked look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=held process=running holder=asked look=unproved bound=no reachable=no -> go_on
 lock=held process=running holder=asked look=unproved bound=yes reachable=no -> not_ended:running answered=yes
-lock=held process=running holder=asked look=another bound=no reachable=no -> go_on
-lock=held process=running holder=asked look=another bound=yes reachable=no -> not_ended:running answered=no
+lock=held process=running holder=asked look=another(5000) bound=no reachable=no -> go_on
+lock=held process=running holder=asked look=another(5000) bound=yes reachable=no -> not_ended:running answered=no
+lock=held process=running holder=asked look=another(-) bound=no reachable=no -> go_on
+lock=held process=running holder=asked look=another(-) bound=yes reachable=no -> not_ended:running answered=no
 lock=held process=running holder=asked look=unclear bound=no reachable=no -> go_on
 lock=held process=running holder=asked look=unclear bound=yes reachable=no -> not_ended:running answered=no
 lock=held process=running holder=other look=not_made bound=no reachable=no -> go_on
@@ -293,8 +341,10 @@ lock=held process=running holder=other look=same bound=no reachable=no -> go_on
 lock=held process=running holder=other look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=held process=running holder=other look=unproved bound=no reachable=no -> go_on
 lock=held process=running holder=other look=unproved bound=yes reachable=no -> not_ended:running answered=yes
-lock=held process=running holder=other look=another bound=no reachable=no -> go_on
-lock=held process=running holder=other look=another bound=yes reachable=no -> not_ended:running answered=no
+lock=held process=running holder=other look=another(5000) bound=no reachable=no -> go_on
+lock=held process=running holder=other look=another(5000) bound=yes reachable=no -> not_ended:running answered=no
+lock=held process=running holder=other look=another(-) bound=no reachable=no -> go_on
+lock=held process=running holder=other look=another(-) bound=yes reachable=no -> not_ended:running answered=no
 lock=held process=running holder=other look=unclear bound=no reachable=no -> go_on
 lock=held process=running holder=other look=unclear bound=yes reachable=no -> not_ended:running answered=no
 lock=held process=ended holder=not_read look=not_made bound=no reachable=no -> go_on
@@ -305,8 +355,10 @@ lock=held process=ended holder=not_read look=same bound=no reachable=no -> go_on
 lock=held process=ended holder=not_read look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=held process=ended holder=not_read look=unproved bound=no reachable=no -> go_on
 lock=held process=ended holder=not_read look=unproved bound=yes reachable=no -> not_ended:held answered=yes
-lock=held process=ended holder=not_read look=another bound=no reachable=no -> successor(5000)
-lock=held process=ended holder=not_read look=another bound=yes reachable=no -> successor(5000)
+lock=held process=ended holder=not_read look=another(5000) bound=no reachable=no -> successor(5000)
+lock=held process=ended holder=not_read look=another(5000) bound=yes reachable=no -> successor(5000)
+lock=held process=ended holder=not_read look=another(-) bound=no reachable=no -> successor(-)
+lock=held process=ended holder=not_read look=another(-) bound=yes reachable=no -> successor(-)
 lock=held process=ended holder=not_read look=unclear bound=no reachable=no -> go_on
 lock=held process=ended holder=not_read look=unclear bound=yes reachable=no -> not_ended:held answered=no
 lock=held process=ended holder=nobody look=not_made bound=no reachable=no -> go_on
@@ -317,8 +369,10 @@ lock=held process=ended holder=nobody look=same bound=no reachable=yes -> go_on
 lock=held process=ended holder=nobody look=same bound=yes reachable=yes -> not_ended:answers answered=yes
 lock=held process=ended holder=nobody look=unproved bound=no reachable=yes -> go_on
 lock=held process=ended holder=nobody look=unproved bound=yes reachable=yes -> not_ended:held answered=yes
-lock=held process=ended holder=nobody look=another bound=no reachable=yes -> successor(5000)
-lock=held process=ended holder=nobody look=another bound=yes reachable=yes -> successor(5000)
+lock=held process=ended holder=nobody look=another(5000) bound=no reachable=yes -> successor(5000)
+lock=held process=ended holder=nobody look=another(5000) bound=yes reachable=yes -> successor(5000)
+lock=held process=ended holder=nobody look=another(-) bound=no reachable=yes -> successor(-)
+lock=held process=ended holder=nobody look=another(-) bound=yes reachable=yes -> successor(-)
 lock=held process=ended holder=nobody look=unclear bound=no reachable=yes -> go_on
 lock=held process=ended holder=nobody look=unclear bound=yes reachable=yes -> not_ended:held answered=no
 lock=held process=ended holder=asked look=not_made bound=no reachable=no -> go_on
@@ -329,8 +383,10 @@ lock=held process=ended holder=asked look=same bound=no reachable=yes -> go_on
 lock=held process=ended holder=asked look=same bound=yes reachable=yes -> not_ended:answers answered=yes
 lock=held process=ended holder=asked look=unproved bound=no reachable=yes -> go_on
 lock=held process=ended holder=asked look=unproved bound=yes reachable=yes -> not_ended:held answered=yes
-lock=held process=ended holder=asked look=another bound=no reachable=yes -> successor(5000)
-lock=held process=ended holder=asked look=another bound=yes reachable=yes -> successor(5000)
+lock=held process=ended holder=asked look=another(5000) bound=no reachable=yes -> successor(5000)
+lock=held process=ended holder=asked look=another(5000) bound=yes reachable=yes -> successor(5000)
+lock=held process=ended holder=asked look=another(-) bound=no reachable=yes -> successor(-)
+lock=held process=ended holder=asked look=another(-) bound=yes reachable=yes -> successor(-)
 lock=held process=ended holder=asked look=unclear bound=no reachable=yes -> go_on
 lock=held process=ended holder=asked look=unclear bound=yes reachable=yes -> not_ended:held answered=no
 lock=held process=ended holder=other look=not_made bound=no reachable=yes -> successor(4001)
@@ -341,8 +397,10 @@ lock=held process=ended holder=other look=same bound=no reachable=no -> successo
 lock=held process=ended holder=other look=same bound=yes reachable=no -> successor(4001)
 lock=held process=ended holder=other look=unproved bound=no reachable=no -> successor(4001)
 lock=held process=ended holder=other look=unproved bound=yes reachable=no -> successor(4001)
-lock=held process=ended holder=other look=another bound=no reachable=no -> successor(4001)
-lock=held process=ended holder=other look=another bound=yes reachable=no -> successor(4001)
+lock=held process=ended holder=other look=another(5000) bound=no reachable=no -> successor(4001)
+lock=held process=ended holder=other look=another(5000) bound=yes reachable=no -> successor(4001)
+lock=held process=ended holder=other look=another(-) bound=no reachable=no -> successor(4001)
+lock=held process=ended holder=other look=another(-) bound=yes reachable=no -> successor(4001)
 lock=held process=ended holder=other look=unclear bound=no reachable=no -> successor(4001)
 lock=held process=ended holder=other look=unclear bound=yes reachable=no -> successor(4001)
 lock=held process=unreadable holder=not_read look=not_made bound=no reachable=yes -> go_on
@@ -353,8 +411,10 @@ lock=held process=unreadable holder=not_read look=same bound=no reachable=no -> 
 lock=held process=unreadable holder=not_read look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=held process=unreadable holder=not_read look=unproved bound=no reachable=no -> go_on
 lock=held process=unreadable holder=not_read look=unproved bound=yes reachable=no -> not_ended:held_not_shown answered=yes
-lock=held process=unreadable holder=not_read look=another bound=no reachable=no -> go_on
-lock=held process=unreadable holder=not_read look=another bound=yes reachable=no -> not_ended:held_not_shown answered=no
+lock=held process=unreadable holder=not_read look=another(5000) bound=no reachable=no -> go_on
+lock=held process=unreadable holder=not_read look=another(5000) bound=yes reachable=no -> not_ended:held_not_shown answered=no
+lock=held process=unreadable holder=not_read look=another(-) bound=no reachable=no -> go_on
+lock=held process=unreadable holder=not_read look=another(-) bound=yes reachable=no -> not_ended:held_not_shown answered=no
 lock=held process=unreadable holder=not_read look=unclear bound=no reachable=no -> go_on
 lock=held process=unreadable holder=not_read look=unclear bound=yes reachable=no -> not_ended:held_not_shown answered=no
 lock=held process=unreadable holder=nobody look=not_made bound=no reachable=no -> go_on
@@ -365,8 +425,10 @@ lock=held process=unreadable holder=nobody look=same bound=no reachable=no -> go
 lock=held process=unreadable holder=nobody look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=held process=unreadable holder=nobody look=unproved bound=no reachable=no -> go_on
 lock=held process=unreadable holder=nobody look=unproved bound=yes reachable=no -> not_ended:held_not_shown answered=yes
-lock=held process=unreadable holder=nobody look=another bound=no reachable=no -> go_on
-lock=held process=unreadable holder=nobody look=another bound=yes reachable=no -> not_ended:held_not_shown answered=no
+lock=held process=unreadable holder=nobody look=another(5000) bound=no reachable=no -> go_on
+lock=held process=unreadable holder=nobody look=another(5000) bound=yes reachable=no -> not_ended:held_not_shown answered=no
+lock=held process=unreadable holder=nobody look=another(-) bound=no reachable=no -> go_on
+lock=held process=unreadable holder=nobody look=another(-) bound=yes reachable=no -> not_ended:held_not_shown answered=no
 lock=held process=unreadable holder=nobody look=unclear bound=no reachable=no -> go_on
 lock=held process=unreadable holder=nobody look=unclear bound=yes reachable=no -> not_ended:held_not_shown answered=no
 lock=held process=unreadable holder=asked look=not_made bound=no reachable=no -> go_on
@@ -377,8 +439,10 @@ lock=held process=unreadable holder=asked look=same bound=no reachable=no -> go_
 lock=held process=unreadable holder=asked look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=held process=unreadable holder=asked look=unproved bound=no reachable=no -> go_on
 lock=held process=unreadable holder=asked look=unproved bound=yes reachable=no -> not_ended:held_not_shown answered=yes
-lock=held process=unreadable holder=asked look=another bound=no reachable=no -> go_on
-lock=held process=unreadable holder=asked look=another bound=yes reachable=no -> not_ended:held_not_shown answered=no
+lock=held process=unreadable holder=asked look=another(5000) bound=no reachable=no -> go_on
+lock=held process=unreadable holder=asked look=another(5000) bound=yes reachable=no -> not_ended:held_not_shown answered=no
+lock=held process=unreadable holder=asked look=another(-) bound=no reachable=no -> go_on
+lock=held process=unreadable holder=asked look=another(-) bound=yes reachable=no -> not_ended:held_not_shown answered=no
 lock=held process=unreadable holder=asked look=unclear bound=no reachable=no -> go_on
 lock=held process=unreadable holder=asked look=unclear bound=yes reachable=no -> not_ended:held_not_shown answered=no
 lock=held process=unreadable holder=other look=not_made bound=no reachable=no -> go_on
@@ -389,8 +453,10 @@ lock=held process=unreadable holder=other look=same bound=no reachable=no -> go_
 lock=held process=unreadable holder=other look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=held process=unreadable holder=other look=unproved bound=no reachable=no -> go_on
 lock=held process=unreadable holder=other look=unproved bound=yes reachable=no -> not_ended:held_not_shown answered=yes
-lock=held process=unreadable holder=other look=another bound=no reachable=no -> go_on
-lock=held process=unreadable holder=other look=another bound=yes reachable=no -> not_ended:held_not_shown answered=no
+lock=held process=unreadable holder=other look=another(5000) bound=no reachable=no -> go_on
+lock=held process=unreadable holder=other look=another(5000) bound=yes reachable=no -> not_ended:held_not_shown answered=no
+lock=held process=unreadable holder=other look=another(-) bound=no reachable=no -> go_on
+lock=held process=unreadable holder=other look=another(-) bound=yes reachable=no -> not_ended:held_not_shown answered=no
 lock=held process=unreadable holder=other look=unclear bound=no reachable=no -> go_on
 lock=held process=unreadable holder=other look=unclear bound=yes reachable=no -> not_ended:held_not_shown answered=no
 lock=unreadable process=no_identity holder=not_read look=not_made bound=no reachable=yes -> go_on
@@ -401,8 +467,10 @@ lock=unreadable process=no_identity holder=not_read look=same bound=no reachable
 lock=unreadable process=no_identity holder=not_read look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=unreadable process=no_identity holder=not_read look=unproved bound=no reachable=no -> go_on
 lock=unreadable process=no_identity holder=not_read look=unproved bound=yes reachable=no -> not_ended:unlooked answered=yes
-lock=unreadable process=no_identity holder=not_read look=another bound=no reachable=no -> go_on
-lock=unreadable process=no_identity holder=not_read look=another bound=yes reachable=no -> not_ended:unlooked answered=no
+lock=unreadable process=no_identity holder=not_read look=another(5000) bound=no reachable=no -> go_on
+lock=unreadable process=no_identity holder=not_read look=another(5000) bound=yes reachable=no -> not_ended:unlooked answered=no
+lock=unreadable process=no_identity holder=not_read look=another(-) bound=no reachable=no -> go_on
+lock=unreadable process=no_identity holder=not_read look=another(-) bound=yes reachable=no -> not_ended:unlooked answered=no
 lock=unreadable process=no_identity holder=not_read look=unclear bound=no reachable=no -> go_on
 lock=unreadable process=no_identity holder=not_read look=unclear bound=yes reachable=no -> not_ended:unlooked answered=no
 lock=unreadable process=no_identity holder=nobody look=not_made bound=no reachable=no -> go_on
@@ -413,8 +481,10 @@ lock=unreadable process=no_identity holder=nobody look=same bound=no reachable=n
 lock=unreadable process=no_identity holder=nobody look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=unreadable process=no_identity holder=nobody look=unproved bound=no reachable=no -> go_on
 lock=unreadable process=no_identity holder=nobody look=unproved bound=yes reachable=no -> not_ended:unlooked answered=yes
-lock=unreadable process=no_identity holder=nobody look=another bound=no reachable=no -> go_on
-lock=unreadable process=no_identity holder=nobody look=another bound=yes reachable=no -> not_ended:unlooked answered=no
+lock=unreadable process=no_identity holder=nobody look=another(5000) bound=no reachable=no -> go_on
+lock=unreadable process=no_identity holder=nobody look=another(5000) bound=yes reachable=no -> not_ended:unlooked answered=no
+lock=unreadable process=no_identity holder=nobody look=another(-) bound=no reachable=no -> go_on
+lock=unreadable process=no_identity holder=nobody look=another(-) bound=yes reachable=no -> not_ended:unlooked answered=no
 lock=unreadable process=no_identity holder=nobody look=unclear bound=no reachable=no -> go_on
 lock=unreadable process=no_identity holder=nobody look=unclear bound=yes reachable=no -> not_ended:unlooked answered=no
 lock=unreadable process=no_identity holder=asked look=not_made bound=no reachable=no -> go_on
@@ -425,8 +495,10 @@ lock=unreadable process=no_identity holder=asked look=same bound=no reachable=no
 lock=unreadable process=no_identity holder=asked look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=unreadable process=no_identity holder=asked look=unproved bound=no reachable=no -> go_on
 lock=unreadable process=no_identity holder=asked look=unproved bound=yes reachable=no -> not_ended:unlooked answered=yes
-lock=unreadable process=no_identity holder=asked look=another bound=no reachable=no -> go_on
-lock=unreadable process=no_identity holder=asked look=another bound=yes reachable=no -> not_ended:unlooked answered=no
+lock=unreadable process=no_identity holder=asked look=another(5000) bound=no reachable=no -> go_on
+lock=unreadable process=no_identity holder=asked look=another(5000) bound=yes reachable=no -> not_ended:unlooked answered=no
+lock=unreadable process=no_identity holder=asked look=another(-) bound=no reachable=no -> go_on
+lock=unreadable process=no_identity holder=asked look=another(-) bound=yes reachable=no -> not_ended:unlooked answered=no
 lock=unreadable process=no_identity holder=asked look=unclear bound=no reachable=no -> go_on
 lock=unreadable process=no_identity holder=asked look=unclear bound=yes reachable=no -> not_ended:unlooked answered=no
 lock=unreadable process=no_identity holder=other look=not_made bound=no reachable=no -> go_on
@@ -437,8 +509,10 @@ lock=unreadable process=no_identity holder=other look=same bound=no reachable=no
 lock=unreadable process=no_identity holder=other look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=unreadable process=no_identity holder=other look=unproved bound=no reachable=no -> go_on
 lock=unreadable process=no_identity holder=other look=unproved bound=yes reachable=no -> not_ended:unlooked answered=yes
-lock=unreadable process=no_identity holder=other look=another bound=no reachable=no -> go_on
-lock=unreadable process=no_identity holder=other look=another bound=yes reachable=no -> not_ended:unlooked answered=no
+lock=unreadable process=no_identity holder=other look=another(5000) bound=no reachable=no -> go_on
+lock=unreadable process=no_identity holder=other look=another(5000) bound=yes reachable=no -> not_ended:unlooked answered=no
+lock=unreadable process=no_identity holder=other look=another(-) bound=no reachable=no -> go_on
+lock=unreadable process=no_identity holder=other look=another(-) bound=yes reachable=no -> not_ended:unlooked answered=no
 lock=unreadable process=no_identity holder=other look=unclear bound=no reachable=no -> go_on
 lock=unreadable process=no_identity holder=other look=unclear bound=yes reachable=no -> not_ended:unlooked answered=no
 lock=unreadable process=running holder=not_read look=not_made bound=no reachable=yes -> go_on
@@ -449,8 +523,10 @@ lock=unreadable process=running holder=not_read look=same bound=no reachable=no 
 lock=unreadable process=running holder=not_read look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=unreadable process=running holder=not_read look=unproved bound=no reachable=no -> go_on
 lock=unreadable process=running holder=not_read look=unproved bound=yes reachable=no -> not_ended:running answered=yes
-lock=unreadable process=running holder=not_read look=another bound=no reachable=no -> go_on
-lock=unreadable process=running holder=not_read look=another bound=yes reachable=no -> not_ended:running answered=no
+lock=unreadable process=running holder=not_read look=another(5000) bound=no reachable=no -> go_on
+lock=unreadable process=running holder=not_read look=another(5000) bound=yes reachable=no -> not_ended:running answered=no
+lock=unreadable process=running holder=not_read look=another(-) bound=no reachable=no -> go_on
+lock=unreadable process=running holder=not_read look=another(-) bound=yes reachable=no -> not_ended:running answered=no
 lock=unreadable process=running holder=not_read look=unclear bound=no reachable=no -> go_on
 lock=unreadable process=running holder=not_read look=unclear bound=yes reachable=no -> not_ended:running answered=no
 lock=unreadable process=running holder=nobody look=not_made bound=no reachable=no -> go_on
@@ -461,8 +537,10 @@ lock=unreadable process=running holder=nobody look=same bound=no reachable=no ->
 lock=unreadable process=running holder=nobody look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=unreadable process=running holder=nobody look=unproved bound=no reachable=no -> go_on
 lock=unreadable process=running holder=nobody look=unproved bound=yes reachable=no -> not_ended:running answered=yes
-lock=unreadable process=running holder=nobody look=another bound=no reachable=no -> go_on
-lock=unreadable process=running holder=nobody look=another bound=yes reachable=no -> not_ended:running answered=no
+lock=unreadable process=running holder=nobody look=another(5000) bound=no reachable=no -> go_on
+lock=unreadable process=running holder=nobody look=another(5000) bound=yes reachable=no -> not_ended:running answered=no
+lock=unreadable process=running holder=nobody look=another(-) bound=no reachable=no -> go_on
+lock=unreadable process=running holder=nobody look=another(-) bound=yes reachable=no -> not_ended:running answered=no
 lock=unreadable process=running holder=nobody look=unclear bound=no reachable=no -> go_on
 lock=unreadable process=running holder=nobody look=unclear bound=yes reachable=no -> not_ended:running answered=no
 lock=unreadable process=running holder=asked look=not_made bound=no reachable=no -> go_on
@@ -473,8 +551,10 @@ lock=unreadable process=running holder=asked look=same bound=no reachable=no -> 
 lock=unreadable process=running holder=asked look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=unreadable process=running holder=asked look=unproved bound=no reachable=no -> go_on
 lock=unreadable process=running holder=asked look=unproved bound=yes reachable=no -> not_ended:running answered=yes
-lock=unreadable process=running holder=asked look=another bound=no reachable=no -> go_on
-lock=unreadable process=running holder=asked look=another bound=yes reachable=no -> not_ended:running answered=no
+lock=unreadable process=running holder=asked look=another(5000) bound=no reachable=no -> go_on
+lock=unreadable process=running holder=asked look=another(5000) bound=yes reachable=no -> not_ended:running answered=no
+lock=unreadable process=running holder=asked look=another(-) bound=no reachable=no -> go_on
+lock=unreadable process=running holder=asked look=another(-) bound=yes reachable=no -> not_ended:running answered=no
 lock=unreadable process=running holder=asked look=unclear bound=no reachable=no -> go_on
 lock=unreadable process=running holder=asked look=unclear bound=yes reachable=no -> not_ended:running answered=no
 lock=unreadable process=running holder=other look=not_made bound=no reachable=no -> go_on
@@ -485,8 +565,10 @@ lock=unreadable process=running holder=other look=same bound=no reachable=no -> 
 lock=unreadable process=running holder=other look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=unreadable process=running holder=other look=unproved bound=no reachable=no -> go_on
 lock=unreadable process=running holder=other look=unproved bound=yes reachable=no -> not_ended:running answered=yes
-lock=unreadable process=running holder=other look=another bound=no reachable=no -> go_on
-lock=unreadable process=running holder=other look=another bound=yes reachable=no -> not_ended:running answered=no
+lock=unreadable process=running holder=other look=another(5000) bound=no reachable=no -> go_on
+lock=unreadable process=running holder=other look=another(5000) bound=yes reachable=no -> not_ended:running answered=no
+lock=unreadable process=running holder=other look=another(-) bound=no reachable=no -> go_on
+lock=unreadable process=running holder=other look=another(-) bound=yes reachable=no -> not_ended:running answered=no
 lock=unreadable process=running holder=other look=unclear bound=no reachable=no -> go_on
 lock=unreadable process=running holder=other look=unclear bound=yes reachable=no -> not_ended:running answered=no
 lock=unreadable process=ended holder=not_read look=not_made bound=no reachable=yes -> go_on
@@ -497,8 +579,10 @@ lock=unreadable process=ended holder=not_read look=same bound=no reachable=no ->
 lock=unreadable process=ended holder=not_read look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=unreadable process=ended holder=not_read look=unproved bound=no reachable=no -> go_on
 lock=unreadable process=ended holder=not_read look=unproved bound=yes reachable=no -> not_ended:unlooked answered=yes
-lock=unreadable process=ended holder=not_read look=another bound=no reachable=no -> go_on
-lock=unreadable process=ended holder=not_read look=another bound=yes reachable=no -> not_ended:unlooked answered=no
+lock=unreadable process=ended holder=not_read look=another(5000) bound=no reachable=no -> go_on
+lock=unreadable process=ended holder=not_read look=another(5000) bound=yes reachable=no -> not_ended:unlooked answered=no
+lock=unreadable process=ended holder=not_read look=another(-) bound=no reachable=no -> go_on
+lock=unreadable process=ended holder=not_read look=another(-) bound=yes reachable=no -> not_ended:unlooked answered=no
 lock=unreadable process=ended holder=not_read look=unclear bound=no reachable=no -> go_on
 lock=unreadable process=ended holder=not_read look=unclear bound=yes reachable=no -> not_ended:unlooked answered=no
 lock=unreadable process=ended holder=nobody look=not_made bound=no reachable=no -> go_on
@@ -509,8 +593,10 @@ lock=unreadable process=ended holder=nobody look=same bound=no reachable=no -> g
 lock=unreadable process=ended holder=nobody look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=unreadable process=ended holder=nobody look=unproved bound=no reachable=no -> go_on
 lock=unreadable process=ended holder=nobody look=unproved bound=yes reachable=no -> not_ended:unlooked answered=yes
-lock=unreadable process=ended holder=nobody look=another bound=no reachable=no -> go_on
-lock=unreadable process=ended holder=nobody look=another bound=yes reachable=no -> not_ended:unlooked answered=no
+lock=unreadable process=ended holder=nobody look=another(5000) bound=no reachable=no -> go_on
+lock=unreadable process=ended holder=nobody look=another(5000) bound=yes reachable=no -> not_ended:unlooked answered=no
+lock=unreadable process=ended holder=nobody look=another(-) bound=no reachable=no -> go_on
+lock=unreadable process=ended holder=nobody look=another(-) bound=yes reachable=no -> not_ended:unlooked answered=no
 lock=unreadable process=ended holder=nobody look=unclear bound=no reachable=no -> go_on
 lock=unreadable process=ended holder=nobody look=unclear bound=yes reachable=no -> not_ended:unlooked answered=no
 lock=unreadable process=ended holder=asked look=not_made bound=no reachable=no -> go_on
@@ -521,8 +607,10 @@ lock=unreadable process=ended holder=asked look=same bound=no reachable=no -> go
 lock=unreadable process=ended holder=asked look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=unreadable process=ended holder=asked look=unproved bound=no reachable=no -> go_on
 lock=unreadable process=ended holder=asked look=unproved bound=yes reachable=no -> not_ended:unlooked answered=yes
-lock=unreadable process=ended holder=asked look=another bound=no reachable=no -> go_on
-lock=unreadable process=ended holder=asked look=another bound=yes reachable=no -> not_ended:unlooked answered=no
+lock=unreadable process=ended holder=asked look=another(5000) bound=no reachable=no -> go_on
+lock=unreadable process=ended holder=asked look=another(5000) bound=yes reachable=no -> not_ended:unlooked answered=no
+lock=unreadable process=ended holder=asked look=another(-) bound=no reachable=no -> go_on
+lock=unreadable process=ended holder=asked look=another(-) bound=yes reachable=no -> not_ended:unlooked answered=no
 lock=unreadable process=ended holder=asked look=unclear bound=no reachable=no -> go_on
 lock=unreadable process=ended holder=asked look=unclear bound=yes reachable=no -> not_ended:unlooked answered=no
 lock=unreadable process=ended holder=other look=not_made bound=no reachable=no -> go_on
@@ -533,8 +621,10 @@ lock=unreadable process=ended holder=other look=same bound=no reachable=no -> go
 lock=unreadable process=ended holder=other look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=unreadable process=ended holder=other look=unproved bound=no reachable=no -> go_on
 lock=unreadable process=ended holder=other look=unproved bound=yes reachable=no -> not_ended:unlooked answered=yes
-lock=unreadable process=ended holder=other look=another bound=no reachable=no -> go_on
-lock=unreadable process=ended holder=other look=another bound=yes reachable=no -> not_ended:unlooked answered=no
+lock=unreadable process=ended holder=other look=another(5000) bound=no reachable=no -> go_on
+lock=unreadable process=ended holder=other look=another(5000) bound=yes reachable=no -> not_ended:unlooked answered=no
+lock=unreadable process=ended holder=other look=another(-) bound=no reachable=no -> go_on
+lock=unreadable process=ended holder=other look=another(-) bound=yes reachable=no -> not_ended:unlooked answered=no
 lock=unreadable process=ended holder=other look=unclear bound=no reachable=no -> go_on
 lock=unreadable process=ended holder=other look=unclear bound=yes reachable=no -> not_ended:unlooked answered=no
 lock=unreadable process=unreadable holder=not_read look=not_made bound=no reachable=yes -> go_on
@@ -545,8 +635,10 @@ lock=unreadable process=unreadable holder=not_read look=same bound=no reachable=
 lock=unreadable process=unreadable holder=not_read look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=unreadable process=unreadable holder=not_read look=unproved bound=no reachable=no -> go_on
 lock=unreadable process=unreadable holder=not_read look=unproved bound=yes reachable=no -> not_ended:unlooked answered=yes
-lock=unreadable process=unreadable holder=not_read look=another bound=no reachable=no -> go_on
-lock=unreadable process=unreadable holder=not_read look=another bound=yes reachable=no -> not_ended:unlooked answered=no
+lock=unreadable process=unreadable holder=not_read look=another(5000) bound=no reachable=no -> go_on
+lock=unreadable process=unreadable holder=not_read look=another(5000) bound=yes reachable=no -> not_ended:unlooked answered=no
+lock=unreadable process=unreadable holder=not_read look=another(-) bound=no reachable=no -> go_on
+lock=unreadable process=unreadable holder=not_read look=another(-) bound=yes reachable=no -> not_ended:unlooked answered=no
 lock=unreadable process=unreadable holder=not_read look=unclear bound=no reachable=no -> go_on
 lock=unreadable process=unreadable holder=not_read look=unclear bound=yes reachable=no -> not_ended:unlooked answered=no
 lock=unreadable process=unreadable holder=nobody look=not_made bound=no reachable=no -> go_on
@@ -557,8 +649,10 @@ lock=unreadable process=unreadable holder=nobody look=same bound=no reachable=no
 lock=unreadable process=unreadable holder=nobody look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=unreadable process=unreadable holder=nobody look=unproved bound=no reachable=no -> go_on
 lock=unreadable process=unreadable holder=nobody look=unproved bound=yes reachable=no -> not_ended:unlooked answered=yes
-lock=unreadable process=unreadable holder=nobody look=another bound=no reachable=no -> go_on
-lock=unreadable process=unreadable holder=nobody look=another bound=yes reachable=no -> not_ended:unlooked answered=no
+lock=unreadable process=unreadable holder=nobody look=another(5000) bound=no reachable=no -> go_on
+lock=unreadable process=unreadable holder=nobody look=another(5000) bound=yes reachable=no -> not_ended:unlooked answered=no
+lock=unreadable process=unreadable holder=nobody look=another(-) bound=no reachable=no -> go_on
+lock=unreadable process=unreadable holder=nobody look=another(-) bound=yes reachable=no -> not_ended:unlooked answered=no
 lock=unreadable process=unreadable holder=nobody look=unclear bound=no reachable=no -> go_on
 lock=unreadable process=unreadable holder=nobody look=unclear bound=yes reachable=no -> not_ended:unlooked answered=no
 lock=unreadable process=unreadable holder=asked look=not_made bound=no reachable=no -> go_on
@@ -569,8 +663,10 @@ lock=unreadable process=unreadable holder=asked look=same bound=no reachable=no 
 lock=unreadable process=unreadable holder=asked look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=unreadable process=unreadable holder=asked look=unproved bound=no reachable=no -> go_on
 lock=unreadable process=unreadable holder=asked look=unproved bound=yes reachable=no -> not_ended:unlooked answered=yes
-lock=unreadable process=unreadable holder=asked look=another bound=no reachable=no -> go_on
-lock=unreadable process=unreadable holder=asked look=another bound=yes reachable=no -> not_ended:unlooked answered=no
+lock=unreadable process=unreadable holder=asked look=another(5000) bound=no reachable=no -> go_on
+lock=unreadable process=unreadable holder=asked look=another(5000) bound=yes reachable=no -> not_ended:unlooked answered=no
+lock=unreadable process=unreadable holder=asked look=another(-) bound=no reachable=no -> go_on
+lock=unreadable process=unreadable holder=asked look=another(-) bound=yes reachable=no -> not_ended:unlooked answered=no
 lock=unreadable process=unreadable holder=asked look=unclear bound=no reachable=no -> go_on
 lock=unreadable process=unreadable holder=asked look=unclear bound=yes reachable=no -> not_ended:unlooked answered=no
 lock=unreadable process=unreadable holder=other look=not_made bound=no reachable=no -> go_on
@@ -581,124 +677,144 @@ lock=unreadable process=unreadable holder=other look=same bound=no reachable=no 
 lock=unreadable process=unreadable holder=other look=same bound=yes reachable=no -> not_ended:answers answered=yes
 lock=unreadable process=unreadable holder=other look=unproved bound=no reachable=no -> go_on
 lock=unreadable process=unreadable holder=other look=unproved bound=yes reachable=no -> not_ended:unlooked answered=yes
-lock=unreadable process=unreadable holder=other look=another bound=no reachable=no -> go_on
-lock=unreadable process=unreadable holder=other look=another bound=yes reachable=no -> not_ended:unlooked answered=no
+lock=unreadable process=unreadable holder=other look=another(5000) bound=no reachable=no -> go_on
+lock=unreadable process=unreadable holder=other look=another(5000) bound=yes reachable=no -> not_ended:unlooked answered=no
+lock=unreadable process=unreadable holder=other look=another(-) bound=no reachable=no -> go_on
+lock=unreadable process=unreadable holder=other look=another(-) bound=yes reachable=no -> not_ended:unlooked answered=no
 lock=unreadable process=unreadable holder=other look=unclear bound=no reachable=no -> go_on
 lock=unreadable process=unreadable holder=other look=unclear bound=yes reachable=no -> not_ended:unlooked answered=no
 
 ## after a request that was written, at the bound
-lock=free process=no_identity holder=not_read look=nobody request=told -> stopped exit=0 stop=ended
-lock=free process=no_identity holder=not_read look=nobody request=maybe_asked -> stopped exit=0 stop=ended
-lock=free process=no_identity holder=not_read look=same request=told -> not_ended exit=1 stop=told
-lock=free process=no_identity holder=not_read look=same request=maybe_asked -> not_ended exit=1 stop=maybe_asked
-lock=free process=no_identity holder=not_read look=unproved request=told -> not_shown exit=1 stop=told
-lock=free process=no_identity holder=not_read look=unproved request=maybe_asked -> not_shown exit=1 stop=maybe_asked
-lock=free process=no_identity holder=not_read look=another request=told -> successor exit=0 stop=ended
-lock=free process=no_identity holder=not_read look=another request=maybe_asked -> successor exit=0 stop=ended
-lock=free process=no_identity holder=not_read look=unclear request=told -> not_shown exit=1 stop=told
-lock=free process=no_identity holder=not_read look=unclear request=maybe_asked -> not_shown exit=1 stop=maybe_asked
-lock=free process=running holder=not_read look=not_made request=told -> not_ended exit=1 stop=told
-lock=free process=running holder=not_read look=not_made request=maybe_asked -> not_ended exit=1 stop=maybe_asked
-lock=free process=ended holder=not_read look=not_made request=told -> stopped exit=0 stop=ended
-lock=free process=ended holder=not_read look=not_made request=maybe_asked -> stopped exit=0 stop=ended
-lock=free process=unreadable holder=not_read look=nobody request=told -> stopped exit=0 stop=ended
-lock=free process=unreadable holder=not_read look=nobody request=maybe_asked -> stopped exit=0 stop=ended
-lock=free process=unreadable holder=not_read look=same request=told -> not_ended exit=1 stop=told
-lock=free process=unreadable holder=not_read look=same request=maybe_asked -> not_ended exit=1 stop=maybe_asked
-lock=free process=unreadable holder=not_read look=unproved request=told -> not_shown exit=1 stop=told
-lock=free process=unreadable holder=not_read look=unproved request=maybe_asked -> not_shown exit=1 stop=maybe_asked
-lock=free process=unreadable holder=not_read look=another request=told -> successor exit=0 stop=ended
-lock=free process=unreadable holder=not_read look=another request=maybe_asked -> successor exit=0 stop=ended
-lock=free process=unreadable holder=not_read look=unclear request=told -> not_shown exit=1 stop=told
-lock=free process=unreadable holder=not_read look=unclear request=maybe_asked -> not_shown exit=1 stop=maybe_asked
-lock=held process=no_identity holder=nobody look=nobody request=told -> held_not_shown exit=1 stop=told
-lock=held process=no_identity holder=nobody look=nobody request=maybe_asked -> held_not_shown exit=1 stop=maybe_asked
-lock=held process=no_identity holder=nobody look=same request=told -> not_ended exit=1 stop=told
-lock=held process=no_identity holder=nobody look=same request=maybe_asked -> not_ended exit=1 stop=maybe_asked
-lock=held process=no_identity holder=nobody look=unproved request=told -> held_not_shown exit=1 stop=told
-lock=held process=no_identity holder=nobody look=unproved request=maybe_asked -> held_not_shown exit=1 stop=maybe_asked
-lock=held process=no_identity holder=nobody look=another request=told -> successor exit=0 stop=ended
-lock=held process=no_identity holder=nobody look=another request=maybe_asked -> successor exit=0 stop=ended
-lock=held process=no_identity holder=nobody look=unclear request=told -> held_not_shown exit=1 stop=told
-lock=held process=no_identity holder=nobody look=unclear request=maybe_asked -> held_not_shown exit=1 stop=maybe_asked
-lock=held process=no_identity holder=other look=nobody request=told -> held_not_shown exit=1 stop=told
-lock=held process=no_identity holder=other look=nobody request=maybe_asked -> held_not_shown exit=1 stop=maybe_asked
-lock=held process=no_identity holder=other look=same request=told -> not_ended exit=1 stop=told
-lock=held process=no_identity holder=other look=same request=maybe_asked -> not_ended exit=1 stop=maybe_asked
-lock=held process=no_identity holder=other look=unproved request=told -> held_not_shown exit=1 stop=told
-lock=held process=no_identity holder=other look=unproved request=maybe_asked -> held_not_shown exit=1 stop=maybe_asked
-lock=held process=no_identity holder=other look=another request=told -> successor exit=0 stop=ended
-lock=held process=no_identity holder=other look=another request=maybe_asked -> successor exit=0 stop=ended
-lock=held process=no_identity holder=other look=unclear request=told -> held_not_shown exit=1 stop=told
-lock=held process=no_identity holder=other look=unclear request=maybe_asked -> held_not_shown exit=1 stop=maybe_asked
-lock=held process=running holder=not_read look=not_made request=told -> not_ended exit=1 stop=told
-lock=held process=running holder=not_read look=not_made request=maybe_asked -> not_ended exit=1 stop=maybe_asked
-lock=held process=ended holder=nobody look=nobody request=told -> still_held exit=1 stop=told
-lock=held process=ended holder=nobody look=nobody request=maybe_asked -> still_held exit=1 stop=maybe_asked
-lock=held process=ended holder=nobody look=same request=told -> not_ended exit=1 stop=told
-lock=held process=ended holder=nobody look=same request=maybe_asked -> not_ended exit=1 stop=maybe_asked
-lock=held process=ended holder=nobody look=unproved request=told -> still_held exit=1 stop=told
-lock=held process=ended holder=nobody look=unproved request=maybe_asked -> still_held exit=1 stop=maybe_asked
-lock=held process=ended holder=nobody look=another request=told -> successor exit=0 stop=ended
-lock=held process=ended holder=nobody look=another request=maybe_asked -> successor exit=0 stop=ended
-lock=held process=ended holder=nobody look=unclear request=told -> still_held exit=1 stop=told
-lock=held process=ended holder=nobody look=unclear request=maybe_asked -> still_held exit=1 stop=maybe_asked
-lock=held process=ended holder=asked look=nobody request=told -> still_held exit=1 stop=told
-lock=held process=ended holder=asked look=nobody request=maybe_asked -> still_held exit=1 stop=maybe_asked
-lock=held process=ended holder=asked look=same request=told -> not_ended exit=1 stop=told
-lock=held process=ended holder=asked look=same request=maybe_asked -> not_ended exit=1 stop=maybe_asked
-lock=held process=ended holder=asked look=unproved request=told -> still_held exit=1 stop=told
-lock=held process=ended holder=asked look=unproved request=maybe_asked -> still_held exit=1 stop=maybe_asked
-lock=held process=ended holder=asked look=another request=told -> successor exit=0 stop=ended
-lock=held process=ended holder=asked look=another request=maybe_asked -> successor exit=0 stop=ended
-lock=held process=ended holder=asked look=unclear request=told -> still_held exit=1 stop=told
-lock=held process=ended holder=asked look=unclear request=maybe_asked -> still_held exit=1 stop=maybe_asked
-lock=held process=ended holder=other look=not_made request=told -> successor exit=0 stop=ended
-lock=held process=ended holder=other look=not_made request=maybe_asked -> successor exit=0 stop=ended
-lock=held process=unreadable holder=not_read look=not_made request=told -> held_not_shown exit=1 stop=told
-lock=held process=unreadable holder=not_read look=not_made request=maybe_asked -> held_not_shown exit=1 stop=maybe_asked
-lock=unreadable process=no_identity holder=not_read look=not_made request=told -> unlooked exit=1 stop=told
-lock=unreadable process=no_identity holder=not_read look=not_made request=maybe_asked -> unlooked exit=1 stop=maybe_asked
-lock=unreadable process=running holder=not_read look=not_made request=told -> not_ended exit=1 stop=told
-lock=unreadable process=running holder=not_read look=not_made request=maybe_asked -> not_ended exit=1 stop=maybe_asked
-lock=unreadable process=ended holder=not_read look=not_made request=told -> unlooked exit=1 stop=told
-lock=unreadable process=ended holder=not_read look=not_made request=maybe_asked -> unlooked exit=1 stop=maybe_asked
-lock=unreadable process=unreadable holder=not_read look=not_made request=told -> unlooked exit=1 stop=told
-lock=unreadable process=unreadable holder=not_read look=not_made request=maybe_asked -> unlooked exit=1 stop=maybe_asked
+lock=free process=no_identity holder=not_read look=nobody request=told -> stopped exit=0 code=- stop=ended
+lock=free process=no_identity holder=not_read look=nobody request=maybe_asked -> stopped exit=0 code=- stop=ended
+lock=free process=no_identity holder=not_read look=same request=told -> not_ended exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=free process=no_identity holder=not_read look=same request=maybe_asked -> not_ended exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=free process=no_identity holder=not_read look=unproved request=told -> not_shown exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=free process=no_identity holder=not_read look=unproved request=maybe_asked -> not_shown exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=free process=no_identity holder=not_read look=another(5000) request=told -> successor exit=0 code=- stop=ended
+lock=free process=no_identity holder=not_read look=another(5000) request=maybe_asked -> successor exit=0 code=- stop=ended
+lock=free process=no_identity holder=not_read look=another(-) request=told -> successor exit=0 code=- stop=ended
+lock=free process=no_identity holder=not_read look=another(-) request=maybe_asked -> successor exit=0 code=- stop=ended
+lock=free process=no_identity holder=not_read look=unclear request=told -> not_shown exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=free process=no_identity holder=not_read look=unclear request=maybe_asked -> not_shown exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=free process=running holder=not_read look=not_made request=told -> not_ended exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=free process=running holder=not_read look=not_made request=maybe_asked -> not_ended exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=free process=ended holder=not_read look=not_made request=told -> stopped exit=0 code=- stop=ended
+lock=free process=ended holder=not_read look=not_made request=maybe_asked -> stopped exit=0 code=- stop=ended
+lock=free process=unreadable holder=not_read look=nobody request=told -> stopped exit=0 code=- stop=ended
+lock=free process=unreadable holder=not_read look=nobody request=maybe_asked -> stopped exit=0 code=- stop=ended
+lock=free process=unreadable holder=not_read look=same request=told -> not_ended exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=free process=unreadable holder=not_read look=same request=maybe_asked -> not_ended exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=free process=unreadable holder=not_read look=unproved request=told -> not_shown exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=free process=unreadable holder=not_read look=unproved request=maybe_asked -> not_shown exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=free process=unreadable holder=not_read look=another(5000) request=told -> successor exit=0 code=- stop=ended
+lock=free process=unreadable holder=not_read look=another(5000) request=maybe_asked -> successor exit=0 code=- stop=ended
+lock=free process=unreadable holder=not_read look=another(-) request=told -> successor exit=0 code=- stop=ended
+lock=free process=unreadable holder=not_read look=another(-) request=maybe_asked -> successor exit=0 code=- stop=ended
+lock=free process=unreadable holder=not_read look=unclear request=told -> not_shown exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=free process=unreadable holder=not_read look=unclear request=maybe_asked -> not_shown exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=held process=no_identity holder=nobody look=nobody request=told -> held_not_shown exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=held process=no_identity holder=nobody look=nobody request=maybe_asked -> held_not_shown exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=held process=no_identity holder=nobody look=same request=told -> not_ended exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=held process=no_identity holder=nobody look=same request=maybe_asked -> not_ended exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=held process=no_identity holder=nobody look=unproved request=told -> held_not_shown exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=held process=no_identity holder=nobody look=unproved request=maybe_asked -> held_not_shown exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=held process=no_identity holder=nobody look=another(5000) request=told -> successor exit=0 code=- stop=ended
+lock=held process=no_identity holder=nobody look=another(5000) request=maybe_asked -> successor exit=0 code=- stop=ended
+lock=held process=no_identity holder=nobody look=another(-) request=told -> successor exit=0 code=- stop=ended
+lock=held process=no_identity holder=nobody look=another(-) request=maybe_asked -> successor exit=0 code=- stop=ended
+lock=held process=no_identity holder=nobody look=unclear request=told -> held_not_shown exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=held process=no_identity holder=nobody look=unclear request=maybe_asked -> held_not_shown exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=held process=no_identity holder=other look=nobody request=told -> held_not_shown exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=held process=no_identity holder=other look=nobody request=maybe_asked -> held_not_shown exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=held process=no_identity holder=other look=same request=told -> not_ended exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=held process=no_identity holder=other look=same request=maybe_asked -> not_ended exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=held process=no_identity holder=other look=unproved request=told -> held_not_shown exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=held process=no_identity holder=other look=unproved request=maybe_asked -> held_not_shown exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=held process=no_identity holder=other look=another(5000) request=told -> successor exit=0 code=- stop=ended
+lock=held process=no_identity holder=other look=another(5000) request=maybe_asked -> successor exit=0 code=- stop=ended
+lock=held process=no_identity holder=other look=another(-) request=told -> successor exit=0 code=- stop=ended
+lock=held process=no_identity holder=other look=another(-) request=maybe_asked -> successor exit=0 code=- stop=ended
+lock=held process=no_identity holder=other look=unclear request=told -> held_not_shown exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=held process=no_identity holder=other look=unclear request=maybe_asked -> held_not_shown exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=held process=running holder=not_read look=not_made request=told -> not_ended exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=held process=running holder=not_read look=not_made request=maybe_asked -> not_ended exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=held process=ended holder=nobody look=nobody request=told -> still_held exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=held process=ended holder=nobody look=nobody request=maybe_asked -> still_held exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=held process=ended holder=nobody look=same request=told -> not_ended exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=held process=ended holder=nobody look=same request=maybe_asked -> not_ended exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=held process=ended holder=nobody look=unproved request=told -> still_held exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=held process=ended holder=nobody look=unproved request=maybe_asked -> still_held exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=held process=ended holder=nobody look=another(5000) request=told -> successor exit=0 code=- stop=ended
+lock=held process=ended holder=nobody look=another(5000) request=maybe_asked -> successor exit=0 code=- stop=ended
+lock=held process=ended holder=nobody look=another(-) request=told -> successor exit=0 code=- stop=ended
+lock=held process=ended holder=nobody look=another(-) request=maybe_asked -> successor exit=0 code=- stop=ended
+lock=held process=ended holder=nobody look=unclear request=told -> still_held exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=held process=ended holder=nobody look=unclear request=maybe_asked -> still_held exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=held process=ended holder=asked look=nobody request=told -> still_held exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=held process=ended holder=asked look=nobody request=maybe_asked -> still_held exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=held process=ended holder=asked look=same request=told -> not_ended exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=held process=ended holder=asked look=same request=maybe_asked -> not_ended exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=held process=ended holder=asked look=unproved request=told -> still_held exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=held process=ended holder=asked look=unproved request=maybe_asked -> still_held exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=held process=ended holder=asked look=another(5000) request=told -> successor exit=0 code=- stop=ended
+lock=held process=ended holder=asked look=another(5000) request=maybe_asked -> successor exit=0 code=- stop=ended
+lock=held process=ended holder=asked look=another(-) request=told -> successor exit=0 code=- stop=ended
+lock=held process=ended holder=asked look=another(-) request=maybe_asked -> successor exit=0 code=- stop=ended
+lock=held process=ended holder=asked look=unclear request=told -> still_held exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=held process=ended holder=asked look=unclear request=maybe_asked -> still_held exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=held process=ended holder=other look=not_made request=told -> successor exit=0 code=- stop=ended
+lock=held process=ended holder=other look=not_made request=maybe_asked -> successor exit=0 code=- stop=ended
+lock=held process=unreadable holder=not_read look=not_made request=told -> held_not_shown exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=held process=unreadable holder=not_read look=not_made request=maybe_asked -> held_not_shown exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=unreadable process=no_identity holder=not_read look=not_made request=told -> unlooked exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=unreadable process=no_identity holder=not_read look=not_made request=maybe_asked -> unlooked exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=unreadable process=running holder=not_read look=not_made request=told -> not_ended exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=unreadable process=running holder=not_read look=not_made request=maybe_asked -> not_ended exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=unreadable process=ended holder=not_read look=not_made request=told -> unlooked exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=unreadable process=ended holder=not_read look=not_made request=maybe_asked -> unlooked exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
+lock=unreadable process=unreadable holder=not_read look=not_made request=told -> unlooked exit=1 code=ENVIRONMENT_UNAVAILABLE stop=told
+lock=unreadable process=unreadable holder=not_read look=not_made request=maybe_asked -> unlooked exit=1 code=ENVIRONMENT_UNAVAILABLE stop=maybe_asked
 
 ## a request that could not be made: what the wait decides, at the bound
 lock=free process=no_identity holder=not_read look=nobody -> ended
 lock=free process=no_identity holder=not_read look=same -> answers
 lock=free process=no_identity holder=not_read look=unproved -> answers
-lock=free process=no_identity holder=not_read look=another -> ended_by_a_successor
+lock=free process=no_identity holder=not_read look=another(5000) -> ended_by_a_successor
+lock=free process=no_identity holder=not_read look=another(-) -> ended_by_a_successor
 lock=free process=no_identity holder=not_read look=unclear -> not_shown
 lock=free process=running holder=not_read look=not_made -> not_shown
 lock=free process=ended holder=not_read look=not_made -> ended
 lock=free process=unreadable holder=not_read look=nobody -> ended
 lock=free process=unreadable holder=not_read look=same -> answers
 lock=free process=unreadable holder=not_read look=unproved -> answers
-lock=free process=unreadable holder=not_read look=another -> ended_by_a_successor
+lock=free process=unreadable holder=not_read look=another(5000) -> ended_by_a_successor
+lock=free process=unreadable holder=not_read look=another(-) -> ended_by_a_successor
 lock=free process=unreadable holder=not_read look=unclear -> not_shown
 lock=held process=no_identity holder=nobody look=nobody -> not_shown
 lock=held process=no_identity holder=nobody look=same -> answers
 lock=held process=no_identity holder=nobody look=unproved -> answers
-lock=held process=no_identity holder=nobody look=another -> ended_by_a_successor
+lock=held process=no_identity holder=nobody look=another(5000) -> ended_by_a_successor
+lock=held process=no_identity holder=nobody look=another(-) -> ended_by_a_successor
 lock=held process=no_identity holder=nobody look=unclear -> not_shown
 lock=held process=no_identity holder=other look=nobody -> not_shown
 lock=held process=no_identity holder=other look=same -> answers
 lock=held process=no_identity holder=other look=unproved -> answers
-lock=held process=no_identity holder=other look=another -> ended_by_a_successor
+lock=held process=no_identity holder=other look=another(5000) -> ended_by_a_successor
+lock=held process=no_identity holder=other look=another(-) -> ended_by_a_successor
 lock=held process=no_identity holder=other look=unclear -> not_shown
 lock=held process=running holder=not_read look=not_made -> not_shown
 lock=held process=ended holder=nobody look=nobody -> not_shown
 lock=held process=ended holder=nobody look=same -> answers
 lock=held process=ended holder=nobody look=unproved -> answers
-lock=held process=ended holder=nobody look=another -> ended_by_a_successor
+lock=held process=ended holder=nobody look=another(5000) -> ended_by_a_successor
+lock=held process=ended holder=nobody look=another(-) -> ended_by_a_successor
 lock=held process=ended holder=nobody look=unclear -> not_shown
 lock=held process=ended holder=asked look=nobody -> not_shown
 lock=held process=ended holder=asked look=same -> answers
 lock=held process=ended holder=asked look=unproved -> answers
-lock=held process=ended holder=asked look=another -> ended_by_a_successor
+lock=held process=ended holder=asked look=another(5000) -> ended_by_a_successor
+lock=held process=ended holder=asked look=another(-) -> ended_by_a_successor
 lock=held process=ended holder=asked look=unclear -> not_shown
 lock=held process=ended holder=other look=not_made -> ended_by_a_successor
 lock=held process=unreadable holder=not_read look=not_made -> not_shown
@@ -708,15 +824,15 @@ lock=unreadable process=ended holder=not_read look=not_made -> not_shown
 lock=unreadable process=unreadable holder=not_read look=not_made -> not_shown
 
 ## a request that could not be made: what is said, with the lock read again where asked
-before=ended lock_again=- -> ended exit=0 stop=ended
-before=silent_accepted lock_again=free -> silent exit=1 stop=not_asked
-before=silent_nothing_accepted lock_again=free -> unmade:nothing_listening exit=3 stop=not_asked
-before=answers lock_again=- -> unmade:answered exit=3 stop=not_asked
-before=own_fault lock_again=- -> unmade:own_fault exit=3 stop=not_asked
-before=silent_accepted lock_again=held -> holds_and_is_silent exit=1 stop=not_asked
-before=silent_nothing_accepted lock_again=held -> holds_and_is_silent exit=1 stop=not_asked
-before=silent_accepted lock_again=unreadable -> silent exit=1 stop=not_asked
-before=silent_nothing_accepted lock_again=unreadable -> unmade:nothing_listening exit=3 stop=not_asked
+before=ended lock_again=- -> ended exit=0 code=- stop=ended
+before=silent_accepted lock_again=free -> silent exit=1 code=ENVIRONMENT_UNAVAILABLE stop=not_asked
+before=silent_nothing_accepted lock_again=free -> unmade:nothing_listening exit=3 code=HOST_NOT_CONFIGURED stop=not_asked
+before=answers lock_again=- -> unmade:answered exit=3 code=HOST_NOT_CONFIGURED stop=not_asked
+before=own_fault lock_again=- -> unmade:own_fault exit=3 code=HOST_NOT_CONFIGURED stop=not_asked
+before=silent_accepted lock_again=held -> holds_and_is_silent exit=1 code=ENVIRONMENT_UNAVAILABLE stop=not_asked
+before=silent_nothing_accepted lock_again=held -> holds_and_is_silent exit=1 code=ENVIRONMENT_UNAVAILABLE stop=not_asked
+before=silent_accepted lock_again=unreadable -> silent exit=1 code=ENVIRONMENT_UNAVAILABLE stop=not_asked
+before=silent_nothing_accepted lock_again=unreadable -> unmade:nothing_listening exit=3 code=HOST_NOT_CONFIGURED stop=not_asked
 
 ## a request that could not be made: the first look, made where the connection was not closed
 closed=yes: no look is made, and the wait decides
@@ -727,12 +843,12 @@ closed=no look=another -> the wait decides
 closed=no look=unclear -> the wait decides
 
 ## the start of the command
-start=other_major lock=free -> other_major exit=1 stop=not_asked
-start=other_major lock=held -> other_major exit=1 stop=not_asked
-start=other_major lock=unreadable -> other_major exit=1 stop=not_asked
-start=silent lock=free -> silent exit=1 stop=not_asked
-start=silent lock=held -> holds_and_is_silent exit=1 stop=not_asked
-start=silent lock=unreadable -> silent exit=1 stop=not_asked
-start=nothing_listening lock=free -> no_daemon exit=0 stop=not_asked
-start=nothing_listening lock=held -> holds_and_is_silent exit=1 stop=not_asked
-start=nothing_listening lock=unreadable -> lock_unreadable exit=1 stop=not_asked
+start=other_major lock=free -> other_major exit=1 code=RESOURCE_UNAVAILABLE stop=not_asked
+start=other_major lock=held -> other_major exit=1 code=RESOURCE_UNAVAILABLE stop=not_asked
+start=other_major lock=unreadable -> other_major exit=1 code=RESOURCE_UNAVAILABLE stop=not_asked
+start=silent lock=free -> silent exit=1 code=ENVIRONMENT_UNAVAILABLE stop=not_asked
+start=silent lock=held -> holds_and_is_silent exit=1 code=ENVIRONMENT_UNAVAILABLE stop=not_asked
+start=silent lock=unreadable -> silent exit=1 code=ENVIRONMENT_UNAVAILABLE stop=not_asked
+start=nothing_listening lock=free -> no_daemon exit=0 code=- stop=not_asked
+start=nothing_listening lock=held -> holds_and_is_silent exit=1 code=ENVIRONMENT_UNAVAILABLE stop=not_asked
+start=nothing_listening lock=unreadable -> lock_unreadable exit=1 code=RESOURCE_UNAVAILABLE stop=not_asked
