@@ -202,8 +202,81 @@ fn group_end(code: &[u8], at: usize) -> usize {
     code.len()
 }
 
-/// The attributes `#[cfg(..)]` of `code` that hold the word `test` and not `not(test)`: where each
-/// ends, and where it starts.
+/// What a `cfg` condition is where the test configuration is off and every other condition is not
+/// known.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Truth {
+    False,
+    True,
+    Unknown,
+}
+
+/// The parts of `list`, split at the commas that stand outside every parenthesis.
+fn top_level_parts(list: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut depth, mut from) = (0usize, 0usize);
+    for (at, character) in list.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&list[from..at]);
+                from = at + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&list[from..]);
+    parts
+}
+
+/// What the condition `condition` of a `cfg` is where the test configuration is off: `test` is
+/// false, `not`, `all` and `any` combine, and every other condition (`unix`, a feature, a target)
+/// is not known. An item is test code only where its condition is false here.
+fn cfg_truth(condition: &str) -> Truth {
+    let condition = condition.trim();
+    let arguments = |name: &str| {
+        condition
+            .strip_prefix(name)
+            .and_then(|rest| rest.trim_start().strip_prefix('('))
+            .and_then(|rest| rest.trim_end().strip_suffix(')'))
+    };
+    if condition == "test" {
+        return Truth::False;
+    }
+    if let Some(inner) = arguments("not") {
+        return match cfg_truth(inner) {
+            Truth::False => Truth::True,
+            Truth::True => Truth::False,
+            Truth::Unknown => Truth::Unknown,
+        };
+    }
+    if let Some(inner) = arguments("all") {
+        let parts: Vec<Truth> = top_level_parts(inner).into_iter().map(cfg_truth).collect();
+        return if parts.contains(&Truth::False) {
+            Truth::False
+        } else if parts.iter().all(|part| *part == Truth::True) {
+            Truth::True
+        } else {
+            Truth::Unknown
+        };
+    }
+    if let Some(inner) = arguments("any") {
+        let parts: Vec<Truth> = top_level_parts(inner).into_iter().map(cfg_truth).collect();
+        return if parts.contains(&Truth::True) {
+            Truth::True
+        } else if parts.iter().all(|part| *part == Truth::False) {
+            Truth::False
+        } else {
+            Truth::Unknown
+        };
+    }
+    Truth::Unknown
+}
+
+/// The attributes `#[cfg(..)]` of `code` whose condition is the test configuration alone, that is
+/// false where the test configuration is off (`test`, `all(test, unix)`): where each ends, and where
+/// it starts. An item under `any(test, unix)` is production code on unix and stays.
 fn test_attributes(code: &[u8]) -> Vec<(usize, usize)> {
     let mark = b"#[cfg(";
     let mut found = Vec::new();
@@ -212,10 +285,11 @@ fn test_attributes(code: &[u8]) -> Vec<(usize, usize)> {
         let start = from + at;
         let end = group_end(code, start + 1);
         let text = String::from_utf8_lossy(&code[start..end]).into_owned();
-        let words: Vec<&str> = text
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .collect();
-        if words.contains(&"test") && !text.contains("not(test") {
+        let condition = text
+            .strip_prefix("#[cfg(")
+            .and_then(|rest| rest.strip_suffix(")]"))
+            .unwrap_or("");
+        if cfg_truth(condition) == Truth::False {
             found.push((start, end));
         }
         from = end;
@@ -932,6 +1006,39 @@ fn said_source(source: ErrorSource) -> &'static str {
         ErrorSource::Closure => "closure",
         ErrorSource::OwnFault => "own",
     }
+}
+
+/// An item that stands under a `cfg` condition is left out of the scan only where its condition is
+/// the test configuration alone: `test`, or `all` of it with others. An item under `any(test, unix)`
+/// or `any(test, windows)` is production code on that platform and its makers stand in the roster, as
+/// one under `unix`, `not(test)` or a feature does.
+#[test]
+fn an_item_is_left_out_only_where_its_condition_is_the_test_configuration_alone() {
+    let text = "\
+#[cfg(test)]
+fn only_in_tests() -> IpcError { IpcError::OutsideLevel(String::new()) }
+#[cfg(all(test, unix))]
+fn only_in_tests_on_unix() -> IpcError { IpcError::OutsideLevel(String::new()) }
+#[cfg(all(unix, test))]
+fn only_in_tests_on_unix_too() -> IpcError { IpcError::OutsideLevel(String::new()) }
+#[cfg(any(test, unix))]
+fn in_tests_and_on_unix() -> IpcError { IpcError::PeerClosed }
+#[cfg(any(windows, test))]
+fn in_tests_and_on_windows() -> IpcError { IpcError::UnexpectedMessage(\"x\") }
+#[cfg(not(test))]
+fn outside_tests() -> IpcError { IpcError::NotInLevel(String::new()) }
+#[cfg(unix)]
+fn on_unix() -> IpcError { IpcError::NotInLevel(String::new()) }
+";
+    let found = makers(&[("crates/x/src/client.rs".to_owned(), text.to_owned())]);
+    let owners: Vec<String> = found.keys().map(|place| place.said()).collect();
+    let want = [
+        "crates/x/src/client.rs | in_tests_and_on_unix | PeerClosed",
+        "crates/x/src/client.rs | in_tests_and_on_windows | UnexpectedMessage",
+        "crates/x/src/client.rs | on_unix | NotInLevel",
+        "crates/x/src/client.rs | outside_tests | NotInLevel",
+    ];
+    assert_eq!(owners, want);
 }
 
 /// For every row that a control connection can return, the row's `function` cell says whether the
