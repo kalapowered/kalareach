@@ -1477,8 +1477,11 @@
 
 /*
  * The paths a failure names, as the service wrote them: one to a line, each breaking where it must
- * when it is longer than the column. The indent is in rem so that it grows with the text instead of
- * taking a larger share of a narrow column at the largest size.
+ * when it is longer than the column. The bullet of each line stands in the list's indent, and the
+ * layout test reads no bullet's box, so the indent alone keeps it inside the column. The root size
+ * follows the system text size, so an indent in rem grows with the text and still holds the bullet
+ * at the largest size, where 1.25rem is about 62 px against the browser's 40 px; that is a larger
+ * share of a narrow column, and the column has room for it.
  */
 .pairing-alternatives {
   display: flex;
