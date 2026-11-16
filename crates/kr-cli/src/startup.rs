@@ -1141,7 +1141,12 @@ async fn standalone(
         Ok(client) => return Ok((ours(client)?, Some(started))),
         Err(last) => last,
     };
-    let state = child.try_wait().ok().flatten().map_or_else(
+    let ended = child.try_wait().ok().flatten();
+    if ended.is_some() {
+        // A process that was seen to end starts nothing, so no requested daemon may still come up.
+        launched.store(false, Ordering::SeqCst);
+    }
+    let state = ended.map_or_else(
         || Shown::said("it is still running"),
         |status| shown!("it has ended ({})", status),
     );

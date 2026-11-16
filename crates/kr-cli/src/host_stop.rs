@@ -19,7 +19,7 @@
 //! every message that no control daemon runs reads the records.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use kr_client::shown;
@@ -113,11 +113,21 @@ pub(crate) struct Progress {
     pub(crate) environment_id: EnvironmentId,
     /// What the command said at its start of the attempts earlier commands recorded.
     pub(crate) earlier: Mutex<Vec<Shown>>,
+    /// Whether the daemon that the command stopped was seen to end: set where the stop returned,
+    /// and read by an interrupt in a later stage, which then knows of the stop what this command
+    /// did and not what a record names.
+    pub(crate) daemon_ended: AtomicBool,
 }
 
 impl Progress {
     pub(crate) fn enter(&self, stage: Stage) {
         self.stage.store(stage as u8, Ordering::SeqCst);
+    }
+
+    /// The stop returned and the daemon was seen to end.
+    pub(crate) fn end_seen(&self) {
+        self.daemon_ended.store(true, Ordering::SeqCst);
+        self.enter(Stage::Ended);
     }
 
     pub(crate) fn stage(&self) -> Stage {
@@ -320,6 +330,7 @@ pub(crate) async fn run_command(which: Which, paths: &HostPaths, json: bool) -> 
         marker: Mutex::new(None),
         environment_id: environment.environment_id,
         earlier: Mutex::new(Vec::new()),
+        daemon_ended: AtomicBool::new(false),
     };
     let work = async {
         match which {
@@ -804,7 +815,7 @@ fn record_said(recorded: &attempt::Recorded, id: EnvironmentId) -> Shown {
             id
         ),
         attempt::Phase::Starting => shown!(
-            "The last record of a {} (process {}) is at {}: it had asked for a new control daemon \
+            "The last record of a {} (process {}) is at {}: it was asking for a new control daemon \
              for environment {}. What happened after that is not recorded.",
             command,
             process,

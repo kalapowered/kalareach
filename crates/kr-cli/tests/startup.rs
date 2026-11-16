@@ -5805,10 +5805,12 @@ fn a_restart_whose_start_fails_after_the_stop_says_so_and_leaves_the_sessions_al
         message.contains("was stopped and the start failed"),
         "{message}"
     );
+    // The process that the start made was seen to end, so no requested daemon may still start.
     assert!(
-        message.contains("The requested daemon may still start."),
-        "{message}"
+        !message.contains("may still start"),
+        "a process that was seen to end is not a daemon that may still start: {message}"
     );
+    assert!(message.contains("it has ended"), "{message}");
     assert!(message.contains("No session was stopped"), "{message}");
     assert!(
         message.ends_with("Fix the cause and run kr host restart again."),
