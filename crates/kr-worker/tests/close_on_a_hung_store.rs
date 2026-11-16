@@ -1428,6 +1428,17 @@ async fn a_read_of_a_held_session_says_the_turn_while_a_question_commit_stands_i
 /// A question is created from the host's own process, which stands in its commit when the case has
 /// armed the ledger's stall.
 fn ask_a_question(service: &WorkerService, session_id: SessionId) {
+    ask_a_question_expiring(service, session_id, "req-1", None);
+}
+
+/// As [`ask_a_question`], for the request `request`, which runs out of time after `expiry_ms` where
+/// that is given.
+fn ask_a_question_expiring(
+    service: &WorkerService,
+    session_id: SessionId,
+    request: &str,
+    expiry_ms: Option<u64>,
+) {
     let source = kr_worker::questions::VerifiedSource {
         process: kr_ipc::identity::current_process_start_identity().expect("a process identity"),
         executable: Some("/bin/agent".to_owned()),
@@ -1442,13 +1453,15 @@ fn ask_a_question(service: &WorkerService, session_id: SessionId) {
             &source,
             &kr_protocol::question::QuestionCreateParams {
                 session_id,
-                request_id: "req-1".to_owned(),
+                request_id: request.to_owned(),
                 agent_name: Nullable::some("an agent".to_owned()),
                 context: "two ways to do it".to_owned(),
                 question: "which one".to_owned(),
                 kind: kr_protocol::question::QuestionKind::Confirm,
                 choices: Vec::new(),
-                requested_expiry_ms: Nullable::null(),
+                requested_expiry_ms: expiry_ms.map_or_else(Nullable::null, |ms| {
+                    Nullable::some(kr_protocol::scalars::DurationMs::new(ms))
+                }),
                 wait_ms: Nullable::null(),
             },
             kr_worker::questions::Now {
@@ -1488,6 +1501,49 @@ async fn a_publication_that_waited_for_the_held_session_is_the_latest_the_facts_
     }
     producer.settle();
     assert_eq!(producer.application().name.as_deref(), Some("second"));
+}
+
+/// Two questions are open, and the maintenance pass's prune holds the session inside a write
+/// transaction of the file that the question ledger shares. One question runs out of time, so the
+/// ledger's reader writes its expiry, which fails after its busy wait. The other question stays
+/// open, and the question fact keeps its last value: a read of the held session still says that a
+/// question waits, where a reader that took the error for "no question" says that nothing does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_question_fact_that_cannot_be_read_keeps_its_last_value() {
+    let host = host().await;
+    let mut agent = bind_agent(&host).await;
+    agent.selects_a_thread().await;
+    ask_a_question_expiring(&host.service, host.session_id, "short", Some(4_000));
+    ask_a_question_expiring(&host.service, host.session_id, "long", None);
+    domain_application_state_becomes(
+        &host,
+        Some(ApplicationState::AwaitingInput),
+        "the questions are open",
+    )
+    .await;
+    let (holder, mut reader) = (host.client().await, host.client().await);
+    let standing = stall(&host, Stalled::Prune, holder).await;
+    // The short question is due. A wake of the loop asks the ledger's reader, whose expiry write
+    // meets the write lock that the prune holds and fails after five seconds.
+    tokio::time::sleep(Duration::from_millis(4_500)).await;
+    agent.says(TURN_7_STARTED).await;
+    agent.says(TURN_7_ENDED).await;
+    let began = Instant::now();
+    let mut said = None;
+    while began.elapsed() < Duration::from_secs(9) {
+        let (_, read) =
+            read_within_its_bound(&mut reader, &host, "held read after the write failed").await;
+        said = read.session.application_state.0;
+        assert_eq!(
+            said,
+            Some(ApplicationState::AwaitingInput),
+            "the read of a held session said {said:?} {:?} after the ledger's expiry write was asked for, with a question still open",
+            began.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let _ = standing.release.send(());
+    assert_eq!(said, Some(ApplicationState::AwaitingInput));
 }
 
 /// The application's two helper threads end with their owners: the reader of the question ledger

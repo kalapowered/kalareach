@@ -508,9 +508,9 @@ pub async fn follow_evidence(
 /// read the ledger would stand still for as long as that storage call does, and read nothing of
 /// the broker meanwhile. The thread reads when it is asked, writes what it found as the question
 /// fact, and tells the loop only when the fact changed, which is when the loop arms its timer
-/// anew. A ledger that cannot be read says nothing, so it is taken for no question: a session is
-/// not kept awake by a record that cannot be read. The thread ends when the loop does, because the
-/// asking end goes with it.
+/// anew. A ledger that cannot be read says nothing: the question fact keeps its last value, because
+/// a question that is still open does not stop being open when its ledger fails to answer. The
+/// thread ends when the loop does, because the asking end goes with it.
 ///
 /// # Panics
 ///
@@ -540,8 +540,11 @@ fn read_the_ledger_apart(
                     utc_ms: kr_ipc::now_ms(),
                     boot_ms: clock.boot_elapsed_ms(),
                 };
-                let open = questions.any_open(now).unwrap_or(false);
-                if producer.observe_questions(open) {
+                // A ledger that cannot be read says nothing, so the fact keeps its last value: an
+                // error is not "no question".
+                if let Ok(open) = questions.any_open(now)
+                    && producer.observe_questions(open)
+                {
                     moved.notify_waiters();
                 }
             }
