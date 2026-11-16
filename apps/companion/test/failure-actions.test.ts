@@ -131,11 +131,44 @@ describe('a refusal that says its own wait', () => {
     eager: true
   })
 
-  it('meets one reader of the action, so that no second reader adds a line after the first', () => {
+  /** The ways a source reads the action of a failure or the words for it, counted in code and not in comments. */
+  const READS = {
+    property: /\.user_action\b/g,
+    bracket: /\[\s*['"`]user_action['"`]\s*\]/g,
+    destructuring: /\{[^{}]*\buser_action\b[^{}]*\}\s*=/g,
+    table: /\bUSER_ACTIONS\b/g
+  }
+  const withoutComments = (text: string) => text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  const readsOf = (text: string) =>
+    Object.fromEntries(
+      Object.entries(READS).map(([how, pattern]) => [how, withoutComments(text).match(pattern)?.length ?? 0])
+    )
+
+  it('meets one reader of the action, counted by its reads, so that no second reader adds a line after the first', () => {
     const readers = Object.entries(files)
-      .filter(([path]) => !/\/src\/host\/fake[^/]*\.ts$|\.\.\/src\/host\/fake[^/]*\.ts$/.test(path))
-      .filter(([, text]) => /\.user_action\b|USER_ACTIONS/.test(text))
-      .map(([path]) => path)
-    expect(readers).toEqual(['../src/host/port.ts'])
+      .filter(([path]) => !/\/src\/host\/fake[^/]*\.ts$/.test(path))
+      .map(([path, text]) => [path, readsOf(text)] as const)
+      .filter(([, reads]) => Object.values(reads).some((count) => count > 0))
+    // `failureMessage` reads the key once and looks it up in the table: one property read, and the
+    // table's own declaration, its membership test and its lookup.
+    expect(readers).toEqual([['../src/host/port.ts', { property: 1, bracket: 0, destructuring: 0, table: 3 }]])
+  })
+
+  it('counts a second reader of the action, whether by a property, a bracket or a destructuring', () => {
+    for (const second of [
+      'const key = failure.user_action',
+      "const key = failure['user_action']",
+      'const { user_action } = failure',
+      'const { code, user_action: key } = failure'
+    ]) {
+      const reads = readsOf(second)
+      expect(Object.values(reads).reduce((total, count) => total + count, 0), second).toBe(1)
+    }
+    expect(readsOf('// failure.user_action\n/* USER_ACTIONS */')).toEqual({
+      property: 0,
+      bracket: 0,
+      destructuring: 0,
+      table: 0
+    })
   })
 })

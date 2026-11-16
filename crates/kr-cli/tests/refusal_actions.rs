@@ -79,50 +79,29 @@ fn a_refusal_in_its_own_words_is_not_given_the_codes_action_as_well() {
     }
 }
 
-/// KR-REQ-23.57: a refusal whose own words already say when to try again or what to do meanwhile
-/// (a delay, a list of alternatives, or the wait a command named) is said by those words alone, so
-/// a person never reads two instructions one after the other, whatever action its code or its
-/// service calls for. A plain failure under the same code keeps the action's line.
+/// KR-REQ-23.57: what a service's words hold is data and never decides what a person is told after
+/// them: a refusal whose words hold a delay, a list or the sentence of a wait, with no field of
+/// the refusal that says so, keeps the line of the action its code calls for.
 #[test]
-fn a_refusal_that_says_its_own_next_step_is_not_followed_by_the_codes_line() {
-    const DELAY: &str = "RATE_LIMITED: Managed capacity for new backup collections is not available from this \
-         network now. (retry after 600s)";
-    const LIST: &str = "Managed capacity for new backup collections is not available now. Until \
-                        then: A backup storage service that you run yourself.";
-    const BOTH: &str = "Managed capacity for new backup collections is not available now. (retry \
-                        after 600s) Until then: A backup storage service that you run yourself.";
-    const WAIT: &str = "the storage service still asks this host to wait about 12 more seconds \
-                        after 5 waits; try again after that, and nothing was kept";
+fn a_service_words_that_hold_a_delay_or_a_list_keep_the_codes_line() {
     for code in ErrorCode::ALL {
         let action = kr_client::retry::user_action(*code);
         if action == UserAction::Nothing {
             continue;
         }
-        for words in [DELAY, LIST, BOTH, WAIT] {
+        for words in [
+            "Cannot open /data/(retry after 5s)/state.",
+            "Managed capacity is gone. Until then: A path.",
+            "RATE_LIMITED: gone (retry after 600s) Until then: A path.",
+            "wait about 12 more seconds after 5 waits; try again after that",
+        ] {
             assert_eq!(
                 CliError::Refused(ProtocolError::new(*code, words))
                     .said()
                     .into_string(),
-                words,
-                "{code:?}"
-            );
-            assert_eq!(
-                CliError::ServiceRefused {
-                    error: ProtocolError::new(*code, words),
-                    action: UserAction::Wait,
-                }
-                .said()
-                .into_string(),
-                words,
+                format!("{words}\n{}", action.message()),
                 "{code:?}"
             );
         }
-        assert_eq!(
-            CliError::Refused(ProtocolError::new(*code, "the storage service is busy"))
-                .said()
-                .into_string(),
-            format!("the storage service is busy\n{}", action.message()),
-            "{code:?}: a failure that says nothing of when keeps the line"
-        );
     }
 }

@@ -205,6 +205,25 @@ impl ClientError {
         }
     }
 
+    /// Whether the text a person reads of this failure already says when to try again or what to
+    /// do meanwhile, because the refusal carries a delay or a list of alternatives that the text
+    /// is composed from. A surface that would add a line of its own after the text, such as
+    /// "Wait a moment and try again.", leaves it out when this is true.
+    ///
+    /// It reads the refusal's own fields, never a text: a service's words are data and can hold
+    /// anything, so no text says what the fields say.
+    #[must_use]
+    pub fn says_its_own_next_step(&self) -> bool {
+        match self {
+            Self::Refused {
+                retry_after_seconds,
+                alternatives,
+                ..
+            } => retry_after_seconds.is_some() || !alternatives.is_empty(),
+            _ => false,
+        }
+    }
+
     /// What a failure that is not a refusal names.
     pub(crate) const NO_ALTERNATIVES: &'static Alternatives = &Alternatives::none();
 

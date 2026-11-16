@@ -1937,7 +1937,9 @@ mod tests {
                     "{status} {code:?}"
                 );
                 assert!(
-                    !kr_client::services::says_its_own_next_step(&error.to_string()),
+                    error
+                        .to_string()
+                        .starts_with(kr_pairing::RENDEZVOUS_UNAVAILABLE_PREFIX),
                     "{status} {code:?}"
                 );
             }
