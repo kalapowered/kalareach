@@ -75,6 +75,8 @@ pub struct Worker {
     pub service: Arc<WorkerService>,
     pub session_id: SessionId,
     endpoint: kr_ipc::paths::Endpoint,
+    secrets_dir: std::path::PathBuf,
+    environment_id: EnvironmentId,
     _runtime: Arc<SessionRuntime>,
     _closing: kr_worker::testing::ClosedOnDrop,
     serving: tokio::task::JoinHandle<()>,
@@ -359,10 +361,50 @@ impl Worker {
             service,
             session_id,
             endpoint,
+            secrets_dir: environment.secrets_dir(),
+            environment_id,
             _closing: kr_worker::testing::ClosedOnDrop::of(&runtime),
             _runtime: runtime,
             serving,
         }
+    }
+
+    /// Begins a presentation of the daemon's generation at this worker on a connection that
+    /// declared `role`, as one of the daemon's own readers does: signed with the daemon's key and
+    /// carrying the generation the worker has accepted. The task ends once the worker has decided
+    /// the presentation, which a held dispatch boundary delays, and gives the link back.
+    pub fn begin_a_presentation_as(
+        &self,
+        role: kr_protocol::local::ControllerConnectionRole,
+    ) -> tokio::task::JoinHandle<kr_ipc::client::BoundLink> {
+        let generation = self
+            .service
+            .accepted_generation()
+            .expect("the daemon presented a generation at its start");
+        let identity = {
+            let store = open_store_in(&self.secrets_dir).expect("a secret store");
+            ControllerIdentity::open(store.store.as_ref(), self.environment_id, false)
+                .expect("the daemon's identity")
+        };
+        let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+        let endpoint = self.endpoint.clone();
+        tokio::spawn(async move {
+            let mut link = kr_ipc::client::BoundLink::connect(&endpoint, build())
+                .await
+                .expect("connects to the worker");
+            link.send(&kr_protocol::envelope::ControlFrame::ControllerRole(role))
+                .await
+                .expect("declares its role");
+            let _ = link.recv().await.expect("the role is acknowledged");
+            link.present_generation(move |nonce| {
+                identity
+                    .generation_token(generation, &boot, nonce)
+                    .map_err(kr_ipc::IpcError::from)
+            })
+            .await
+            .expect("the presentation is decided");
+            link
+        })
     }
 
     /// The owner's own client on this worker's socket, as a terminal on this machine reaches it.

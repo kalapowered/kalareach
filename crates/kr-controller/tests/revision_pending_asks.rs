@@ -1361,6 +1361,87 @@ async fn a_repeat_of_a_revocation_does_not_wait_for_a_presentation_that_is_under
     drop(workers);
 }
 
+/// KR-REQ-09.12, KR-ACC-022: a presentation of another role that waits at a held boundary before the
+/// daemon's authority opening has begun is not taken for that opening.
+///
+/// The daemon's attention and description readers present by themselves, and under load one of
+/// them can reach a held boundary before the authority's opening does. The case makes that order
+/// with a pause it confirms: the pass's asks are held, so no authority presentation can begin, and a
+/// presentation of the proxy role (a connection the daemon opens for a caller, which replaces none of
+/// the readers' links) is begun at the held boundary. The case waits on the count of that role until
+/// the presentation waits, and finds no authority presentation begun or waiting, though a count over
+/// every role says one waits. The pass is let go, and the authority opening that follows is counted
+/// alone, by its own wait and its own rise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_presentation_of_another_role_waiting_first_is_not_taken_for_the_authority_opening() {
+    let Adopted {
+        host,
+        owner: _,
+        workers,
+    } = Adopted::start(1).await;
+    let worker = &workers[0];
+    let begun_before_the_opening =
+        authority_presentations_with_the_link_up(host.controller(), worker).await;
+    host.controller().hold_the_pass_asks_for_tests(true);
+    let held = restricted_while_the_boundary_is_held(host.controller(), worker).await;
+    host.controller()
+        .forget_the_worker_link_for_tests(worker.session_id)
+        .await;
+    let other = worker.begin_a_presentation_as(ControllerConnectionRole::Proxy);
+    until(
+        Duration::from_secs(40),
+        "the other role's presentation, which waits at the held boundary",
+        || {
+            worker
+                .service
+                .presentations_waiting_for_role_for_tests(ControllerConnectionRole::Proxy)
+                == 1
+        },
+    )
+    .await;
+    assert_eq!(
+        authority_presentations_waiting(worker),
+        0,
+        "no authority presentation waits while the pass's asks are held (all roles: {})",
+        worker.service.presentations_waiting_for_tests()
+    );
+    assert_eq!(
+        authority_presentations_since(worker, begun_before_the_opening),
+        0,
+        "no authority presentation has begun while the pass's asks are held (by role: {})",
+        presentations_by_role(worker)
+    );
+
+    host.controller().hold_the_pass_asks_for_tests(false);
+    until(
+        Duration::from_secs(40),
+        "the pass's ask of the worker, which begins an authority presentation that waits",
+        || authority_presentations_waiting(worker) == 1,
+    )
+    .await;
+    assert_eq!(
+        authority_presentations_since(worker, begun_before_the_opening),
+        1,
+        "the authority presentations the host began once the pass was let go, counted from \
+         {begun_before_the_opening} with the daemon's link up (now, by role: {})",
+        presentations_by_role(worker)
+    );
+
+    held.release();
+    until_nobody_is_pending(
+        host.controller(),
+        DEBT_PASS_INTERVAL * 3 + SLACK,
+        "the worker acknowledged once its boundary was free",
+    )
+    .await;
+    let link = other
+        .await
+        .expect("the other role's presentation was decided once the boundary was free");
+    drop(link);
+    host.stop().await;
+    drop(workers);
+}
+
 /// KR-REQ-09.12, KR-REQ-10.45: a repeat of a revocation says so when the worker no longer holds the
 /// names.
 ///
