@@ -1717,3 +1717,127 @@ async fn a_presentation_that_never_took_authority_ends_while_another_holds_the_a
     record.release();
     boundary.release();
 }
+
+/// The longest a daemon waits for a presentation to be answered before it gives up on the link: the
+/// start's rebuild drops its client after five seconds. A presentation whose peer is there is
+/// decided inside it while the boundary is taken again and again.
+const PRESENTATION_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One local client that attaches a terminal and detaches it again, back to back, until `stop` is
+/// set: each is a mutation, and each takes the dispatch boundary. It counts the mutations it made.
+async fn mutating(
+    endpoint: kr_ipc::paths::Endpoint,
+    environment_id: kr_protocol::ids::EnvironmentId,
+    session_id: SessionId,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    made: Arc<std::sync::atomic::AtomicU64>,
+) {
+    use kr_protocol::attachment::{
+        AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
+        SessionDetachParams,
+    };
+    use kr_protocol::envelope::ActionTarget;
+    use kr_protocol::ids::ActionId;
+
+    let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let target = || ActionTarget {
+        environment_id,
+        session_id: Nullable::some(session_id),
+        session_epoch: Nullable::some(SessionEpoch::V1),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    };
+    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+        let mut requested = kr_protocol::scalars::CanonicalSet::new();
+        requested.insert(AttachmentCapability::ObserveTerminal);
+        let attached: SessionAttachResult = client
+            .mutate(
+                Method::SessionAttach,
+                ActionId::new(kr_ipc::new_uuid()),
+                target(),
+                &SessionAttachParams {
+                    session_id,
+                    mode: AttachMode::Terminal,
+                    claim_geometry: false,
+                    dimensions: Nullable::some(Dimensions::new(80, 24)),
+                    terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                    requested,
+                },
+            )
+            .await
+            .expect("reaches the worker")
+            .expect("the terminal attaches")
+            .to_typed()
+            .expect("decodes");
+        client
+            .mutate(
+                Method::SessionDetach,
+                ActionId::new(kr_ipc::new_uuid()),
+                target(),
+                &SessionDetachParams {
+                    attachment_id: Nullable::some(attached.attachment.attachment_id),
+                    line_token: Nullable::null(),
+                },
+            )
+            .await
+            .expect("reaches the worker")
+            .expect("detaches");
+        made.fetch_add(2, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A presentation whose peer is there gets in while mutations take the dispatch boundary again and
+/// again.
+///
+/// Four local clients attach and detach back to back, so the boundary is free only between one
+/// mutation and the next. A presentation that tries the boundary at intervals, and does not queue
+/// for it, must still be decided within the time a daemon waits for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_living_presentation_is_decided_while_mutations_take_the_boundary_again_and_again() {
+    let host = host(1).await;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let made = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let streams: Vec<_> = (0..4)
+        .map(|_| {
+            let (stop, made) = (Arc::clone(&stop), Arc::clone(&made));
+            tokio::spawn(mutating(
+                host.endpoint.clone(),
+                host.environment_id,
+                host.session_id,
+                stop,
+                made,
+            ))
+        })
+        .collect();
+    settle(|| made.load(std::sync::atomic::Ordering::SeqCst) >= 20).await;
+    assert!(
+        made.load(std::sync::atomic::Ordering::SeqCst) >= 20,
+        "the mutations are under way"
+    );
+
+    let before = made.load(std::sync::atomic::Ordering::SeqCst);
+    let living = presenting(&host, 1);
+    let decided = tokio::time::timeout(PRESENTATION_BOUND, living).await;
+    let during = made.load(std::sync::atomic::Ordering::SeqCst) - before;
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    for stream in streams {
+        stream.await.expect("the mutating client ends");
+    }
+    let (mut link, answer) = decided
+        .unwrap_or_else(|_| {
+            panic!(
+                "the living presentation was not decided within {PRESENTATION_BOUND:?} while {during} mutations took the boundary"
+            )
+        })
+        .expect("the task ends");
+    answer.expect("the presentation is accepted");
+    eprintln!(
+        "presentation decided after {} tries while {during} mutations took the boundary",
+        host.service.presentation_tries_for_tests()
+    );
+    read_session(&mut link, host.session_id)
+        .await
+        .expect("the presenting connection holds the authority");
+}
