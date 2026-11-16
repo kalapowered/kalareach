@@ -162,10 +162,13 @@ pub trait ControlTransport: Send + Sync + std::fmt::Debug {
     /// Returns [`ClientError::ConnectionEnded`] when the receive side is already claimed.
     fn claim_receiver(&self) -> Result<()>;
 
-    /// Reads the next control frame, or `None` when the stream ended without a failure: the peer
-    /// finished it at a frame's boundary on a network connection, or this side closed the
-    /// connection. A stream that fails is an error that carries what the transport said, and the
-    /// local link reports the peer's end at a frame's boundary as such an error too.
+    /// Reads the next control frame, or `None` when the stream ended without a failure: this side
+    /// closed the connection, which every transport reports as `None` by its own knowledge of its
+    /// close, whatever its read would otherwise fail with; or the peer finished the stream at a
+    /// frame's boundary on a network connection. Every other end is an error that carries what the
+    /// transport said, and it stays that error when a close follows it. The local link reports the
+    /// peer's end at a frame's boundary as an error, and also closes itself, and then returns
+    /// `None`, after a write that was cut or failed part way.
     ///
     /// Only the holder of the claim calls this.
     fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>>;
@@ -414,7 +417,16 @@ impl ControlTransport for NetworkTransport {
         Box::pin(async move {
             let mut held = self.reader.lock().await;
             let reader = held.as_mut().ok_or(ClientError::ConnectionEnded)?;
-            let frame = reader.read_message::<ControlFrame>().await?;
+            let frame = match reader.read_message::<ControlFrame>().await {
+                Ok(frame) => frame,
+                // A read that fails because this side closed the connection is the clean end,
+                // as on the local link. `is_closed` says it by what the connection recorded as
+                // the cause of its end, which is the first cause: a connection that the host
+                // closed, or that was reset or timed out, before this side closed it is not one
+                // that this side closed, so its read keeps its error.
+                Err(_) if self.is_closed() => None,
+                Err(error) => return Err(error.into()),
+            };
             if frame.is_none() {
                 held.take();
             }

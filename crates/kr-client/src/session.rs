@@ -2074,9 +2074,10 @@ async fn read_loop(
         };
         let frame = match read {
             Ok(Some(frame)) => frame,
+            // A read's end is classified by what the transport returned: each transport returns
+            // the clean end for this side's own close, by its own knowledge of that close, and
+            // every other error is a failure that keeps its cause, a later close or not.
             Ok(None) => break Ended::Finished,
-            // A read that fails after the owner closed the session failed because of the close.
-            Err(_) if *stopped.borrow() => break Ended::Finished,
             Err(error) => break Ended::Failed(error),
         };
         if !route(&state, frame, ordered.as_ref()).await {
