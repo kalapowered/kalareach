@@ -442,6 +442,12 @@ impl ControlTransport for NetworkTransport {
 
     fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>> {
         Box::pin(async move {
+            // A read that starts after the owner's close is the clean end, as on the local link,
+            // and it does not touch the connection: the owner ended it on purpose, and there is
+            // nothing left for a read to find out.
+            if self.own_close.get() != OwnClose::NotMade {
+                return Ok(None);
+            }
             let mut held = self.reader.lock().await;
             let reader = held.as_mut().ok_or(ClientError::ConnectionEnded)?;
             // A read's end is classified by what the read itself returned and by this wrapper's
