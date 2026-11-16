@@ -1274,6 +1274,31 @@ impl CanonicalGrid {
         true
     }
 
+    /// Gives up every retained row above the screen and keeps the screen as it is.
+    ///
+    /// Returns whether the rows could be reached. The retained rows are the primary buffer's, and
+    /// the library lends out only the screen that is showing for writing, so while the alternate
+    /// buffer is showing nothing is done and the answer is no. The caller asks again once the
+    /// primary buffer is back.
+    ///
+    /// The rows that are showing are the last rows the screen holds and are not read, moved or
+    /// rewritten: the oldest rows are taken off the front, and the identifiers of the rows that
+    /// remain do not change. The cursor, the margins and the pen are in screen coordinates and are
+    /// not touched either.
+    pub fn discard_history(&mut self) -> bool {
+        if self.alternate_active() {
+            return false;
+        }
+        let rows = self.size.rows as usize;
+        let screen = self.terminal.screen_mut();
+        // The library subtracts the screen's rows from what it holds, so there has to be more.
+        if screen.scrollback_rows() > rows {
+            screen.erase_scrollback();
+        }
+        self.sync_history();
+        true
+    }
+
     /// Drops the rows that are now past the scrollback bound, without waiting for more output.
     ///
     /// The library evicts while it scrolls, so a session that has stopped printing would otherwise
