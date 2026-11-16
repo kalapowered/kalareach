@@ -2558,6 +2558,41 @@ mod tests {
     /// The service name the selection's cases open the stand-in under, which nothing else uses.
     const SELECTION_SERVICE: &str = "kalareach-selection-cases";
 
+    /// One state of a host's directory in one environment, and what the selection answers.
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+    ))]
+    struct Row {
+        row: &'static str,
+        record: Option<StoreKind>,
+        files: bool,
+        opens: bool,
+        answer: Option<StoreKind>,
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+    ))]
+    impl Row {
+        fn new(
+            row: &'static str,
+            record: Option<StoreKind>,
+            files: bool,
+            opens: bool,
+            answer: Option<StoreKind>,
+        ) -> Self {
+            Self {
+                row,
+                record,
+                files,
+                opens,
+                answer,
+            }
+        }
+    }
+
     /// KR-REQ-10.47: each state of a host's directory and each environment has one store for the
     /// host's keys. The record and the files already in the directory decide it before what opens
     /// does, a record that names the platform store is never given up for another one, and the
@@ -2574,51 +2609,51 @@ mod tests {
         let name = SecretName::new("host/x").expect("a name");
         // The state: a record, files already in the directory; the environment: whether the
         // platform store opens; the answer: the store, or a refusal.
-        let rows: [(&str, Option<StoreKind>, bool, bool, Option<StoreKind>); 8] = [
-            ("no record, empty, opens", None, false, true, Some(Platform)),
-            (
+        let rows = [
+            Row::new("no record, empty, opens", None, false, true, Some(Platform)),
+            Row::new(
                 "no record, empty, closed",
                 None,
                 false,
                 false,
                 Some(FileFallback),
             ),
-            (
+            Row::new(
                 "no record, files, opens",
                 None,
                 true,
                 true,
                 Some(FileFallback),
             ),
-            (
+            Row::new(
                 "no record, files, closed",
                 None,
                 true,
                 false,
                 Some(FileFallback),
             ),
-            (
+            Row::new(
                 "record platform, opens",
                 Some(Platform),
                 false,
                 true,
                 Some(Platform),
             ),
-            (
+            Row::new(
                 "record platform, closed",
                 Some(Platform),
                 false,
                 false,
                 None,
             ),
-            (
+            Row::new(
                 "record file, opens",
                 Some(FileFallback),
                 false,
                 true,
                 Some(FileFallback),
             ),
-            (
+            Row::new(
                 "record file, closed",
                 Some(FileFallback),
                 false,
@@ -2626,7 +2661,14 @@ mod tests {
                 Some(FileFallback),
             ),
         ];
-        for (row, record, files, opens, answer) in rows {
+        for Row {
+            row,
+            record,
+            files,
+            opens,
+            answer,
+        } in rows
+        {
             let base = scratch_directory("selection-row");
             if files {
                 open_store_in(&base)
