@@ -661,16 +661,18 @@ impl RemoteOutput {
                     .feed_refusal_on(self.authority.connection_id)
                     .is_some()
         };
-        // What stands at the stream, asked in one place and reading atomics and clocks alone: the
-        // standing a kept answer or a conflict was admitted under (the fence this host owes, the
-        // revision in force and the connection's latch), every bound the answer is written under
-        // and the decision a relayed batch rides on.
+        // What stands at the stream, asked in one place and taking no lock: every bound the answer
+        // is written under, the decision a relayed batch rides on, and last the standing a kept
+        // answer or a conflict was admitted under (the fence this host owes, the revision in force
+        // and the connection's latch). The bounds are read first because reading a bound's cell
+        // can wait, and the footing's question reads atomics alone, so nothing it reads is behind
+        // such a wait.
         let standing = || {
-            kept_standing.is_none_or(|footing| footing.ask(Ask::KEPT_ANSWER).is_ok())
-                && bounds_hold(&self.authority.controller, under, HeldBound::stands_at)
+            bounds_hold(&self.authority.controller, under, HeldBound::stands_at)
                 && relaying
                     .as_ref()
                     .is_none_or(|relaying| relaying.grant.holds(&self.authority.controller))
+                && kept_standing.is_none_or(|footing| footing.ask(Ask::KEPT_ANSWER).is_ok())
         };
         let decided = || !feed_refuses() && standing() && read_under.is_none_or(ReadUnder::stands);
         if !decided() {
