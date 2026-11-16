@@ -1221,11 +1221,21 @@ impl View {
             Completed::Lane(opened) => return self.lane_opened(opened),
             Completed::Call(answered) => answered,
         };
-        // A launch's hold on the later typing ends with its answer, whatever the answer was.
-        if let Some(launch) = self.holds.remove(&tag)
-            && let Some(lane) = &self.lane
-        {
-            lane.release_hold(launch);
+        // A launch's hold on the later typing ends with the host's definite word on it: a result, or
+        // any refusal that is not the library's "unknown", a transient one and the host's own among
+        // them. An unknown word keeps the hold, because the launch may still be before its
+        // reservation and typing released now could reach the program first; the lane ends it at the
+        // launch's marker, whenever that comes, and at the end of its epoch or its stream. An older
+        // launch's word never ends a newer launch's hold: the lane keeps a hold by its launch.
+        if let Some(launch) = self.holds.remove(&tag) {
+            let unknown = matches!(
+                &answered,
+                Err(failed) if refusal_of(failed)
+                    .is_some_and(|refusal| HostWord::of_refusal(&refusal) == HostWord::Unknown)
+            );
+            if !unknown && let Some(lane) = &self.lane {
+                lane.release_hold(launch);
+            }
         }
         let outcome = match answered {
             Ok(value) => Outcome::Ok(value),
@@ -2180,25 +2190,36 @@ impl View {
         // that the host answered and whose acceptance or refusal the view has not read yet is not
         // one that waits.
         tokio::task::yield_now().await;
-        while let Some(event) = self.lane_events.as_mut().and_then(InputEvents::try_recv) {
-            match event {
-                InputEvent::Accepted { epoch, through, .. } => self.accepted(epoch, through),
-                InputEvent::Refused {
-                    epoch,
-                    sequence,
-                    error,
-                    ..
-                } => {
-                    let _ = self.refused(epoch, sequence, error);
-                }
-                _ => {}
+        for heard in std::mem::take(&mut self.heard) {
+            if let Heard::Lane(Some(event)) = heard {
+                self.settle(event);
             }
+        }
+        while let Some(event) = self.lane_events.as_mut().and_then(InputEvents::try_recv) {
+            self.settle(event);
         }
         if detach {
             self.detach().await;
         }
         self.link.close();
         self.events.drain().await;
+    }
+
+    /// Applies what the lane said of the keys, at the close: an acceptance or a refusal settles keys,
+    /// and nothing else of the lane's words matters to a view that ends.
+    fn settle(&mut self, event: InputEvent) {
+        match event {
+            InputEvent::Accepted { epoch, through, .. } => self.accepted(epoch, through),
+            InputEvent::Refused {
+                epoch,
+                sequence,
+                error,
+                ..
+            } => {
+                let _ = self.refused(epoch, sequence, error);
+            }
+            _ => {}
+        }
     }
 
     /// Writes the detach whole, behind the typing the lane holds.
