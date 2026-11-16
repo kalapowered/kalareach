@@ -34,7 +34,8 @@ final class LinkTapTests: HarnessTestCase {
         let kind: String
         let pointer: String
         let pointerType: String
-        /// At a pointer down: the name of the link that the page's press handling had lit by then, or nil.
+        /// At a pointer down and at a click: the name of the link that the page's press handling had lit by then, or nil.
+        /// The click's is the look at the click, which plain text gets only there; a press on plain text lights nothing.
         let lit: String?
     }
 
@@ -216,7 +217,7 @@ final class LinkTapTests: HarnessTestCase {
         let list = result.events.map {
             "\($0.type)(\($0.target),\($0.trusted ? "trusted" : "synthetic"),detail \($0.detail),\($0.kind) pointer \($0.pointer) \($0.pointerType),at \(String(format: "%.1f %.1f", $0.point.x, $0.point.y)))"
         }.joined(separator: " ")
-        say("LINKTAP \(result.label) at (\(Int(point.x)), \(Int(point.y))): \(list.isEmpty ? "no events" : list) | the click named: \(named(result)) | lit at the press: \(result.events.first(where: { $0.type == "pointerdown" })?.lit ?? "nothing") | press-to-click(\(clickKind(result))): \(away(result).map { String(format: "%.1f", $0) } ?? "no click") | pointer point off by \(pointerOff(result, at: point)) | opened: \(result.opened.isEmpty ? "nothing" : result.opened.joined(separator: " ")) | \(result.focus)")
+        say("LINKTAP \(result.label) at (\(Int(point.x)), \(Int(point.y))): \(list.isEmpty ? "no events" : list) | the click named: \(named(result)) | lit at the press: \(pressLook(result) ?? "nothing") | lit at the click: \(clickLook(result) ?? "nothing") | press-to-click(\(clickKind(result))): \(away(result).map { String(format: "%.1f", $0) } ?? "no click") | pointer point off by \(pointerOff(result, at: point)) | opened: \(result.opened.isEmpty ? "nothing" : result.opened.joined(separator: " ")) | \(result.focus)")
     }
 
     /// What the system's click landed on, for the two distances that are logged apart: `element` (a link's button or another
@@ -244,22 +245,48 @@ final class LinkTapTests: HarnessTestCase {
         return String(target[target.index(after: open)..<target.index(before: target.endIndex)])
     }
 
-    /// The look at the press against what the tap did, or nil where they agree. A tap with no trusted click of the system's
-    /// does not agree (unless `clickExpected` is false). Where the system's click names plain
-    /// text the page decided, and the look at the press is the open at the release; where it names a link's button or
-    /// another control, the system decided, and the look lit nothing or that same link.
+    /// The look the page had lit at the pointer's press, or nil.
+    private func pressLook(_ result: Result) -> String? {
+        result.events.first(where: { $0.type == "pointerdown" })?.lit
+    }
+
+    /// The look the page had lit at the system's trusted click, or nil.
+    private func clickLook(_ result: Result) -> String? {
+        result.events.first(where: { $0.type == "click" && $0.trusted })?.lit
+    }
+
+    /// Whether an event's target is neither a link's own element nor a control: plain text, the pane or its message.
+    private func isPlainText(_ target: String) -> Bool {
+        !target.contains("md-link") && !target.hasPrefix("button")
+    }
+
+    /// The look against what the tap did, or nil where they agree. A tap with no trusted click of the system's
+    /// does not agree (unless `clickExpected` is false). The look at the click is the link that opens: the link the system's
+    /// click names, or, where it names plain text, the link the page opens from it (none where it opens nothing); a control's
+    /// click has none. The look at the press is none on plain text and on a control, and on a link's own element it is
+    /// none or the link that the click then names.
     private func lookDisagreement(_ result: Result, clickExpected: Bool = true) -> String? {
         // Without the system's click there is nothing to hold the look to: a tap that gets none fails, since the look
         // would then pass whatever it lit.
         guard let click = result.events.first(where: { $0.type == "click" && $0.trusted }) else { return clickExpected ? "no trusted click arrived" : nil }
-        let lit = result.events.first(where: { $0.type == "pointerdown" })?.lit
+        let press = pressLook(result)
+        let atClick = click.lit
+        let pressTarget = result.events.first(where: { $0.type == "pointerdown" })?.target
+        // What the click opens: the link whose button it names, or the link the page opened from plain text.
+        let opens: String?
         if click.target.contains("md-link") {
-            let name = linkName(of: click.target)
-            return lit == nil || lit == name ? nil : "lit \(lit ?? "nothing"), the click named the button of \(name ?? "a link")"
+            opens = linkName(of: click.target)
+        } else if click.target.hasPrefix("button") {
+            opens = nil
+        } else {
+            opens = result.opened.last.map { String($0.split(separator: "/").last ?? "") }
         }
-        if click.target.hasPrefix("button") { return lit == nil ? nil : "lit \(lit ?? "") on a control" }
-        let opened = result.opened.last.map { String($0.split(separator: "/").last ?? "") }
-        return lit == opened ? nil : "lit \(lit ?? "nothing"), opened \(opened ?? "nothing")"
+        if atClick != opens {
+            return "the click named \(click.target), lit \(atClick ?? "nothing") at the click, the link that opens is \(opens ?? "none")"
+        }
+        if let pressTarget, isPlainText(pressTarget), press != nil { return "lit \(press ?? "") at a press on plain text (\(pressTarget))" }
+        if press != nil && press != opens { return "lit \(press ?? "") at the press, the click opens \(opens ?? "none")" }
+        return nil
     }
 
     /// What the system's click named, and whether the page added a click of its own: `button` (the link's own, by the
@@ -414,7 +441,8 @@ final class LinkTapTests: HarnessTestCase {
     }
 
     /// A tap outside the area that lands on the link's own button: the system's click names the button, the page adds
-    /// no click, and the look lit nothing or that link, as for any press on a link's own element.
+    /// no click, the look at the press is none or that link, as for any press on a link's own element, and the look
+    /// at the click is that link.
     private func expectOnTheLinksButton(_ result: Result, _ name: String, file: StaticString = #filePath, line: UInt = #line) {
         XCTAssertFalse(result.events.contains { $0.type == "click" && !$0.trusted }, "\(result.label): the page added a click on the link's own button", file: file, line: line)
         if let disagreement = lookDisagreement(result) { XCTFail("\(result.label): \(disagreement)", file: file, line: line) }
@@ -422,13 +450,16 @@ final class LinkTapTests: HarnessTestCase {
         XCTAssertTrue(result.opened.allSatisfy { $0.hasSuffix(name) }, "\(result.label): opened \(result.opened), expected only \(name)", file: file, line: line)
     }
 
-    /// A tap outside the area: the page adds no click and lights nothing; where the platform's own adjustment opens the
-    /// link there, the system's click names the link's button.
+    /// A tap outside the area: the page adds no click and lights nothing at the press, and nothing at the click unless the
+    /// platform's own adjustment opens the link there: then the system's click names the link's button and that link has
+    /// the look at the click.
     private func expectNotOpenedByThePage(_ result: Result, _ name: String, file: StaticString = #filePath, line: UInt = #line) {
         XCTAssertFalse(result.events.contains { $0.type == "click" && !$0.trusted }, "\(result.label): the page added a click outside the area", file: file, line: line)
-        XCTAssertNil(result.events.first(where: { $0.type == "pointerdown" })?.lit, "\(result.label): the look lit outside the area", file: file, line: line)
+        XCTAssertNil(pressLook(result), "\(result.label): the look lit at the press outside the area", file: file, line: line)
+        let click = result.events.first { $0.type == "click" && $0.trusted }
+        let named = click.flatMap { $0.target.contains("md-link") ? linkName(of: $0.target) : nil }
+        XCTAssertEqual(clickLook(result), named, "\(result.label): the look at the click outside the area, the click named \(click?.target ?? "none")", file: file, line: line)
         if !result.opened.isEmpty {
-            let click = result.events.first { $0.type == "click" && $0.trusted }
             XCTAssertTrue(click?.target.contains("md-link") ?? false, "\(result.label): opened \(result.opened) with a click that named \(click?.target ?? "none")", file: file, line: line)
             XCTAssertEqual(result.opened.count, 1, "\(result.label): the links that opened: \(result.opened), expected \(name) once", file: file, line: line)
             XCTAssertTrue(result.opened.allSatisfy { $0.hasSuffix(name) }, "\(result.label): opened \(result.opened), expected only \(name)", file: file, line: line)
@@ -469,7 +500,8 @@ final class LinkTapTests: HarnessTestCase {
             XCTAssertTrue(bare.events.contains { $0.type == "click" && $0.trusted }, "\(bare.label): the system sent no click to the bare area: \(bare.events.map(\.type))")
             XCTAssertFalse(bare.events.contains { $0.type == "click" && !$0.trusted }, "\(bare.label): the page added a click")
             XCTAssertTrue(bare.opened.isEmpty, "\(bare.label): opened \(bare.opened)")
-            XCTAssertNil(bare.events.first(where: { $0.type == "pointerdown" })?.lit, "\(bare.label): the look lit")
+            XCTAssertNil(pressLook(bare), "\(bare.label): the look lit at the press")
+            XCTAssertNil(clickLook(bare), "\(bare.label): the look lit at the click")
         }
         let atBottom = tap("\(named): the pane's bottom row", at: CGPoint(x: words.midX, y: room.maxY - 1), shift: shift)
         XCTAssertTrue(atBottom.opened.isEmpty, "\(atBottom.label): opened \(atBottom.opened)")
