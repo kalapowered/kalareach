@@ -171,6 +171,16 @@ pub struct Producer {
     /// sends what it has read, for this host's own tests.
     #[cfg(feature = "testing")]
     after_the_take: crate::testing::Stall,
+    /// Stands in the question ledger's reader after it has read the ledger and before it records
+    /// what it found, for this host's own tests.
+    #[cfg(feature = "testing")]
+    before_the_fact: crate::testing::Stall,
+    /// How many rounds the evidence loop has begun and how many of them have come to a wait, for
+    /// this host's own tests: the two are equal while the loop waits.
+    #[cfg(feature = "testing")]
+    rounds: std::sync::atomic::AtomicUsize,
+    #[cfg(feature = "testing")]
+    waits: std::sync::atomic::AtomicUsize,
     #[cfg(feature = "testing")]
     before_the_send: crate::testing::Stall,
     /// How many helper threads of this producer are alive: its publisher, and the reader of the
@@ -259,6 +269,12 @@ impl Producer {
                 owed,
                 #[cfg(feature = "testing")]
                 after_the_take: crate::testing::Stall::default(),
+                #[cfg(feature = "testing")]
+                before_the_fact: crate::testing::Stall::default(),
+                #[cfg(feature = "testing")]
+                rounds: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(feature = "testing")]
+                waits: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(feature = "testing")]
                 before_the_send: crate::testing::Stall::default(),
                 #[cfg(feature = "testing")]
@@ -420,6 +436,32 @@ impl Producer {
         self.published.send_replace(application);
     }
 
+    /// Stops the question ledger's reader after it has read the ledger and before it records what
+    /// it found, for this host's own tests. Returns the end that says the reader has arrived there
+    /// and the end that lets it go on; the stop fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn pause_ledger_reader_before_its_fact(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.before_the_fact.arm_blocking()
+    }
+
+    /// Returns how many rounds the evidence loop has begun and how many of them have come to a wait
+    /// on its stream, for this host's own tests. While the two are equal the loop waits, with the
+    /// facts it last read.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn loop_rounds(&self) -> (usize, usize) {
+        (
+            self.rounds.load(std::sync::atomic::Ordering::SeqCst),
+            self.waits.load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
     /// Stops the next publication after the publisher has taken the session and before it reads the
     /// facts, for this host's own tests. Returns the end that says the publisher has arrived there
     /// and the end that lets it go on; the stop fires once. Facts that join while it stands there
@@ -497,6 +539,10 @@ pub async fn follow_evidence(
     let ledger_read = Arc::new(tokio::sync::Notify::new());
     let ask = read_the_ledger_apart(&producer, &questions, Arc::clone(&ledger_read), clock);
     loop {
+        #[cfg(feature = "testing")]
+        producer
+            .rounds
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let moved_questions = questions.subscribe();
         let moved_ledger = ledger_read.notified();
         let moved_journal = journal_changes.as_ref().map(|journal| journal.notified());
@@ -512,6 +558,10 @@ pub async fn follow_evidence(
             return;
         }
         let question_open = producer.question_open();
+        #[cfg(feature = "testing")]
+        producer
+            .waits
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         tokio::select! {
             () = moved_questions => {}
             () = moved_ledger => {}
@@ -590,10 +640,12 @@ fn read_the_ledger_apart(
                 };
                 // A ledger that cannot be read says nothing, so the fact keeps its last value: an
                 // error is not "no question".
-                if let Ok(open) = questions.any_open(now)
-                    && producer.observe_questions(open)
-                {
-                    moved.notify_waiters();
+                if let Ok(open) = questions.any_open(now) {
+                    #[cfg(feature = "testing")]
+                    producer.before_the_fact.stand();
+                    if producer.observe_questions(open) {
+                        moved.notify_waiters();
+                    }
                 }
             }
         })
