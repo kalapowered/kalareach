@@ -13,6 +13,7 @@ use crate::account::{HostAccount, Service};
 use crate::config::Outbound;
 use crate::error::{ControllerError, Result};
 
+use super::footing::{Ask, Footing, LeasedLapse};
 use super::{Controller, parse};
 
 /// The account service's origin: the one the browser signs in at, which the issuer every answer is
@@ -227,6 +228,14 @@ impl Controller {
     /// membership lease for `method`, which on a host that is exclusively organisation-managed is
     /// the authority the request was accepted under. The request's deadline and its connection are
     /// not asked: that request has answered, and its connection ends with the command.
+    ///
+    /// The lease is read first, which waits for the policy lock that a policy commit holds across
+    /// its storage writes. The footing's one question is asked after that, with the bound of the
+    /// lease that reading found, and reads atomics and clocks alone: nothing but instructions
+    /// stands between it and the write that the caller goes on to. A bound whose cell moved to
+    /// another lineage between the reading and the question is not decided by the question: the
+    /// lease is read again and the question asked with the new bound. Where the sign-in stands,
+    /// the host is given to the caller as the guard to hold until its write has returned.
     pub(super) fn sign_in_lasting(self: &Arc<Self>, method: Method) -> crate::account::Lasting {
         let controller = Arc::downgrade(self);
         Arc::new(move || {
@@ -236,22 +245,23 @@ impl Controller {
                     .ok_or_else(|| ControllerError::PermissionDenied {
                         detail: "this host is stopping".to_owned(),
                     })?;
-            // The lease is read first: reading it waits for the policy lock, which a policy commit
-            // holds across its storage writes, and the fence is read after that wait. Reading the
-            // fence takes its own lock, so the lease's end is compared with the clock again after
-            // it, with no lock of its own.
-            let end = controller
-                .local_hold(method)
-                .map_err(ControllerError::from)?
-                .end;
-            #[cfg(feature = "testing")]
-            controller.before_the_last_fence_read.wait();
-            controller.check_fence()?;
-            controller
-                .lease_is_live_until(end)
-                .map_err(ControllerError::from)?;
-            // The guard: the account holds this host until its write has returned.
-            Ok(crate::account::Guard::new(controller))
+            let footing = Footing::untargeted(Arc::clone(&controller.copies));
+            loop {
+                let held = controller
+                    .local_hold(method)
+                    .map_err(ControllerError::from)?;
+                #[cfg(feature = "testing")]
+                controller.before_the_last_fence_read.wait();
+                let asked = match held.bound {
+                    Some(bound) => footing.clone().holding(bound).ask(Ask::SIGN_IN),
+                    None => footing.ask(Ask::SIGN_IN).map_err(LeasedLapse::from),
+                };
+                match asked {
+                    Ok(()) => return Ok(crate::account::Guard::new(controller)),
+                    Err(LeasedLapse::BoundMoved) => {}
+                    Err(LeasedLapse::Lapse(lapse)) => return Err(lapse.refusal()),
+                }
+            }
         })
     }
 
@@ -269,10 +279,11 @@ impl Controller {
         carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
         let _: AccountSignInParams = parse(&mutation.params)?;
+        let footing = self.footing_of_a_mutation(&carried)?;
         let started = self
             .own_storage_account()?
             .sign_in(
-                &|| self.check_registration(&carried),
+                &|| footing.stands(Ask::MUTATION),
                 self.sign_in_lasting(Method::AccountStorageSignIn),
             )
             .await?;
@@ -294,9 +305,10 @@ impl Controller {
         carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
         let _: AccountSignOutParams = parse(&mutation.params)?;
+        let footing = self.footing_of_a_mutation(&carried)?;
         let done = self
             .own_storage_account()?
-            .sign_out(&|| self.check_registration(&carried))
+            .sign_out(&|| footing.stands(Ask::MUTATION))
             .await?;
         ParamsValue::from_typed(&done)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
@@ -327,10 +339,11 @@ impl Controller {
         carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
         let _: AccountSignInParams = parse(&mutation.params)?;
+        let footing = self.footing_of_a_mutation(&carried)?;
         let started = self
             .account
             .sign_in(
-                &|| self.check_registration(&carried),
+                &|| footing.stands(Ask::MUTATION),
                 self.sign_in_lasting(Method::AccountSignIn),
             )
             .await?;
@@ -349,9 +362,10 @@ impl Controller {
         carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
         let _: AccountSignOutParams = parse(&mutation.params)?;
+        let footing = self.footing_of_a_mutation(&carried)?;
         let done = self
             .account
-            .sign_out(&|| self.check_registration(&carried))
+            .sign_out(&|| footing.stands(Ask::MUTATION))
             .await?;
         ParamsValue::from_typed(&done)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
