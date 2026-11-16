@@ -1296,6 +1296,66 @@ fn a_privacy_call_with_a_write_in_flight_returns_and_no_reader_reaches_the_outpu
 }
 
 #[test]
+fn a_discard_owed_after_a_write_in_flight_is_made_at_the_next_append() {
+    let (temp, mut session) = session_on_disk();
+    let session_id = session.summary().session_id;
+    let (tell, making) = privacy_on_with_a_write_in_flight(&mut session);
+    tell.send(()).expect("the write is waiting to be told");
+    making.join().expect("the write is made");
+    assert!(!session.reconcile_privacy(&[]).is_complete());
+
+    session.ingest_output(b"z");
+    assert!(
+        session.reconcile_privacy(&[]).is_complete(),
+        "the append made the discard before it appended"
+    );
+    assert_eq!(segments(&temp, session_id), 0);
+    assert_eq!(session.retained_output_bytes(), 0);
+}
+
+#[test]
+fn a_disable_while_the_write_is_in_flight_is_refused_and_a_later_discard_removes_nothing_new() {
+    let (_temp, mut session) = session_on_disk();
+    let (tell, making) = privacy_on_with_a_write_in_flight(&mut session);
+    let refused = session
+        .disable_privacy(PrivacyGeneration::new(2))
+        .expect_err("the cleanup is unfinished");
+    assert!(
+        refused
+            .to_string()
+            .contains("privacy mode is not turned off while its own cleanup is unfinished"),
+        "{refused}"
+    );
+    tell.send(()).expect("the write is waiting to be told");
+    making.join().expect("the write is made");
+    session.collect_expired();
+    assert!(session.reconcile_privacy(&[]).is_complete());
+
+    // Released first, the disable goes through, and output kept after it is the new history.
+    session
+        .disable_privacy(PrivacyGeneration::new(2))
+        .expect("the cleanup is finished");
+    session.ingest_output(&[b'n'; 1024]);
+    assert_eq!(session.retained_output_bytes(), 1024);
+    // A caller that was waiting for the old write asks again and finds nothing owed.
+    session.discard_history_if_owed();
+    session.collect_expired();
+    assert_eq!(
+        session.retained_output_bytes(),
+        1024,
+        "the new history was not removed"
+    );
+    assert_eq!(
+        session
+            .history_page(0, 1 << 20)
+            .expect("a page")
+            .bytes
+            .as_slice(),
+        &[b'n'; 1024][..]
+    );
+}
+
+#[test]
 fn a_session_reopened_under_privacy_mode_serves_no_retained_byte_before_its_first_pass() {
     let (temp, mut session) = session_on_disk();
     let session_id = session.summary().session_id;

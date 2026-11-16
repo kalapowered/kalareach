@@ -614,6 +614,26 @@ impl OutputHistory {
         self.discard_owed = owed;
     }
 
+    /// Whether a discard met a write in flight and has not been made since, which is the reason
+    /// the appender asks for it again at its next append. A discard that left output behind for
+    /// any other reason is not owed by the appender: the maintenance pass takes that one.
+    #[must_use]
+    pub fn discard_deferred(&self) -> bool {
+        self.spool
+            .as_ref()
+            .is_some_and(|spool| spool.owed.discard_deferred())
+    }
+
+    /// Returns the handle that watches the spool's writes, when a discard has met one in flight
+    /// and is waiting for it to end.
+    #[must_use]
+    pub fn deferred_discard_watch(&self) -> Option<SpoolWriteWatch> {
+        self.spool
+            .as_ref()
+            .filter(|spool| spool.owed.discard_deferred())
+            .map(|spool| SpoolWriteWatch(Arc::clone(&spool.owed)))
+    }
+
     /// What a reader of the retained range is told, from the one place that says so.
     ///
     /// The history as it stands, or, while a discard is owed, as it stands once the discard is
@@ -2076,6 +2096,17 @@ impl OwedWrite {
         }
     }
 
+    /// Waits until no write is in flight, for at most `bound`, and says whether none is. It holds
+    /// no lock but the one the write ends under, which the wait lets go of.
+    fn wait_idle_for(&self, bound: std::time::Duration) -> bool {
+        let state = self.lock();
+        let (state, _) = self
+            .done
+            .wait_timeout_while(state, bound, |state| state.in_flight.is_some())
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.in_flight.is_none()
+    }
+
     /// Ends write number `ticket`, leaving its failure when it failed and the handle it opened
     /// when it opened one. A write that is no longer the one in flight has nothing to end.
     fn finish(
@@ -2238,6 +2269,35 @@ impl Drop for SpoolWrite {
                 "the write to the spool was dropped before it was made".to_owned(),
             )
         });
+    }
+}
+
+/// A handle on the write a spool owes, which says whether a discard met that write in flight and
+/// waits for the write to end.
+///
+/// It holds no lock of the session's, and nothing waits on it with one: it is what the task that
+/// made the write, and the privacy call, keep once the session is let go.
+#[derive(Clone, Debug)]
+pub struct SpoolWriteWatch(Arc<OwedWrite>);
+
+impl SpoolWriteWatch {
+    /// Whether a discard of the retained output met a write in flight and has not been made since.
+    #[must_use]
+    pub fn discard_deferred(&self) -> bool {
+        self.0.discard_deferred()
+    }
+
+    /// Waits until no write is in flight, for at most `bound`, and says whether none is.
+    #[must_use]
+    pub fn wait_idle_for(&self, bound: std::time::Duration) -> bool {
+        self.0.wait_idle_for(bound)
+    }
+}
+
+impl SpoolWrite {
+    /// Returns the handle that watches this write and the ones after it.
+    pub fn watch(&self) -> SpoolWriteWatch {
+        SpoolWriteWatch(Arc::clone(&self.owed))
     }
 }
 
