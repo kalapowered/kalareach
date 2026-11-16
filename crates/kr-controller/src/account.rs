@@ -198,15 +198,15 @@ const CALL_OPEN_REVOCATION_OWED_PAGE: &str = "A voice call is open on this host.
      in again. The host could not yet revoke what the account service issued. The host tries again \
      the next time it uses the account, and what was issued ends by itself when it expires.";
 
-/// The line that records a failed revocation of the token of a `whose` sign-in: what the queue and
-/// the service are known to have done, with "may have" where a write can have landed before it was
-/// reported as failed.
+/// The line that records a failed revocation of `whose` token: what the queue and the service are
+/// known to have done, and "may" where a step that failed can have done more than it reported (a
+/// write that landed before its flush failed, a send that reached the service).
 fn failed_revocation_line(whose: &str, unrevoked: &Unrevoked) -> String {
     let (said, error) = match unrevoked {
         Unrevoked::Queued(error) => (
             "the queue took the token and sending the queue failed, and a send of the token \
-             alone was not taken; the service may have taken the token in the first send, and \
-             the queue holds its entry",
+             alone was not acknowledged; the service may have taken the token, and the queue \
+             may still hold its entry",
             error,
         ),
         Unrevoked::Ended(error) => (
@@ -215,12 +215,13 @@ fn failed_revocation_line(whose: &str, unrevoked: &Unrevoked) -> String {
             error,
         ),
         Unrevoked::Held(error) => (
-            "the service did not take the token and the queue's write failed, which may have \
-             left its entry in place; the token is held in memory for the next send",
+            "queuing the token failed and a send of the token alone was not acknowledged; a \
+             write that had begun may have left its entry in place, and the service may have \
+             taken the token; the token is held in memory for the next send",
             error,
         ),
     };
-    format!("kr-controller: {whose} sign-in's token: {said}: {error}")
+    format!("kr-controller: {whose} token: {said}: {error}")
 }
 
 /// What a waiting sign-in came to.
@@ -1642,7 +1643,10 @@ impl Inner {
                     // is told as the keep tells them, so a revocation that is still owed is said.
                     let (commit, unrevoked) = held.signed_in.end_withheld(refresh).await;
                     if let Some(unrevoked) = unrevoked {
-                        eprintln!("{}", failed_revocation_line("a withheld", &unrevoked));
+                        eprintln!(
+                            "{}",
+                            failed_revocation_line("a withheld sign-in's", &unrevoked)
+                        );
                     }
                     return Outcome::withheld(commit);
                 };
@@ -1654,7 +1658,10 @@ impl Inner {
                     // revocation that is still owed as it is there.
                     let (commit, unrevoked) = held.signed_in.end_withheld(refresh).await;
                     if let Some(unrevoked) = unrevoked {
-                        eprintln!("{}", failed_revocation_line("a refused", &unrevoked));
+                        eprintln!(
+                            "{}",
+                            failed_revocation_line("a refused sign-in's", &unrevoked)
+                        );
                     }
                     return Outcome::call_open(commit);
                 };
@@ -1923,8 +1930,8 @@ mod tests {
 
     /// What the line of a failed revocation says is what the revocation knows, whole, in each state:
     /// where the queue took the token and the send failed, where the service took it by a send of
-    /// its own, and where only memory holds it (a queue write that was reported as failed may have
-    /// landed).
+    /// its own, and where only memory holds it. A step that failed can have done more than it
+    /// reported, so the lines say "may" there.
     #[test]
     fn the_line_of_a_failed_revocation_says_no_more_than_the_revocation_knows() {
         use kr_client::error::ClientError;
@@ -1937,15 +1944,15 @@ mod tests {
         };
         let error = failed().to_string();
         assert_eq!(
-            super::failed_revocation_line("a withheld", &Unrevoked::Queued(failed())),
+            super::failed_revocation_line("a withheld sign-in's", &Unrevoked::Queued(failed())),
             format!(
                 "kr-controller: a withheld sign-in's token: the queue took the token and sending \
-                 the queue failed, and a send of the token alone was not taken; the service may \
-                 have taken the token in the first send, and the queue holds its entry: {error}"
+                 the queue failed, and a send of the token alone was not acknowledged; the \
+                 service may have taken the token, and the queue may still hold its entry: {error}"
             )
         );
         assert_eq!(
-            super::failed_revocation_line("a refused", &Unrevoked::Ended(failed())),
+            super::failed_revocation_line("a refused sign-in's", &Unrevoked::Ended(failed())),
             format!(
                 "kr-controller: a refused sign-in's token: the service took the token by a send \
                  of its own; the queue of revocations failed, and may still hold its entry: \
@@ -1953,11 +1960,12 @@ mod tests {
             )
         );
         assert_eq!(
-            super::failed_revocation_line("a withheld", &Unrevoked::Held(failed())),
+            super::failed_revocation_line("a withheld sign-in's", &Unrevoked::Held(failed())),
             format!(
-                "kr-controller: a withheld sign-in's token: the service did not take the token \
-                 and the queue's write failed, which may have left its entry in place; the \
-                 token is held in memory for the next send: {error}"
+                "kr-controller: a withheld sign-in's token: queuing the token failed and a send \
+                 of the token alone was not acknowledged; a write that had begun may have left \
+                 its entry in place, and the service may have taken the token; the token is held \
+                 in memory for the next send: {error}"
             )
         );
     }
