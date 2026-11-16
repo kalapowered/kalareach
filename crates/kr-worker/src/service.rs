@@ -520,6 +520,11 @@ pub struct WorkerService {
     /// shipped build.
     #[cfg(feature = "testing")]
     receipt_threads: Arc<std::sync::atomic::AtomicUsize>,
+    /// The two places where a receipt read's thread stands when this host's own tests arm them:
+    /// before it takes the session, and between its take and the send that tells its caller. It
+    /// is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    receipt_pauses: Arc<ReceiptPauses>,
     /// How many description facts requests this service is holding at this moment, waiting for a
     /// fact to change, for this host's own tests. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -975,6 +980,8 @@ impl WorkerService {
             subscriptions_held: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "testing")]
             receipt_threads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(feature = "testing")]
+            receipt_pauses: Arc::new(ReceiptPauses::default()),
             #[cfg(feature = "testing")]
             facts_held: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "testing")]
@@ -1551,6 +1558,38 @@ impl WorkerService {
     pub fn receipt_threads_alive(&self) -> usize {
         self.receipt_threads
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Stops the thread of the next receipt read before it takes the session, for this host's own
+    /// tests. It makes the thread late for its caller's deadline by as long as the test likes.
+    ///
+    /// Returns the end that says the thread has arrived, and the end that lets it go. The stop
+    /// fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn pause_receipt_before_the_take(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.receipt_pauses.before_the_take.arm_blocking()
+    }
+
+    /// Stops the thread of the next receipt read after it has taken the session and before it
+    /// tells its caller, for this host's own tests. The thread holds the session while it stands.
+    ///
+    /// Returns the end that says the thread has arrived, and the end that lets it go. The stop
+    /// fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn pause_receipt_before_the_send(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.receipt_pauses.before_the_send.arm_blocking()
     }
 
     /// How many description facts requests this service is holding at this moment, for the host
@@ -9285,14 +9324,20 @@ impl WorkerService {
         let (actor_id, action_id, named) = (actor_id.clone(), params.action_id, params.session_id);
         #[cfg(feature = "testing")]
         let counted = ReceiptThread::count(&self.receipt_threads);
+        #[cfg(feature = "testing")]
+        let pauses = Arc::clone(&self.receipt_pauses);
         std::thread::spawn(move || {
             #[cfg(feature = "testing")]
             let _counted = counted;
+            #[cfg(feature = "testing")]
+            pauses.before_the_take.stand();
             let left = take_until.saturating_duration_since(std::time::Instant::now());
             let Some(mut session) = runtime.session_within(left) else {
                 let _ = took_sender.send(false);
                 return;
             };
+            #[cfg(feature = "testing")]
+            pauses.before_the_send.stand();
             // A caller that has gone has no use for the receipt: the thread lets the session go
             // and makes no call to the store.
             if took_sender.send(true).is_err() {
@@ -11285,6 +11330,14 @@ impl Drop for ReceiptThread {
     fn drop(&mut self) {
         self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// The places where a receipt read's thread can be made to stand, for this host's own tests.
+#[cfg(feature = "testing")]
+#[derive(Debug, Default)]
+struct ReceiptPauses {
+    before_the_take: crate::testing::Stall,
+    before_the_send: crate::testing::Stall,
 }
 
 /// One connection's registration in the worker's authority store.

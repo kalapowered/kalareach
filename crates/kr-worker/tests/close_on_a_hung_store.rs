@@ -1790,6 +1790,97 @@ async fn a_receipt_read_of_a_held_session_leaves_no_thread_waiting_for_the_sessi
     let _ = standing.release.send(());
 }
 
+/// A receipt read's thread takes the session and stands before it tells its caller. The caller's
+/// deadline passes and the caller is refused. The thread, let go, finds that nobody waits for it:
+/// it lets the session go and makes no call to the store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_receipt_read_whose_caller_has_gone_lets_the_session_go_and_makes_no_call_to_the_store() {
+    let host = host().await;
+    let (mut owner, mut reader) = (host.client().await, host.client().await);
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let attached = owner
+        .mutate(
+            Method::SessionAttach,
+            action_id,
+            host.target(),
+            &attach_params(host.session_id),
+        )
+        .await
+        .expect("the attach reached the worker");
+    assert!(attached.is_ok(), "the attach was accepted: {attached:?}");
+    let (store_reached, _store_release) = {
+        let mut session = host.runtime.session();
+        session
+            .journal_mut()
+            .expect("this session keeps a journal")
+            .stall_next_result_read_blocking()
+    };
+    let (thread_reached, let_the_thread_go) = host.service.pause_receipt_before_the_send();
+    let (_, refused) = receipt_within_its_bound(&mut reader, action_id, "late send").await;
+    reached(thread_reached, "the receipt read's thread").await;
+    let refusal = refused.expect_err("a read whose thread told nobody is refused");
+    assert!(
+        refusal
+            .message
+            .contains("The session did not answer in time, so the receipt was not read."),
+        "the caller's wait ran out, and says so: {}",
+        refusal.message
+    );
+    let _ = let_the_thread_go.send(());
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), store_reached)
+            .await
+            .is_err(),
+        "a thread whose caller had gone made a call to the store"
+    );
+    let began = Instant::now();
+    while host.service.receipt_threads_alive() != 0 {
+        assert!(
+            began.elapsed() < READ_BOUND,
+            "the receipt read's thread was still alive {READ_BOUND:?} after it was let go"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(
+        host.runtime
+            .session_within(CLOSURE_WAIT)
+            .expect("the thread let the session go"),
+    );
+}
+
+/// A receipt read's thread starts late: it stands before its first step while its caller's wait
+/// runs out, and the session is held. Let go, it has the one deadline that its caller had, which
+/// is behind it, so it tries the session once and ends, and does not wait a bound of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_receipt_read_thread_that_starts_after_its_callers_deadline_tries_once_and_ends() {
+    let host = host().await;
+    let (holder, mut reader) = (host.client().await, host.client().await);
+    let (thread_reached, let_the_thread_go) = host.service.pause_receipt_before_the_take();
+    let standing = stall(&host, Stalled::Prune, holder).await;
+    let (_, refused) = receipt_within_its_bound(
+        &mut reader,
+        ActionId::new(kr_ipc::new_uuid()),
+        "late thread",
+    )
+    .await;
+    reached(thread_reached, "the receipt read's thread").await;
+    assert!(
+        refused.is_err(),
+        "a receipt read of a held session is refused"
+    );
+    let _ = let_the_thread_go.send(());
+    let bound = TAKE_BOUND / 2;
+    let began = Instant::now();
+    while host.service.receipt_threads_alive() != 0 {
+        assert!(
+            began.elapsed() < bound,
+            "the receipt read's thread was still waiting for the session {bound:?} after it was let go, past its caller's deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let _ = standing.release.send(());
+}
+
 /// A session that has recorded its closure publishes it: the summary says closed and carries the
 /// record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
