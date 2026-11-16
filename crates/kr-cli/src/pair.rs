@@ -146,9 +146,7 @@ async fn invite(
     let ceremony = Ceremony::Issue {
         owner: grant_kind == InviteGrantKind::PersonalOwner,
     };
-    let answer = confirmed(&mut client, target, subject, &ceremony, &effect, build_id)
-        .await
-        .map_err(capacity_in_its_own_words)?;
+    let answer = confirmed(&mut client, target, subject, &ceremony, &effect, build_id).await?;
     let invited: PairInviteResult = decode(&answer)?;
     if json {
         output::document(&invitation_document(&invited));
@@ -1311,29 +1309,6 @@ fn decode<T: kr_protocol::wire::WireMessage>(value: &ParamsValue) -> Result<T> {
     })
 }
 
-/// Returns the refusal of an invitation as a person is told it: when the rendezvous service had no
-/// managed capacity for it and named the paths that still work, the host's text already says when to
-/// try again and what to do meanwhile, so the client's one line for that code, which tells a person
-/// to wait a moment, is not added after it. It is added to every other refusal under that code,
-/// which is the service being unavailable, and every other refusal is as it was.
-///
-/// The kind is told by the text itself (`kr_client::services::says_its_own_next_step`), because the code
-/// is the same for both and the wire carries nothing else.
-fn capacity_in_its_own_words(error: CliError) -> CliError {
-    match error {
-        CliError::Refused(refused)
-            if refused.code == ErrorCode::RendezvousUnavailable
-                && kr_client::services::says_its_own_next_step(&refused.message) =>
-        {
-            CliError::ServiceRefused {
-                error: refused,
-                action: kr_client::retry::UserAction::Nothing,
-            }
-        }
-        other => other,
-    }
-}
-
 fn refused(code: ErrorCode, message: impl Into<Shown>) -> CliError {
     CliError::refused_in_its_own_words(code, message)
 }
@@ -2018,23 +1993,11 @@ mod tests {
             ),
         ] {
             let told = kr_client::services::told_capacity(WORDS, wait, alternatives).expect("told");
-            let error = capacity_in_its_own_words(the_daemons_refusal(
-                kr_pairing::PairingError::RendezvousCapacity {
-                    told,
-                    retry_after_seconds: wait,
-                },
-            ));
+            let error = the_daemons_refusal(kr_pairing::PairingError::RendezvousCapacity {
+                told,
+                retry_after_seconds: wait,
+            });
             assert_eq!(output_of(&error), expected, "{wait:?}");
-            assert!(
-                matches!(
-                    error,
-                    CliError::ServiceRefused {
-                        action: kr_client::retry::UserAction::Nothing,
-                        ..
-                    }
-                ),
-                "{wait:?}"
-            );
             assert_eq!(error.code(), ErrorCode::RendezvousUnavailable);
             assert_eq!(
                 error.machine_message().as_str(),
@@ -2065,11 +2028,9 @@ mod tests {
             "the request could not be written: a message".to_owned(),
             String::new(),
         ] {
-            let error = capacity_in_its_own_words(the_daemons_refusal(
-                kr_pairing::PairingError::RendezvousUnavailable {
-                    reason: reason.clone(),
-                },
-            ));
+            let error = the_daemons_refusal(kr_pairing::PairingError::RendezvousUnavailable {
+                reason: reason.clone(),
+            });
             assert!(matches!(error, CliError::Refused(_)), "{reason}");
             assert_eq!(
                 output_of(&error),
@@ -2080,12 +2041,6 @@ mod tests {
                 "{reason}"
             );
         }
-        // Other refusals are as they were, whatever code they carry.
-        let other = capacity_in_its_own_words(CliError::Refused(ProtocolError::new(
-            ErrorCode::PermissionDenied,
-            "Managed. Until then: A path.",
-        )));
-        assert!(matches!(other, CliError::Refused(_)));
     }
 
     /// KR-REQ-17.48: whatever text the composing makes for a refusal of the reservation, the
@@ -2111,12 +2066,10 @@ mod tests {
                     continue;
                 };
                 told_at_all += 1;
-                let error = capacity_in_its_own_words(the_daemons_refusal(
-                    kr_pairing::PairingError::RendezvousCapacity {
-                        told: told.clone(),
-                        retry_after_seconds: wait,
-                    },
-                ));
+                let error = the_daemons_refusal(kr_pairing::PairingError::RendezvousCapacity {
+                    told: told.clone(),
+                    retry_after_seconds: wait,
+                });
                 assert_eq!(output_of(&error), told, "{list} {wait:?}");
             }
         }
