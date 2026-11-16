@@ -227,10 +227,12 @@ impl RelayGrant {
     }
 }
 
-/// Whether every bound in `under` still holds by `judge`, reading each clock once, and never
-/// waiting: a check inside a poll takes no lock and calls no store. A bound found ended owes only
-/// what a lapse owes today, which the next step outside the poll writes: in UTC, the floor the
-/// reading raised; on the continuous clock, for the offline bound, the time it has spent.
+/// Whether every bound in `under` still holds by `judge`, reading each clock once. A bound that
+/// holds is passed with no lock and no call to a store; a bound found ended owes only what a lapse
+/// owes today, which the next step outside the poll writes: in UTC, the floor the reading raised;
+/// on the continuous clock, for the offline bound, the time it has spent. The offline bound's and a
+/// share's debts are noted under a mutex of their own ([`held_by`]), on the refusal's branch alone,
+/// which no landing follows.
 ///
 /// It loads each bound's cell after its first clock read, so it is for a check outside a poll. The
 /// writer's own standing is asked by [`copied_bounds_hold`].
@@ -250,8 +252,10 @@ pub(super) fn bounds_hold(
 }
 
 /// [`bounds_hold`], by `copies` of the cells of `under`, one for each in order, that the caller
-/// took before it read a clock: only comparisons stand after the reads, so nothing in them
-/// allocates, frees, takes a lock or waits.
+/// took before it read a clock: where every bound holds only comparisons stand after the reads, so
+/// nothing in them loads a cell, allocates, frees, takes a lock or waits. A bound found ended notes
+/// its debt in [`held_by`], which can take a mutex and allocate; the check then refuses, and no
+/// landing follows a refusal.
 fn copied_bounds_hold(
     controller: &Controller,
     under: &[HeldBound],
