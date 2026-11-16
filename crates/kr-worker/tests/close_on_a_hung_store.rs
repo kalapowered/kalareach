@@ -1578,12 +1578,54 @@ async fn a_change_back_to_the_published_value_while_a_publication_is_in_flight_i
 }
 
 /// A question that runs out of time stops counting without anything else waking the evidence loop.
-/// The loop re-reads the ledger on a timer while a question is open, and it arms that timer when
-/// the ledger's reader says that a question is open, which is a wake of the reader's own.
+/// The loop re-reads the ledger on a timer while a question is open, and it arms that timer when the
+/// ledger's reader says that a question is open, which is a wake of the reader's own. The case
+/// establishes that the loop waits with no open question BEFORE the reader records the change: the
+/// reader is held after it has read the ledger, and the case lets it go only once the loop has gone
+/// round and waits with the question fact still false, so the loop arms its timer only through the
+/// reader's wake.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_question_that_runs_out_of_time_stops_counting_with_no_other_wake() {
     let host = host().await;
+    let producer = Arc::clone(host.service.application());
+    // The loop has gone round and waits, with no question open.
+    let began = Instant::now();
+    while {
+        let (rounds, waits) = producer.loop_rounds();
+        rounds == 0 || rounds != waits
+    } {
+        assert!(
+            began.elapsed() < CLOSURE_WAIT,
+            "the evidence loop did not come to a wait within {CLOSURE_WAIT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let before = producer.loop_rounds().0;
+    let (read, let_go) = producer.pause_ledger_reader_before_its_fact();
     ask_a_question_expiring(&host.service, host.session_id, "short", Some(3_000));
+    tokio::time::timeout(REACH, read)
+        .await
+        .expect("the ledger's reader read the ledger within a bound")
+        .expect("the pause was dropped before it was reached");
+    // The question's creation woke the loop, which asked the reader and now waits with the question
+    // fact false: the reader has not recorded what it found.
+    let began = Instant::now();
+    while {
+        let (rounds, waits) = producer.loop_rounds();
+        rounds <= before || rounds != waits
+    } {
+        assert!(
+            began.elapsed() < CLOSURE_WAIT,
+            "the evidence loop did not go round and wait after the question was asked"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        domain_application_state(&host),
+        Some(ApplicationState::ShellReady),
+        "the question fact was recorded before the loop waited"
+    );
+    let _ = let_go.send(());
     domain_application_state_becomes(
         &host,
         Some(ApplicationState::AwaitingInput),
