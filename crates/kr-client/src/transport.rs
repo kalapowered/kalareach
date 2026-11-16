@@ -237,10 +237,11 @@ pub struct NetworkTransport {
     reader: Mutex<Option<FrameReader>>,
     /// Set once a session has claimed the receive side.
     claimed: std::sync::atomic::AtomicBool,
-    /// Set by this wrapper's own [`ControlTransport::close`], before it touches the connection.
-    /// A read's end is the clean end for this side's close only when the read's own cause says
-    /// the connection was closed by this side and this mark says that this wrapper closed it.
-    closed_here: std::sync::atomic::AtomicBool,
+    /// Stored by this wrapper's own [`ControlTransport::close`], before it touches the connection:
+    /// whether the connection had already ended when the close was made. A read's end is the clean
+    /// end for this side's close only when the read's own cause says that this side closed the
+    /// connection and this mark says that the close was made while the connection stood.
+    own_close: OwnCloseMark,
     streams: Arc<StreamRegistry>,
     opener: Arc<NetworkStreams>,
     reach: Reach,
@@ -292,7 +293,7 @@ impl NetworkTransport {
             writer: Arc::new(Mutex::new(authorised.control_writer)),
             reader: Mutex::new(Some(authorised.control_reader)),
             claimed: std::sync::atomic::AtomicBool::new(false),
-            closed_here: std::sync::atomic::AtomicBool::new(false),
+            own_close: OwnCloseMark::new(),
             streams,
             opener,
             reach: Reach {
@@ -444,13 +445,13 @@ impl ControlTransport for NetworkTransport {
             let mut held = self.reader.lock().await;
             let reader = held.as_mut().ok_or(ClientError::ConnectionEnded)?;
             // A read's end is classified by what the read itself returned and by this wrapper's
-            // own mark, and never by the connection's record, which a later close overwrites.
+            // own mark. The mark was stored by the owner's close before it touched the connection
+            // and says whether the connection had already ended at that close, so a close that
+            // follows the read's return cannot change what it says about an end that came first.
+            // The connection's record is read nowhere here.
             let frame = match reader.read_message::<ControlFrame>().await {
                 Ok(frame) => frame,
-                Err(error) => end_of_a_failed_read(
-                    error,
-                    self.closed_here.load(std::sync::atomic::Ordering::Acquire),
-                )?,
+                Err(error) => end_of_a_failed_read(error, self.own_close.get())?,
             };
             if frame.is_none() {
                 held.take();
@@ -468,12 +469,17 @@ impl ControlTransport for NetworkTransport {
     }
 
     fn close(&self) {
-        // The mark comes before the close, so that a read that the close ends finds it set.
-        self.closed_here
-            .store(true, std::sync::atomic::Ordering::Release);
-        self.streams.revoke_all();
-        self.connection
-            .close(CLIENT_CLOSED.into(), b"the client closed the connection");
+        // The connection's record is read here, once and for its existence alone, before the close
+        // changes it, and the mark is stored before the connection is closed, so that a read that
+        // the close ends finds it set.
+        self.own_close.close_with(
+            || self.connection.close_reason().is_some(),
+            || {
+                self.streams.revoke_all();
+                self.connection
+                    .close(CLIENT_CLOSED.into(), b"the client closed the connection");
+            },
+        );
     }
 
     /// Whether the connection's record says that a local close ended it: the library records
@@ -503,23 +509,80 @@ impl ControlTransport for NetworkTransport {
     }
 }
 
+/// What this wrapper's own close found when it was made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnClose {
+    /// The close was not made.
+    NotMade,
+    /// The connection had not ended: this wrapper's close ended it.
+    WhileOpen,
+    /// The connection had already ended by another cause (the peer's close, a reset, a timeout or
+    /// the endpoint's close): this wrapper's close came after that end.
+    AfterEnd,
+}
+
+/// The owner's close, recorded: stored once, by the first close, before the connection is closed.
+struct OwnCloseMark(std::sync::atomic::AtomicU8);
+
+impl OwnCloseMark {
+    const NOT_MADE: u8 = 0;
+    const WHILE_OPEN: u8 = 1;
+    const AFTER_END: u8 = 2;
+
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicU8::new(Self::NOT_MADE))
+    }
+
+    fn get(&self) -> OwnClose {
+        match self.0.load(std::sync::atomic::Ordering::Acquire) {
+            Self::WHILE_OPEN => OwnClose::WhileOpen,
+            Self::AFTER_END => OwnClose::AfterEnd,
+            _ => OwnClose::NotMade,
+        }
+    }
+
+    /// Makes the owner's close in this order: asks `ended` whether the connection had already
+    /// ended, stores the mark that the answer gives, and only then runs `close`, which closes the
+    /// connection. A later close keeps the first mark, since it sees the end that the first close
+    /// made and would otherwise take the clean end from a read that the first close ended.
+    fn close_with(&self, ended: impl FnOnce() -> bool, close: impl FnOnce()) {
+        if self.0.load(std::sync::atomic::Ordering::Acquire) == Self::NOT_MADE {
+            let mark = if ended() {
+                Self::AFTER_END
+            } else {
+                Self::WHILE_OPEN
+            };
+            // Another close that came first keeps its mark.
+            let _ = self.0.compare_exchange(
+                Self::NOT_MADE,
+                mark,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            );
+        }
+        close();
+    }
+}
+
 /// What the end of a failed read of the control stream is: the one place that gives each cause its
 /// end.
 ///
-/// The cause that the read itself returned decides. A connection that this side closed ends the
-/// read as the clean end only when this wrapper's own close was called (`closed_here`): a cause of
-/// "closed by this side" that this wrapper did not make (the endpoint's close under a live
-/// connection) is a failure. A connection closed by the peer, lost for another reason or failed in
-/// its stream keeps its cause as a failure, and keeps it when a close follows, since the cause was
-/// returned before. The inner match names every cause of the transport's type, with no catch-all.
+/// The cause that the read itself returned decides, with this wrapper's own mark. A cause of
+/// "closed by this side" ends the read as the clean end only when this wrapper's own close was
+/// made while the connection stood: with the mark that the close came after the connection's end
+/// (the endpoint's close or the peer's came first), or with no mark (the endpoint's close under a
+/// live connection, which this wrapper did not make), it is a failure. A connection closed by the
+/// peer, lost for another reason or failed in its stream keeps its cause as a failure whatever the
+/// mark says, and keeps it when a close follows, since the cause was returned before. The inner
+/// match names every cause of the transport's type, with no catch-all.
 fn end_of_a_failed_read(
     error: kr_transport::TransportError,
-    closed_here: bool,
+    own_close: OwnClose,
 ) -> Result<Option<ControlFrame>> {
     use kr_transport::{ConnectionEnd, TransportError};
     match error {
         TransportError::StreamLost(cause) => match cause {
-            ConnectionEnd::ClosedBySelf if closed_here => Ok(None),
+            ConnectionEnd::ClosedBySelf if own_close == OwnClose::WhileOpen => Ok(None),
             ConnectionEnd::ClosedBySelf
             | ConnectionEnd::ClosedByPeer(_)
             | ConnectionEnd::Lost(_) => Err(TransportError::StreamLost(cause).into()),
@@ -563,25 +626,30 @@ mod tests {
     }
 
     /// Each cause that a failed read returned has its end, and the end reads nothing but the cause
-    /// and this wrapper's own mark: the host's close that was read before this side's close stays a
-    /// failure with the host's cause, whatever the mark says when the end is classified.
+    /// and this wrapper's own mark: the clean end needs the cause "closed by this side" and a close
+    /// that this wrapper made while the connection stood. Every other cause is a failure that
+    /// keeps its cause, whatever the mark says when the end is classified.
     #[test]
     fn each_cause_of_a_failed_read_has_its_end() {
-        // A close by this side, made by this wrapper: the clean end.
+        // A close by this side, made by this wrapper while the connection stood: the clean end.
         assert!(matches!(
-            end_of_a_failed_read(lost(ConnectionEnd::ClosedBySelf), true),
+            end_of_a_failed_read(lost(ConnectionEnd::ClosedBySelf), OwnClose::WhileOpen),
             Ok(None)
         ));
-        // A close by this side that this wrapper did not make (the endpoint's): a failure.
-        assert!(matches!(
-            end_of_a_failed_read(lost(ConnectionEnd::ClosedBySelf), false),
-            Err(ClientError::Transport(TransportError::StreamLost(
-                ConnectionEnd::ClosedBySelf
-            )))
-        ));
-        // The host closed and the read returned that; this side's close came after it (the mark is
-        // set when the end is classified): the host's cause is kept.
-        for mark in [false, true] {
+        // A close by this side that this wrapper did not make (the endpoint's), or that this
+        // wrapper made after the connection had ended (the endpoint's or the peer's came first):
+        // a failure.
+        for mark in [OwnClose::NotMade, OwnClose::AfterEnd] {
+            assert!(matches!(
+                end_of_a_failed_read(lost(ConnectionEnd::ClosedBySelf), mark),
+                Err(ClientError::Transport(TransportError::StreamLost(
+                    ConnectionEnd::ClosedBySelf
+                )))
+            ));
+        }
+        // The host closed and the read returned that, whatever this side's close did or did not do
+        // before or after: the host's cause is kept.
+        for mark in [OwnClose::NotMade, OwnClose::WhileOpen, OwnClose::AfterEnd] {
             assert!(matches!(
                 end_of_a_failed_read(lost(ConnectionEnd::ClosedByPeer("closed".into())), mark),
                 Err(ClientError::Transport(TransportError::StreamLost(
@@ -600,5 +668,46 @@ mod tests {
                 Err(ClientError::Transport(TransportError::Stream(_)))
             ));
         }
+    }
+
+    /// The owner's close is made in one order: it asks whether the connection had already ended,
+    /// stores the mark that the answer gives, and only then closes the connection. A close that
+    /// follows keeps the first mark. The connection here is a flag that the close sets.
+    #[test]
+    fn the_owners_close_stores_what_the_connection_was_before_it_closes_it() {
+        // The connection stands: the close is made while it is open, and the mark is already
+        // stored when the connection is closed.
+        let ended = std::cell::Cell::new(false);
+        let mark = OwnCloseMark::new();
+        assert_eq!(mark.get(), OwnClose::NotMade);
+        let mut stored_at_the_close = None;
+        mark.close_with(
+            || ended.get(),
+            || {
+                ended.set(true);
+                stored_at_the_close = Some(mark.get());
+            },
+        );
+        assert_eq!(
+            stored_at_the_close,
+            Some(OwnClose::WhileOpen),
+            "the mark was not stored, from the connection as it stood, before the connection was closed"
+        );
+        assert_eq!(mark.get(), OwnClose::WhileOpen);
+        // A second close finds the end that the first one made, and keeps the first mark.
+        mark.close_with(|| ended.get(), || {});
+        assert_eq!(
+            mark.get(),
+            OwnClose::WhileOpen,
+            "a later close took the mark of the first"
+        );
+
+        // The connection had ended already: the close is made after its end.
+        let ended = std::cell::Cell::new(true);
+        let mark = OwnCloseMark::new();
+        let mut stored_at_the_close = None;
+        mark.close_with(|| ended.get(), || stored_at_the_close = Some(mark.get()));
+        assert_eq!(stored_at_the_close, Some(OwnClose::AfterEnd));
+        assert_eq!(mark.get(), OwnClose::AfterEnd);
     }
 }
