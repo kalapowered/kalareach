@@ -2090,7 +2090,7 @@ fn paired_connection_writing_to(
 }
 
 /// As [`paired_connection_writing_to`], with a pairing grant that `expiry` ends.
-fn paired_connection_expiring(
+pub(super) fn paired_connection_expiring(
     controller: &Arc<Controller>,
     byte: u8,
     actions: &[ActionRight],
