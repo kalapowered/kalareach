@@ -1718,6 +1718,82 @@ async fn a_presentation_that_never_took_authority_ends_while_another_holds_the_a
     boundary.release();
 }
 
+/// A connection that says hello, declares `role` and presents `generation`, on a task of its own
+/// that owns the link.
+fn presenting_as(
+    host: &Host,
+    role: ControllerConnectionRole,
+    generation: u64,
+) -> tokio::task::JoinHandle<Presented> {
+    let endpoint = host.endpoint.clone();
+    let signer = host.signer();
+    tokio::spawn(async move {
+        let mut link = BoundLink::connect(&endpoint, build())
+            .await
+            .expect("connects");
+        link.send(&ControlFrame::ControllerRole(role))
+            .await
+            .expect("declares the role");
+        match link.recv().await.expect("the worker answers") {
+            ControlFrame::ControllerRole(declared) => assert_eq!(declared, role),
+            other => panic!("the worker answered {other:?}"),
+        }
+        let answer = present(&mut link, signer, generation).await;
+        (link, answer)
+    })
+}
+
+/// Several presentations of live proxy connections are all admitted while the boundary is held, and
+/// are all accepted once it is free; the connections of the proxies whose processes end are given
+/// back while it is held.
+///
+/// A daemon opens one proxy connection for each caller it forwards, so many wait at once, and none
+/// of them is a peer that has gone while its process is there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn several_living_proxy_presentations_stay_admitted_through_a_hold_and_go_with_their_peers() {
+    let host = host(1).await;
+    let service = &host.service;
+    let boundary = Held::boundary(&host).await;
+    let start = service.connections_held_for_tests();
+    let living: Vec<_> = (0..6)
+        .map(|_| presenting_as(&host, ControllerConnectionRole::Proxy, 2))
+        .collect();
+    let ending: Vec<_> = (0..6)
+        .map(|_| presenting_as(&host, ControllerConnectionRole::Proxy, 2))
+        .collect();
+    settle(|| service.presentations_waiting_for_tests() == 12).await;
+    assert_eq!(
+        service.presentations_waiting_for_tests(),
+        12,
+        "every proxy presentation is admitted while the boundary is held"
+    );
+    peers_go(ending).await;
+    settle(|| {
+        service.presentations_waiting_for_tests() == 6
+            && service.connections_held_for_tests() == start + 6
+    })
+    .await;
+    assert_eq!(
+        service.connections_held_for_tests(),
+        start + 6,
+        "the proxies whose processes ended give their connections back and the others keep theirs"
+    );
+    assert_eq!(service.presentations_waiting_for_tests(), 6);
+
+    boundary.release();
+    for presented in living {
+        let (_link, answer) = tokio::time::timeout(WAIT, presented)
+            .await
+            .expect("each living proxy presentation is answered once the boundary is free")
+            .expect("the task ends");
+        answer.expect("the proxy is accepted");
+    }
+    assert_eq!(
+        service.accepted_generation(),
+        Some(ControllerGeneration::new(2))
+    );
+}
+
 /// The longest a daemon waits for a presentation to be answered before it gives up on the link: the
 /// start's rebuild drops its client after five seconds. A presentation whose peer is there is
 /// decided inside it while the boundary is taken again and again.
