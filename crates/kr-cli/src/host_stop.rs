@@ -1393,8 +1393,8 @@ enum Decided {
     Ended(End),
     /// The end is not shown within the bound, and no daemon answered.
     NotShown,
-    /// A daemon answered a look: the first, or the last of the wait at its bound. This is the only
-    /// result that leads to exit 3, and it holds the answer.
+    /// A daemon answered a look, with a proved generation or without one: the first, or the last of
+    /// the wait at its bound. It holds the answer.
     Answers(Answered),
 }
 
