@@ -865,12 +865,13 @@ impl<K: Ord> OwedSet<K> {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum SessionWork {
     /// Rejects an accepted action whose connection ended before it was dispatched, when its receipt
-    /// is still the accepted one at `revision`: a receipt that has moved since, or that a later
-    /// request made new under the same identity, is not this action's.
+    /// is still the one that the acceptance at journal sequence `accepted_at` made: a receipt that
+    /// has moved since, or that a later request made new under the same identity after retention
+    /// removed the first, is not this action's.
     Reject {
         actor_id: ActorId,
         action_id: kr_protocol::ids::ActionId,
-        revision: u64,
+        accepted_at: u64,
     },
     /// Detaches an attachment the connection kept.
     Detach(AttachmentId),
@@ -2701,9 +2702,9 @@ impl WorkerService {
                 SessionWork::Reject {
                     actor_id,
                     action_id,
-                    revision,
+                    accepted_at,
                 } => {
-                    Self::reject_abandoned(&mut session, actor_id, action_id, Some(revision));
+                    Self::reject_abandoned(&mut session, actor_id, action_id, accepted_at);
                     #[cfg(feature = "testing")]
                     self.owed_done[0].fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
@@ -6919,49 +6920,41 @@ impl WorkerService {
             self.clean_up_owed.session.owe(SessionWork::Reject {
                 actor_id,
                 action_id,
-                revision: pending.revision,
+                accepted_at: pending.accepted_at,
             });
             return;
         };
-        Self::reject_abandoned(&mut session, actor_id, action_id, Some(pending.revision));
+        Self::reject_abandoned(&mut session, actor_id, action_id, pending.accepted_at);
     }
 
     /// Rejects an action whose connection ended before it was dispatched, under the session the
-    /// caller holds. A receipt that is no longer `accepted` is left as it is, and so is one whose
-    /// revision is not `revision`, which is a receipt of another action that took the identity.
+    /// caller holds. A receipt that is no longer `accepted` is left as it is, and so is one that is
+    /// not the receipt the acceptance at `accepted_at` made, which is the receipt of another action
+    /// that took the identity.
     fn reject_abandoned(
         session: &mut Session,
         actor_id: ActorId,
         action_id: kr_protocol::ids::ActionId,
-        revision: Option<u64>,
+        accepted_at: u64,
     ) {
         let Some(journal) = session.journal_mut() else {
             return;
         };
-        let this_one = journal
-            .read(actor_id.clone(), action_id)
-            .ok()
-            .flatten()
-            .is_some_and(|receipt| {
-                receipt.state == kr_protocol::receipt::ReceiptState::Accepted
-                    && revision.is_none_or(|revision| receipt.revision.get() == revision)
-            });
-        if this_one {
-            let _ = journal.reject(
-                actor_id,
-                action_id,
-                kr_protocol::receipt::RejectionReason::AdmissionFailed,
-                Some(
-                    WorkerError::PreconditionFailed {
-                        detail: "the connection this action was accepted on ended before it was \
-                                 dispatched"
-                            .to_owned(),
-                    }
-                    .to_protocol_error(),
-                ),
-                kr_ipc::now_ms(),
-            );
-        }
+        let _ = journal.reject_if_accepted_at(
+            actor_id,
+            action_id,
+            accepted_at,
+            kr_protocol::receipt::RejectionReason::AdmissionFailed,
+            Some(
+                WorkerError::PreconditionFailed {
+                    detail: "the connection this action was accepted on ended before it was \
+                             dispatched"
+                        .to_owned(),
+                }
+                .to_protocol_error(),
+            ),
+            kr_ipc::now_ms(),
+        );
     }
 
     /// Rejects an action whose intent is committed and which will not be dispatched, and returns
@@ -7702,9 +7695,9 @@ impl WorkerService {
         // and failing* is the same condition as one that is absent — a full disk refusing a write
         // is exactly when a person most needs to be able to stop a session — so the exception
         // covers the write failing as well as the journal being missing.
-        let (admitted, accepted_revision) = match session.journal_mut() {
+        let (admitted, accepted_at) = match session.journal_mut() {
             Some(journal) => match journal.accept(submission) {
-                Ok(admission) => (true, Some(admission.receipt.revision.get())),
+                Ok(admission) => (true, Some(admission.sequence)),
                 Err(error) if volatile_permitted && is_storage_failure(&error) => {
                     session.note_journal_failure(error.to_string());
                     (false, None)
@@ -7730,7 +7723,7 @@ impl WorkerService {
             caller,
             deadline,
             admitted,
-            accepted_revision,
+            accepted_at,
             volatile_permitted,
             None,
         )
@@ -7754,7 +7747,7 @@ impl WorkerService {
         caller: &Caller,
         deadline: ContinuousInstant,
         admitted: bool,
-        accepted_revision: Option<u64>,
+        accepted_at: Option<u64>,
         volatile_permitted: bool,
         preparation: Option<Made>,
     ) -> Result<Answered> {
@@ -7832,8 +7825,8 @@ impl WorkerService {
                     caller: caller.clone(),
                     deadline,
                     forwarded: false,
-                    revision: accepted_revision
-                        .expect("a first pass keeps the revision of the receipt it accepted"),
+                    accepted_at: accepted_at
+                        .expect("a first pass keeps the sequence of the acceptance it made"),
                 })))
             } else {
                 // The receipt is where a prepared action is remembered, and this session keeps
@@ -13126,9 +13119,9 @@ pub struct PendingPreparation {
     deadline: ContinuousInstant,
     /// Whether the answer goes to a proxy rather than to the actor whose action it is.
     forwarded: bool,
-    /// The revision of the `accepted` receipt this action was admitted under. A rejection owed for
-    /// the action names it, so that it can only reject that receipt.
-    revision: u64,
+    /// The journal's sequence of the acceptance that this action was admitted under. A rejection
+    /// owed for the action names it, so that it can only reject the receipt that acceptance made.
+    accepted_at: u64,
 }
 
 /// What an attachment's offer came to, from what its action came to.
