@@ -377,11 +377,22 @@ impl HeldBound {
     /// snapshot, so a batch decided before it is decided again.
     #[must_use]
     pub fn holds_as_decided(&self, now: ContinuousInstant, utc_ms: u64) -> Stands {
-        let current = self.cell.load();
-        if current.version != self.snapshot.version {
+        self.holds_as_decided_in(&self.published(), now, utc_ms)
+    }
+
+    /// [`Self::holds_as_decided`], from a snapshot that [`Self::published`] copied out earlier:
+    /// only comparisons, so nothing in it allocates, frees, takes a lock or waits.
+    #[must_use]
+    pub fn holds_as_decided_in(
+        &self,
+        published: &BoundSnapshot,
+        now: ContinuousInstant,
+        utc_ms: u64,
+    ) -> Stands {
+        if published.version != self.snapshot.version {
             return Stands::Moved;
         }
-        judged(&current, now, utc_ms)
+        judged(published, now, utc_ms)
     }
 }
 
