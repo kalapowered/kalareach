@@ -26,8 +26,9 @@
 //!   (`Asked::Connection`), which only the functions above handle;
 //! - the client's accessor of the refusal that a connection kept (`connection_refusal(`), which is
 //!   asked for in `connection.rs` and nowhere else. No exception excuses it;
-//! - the two other names that reach that refusal with its code, the wire's `kept_refusal(` and the
-//!   cause's `refusal_kept_by(`: each in its definition and its one caller, and nowhere else.
+//! - the cause's `refusal_kept_by(`, the one other name that reaches that refusal with its code: in
+//!   its definition and its one caller, and nowhere else. A function named `kept_refusal(` is read
+//!   as well, and no exception excuses one.
 //!
 //! An exception names one file, one function, one needle and how many lines of that function it
 //! excuses, and says why. It ends where its function ends: a line stands in the function whose
@@ -162,7 +163,7 @@ struct Exception {
 
 /// Every place outside `HOME` that reads a code or words or handles a refused connection, and why it
 /// does not decide what a connection that was not opened means.
-const EXCEPTIONS: [Exception; 66] = [
+const EXCEPTIONS: [Exception; 63] = [
     Exception {
         file: "account/mod.rs",
         function: "usage",
@@ -578,31 +579,10 @@ const EXCEPTIONS: [Exception; 66] = [
     },
     Exception {
         file: "terminal/view.rs",
-        function: "open_paired",
-        needle: "of_kept_refusal(",
-        lines: 1,
-        reason: "hands the refusal that the view's wire kept to the one function that tells a refusal of a connection from a refusal of a request",
-    },
-    Exception {
-        file: "terminal/view.rs",
-        function: "open_paired",
-        needle: KEPT,
-        lines: 1,
-        reason: "hands the refusal that the view's wire kept to the one function that tells a refusal of a connection from a refusal of a request",
-    },
-    Exception {
-        file: "terminal/view.rs",
         function: "response",
         needle: USED,
         lines: 1,
         reason: "the refusal of a request of the view, answered on a connection that is open; it decides nothing about a connection that was not opened",
-    },
-    Exception {
-        file: "terminal/wire.rs",
-        function: "kept_refusal",
-        needle: KEPT,
-        lines: 1,
-        reason: "the wire's own record of the host's refusal of the connection, which only the view's opening hands to the one function that gives it its meaning",
     },
     Exception {
         file: "voice/host.rs",
@@ -1312,8 +1292,8 @@ fn the_rule_reads_every_source_file_and_leaves_out_only_the_functions_that_make_
         "lease.rs",
         "settings/connected.rs",
         "standing.rs",
+        "terminal/link.rs",
         "terminal/view.rs",
-        "terminal/wire.rs",
         "voice/owner.rs",
     ] {
         assert!(names.contains(&expected), "{expected} is read");
@@ -1699,9 +1679,9 @@ fn comments_and_literals_are_not_read_as_code() {
     );
 }
 
-/// KR-REQ-19.08: the wire's record of a connection's kept refusal and the cause's carrier of it are
-/// each named in their definition and their one caller and nowhere else, and a name that only ends
-/// in one of them is not one of them.
+/// KR-REQ-19.08: the cause's carrier of a connection's kept refusal is named in its definition and
+/// its one caller and nowhere else, no function named `kept_refusal(` has an exception, and a name
+/// that only ends in one of them is not one of them.
 #[test]
 fn the_other_names_that_reach_a_connections_kept_refusal_are_each_named_in_one_place() {
     let wire = "fn a(wire: &Wire) -> Option<ProtocolError> {\n    wire.kept_refusal()\n}\n";
@@ -1716,7 +1696,11 @@ fn the_other_names_that_reach_a_connections_kept_refusal_are_each_named_in_one_p
             .filter(|exception| exception.needle == needle)
             .count()
     };
-    assert_eq!(counted(KEPT), 2, "its definition and its one caller");
+    assert_eq!(
+        counted(KEPT),
+        0,
+        "no name reaches the kept refusal outside the connection file"
+    );
     assert_eq!(
         counted(KEPT_BY),
         1,
