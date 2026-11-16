@@ -711,8 +711,8 @@ impl PairingAdmissions {
 
     /// What the service's answer says a dial to `host` that failed was held back by, when it says
     /// anything and that answer still stands: no free capacity to admit this device through the
-    /// relay the dial addresses, with the paths that still work and the delay it named, or a fault
-    /// of the service itself.
+    /// relay the dial addresses, with the paths that still work, or a fault of the service itself,
+    /// each with the device's own wait until it asks the service again.
     ///
     /// It decides what a dial that failed is reported as: a managed relay that cannot admit a
     /// device is not a host that cannot be reached.

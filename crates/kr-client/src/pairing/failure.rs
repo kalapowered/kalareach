@@ -122,11 +122,11 @@ impl Said for FailureKind {
 /// secret or anything a host, a service, a store or a payload wrote, and an interface shows the
 /// kind's own words rather than it.
 ///
-/// A failure that the managed relay service's answer explains also carries what that answer named:
-/// the paths that still work, each as the service wrote it, and the seconds after which the same
-/// attempt could succeed. Both are absent from what an interface is sent when the answer named none.
-/// Nothing is made up for either: an interface shows each path as received or not at all, and says
-/// no wait the service did not name.
+/// A failure that the managed relay service's answer explains also carries the device's own wait,
+/// in seconds, until it asks the service again, and for lack of capacity the paths that still work,
+/// each as the service wrote it. The wait is always there for these two kinds and for no other; the
+/// paths are absent from what an interface is sent when the answer named none. Nothing is made up
+/// for either: an interface shows each path as received or not at all.
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct PairingFailure {
     /// Which outcome it was.
@@ -174,8 +174,8 @@ impl PairingFailure {
     }
 
     /// The failure of a dial that the managed relay service's standing answer held back. Capacity
-    /// keeps the paths and the delay the service named; a fault of the service keeps the delay and
-    /// no path, since a path is only ever a path the service named.
+    /// keeps the paths the service named; a fault of the service keeps no path, since a path is only
+    /// ever a path the service named. Both keep the device's own wait.
     #[must_use]
     pub fn of_relay(refusal: RelayRefusal) -> Self {
         match refusal {
@@ -329,9 +329,9 @@ mod tests {
         );
     }
 
-    /// KR-REQ-17.48: a failure that the managed relay service's answer explains carries the paths
-    /// the service named, each as it wrote it, and the wait it named, and says nothing it did not.
-    /// A fault of the service is its own kind, and carries no path.
+    /// KR-REQ-17.48: a failure that the managed relay service's answer explains carries the device's
+    /// own wait, and for want of capacity the paths the service named, each as it wrote it, and says
+    /// nothing it did not. A fault of the service is its own kind, and carries no path.
     #[test]
     fn kr_req_17_48_a_failure_of_the_relay_service_carries_what_it_named() {
         let named = || {

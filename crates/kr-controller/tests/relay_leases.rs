@@ -5187,7 +5187,7 @@ async fn a_device_that_is_refused_free_capacity_is_told_so_when_it_cannot_pair()
         .expect("the attempt ran")
         .expect_err("a relay that takes no session carries nothing");
     assert_eq!(failure.kind, FailureKind::RelayCapacity);
-    // The failure holds the paths the service named, as it wrote them, and no wait it did not name.
+    // The failure holds the paths the service named, as it wrote them.
     assert_eq!(told_paths(&failure), STAND_IN_PATHS);
     // The service named no delay, and the device still asks again after twenty seconds.
     let wait = failure.retry_after_seconds.expect("a wait");
@@ -5492,9 +5492,9 @@ fn told_paths(failure: &kr_client::pairing::failure::PairingFailure) -> Vec<Stri
 }
 
 /// KR-REQ-17.48: a device whose dial the managed service could not admit and told to wait is handed
-/// the wait it named and the paths it named, so that what a person reads says when to try again.
+/// its own wait and the paths the service named, so that what a person reads says when to try again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_device_that_is_refused_free_capacity_is_handed_the_wait_the_service_named() {
+async fn a_device_that_is_refused_free_capacity_is_handed_its_own_wait() {
     use kr_client::pairing::failure::FailureKind;
 
     let relays = Relays::spawn().await;
