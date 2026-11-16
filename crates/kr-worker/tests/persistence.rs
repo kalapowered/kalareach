@@ -4427,6 +4427,23 @@ fn a_spool_that_puts_the_host_over_its_cap(days_ago: u64) -> impl FnOnce(&std::p
     }
 }
 
+/// Puts a directory where the lock file on the host's cap is, and moves the file to `aside`. The
+/// descriptor that holds the lock keeps it: the lock goes with the file.
+///
+/// The directory and the file trade names in one call of the system's own, so the name of the lock
+/// is never free. The host makes the lock file again whenever a look at the cap finds the name
+/// free, and takes the lock on the new file; a file moved aside and a directory made after it leave
+/// the moment between the two for a look to fall in. A look that comes before the call finds the
+/// file, and one that comes after finds the directory.
+#[cfg(unix)]
+fn put_a_directory_where_the_lock_file_is(lock: &std::path::Path, aside: &std::path::Path) {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+
+    std::fs::create_dir(aside).expect("a directory to put where the lock goes");
+    renameat_with(CWD, aside, CWD, lock, RenameFlags::EXCHANGE)
+        .expect("the lock file and the directory trade names");
+}
+
 /// A host over its output cap whose pass cannot take the lock on the cap, because a directory
 /// stands where the lock file goes: the pass leaves output it was asked to remove, and the reason
 /// is that the lock could not be taken. The directory is there before the host starts, so the
@@ -4641,8 +4658,7 @@ async fn a_worker_says_why_it_left_output_behind_once_and_is_not_stopped_by_a_re
             .open(spools.join("other.log").join("0.out"))
             .and_then(|segment| segment.set_len(cap))
             .expect("the other session's segment");
-        std::fs::remove_file(&lock).expect("the lock file made by the pass");
-        std::fs::create_dir(&lock).expect("a directory where the lock goes");
+        put_a_directory_where_the_lock_file_is(&lock, &spools.join("lock-made-by-the-pass"));
         host.service.maintain_now();
         wait_for_the_reason_to_be_written(&host).await;
         let mut client = cli(&host).await;
@@ -4842,9 +4858,10 @@ async fn a_standard_error_that_stops_draining_does_not_hold_up_the_stop_of_a_ses
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        std::fs::rename(spools.join("host-cap.lock"), spools.join("lock-held"))
-            .expect("the held lock file is moved aside");
-        std::fs::create_dir(spools.join("host-cap.lock")).expect("a directory where the lock goes");
+        put_a_directory_where_the_lock_file_is(
+            &spools.join("host-cap.lock"),
+            &spools.join("lock-held"),
+        );
         pass_and_stop_while_the_standard_error_is_stalled(&host).await;
         return;
     }
@@ -5019,9 +5036,10 @@ async fn a_look_at_the_host_cap_says_what_it_finds_and_does_not_say_again_what_a
         // A pass that finds the same reason after those looks.
         host.service.maintain_now();
 
-        std::fs::rename(spools.join("host-cap.lock"), spools.join("lock-held"))
-            .expect("the held lock file is moved aside");
-        std::fs::create_dir(spools.join("host-cap.lock")).expect("a directory where the lock goes");
+        put_a_directory_where_the_lock_file_is(
+            &spools.join("host-cap.lock"),
+            &spools.join("lock-held"),
+        );
         while !host
             .service
             .output_reason_said()
