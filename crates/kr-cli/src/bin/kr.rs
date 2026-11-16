@@ -2794,6 +2794,7 @@ fn typed<T: kr_protocol::wire::WireMessage>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kr_client::Said;
 
     /// A snapshot that cannot be read says the rule it broke and where, never a member it named;
     /// a worker's refusal says its code and its message.
@@ -2866,6 +2867,56 @@ mod tests {
                  `kr close 5 --environment {environment}` asks again, and a second close does no \
                  harm."
             )
+        );
+    }
+
+    /// The worker's refusal to show a close it holds no receipt for is shown in the worker's words
+    /// and one sentence of what holds if the host holds none: no action line from the code stands
+    /// before it, and the `--json` message is the one it had. Another code keeps both forms.
+    #[test]
+    fn a_refused_read_of_the_earlier_close_says_that_a_plain_close_asks_again() {
+        let action =
+            kr_protocol::ids::ActionId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16]));
+        let unknown = close_unknown(shown!("5"), None, true);
+        let worker = kr_client::error::refusal(
+            kr_protocol::error::ErrorCode::InvalidArgument,
+            shown!("no receipt for action {}", action),
+        );
+        let ended = kr_cli::unknown::read_refused(worker.clone(), action, "close", &unknown);
+        assert_eq!(
+            ended.said().as_str(),
+            format!(
+                "no receipt for action {action}\nIf the host holds no receipt for action {action}, \
+                 there is nothing for a later close to name: `kr close 5` asks again, and a second \
+                 close does no harm."
+            )
+        );
+        assert_eq!(
+            ended.machine_message().as_str(),
+            format!("INVALID_ARGUMENT: no receipt for action {action}")
+        );
+        assert_eq!(
+            ended.machine_message().as_str(),
+            kr_cli::error::CliError::Refused(worker)
+                .machine_message()
+                .as_str()
+        );
+        let other = kr_client::error::refusal(
+            kr_protocol::error::ErrorCode::PermissionDenied,
+            shown!("the worker would not say"),
+        );
+        let kept = kr_cli::unknown::read_refused(other.clone(), action, "close", &unknown);
+        assert_eq!(
+            kept.said().as_str(),
+            kr_cli::error::CliError::Refused(other.clone())
+                .said()
+                .as_str()
+        );
+        assert_eq!(
+            kept.machine_message().as_str(),
+            kr_cli::error::CliError::Refused(other)
+                .machine_message()
+                .as_str()
         );
     }
 
