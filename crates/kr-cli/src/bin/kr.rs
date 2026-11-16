@@ -511,6 +511,11 @@ async fn run(cli: Cli) -> Result<Completion> {
                                 action,
                                 Method::SessionClose,
                                 "close",
+                                &close_unknown(
+                                    shown!("{}", descriptor.session_id),
+                                    Some(known.environment_id),
+                                    true,
+                                ),
                             )
                             .await?;
                             (Some(quote), Some(worker))
@@ -2346,13 +2351,19 @@ fn close_unknown(
     worker_holds: bool,
 ) -> kr_cli::unknown::Unknown {
     let environment = environment.map(|environment_id| shown!("{}", environment_id));
-    let later = worker_holds.then(|| match &environment {
-        Some(environment) => shown!(
-            "kr close {} --environment {}",
-            session.clone(),
-            environment.clone()
-        ),
-        None => shown!("kr close {}", session.clone()),
+    let later = worker_holds.then(|| {
+        let command = match &environment {
+            Some(environment) => shown!(
+                "kr close {} --environment {}",
+                session.clone(),
+                environment.clone()
+            ),
+            None => shown!("kr close {}", session.clone()),
+        };
+        kr_cli::unknown::Later {
+            asks_again: shown!("`{}` asks again, and a second close does no harm", command),
+            command,
+        }
     });
     kr_cli::unknown::Unknown {
         what: "the close",
@@ -2825,6 +2836,59 @@ mod tests {
         assert_eq!(
             attachments_read(None).expect_err("no answer").as_str(),
             "the session's worker did not answer within 10 seconds"
+        );
+    }
+
+    /// A close that ended with an unknown outcome says what the host holds of it, what a later
+    /// close that names it is, and what a plain close does where the host holds no receipt.
+    #[test]
+    fn a_close_that_ended_unknown_says_what_each_state_of_the_host_calls_for() {
+        let action =
+            kr_protocol::ids::ActionId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16]));
+        let environment =
+            kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16]));
+        let unknown = close_unknown(shown!("5"), Some(environment), true);
+        let kr_cli::error::CliError::Unfinished { message, .. } =
+            unknown.ended(action, kr_cli::unknown::Cause::Connection)
+        else {
+            panic!("an unknown outcome ends as unfinished");
+        };
+        assert_eq!(
+            message.as_str(),
+            format!(
+                "the exchange with the host failed after the request for the close was composed, \
+                 and the request may have reached the host, so whether it performed it is not \
+                 known. The request was made as action {action} and is not sent again; \
+                 `kr action read {action} --session 5 --environment {environment}` shows what the \
+                 host holds of it. If the host holds it with an unknown outcome, \
+                 `kr close 5 --environment {environment} --after-unknown {action}` makes the later \
+                 request that names it. If the host holds no receipt for it, \
+                 `kr close 5 --environment {environment}` asks again, and a second close does no \
+                 harm."
+            )
+        );
+    }
+
+    /// A close sent for a session whose worker was not found names no later request, and keeps the
+    /// words it had.
+    #[test]
+    fn a_close_with_no_later_request_keeps_its_words() {
+        let action =
+            kr_protocol::ids::ActionId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16]));
+        let unknown = close_unknown(shown!("5"), None, false);
+        let kr_cli::error::CliError::Unfinished { message, .. } =
+            unknown.ended(action, kr_cli::unknown::Cause::Unreadable)
+        else {
+            panic!("an unknown outcome ends as unfinished");
+        };
+        assert_eq!(
+            message.as_str(),
+            format!(
+                "the host answered the request for the close and its answer could not be read, so \
+                 whether it performed it is not known. The request was made as action {action} and \
+                 is not sent again; `kr action read {action} --session 5` shows what the host \
+                 holds of it, and this command makes no later request"
+            )
         );
     }
 }

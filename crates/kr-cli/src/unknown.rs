@@ -14,7 +14,7 @@
 
 use kr_client::answers::{self, Quote};
 use kr_client::shown;
-use kr_client::shown::Shown;
+use kr_client::shown::{Said, Shown};
 use kr_ipc::client::LocalClient;
 use kr_ipc::error::IpcError;
 use kr_protocol::envelope::ActionTarget;
@@ -35,9 +35,17 @@ pub struct Unknown {
     pub what: &'static str,
     /// Where the person reads what the host holds of the action.
     pub read_back: ReadBack,
-    /// The command line that makes a later request for the same thing, without its
-    /// `--after-unknown` flag, where the command has one.
-    pub later: Option<Shown>,
+    /// The later request for the same thing, where the command has one.
+    pub later: Option<Later>,
+}
+
+/// A command's later request, in the words a person is told it in.
+pub struct Later {
+    /// The command line that makes it, without its `--after-unknown` flag.
+    pub command: Shown,
+    /// What the command does where the host holds no receipt for the earlier action, which is to
+    /// ask again, and what that costs. It is the command's own sentence, without its full stop.
+    pub asks_again: Shown,
 }
 
 /// Where a person reads back what became of an action: the session whose worker keeps its receipt,
@@ -109,24 +117,30 @@ impl Unknown {
                 Shown::protocol(refusal)
             ),
         };
-        let next = match &self.later {
-            Some(command) => shown!(
-                "`{} --after-unknown {}` makes the later request that names it",
-                command.clone(),
-                action
-            ),
-            None => Shown::said("this command makes no later request"),
-        };
-        CliError::Unfinished {
-            code: ErrorCode::OutcomeUnknown,
-            message: shown!(
+        let message = match &self.later {
+            Some(later) => shown!(
                 "{}. The request was made as action {} and is not sent again; `{}` shows what the \
-                 host holds of it, and {}",
+                 host holds of it. If the host holds it with an unknown outcome, `{} \
+                 --after-unknown {}` makes the later request that names it. If the host holds no \
+                 receipt for it, {}.",
                 cause,
                 action,
                 self.read_back.command(action),
-                next
+                later.command.clone(),
+                action,
+                later.asks_again.clone()
             ),
+            None => shown!(
+                "{}. The request was made as action {} and is not sent again; `{}` shows what the \
+                 host holds of it, and this command makes no later request",
+                cause,
+                action,
+                self.read_back.command(action)
+            ),
+        };
+        CliError::Unfinished {
+            code: ErrorCode::OutcomeUnknown,
+            message,
         }
     }
 
@@ -137,7 +151,7 @@ impl Unknown {
     /// is also told the command that makes it: the refusal alone does not say there is one.
     #[must_use]
     pub fn refused(&self, refusal: ProtocolError) -> CliError {
-        let (Some(command), Some(action)) = (&self.later, standing(&refusal)) else {
+        let (Some(Later { command, .. }), Some(action)) = (&self.later, standing(&refusal)) else {
             return CliError::Refused(refusal);
         };
         CliError::refused_in_its_own_words(
@@ -208,6 +222,39 @@ where
     }
 }
 
+/// What the command ends as when the worker refuses to show the receipt of the earlier action.
+///
+/// The refusal is shown as it always was. One that the worker gives to an argument it cannot use is
+/// followed, where the command has a later request, by what the person does if the host holds no
+/// receipt for the action. Only the refusal's code decides that: the worker words that refusal for
+/// an action it has no receipt for, and also for other arguments it cannot use, and the sentence
+/// says what holds if it is the first.
+fn read_refused(
+    refusal: ProtocolError,
+    action: ActionId,
+    what: &'static str,
+    unknown: &Unknown,
+) -> CliError {
+    let Some(later) = &unknown.later else {
+        return CliError::Refused(refusal);
+    };
+    if refusal.code != ErrorCode::InvalidArgument {
+        return CliError::Refused(refusal);
+    }
+    let code = refusal.code;
+    CliError::refused_in_its_own_words(
+        code,
+        shown!(
+            "{}\nIf the host holds no receipt for action {}, there is nothing for a later {} to \
+             name: {}.",
+            CliError::Refused(refusal).said(),
+            action,
+            what,
+            later.asks_again.clone()
+        ),
+    )
+}
+
 /// Reads the receipt of the earlier action a person names and shows it, which is also how the worker
 /// comes to hold that this caller was shown it at that revision, and returns what a later request
 /// for the same thing names.
@@ -220,12 +267,16 @@ where
 /// Returns a usage failure when the action is not a request for `method` whose outcome the worker
 /// could not establish, when its receipt could not be shown on standard error (nothing is sent: a
 /// later request names a result the person was shown), and the worker's refusal when it holds no
-/// such action.
+/// such action. A refusal that says an argument cannot be used is shown with one sentence more,
+/// where the command has a later request: if the host holds no receipt for the action there is
+/// nothing to name, and the plain command asks again. The sentence is chosen by the refusal's code
+/// and by nothing it says.
 pub async fn earlier(
     client: &mut LocalClient,
     action: ActionId,
     method: Method,
     what: &'static str,
+    unknown: &Unknown,
 ) -> Result<Quote> {
     let outcome = client
         .request(
@@ -236,16 +287,13 @@ pub async fn earlier(
             },
         )
         .await?;
-    let read: ActionReadResult =
-        outcome
-            .map_err(CliError::Refused)?
-            .to_typed()
-            .map_err(|error| {
-                CliError::Other(shown!(
-                    "the worker's answer could not be read: {}",
-                    Shown::cbor(&error)
-                ))
-            })?;
+    let value = outcome.map_err(|refusal| read_refused(refusal, action, what, unknown))?;
+    let read: ActionReadResult = value.to_typed().map_err(|error| {
+        CliError::Other(shown!(
+            "the worker's answer could not be read: {}",
+            Shown::cbor(&error)
+        ))
+    })?;
     let receipt = read.receipt;
     if receipt.method != MethodName::from(method) {
         return Err(CliError::Usage(shown!(
@@ -283,4 +331,117 @@ pub async fn earlier(
         action_id: action,
         revision: receipt.revision.get(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kr_protocol::scalars::Uuid;
+
+    fn action() -> ActionId {
+        ActionId::new(Uuid::from_bytes([7; 16]))
+    }
+
+    fn cancelling() -> Unknown {
+        let command = shown!("kr question cancel 11");
+        Unknown {
+            what: "the cancellation",
+            read_back: ReadBack::of(shown!("5"), None),
+            later: Some(Later {
+                asks_again: shown!("`{}` asks again", command),
+                command,
+            }),
+        }
+    }
+
+    fn refusal(code: ErrorCode, message: Shown) -> ProtocolError {
+        kr_client::error::refusal(code, message)
+    }
+
+    /// A command with a later request tells the person what the host holds, what each state calls
+    /// for, and what the command does where the host holds nothing.
+    #[test]
+    fn an_unknown_outcome_tells_what_the_host_holds_and_what_each_state_calls_for() {
+        let CliError::Unfinished { message, .. } = cancelling().ended(action(), Cause::Connection)
+        else {
+            panic!("an unknown outcome ends as unfinished");
+        };
+        assert_eq!(
+            message.as_str(),
+            format!(
+                "the exchange with the host failed after the request for the cancellation was \
+                 composed, and the request may have reached the host, so whether it performed it \
+                 is not known. The request was made as action {a} and is not sent again; \
+                 `kr action read {a} --session 5` shows what the host holds of it. If the host \
+                 holds it with an unknown outcome, `kr question cancel 11 --after-unknown {a}` \
+                 makes the later request that names it. If the host holds no receipt for it, \
+                 `kr question cancel 11` asks again.",
+                a = action()
+            )
+        );
+    }
+
+    /// A command with no later request keeps the words it had.
+    #[test]
+    fn a_command_with_no_later_request_keeps_its_words() {
+        let mut unknown = cancelling();
+        unknown.later = None;
+        let CliError::Unfinished { message, .. } = unknown.ended(action(), Cause::Unreadable)
+        else {
+            panic!("an unknown outcome ends as unfinished");
+        };
+        assert_eq!(
+            message.as_str(),
+            format!(
+                "the host answered the request for the cancellation and its answer could not be \
+                 read, so whether it performed it is not known. The request was made as action \
+                 {a} and is not sent again; `kr action read {a} --session 5` shows what the host \
+                 holds of it, and this command makes no later request",
+                a = action()
+            )
+        );
+    }
+
+    /// The refusal of an argument the worker cannot use is shown as it was, and one sentence says
+    /// what holds if the host has no receipt for the action.
+    #[test]
+    fn a_refusal_of_an_argument_adds_what_holds_where_the_host_has_no_receipt() {
+        let worker = refusal(
+            ErrorCode::InvalidArgument,
+            shown!("no receipt for action {}", action()),
+        );
+        let today = CliError::Refused(worker.clone()).said();
+        let said = read_refused(worker, action(), "cancellation", &cancelling()).said();
+        assert_eq!(
+            said.as_str(),
+            format!(
+                "{today}\nIf the host holds no receipt for action {a}, there is nothing for a \
+                 later cancellation to name: `kr question cancel 11` asks again.",
+                a = action()
+            )
+        );
+    }
+
+    /// A refusal with any other code is shown as it was, and so is any refusal where the command has
+    /// no later request.
+    #[test]
+    fn a_refusal_with_another_code_is_shown_as_it_was() {
+        for code in [
+            ErrorCode::PermissionDenied,
+            ErrorCode::UnknownSession,
+            ErrorCode::OutcomeUnknown,
+        ] {
+            let worker = refusal(code, Shown::said("the worker would not say"));
+            let said = read_refused(worker.clone(), action(), "cancellation", &cancelling()).said();
+            assert_eq!(said.as_str(), CliError::Refused(worker).said().as_str());
+        }
+        let worker = refusal(
+            ErrorCode::InvalidArgument,
+            Shown::said("no receipt for action"),
+        );
+        let mut unknown = cancelling();
+        unknown.later = None;
+        let said = read_refused(worker.clone(), action(), "cancellation", &unknown).said();
+        assert_eq!(said.as_str(), CliError::Refused(worker).said().as_str());
+    }
 }
