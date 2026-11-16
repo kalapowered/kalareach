@@ -607,9 +607,12 @@ export type FailureKind =
   | 'store_failed'
   | 'approval_unknown'
 
-/** How an attempt ended, with the tries this computer has left when it was charged. */
-export interface PairingFailure {
-  readonly kind: FailureKind
+/** A kind of failure that carries no wait: every kind except the two of the managed relay service. */
+export type WaitlessKind = Exclude<FailureKind, 'relay_capacity' | 'relay_fault'>
+
+/** What every failure of an attempt carries. */
+interface FailureCommon {
+  /** The tries this computer has left, when the attempt was charged. */
   readonly tries_left: number | null
   /**
    * The paths that still work, each exactly as the managed relay service wrote it, in the order it
@@ -617,13 +620,23 @@ export interface PairingFailure {
    * The page shows each as text and never builds one.
    */
   readonly alternatives?: readonly string[]
-  /**
-   * This device's own wait, in whole seconds from the moment the attempt ended until it asks the
-   * managed relay service again. Present with `relay_capacity` and `relay_fault`, and with no other
-   * kind. At most a day, and 0 is possible. The page says it once and never counts it down.
-   */
-  readonly retry_after_seconds?: number
 }
+
+/**
+ * How an attempt ended. The two kinds of the managed relay service always carry this device's own
+ * wait, and no other kind does.
+ */
+export type PairingFailure =
+  | (FailureCommon & { readonly kind: WaitlessKind; readonly retry_after_seconds?: never })
+  | (FailureCommon & {
+      readonly kind: 'relay_capacity' | 'relay_fault'
+      /**
+       * This device's own wait, in whole seconds from the moment the attempt ended until it asks
+       * the managed relay service again. At most a day, and 0 is possible. The page says it once
+       * and never counts it down.
+       */
+      readonly retry_after_seconds: number
+    })
 
 /** What a paired host is shown as. */
 export interface PairedHostView {
@@ -810,7 +823,7 @@ export interface PairingUnavailable {
 /** What taking an invitation in from the pasteboard, the camera or a picture found. */
 export interface IntakeView {
   readonly invitation: InvitationSummary | null
-  readonly failure: FailureKind | null
+  readonly failure: WaitlessKind | null
   readonly cleared: boolean
   readonly declined: boolean
   /**

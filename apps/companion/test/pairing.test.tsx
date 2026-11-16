@@ -12,7 +12,7 @@ import userEvent from '@testing-library/user-event'
 import { App } from '../src/App'
 import { AppProvider, type Place } from '../src/app/state'
 import { fakeHost, type FakeHostControls } from '../src/host/fake'
-import type { AttemptState, FailureKind, ConfirmationRequest } from '../src/host/port'
+import type { AttemptState, ConfirmationRequest, PairingFailure, WaitlessKind } from '../src/host/port'
 import { failureWords } from '../src/pairing/words'
 import { heardIn, readAloud, regionsOf, shown } from './live-regions'
 
@@ -35,17 +35,14 @@ function attempt(controls: FakeHostControls, state: AttemptState): void {
 const IN_FIVE_MINUTES = Date.now() + 5 * 60_000
 
 /** A code attempt through the configured service that ended as `kind`. */
-function ended(
-  kind: FailureKind,
-  tries_left: number | null,
-  retry_after_seconds?: number
-): AttemptState {
-  return {
-    state: 'ended',
-    failure: { kind, tries_left, ...(retry_after_seconds === undefined ? {} : { retry_after_seconds }) },
-    mode: 'code',
-    service: null
-  }
+function ended(kind: WaitlessKind, tries_left: number | null): AttemptState {
+  return { state: 'ended', failure: { kind, tries_left }, mode: 'code', service: null }
+}
+
+/** A code attempt through the configured service that the managed relay could not take. */
+function turnedAway(tries_left: number | null, retry_after_seconds: number): AttemptState {
+  const failure: PairingFailure = { kind: 'relay_capacity', tries_left, retry_after_seconds }
+  return { state: 'ended', failure, mode: 'code', service: null }
 }
 
 describe('pairing with a host', () => {
@@ -161,7 +158,7 @@ describe('pairing with a host', () => {
   })
 
   it('gives every failure kind its own sentence and action, with the tries line when charged', async () => {
-    const kinds: FailureKind[] = [
+    const kinds: WaitlessKind[] = [
       'service_unreachable',
       'service_not_pairing',
       'no_host_answered',
@@ -243,7 +240,7 @@ describe('pairing with a host', () => {
     const { controls } = start()
     await screen.findByLabelText('Pairing code')
 
-    attempt(controls, ended('relay_capacity', null, 20))
+    attempt(controls, turnedAway(null, 20))
     const code = (await screen.findByTestId('failure-sentence')).textContent ?? ''
     expect(code).toMatch(/managed relay/)
     expect(code).not.toMatch(/could not be reached/)
@@ -264,7 +261,7 @@ describe('pairing with a host', () => {
   it('names an unknown failure kind only as not finished, with the generic action', async () => {
     const { controls } = start()
     await screen.findByLabelText('Pairing code')
-    attempt(controls, ended('a_kind_from_a_newer_build' as FailureKind, null))
+    attempt(controls, ended('a_kind_from_a_newer_build' as WaitlessKind, null))
     expect(await screen.findByRole('heading', { name: 'Pairing did not finish' })).toBeInTheDocument()
     expect(screen.getByTestId('failure-sentence').textContent).toMatch(/^Pairing did not finish/)
     expect(screen.getByTestId('failure-action').textContent).toBe('Try again')

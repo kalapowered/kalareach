@@ -29,7 +29,7 @@ import { useApp } from '../app/state'
 import {
   failureMessage,
   type AttemptState,
-  type FailureKind,
+  type WaitlessKind,
   type HostRow,
   type IntakeView,
   type InvitationSummary,
@@ -136,7 +136,7 @@ export function PairingFlow({
   const [code, setCode] = useState('')
   const [composing, setComposing] = useState(false)
   const [codeError, setCodeError] = useState<string | null>(null)
-  const [pasteFailure, setPasteFailure] = useState<FailureKind | null>(null)
+  const [pasteFailure, setPasteFailure] = useState<WaitlessKind | null>(null)
   const [changing, setChanging] = useState(false)
   const [draftOrigin, setDraftOrigin] = useState('')
   const [now, setNow] = useState(() => Date.now())

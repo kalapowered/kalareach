@@ -1157,8 +1157,8 @@ async fn kr_req_17_48_a_kept_answer_holds_the_list_and_the_delay_it_named() {
                 };
                 assert_eq!(words_of(&alternatives), list, "at {probe}s");
                 assert!(
-                    retry_after_seconds.is_some(),
-                    "at {probe}s with {delay:?}: a device that waits is told how long"
+                    retry_after_seconds <= 86_400,
+                    "at {probe}s with {delay:?}: {retry_after_seconds}"
                 );
             }
         }
@@ -1187,8 +1187,8 @@ async fn kr_req_17_48_an_unavailable_answer_with_no_entry_is_a_fault_and_never_c
                 panic!("at {probe}s with {delay:?}: {refusal:?}");
             };
             assert!(
-                retry_after_seconds.is_some(),
-                "at {probe}s with {delay:?}: a device that waits is told how long"
+                retry_after_seconds <= 86_400,
+                "at {probe}s with {delay:?}: {retry_after_seconds}"
             );
         }
     }
@@ -1202,7 +1202,7 @@ async fn kr_req_17_48_a_refusal_of_the_5xx_class_in_the_envelope_is_a_fault() {
     const SHORT: &str = "Managed capacity for new pairing invitations is not available now.";
     // The same wait, said as unavailable: asked again after a wait of twenty seconds or more at the
     // same moments, so the whole series is equal.
-    for (status, delay, told) in [(503, None, Some(20)), (500, Some(3600), Some(3600))] {
+    for (status, delay, told) in [(503, None, 20), (500, Some(3600), 3600)] {
         let refused = Exact::new(status, &refusal_body("INTERNAL", delay));
         let seen = series(Arc::clone(&refused) as _, || refused.requests()).await;
         let unavailable = Exact::new(200, &unavailable_body(SHORT, &STILL_WORK, delay));
@@ -1231,7 +1231,7 @@ async fn kr_req_17_48_a_refusal_of_the_5xx_class_in_the_envelope_is_a_fault() {
     assert_eq!(
         seen[0].2,
         Some(RelayRefusal::Fault {
-            retry_after_seconds: Some(20)
+            retry_after_seconds: 20
         })
     );
     // A service that says it is not configured is a fault as well, and is not asked for ten
@@ -1245,7 +1245,7 @@ async fn kr_req_17_48_a_refusal_of_the_5xx_class_in_the_envelope_is_a_fault() {
     assert_eq!(
         seen[0].2,
         Some(RelayRefusal::Fault {
-            retry_after_seconds: Some(600)
+            retry_after_seconds: 600
         })
     );
 }
@@ -1290,7 +1290,7 @@ fn handed_on(refusal: &Option<RelayRefusal>) -> Option<u64> {
             | RelayRefusal::Fault {
                 retry_after_seconds,
             },
-        ) => *retry_after_seconds,
+        ) => Some(*retry_after_seconds),
         None => None,
     }
 }
