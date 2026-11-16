@@ -203,20 +203,41 @@ impl AttentionFence {
 
     /// Forgets a connection that has ended or been withdrawn, when it was the current one.
     pub fn ended(&self, connection_id: ConnectionId) {
-        let changed = {
-            let mut state = self.state();
-            let current = state
-                .current
-                .as_ref()
-                .is_some_and(|current| current.connection_id == connection_id);
-            if current {
-                state.current = None;
-            }
-            current
-        };
+        let changed = Self::forget(&mut self.state(), connection_id);
         if changed {
             self.changed.notify_waiters();
         }
+    }
+
+    /// Does what [`Self::ended`] does when the fence's own lock is free, and says whether it did.
+    ///
+    /// It never waits: a statement holds that lock while it reads the journal, and a connection
+    /// that ended because its peer went must not keep its place in the worker's count until that
+    /// read is done.
+    pub fn try_ended(&self, connection_id: ConnectionId) -> bool {
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
+        let changed = Self::forget(&mut state, connection_id);
+        drop(state);
+        if changed {
+            self.changed.notify_waiters();
+        }
+        true
+    }
+
+    /// Takes the connection out of the fence when it is the current one, and says whether it was.
+    fn forget(state: &mut FenceState, connection_id: ConnectionId) -> bool {
+        let current = state
+            .current
+            .as_ref()
+            .is_some_and(|current| current.connection_id == connection_id);
+        if current {
+            state.current = None;
+        }
+        current
     }
 
     /// Records the daemon's acknowledgement of a statement, when it arrived on the current
