@@ -119,15 +119,15 @@ impl Said for CliError {
 }
 
 /// What a person is told of a refusal: what the refuser said, and the direct action after it where
-/// there is one. A code that calls for nothing is said by its message alone.
+/// there is one. A code that calls for nothing is said by its message alone, and so is a message
+/// that already says when to try again or what to do meanwhile: a second instruction after the
+/// first is one too many.
 fn refusal_said(error: &kr_protocol::error::ProtocolError, action: UserAction) -> Shown {
+    let said = Shown::protocol(error);
     match action {
-        UserAction::Nothing => Shown::protocol(error),
-        action => shown!(
-            "{}\n{}",
-            Shown::protocol(error),
-            Shown::said(action.message())
-        ),
+        UserAction::Nothing => said,
+        _ if kr_client::services::says_its_own_next_step(said.as_str()) => said,
+        action => shown!("{}\n{}", said, Shown::said(action.message())),
     }
 }
 
