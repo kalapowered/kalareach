@@ -92,13 +92,15 @@ async fn a_project_action_performed_and_not_recorded_is_told_the_outcome_is_unkn
 
 /// KR-REQ-09.09: a close the worker answers with the closure of the session it has ended. The
 /// answer is the worker's, and the daemon writes the record on a task of its own: with the registry
-/// refusing the write that records it, the device is still told that the session closed, and the
-/// worker has the close; once the registry takes the write, a repeat of the close is answered from
-/// what the daemon knows without asking the worker again, and the closure is recorded.
+/// refusing the write that records it, the device is still told that the session closed, with the
+/// closure the worker gave, and the worker has the close; a repeat of the close is answered from
+/// what the daemon knows without asking the worker again, while the registry still refuses; once
+/// the registry takes the write, the closure is recorded durably.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_close_whose_closure_cannot_be_recorded_is_answered_and_recorded_when_the_registry_takes_it()
  {
     use kr_protocol::envelope::{ActionTarget, ControlFrame, Outcome, Response};
+    use kr_protocol::session::{Durability, SessionCloseResult};
 
     use crate::service::a_read_that_meets_a_worker_on_its_way_out::{
         self as scripted, Scripted, recorded,
@@ -134,6 +136,20 @@ async fn a_close_whose_closure_cannot_be_recorded_is_answered_and_recorded_when_
             rusqlite::Connection::open(controller.paths.registry_database())
                 .expect("the registry opens beside the daemon's own handle")
         };
+        // What a close answers with, and the closure it carries, which is the worker's own.
+        let closure_in = |answered: &super::decision::Answered| -> SessionCloseResult {
+            let ControlFrame::Response(Response {
+                outcome: Outcome::Ok(value),
+                ..
+            }) = answered.frame()
+            else {
+                panic!(
+                    "the close is answered with a result: {:?}",
+                    answered.frame()
+                );
+            };
+            value.to_typed().expect("decodes")
+        };
         if refused {
             registry()
                 .execute_batch(
@@ -147,55 +163,69 @@ async fn a_close_whose_closure_cannot_be_recorded_is_answered_and_recorded_when_
             .answer_now(ControlFrame::Mutation(Box::new(close(91))))
             .await
             .expect("the close is answered");
+        let first = closure_in(&answered);
+        assert_eq!(
+            first.closure.0.as_ref().map(|record| record.durability),
+            Some(Durability::Durable),
+            "the closure the worker gave is in the answer, refused {refused}: {first:?}"
+        );
         assert_eq!(
             script.forwarded().len(),
             1,
             "the close reached the worker, refused {refused}"
         );
-        assert!(
-            matches!(
-                answered.frame(),
-                ControlFrame::Response(Response {
-                    outcome: Outcome::Ok(_),
-                    ..
-                })
-            ),
-            "the close is answered whether or not the registry takes the record, refused \
-             {refused}: {:?}",
-            answered.frame()
-        );
         if refused {
-            registry()
-                .execute_batch("DROP TRIGGER the_closure_is_not_kept;")
-                .expect("the registry takes a closure again");
+            // The registry still refuses the write, so the closure is known and not recorded: the
+            // repeat is answered from what the daemon knows, whichever way the retries run.
             let repeated = connection
                 .answer_now(ControlFrame::Mutation(Box::new(close(92))))
                 .await
                 .expect("the repeat is answered");
-            assert!(
-                matches!(
-                    repeated.frame(),
-                    ControlFrame::Response(Response {
-                        outcome: Outcome::Ok(_),
-                        ..
-                    })
-                ),
-                "the repeat is answered: {:?}",
-                repeated.frame()
+            let again = closure_in(&repeated);
+            assert_eq!(again.durability, Durability::Durable, "{again:?}");
+            assert_eq!(
+                again.closure.0.as_ref().map(|record| record.session_id),
+                Some(world.session_id),
+                "{again:?}"
             );
             assert_eq!(
                 script.forwarded().len(),
                 1,
                 "the repeat is answered from what the daemon knows and does not reach the worker"
             );
+            registry()
+                .execute_batch("DROP TRIGGER the_closure_is_not_kept;")
+                .expect("the registry takes a closure again");
         }
+        // The write is tried again when the closure is asked about, so a close sent now is
+        // answered whichever write is running, and the closure is recorded.
+        let mut action = 93;
         tokio::time::timeout(std::time::Duration::from_secs(20), async {
             while !recorded(&world).await {
-                tokio::task::yield_now().await;
+                if refused {
+                    connection
+                        .answer_now(ControlFrame::Mutation(Box::new(close(action))))
+                        .await
+                        .expect("a repeat is answered");
+                    action += 1;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         })
         .await
         .unwrap_or_else(|_| panic!("the closure was never recorded, refused {refused}"));
+        let record = controller
+            .registry
+            .lock()
+            .await
+            .closure(world.session_id)
+            .expect("the registry answers")
+            .expect("the closure is recorded");
+        assert_eq!(
+            record.durability,
+            Durability::Durable,
+            "the record is durable, refused {refused}"
+        );
         world.serving.abort();
     }
 }
