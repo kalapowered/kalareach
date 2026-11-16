@@ -16,6 +16,11 @@
 //! The broadcast and the cursors see every notification as they do on any session, and the
 //! session keeps everything else it reads for itself: answers, receipts and window renewals never
 //! reach the channel.
+//!
+//! What the reader has taken from the connection is the holder's: closing or dropping the session
+//! stops further reads and nothing else. Each notification already read, then the end, then the
+//! channel's end still arrive, and the reader holds no lock while it waits for the holder to take
+//! them.
 
 use kr_protocol::envelope::Notification;
 use kr_protocol::error::ProtocolError;
@@ -29,7 +34,9 @@ pub enum Ended {
     /// dropped the session, which is how the reader tells the owner's own close: the owner asked
     /// for it, so it is no failure.
     Finished,
-    /// Reading the stream failed: the transport's own failure.
+    /// Reading the stream failed: the transport's own failure, with what the transport said. On
+    /// the local link every failed read is one, the peer's end at a frame's boundary included; on
+    /// the network the peer's clean end is [`Ended::Finished`].
     Failed(ClientError),
     /// The host refused the connection, and said why. The refusal comes before the end on the
     /// stream, so it is complete when this is delivered.
