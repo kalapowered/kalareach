@@ -81,7 +81,7 @@ use crate::trace::Site;
 mod overtake;
 mod standing;
 
-use standing::{Mode, ShownAtAdmission, Sweep};
+use standing::{Limited, Mode, ShownAtAdmission, Sweep};
 
 /// How often the worker replaces a live connection's action window.
 ///
@@ -7760,13 +7760,23 @@ impl WorkerService {
         // The envelope is checked before anything durable happens: the target this worker will
         // act on, the grant the caller claims, the preconditions the subject must still satisfy
         // and the freshness window that admits a first request.
-        first.envelope(mutation, entry, caller)?;
+        {
+            let session = self.runtime.session();
+            first.envelope(&session, mutation, entry, caller)?;
+        }
         Self::check_draft_route(state, mutation, method)?;
         // What this mutation asks for, as distinct from the identifier it asks under. It is what
         // decides whether a fresh identifier would be taking an uncertain outcome's place.
         let subject = kr_protocol::action::subject_digest(mutation)
             .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
-        let shown = first.limits(None, caller, state, mutation, method, subject, None)?;
+        let limited = first.limits(None, caller, state, mutation, method, subject, None)?;
+        // The first admission's own work: a journal that could not answer the reads above, for a
+        // method that goes on without it, is noted once for the session, which then reports
+        // volatile durability.
+        if let Some(detail) = limited.unreadable {
+            self.runtime.session().note_journal_failure(detail);
+        }
+        let shown = limited.shown;
         #[cfg(feature = "testing")]
         self.after_limits_stall.stand();
         // The deadline lives on the continuous clock. That is what admission, revalidation and
@@ -7952,12 +7962,10 @@ impl WorkerService {
         let actor_id = caller.actor_id.clone();
         let second_pass = preparation.is_some();
         // Revalidate inside the boundary. Anything that was true at acceptance may not be now, and
-        // this is the last moment at which checking it still means something.
-        let pass = self.standing_pass(if second_pass {
-            Mode::Again
-        } else {
-            Mode::First
-        });
+        // this is the last moment at which checking it still means something. Both calls ask in the
+        // first mode: a refusal here is the admission's own, and the receipt's reason is chosen
+        // from the error below, whichever call it was.
+        let pass = self.standing_pass(Mode::First);
         let revalidated = pass
             .subject(&session, state, mutation, method, caller)
             // The deadline the host derived is the deadline it keeps, measured on the continuous
@@ -8332,6 +8340,7 @@ impl WorkerService {
     /// be. A host that parses only the parameters is acting on a request it has not read.
     fn check_envelope(
         &self,
+        session: &Session,
         mutation: &MutationRequest,
         entry: &'static kr_protocol::authority::MethodEntry,
         caller: &Caller,
@@ -8347,10 +8356,8 @@ impl WorkerService {
                 detail: format!("this worker belongs to environment {}", self.environment_id),
             });
         }
-        let session = self.runtime.session();
         let owned = session.id();
         let epoch = session.epoch();
-        drop(session);
         // The registry says which resources a method names. A method whose selectors include a
         // session must name one; a method that acts on a receipt need not.
         let names_session = entry
@@ -8690,7 +8697,6 @@ impl WorkerService {
     #[allow(clippy::too_many_arguments)]
     fn check_admission_limits(
         &self,
-        mode: Mode,
         held: Option<&mut Session>,
         caller: &Caller,
         state: &ConnectionState,
@@ -8698,7 +8704,7 @@ impl WorkerService {
         method: Method,
         subject: kr_protocol::scalars::Digest256,
         shown: Option<ShownAtAdmission>,
-    ) -> Result<ShownAtAdmission> {
+    ) -> Result<Limited> {
         let actor_id = &caller.actor_id;
         let declared = MutationPreconditions::parse(&mutation.expected)?.supersedes;
         // A person is shown a result through the local owner's commands or a paired device. The
@@ -8727,23 +8733,27 @@ impl WorkerService {
             None => taken.insert(self.runtime.session()),
         };
         let Some(journal) = session.journal_mut() else {
-            return Ok(shown);
+            return Ok(Limited {
+                shown,
+                unreadable: None,
+            });
         };
         // These two reads are what stops a *new* rich action being admitted twice or past its
         // limit. An authorised stop and a native interrupt are neither, and a store that cannot
         // answer them is not a reason to take away the one way a person has of stopping a running
-        // command. The failure is published as the fault it is, and the checks it feeds are
-        // skipped rather than guessed at.
+        // command. The failure is published as the fault it is (by the journal's own read), and
+        // the checks it feeds are skipped rather than guessed at; the first admission notes it
+        // for the session, from what comes back.
         let volatile_permitted = work_class(method).survives_a_journal_fault();
         let read = Self::uncertain_outcome_in_the_way(journal, actor_id, subject, mutation, method)
             .and_then(|uncertain| journal.outstanding(actor_id).map(|held| (uncertain, held)));
         let (uncertain, outstanding) = match read {
             Ok(pair) => pair,
             Err(error) if volatile_permitted && is_storage_failure(&error) => {
-                if mode == Mode::First {
-                    session.note_journal_failure(error.to_string());
-                }
-                return Ok(shown);
+                return Ok(Limited {
+                    shown,
+                    unreadable: Some(error.to_string()),
+                });
             }
             Err(error) => return Err(error),
         };
@@ -8754,7 +8764,10 @@ impl WorkerService {
         drop(taken);
         crate::action::dedup::check_supersession(uncertain, declared, shown.0)?;
         if !crate::action::dedup::bounded_by_outstanding(method) {
-            return Ok(shown);
+            return Ok(Limited {
+                shown,
+                unreadable: None,
+            });
         }
         crate::action::dedup::check_outstanding(
             outstanding,
@@ -8762,7 +8775,10 @@ impl WorkerService {
                 state.peer_limits.max_outstanding_mutations.get(),
             ),
         )?;
-        Ok(shown)
+        Ok(Limited {
+            shown,
+            unreadable: None,
+        })
     }
 
     /// Returns the actor's uncertain outcome that a fresh `mutation` for `subject` has to show, if
