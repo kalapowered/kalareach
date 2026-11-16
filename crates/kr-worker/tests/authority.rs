@@ -1312,7 +1312,8 @@ async fn settle(mut settled: impl FnMut() -> bool) -> bool {
     true
 }
 
-/// Holds the worker's dispatch boundary on a thread of its own until it is released.
+/// Holds the worker's dispatch boundary on a thread of its own until it is released, and its
+/// authority record with it when asked: a generation that is being decided holds both.
 struct Held {
     release: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -1320,11 +1321,20 @@ struct Held {
 
 impl Held {
     async fn boundary(host: &Host) -> Self {
+        Self::take(host, false).await
+    }
+
+    async fn boundary_and_authority(host: &Host) -> Self {
+        Self::take(host, true).await
+    }
+
+    async fn take(host: &Host, with_authority: bool) -> Self {
         let (release, wait) = std::sync::mpsc::channel::<()>();
         let (held, confirmed) = tokio::sync::oneshot::channel::<()>();
         let service = Arc::clone(&host.service);
         let thread = std::thread::spawn(move || {
             let _boundary = service.hold_the_dispatch_boundary();
+            let _authority = with_authority.then(|| service.hold_the_authority_for_tests());
             let _ = held.send(());
             let _ = wait.recv();
         });
@@ -1670,4 +1680,33 @@ async fn a_dead_presentation_does_not_fence_a_living_older_binding() {
     read_session(&mut older, host.session_id)
         .await
         .expect("the connection that held the authority is served still");
+}
+
+/// A presentation that never took authority does not wait for authority when its connection ends.
+///
+/// A generation that is being decided holds the dispatch boundary and the authority record while it
+/// reads the journal. Presentations wait behind it and their peers go. Their connections are given
+/// back while both are still held, because a connection that was never bound has nothing to remove
+/// from the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_presentation_that_never_took_authority_ends_while_another_holds_the_authority() {
+    let host = host(1).await;
+    let service = &host.service;
+    let held = Held::boundary_and_authority(&host).await;
+    let start = service.connections_held_for_tests();
+    let peers = presenting_many(&host, 3, 1);
+    settle(|| service.presentations_waiting_for_tests() == 3).await;
+    assert_eq!(service.presentations_waiting_for_tests(), 3);
+    peers_go(peers).await;
+    settle(|| {
+        service.presentations_waiting_for_tests() == 0
+            && service.connections_held_for_tests() == start
+    })
+    .await;
+    assert_eq!(
+        service.connections_held_for_tests(),
+        start,
+        "the connections of the peers that went are given back while the authority is held"
+    );
+    held.release();
 }
