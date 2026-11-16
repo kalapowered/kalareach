@@ -322,10 +322,10 @@ pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
                  worker gave. A result that carries the member is written only by a worker of \
                  this build. The daemon's sleep scan is its one reader: it never lowers what it \
                  counted for the session on such an answer. The daemon's own answer to a client \
-                 never carries it. The retained level's daemon, whose result is a closed object, \
-                 cannot read a result that carries the member and takes the answer for a read \
-                 that failed, which is what it takes a read that is not answered for; its scan \
-                 keeps what it counted, as it does then. No client was released, so there is no \
+                 never carries it. A daemon refuses a worker of another level at the hello, so the \
+                 retained level's daemon never decodes a result that carries the member: it takes \
+                 the worker for one it cannot reach, and its scan keeps what it counted, as it \
+                 does when a worker does not answer. No client was released, so there is no \
                  shim: the public contract may change with a level move until public 1.0 freezes \
                  at the first client release (`docs/releases/packages.md`).",
     }],
