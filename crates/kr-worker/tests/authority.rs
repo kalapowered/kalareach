@@ -1841,3 +1841,40 @@ async fn a_living_presentation_is_decided_while_mutations_take_the_boundary_agai
         .await
         .expect("the presenting connection holds the authority");
 }
+
+/// A worker that is stopped while presentations wait does not wait for the hold on their account.
+///
+/// Presentations whose clients are there wait at a held boundary, on a runtime that this case builds
+/// and then drops, which is what a stop of the worker does to its runtime. A holder outside the
+/// runtime keeps the boundary throughout, so the drop ends only if the presentations leave the
+/// wait. A stop still waits for a hold that a holder inside the runtime has, on a thread of the
+/// runtime's own.
+#[test]
+fn a_worker_stopped_while_presentations_wait_ends_without_the_hold() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let host = runtime.block_on(host(1));
+    let boundary = runtime.block_on(Held::boundary(&host));
+    let peers = runtime.block_on(async { presenting_many(&host, 8, 1) });
+    let waiting = runtime.block_on(settle(|| {
+        host.service.presentations_waiting_for_tests() == 8
+    }));
+    let (ended, ending) = std::sync::mpsc::channel::<()>();
+    let stopping = std::thread::spawn(move || {
+        drop(peers);
+        drop(runtime);
+        let _ = ended.send(());
+    });
+    let stopped = ending.recv_timeout(SETTLE);
+    // The holder is let go whatever came of the stop, so that a stop that waited ends too.
+    boundary.release();
+    stopping.join().expect("the stopping thread finishes");
+    assert!(waiting, "the presentations wait at the held boundary");
+    assert!(
+        stopped.is_ok(),
+        "the runtime ended while the boundary was still held"
+    );
+}
