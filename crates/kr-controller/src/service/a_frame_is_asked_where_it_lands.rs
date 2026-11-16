@@ -126,21 +126,16 @@ fn restamp(controller: &Arc<Controller>) -> Change {
 async fn what_the_caller_is_handed(
     controller: &Arc<Controller>,
     mut writer: FrameWriter,
-    mut reader: FrameReader,
+    reader: FrameReader,
     frame: &ControlFrame,
     method: Method,
     under: WrittenUnder,
     changes: Vec<Change>,
 ) -> (bool, Vec<ControlFrame>) {
-    let mut changes = changes.into_iter().peekable();
-    let mut armed = changes
-        .peek()
-        .is_some()
-        .then(|| controller.pause_after_the_lease_is_read());
-    let writing = tokio::spawn({
+    what_the_caller_is_handed_when(controller, reader, changes, || {
         let controller = Arc::clone(controller);
         let frame = frame.clone();
-        async move {
+        tokio::spawn(async move {
             let stood = controller
                 .write_answer(
                     &mut writer,
@@ -154,8 +149,25 @@ async fn what_the_caller_is_handed(
             // The connection ends with the writer, as it does when the daemon's loop stops.
             drop(writer);
             stood
-        }
-    });
+        })
+    })
+    .await
+}
+
+/// As [`what_the_caller_is_handed`], for a write that `write` starts: the pause is armed before it
+/// starts.
+async fn what_the_caller_is_handed_when(
+    controller: &Arc<Controller>,
+    mut reader: FrameReader,
+    changes: Vec<Change>,
+    write: impl FnOnce() -> tokio::task::JoinHandle<bool>,
+) -> (bool, Vec<ControlFrame>) {
+    let mut changes = changes.into_iter().peekable();
+    let mut armed = changes
+        .peek()
+        .is_some()
+        .then(|| controller.pause_after_the_lease_is_read());
+    let writing = write();
     while let Some(change) = changes.next() {
         let (arrived, go) = armed.take().expect("the pause is armed");
         arrival(arrived).await;
@@ -312,10 +324,11 @@ async fn a_reply_read_from_a_record_is_replaced_by_the_reply_of_the_member_that_
 /// says nothing was done. A revision that moved is no member of its ask.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fresh_reply_asks_the_registration_and_no_fence() {
-    for (name, frame, change_of, expected) in [
+    for (name, frame, taken_effect, change_of, expected) in [
         (
             "a result with a fence owed",
             result(),
+            true,
             (|controller: &Arc<Controller>, _| fence(controller, true))
                 as fn(&Arc<Controller>, ConnectionId) -> Change,
             result(),
@@ -323,24 +336,28 @@ async fn a_fresh_reply_asks_the_registration_and_no_fence() {
         (
             "a result with the revision moved",
             result(),
+            true,
             |controller, _| restamp(controller),
             result(),
         ),
         (
             "a result with its registration withdrawn",
             result(),
+            true,
             withdrawal,
             not_shown(),
         ),
         (
             "a refusal with its registration withdrawn",
             a_definite_refusal(),
+            false,
             withdrawal,
             registration_gone(),
         ),
         (
             "a refusal with a fence owed",
             a_definite_refusal(),
+            false,
             |controller, _| fence(controller, true),
             a_definite_refusal(),
         ),
@@ -353,11 +370,75 @@ async fn a_fresh_reply_asks_the_registration_and_no_fence() {
             reader,
             &frame,
             Method::PrivacySet,
-            WrittenUnder::for_an_own_effect_case(footing),
+            WrittenUnder::for_an_own_effect_case(footing, taken_effect),
             vec![change_of(&controller, connection_id)],
         )
         .await;
         controller.hold_fence(false);
+        assert!(stood, "{name}: the connection goes on");
+        assert_eq!(handed, vec![expected], "{name}");
+    }
+}
+
+/// KR-REQ-09.09: a refusal that the door made after the request had changed something does not say
+/// that nothing was done, and it is the door's verdict that reaches the writer, whatever the code
+/// of the refusal is. Told through the door and written through the sink, such a refusal whose
+/// registration is withdrawn in the pause after the lease's reading is not shown, where a fresh
+/// refusal of the same code is the registration's refusal. The control: with the registration
+/// standing, the refusal is written as it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_made_after_an_effect_is_not_shown_when_its_registration_goes_before_the_write() {
+    use crate::given::local_door::{ReplySink, Standing, told};
+    use crate::given::{Given, Settled};
+
+    for (name, after_an_effect, withdrawn, expected) in [
+        (
+            "after an effect, the registration withdrawn",
+            true,
+            true,
+            not_shown(),
+        ),
+        (
+            "after an effect, the registration standing",
+            true,
+            false,
+            a_definite_refusal(),
+        ),
+        (
+            "a fresh refusal, the registration withdrawn",
+            false,
+            true,
+            registration_gone(),
+        ),
+    ] {
+        let (_temp, controller, mut writer, reader) = connected(false).await;
+        let (connection_id, _, footing) = registered(&controller);
+        let given = if after_an_effect {
+            Given::after_an_effect(a_definite_refusal())
+        } else {
+            Given::fresh(a_definite_refusal())
+        };
+        let reply = told(
+            Settled::of(given),
+            &Standing::new(&controller, footing, REQUEST),
+        )
+        .await;
+        let changes = if withdrawn {
+            vec![withdrawal(&controller, connection_id)]
+        } else {
+            vec![]
+        };
+        let (stood, handed) = what_the_caller_is_handed_when(&controller, reader, changes, || {
+            let controller = Arc::clone(&controller);
+            tokio::spawn(async move {
+                let stood = ReplySink::new(&mut writer, StreamKind::Control)
+                    .write(&controller, reply, Some(Method::PrivacySet))
+                    .await;
+                drop(writer);
+                stood
+            })
+        })
+        .await;
         assert!(stood, "{name}: the connection goes on");
         assert_eq!(handed, vec![expected], "{name}");
     }
@@ -381,7 +462,7 @@ async fn a_lease_that_ends_after_it_is_read_is_answered_in_the_leases_words() {
             } else if method == Method::SessionRead {
                 WrittenUnder::of_a_read(footing)
             } else {
-                WrittenUnder::for_an_own_effect_case(footing)
+                WrittenUnder::for_an_own_effect_case(footing, true)
             };
             let change: Change = if ends {
                 Box::new(move || continuous.advance(Duration::from_secs(16 * 60)))
@@ -429,7 +510,7 @@ async fn a_bound_that_moved_is_decided_by_the_writers_own_reading_of_the_lease()
         reader,
         &result(),
         Method::PrivacySet,
-        WrittenUnder::for_an_own_effect_case(footing),
+        WrittenUnder::for_an_own_effect_case(footing, true),
         vec![Box::new(move || {
             presenter.present(&[kr_protocol::rights::ActionRight::FilesRead]);
         })],
@@ -455,7 +536,7 @@ async fn the_ask_that_finds_a_bound_moved_reads_the_lease_again_and_does_not_ref
     let (_temp, controller, _continuous, presenter, _writer, _reader) =
         connected_under_a_lease_that_can_be_presented_again().await;
     let (_, _, footing) = registered(&controller);
-    let under = WrittenUnder::for_an_own_effect_case(footing);
+    let under = WrittenUnder::for_an_own_effect_case(footing, true);
     let (arrived, go) = controller.pause_after_the_lease_is_read();
     let asking = tokio::task::spawn_blocking({
         let controller = Arc::clone(&controller);

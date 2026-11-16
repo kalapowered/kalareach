@@ -61,9 +61,12 @@ enum Words {
     /// A read's answer, or an attention read's release: a registration that has gone is refused in
     /// the words of the door's own check of the registration.
     Read,
-    /// A mutation's reply that carries only what the request itself did: not shown where it may
-    /// have taken effect, and the refusal of the member that refused where it says nothing was done.
-    OwnEffect,
+    /// A mutation's reply that carries only what the request itself did: not shown where the door
+    /// found that the request took effect or may have, and the refusal of the member that refused
+    /// where it says nothing was done. The door's verdict is `taken_effect`: the writer does not
+    /// make it again from the frame, whose code can say that nothing was done of a request that
+    /// first changed something.
+    OwnEffect { taken_effect: bool },
     /// A reply read from a record: the refusal of the member that refused for a reply that says
     /// another request spent the identifier of this one (that request had no effect of its own),
     /// and the outcome that is not shown for a copy of what an earlier request did.
@@ -81,12 +84,13 @@ impl WrittenUnder {
     }
 
     /// The standing of a mutation's reply that carries only what the request did: the registration
-    /// and the lease, and no fence, since the door told it while no fence was owed.
-    const fn of_an_own_effect(footing: Footing) -> Self {
+    /// and the lease, and no fence, since the door told it while no fence was owed. `taken_effect`
+    /// is the door's verdict that the request took effect or may have.
+    const fn of_an_own_effect(footing: Footing, taken_effect: bool) -> Self {
         Self {
             footing,
             ask: Ask::READ,
-            words: Words::OwnEffect,
+            words: Words::OwnEffect { taken_effect },
         }
     }
 
@@ -94,11 +98,15 @@ impl WrittenUnder {
     /// connection of the host, its own included: the registration is gone by the request's own
     /// doing, so what is asked is that no fence is owed and no later barrier has moved the
     /// revision that withdrawal set, and the lease.
-    const fn of_an_own_withdrawal(footing: Footing, withdrew: &HostWithdrawal) -> Self {
+    const fn of_an_own_withdrawal(
+        footing: Footing,
+        withdrew: &HostWithdrawal,
+        taken_effect: bool,
+    ) -> Self {
         Self {
             footing,
             ask: withdrew.ask().and_the_lease(),
-            words: Words::OwnEffect,
+            words: Words::OwnEffect { taken_effect },
         }
     }
 
@@ -121,8 +129,8 @@ impl WrittenUnder {
 
     /// The standing of a mutation's own reply, for a case that writes a reply by itself.
     #[cfg(test)]
-    pub(crate) const fn for_an_own_effect_case(footing: Footing) -> Self {
-        Self::of_an_own_effect(footing)
+    pub(crate) const fn for_an_own_effect_case(footing: Footing, taken_effect: bool) -> Self {
+        Self::of_an_own_effect(footing, taken_effect)
     }
 
     /// The question, for a lease whose reading found `bound`: no lock is taken, nothing is awaited
@@ -141,13 +149,12 @@ impl WrittenUnder {
     /// What is written in place of a frame that the last question stopped, for the member `lapse`
     /// that refused it.
     ///
-    /// `lease_ended` is the reply of a lease that ended. `effect` says the frame states a result,
-    /// or a word that does not say nothing was done.
+    /// `lease_ended` is the reply of a lease that ended. Whether the frame stands for an effect is
+    /// what the door found when it made this standing, never read again from the frame.
     pub(crate) fn withheld(
         &self,
         lapse: Lapse,
         request_id: RequestId,
-        effect: bool,
         lease_ended: impl FnOnce() -> ControlFrame,
     ) -> ControlFrame {
         if lapse == Lapse::LeaseEnded {
@@ -155,9 +162,14 @@ impl WrittenUnder {
         }
         let not_shown = || respond(request_id, Err(ControllerError::outcome_not_shown()));
         match self.words {
-            Words::Record { conflict: false } => not_shown(),
-            Words::OwnEffect if effect => not_shown(),
-            Words::Record { conflict: true } | Words::OwnEffect | Words::Read => {
+            Words::Record { conflict: false } | Words::OwnEffect { taken_effect: true } => {
+                not_shown()
+            }
+            Words::Record { conflict: true }
+            | Words::OwnEffect {
+                taken_effect: false,
+            }
+            | Words::Read => {
                 refused_with(request_id, &refusal_of(&self.footing, self.words, lapse))
             }
         }
@@ -293,7 +305,8 @@ impl<'a> Standing<'a> {
 /// - Any other answer carries only this request's own effect. It is given while the connection's
 ///   registration stands and no fence is owed ([`Ask::FRESH_REPLY`]); otherwise it is not shown
 ///   when it may have taken effect, and the refusal of the member that refused when it says nothing
-///   was done.
+///   was done. A refusal made after the request had changed something does not say that: it is
+///   not shown whatever its code is, here and where the writer's last question stops it.
 /// - The same, when the request's own effect raised the barrier that withdrew every connection of
 ///   the host, its own included ([`HostWithdrawal`]): the registration is then gone by the
 ///   request's own doing, so the answer is given while no fence is owed and no later barrier has
@@ -318,11 +331,20 @@ pub(crate) async fn told(settled: Settled<ControlFrame>, standing: &Standing<'_>
     } = standing;
     let request_id = *request_id;
     let not_shown = || respond(request_id, Err(ControllerError::outcome_not_shown()));
+    // Whether the request took effect, or may have: the writer is handed this verdict and does not
+    // make it again from the frame, whose code can say that nothing was done of a request that
+    // first changed something.
+    let taken_effect = match origin {
+        Origin::Withheld | Origin::Copied | Origin::AfterAnEffect => true,
+        Origin::Fresh => may_have_taken_effect(&answer),
+    };
     // What the frame is written under: a reply read from a record that passes the kept answer's
     // question is written under that question again, and any other under the request's own.
     let mut written_under = match &withdrew {
-        Some(withdrew) => WrittenUnder::of_an_own_withdrawal(footing.clone(), withdrew),
-        None => WrittenUnder::of_an_own_effect(footing.clone()),
+        Some(withdrew) => {
+            WrittenUnder::of_an_own_withdrawal(footing.clone(), withdrew, taken_effect)
+        }
+        None => WrittenUnder::of_an_own_effect(footing.clone(), taken_effect),
     };
     let frame = match origin {
         Origin::Withheld => not_shown(),
@@ -358,7 +380,7 @@ pub(crate) async fn told(settled: Settled<ControlFrame>, standing: &Standing<'_>
                 Ok(()) => answer,
                 // The check's refusal says nothing was done, which is true of a refusal and false of a
                 // result, or of any word that does not say so.
-                Err(_) if may_have_taken_effect(&answer) => not_shown(),
+                Err(_) if taken_effect => not_shown(),
                 Err(refusal) => refused_with(request_id, &refusal),
             }
         }
@@ -383,9 +405,15 @@ async fn own_withdrawal_or_standing(
 ) -> Result<(), ControllerError> {
     match withdrew {
         Some(withdrew) => controller.withdrawal_stands(withdrew).await,
-        None => footing
-            .ask(Ask::FRESH_REPLY)
-            .map_err(|lapse| refusal_of(footing, Words::OwnEffect, lapse)),
+        None => footing.ask(Ask::FRESH_REPLY).map_err(|lapse| {
+            refusal_of(
+                footing,
+                Words::OwnEffect {
+                    taken_effect: false,
+                },
+                lapse,
+            )
+        }),
     }
 }
 
