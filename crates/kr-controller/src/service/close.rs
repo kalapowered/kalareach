@@ -1176,10 +1176,11 @@ impl Controller {
         //    `surviving` below - and must not open the store on the way. A journal that could not
         //    be read at an earlier look may be read at this one, so it comes before the record
         //    that the earlier look kept.
-        // 3. A record of this daemon's own that an earlier look could not write, which is written
-        //    again and not replaced by a new one from a new look, so that the registry gets the
-        //    same record whichever retry runs first.
-        // 4. A new record, below.
+        // 3. A record of this daemon's own that an earlier look could not write gives its reason
+        //    alone. What a record says of the journal, the endpoint and the session's processes
+        //    is what the look that built it could read, remove and stop, and this look has made
+        //    its own pass: no look writes an item that its own pass made false.
+        // 4. A new record, built from this look's own pass, below.
         let kept = self.known_record(session_id);
         if let Some((account, Whose::Worker)) = &kept {
             self.write_closure(account, Whose::Worker).await?;
@@ -1191,10 +1192,10 @@ impl Controller {
             self.write_closure(&recovered, Whose::Worker).await?;
             return Ok(recovered);
         }
-        if let Some((own, Whose::Daemon)) = kept {
-            self.write_closure(&own, Whose::Daemon).await?;
-            return Ok(own);
-        }
+        let reason = match kept {
+            Some((own, Whose::Daemon)) => own.reason,
+            _ => reason,
+        };
         // Nothing authoritative survived. What is written instead says so: the coverage is
         // incomplete and the root's result is absent rather than invented.
         // A worker this host saw end is terminated; one it did not is not, whatever else is true
