@@ -264,7 +264,8 @@ export function startLinkPress(element: HTMLElement): () => void {
       { trusted: true, detail: event.detail, at: performance.now(), names, point: { x, y } },
       (at) => layoutNear(element, at.x, at.y)
     )
-    const named = names === 'link' ? linkOf(event.target) : null
+    // Only a touch or a pen gets a look at the click, so the link is read, and its view measured, for no other.
+    const named = names === 'link' && kind !== null && opensByRule(kind) ? linkOf(event.target) : null
     show(lookAt(kind, { trusted: true, detail: event.detail, names }, named === null ? null : { id: named, measurable: !unmeasured(named) }, decision))
     if (decision.kind !== 'open') return
     // One press gives one open: the click that follows needs a press of its own.
