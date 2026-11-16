@@ -392,21 +392,40 @@ async fn kr_req_23_30_a_cancel_sent_behind_a_waiting_prepared_action_is_read_aft
         .write_message(&ControlFrame::Mutation(Box::new(cancel)))
         .await
         .expect("writes the cancellation behind the action");
-    // The action still waits, and nothing it waits behind has been read.
+    // The state this case stands on: the action waits for the boundary, and the cancellation is
+    // queued on its connection behind it and is not read. A read of the connection would show as
+    // a request waiting at the boundary beside the action, which the window below would see.
     assert_eq!(
         waiting.service.prepared_waiting_for_tests(),
         1,
         "the action waits while the cancellation is written behind it"
     );
+    let read_while_the_action_waits = tokio::time::timeout(
+        Duration::from_millis(300),
+        settles(|| waiting.service.mutations_waiting_for_tests() != 0),
+    )
+    .await
+    .is_ok();
+    assert!(
+        !read_while_the_action_waits,
+        "the connection was read while the action waited: the cancellation waits at the boundary"
+    );
+    assert_eq!(
+        waiting.service.prepared_waiting_for_tests(),
+        1,
+        "the action still waits, with the cancellation queued behind it"
+    );
     waiting.held.release();
     let mut order = Vec::new();
     let mut outcomes = std::collections::BTreeMap::new();
     while order.len() < 2 {
-        let frame = tokio::time::timeout(PATIENCE, asking.recv())
-            .await
-            .expect("both requests are answered after the release")
-            .expect("the connection is read");
-        if let ControlFrame::Response(response) = frame {
+        let frame = tokio::time::timeout(PATIENCE, asking.recv()).await;
+        assert!(
+            matches!(frame, Ok(Ok(_))),
+            "both requests are answered after the release on a connection that is still read, \
+             and the answers so far are {order:?}: {frame:?}"
+        );
+        if let Ok(Ok(ControlFrame::Response(response))) = frame {
             order.push(response.request_id.get());
             outcomes.insert(response.request_id.get(), response.outcome);
         }
