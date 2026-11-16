@@ -86,11 +86,11 @@
         },
         {
           "path": "physical/iterm2-3.7.1.json",
-          "sha256": "d8a058aec28c6182cf058c36791a922a6f600838a59bb10c91b49564aa7bf2d6"
+          "sha256": "d832dea9e9956f99f3936514537a7054e337957e1cab312913fd00f4e69613ec"
         },
         {
           "path": "physical/terminal-app-2.15.json",
-          "sha256": "e53f57a37eebf1f7710e249ce0870cc81a4525354efc9f9bc3268b76dffd3116"
+          "sha256": "29b66f98e4c481c77ed8b836e556233704eeb82fbddb74717bc8d8f3ff83b5c0"
         }
       ],
       "name": "renderer-fixtures",
