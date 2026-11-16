@@ -452,6 +452,9 @@ async fn a_turn_that_starts_behind_a_stalled_broker_commit_keeps_the_count() {
 /// transaction in the file that the question ledger shares, one question runs out of time, and
 /// the ledger's expiry write fails after its busy wait. The other question stays open, so the
 /// host keeps counting a request waiting for a person.
+/// The hold stands past the busy wait, and a probe on the case's own thread shows that the ledger's
+/// read fails inside it, so a scan and a reader that took the error for no question (the base's)
+/// fail this case.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_question_whose_expiry_write_fails_beside_one_that_stays_open_keeps_the_count() {
     let rig = Rig::start().await;
@@ -516,6 +519,29 @@ async fn a_question_whose_expiry_write_fails_beside_one_that_stays_open_keeps_th
     tokio::time::sleep(Duration::from_secs(5)).await;
     rig.agent.says(TURN_7_STARTED).await;
     rig.agent.says(TURN_7_ENDED).await;
+    // What the case stands on: the same read on a thread of the case's own fails before the hold
+    // ends, because the write that the due question needs meets the write lock and gives up after
+    // its busy wait of five seconds. The ledger's reader makes this read at the frames above, so its
+    // error is there by the time the probe's is.
+    let probe = {
+        let service = Arc::clone(&worker.service);
+        tokio::task::spawn_blocking(move || {
+            service.questions().any_open(kr_worker::questions::Now {
+                utc_ms: kr_ipc::now_ms(),
+                boot_ms: kr_ipc::clock::boot_elapsed_ms(),
+            })
+        })
+    };
+    let read = tokio::time::timeout(Duration::from_secs(20), probe)
+        .await
+        .expect("the probe's read of the ledger returned within a bound")
+        .expect("the probe's thread ended");
+    assert!(
+        read.is_err(),
+        "a read of the ledger said {read:?} while the hold stood: the expiry write did not meet the write lock"
+    );
+    // The reader's own error is recorded as the probe's returns; the host counts the question
+    // that stays open for as long as the hold stands.
     rig.counts_stay(ASKED, "after the ledger's expiry write failed")
         .await;
     let _ = release.send(());
