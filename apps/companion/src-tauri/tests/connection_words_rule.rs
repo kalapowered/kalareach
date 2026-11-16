@@ -307,8 +307,8 @@ const EXCEPTIONS: [Exception; 66] = [
         file: "inbox.rs",
         function: "present",
         needle: "Asked::Connection",
-        lines: 1,
-        reason: "names the visit's refusal as that of the connection; it chooses no words",
+        lines: 2,
+        reason: "names the visit's refusal as that of the connection, the host's own and the lease's, which carries the action that its stop says; it chooses no words",
     },
     Exception {
         file: "inbox.rs",
