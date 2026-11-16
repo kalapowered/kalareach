@@ -2,14 +2,19 @@
 //!
 //! The record of the request is written in one transaction. After the lookup it asks the authority
 //! feed where that takes its locks, reads the caller's own owner check, copies the bound of the
-//! local owner's lease, and asks the footing's one question with the copy; where the bound ended or moved in the waits before the
-//! copy, the subject is decided again under the scope that no lease serves; the feed is asked once
-//! more with no lock; the record is written with nothing allocated or awaited between the question
-//! and the write; and a last ask, immediately before the commit, makes the question and the feed's
-//! ask again, so that what lapsed while the write stood rolls the transaction back.
+//! local owner's lease, and asks the footing's one question with the copy; where the bound ended or
+//! moved in the waits before the copy, the subject is decided again under the scope that no lease
+//! serves; the feed is asked once more with no lock; the record is written with nothing allocated
+//! or awaited between the question and the write; and a last ask, immediately before the commit,
+//! asks the caller's own owner check again, then makes the question and the feed's ask again, so
+//! that what lapsed while the write stood rolls the transaction back.
 //!
-//! Each case stops the record at the last wait, after the feed was asked and before the bound is
-//! copied, and ends what it ends there.
+//! Each case stops the record at a wait and ends what it ends there: at the last wait, after the
+//! feed was asked and before the bound is copied, where the early asks meet it; or once the write
+//! has been made, where the last ask meets it. A device's grant that ends by the wall clock while
+//! the write stands, with the landing's deadline an hour away, is found by the owner check asked
+//! again, and refused at the commit in the check's own words with no row recorded; a case counts
+//! the records that reached their first write, to tell a refusal at the commit from one before it.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

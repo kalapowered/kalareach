@@ -10,8 +10,13 @@
 //! again, so that what lapsed while the writes stood rolls the transaction back.
 //!
 //! Each case stops the record at a wait and ends what it ends there: before the transaction begins,
-//! which stands for the wait for the pairing records' write lock, or in the last wait, after the
-//! feed was asked and before the bound is copied.
+//! which stands for the wait for the pairing records' write lock; in the last wait, after the feed
+//! was asked and before the bound is copied, where the early asks meet it; or between the writes,
+//! once the first has been made, where the last ask meets it. The last ask asks the signer's
+//! standing and the verification again first, so a case that ends the challenge, the signer's grant
+//! or the feed's standing of that grant between the writes finds each refused at the commit in the
+//! check's own words, with neither row recorded; a case counts the records that reached their first
+//! write, to tell a refusal at the commit from one before it.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
