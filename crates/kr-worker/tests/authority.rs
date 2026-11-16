@@ -1918,6 +1918,53 @@ async fn a_living_presentation_is_decided_while_mutations_take_the_boundary_agai
         .expect("the presenting connection holds the authority");
 }
 
+/// A living presentation is decided in a gap that is shorter than its pause between two tries.
+///
+/// The boundary is held, and the presentation has waited long enough for its pause to have reached
+/// its longest. Each time it has just tried and found the boundary held, the boundary is let go of
+/// for a tenth of a second and then taken again. A presentation that only tries again when its
+/// pause is over finds it held every time; one that is woken when the boundary is let go takes it
+/// in the first gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_living_presentation_is_decided_in_a_gap_shorter_than_its_pause() {
+    let host = host(1).await;
+    let service = &host.service;
+    let mut boundary = Some(Held::boundary(&host).await);
+    let mut living = presenting(&host, 1);
+    settle(|| service.presentations_waiting_for_tests() == 1).await;
+    settle(|| service.presentation_tries_for_tests() >= 8).await;
+    let mut decided = None;
+    for _gap in 0..20 {
+        // A try has just found the boundary held, and the next waits out a pause.
+        let seen = service.presentation_tries_for_tests();
+        settle(|| service.presentation_tries_for_tests() > seen).await;
+        boundary
+            .take()
+            .expect("the boundary is held here")
+            .release();
+        tokio::select! {
+            presented = &mut living => {
+                decided = Some(presented.expect("the task ends"));
+                break;
+            }
+            () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
+        boundary = Some(Held::boundary(&host).await);
+    }
+    let Some((mut link, answer)) = decided else {
+        if let Some(held) = boundary.take() {
+            held.release();
+        }
+        panic!(
+            "the living presentation was not decided in any of twenty gaps shorter than its pause"
+        );
+    };
+    answer.expect("the presentation is accepted");
+    read_session(&mut link, host.session_id)
+        .await
+        .expect("the presenting connection holds the authority");
+}
+
 /// A worker that is stopped while presentations wait does not wait for the hold on their account.
 ///
 /// Presentations whose clients are there wait at a held boundary, on a runtime that this case builds
