@@ -5578,6 +5578,102 @@ fn kr_host_restart_is_refused_inside_a_session_with_nothing_asked() {
     );
 }
 
+/// The word of a failed `--json` command: the document that carries the failure.
+fn failure_of(output: &Output, what: &str) -> Value {
+    let said = document(output, what);
+    assert_eq!(said["ok"], false, "{said}");
+    said
+}
+
+/// KR-REQ-07.12 (a restart where no daemon runs): it starts one under the chosen start and says
+/// which, and the daemon that answers is the one it started. Nothing was asked of a daemon, and the
+/// command's record is gone.
+#[test]
+fn kr_host_restart_starts_a_daemon_where_none_runs_and_says_which() {
+    let host = Standalone::create();
+    host.select_standalone();
+    let output = start(host.kr(&["--json", "host", "restart"])).finish("kr host restart");
+    let said = document(&output, "kr host restart");
+    assert!(output.status.success(), "{said}");
+    assert_eq!(said["ok"], true, "{said}");
+    assert_eq!(stop_of(&said), "not_asked", "{said}");
+    assert_eq!(said["started"]["start"], "standalone", "{said}");
+    assert!(said["started"]["pid"].is_u64(), "{said}");
+    assert!(host.answers(), "a daemon answers");
+    assert_eq!(host.running().len(), 1, "one daemon runs");
+    assert!(attempts(&host).is_empty(), "the command removed its record");
+}
+
+/// KR-REQ-07.12 (a restart refuses before it stops): where no start is chosen for this
+/// installation, the daemon started by hand stays, nothing is asked of it and no record is made.
+/// The control: `kr host stop` still ends it.
+#[test]
+fn kr_host_restart_refuses_before_it_stops_where_no_start_is_chosen() {
+    let host = Standalone::create();
+    host.start_a_daemon_by_hand();
+    let daemon = host.one_daemon();
+    let output = start(host.kr(&["--json", "host", "restart"])).finish("kr host restart");
+    let refused = failure_of(&output, "kr host restart");
+    assert_eq!(output.status.code(), Some(3), "{refused}");
+    assert_eq!(refused["code"], "HOST_NOT_CONFIGURED", "{refused}");
+    assert_eq!(stop_of(&refused), "not_asked", "{refused}");
+    assert_eq!(refused["started"], Value::Null, "{refused}");
+    let message = refused["message"].as_str().expect("a message");
+    assert!(
+        message.contains("this environment chooses no start for a control daemon"),
+        "{message}"
+    );
+    assert!(message.contains("Nothing was stopped."), "{message}");
+    assert!(
+        message.contains("kr host startup --set standalone"),
+        "{message}"
+    );
+    assert_eq!(host.running(), vec![daemon], "the same daemon runs");
+    assert!(host.answers(), "the same daemon answers");
+    assert!(attempts(&host).is_empty(), "no record was made");
+    let stopped = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
+    assert!(stopped.status.success(), "the stop still works");
+}
+
+/// KR-REQ-07.12 (a launch that differs): a daemon started with `--secret-store file`, which this
+/// installation's start does not give, is refused before anything is stopped where a daemon started
+/// without it would not find its keys. The store's record names the platform store here, which makes
+/// that so on every platform; the daemon stays, answers and is stopped by `kr host stop`. Nothing is
+/// asked of it but its launch.
+#[test]
+fn kr_host_restart_refuses_a_daemon_whose_launch_the_start_does_not_give_and_stops_nothing() {
+    let (host, _session_id, _created, daemon) = a_host_with_a_session();
+    let secrets = host.tree.environment().secrets_dir();
+    std::fs::create_dir_all(&secrets).expect("the secrets directory");
+    std::fs::write(secrets.join(".store-kind"), "platform\n").expect("names the platform store");
+    let output = start(host.kr(&["--json", "host", "restart"])).finish("kr host restart");
+    let refused = failure_of(&output, "kr host restart");
+    assert_eq!(output.status.code(), Some(3), "{refused}");
+    assert_eq!(refused["code"], "HOST_NOT_CONFIGURED", "{refused}");
+    assert_eq!(stop_of(&refused), "not_asked", "{refused}");
+    let message = refused["message"].as_str().expect("a message");
+    assert!(
+        message.contains("was started with the argument --secret-store file"),
+        "{message}"
+    );
+    assert!(
+        message.contains("looks for them in the platform store and does not start"),
+        "{message}"
+    );
+    assert!(message.contains("Nothing was stopped."), "{message}");
+    assert!(!message.contains("kr new"), "{message}");
+    assert_eq!(host.running(), vec![daemon], "the same daemon runs");
+    assert!(host.answers(), "the same daemon answers");
+    assert!(attempts(&host).is_empty(), "no record was made");
+    let stopped = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
+    let stopped = document(&stopped, "kr host stop");
+    assert_eq!(
+        stop_of(&stopped),
+        "ended",
+        "the stop still ends it: {stopped}"
+    );
+}
+
 /// KR-REQ-07.12 (two stops at once): one daemon has ended, and each command says something true.
 /// A command may see the daemon end, or find no daemon, or meet a holder that does not answer
 /// (the listener has closed and the lock is not yet free) and ask nothing; none says that something

@@ -87,6 +87,7 @@ pub mod question;
 pub mod render;
 pub mod report;
 pub mod resolve;
+pub mod restart_launch;
 pub mod service_manager;
 pub mod session;
 pub mod share;
