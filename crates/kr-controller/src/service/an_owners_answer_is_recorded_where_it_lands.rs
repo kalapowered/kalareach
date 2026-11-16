@@ -79,6 +79,9 @@ struct Found {
     /// The wall readings before the answer began and after it ended: the time it records lies
     /// between them.
     window: (u64, u64),
+    /// How many records made their first write while the answer ran: one where the answer's
+    /// writes were begun, none where a lapse refused it before that.
+    first_writes: usize,
 }
 
 fn making_exclusive() -> ConfirmationDisplay {
@@ -234,6 +237,7 @@ async fn answered_with_at(
     // The end of the feed's locked ask, where a bound that moves inside the transaction is stopped.
     let inside = matches!(ends, Ends::TheBoundMovesInside)
         .then(|| controller.pause_after_the_record_asks_the_feed());
+    let first_writes_before = controller.first_writes_reached();
     let before = kr_ipc::now_ms().get();
     let answering = tokio::task::spawn_blocking({
         let owner = Arc::clone(&owner);
@@ -301,6 +305,7 @@ async fn answered_with_at(
         ),
         row_answered_at_ms: row_time(&parts.temp, confirmation),
         window: (before, after),
+        first_writes: controller.first_writes_reached() - first_writes_before,
     }
 }
 
@@ -350,11 +355,33 @@ fn recorded_through(found: &Found, channel: ConfirmationChannel) {
         }
     );
     assert!(!found.copied, "the answer was recorded here, not copied");
+    assert_eq!(found.first_writes, 1, "the record reached its first write");
     assert_eq!(found.answers, 1, "the acceptance is recorded once");
     assert_eq!(found.actions, 1, "the action is recorded once");
 }
 
+/// The refusal of an answer that a lapse stopped before its first write: nothing is recorded and
+/// the record never reached that write. A refusal that comes later fails here, so that an early
+/// ask that is moved or removed is seen even though the last ask refuses what it let through.
 fn refused(found: &Found) -> &ControllerError {
+    assert_eq!(
+        found.first_writes, 0,
+        "the record is refused before its first write"
+    );
+    nothing_recorded(found)
+}
+
+/// The refusal of an answer whose first write was made and which the last ask, immediately before
+/// the commit, rolled back.
+fn refused_at_the_commit(found: &Found) -> &ControllerError {
+    assert_eq!(
+        found.first_writes, 1,
+        "the record is refused after its first write, at the commit"
+    );
+    nothing_recorded(found)
+}
+
+fn nothing_recorded(found: &Found) -> &ControllerError {
     assert_eq!(found.answers, 0, "no acceptance is recorded");
     assert_eq!(found.actions, 0, "no action is recorded");
     found.answered.as_ref().expect_err("the answer is refused")
@@ -543,6 +570,7 @@ async fn answered_by_an_owner_device(raised: bool) -> Found {
     );
     let caller = controller.local_caller(door.actor_id()).landed(landing());
     let (arrived, go) = controller.pause_after_the_record_asks_the_feed();
+    let first_writes_before = controller.first_writes_reached();
     let before = kr_ipc::now_ms().get();
     let answering = tokio::task::spawn_blocking({
         let owner = Arc::clone(&owner);
@@ -603,6 +631,7 @@ async fn answered_by_an_owner_device(raised: bool) -> Found {
         ),
         row_answered_at_ms: row_time(&parts.temp, confirmation),
         window: (before, after),
+        first_writes: controller.first_writes_reached() - first_writes_before,
     }
 }
 
@@ -676,7 +705,7 @@ async fn an_answer_whose_lease_ends_between_its_writes_is_refused_at_the_commit_
         true,
     )
     .await;
-    assert!(is_the_closed_refusal(refused(&found)));
+    assert!(is_the_closed_refusal(refused_at_the_commit(&found)));
 }
 
 /// KR-REQ-17.54: an answer whose deadline passes between its two writes is refused at the commit
@@ -692,7 +721,7 @@ async fn an_answer_whose_deadline_passes_between_its_writes_is_refused_at_the_co
         true,
     )
     .await;
-    let refusal = refused(&found);
+    let refusal = refused_at_the_commit(&found);
     let expired =
         crate::service::Lapse::Admission(crate::authority::AdmissionLapse::Expired).refusal();
     assert_eq!(refusal.to_string(), expired.to_string());

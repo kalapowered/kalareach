@@ -54,6 +54,9 @@ struct Found {
     /// The wall readings before the request began and after it ended: the expiry it issued lies
     /// between them, a confirmation's lifetime on.
     window: (u64, u64),
+    /// How many records had made their first write when the request ended: one where the
+    /// request's write was made, none where a lapse refused it before that.
+    first_writes: usize,
 }
 
 /// Completes what a request found with what the case reads beside it: the host's owner, and the
@@ -217,6 +220,7 @@ async fn recorded_with_at(at: At, ends: Ends, display: ConfirmationDisplay) -> F
     }
     go.send(()).expect("the record goes on");
     let (answered, copied) = asking.await.expect("the request ends");
+    let first_writes = controller.first_writes_reached();
     let ended_at = kr_ipc::now_ms().get();
     let rows = registry(&temp)
         .query_row(
@@ -232,6 +236,7 @@ async fn recorded_with_at(at: At, ends: Ends, display: ConfirmationDisplay) -> F
         replayed: None,
         has_an_owner: false,
         window: (begun_at, ended_at),
+        first_writes,
     };
     with_its_replay(found, &temp, again.0, again.1, action, shown).await
 }
@@ -280,6 +285,7 @@ async fn recorded_with_the_bound_moving_inside(display: ConfirmationDisplay) -> 
     held.swap().await;
     go_on.send(()).expect("the record goes on");
     let (answered, copied) = asking.await.expect("the request ends");
+    let first_writes = controller.first_writes_reached();
     let ended_at = kr_ipc::now_ms().get();
     let rows = registry(&temp)
         .query_row(
@@ -295,6 +301,7 @@ async fn recorded_with_the_bound_moving_inside(display: ConfirmationDisplay) -> 
         replayed: None,
         has_an_owner: false,
         window: (begun_at, ended_at),
+        first_writes,
     };
     with_its_replay(found, &temp, again.0, again.1, action, shown).await
 }
@@ -310,6 +317,7 @@ fn written(found: &Found) {
     let answered = found.answered.as_ref().expect("the request is answered");
     assert!(!found.copied, "the request was recorded here, not copied");
     assert_eq!(found.rows, 1, "the record is written once");
+    assert_eq!(found.first_writes, 1, "the record reached its first write");
     let recorded = found
         .replayed
         .as_ref()
@@ -336,12 +344,22 @@ fn written(found: &Found) {
     assert_eq!(answered.initial_bootstrap, !found.has_an_owner);
 }
 
-fn refused_as_a_caller_no_lease_serves(found: &Found) {
+/// The refusal a caller no lease serves is told, with nothing recorded. `reached` says where the
+/// record was refused: at its early question, before its first write, or at the last ask, after
+/// it, which rolled the write back. A refusal at the wrong place fails here, so that an early ask
+/// that is moved or removed is seen even though the last ask refuses what it let through.
+fn refused_as_a_caller_no_lease_serves(found: &Found, reached: bool) {
     let refusal = found.answered.as_ref().expect_err("the request is refused");
     let closed = closed_refusal();
     assert_eq!(refusal.to_string(), closed.to_string());
     assert_eq!(refusal.code(), closed.code());
     assert_eq!(found.rows, 0, "nothing is written");
+    assert_eq!(
+        found.first_writes,
+        usize::from(reached),
+        "the record is refused {} its first write",
+        if reached { "after" } else { "before" }
+    );
 }
 
 /// KR-REQ-17.54: where the bound of the lease stands at the copy, the request is recorded, for a
@@ -361,6 +379,7 @@ async fn a_request_whose_lease_ends_in_the_last_wait_is_decided_again_under_the_
     written(&recorded_with(Ends::TheLeasesTime, establishing()).await);
     refused_as_a_caller_no_lease_serves(
         &recorded_with(Ends::TheLeasesTime, making_exclusive()).await,
+        false,
     );
 }
 
@@ -377,6 +396,10 @@ async fn a_request_whose_deadline_passes_in_the_last_wait_is_refused_in_the_dead
         assert_eq!(refusal.to_string(), expired.to_string());
         assert_eq!(refusal.code(), expired.code());
         assert_eq!(found.rows, 0, "nothing is written");
+        assert_eq!(
+            found.first_writes, 0,
+            "the record is refused before its first write"
+        );
     }
 }
 
@@ -388,6 +411,7 @@ async fn a_request_whose_bound_moves_before_its_transaction_is_decided_again_und
     written(&recorded_with(Ends::TheLeaseIsPresentedAgain, establishing()).await);
     refused_as_a_caller_no_lease_serves(
         &recorded_with(Ends::TheLeaseIsPresentedAgain, making_exclusive()).await,
+        false,
     );
 }
 
@@ -440,6 +464,7 @@ async fn a_request_whose_bound_moves_inside_its_transaction_is_decided_again_und
     written(&recorded_with_the_bound_moving_inside(establishing()).await);
     refused_as_a_caller_no_lease_serves(
         &recorded_with_the_bound_moving_inside(making_exclusive()).await,
+        false,
     );
 }
 
@@ -454,6 +479,7 @@ async fn a_request_whose_lease_ends_while_its_write_stands_is_refused_at_the_com
     written(&recorded_with_at(At::TheFirstWrite, Ends::TheLeasesTime, establishing()).await);
     refused_as_a_caller_no_lease_serves(
         &recorded_with_at(At::TheFirstWrite, Ends::TheLeasesTime, making_exclusive()).await,
+        true,
     );
 }
 
@@ -470,5 +496,9 @@ async fn a_request_whose_deadline_passes_while_its_write_stands_is_refused_at_th
         assert_eq!(refusal.to_string(), expired.to_string());
         assert_eq!(refusal.code(), expired.code());
         assert_eq!(found.rows, 0, "nothing is recorded");
+        assert_eq!(
+            found.first_writes, 1,
+            "the record is refused after its first write, at the commit"
+        );
     }
 }

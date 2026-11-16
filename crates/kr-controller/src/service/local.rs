@@ -228,6 +228,13 @@ impl Controller {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// How many records of an owner's request or of its answer have made their first write.
+    #[cfg(feature = "testing")]
+    pub fn first_writes_reached(&self) -> usize {
+        self.first_writes_reached
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// The pace local connections write unasked at.
     fn local_pace(&self) -> LocalPace {
         #[cfg(feature = "testing")]
