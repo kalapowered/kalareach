@@ -262,6 +262,15 @@ pub struct Engine {
     /// it back. The pinned revision keeps no such record, so the session does.
     saved_shift: [bool; 2],
     measure_now: bool,
+    /// Whether the rows that leave the live screen are kept ([`Self::set_history_kept`]).
+    history_kept: bool,
+    /// Whether the primary buffer may still hold rows that are owed a removal.
+    ///
+    /// The rows are reached only while the primary buffer is showing, so a removal asked for while
+    /// the alternate buffer shows waits here, and it is made in the call that makes the primary
+    /// buffer show again. It is not ended by [`Self::set_history_kept`]: keeping rows again does
+    /// not give back the ones that were owed.
+    history_owed: bool,
     /// How many times what the hyperlink objects cost has been read.
     ///
     /// A reading replaces what was charged for the links a session opened, so where one happens
@@ -319,6 +328,8 @@ impl Engine {
             saved_revision: 0,
             saved_shift: [false; 2],
             measure_now: false,
+            history_kept: true,
+            history_owed: false,
             link_readings: 0,
             link_read_at: None,
             alternate_seen: false,
@@ -1056,9 +1067,43 @@ impl Engine {
             // The alternate buffer keeps no history, and its rows are numbered separately.
             return;
         }
-        if self.budget.set_row_cache(self.grid.history_bytes()) {
+        // This is also where a removal owed while the alternate buffer showed is made: the event
+        // that brought the primary buffer back is followed by this call, inside the same read, so
+        // no reader sees the rows between the switch and their removal.
+        if self.budget.set_row_cache(self.grid.history_bytes()) || self.history_to_give_up() {
             self.evict_history(now_ms);
         }
+    }
+
+    /// Sets whether the rows that leave the live screen are kept.
+    ///
+    /// Turning it off gives up every row held above the live screen at once and keeps none from
+    /// then on: a row is given up in the call that moved it off the screen, so none is ever held
+    /// between two calls. The live screen is not changed, and nothing is recorded as truncated,
+    /// because nothing was cut to fit a bound. Turning it on again starts a history with no rows,
+    /// kept up to the cache bound as before.
+    ///
+    /// While the alternate buffer shows, the primary buffer's rows cannot be reached, and they
+    /// cannot be read either. They are given up in the call that makes the primary buffer show
+    /// again, whether or not they are kept by then.
+    pub fn set_history_kept(&mut self, kept: bool) {
+        self.history_kept = kept;
+        if !kept {
+            self.give_up_history();
+            // What the hyperlink objects on the given-up rows cost is read again at the next read.
+            self.measure_now = true;
+        }
+    }
+
+    /// Whether rows are held that this engine may not keep.
+    fn history_to_give_up(&self) -> bool {
+        self.history_owed || (!self.history_kept && self.grid.history_bytes() > 0)
+    }
+
+    /// Gives up every retained row, or leaves the removal owed while they cannot be reached.
+    fn give_up_history(&mut self) {
+        self.history_owed = !self.grid.discard_history();
+        self.budget.set_row_cache(self.grid.history_bytes());
     }
 
     /// Brings the historical cache back under its bound.
@@ -1067,6 +1112,10 @@ impl Engine {
     /// average of what the rows cost, so what is left after it costs no more than the bound; the
     /// figure afterwards is what those rows cost, not an estimate of it.
     fn evict_history(&mut self, now_ms: u64) {
+        if self.history_to_give_up() {
+            self.give_up_history();
+            return;
+        }
         let limit = self.budget.limits().row_cache_bytes;
         if !self.grid.enforce_row_cache(limit) {
             return;
