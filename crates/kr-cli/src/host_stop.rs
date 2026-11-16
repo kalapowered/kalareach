@@ -4581,6 +4581,62 @@ mod tests {
         scan.found
     }
 
+    /// The functions with a body that the module's product part defines, found in its syntax with
+    /// the test module left out: a function by its name, a method as `Type::name`, and a function
+    /// declared inside another by its own name. A function of a trait that has no body decides
+    /// nothing and is not one of them.
+    struct Defined {
+        types: Vec<String>,
+        found: Vec<(String, syn::ItemFn)>,
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for Defined {
+        fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+            if module.ident != "tests" {
+                syn::visit::visit_item_mod(self, module);
+            }
+        }
+
+        fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+            let name = match &*item.self_ty {
+                syn::Type::Path(path) => path.path.segments.last().map(|s| s.ident.to_string()),
+                _ => None,
+            };
+            self.types.push(name.expect("an impl of a named type"));
+            syn::visit::visit_item_impl(self, item);
+            self.types.pop();
+        }
+
+        fn visit_item_fn(&mut self, function: &'ast syn::ItemFn) {
+            self.found
+                .push((function.sig.ident.to_string(), function.clone()));
+            syn::visit::visit_item_fn(self, function);
+        }
+
+        fn visit_impl_item_fn(&mut self, method: &'ast syn::ImplItemFn) {
+            let owner = self.types.last().expect("a method stands in an impl");
+            let function = syn::ItemFn {
+                attrs: method.attrs.clone(),
+                vis: method.vis.clone(),
+                sig: method.sig.clone(),
+                block: Box::new(method.block.clone()),
+            };
+            self.found
+                .push((format!("{owner}::{}", method.sig.ident), function));
+            syn::visit::visit_impl_item_fn(self, method);
+        }
+    }
+
+    /// The functions of the module's product part, by name, from the file's syntax.
+    fn defined_in(file: &syn::File) -> Vec<(String, syn::ItemFn)> {
+        let mut defined = Defined {
+            types: Vec::new(),
+            found: Vec::new(),
+        };
+        syn::visit::Visit::visit_file(&mut defined, file);
+        defined.found
+    }
+
     /// What the check says of a form of source: the form, whether the check refuses it, a plant
     /// (a function that holds the form and nothing else that the check reads), and why. A refused
     /// row's plant fails the check for that form's own reason and no other; a row that is not
@@ -4589,8 +4645,9 @@ mod tests {
     ///
     /// The check reads the syntax of the functions that [`SCANNED`] names, so that a catch-all in a
     /// decision over the sets is a failure of this case and not a change that a reviewer must see.
-    /// The functions that are not scanned are named in [`NOT_SCANNED`], each with the reason why no
-    /// decision over the sets stands in it. The forms:
+    /// Every other function of the module's product part is named in [`NOT_SCANNED`], with the
+    /// refused forms that stand in it and the reason why no decision over the sets stands in it;
+    /// a function in neither list fails a case of its own. The forms:
     ///
     /// | form | verdict |
     /// | --- | --- |
@@ -4724,20 +4781,26 @@ mod tests {
     ];
 
     /// The functions whose syntax the check reads: the decisions over the readings of a round and
-    /// what is said from them, the look's label and the producers of its value, and the decisions
-    /// that stand beside them.
-    const SCANNED: [&str; 22] = [
-        "successor_wanted",
-        "marker_told",
+    /// what is said from them, the look's label and the producers of its value, the decisions
+    /// that stand beside them, and the functions that make or word a value of a set. None of them
+    /// holds a form that the check refuses.
+    const SCANNED: &[&str] = &[
+        "words_after_the_request",
         "what_the_round_shows",
         "the_endpoint_decides",
         "a_successor_by_the_endpoint",
         "bound_shows",
         "look_wanted",
         "holder_wanted",
+        "successor_wanted",
+        "marker_told",
+        "wait_for_the_end",
         "said_after_the_request",
         "said_before_the_request",
         "said_at_the_start",
+        "at_the_start",
+        "conclude",
+        "interrupted",
         "label_of",
         "gave_by_the_greeting",
         "gave_by_the_read",
@@ -4747,56 +4810,295 @@ mod tests {
         "endpoint_look",
         "first_look_answers",
         "decided_by_the_wait",
+        "ended_before_the_request",
         "failed_before_the_request",
+        "ended_by",
+        "unmade_ended",
         "ended_before_the_request_said",
+        "Knows::word",
+        "Request::knows",
+        "Request::not_known",
+        "Exit::failure",
+        "Lock::of",
+        "Process::of",
+        "Holder::of",
+        "Answered::of_reply",
     ];
 
-    /// The functions that are not scanned, each with the reason why no decision over the sets
-    /// stands in it.
-    const NOT_SCANNED: [(&str, &str); 3] = [
+    /// Why a function that only words, reads or forwards decides nothing over a set.
+    const WORDS: &str = "it words a sentence, a failure or a document from values that were decided elsewhere and names no set; where it matches, the match is over an option, a count or a file's content";
+    const READS: &str = "it reads a file, a process, a signal or the endpoint and gives what it read; it names no set and decides nothing over one";
+    const MAKES: &str = "it makes the one value that its arguments stand for or forwards one call, and holds no match";
+
+    /// The functions that are not scanned, each with the refused forms that the check reads in it
+    /// (none where the list is empty) and the reason why no decision over the sets stands in it. A
+    /// set is a type whose every value a generated table walks: `Lock`, `Process`, `Holder`, the
+    /// endpoint's look, `Request`, `Start`, `Before`, `Gave` and the generation that was asked.
+    const NOT_SCANNED: &[(&str, &[Form], &str)] = &[
         (
             "ask",
+            &[
+                Form::MatchesMacro,
+                Form::WildcardInWrapper,
+                Form::LoneWildcard,
+                Form::WildcardInWrapper,
+            ],
             "its patterns are over the answer to one request (a frame, a retry category, a timeout) and not over the readings of a round, and its default is the ruled one: anything but a whole answer is an outcome that is not known; the outcomes that it gives are the `Request` set, which the table walks",
         ),
         (
             "after_the_write_failed",
+            &[Form::MatchesMacro],
             "it decides by one failure (the level's refusal of a frame) whether a write left nothing, with the ruled default that any other failure leaves the outcome unknown; the failure is no value of the sets of a round",
         ),
         (
             "how_to_end_the_holder",
+            &[],
             "it words the way to end a holder from the lock file read once more after the decision; the decision is already made and printed by the sentence's kind, and what it reads is a file's content and not a value of the sets",
+        ),
+        (
+            "stop",
+            &[Form::LetWithElse],
+            "its `let ... else` takes the one other variant of the link crate's `Listed` (a daemon of another major) to `Start::OtherMajor`, whose words the table of the start walks; `Listed` is no set of this module",
+        ),
+        (
+            "stop_the_daemon",
+            &[Form::WildcardInWrapper],
+            "its `Err(_)` is the elapsed time-out of the read of `host.info`, which carries no value; the other results of that read are named, and the request's and the wait's decisions are made in the functions that it calls",
+        ),
+        (
+            "closed_by_the_daemon",
+            &[Form::MatchesMacro],
+            "it names the two failures of the link crate's `IpcError` that a close by the daemon causes, and nothing else is decided in it; `IpcError` is no set of this module",
+        ),
+        (
+            "runs_the_daemon",
+            &[Form::LoneWildcard],
+            "its wildcard stands over the system's reading of a process (`ProcessReading`), where only a running process can be a daemon, and gives false for every other reading; that reading is no set of this module",
+        ),
+        (
+            "lock_held",
+            &[Form::WildcardInWrapper],
+            "its `Ok(_)` is the lock that was taken and dropped at once, which carries one value; the failure that means a daemon holds it is named, and any other failure is said; the sets are made from its result by `Lock::of`",
+        ),
+        (
+            "creates_under_way",
+            &[Form::LoneWildcard],
+            "its wildcard stands over a count of session creates, which is no set: any count that is not above zero says nothing",
+        ),
+        (
+            "after_the_probe",
+            &[Form::WildcardInWrapper],
+            "its `Err(_)` is a failure of the probe's link, taken with a probe that was not answered to give the refusal as it was; the probe's answer is the protocol's result, no set of this module",
+        ),
+        (
+            "host_info",
+            &[Form::BareBinding],
+            "its last arm takes every answer of the read of `host.info` that is not a withdrawn authority and types it; the answer is the host's result, no set of this module",
+        ),
+        (
+            "look_failed",
+            &[Form::BareBinding],
+            "its last arm takes every failure of the look but the deferred start lock and says it in its own words; `CliError` is no set of this module",
+        ),
+        (
+            "by_generation",
+            &[Form::WildcardInWrapper],
+            "its `Some(_)` stands after the arm that names the generation asked and takes a generation that differs, a number and no set; the table of the look walks the generation asked as none, equal and different",
+        ),
+        (
+            "Progress::stage",
+            &[Form::LoneWildcard],
+            "it turns the stored number back into a `Stage`, and its wildcard stands over that number, which is no set, and gives the last stage",
+        ),
+        ("Progress::enter", &[], MAKES),
+        ("Said::new", &[], MAKES),
+        ("Facts::none", &[], MAKES),
+        ("Installation::of", &[], MAKES),
+        ("Real::of", &[], MAKES),
+        ("greeting_failed", &[], MAKES),
+        ("host_info_failed", &[], MAKES),
+        ("Answered::reporting", &[], MAKES),
+        ("Answered::for_a_case", &[], MAKES),
+        ("Answered::of_refusal", &[], MAKES),
+        ("Answered::of_undecodable", &[], MAKES),
+        (
+            "Progress::with_marker",
+            &[],
+            "it reaches the record of the attempt under its lock and acts on it; it names no set and decides nothing over one",
+        ),
+        (
+            "Progress::said_earlier",
+            &[],
+            "it reaches the record of the attempt under its lock and acts on it; it names no set and decides nothing over one",
+        ),
+        (
+            "Progress::remove_marker",
+            &[],
+            "it reaches the record of the attempt under its lock and acts on it; it names no set and decides nothing over one",
+        ),
+        (
+            "Interrupts::catch",
+            &[],
+            "it installs the process's signal handlers or waits for the signals and says which came first; `Interrupt` is the kind of signal that came and no set that a table walks",
+        ),
+        (
+            "Interrupts::next",
+            &[],
+            "it installs the process's signal handlers or waits for the signals and says which came first; `Interrupt` is the kind of signal that came and no set that a table walks",
+        ),
+        (
+            "one",
+            &[],
+            "it installs the process's signal handlers or waits for the signals and says which came first; `Interrupt` is the kind of signal that came and no set that a table walks",
+        ),
+        (
+            "c",
+            &[],
+            "it installs the process's signal handlers or waits for the signals and says which came first; `Interrupt` is the kind of signal that came and no set that a table walks",
+        ),
+        (
+            "b",
+            &[],
+            "it installs the process's signal handlers or waits for the signals and says which came first; `Interrupt` is the kind of signal that came and no set that a table walks",
+        ),
+        (
+            "run",
+            &[],
+            "it sets up the signals and the record of the attempt and calls `stop`; it holds no match",
+        ),
+        ("installation", &[], READS),
+        ("Earlier::read", &[], READS),
+        ("lock_holder", &[], READS),
+        ("named_daemon", &[], READS),
+        ("Installation::held", &[], READS),
+        ("Real::held", &[], READS),
+        ("Real::process_state", &[], READS),
+        ("Real::look", &[], READS),
+        ("Real::named_daemon", &[], READS),
+        ("Real::pause", &[], READS),
+        (
+            "Earlier::say",
+            &[],
+            "it prints the earlier attempts' records that were read; it names no set and holds no match",
+        ),
+        (
+            "Earlier::said",
+            &[],
+            "it gives the earlier attempts' words that were read; it names no set and holds no match",
+        ),
+        (
+            "Earlier::remove_those_put_out",
+            &[],
+            "it removes the records that were said once the result is written; it names no set and decides nothing over one",
+        ),
+        ("Facts::document", &[], WORDS),
+        ("failed", &[], WORDS),
+        ("done", &[], WORDS),
+        ("record_said", &[], WORDS),
+        ("records_said", &[], WORDS),
+        ("no_daemon_said", &[], WORDS),
+        ("silent_said", &[], WORDS),
+        ("holds_and_is_silent_said", &[], WORDS),
+        ("lock_unreadable_said", &[], WORDS),
+        ("other_major_said", &[], WORDS),
+        ("gone_said", &[], WORDS),
+        ("not_shown", &[], WORDS),
+        ("successor_said", &[], WORDS),
+        ("not_ended", &[], WORDS),
+        ("held_not_shown", &[], WORDS),
+        ("still_held", &[], WORDS),
+        ("unlooked", &[], WORDS),
+        (
+            "unreached",
+            &[],
+            "it words one failure of the link; its `Unmade` argument shows that the cause was decided and is not read",
+        ),
+        (
+            "unmade_request",
+            &[],
+            "it words one failure of the request; its `Unmade` argument shows that the cause was decided and is not read",
+        ),
+        (
+            "refused",
+            &[],
+            "it asks the daemon once more whether a refusal is its own and words what it says; the refusal is the protocol's, no set of this module",
+        ),
+        (
+            "is_the_daemons_own_refusal",
+            &[],
+            "it compares one refusal's code with the codes that a daemon of this build gives; the refusal is the protocol's, no set of this module",
         ),
     ];
 
-    /// The function `name` of the module's own source, from the file's syntax.
-    fn function_named<'a>(file: &'a syn::File, name: &str) -> &'a syn::ItemFn {
-        file.items
+    /// The function `name` of the module's product part, from the syntax that [`defined_in`] read.
+    fn function_named<'a>(defined: &'a [(String, syn::ItemFn)], name: &str) -> &'a syn::ItemFn {
+        defined
             .iter()
-            .find_map(|item| match item {
-                syn::Item::Fn(function) if function.sig.ident == name => Some(function),
-                _ => None,
-            })
+            .find(|(found, _)| found == name)
+            .map(|(_, function)| function)
             .unwrap_or_else(|| panic!("no function {name}"))
     }
 
-    /// The decisions hold no refused form: no catch-all over any set, so that a value added to a
-    /// set stops the build or fails a case here until it is decided.
+    /// The decisions hold no form that the check refuses, and each function that is not scanned
+    /// holds exactly the forms that its entry names.
     #[test]
     fn the_decisions_hold_no_form_that_the_check_refuses() {
         let file = syn::parse_file(include_str!("host_stop.rs")).expect("the module parses");
+        let defined = defined_in(&file);
         for name in SCANNED {
-            let function = function_named(&file, name);
+            let function = function_named(&defined, name);
             assert!(!function.block.stmts.is_empty(), "{name} was read whole");
             assert_eq!(forms_of(function), Vec::<Form>::new(), "{name}");
         }
-        for (name, reason) in NOT_SCANNED {
-            function_named(&file, name);
+        for (name, forms, reason) in NOT_SCANNED {
+            assert_eq!(forms_of(function_named(&defined, name)), *forms, "{name}");
             assert!(!reason.is_empty(), "{name} has its reason");
-            assert!(
-                !SCANNED.contains(&name),
-                "{name} is scanned or named, not both"
-            );
         }
+    }
+
+    /// Every function of the module's product part stands in [`SCANNED`] or in [`NOT_SCANNED`],
+    /// once, and every name in them is such a function: a function added to the module fails
+    /// this case until it is placed in one of them.
+    #[test]
+    fn every_function_of_the_module_stands_in_one_of_the_two_lists() {
+        let file = syn::parse_file(include_str!("host_stop.rs")).expect("the module parses");
+        let defined = defined_in(&file);
+        let mut named: Vec<&str> = defined.iter().map(|(name, _)| name.as_str()).collect();
+        named.sort_unstable();
+        named.dedup();
+        let mut listed: Vec<&str> = SCANNED
+            .iter()
+            .copied()
+            .chain(NOT_SCANNED.iter().map(|(name, _, _)| *name))
+            .collect();
+        listed.sort_unstable();
+        let listed_in_all = listed.len();
+        listed.dedup();
+        assert_eq!(
+            listed.len(),
+            listed_in_all,
+            "a function stands in the lists once"
+        );
+        let unplaced: Vec<&str> = named
+            .iter()
+            .copied()
+            .filter(|name| !listed.contains(name))
+            .collect();
+        assert_eq!(
+            unplaced,
+            Vec::<&str>::new(),
+            "these functions stand in neither list"
+        );
+        let stale: Vec<&str> = listed
+            .iter()
+            .copied()
+            .filter(|name| !named.contains(name))
+            .collect();
+        assert_eq!(
+            stale,
+            Vec::<&str>::new(),
+            "these names are no function of the module"
+        );
     }
 
     /// Each row of the table has a plant on its side: a refused row's plant fails the check for the
