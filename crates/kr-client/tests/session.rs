@@ -804,6 +804,48 @@ async fn a_read_that_starts_after_the_owners_close_is_the_clean_end_and_touches_
     serving.abort();
 }
 
+/// A read that starts after an owner's close that came after the connection's end is the clean end
+/// at its entry too, and it touches nothing: the host closed first, so the close's mark is "closed
+/// after its end", and the entry check asks for any mark and not for the one of a close that found
+/// the connection standing. Two reads are made, since each starts after the close.
+#[tokio::test]
+async fn a_read_that_starts_after_a_close_that_came_after_the_connections_end_is_the_clean_end() {
+    use kr_client::transport::ControlTransport;
+
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    script.closes_when_told.store(true, Ordering::Release);
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+
+    let transport = dial(&client, &host).await;
+    script.close_now.notify_one();
+    let recorded = tokio::time::timeout(Duration::from_secs(30), transport.closed())
+        .await
+        .expect("the host's close reached the connection");
+    assert!(
+        !matches!(recorded, ConnectionError::LocallyClosed),
+        "the connection's record names the host's close, so the owner's close comes after the \
+         connection's end: {recorded:?}"
+    );
+    transport.close();
+    for _ in 0..2 {
+        let read = tokio::time::timeout(Duration::from_secs(30), transport.recv())
+            .await
+            .expect("the read ended at its entry");
+        assert!(
+            matches!(read, Ok(None)),
+            "a read that started after the owner's close did not give the clean end: {read:?}"
+        );
+    }
+    assert_eq!(
+        transport.read_seam().returned(),
+        0,
+        "a read that started after the owner's close touched the connection"
+    );
+    serving.abort();
+}
+
 /// This side's own close ends a read of the paired transport that waits, and the read returns the
 /// clean end and no error: the transport says so by the cause that the read returned and by the
 /// mark that its close stored before it closed the connection, so a session that reads the end
