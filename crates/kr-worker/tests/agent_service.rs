@@ -5094,6 +5094,8 @@ enum Wait {
     BeforeTheMarker,
     /// The hop to the thread that makes the transport's call, after the marker is written.
     BeforeTheSubmission,
+    /// The marker's write, which waits for the ledger's writer lock that another connection holds.
+    WhileTheWriterLockIsHeld,
 }
 
 /// What an answer came to when `deadline` passed (or did not) in `wait`.
@@ -5123,24 +5125,50 @@ async fn answer_whose_deadline(deadline: Deadline, wait: Wait, passes: bool) -> 
 
     let broker = host.service.broker();
     let (arrived, release) = match wait {
-        Wait::BeforeTheMarker => broker.pause_before_the_marker_commit(),
+        Wait::BeforeTheMarker | Wait::WhileTheWriterLockIsHeld => {
+            broker.pause_before_the_marker_commit()
+        }
         Wait::BeforeTheSubmission => broker.pause_before_submit(),
     };
+    let waiting =
+        (wait == Wait::WhileTheWriterLockIsHeld).then(|| broker.signal_next_ledger_lock_wait());
     let sending = tokio::spawn(async move { send(&mut client, mutation).await });
     tokio::task::spawn_blocking(move || arrived.recv_timeout(LIVENESS_DEADLINE))
         .await
         .expect("the wait ends")
         .expect("the answer reaches the wait");
-    if passes {
-        match deadline {
-            // The request's accepted lifetime is a minute; the clock is the case's own.
-            Deadline::Accepted => clock.advance(std::time::Duration::from_secs(61)),
-            Deadline::Resource => {
-                broker.hold_clock_at(Some(TimestampMs::new(resource_ends.get() + 1)))
+    let passing = |clock: &kr_transport::clock::ManualClock| {
+        if passes {
+            match deadline {
+                // The request's accepted lifetime is a minute; the clock is the case's own.
+                Deadline::Accepted => clock.advance(std::time::Duration::from_secs(61)),
+                Deadline::Resource => {
+                    broker.hold_clock_at(Some(TimestampMs::new(resource_ends.get() + 1)))
+                }
             }
         }
+    };
+    if let Some(waiting) = waiting {
+        // Another connection takes the writer's lock while the answer stands before the marker's
+        // write, and the ledger's own signal says that the write now waits for it. The deadline
+        // passes in that wait.
+        let holder = rusqlite::Connection::open(&host.journal_path).expect("opens the ledger");
+        holder
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("takes the writer's lock");
+        release.send(()).expect("the answer is let go");
+        tokio::time::timeout(LIVENESS_DEADLINE, waiting)
+            .await
+            .expect("the marker's write waits for the lock in time")
+            .expect("the wait is signalled");
+        passing(&clock);
+        holder
+            .execute_batch("COMMIT")
+            .expect("lets the writer's lock go");
+    } else {
+        passing(&clock);
+        release.send(()).expect("the answer is let go");
     }
-    release.send(()).expect("the answer is let go");
     let outcome = sending.await.expect("the mutation is answered");
 
     let marker_written = rusqlite::Connection::open_with_flags(
@@ -5204,6 +5232,35 @@ async fn kr_req_09_16_an_answer_whose_deadline_passes_before_its_marker_is_refus
             "{deadline:?}: the control is carried once"
         );
     }
+}
+
+/// KR-REQ-09.16 and section 9: an answer whose accepted deadline passes while the marker's write
+/// waits for the ledger's writer lock, which another connection holds, is refused when the write
+/// has the lock: the deadline is asked after the lock and not before it. The marker is not
+/// written, the transport is never asked and the request stays answerable. The control, where the
+/// deadline does not pass, writes the marker and carries the answer once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_16_an_answer_whose_deadline_passes_while_its_marker_waits_for_the_writer_lock_is_refused()
+ {
+    let passed =
+        answer_whose_deadline(Deadline::Accepted, Wait::WhileTheWriterLockIsHeld, true).await;
+    // What landed is read before what was answered.
+    assert!(
+        !passed.marker_written,
+        "the marker was written after the deadline passed in the wait for the writer's lock"
+    );
+    assert_eq!(passed.carried, 0, "the transport was asked");
+    assert!(passed.still_pending, "the request stays answerable");
+    let Outcome::Error(error) = passed.outcome else {
+        panic!("the deadline passed in the wait for the lock and the answer applied");
+    };
+    assert_eq!(error.code, ErrorCode::PermissionDenied);
+
+    let control =
+        answer_whose_deadline(Deadline::Accepted, Wait::WhileTheWriterLockIsHeld, false).await;
+    assert!(matches!(control.outcome, Outcome::Ok(_)));
+    assert!(control.marker_written, "the control writes its marker");
+    assert_eq!(control.carried, 1, "the control is carried once");
 }
 
 /// KR-REQ-09.16 and section 9: an answer whose deadline passes in the hop to the thread that makes

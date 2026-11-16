@@ -2576,6 +2576,14 @@ impl Broker {
         (watch, release)
     }
 
+    /// Says, for this host's own tests, when the next write of the broker's ledger begins to wait
+    /// for another connection's lock: the end that carries the signal.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn signal_next_ledger_lock_wait(&self) -> tokio::sync::oneshot::Receiver<()> {
+        self.state().ledger.signal_next_writer_lock_wait()
+    }
+
     /// Waits, blocking this thread, at an armed pause before an answer's marker is committed.
     #[cfg(feature = "testing")]
     pub(crate) fn at_commit_pause(&self) {
@@ -2723,8 +2731,12 @@ impl Broker {
             crate::broker::ledger::TransitionCause::Dispatched,
             Some(claim.actor_id.clone()),
         );
+        // The deadlines are asked once more inside the write, after its lock is held: a write that
+        // waits for another connection's lock waits on, and a deadline can pass in that wait.
         state.stored(now, "a dispatch marker", |ledger| {
-            ledger.mark_dispatched(&transition.resource, &event)
+            ledger.mark_dispatched(&transition.resource, &event, || {
+                against.require_in_time(self.deadline_now())
+            })
         })?;
         state.remember(&event);
         let resource = state.arbitration.commit(transition)?;
