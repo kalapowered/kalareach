@@ -104,6 +104,12 @@
       "message": "your organisation's service asks this device to wait 60 minutes before it asks for the lease this host needs",
       "user_action": "nothing",
       "page": "your organisation's service asks this device to wait 60 minutes before it asks for the lease this host needs"
+    },
+    "sign_in": {
+      "code": "RESOURCE_UNAVAILABLE",
+      "message": "sign in to your account again: this device cannot ask your organisation for the lease that lets it use this host",
+      "user_action": "nothing",
+      "page": "sign in to your account again: this device cannot ask your organisation for the lease that lets it use this host"
     }
   }
 }

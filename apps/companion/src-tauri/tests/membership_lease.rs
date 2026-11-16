@@ -41,6 +41,7 @@
 //! | KR-REQ-17.48 | `a_new_visit_the_service_asks_to_wait_is_sent_with_its_own_wait_and_no_action_beside_it` |
 //! | KR-REQ-17.48 | `each_stop_of_the_lease_is_sent_to_the_inbox_as_its_own_words_and_its_own_action` |
 //! | KR-REQ-17.48 | `a_session_read_after_a_wait_stop_is_sent_with_its_own_wait_and_no_action_beside_it` |
+//! | KR-REQ-17.48 | `a_session_read_after_a_sign_out_is_sent_with_the_sign_in_words_and_no_action_beside_them` |
 //! | KR-REQ-17.53 | `a_visit_does_not_ask_for_the_chain_of_keys_while_the_service_asks_for_a_wait` |
 //! | KR-REQ-17.53 | `a_reused_lease_lasts_until_the_first_refresh_of_the_connection_that_keeps_it` |
 //! | KR-REQ-17.53 | `a_presentation_its_caller_cuts_off_while_the_service_is_silent_holds_the_service_off` |
@@ -58,6 +59,7 @@
 //! | KR-REQ-17.53 | `an_owner_watcher_lets_its_session_go_when_the_account_signs_out` |
 //! | KR-REQ-17.53 | `a_confirmation_in_the_ceremony_when_the_account_signs_out_is_not_completed` |
 //! | KR-REQ-17.53 | `an_inbox_pass_whose_account_leaves_while_the_host_is_asked_publishes_nothing` |
+//! | KR-REQ-17.53 | `an_inbox_pass_whose_account_leaves_while_the_sessions_are_listed_publishes_nothing` |
 //! | KR-REQ-17.53 | `a_kept_visit_whose_account_leaves_before_its_session_list_publishes_nothing` |
 //! | KR-REQ-17.53 | `a_token_the_service_turns_back_is_not_replaced_during_the_hold_a_cancelled_request_left` |
 
@@ -2004,6 +2006,35 @@ async fn each_stop_of_the_lease_is_sent_to_the_inbox_as_its_own_words_and_its_ow
     rig.control.fail_presentation(None);
 }
 
+/// KR-REQ-17.53 and KR-REQ-17.48: a session read after a sign-out is refused on the dial's route,
+/// with the sentence that says to sign in again and with no line of the code's after it: the one
+/// conversion of the stop carries the stop's action, and nothing falls back to the wait of a host
+/// that did not answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_read_after_a_sign_out_is_sent_with_the_sign_in_words_and_no_action_beside_them()
+{
+    let rig = Rig::start_with(SERVED, 1).await;
+    rig.connection(true).await;
+    let _ = rig.tokens.sign_out().await;
+
+    let refused = rig
+        .companion()
+        .call(
+            "session_agents",
+            json!({ "sessionId": rig.session().to_string(), "opening": null }),
+        )
+        .expect_err("the read is refused");
+    let sent = golden_sent("agent_page", "sign_in");
+    assert_eq!(
+        json!({
+            "code": refused["code"],
+            "message": refused["message"],
+            "user_action": refused["user_action"],
+        }),
+        native_part(&sent)
+    );
+}
+
 /// KR-REQ-17.53 and KR-REQ-17.48: a session read over a link of its own, which sends its first
 /// request with no presentation of its own, is ended by the keeper's stop when the service has
 /// asked this device to wait, and the page is sent the stop's words and the stop's action: one
@@ -2865,8 +2896,10 @@ async fn a_pass_whose_account_leaves_while_the_host_is_asked(method: Method) {
     });
     assert_eq!(row.state, HostInboxState::Refused, "{row:?}");
     assert!(row.result.is_none(), "nothing was published: {row:?}");
-    let said = row.refusal.expect("the reason").message;
-    assert!(said.contains("sign in"), "{said}");
+    let refusal = row.refusal.expect("the reason");
+    assert!(refusal.message.contains("sign in"), "{}", refusal.message);
+    // The words say what to do, so the page adds no line of its own after them.
+    assert_eq!(refusal.user_action, "nothing", "{refusal:?}");
 }
 
 /// KR-REQ-17.53: an inbox pass whose account signs out while the host is asked who it is publishes
@@ -2874,6 +2907,13 @@ async fn a_pass_whose_account_leaves_while_the_host_is_asked(method: Method) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_inbox_pass_whose_account_leaves_while_the_host_is_asked_publishes_nothing() {
     a_pass_whose_account_leaves_while_the_host_is_asked(Method::HostInfo).await;
+}
+
+/// KR-REQ-17.53: the same, while the host is asked for the session list after the inbox's pages
+/// were read: the connection's recorded end is read after the reads, and says what the stop says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_inbox_pass_whose_account_leaves_while_the_sessions_are_listed_publishes_nothing() {
+    a_pass_whose_account_leaves_while_the_host_is_asked(Method::SessionList).await;
 }
 
 /// KR-REQ-17.53: the same, while the host is asked to open the connection for itself.
