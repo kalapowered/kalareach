@@ -3372,6 +3372,13 @@ impl Session {
         if bytes.is_empty() {
             return (Vec::new(), None);
         }
+        // A discard that met the write in flight is made here, before this batch is appended, where
+        // no write is in flight: the appender is the only one that plans a write, and it waited for
+        // its own. It is asked for only after a discard met a write, so a segment that cannot be
+        // unlinked costs the maintenance pass a retry and not every batch.
+        if self.history.discard_deferred() {
+            self.discard_history_if_owed();
+        }
         let (cursor, owed) = {
             let mut span = self.trace.acquisition(crate::trace::Site::IngestRetain);
             // What the index records with the time of this output: whether the clock that reads it
@@ -4794,12 +4801,7 @@ impl Session {
                 Some(Err(_)) | None => return,
             }
         }
-        if self.privacy_cleanup.history.is_some() {
-            let discarded = self.history.discard_retained();
-            self.privacy_cleanup.history = discarded.left_behind;
-            self.history
-                .set_discard_owed(self.privacy_cleanup.history.is_some());
-        }
+        self.discard_history_if_owed();
         if self.privacy_cleanup.receipts.is_some() {
             match self
                 .journal
@@ -4814,6 +4816,30 @@ impl Session {
                 None => self.privacy_cleanup.receipts = None,
             }
         }
+    }
+
+    /// Removes the retained output when that is still owed, and says nothing when it is not.
+    ///
+    /// The privacy call after its wait, the pump after the write it waited for, the appender at its
+    /// next append and the maintenance pass all make the discard here, so each asks the one
+    /// question first: is the removal still owed. A session that cannot read whether privacy mode
+    /// is on owes it only once it can, and one whose privacy mode was turned off after the removal
+    /// finished owes nothing, so a late caller removes none of the output kept since. It never
+    /// waits: a write in flight leaves the removal owed.
+    pub fn discard_history_if_owed(&mut self) {
+        if self.privacy_cleanup.unresolved.is_some() || self.privacy_cleanup.history.is_none() {
+            return;
+        }
+        let discarded = self.history.discard_retained();
+        self.privacy_cleanup.history = discarded.left_behind;
+        self.history
+            .set_discard_owed(self.privacy_cleanup.history.is_some());
+    }
+
+    /// Returns the handle that watches the spool's writes, when a discard has met one in flight.
+    #[must_use]
+    pub(crate) fn deferred_discard_watch(&self) -> Option<crate::history::SpoolWriteWatch> {
+        self.history.deferred_discard_watch()
     }
 
     /// Returns the handle to the time index of this session's output, for a pass of maintenance to

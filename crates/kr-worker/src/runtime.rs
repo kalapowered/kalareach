@@ -1243,6 +1243,7 @@ impl SessionRuntime {
                         // one is written, so the spool receives the output in the order it came.
                         if let Some(write) = owed {
                             let writing_trace = ingest_trace.clone();
+                            let watch = write.watch();
                             let made = tokio::task::spawn_blocking(move || {
                                 let mut span = writing_trace.acquisition(Site::SpoolWrite);
                                 let made = write.perform(&bytes);
@@ -1251,11 +1252,24 @@ impl SessionRuntime {
                             })
                             .await;
                             // A write that failed, or was lost with the thread that made it, left
-                            // its settlement in the spool, and the session settles it.
-                            if !matches!(made, Ok(true))
-                                && let Ok(mut session) = lock_session(&ingest_session)
-                            {
-                                session.settle_spool_write();
+                            // its settlement in the spool, and the session settles it. A discard
+                            // of the retained output that met this write in flight left it owed
+                            // and is made here, in the same hold, right after the write ended:
+                            // the mark was set with the look at the write, so one that ended just
+                            // after the look is seen, and the write is the only one in flight.
+                            let failed = !matches!(made, Ok(true));
+                            let discard_owed = watch.discard_deferred();
+                            if failed || discard_owed {
+                                off_the_executor(|| {
+                                    if let Ok(mut session) = ingest_session.lock() {
+                                        if failed {
+                                            session.settle_spool_write();
+                                        }
+                                        if discard_owed {
+                                            session.discard_history_if_owed();
+                                        }
+                                    }
+                                });
                             }
                         }
                         // Every attachment has been handed this batch and the spool has it, so a
