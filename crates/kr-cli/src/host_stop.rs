@@ -1490,9 +1490,9 @@ enum Why {
     /// Its process runs, a lock is held or the last look showed the daemon, or nothing shows that
     /// it has gone where its process was read: the daemon is told to stop and goes on.
     Running,
-    /// No sign of life in the last round and no sign of an end: with no process identity the lock
-    /// was free and the last look showed neither the daemon nor its end. The command cannot say
-    /// that the daemon has not ended.
+    /// No sign of life in the last round and no sign of an end: with no usable reading of the
+    /// process (none was possible, or the system did not say) the lock was free and the last look
+    /// showed neither the daemon nor its end. The command cannot say that the daemon has not ended.
     NotShown,
     /// Its process has gone and something holds the environment that nothing shows to be a daemon.
     Held,
@@ -1571,6 +1571,8 @@ async fn wait_for_the_end(
         let unlooked = held.as_ref().err().cloned();
         let process = old.map(|old| operations.process_state(old));
         let old_gone = matches!(process, Some(ProcessState::Ended));
+        // No usable reading of the process: none was possible, or the system did not say.
+        let no_reading = old.is_none() || matches!(process, Some(ProcessState::Unknown { .. }));
         // What this round shows of the daemon: the lock's reading and the look are this round's.
         let lock_free = matches!(held, Ok(false));
         let mut last_look = None;
@@ -1579,9 +1581,12 @@ async fn wait_for_the_end(
             (Ok(true), Some(ProcessState::Ended)) => successor_of(operations, old, left())
                 .await
                 .map(End::Successor),
-            // The process runs, or the system did not say: the daemon has not ended.
-            (_, Some(ProcessState::Running | ProcessState::Unknown { .. })) => None,
-            (Ok(false), None) => {
+            // The process runs, or the system did not say and the lock is held or unreadable: the
+            // daemon has not ended.
+            (_, Some(ProcessState::Running))
+            | (Ok(true) | Err(_), Some(ProcessState::Unknown { .. })) => None,
+            // No usable reading of the process, and the lock is free: the endpoint decides.
+            (Ok(false), None | Some(ProcessState::Unknown { .. })) => {
                 let look = operations.look(left()).await;
                 last_look = Some(look);
                 match look {
@@ -1603,10 +1608,7 @@ async fn wait_for_the_end(
                 (Some(why), _) if old.is_none() || old_gone => Why::Unlooked(why),
                 (None, true) => Why::Held,
                 // The lock is free and the last look did not show the daemon: no sign of life.
-                _ if old.is_none()
-                    && lock_free
-                    && !matches!(last_look, Some(Endpoint::Same(_))) =>
-                {
+                _ if no_reading && lock_free && !matches!(last_look, Some(Endpoint::Same(_))) => {
                     Why::NotShown
                 }
                 _ => Why::Running,
@@ -2656,6 +2658,23 @@ mod tests {
                 .look(vec![at_once(Endpoint::Same(an_answer()))]);
             let ended = wait_for_the_end(&supplied, Some(&process), END_BOUND).await;
             assert_eq!(said(&ended), expected, "{state:?}");
+        }
+
+        // A process whose state the system did not say is no sign of life and no sign of an end:
+        // with the lock free the endpoint decides, as where there is no identity.
+        for (look, expected) in [
+            (Endpoint::Unclear, "not ended, not shown"),
+            (Endpoint::Nobody, "gone"),
+            (Endpoint::Same(an_answer()), "not ended, running"),
+        ] {
+            let supplied = Supplied::new()
+                .held(vec![at_once(Ok(false))])
+                .process(vec![at_once(ProcessState::Unknown {
+                    detail: "denied".to_owned(),
+                })])
+                .look(vec![at_once(look)]);
+            let ended = wait_for_the_end(&supplied, Some(&process), END_BOUND).await;
+            assert_eq!(said(&ended), expected, "{look:?}");
         }
 
         // A successor: another process that the lock file names, with no look made for it; and
