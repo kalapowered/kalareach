@@ -32,7 +32,8 @@ use crate::shown::{Said, Shown};
 pub struct Waited(());
 
 /// Which of the outcomes a person is told apart an attempt ended with.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(into = "String")]
 pub enum FailureKind {
     /// The code is not ten characters of the pairing alphabet.
     Malformed,
@@ -128,18 +129,18 @@ impl Said for FailureKind {
     }
 }
 
-impl Serialize for FailureKind {
-    /// A kind is sent as the name [`Said::said`] gives it, in snake case: lower case, with an
-    /// underscore before each capital but the first.
-    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        let mut name = String::new();
-        for (index, letter) in self.said().as_str().chars().enumerate() {
+impl From<FailureKind> for String {
+    /// The name a kind is sent as: the name [`Said::said`] gives it, in snake case (lower case, with
+    /// an underscore before each capital but the first).
+    fn from(kind: FailureKind) -> Self {
+        let mut name = Self::new();
+        for (index, letter) in kind.said().as_str().chars().enumerate() {
             if index > 0 && letter.is_ascii_uppercase() {
                 name.push('_');
             }
             name.push(letter.to_ascii_lowercase());
         }
-        serializer.serialize_str(&name)
+        name
     }
 }
 
