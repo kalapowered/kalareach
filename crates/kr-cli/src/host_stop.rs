@@ -737,6 +737,12 @@ enum Asked {
     NotComposed { why: Shown, closed: bool },
 }
 
+/// Whether the failure of composing a request is the daemon's close of the connection, which a
+/// daemon does when it goes.
+fn closed_by_the_daemon(error: &kr_ipc::IpcError) -> bool {
+    matches!(error, kr_ipc::IpcError::PeerClosed)
+}
+
 /// Sends the request, says that it left, and waits for its answer.
 ///
 /// The answer is read from the connection, and anything but a whole answer to this request is an
@@ -760,7 +766,7 @@ async fn ask(
         Ok(mutation) => mutation,
         Err(error) => {
             return Asked::NotComposed {
-                closed: matches!(error, kr_ipc::IpcError::PeerClosed),
+                closed: closed_by_the_daemon(&error),
                 why: Shown::ipc(&error),
             };
         }
@@ -887,22 +893,11 @@ async fn stop_the_daemon(
             // the unmade request's failure. The deadline counts from the failure.
             let deadline = tokio::time::Instant::now() + END_BOUND;
             progress.remove_marker();
-            // The connection is let go before the look, as before the wait of a request that was
-            // asked. Where the platform keeps a pipe instance for as long as a handle to it is
-            // open, a daemon that has gone stays at its endpoint for a command that holds its
-            // end: every new connection finds the pipe busy, so no look sees the end, and a new
-            // daemon cannot create the pipe's first instance.
-            drop(client);
             let named = holder.as_ref().map(|holder| holder.pid.get());
-            if let Some(ended) = ended_before_the_request(
-                host,
-                &environment.paths,
-                info.generation,
-                holder.as_ref(),
-                closed,
-                deadline,
-            )
-            .await
+            let operations = Real::of(host, &environment.paths, info.generation);
+            if let Some(ended) =
+                ended_before_the_request(&operations, client, holder.as_ref(), closed, deadline)
+                    .await
             {
                 let facts = Facts {
                     knows: Knows::Ended,
@@ -953,7 +948,8 @@ async fn stop_the_daemon(
     let named = old.map(|old| old.pid.get());
     // For `--json`: the process the answer gave, and otherwise the one the lock file named.
     let pid = pid.or_else(|| holder.as_ref().map(|holder| holder.pid.get()));
-    let ended = wait_for_the_end(host, &environment.paths, info.generation, old, END_BOUND).await;
+    let operations = Real::of(host, &environment.paths, info.generation);
+    let ended = wait_for_the_end(&operations, old, END_BOUND).await;
     let result = |knows| Facts {
         knows,
         pid,
@@ -1027,21 +1023,26 @@ async fn stop_the_daemon(
 /// answers at its endpoint stays, and nothing is waited for. A daemon that has not ended by the
 /// deadline is the failure's, and so is one whose end cannot be looked at. The deadline is the
 /// caller's, set before the look, so that the look and the wait together stay inside it.
+///
+/// `connection` is the command's connection to the daemon, which is let go before anything is
+/// looked at, as before the wait of a request that was asked.
 async fn ended_before_the_request(
-    host: &HostPaths,
-    environment: &EnvironmentPaths,
-    generation: ControllerGeneration,
+    operations: &impl Operations,
+    connection: impl Sized,
     old: Option<&ProcessStartIdentity>,
     closed: bool,
     deadline: tokio::time::Instant,
 ) -> Option<End> {
-    if !closed
-        && endpoint_look(environment, generation, startup::ANSWER_BOUND).await == Endpoint::Same
-    {
+    // Where the platform keeps a pipe instance for as long as a handle to it is open, a daemon
+    // that has gone stays at its endpoint for a command that holds its end: every new connection
+    // finds the pipe busy, so no look sees the end, and a new daemon cannot create the pipe's
+    // first instance.
+    drop(connection);
+    if !closed && operations.look(startup::ANSWER_BOUND).await == Endpoint::Same {
         return None;
     }
     let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-    match wait_for_the_end(host, environment, generation, old, left).await {
+    match wait_for_the_end(operations, old, left).await {
         End::NotEnded(_) => None,
         ended => Some(ended),
     }
@@ -1325,35 +1326,30 @@ async fn host_info(
 /// before it: the install lock's wait, a look at the endpoint and the pause between two rounds. A
 /// look that cannot be made leaves the daemon as not ended.
 async fn wait_for_the_end(
-    host: &HostPaths,
-    environment: &EnvironmentPaths,
-    generation: ControllerGeneration,
+    operations: &impl Operations,
     old: Option<&ProcessStartIdentity>,
     bound: Duration,
 ) -> End {
     let deadline = tokio::time::Instant::now() + bound;
     let left = || deadline.saturating_duration_since(tokio::time::Instant::now());
-    let installation = Installation::of(host, environment);
     loop {
-        let held = installation.held(left()).await;
+        let held = operations.held(left()).await;
         let unlooked = held.as_ref().err().cloned();
-        let process = old.map(identity::process_state);
+        let process = old.map(|old| operations.process_state(old));
         let old_gone = matches!(process, Some(ProcessState::Ended));
         let seen = match (held, process) {
             (Ok(false), Some(ProcessState::Ended)) => Some(End::Gone),
-            (Ok(true), Some(ProcessState::Ended)) => {
-                successor_of(environment, generation, old, left())
-                    .await
-                    .map(End::Successor)
-            }
+            (Ok(true), Some(ProcessState::Ended)) => successor_of(operations, old, left())
+                .await
+                .map(End::Successor),
             // The process runs, or the system did not say: the daemon has not ended.
             (_, Some(ProcessState::Running | ProcessState::Unknown { .. })) => None,
-            (Ok(false), None) => match endpoint_look(environment, generation, left()).await {
+            (Ok(false), None) => match operations.look(left()).await {
                 Endpoint::Nobody => Some(End::Gone),
-                Endpoint::Another => Some(End::Successor(named_daemon(environment))),
+                Endpoint::Another => Some(End::Successor(operations.named_daemon())),
                 Endpoint::Same | Endpoint::Unclear => None,
             },
-            (Ok(true), None) => successor_of(environment, generation, None, left())
+            (Ok(true), None) => successor_of(operations, None, left())
                 .await
                 .map(End::Successor),
             (Err(_), _) => None,
@@ -1368,7 +1364,7 @@ async fn wait_for_the_end(
                 _ => Why::Running,
             });
         }
-        tokio::time::sleep(LOOK_EVERY.min(left())).await;
+        operations.pause(LOOK_EVERY.min(left())).await;
     }
 }
 
@@ -1377,18 +1373,17 @@ async fn wait_for_the_end(
 /// kr-controller other than `old`, or a daemon of another generation that answers. Nothing else
 /// proves a successor.
 async fn successor_of(
-    environment: &EnvironmentPaths,
-    generation: ControllerGeneration,
+    operations: &impl Operations,
     old: Option<&ProcessStartIdentity>,
     within: Duration,
 ) -> Option<Option<u64>> {
-    let named =
-        named_daemon(environment).filter(|named| old.is_none_or(|old| *named != old.pid.get()));
+    let named = operations
+        .named_daemon()
+        .filter(|named| old.is_none_or(|old| *named != old.pid.get()));
     if named.is_some() && old.is_some() {
         return Some(named);
     }
-    (endpoint_look(environment, generation, within).await == Endpoint::Another)
-        .then(|| named_daemon(environment))
+    (operations.look(within).await == Endpoint::Another).then(|| operations.named_daemon())
 }
 
 /// What answers at the environment's endpoint.
@@ -1485,6 +1480,65 @@ impl Installation {
     }
 }
 
+/// What the wait for a daemon's end and the look before it read of the machine and wait on, given
+/// to them so that a case can supply each answer and the pause, with the runtime's clock in its
+/// own hands. [`Real`] is the command's own.
+trait Operations {
+    /// Whether a daemon holds the environment, waiting up to `within` for one that is starting.
+    async fn held(&self, within: Duration) -> std::result::Result<bool, Shown>;
+    /// What the system says of the process of the daemon that was asked.
+    fn process_state(&self, old: &ProcessStartIdentity) -> ProcessState;
+    /// What answers at the environment's endpoint, bounded by `within`.
+    async fn look(&self, within: Duration) -> Endpoint;
+    /// The process the lock file names as a control daemon, where it names one.
+    fn named_daemon(&self) -> Option<u64>;
+    /// Waits `time` between two rounds of looks.
+    async fn pause(&self, time: Duration);
+}
+
+/// The operations on this machine: its locks, its processes, its endpoint and its timer.
+struct Real<'a> {
+    installation: Installation,
+    environment: &'a EnvironmentPaths,
+    generation: ControllerGeneration,
+}
+
+impl<'a> Real<'a> {
+    fn of(
+        host: &HostPaths,
+        environment: &'a EnvironmentPaths,
+        generation: ControllerGeneration,
+    ) -> Self {
+        Self {
+            installation: Installation::of(host, environment),
+            environment,
+            generation,
+        }
+    }
+}
+
+impl Operations for Real<'_> {
+    async fn held(&self, within: Duration) -> std::result::Result<bool, Shown> {
+        self.installation.held(within).await
+    }
+
+    fn process_state(&self, old: &ProcessStartIdentity) -> ProcessState {
+        identity::process_state(old)
+    }
+
+    async fn look(&self, within: Duration) -> Endpoint {
+        endpoint_look(self.environment, self.generation, within).await
+    }
+
+    fn named_daemon(&self) -> Option<u64> {
+        named_daemon(self.environment)
+    }
+
+    async fn pause(&self, time: Duration) {
+        tokio::time::sleep(time).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1536,9 +1590,7 @@ mod tests {
         let waited = tokio::time::timeout(
             Duration::from_secs(60),
             wait_for_the_end(
-                &host,
-                &environment,
-                generation,
+                &Real::of(&host, &environment, generation),
                 Some(&own),
                 Duration::from_millis(300),
             ),
@@ -1552,9 +1604,7 @@ mod tests {
         drop(held);
         let ended = identity::ended_process_identity(std::process::id());
         let waited = wait_for_the_end(
-            &host,
-            &environment,
-            generation,
+            &Real::of(&host, &environment, generation),
             Some(&ended),
             Duration::from_secs(60),
         )
@@ -1590,9 +1640,7 @@ mod tests {
         let waited = tokio::time::timeout(
             Duration::from_secs(60),
             wait_for_the_end(
-                &host,
-                &environment,
-                generation,
+                &Real::of(&host, &environment, generation),
                 Some(&ended),
                 Duration::from_secs(30),
             ),
@@ -1608,9 +1656,7 @@ mod tests {
         let held = SingletonLock::hold(&environment.singleton_lock(), environment.environment_id())
             .expect("takes the lock again");
         let waited = wait_for_the_end(
-            &host,
-            &environment,
-            generation,
+            &Real::of(&host, &environment, generation),
             Some(&ended),
             Duration::from_millis(300),
         )
@@ -1633,9 +1679,7 @@ mod tests {
         let endpoint = environment.controller_endpoint().expect("an endpoint");
         let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
         let waited = wait_for_the_end(
-            &host,
-            &environment,
-            generation,
+            &Real::of(&host, &environment, generation),
             None,
             Duration::from_millis(300),
         )
@@ -1649,9 +1693,7 @@ mod tests {
         let held = SingletonLock::hold(&environment.singleton_lock(), environment.environment_id())
             .expect("takes the lock");
         let waited = wait_for_the_end(
-            &host,
-            &environment,
-            generation,
+            &Real::of(&host, &environment, generation),
             None,
             Duration::from_millis(300),
         )
@@ -1663,9 +1705,7 @@ mod tests {
         drop(held);
 
         let waited = wait_for_the_end(
-            &host,
-            &environment,
-            generation,
+            &Real::of(&host, &environment, generation),
             None,
             Duration::from_secs(30),
         )
