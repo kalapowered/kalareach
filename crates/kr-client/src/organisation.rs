@@ -198,18 +198,24 @@ impl LeaseStop {
         }
     }
 
-    /// What the person is asked to do after the stop's words. `Later` asks nothing: its words say
-    /// how long this device waits before it asks again, and a wait that the code chose would be a
-    /// second one.
+    /// What the person is asked to do after the stop's words. A stop whose words say their own next
+    /// step (to sign in again, to ask the administrator, to update this app, to wait, or that this
+    /// app asks again) asks nothing more, since a second instruction would repeat or contradict the
+    /// first. A stop that states only a fact asks what tells the person what to do: that the
+    /// connection ended says nothing of what to do, so it asks for a wait.
     #[must_use]
     pub const fn user_action(&self) -> UserAction {
         match self {
-            Self::SignIn | Self::TokenRefused => UserAction::SignIn,
-            Self::NotAMember | Self::Refused(_) | Self::Later(_) => UserAction::Nothing,
-            Self::Unusable => UserAction::Update,
-            Self::ConnectionEnded | Self::Unreachable | Self::AccountChanged | Self::Presenting => {
-                UserAction::Wait
-            }
+            Self::ConnectionEnded => UserAction::Wait,
+            Self::SignIn
+            | Self::TokenRefused
+            | Self::NotAMember
+            | Self::Refused(_)
+            | Self::Unusable
+            | Self::Later(_)
+            | Self::Unreachable
+            | Self::AccountChanged
+            | Self::Presenting => UserAction::Nothing,
         }
     }
 
@@ -250,7 +256,10 @@ impl Said for LeaseStop {
                  sign-in this device holds",
             ),
             Self::NotAMember => {
-                Shown::said("this account is not a member of the organisation this host answers to")
+                Shown::said(
+                    "this account is not a member of the organisation this host answers to; sign in \
+                     with an account that is a member, or ask your organisation's administrator",
+                )
             }
             Self::Refused(rule) => crate::shown!(
                 "this host refused the lease your organisation signed ({}); ask your \
