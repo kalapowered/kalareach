@@ -4527,7 +4527,6 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "signal-hook 0.4.4",
- "strum",
  "syn 2.0.119",
  "tar",
  "tempfile",
