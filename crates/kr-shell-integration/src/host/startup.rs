@@ -5242,6 +5242,75 @@ mod tests {
         );
     }
 
+    /// The product's own question, asked of each edition of PowerShell that the machine has
+    /// (`pwsh.exe` and `powershell.exe`), names the profiles that the edition names plainly. The
+    /// plain answer is the UTF-16 units of each member in digits, so no code page is involved in
+    /// either. It writes nothing: it asks and reads.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs an edition of PowerShell on the search path; the Windows machine runs it with --ignored (tasks/T-SHELL-PS-4-scripts/win-cases-real.txt)"]
+    fn each_edition_that_is_found_names_its_profiles_as_it_names_them_plainly() {
+        let path = std::env::var_os("PATH").expect("a search path");
+        let mut found = Vec::new();
+        for name in ["pwsh.exe", "powershell.exe"] {
+            let Some(executable) = std::env::split_paths(&path)
+                .map(|directory| directory.join(name))
+                .find(|candidate| candidate.is_file())
+            else {
+                continue;
+            };
+            let root = tempfile::tempdir().expect("a directory");
+            let asking = HomeLayout {
+                powershell: Some(PowerShell::plain(executable.clone())),
+                ..layout(root.path())
+            };
+            let (all_hosts, current_host) = asking
+                .powershell_profiles(PLACEMENT_DEADLINE)
+                .unwrap_or_else(|refused| panic!("{name}: {refused}"))
+                .expect("a PowerShell is there");
+            let plain = std::process::Command::new(&executable)
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-NoLogo",
+                    "-Command",
+                    "foreach ($member in @($PROFILE.CurrentUserAllHosts, \
+                     $PROFILE.CurrentUserCurrentHost)) { [Console]::Out.WriteLine(\
+                     [string]::Join(',', @($member.ToCharArray() | ForEach-Object { [int]$_ }))) }",
+                ])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("the edition starts");
+            assert!(plain.status.success(), "{name}: {plain:?}");
+            let said = String::from_utf8(plain.stdout).expect("digits and commas");
+            let plainly: Vec<String> = said
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(|line| {
+                    let units: Vec<u16> = line
+                        .split(',')
+                        .map(|unit| unit.parse().expect("a UTF-16 unit"))
+                        .collect();
+                    String::from_utf16(&units).expect("a path that is text")
+                })
+                .collect();
+            assert_eq!(
+                plainly,
+                [
+                    all_hosts.to_string_lossy().into_owned(),
+                    current_host.to_string_lossy().into_owned()
+                ],
+                "{name}: the product's question and the plain one name different profiles"
+            );
+            found.push(name);
+        }
+        assert!(
+            !found.is_empty(),
+            "no edition of PowerShell is on the search path"
+        );
+    }
+
     /// An answer of the later two questions that is not text is not understood, as the profile
     /// question's is: it is not an answer that did not come.
     #[cfg(unix)]
