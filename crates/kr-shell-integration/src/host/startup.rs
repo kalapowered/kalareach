@@ -5012,6 +5012,15 @@ mod tests {
             }
         }
         let standard = base64::engine::general_purpose::STANDARD;
+        let not_text: &[u8] = if cfg!(windows) {
+            b"C:\\h\xF6m\xE9\\p.ps1"
+        } else {
+            b"/h\xF6m\xE9/p.ps1"
+        };
+        assert!(
+            Path::new(&*String::from_utf8_lossy(not_text)).is_absolute(),
+            "a lossy reading of these bytes is a full path"
+        );
         for answer in [
             String::new(),
             "\n \n".to_owned(),
@@ -5029,10 +5038,11 @@ mod tests {
             // Not encoded: the paths themselves, which is a form no code page keeps.
             format!("{all_hosts}\n{current_host}"),
             "-NoProfile -NonInteractive -NoLogo -Command".to_owned(),
-            // Encoded, but not text: bytes that are not UTF-8.
+            // Encoded, but not text: bytes that begin as a full path and are not UTF-8, so that a
+            // reading that replaced them would take the path and only the UTF-8 reading refuses.
             format!(
                 "{}\n{}",
-                standard.encode([0xf6_u8, 0xe9]),
+                standard.encode(not_text),
                 standard.encode(current_host)
             ),
         ] {
@@ -5095,6 +5105,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_answer_that_did_not_come_is_a_refused_question_and_no_profile_is_guessed() {
+        use base64::Engine as _;
+
         let root = tempfile::tempdir().expect("a directory");
         let not_understood = "PowerShell's answer about where its profiles are was not understood: it \
                               was too long, or it was not two full paths in the form that this host \
@@ -5164,7 +5176,14 @@ mod tests {
             ),
             (
                 "says two lines that are encoded bytes that are not text",
-                program_that(root.path(), "pwsh-not-text", "printf '9ukK\\n9ukK\\n'"),
+                program_that(
+                    root.path(),
+                    "pwsh-not-text",
+                    &format!(
+                        "printf '%s\\n%s\\n' '{0}' '{0}'",
+                        base64::engine::general_purpose::STANDARD.encode(b"/h\xF6m\xE9/p.ps1")
+                    ),
+                ),
             ),
             (
                 "says two full paths, then blank lines past the limit",
