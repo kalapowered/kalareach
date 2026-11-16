@@ -1243,6 +1243,10 @@ impl Controller {
             #[cfg(feature = "testing")]
             after_the_record_asks_the_feed: ThreadPause::default(),
             #[cfg(feature = "testing")]
+            after_the_first_write: ThreadPause::default(),
+            #[cfg(feature = "testing")]
+            after_a_wait_for_room: ThreadPause::default(),
+            #[cfg(feature = "testing")]
             before_the_record_begins: ThreadPause::default(),
             #[cfg(feature = "testing")]
             before_the_last_fence_read: ThreadPause::default(),

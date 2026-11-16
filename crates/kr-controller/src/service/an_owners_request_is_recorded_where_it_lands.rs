@@ -1,11 +1,12 @@
 //! Where an owner's request for a confirmation lands.
 //!
 //! The record of the request is written in one transaction. After the lookup it asks the authority
-//! feed where that takes its locks, copies the bound of the local owner's lease, and asks the
-//! footing's one question with the copy; where the bound ended or moved in the waits before the
+//! feed where that takes its locks, reads the caller's own owner check, copies the bound of the
+//! local owner's lease, and asks the footing's one question with the copy; where the bound ended or moved in the waits before the
 //! copy, the subject is decided again under the scope that no lease serves; the feed is asked once
-//! more with no lock; and the record is written with nothing allocated or awaited between the
-//! question and the write.
+//! more with no lock; the record is written with nothing allocated or awaited between the question
+//! and the write; and a last ask, immediately before the commit, makes the question and the feed's
+//! ask again, so that what lapsed while the write stood rolls the transaction back.
 //!
 //! Each case stops the record at the last wait, after the feed was asked and before the bound is
 //! copied, and ends what it ends there.
@@ -152,6 +153,21 @@ impl HeldPresentation {
 }
 
 async fn recorded_with(ends: Ends, display: ConfirmationDisplay) -> Found {
+    recorded_with_at(At::TheFeedsAsk, ends, display).await
+}
+
+/// Where the record is stopped for `ends` to come.
+#[derive(Clone, Copy, Debug)]
+enum At {
+    /// The end of the feed's locked ask, before the bound is copied.
+    TheFeedsAsk,
+    /// Once the record's first write has been made, before its last ask, which stands immediately
+    /// before the commit.
+    TheFirstWrite,
+}
+
+/// As [`recorded_with`], with the stop where `at` says.
+async fn recorded_with_at(at: At, ends: Ends, display: ConfirmationDisplay) -> Found {
     let (temp, controller, continuous, presenter, _writer, _reader) =
         connected_under_a_lease_that_can_be_presented_again().await;
     let door = Door::open(&temp, &controller).await;
@@ -172,11 +188,12 @@ async fn recorded_with(ends: Ends, display: ConfirmationDisplay) -> Found {
     // A lease presented again is a policy commit, which needs the pairing records' write lock, so it
     // lands in the wait for that lock, before the record's transaction begins; the lease's time
     // passes in the last wait, inside the transaction.
-    let (arrived, go) = match ends {
-        Ends::TheLeaseIsPresentedAgain => controller.pause_before_the_record_begins(),
-        Ends::Nothing | Ends::TheLeasesTime | Ends::TheDeadlinePasses => {
-            controller.pause_after_the_record_asks_the_feed()
+    let (arrived, go) = match (at, ends) {
+        (At::TheFirstWrite, _) => controller.pause_after_the_first_write(),
+        (At::TheFeedsAsk, Ends::TheLeaseIsPresentedAgain) => {
+            controller.pause_before_the_record_begins()
         }
+        (At::TheFeedsAsk, _) => controller.pause_after_the_record_asks_the_feed(),
     };
     let owner = Arc::clone(controller.owner_authority());
     let (again, shown) = ((Arc::clone(&owner), caller.clone()), display.clone());
@@ -424,4 +441,34 @@ async fn a_request_whose_bound_moves_inside_its_transaction_is_decided_again_und
     refused_as_a_caller_no_lease_serves(
         &recorded_with_the_bound_moving_inside(making_exclusive()).await,
     );
+}
+
+/// KR-REQ-17.54: a lease that ends while the request's write stands is found by the last ask,
+/// immediately before the commit: the subject is decided again under the scope that no lease
+/// serves, and the one the recovery set does not hold is refused in the door's own words, the
+/// transaction is rolled back and nothing is recorded. The confirmation of the clock, which the
+/// recovery set holds, is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_whose_lease_ends_while_its_write_stands_is_refused_at_the_commit_and_records_nothing()
+ {
+    written(&recorded_with_at(At::TheFirstWrite, Ends::TheLeasesTime, establishing()).await);
+    refused_as_a_caller_no_lease_serves(
+        &recorded_with_at(At::TheFirstWrite, Ends::TheLeasesTime, making_exclusive()).await,
+    );
+}
+
+/// KR-REQ-17.54: a request whose deadline passes while its write stands is refused at the commit
+/// in the words of the deadline, whole, and nothing is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_whose_deadline_passes_while_its_write_stands_is_refused_at_the_commit_and_records_nothing()
+ {
+    for display in [establishing(), making_exclusive()] {
+        let found = recorded_with_at(At::TheFirstWrite, Ends::TheDeadlinePasses, display).await;
+        let refusal = found.answered.as_ref().expect_err("the request is refused");
+        let expired =
+            crate::service::Lapse::Admission(crate::authority::AdmissionLapse::Expired).refusal();
+        assert_eq!(refusal.to_string(), expired.to_string());
+        assert_eq!(refusal.code(), expired.code());
+        assert_eq!(found.rows, 0, "nothing is recorded");
+    }
 }

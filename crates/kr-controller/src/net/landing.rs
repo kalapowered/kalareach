@@ -12,9 +12,12 @@
 //! lock before it returns, so that raise cannot return while a record's transaction is open; the
 //! word it sets stands inside the transaction, where the second ask reads it. Three raisers do not
 //! wait for the lock: the feed's removal (`refuse_the_grants_that_rest_on_the_feed`), the personal
-//! grants' mirror and the raise at start. A word one of them sets after the second ask lands
-//! inside that ask's stated limit: the instructions between it and the write, and the write call
-//! itself.
+//! grants' mirror and the raise at start. A fourth, `refuse_for_an_unverified_withdrawal`, leaves
+//! the wait to its caller and reads the device directory first, which an open record holds, so it
+//! cannot raise during a record's transaction. A word one of the three sets after the second ask
+//! is met by the last ask, immediately before the commit ([`Landing::asks_before_the_commit`]),
+//! which asks the footing's question and the feed again and rolls the transaction back on a
+//! refusal; what stands outside it is the commit's own call, the rule's stated limit.
 //!
 //! A [`Landing`] is what a door gives the caller of such a mutation: the feed's ask, the footing
 //! made once at the door, and the held bound of the local owner's lease. The same parts give the
@@ -23,10 +26,12 @@
 
 use std::sync::Arc;
 
+use kr_protocol::confirmation::ConfirmationDisplay;
 use kr_protocol::ids::{AuthorityRevision, ConnectionId};
 use kr_transport::clock::ContinuousInstant;
 
 use super::invitations::Admission;
+use super::owner::Scope;
 use crate::authority::{AdmissionLapse, AdmittedMutation};
 use crate::error::{ControllerError, Result};
 use crate::grants::policy::HeldBound;
@@ -173,6 +178,46 @@ impl Landing {
         if let Some(daemon) = &self.daemon {
             daemon.before_the_record_begins.wait();
         }
+    }
+
+    /// Where this host's own tests stop a record once its first write has been made and before
+    /// its last ask, so that what lapses while that write stood can be seen refused at the
+    /// commit.
+    #[cfg(feature = "testing")]
+    pub(crate) fn waits_after_the_first_write(&self) {
+        if let Some(daemon) = &self.daemon {
+            daemon.after_the_first_write.wait();
+        }
+    }
+
+    /// The last ask of a record, immediately before its commit: the footing's question with a
+    /// copy of the bound taken now, where the bound ended or moved the subject decided again
+    /// under the scope that no lease serves, and the feed's refusal asked again of the kept grants
+    /// with no lock. A refusal here rolls the transaction back, so that nothing is recorded: the
+    /// asks before the first statement refuse early, and this one covers what lapsed while the
+    /// writes were made.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal of the footing, of the scope or of the feed.
+    pub(crate) fn asks_before_the_commit(
+        &self,
+        kept: &Kept,
+        scope: Scope,
+        display: &ConfirmationDisplay,
+    ) -> Result<()> {
+        let copied = self.copies_the_bound();
+        match self.asks(&copied) {
+            Ok(()) => {}
+            Err(LeasedLapse::BoundMoved | LeasedLapse::Lapse(Lapse::LeaseEnded)) => {
+                let closed = scope.closed();
+                if !closed.may_confirm_display(display) {
+                    return Err(closed.refusal());
+                }
+            }
+            Err(LeasedLapse::Lapse(lapse)) => return Err(lapse.refusal()),
+        }
+        self.feed_still_clear(kept)
     }
 
     /// The copy of the held bound's cell that the question compares. It is taken after the feed's

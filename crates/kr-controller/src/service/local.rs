@@ -445,13 +445,24 @@ impl Controller {
         // What the question was asked with, held until the transport's write has been made.
         let mut asked = LeaseAsked::default();
         let mut begun = false;
+        // Whether the list that replaces this one is the frame in hand. Its question is the
+        // footing's alone, without the bound: the lease it was prepared for has ended, and what
+        // can still stop it is the registration, at every wait.
+        let mut replacing = false;
         loop {
             let attempt = {
+                let frame: &[u8] = match (&instead, replacing) {
+                    (Some(replacement), true) => replacement,
+                    _ => &bytes,
+                };
                 let permitted = || {
                     // What the earlier question was asked with goes before this one's reading of
                     // the lease: a slot that the new value overwrote would let the old one go after
                     // this question, and a transport attempt asks before each chunk it writes.
                     drop(std::mem::take(&mut asked));
+                    if replacing {
+                        return under.asked_without_the_bound().is_ok();
+                    }
                     match self.ask_where_a_frame_lands(leased, under) {
                         Ok(held) => {
                             asked = held;
@@ -464,20 +475,38 @@ impl Controller {
                     writer.resume_frame_checked(permitted)
                 } else {
                     begun = true;
-                    writer.begin_frame_checked(&bytes, permitted)
+                    writer.begin_frame_checked(frame, permitted)
                 }
             };
             drop(std::mem::take(&mut asked));
             match attempt {
                 Ok(CheckedWrite::Complete) => return true,
                 Ok(CheckedWrite::Blocked) => {
+                    #[cfg(feature = "testing")]
+                    self.local_writes_blocked
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     if writer.writable().ready().await.is_err() {
                         return false;
                     }
+                    // The wait for room has ended: the next question stands after it.
+                    #[cfg(feature = "testing")]
+                    self.after_a_wait_for_room.wait();
                 }
                 Ok(CheckedWrite::Refused) => {
                     if !writer.withdraw_unstarted() {
                         return false;
+                    }
+                    if replacing {
+                        // The registration refused the list that replaces the first: nothing of
+                        // either list is written, and the refusal is the one of the member that
+                        // refused.
+                        let Err(lapse) = under.asked_without_the_bound() else {
+                            return false;
+                        };
+                        let reply = under.withheld(lapse, request_id, || {
+                            self.lease_ended_reply(request_id, method)
+                        });
+                        return writer.write_message(&reply).await.is_ok();
                     }
                     match self.ask_where_a_frame_lands(leased, under) {
                         Ok(_) => {
@@ -485,15 +514,14 @@ impl Controller {
                             // offered afresh.
                             begun = false;
                         }
+                        // The question that stopped the list is the choice: where it is the
+                        // lease's end, the list under the scope that no lease serves goes as it
+                        // was prepared, through this loop, asked at each wait.
+                        Err(Lapse::LeaseEnded) if instead.is_some() => {
+                            replacing = true;
+                            begun = false;
+                        }
                         Err(lapse) => {
-                            // The question that stopped the list is the choice: where it is the
-                            // lease's end, the list under the scope that no lease serves goes as
-                            // it was prepared.
-                            if lapse == Lapse::LeaseEnded
-                                && let Some(bytes) = &instead
-                            {
-                                return writer.write_frame(bytes).await.is_ok();
-                            }
                             let reply = under.withheld(lapse, request_id, || {
                                 self.lease_ended_reply(request_id, method)
                             });
@@ -610,6 +638,26 @@ impl Controller {
         &self,
     ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
         self.after_the_record_asks_the_feed.arm()
+    }
+
+    /// Arms the pause the next record of an owner's request or of its answer stops at once its
+    /// first write has been made, before its last ask. Returns the end that says the record has
+    /// arrived, and the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_after_the_first_write(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.after_the_first_write.arm()
+    }
+
+    /// Arms the pause the next local writer that waited for room stops at once the socket is
+    /// writable again, before the question that precedes its next transport write. Returns the
+    /// end that says the writer has arrived, and the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_after_a_wait_for_room(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.after_a_wait_for_room.arm()
     }
 
     /// Arms the pause the next record of an owner's request or of its answer stops at before its

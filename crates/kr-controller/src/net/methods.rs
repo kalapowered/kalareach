@@ -153,7 +153,7 @@ impl Controller {
             }
             // The challenges are the daemon's, networked or not.
             Method::OwnerConfirmationPending => {
-                let _: OwnerConfirmationPendingParams = decode(params)?;
+                decode_pending_params(params)?;
                 let listed = self.pairing_pending(caller).await?;
                 encode(&listed.full)
             }
@@ -534,6 +534,17 @@ where
             })??;
     ParamsValue::from_typed(&answer)
         .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+}
+
+/// Decodes the parameters of the owner's list of outstanding confirmations, which carry no member:
+/// the one decode that every door of that read makes.
+///
+/// # Errors
+///
+/// Returns the refusal of parameters that name a member.
+pub(crate) fn decode_pending_params(params: &ParamsValue) -> Result<()> {
+    let _: OwnerConfirmationPendingParams = decode(params)?;
+    Ok(())
 }
 
 fn encode<T: serde::Serialize>(value: &T) -> Result<ParamsValue> {

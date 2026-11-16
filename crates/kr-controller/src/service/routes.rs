@@ -264,6 +264,9 @@ impl Controller {
         if request.method.method() != Some(Method::OwnerConfirmationPending) {
             return (self.read_method(actor_id, request, false).await, None);
         }
+        if let Err(error) = net::methods::decode_pending_params(&request.params) {
+            return (respond(request.request_id, Err(error)), None);
+        }
         let caller = self.local_caller(actor_id);
         let listed = match self.pairing_pending(caller).await {
             Ok(listed) => listed,

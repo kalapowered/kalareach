@@ -208,6 +208,16 @@ impl WrittenUnder {
         }
     }
 
+    /// The footing's question without the bound, for the list that replaces a list whose lease
+    /// ended: only the registration, the fence and the revision can stop it, and the lease cannot.
+    ///
+    /// # Errors
+    ///
+    /// Returns the member that refuses.
+    pub(crate) fn asked_without_the_bound(&self) -> Result<(), Lapse> {
+        self.footing.ask(self.ask)
+    }
+
     /// What is written in place of a frame that the last question stopped, for the member `lapse`
     /// that refused it.
     ///

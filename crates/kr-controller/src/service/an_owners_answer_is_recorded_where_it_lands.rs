@@ -1,11 +1,13 @@
 //! Where an owner's answer to a confirmation lands.
 //!
-//! The record of the answer is written in one transaction. After the lookup it reads the signer's
-//! standing from the rows of that transaction and verifies the confirmation again; it asks the
-//! authority feed where that takes its locks, copies the bound of the local owner's lease, and asks
-//! the footing's one question with the copy; where the bound ended or moved, the challenge's display
-//! is decided again under the scope that no lease serves; the feed is asked once more with no lock;
-//! and the record is written with nothing allocated or awaited between the question and the write.
+//! The record of the answer is written in one transaction. After the lookup it asks the authority
+//! feed where that takes its locks, reads the signer's standing from the rows of that transaction
+//! and verifies the confirmation again, copies the bound of the local owner's lease, and asks the
+//! footing's one question with the copy; where the bound ended or moved, the challenge's display is
+//! decided again under the scope that no lease serves; the feed is asked once more with no lock;
+//! the two rows are written with nothing allocated or awaited between the question and the first
+//! write; and a last ask, immediately before the commit, makes the question and the feed's ask
+//! again, so that what lapsed while the writes stood rolls the transaction back.
 //!
 //! Each case stops the record at a wait and ends what it ends there: before the transaction begins,
 //! which stands for the wait for the pairing records' write lock, or in the last wait, after the
@@ -146,6 +148,18 @@ async fn answered_with(
     display: ConfirmationDisplay,
     landed: bool,
 ) -> Found {
+    answered_with_at(false, world, ends, display, landed).await
+}
+
+/// As [`answered_with`]; where `at_the_first_write` is set the record is stopped between its two
+/// writes, once the first has been made, and not at the end of the feed's ask.
+async fn answered_with_at(
+    at_the_first_write: bool,
+    world: World,
+    ends: Ends,
+    display: ConfirmationDisplay,
+    landed: bool,
+) -> Found {
     let mut parts = parts(world).await;
     let controller = &parts.controller;
     let door = Door::open(&parts.temp, controller).await;
@@ -204,13 +218,17 @@ async fn answered_with(
     } else {
         caller
     };
-    let (arrived, go) = match ends {
-        Ends::Nothing
-        | Ends::TheLeasesTime
-        | Ends::TheDeadlinePasses
-        | Ends::TheChallengeExpires => controller.pause_after_the_record_asks_the_feed(),
-        Ends::TheLeaseIsPresentedAgain | Ends::TheBoundMovesInside | Ends::AnOwnerIsEstablished => {
-            controller.pause_before_the_record_begins()
+    let (arrived, go) = if at_the_first_write {
+        controller.pause_after_the_first_write()
+    } else {
+        match ends {
+            Ends::Nothing
+            | Ends::TheLeasesTime
+            | Ends::TheDeadlinePasses
+            | Ends::TheChallengeExpires => controller.pause_after_the_record_asks_the_feed(),
+            Ends::TheLeaseIsPresentedAgain
+            | Ends::TheBoundMovesInside
+            | Ends::AnOwnerIsEstablished => controller.pause_before_the_record_begins(),
         }
     };
     // The end of the feed's locked ask, where a bound that moves inside the transaction is stopped.
@@ -638,4 +656,45 @@ async fn an_answer_whose_deadline_passes_in_the_last_wait_is_refused_in_the_dead
         assert_eq!(refusal.to_string(), expired.to_string());
         assert_eq!(refusal.code(), expired.code());
     }
+}
+
+/// KR-REQ-17.54: a lease that ends between the answer's two writes is found by the last ask,
+/// immediately before the commit: the challenge's display is decided again under the scope that no
+/// lease serves, and the one the recovery set does not hold is refused in the door's own words,
+/// the transaction is rolled back and neither the action nor the acceptance is recorded. The
+/// confirmation of the clock is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_whose_lease_ends_between_its_writes_is_refused_at_the_commit_and_records_nothing()
+ {
+    let establishing = ConfirmationDisplay::EstablishClock;
+    recorded(&answered_with_at(true, World::Leased, Ends::TheLeasesTime, establishing, true).await);
+    let found = answered_with_at(
+        true,
+        World::Leased,
+        Ends::TheLeasesTime,
+        making_exclusive(),
+        true,
+    )
+    .await;
+    assert!(is_the_closed_refusal(refused(&found)));
+}
+
+/// KR-REQ-17.54: an answer whose deadline passes between its two writes is refused at the commit
+/// in the words of the deadline, and neither row is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_whose_deadline_passes_between_its_writes_is_refused_at_the_commit_and_records_nothing()
+ {
+    let found = answered_with_at(
+        true,
+        World::Leased,
+        Ends::TheDeadlinePasses,
+        ConfirmationDisplay::EstablishClock,
+        true,
+    )
+    .await;
+    let refusal = refused(&found);
+    let expired =
+        crate::service::Lapse::Admission(crate::authority::AdmissionLapse::Expired).refusal();
+    assert_eq!(refusal.to_string(), expired.to_string());
+    assert_eq!(refusal.code(), expired.code());
 }
