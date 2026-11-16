@@ -13,10 +13,12 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use tokio::sync::watch;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use super::LocalRelay;
@@ -34,8 +36,15 @@ pub struct RelayFront {
     pub ca_roots: Vec<Vec<u8>>,
     accepted: Arc<AtomicUsize>,
     refused: Arc<AtomicUsize>,
+    /// The switch of a stalling front, and what it has read from the device.
+    switch: Option<watch::Sender<bool>>,
+    from_device: Arc<AtomicU64>,
     runtime: Option<tokio::runtime::Runtime>,
 }
+
+/// The receive buffer of a stalling front's listener, which its accepted sockets inherit: a few
+/// KiB, so that a stalled front takes almost nothing of what the device sends.
+const STALLED_RECEIVE_BUFFER: u32 = 4096;
 
 impl RelayFront {
     /// Starts a front that passes every connection to `relay` unchanged, so the relay's own TLS
@@ -134,8 +143,86 @@ impl RelayFront {
             ca_roots,
             accepted,
             refused,
+            switch: None,
+            from_device: Arc::new(AtomicU64::new(0)),
             runtime: Some(runtime),
         }
+    }
+
+    /// Starts a front that passes every byte to `relay` and back until it is told to stall, with
+    /// a receive buffer of a few KiB of its own.
+    ///
+    /// Stalled, it reads and writes nothing on any connection that it holds, so the sockets stay
+    /// open and the device's side of each fills. It goes on accepting connections that are made
+    /// after the switch and leaves each of them alone, so that a client dialling it again meets a
+    /// connection that never completes its handshake and not a refusal. On resume it passes again,
+    /// bytes and new connections alike; what it held was never read, so no byte is lost.
+    pub fn stalling(relay: &LocalRelay) -> Self {
+        let upstream = authority(&relay.url);
+        let (switch, gate) = watch::channel(false);
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let from_device = Arc::new(AtomicU64::new(0));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("the front's runtime");
+        let (found, finding) = std::sync::mpsc::channel();
+        let (counting, counted) = (Arc::clone(&accepted), Arc::clone(&from_device));
+        runtime.spawn(async move {
+            let socket = TcpSocket::new_v4().expect("a front socket");
+            socket
+                .set_recv_buffer_size(STALLED_RECEIVE_BUFFER)
+                .expect("a small receive buffer");
+            socket
+                .bind((Ipv4Addr::LOCALHOST, 0).into())
+                .expect("a front address");
+            let listener = socket.listen(1024).expect("a front listener");
+            found
+                .send(listener.local_addr().expect("a bound address"))
+                .ok();
+            while let Ok((client, _)) = listener.accept().await {
+                counting.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(carry(
+                    client,
+                    upstream.clone(),
+                    gate.clone(),
+                    Arc::clone(&counted),
+                ));
+            }
+        });
+        let addr: SocketAddr = finding.recv().expect("the front's address");
+        Self {
+            url: format!("https://{addr}").parse().expect("a relay URL"),
+            ca_roots: relay.ca_roots.clone(),
+            accepted,
+            refused: Arc::new(AtomicUsize::new(0)),
+            switch: Some(switch),
+            from_device,
+            runtime: Some(runtime),
+        }
+    }
+
+    /// Stops a stalling front reading and writing.
+    pub fn stall(&self) {
+        self.switch
+            .as_ref()
+            .expect("a stalling front")
+            .send_replace(true);
+    }
+
+    /// Lets a stalling front pass bytes and connections again.
+    pub fn resume(&self) {
+        self.switch
+            .as_ref()
+            .expect("a stalling front")
+            .send_replace(false);
+    }
+
+    /// How many bytes a stalling front has read from the device, which is what the device's relay
+    /// actors took.
+    pub fn read_from_device(&self) -> u64 {
+        self.from_device.load(Ordering::SeqCst)
     }
 
     /// How many connections reached the front.
@@ -165,4 +252,57 @@ fn is_websocket_upgrade(head: &str) -> bool {
                 && value.trim().eq_ignore_ascii_case("websocket")
         })
     })
+}
+
+/// Carries one connection of a stalling front to the relay, once the front is not stalled.
+async fn carry(
+    client: TcpStream,
+    upstream: String,
+    mut gate: watch::Receiver<bool>,
+    from_device: Arc<AtomicU64>,
+) {
+    // A connection that is made while the front is stalled waits here, accepted and untouched.
+    if gate.wait_for(|stalled| !*stalled).await.is_err() {
+        return;
+    }
+    let Ok(relay) = TcpStream::connect(&upstream).await else {
+        return;
+    };
+    let (client_read, client_write) = client.into_split();
+    let (relay_read, relay_write) = relay.into_split();
+    tokio::join!(
+        pump(client_read, relay_write, gate.clone(), Some(from_device)),
+        pump(relay_read, client_write, gate.clone(), None),
+    );
+}
+
+/// Copies `from` to `to` a chunk at a time, and reads nothing while the front is stalled. A read
+/// that the switch interrupts has taken nothing, so the stream continues intact on resume.
+async fn pump(
+    mut from: OwnedReadHalf,
+    mut to: OwnedWriteHalf,
+    mut gate: watch::Receiver<bool>,
+    count: Option<Arc<AtomicU64>>,
+) {
+    let mut chunk = vec![0_u8; 16 * 1024];
+    loop {
+        if gate.wait_for(|stalled| !*stalled).await.is_err() {
+            break;
+        }
+        let read = tokio::select! {
+            read = from.read(&mut chunk) => read,
+            _ = gate.wait_for(|stalled| *stalled) => continue,
+        };
+        let Ok(length) = read else { break };
+        if length == 0 {
+            break;
+        }
+        if let Some(count) = &count {
+            count.fetch_add(length as u64, Ordering::SeqCst);
+        }
+        if to.write_all(&chunk[..length]).await.is_err() {
+            break;
+        }
+    }
+    let _ = to.shutdown().await;
 }
