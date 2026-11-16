@@ -301,6 +301,49 @@ fn rows_are_kept_through_a_height_only_resize_that_gives_up_nothing_of_its_own()
 }
 
 #[test]
+fn rows_are_kept_through_a_resize_to_the_same_size_and_a_width_only_resize() {
+    let mut engine = after_a_private_interval();
+    feed(&mut engine, &printed("after", 0, 12));
+    // The screen holds `after 9` to `after 11` and the row the cursor is on; `after 0` was
+    // printed onto a row that was on the screen at the disabling.
+    let kept = numbered("after", 1, 9);
+    assert_eq!(retained(&engine), kept);
+
+    engine
+        .resize(GridSize::new(20, 4), 0)
+        .expect("the same size");
+    assert_eq!(retained(&engine), kept, "after a resize to the size it has");
+
+    engine.resize(GridSize::new(21, 4), 0).expect("wider");
+    assert_eq!(retained(&engine), kept, "after a wider screen");
+
+    // A narrower screen that splits no row. The library moves the row above the screen onto it when
+    // the empty row under the cursor goes, so the rows held and the rows shown are read together.
+    let everything = |engine: &Engine| -> Vec<String> {
+        retained(engine)
+            .into_iter()
+            .chain(
+                text_of(&engine.grid().visible_rows())
+                    .into_iter()
+                    .filter(|row| !row.is_empty()),
+            )
+            .collect()
+    };
+    engine.resize(GridSize::new(12, 4), 0).expect("narrower");
+    assert_eq!(
+        everything(&engine),
+        numbered("after", 1, 12),
+        "after a narrower screen: none of the rows is joined, cut or given up"
+    );
+    feed(&mut engine, &format!("\r\n{}", printed("later", 0, 4)));
+    assert_eq!(
+        everything(&engine),
+        [numbered("after", 1, 12), numbered("later", 0, 4)].concat(),
+        "and the rows that come after are kept"
+    );
+}
+
+#[test]
 fn a_resize_does_not_let_the_rows_on_the_screen_be_kept() {
     // Rows of seventeen columns on a screen of twenty. Narrowed to ten, each splits in two, so the
     // library's numbers of rows move.
