@@ -186,6 +186,24 @@ const PRESENTATION_FIRST_RETRY: std::time::Duration = std::time::Duration::from_
 /// boundary is held throughout, apart from the time the system takes to run its task.
 const PRESENTATION_RETRY_CAP: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// How many roles a connection can declare, which is how many counts of presentations begun a
+/// host keeps for its own tests.
+#[cfg(feature = "testing")]
+const PRESENTATION_ROLE_SLOTS: usize = 5;
+
+/// Where the count of presentations begun on connections of `role` is kept. A new role has no
+/// arm to fall into: this does not build until it has a slot.
+#[cfg(feature = "testing")]
+const fn presentation_role_slot(role: ControllerConnectionRole) -> usize {
+    match role {
+        ControllerConnectionRole::Authority => 0,
+        ControllerConnectionRole::Proxy => 1,
+        ControllerConnectionRole::Attention => 2,
+        ControllerConnectionRole::Descriptions => 3,
+        ControllerConnectionRole::Checks => 4,
+    }
+}
+
 /// The largest replay page one notification carries.
 ///
 /// A control frame is bounded at 1 MiB including its metadata, so a replay page stays well inside
@@ -617,11 +635,12 @@ pub struct WorkerService {
     /// tests read. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     presentation_tries: std::sync::atomic::AtomicU64,
-    /// How many presentations of a generation have begun, whatever became of them, which this
-    /// host's own tests read. A presentation whose peer goes leaves the count of those waiting and
-    /// not this one. It is compiled away in every shipped build.
+    /// How many presentations of a generation have begun, whatever became of them, for each role a
+    /// connection declared (in the order of `presentation_role_slot`), which this host's own
+    /// tests read. A presentation whose peer goes leaves the count of those waiting and not this
+    /// one. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
-    presentations_begun: std::sync::atomic::AtomicU64,
+    presentations_begun: [std::sync::atomic::AtomicU64; PRESENTATION_ROLE_SLOTS],
     /// How many maintenance passes have finished, which this host's own tests read. It is compiled
     /// away in every shipped build.
     #[cfg(feature = "testing")]
@@ -1136,7 +1155,7 @@ impl WorkerService {
             #[cfg(feature = "testing")]
             presentation_tries: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "testing")]
-            presentations_begun: std::sync::atomic::AtomicU64::new(0),
+            presentations_begun: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "testing")]
             presentation_boundary_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
@@ -1662,12 +1681,14 @@ impl WorkerService {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// How many presentations of a generation have begun, for this host's own tests: a count that
-    /// a presentation whose peer has gone does not lower.
+    /// How many presentations of a generation have begun on connections that declared `role`, for
+    /// this host's own tests: a count that a presentation whose peer has gone does not lower, and
+    /// that a presentation of another role does not raise. A connection that declared no role is
+    /// counted for the authority.
     #[cfg(feature = "testing")]
     #[must_use]
-    pub fn presentations_begun_for_tests(&self) -> u64 {
-        self.presentations_begun
+    pub fn presentations_begun_for_tests(&self, role: ControllerConnectionRole) -> u64 {
+        self.presentations_begun[presentation_role_slot(role)]
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -4729,7 +4750,7 @@ impl WorkerService {
             ));
         };
         #[cfg(feature = "testing")]
-        self.presentations_begun
+        self.presentations_begun[presentation_role_slot(state.facts.controller_role)]
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         #[cfg(feature = "testing")]
         let _decided = off_the_executor(|| self.wait_before_presentation());
