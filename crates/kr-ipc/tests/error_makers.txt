@@ -29,7 +29,7 @@ crates/kr-ipc/src/client.rs | BoundLink::connecting | OutsideLevel | 2 | own | o
 crates/kr-ipc/src/client.rs | BoundLink::connecting | UnexpectedMessage | 1 | arrived | reply | - | agrees   # worker link
 crates/kr-ipc/src/client.rs | Client::acknowledged | IdentityUnavailable | 1 | arrived | reply | - | differs   # a worker's refusal
 crates/kr-ipc/src/client.rs | Client::acknowledged | UnexpectedMessage | 1 | arrived | reply | - | agrees   # worker link
-crates/kr-ipc/src/client.rs | Client::await_response | LinkFenced | 1 | arrived | reply | request | differs   # a worker's refusal of the controller's link, a complete reply
+crates/kr-ipc/src/client.rs | Client::await_response | LinkFenced | 1 | arrived | reply | request | agrees   # a worker's refusal of the controller's link, a complete reply
 crates/kr-ipc/src/client.rs | Client::await_response | UnexpectedMessage | 1 | arrived | reply | request | agrees
 crates/kr-ipc/src/client.rs | Client::challenge_worker | UnexpectedMessage | 1 | arrived | reply | - | agrees   # worker link
 crates/kr-ipc/src/client.rs | Client::exchange_admissions | IdentityUnavailable | 2 | arrived | reply | - | differs   # a worker's refusal

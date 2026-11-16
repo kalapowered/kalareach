@@ -267,15 +267,38 @@ impl IpcError {
         }
     }
 
-    /// Where this failure comes from, which is what a command may say of the daemon from it. The
-    /// match names every variant and has no catch-all arm, so that a new variant does not compile
-    /// until it has a source.
+    /// Where a failure that a control connection returned comes from, by its variant: what a
+    /// command may say of the daemon from it. The match names every variant and has no catch-all
+    /// arm, so that a new variant does not compile until it has a source. `tests/error_makers.txt`
+    /// lists every place that makes a value of this type, with its true source and whether a
+    /// control connection's connect, greeting or request can return it, and a case holds each row
+    /// that a control connection can return against this function.
+    ///
+    /// A `Socket` failure is a closure where nothing listens (`NotFound`, `ConnectionRefused`) and
+    /// this side's own fault otherwise, and so is a refusal of the endpoint's access list that one
+    /// carries.
+    ///
+    /// For every maker that a control connection can return, the answer is the maker's true
+    /// source, except for two, which a caller must not read as the maker's source:
+    ///
+    /// - `Frame` is answered as a closure. That is the true source of a frame that arrived and
+    ///   cannot be decoded. This side's own encoding of a request makes a `Frame` too, through the
+    ///   conversions of the frame codec's error and the retained codec's error, and that is this
+    ///   side's own fault.
+    /// - A `Socket` failure of kind `TimedOut` is answered as this side's own fault. A Windows
+    ///   connect that finds every instance of the pipe busy until its deadline makes one, and a
+    ///   daemon, or another holder of the pipe, causes that.
+    ///
+    /// The other makers whose source differs from their variant's answer are not made on that
+    /// path: the guards on this side's own link kind (`UnexpectedMessage`, made before any
+    /// connection) and the refusals of a worker's link (`IdentityUnavailable`).
     #[must_use]
     pub fn comes_from(&self) -> ErrorSource {
         match self {
             Self::UnexpectedMessage(_)
             | Self::VersionMismatch { .. }
-            | Self::HostRefused { .. } => ErrorSource::Reply,
+            | Self::HostRefused { .. }
+            | Self::LinkFenced { .. } => ErrorSource::Reply,
             Self::PeerClosed | Self::TruncatedFrame { .. } | Self::Frame(_) => ErrorSource::Closure,
             Self::Socket { source, .. } => {
                 if carries_account_refusal(source) {
@@ -303,7 +326,6 @@ impl IpcError {
             | Self::UnretainedLevel { .. }
             | Self::NotInLevel(_)
             | Self::OutsideLevel(_)
-            | Self::LinkFenced { .. }
             | Self::IdentityUnavailable { .. } => ErrorSource::OwnFault,
         }
     }
@@ -551,6 +573,12 @@ mod tests {
             (
                 IpcError::HostRefused {
                     detail: "no".to_owned(),
+                },
+                ErrorSource::Reply,
+            ),
+            (
+                IpcError::LinkFenced {
+                    detail: "the worker refused the link".to_owned(),
                 },
                 ErrorSource::Reply,
             ),
