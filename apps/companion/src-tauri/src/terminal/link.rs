@@ -306,8 +306,8 @@ impl Events {
 }
 
 /// What a link whose reading ended says, by the cause the reader read: on the local link a failed
-/// read is the socket's own words, on the network the transport's, and a clean end of the
-/// connection says so.
+/// read is the socket's own words, on the network the shown rule's words for the transport's
+/// error, and a clean end of the connection says so.
 pub(super) fn ended_words(ended: &Ended) -> String {
     match ended {
         Ended::Finished => "the connection ended".to_owned(),
@@ -321,7 +321,7 @@ pub(super) fn ended_words(ended: &Ended) -> String {
 fn words_of(error: &ClientError) -> String {
     match error {
         ClientError::Ipc(error) => Shown::ipc(error).to_string(),
-        ClientError::Transport(error) => error.to_string(),
+        ClientError::Transport(error) => Shown::transport(error).to_string(),
         ClientError::ConnectionEnded => "the connection ended".to_owned(),
         other => other.to_string(),
     }
@@ -347,14 +347,17 @@ mod tests {
     use kr_protocol::ids::{ActionWindowId, BootEpoch, ConnectionId, RequestId};
     use kr_protocol::scalars::{Nullable, TimestampMs, Uuid};
     use kr_protocol::session::SessionOpenParams;
+    use kr_transport::TransportError;
 
     use super::*;
 
     /// A connection that the host refused and ended: every write fails, and the host's refusal, sent
-    /// before it ended the connection, is what is read from it, once, if `refusal` holds one.
+    /// before it ended the connection, is what is read from it, once, if `refusal` holds one. A
+    /// connection whose reading failed has `failure` instead, which the first read returns.
     #[derive(Debug)]
     struct Refused {
         refusal: Mutex<Option<ProtocolError>>,
+        failure: Mutex<Option<TransportError>>,
     }
 
     impl ControlTransport for Refused {
@@ -394,7 +397,11 @@ mod tests {
 
         fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>> {
             let refusal = self.refusal.lock().expect("the refusal").take();
+            let failure = self.failure.lock().expect("the failure").take();
             Box::pin(async move {
+                if let Some(failure) = failure {
+                    return Err(ClientError::Transport(failure));
+                }
                 Ok(refusal.map(|error| {
                     ControlFrame::Response(Response {
                         request_id: RequestId::new(0),
@@ -414,8 +421,16 @@ mod tests {
     }
 
     fn wire_over(refusal: Option<ProtocolError>) -> (Link, Events) {
+        wire_with(refusal, None)
+    }
+
+    fn wire_with(
+        refusal: Option<ProtocolError>,
+        failure: Option<TransportError>,
+    ) -> (Link, Events) {
         let transport = Arc::new(Refused {
             refusal: Mutex::new(refusal),
+            failure: Mutex::new(failure),
         });
         Link::over(transport, None).expect("a wire")
     }
@@ -453,5 +468,30 @@ mod tests {
             .expect_err("nothing answered the call");
         assert_eq!(lost.0, "the connection ended");
         assert_eq!(wire.session().connection_refusal(), None);
+    }
+
+    /// A call whose connection to a paired host failed in its reading is told how the link ended in
+    /// the shown rule's words for the transport's error, whole: the text that the connection
+    /// library gives for a failure of its own carries addresses and what a peer wrote, which the
+    /// shown rule leaves out.
+    #[tokio::test]
+    async fn a_call_on_a_paired_link_whose_reading_failed_says_it_in_the_shown_words() {
+        for (failure, said) in [
+            (
+                TransportError::Stream("connection to 192.0.2.7:4433 was reset".to_owned()),
+                "the stream failed",
+            ),
+            (
+                TransportError::Closed("relay 192.0.2.9 sent its goodbye".to_owned()),
+                "the peer closed the connection",
+            ),
+        ] {
+            let (wire, mut events) = wire_with(None, Some(failure));
+            let lost = wire
+                .request(&mut events, wire.read(Method::SessionOpen, open_params()))
+                .await
+                .expect_err("the link failed under the call");
+            assert_eq!(lost.0, said);
+        }
     }
 }
