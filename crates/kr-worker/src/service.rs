@@ -616,6 +616,15 @@ pub struct WorkerService {
     /// tests read. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     presentation_tries: std::sync::atomic::AtomicU64,
+    /// A pause inside the dispatch boundary for the next presentation that takes it, which this
+    /// host's own tests arm. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    presentation_boundary_pause: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<bool>,
+        )>,
+    >,
     /// Whether every announcement of an authority revision finds the dispatch boundary held, which
     /// this host's own tests arm. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -1039,6 +1048,8 @@ impl WorkerService {
             #[cfg(feature = "testing")]
             presentation_tries: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "testing")]
+            presentation_boundary_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
             refusing_announcements: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "testing")]
             evidence_continuation_delay: Mutex::new(None),
@@ -1431,6 +1442,48 @@ impl WorkerService {
             let _ = armed.go.recv();
             armed.decided
         }))
+    }
+
+    /// Stops the next presentation inside the dispatch boundary, the moment it holds it and before
+    /// it asks whether its peer has gone, for this host's own tests.
+    ///
+    /// Returns the end that says the presentation has arrived, and the end that lets it go. Letting
+    /// it go with `true` says the test has ended the peer: the presentation then waits, to a bound,
+    /// until the system reports the peer gone, which a runtime that releases a closed connection
+    /// only when it next turns reports late. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_inside_presentation(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<bool>,
+    ) {
+        let (arrived, watch) = std::sync::mpsc::sync_channel(1);
+        let (release, go) = std::sync::mpsc::sync_channel(1);
+        *self
+            .presentation_boundary_pause
+            .lock()
+            .expect("the pause is not poisoned") = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Waits at the pause above, where one is armed. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    fn wait_inside_presentation(&self, state: &ConnectionState) {
+        let armed = self
+            .presentation_boundary_pause
+            .lock()
+            .expect("the pause is not poisoned")
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            if go.recv().unwrap_or(false) {
+                let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                while !state.peer_has_gone() && std::time::Instant::now() < end {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
     }
 
     /// Takes the dispatch boundary and holds it until the returned guard is dropped, for this
@@ -4492,13 +4545,14 @@ impl WorkerService {
     /// would keep both, and a thread, until the hold ended. A peer that is there waits for the whole
     /// hold, however long, and takes the boundary at its first try after the holder lets go, which
     /// is at most one pause after the release. The try, the question to the system and the
-    /// acceptance are one step that returns no guard, so nothing is held across a pause.
+    /// acceptance are one step that returns no guard, so nothing is held across a pause. Once the
+    /// boundary is taken, the question is asked once more before anything is changed.
     ///
     /// What this leaves open, as limits to know:
     ///
-    /// - A peer can go at any time after the last question, and the acceptance then runs for a peer
-    ///   that has just gone. No design closes that window. Such a presentation cannot collect: its
-    ///   answer fails to write and its connection ends.
+    /// - A peer can go at any time after the last question, the one asked under the boundary, and
+    ///   the acceptance then runs for a peer that has just gone. No design closes that window. Such
+    ///   a presentation cannot collect: its answer fails to write and its connection ends.
     /// - A Unix peer that sent bytes behind its token, and then went, is taken as there for as long
     ///   as those bytes are unread, which is the whole hold. A client sends nothing behind its
     ///   token until the worker has answered.
@@ -4566,6 +4620,14 @@ impl WorkerService {
                 panic!("the dispatch barrier is not poisoned")
             }
         };
+        #[cfg(feature = "testing")]
+        self.wait_inside_presentation(state);
+        // Asked again now that the boundary is held, before anything is taken, replaced or fenced
+        // for this presentation: a peer that went since the last try is not answered. This narrows
+        // the window and cannot close it, since a peer can go at any time after the question.
+        if state.peer_has_gone() {
+            return Presentation::PeerGone;
+        }
         Presentation::Decided(self.accept_generation(state, nonce, token))
     }
 

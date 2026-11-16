@@ -1588,3 +1588,86 @@ async fn the_owners_own_connection_is_admitted_while_dead_presentations_wait() {
     .expect("the owner's connection is admitted");
     boundary.release();
 }
+
+/// A presentation whose peer goes as the hold ends has no effect.
+///
+/// The presentation takes the boundary the moment the holder lets go, and stops inside it. Its peer
+/// goes there, between its last try and the take. What the worker asks once more under the
+/// boundary keeps the acceptance from running: no generation is accepted, and the next
+/// presentation finds a worker that nothing was done to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_presentation_whose_peer_goes_as_the_hold_ends_has_no_effect() {
+    let host = host(1).await;
+    let service = &host.service;
+    let boundary = Held::boundary(&host).await;
+    let (arrived, go) = service.pause_inside_presentation();
+    let peer = presenting(&host, 1);
+    settle(|| service.presentations_waiting_for_tests() == 1).await;
+    assert_eq!(service.presentations_waiting_for_tests(), 1);
+
+    boundary.release();
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(WAIT))
+        .await
+        .expect("the wait ends")
+        .expect("the presentation takes the boundary once it is free");
+    peers_go(vec![peer]).await;
+    go.send(true)
+        .expect("the presentation goes on, once the system says its peer has gone");
+    settle(|| {
+        service.presentations_waiting_for_tests() == 0 && service.connections_held_for_tests() == 0
+    })
+    .await;
+    assert_eq!(service.connections_held_for_tests(), 0);
+    assert_eq!(
+        service.accepted_generation(),
+        None,
+        "nothing was accepted for a peer that had gone"
+    );
+
+    let mut next = controller_client(&host, 1).await;
+    read_session(&mut next, host.session_id)
+        .await
+        .expect("the next presentation is accepted and served");
+}
+
+/// A presentation whose peer has gone fences nobody, whether it comes from a newer connection of
+/// the generation that holds the authority or from a higher generation.
+///
+/// A connection holds the authority. Two presentations wait at a held boundary, one after the
+/// other, and their peers go before it is free. The connection that held the authority still holds
+/// it, and is served, afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_presentation_does_not_fence_a_living_older_binding() {
+    let host = host(1).await;
+    let service = &host.service;
+    let mut older = controller_client(&host, 1).await;
+    read_session(&mut older, host.session_id)
+        .await
+        .expect("the older connection is served");
+    let start = service.connections_held_for_tests();
+    let boundary = Held::boundary(&host).await;
+    for generation in [2, 1] {
+        let peer = presenting(&host, generation);
+        settle(|| service.presentations_waiting_for_tests() == 1).await;
+        assert_eq!(service.presentations_waiting_for_tests(), 1);
+        peers_go(vec![peer]).await;
+        settle(|| {
+            service.presentations_waiting_for_tests() == 0
+                && service.connections_held_for_tests() == start
+        })
+        .await;
+        assert_eq!(
+            service.connections_held_for_tests(),
+            start,
+            "the presentation of generation {generation} is given up while the boundary is held"
+        );
+    }
+    boundary.release();
+    assert_eq!(
+        service.accepted_generation(),
+        Some(ControllerGeneration::new(1))
+    );
+    read_session(&mut older, host.session_id)
+        .await
+        .expect("the connection that held the authority is served still");
+}
