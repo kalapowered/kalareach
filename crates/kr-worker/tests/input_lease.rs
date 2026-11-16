@@ -6014,8 +6014,8 @@ async fn a_key_behind_a_living_mutation_waits_through_the_hold_and_is_answered_a
 /// Unix only. The client sends a Blocking mutation, more keys than the worker reads ahead of a key,
 /// and a last key frame cut part way, and then closes. The worker finds its peer gone beside the
 /// bytes that are still queued, drops the mutation and ends the connection, and serves none of the
-/// keys: the connection's place is given back while the boundary is held and the application has
-/// nothing. A Windows pipe counts the queued bytes as waiting and takes its peer as there until they
+/// keys: the connection's place is given back while the boundary is held and the input domain was
+/// handed no key. A Windows pipe counts the queued bytes as waiting and takes its peer as there until they
 /// are read, which the worker does not do at the wait, so there the request would wait for the
 /// release; the rule for a client that is there is
 /// `a_key_behind_a_living_mutation_waits_through_the_hold_and_is_answered_after_it`.
@@ -6030,6 +6030,7 @@ async fn keys_behind_a_mutation_whose_client_has_gone_do_not_reach_the_applicati
     );
     let start = service.connections_held_for_tests();
     let boundary = BoundaryHeld::take(&service).await;
+    let queued_before = service.runtime().input().lease_batches_queued();
     let attach = terminal(rig.wired.session_id, Some("xterm-256color"));
     let _ = send_mutation(&mut rig, Method::SessionAttach, &attach).await;
     assert!(
@@ -6052,7 +6053,6 @@ async fn keys_behind_a_mutation_whose_client_has_gone_do_not_reach_the_applicati
         .expect("the first part of the last frame is written");
     let Rig {
         client,
-        received,
         _kept,
         wired: _wired,
         ..
@@ -6066,12 +6066,13 @@ async fn keys_behind_a_mutation_whose_client_has_gone_do_not_reach_the_applicati
         service.connections_held_for_tests(),
         service.mutations_waiting_for_tests()
     );
-    boundary.release();
-    // A key that the worker had served would have been handed to the application before the
-    // connection ended, and the application keeps what it reads as it reads it.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(
-        std::fs::read(&received).unwrap_or_default().is_empty(),
-        "a key behind a mutation whose client had gone reached the application"
+    // The connection has ended, so it served every key it was going to serve before it did: a key
+    // that the worker had accepted would have entered the input domain's queue by now, whether or
+    // not the writer has written it since.
+    assert_eq!(
+        service.runtime().input().lease_batches_queued(),
+        queued_before,
+        "a key behind a mutation whose client had gone entered the input domain"
     );
+    boundary.release();
 }

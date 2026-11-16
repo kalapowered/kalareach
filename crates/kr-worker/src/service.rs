@@ -665,7 +665,7 @@ pub struct WorkerService {
     look_pause: Mutex<
         Option<(
             std::sync::mpsc::SyncSender<()>,
-            std::sync::mpsc::Receiver<()>,
+            std::sync::mpsc::Receiver<bool>,
         )>,
     >,
     /// What the owner of the clean-ups' work has done: rejections, detaches and unbinds, one count
@@ -1720,12 +1720,21 @@ impl WorkerService {
         if let Some((arrived, go)) = armed {
             let _ = arrived.send(());
             if go.recv().unwrap_or(false) {
-                let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
-                while !state.peer_has_gone() && std::time::Instant::now() < end {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
+                Self::until_the_peer_has_gone(state);
             }
         }
+    }
+
+    /// Whether the authority record has a connection bound as the controller's, for this host's own
+    /// tests. It waits for the record, so it is not asked while a holder has it.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn controller_is_bound_for_tests(&self) -> bool {
+        self.authority
+            .lock()
+            .expect("the authority lock is not poisoned")
+            .bound_connection
+            .is_some()
     }
 
     /// Takes the authority record and holds it until the returned guard is dropped, for this
@@ -1828,14 +1837,17 @@ impl WorkerService {
     /// Stops the next mutation or prepared action inside the dispatch boundary, the moment it
     /// holds it and before it asks whether its peer has gone, for this host's own tests.
     ///
-    /// Returns the end that says the request has arrived, and the end that lets it go. The pause
-    /// fires once.
+    /// Returns the end that says the request has arrived, and the end that lets it go. Letting it
+    /// go with `true` says the test has ended the peer: the request then waits, to a bound, until
+    /// the system reports the peer gone, which a runtime that releases a closed connection only
+    /// when it next turns reports late, and a Windows pipe stays open until then. The pause fires
+    /// once.
     #[cfg(feature = "testing")]
     pub fn pause_before_the_look(
         &self,
     ) -> (
         std::sync::mpsc::Receiver<()>,
-        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::SyncSender<bool>,
     ) {
         let (arrived, watch) = std::sync::mpsc::sync_channel(1);
         let (release, go) = std::sync::mpsc::sync_channel(1);
@@ -1845,7 +1857,7 @@ impl WorkerService {
 
     /// Waits at the pause above, where one is armed. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
-    fn wait_before_the_look(&self) {
+    fn wait_before_the_look(&self, state: &ConnectionState) {
         let armed = self
             .look_pause
             .lock()
@@ -1853,7 +1865,18 @@ impl WorkerService {
             .take();
         if let Some((arrived, go)) = armed {
             let _ = arrived.send(());
-            let _ = go.recv();
+            if go.recv().unwrap_or(false) {
+                Self::until_the_peer_has_gone(state);
+            }
+        }
+    }
+
+    /// Waits, for 15 seconds at most, until the system reports the peer of `state` gone.
+    #[cfg(feature = "testing")]
+    fn until_the_peer_has_gone(state: &ConnectionState) {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !state.peer_has_gone() && std::time::Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 
@@ -5183,7 +5206,7 @@ impl WorkerService {
         // executor.
         off_the_executor(|| {
             #[cfg(feature = "testing")]
-            self.wait_before_the_look();
+            self.wait_before_the_look(state);
             // Asked again now that the boundary is held, before anything is read or written for
             // this request: a peer that went since the last try is not answered, and no receipt,
             // effect or answer is made for it. This narrows the window and cannot close it, since
@@ -5208,7 +5231,7 @@ impl WorkerService {
         };
         off_the_executor(|| {
             #[cfg(feature = "testing")]
-            self.wait_before_the_look();
+            self.wait_before_the_look(state);
             // Asked again now that the boundary is held, before the action's receipt is read or
             // changed: a peer that went since the last try is not answered, and the action is
             // rejected by the caller of this try, not dispatched.

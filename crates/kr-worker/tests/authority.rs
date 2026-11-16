@@ -2301,7 +2301,9 @@ async fn a_mutation_whose_client_goes_before_the_look_is_dropped_and_after_it_is
         .recv_timeout(SETTLE)
         .expect("the mutation reaches the pause before the look");
     clients_go(vec![client]).await;
-    go.send(()).expect("lets the mutation go");
+    // The pause waits, to a bound, for the system to report that the client has gone: a pipe on
+    // Windows stays open until its runtime next turns.
+    go.send(true).expect("lets the mutation go");
     assert!(
         settle(|| service.connections_held_for_tests() == start).await,
         "the connection of the client that went is given back"
@@ -2582,6 +2584,10 @@ async fn a_controller_link_that_goes_while_the_authority_is_held_is_unbound_once
     let host = host_ready_apart(false).await;
     let service = &host.service;
     let link = controller_client(&host, 1).await;
+    assert!(
+        service.controller_is_bound_for_tests(),
+        "the link is the controller's connection in the authority record"
+    );
     let start = service.connections_held_for_tests();
     let holder = Held::boundary_and_authority(&host).await;
     drop(link);
@@ -2596,10 +2602,14 @@ async fn a_controller_link_that_goes_while_the_authority_is_held_is_unbound_once
     );
     holder.release();
     assert!(
-        settle(|| service.owed_done_for_tests().2 == 1).await,
-        "the owner unbinds the link when the authority is let go"
+        settle(|| !service.controller_is_bound_for_tests()).await,
+        "the owner removes the link from the authority record when the authority is let go"
     );
-    assert_eq!(service.owed_done_for_tests().2, 1, "once");
+    assert_eq!(
+        service.owed_done_for_tests().2,
+        1,
+        "the owner took the link's entry once"
+    );
 }
 
 /// Connections that keep identifiers of attachments that another connection detached do not keep
@@ -2674,6 +2684,62 @@ async fn connections_that_keep_detached_identifiers_do_not_keep_their_places_whi
     assert!(
         service.runtime().session().attachments().is_empty(),
         "no attachment is left"
+    );
+}
+
+/// Connections that keep live attachments do not keep their places while the boundary and the
+/// session are held, and the owner detaches each attachment when the session is let go.
+///
+/// Thirty clients each attach and keep the attachment: nobody detaches, so every identifier a
+/// connection keeps names a live attachment. All thirty go under a holder of the boundary and the
+/// session. Their connections are given back and nothing is detached while the holder has the
+/// session; at its release the owner detaches every one, which the session's own list shows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn connections_that_keep_live_attachments_do_not_keep_their_places_while_the_session_is_held()
+{
+    let host = host_ready_apart(false).await;
+    let service = &host.service;
+    let mut clients = Vec::new();
+    for _ in 0..30 {
+        let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects");
+        client
+            .mutate(
+                Method::SessionAttach,
+                kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+                target(host.environment_id, host.session_id),
+                &attach_params(host.session_id),
+            )
+            .await
+            .expect("reaches the worker")
+            .expect("the terminal attaches");
+        clients.push(client);
+    }
+    assert_eq!(
+        service.runtime().session().attachments().len(),
+        30,
+        "every attachment is live"
+    );
+    let start = service.connections_held_for_tests() - clients.len();
+    let holder = Held::boundary_and_session(&host).await;
+    drop(clients);
+    assert!(
+        settle(|| service.connections_held_for_tests() == start).await,
+        "the connections that kept a live attachment are given back while the session is held: {} \
+         of 30 still held",
+        service.connections_held_for_tests() - start
+    );
+    assert_eq!(
+        service.owed_done_for_tests().1,
+        0,
+        "nothing is detached while the session is held"
+    );
+    holder.release();
+    assert!(
+        settle(|| service.runtime().session().attachments().is_empty()).await,
+        "the owner detaches every live attachment when the session is let go: {} left",
+        service.runtime().session().attachments().len()
     );
 }
 
