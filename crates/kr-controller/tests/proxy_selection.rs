@@ -472,7 +472,10 @@ async fn a_daemon_started_over_a_document_it_cannot_use_keeps_the_account_local(
         Some(SignInUnavailable::NotUsable)
     );
     let refused = account
-        .sign_in(&|| Ok(()), std::sync::Arc::new(|| Ok(())))
+        .sign_in(
+            &|| Ok(()),
+            std::sync::Arc::new(|| Ok(kr_controller::account::Guard::new(()))),
+        )
         .await
         .expect_err("a sign-in is refused over a document the host cannot use");
     assert!(

@@ -1440,7 +1440,10 @@ async fn an_open_call_holds_the_managed_account_and_not_the_storage_account() {
     let storage = host.controller().storage_account();
     storage.listen_on("127.0.0.1:0".parse().expect("an address"));
     storage
-        .sign_in(&|| Ok(()), std::sync::Arc::new(|| Ok(())))
+        .sign_in(
+            &|| Ok(()),
+            std::sync::Arc::new(|| Ok(kr_controller::account::Guard::new(()))),
+        )
         .await
         .expect("the storage account's sign-in is not held by the call");
 
@@ -1826,6 +1829,125 @@ async fn a_sign_in_that_meets_a_fence_before_it_is_shown_as_waiting_is_not_shown
                 ),
                 "the control waits for the browser"
             );
+        }
+        host.stop().await;
+    }
+}
+
+/// KR-REQ-09.09: a sign-in asks whether its request still stands immediately before each try to
+/// bind the address a sign-in comes back to, since the bind takes the address and the request's
+/// authority can end in the waits before it. A fence this host comes to owe after the sign-in's
+/// last early ask stops it before any bind is made: the sign-in is refused, no address was bound
+/// and the account is not shown as waiting. The control: with no fence the same sign-in binds once
+/// and waits for the browser.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_that_meets_a_fence_before_it_binds_its_address_binds_none() {
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+    for owed in [false, true] {
+        let broker = Broker::start().await;
+        let owner = DeviceKeys::generate().expect("owner keys");
+        let host =
+            net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+        listen_for_sign_ins(&host);
+        let account = host.controller().host_account();
+        let (arrived, go) = account.pause_before_it_binds();
+        let (answered, ()) = tokio::join!(
+            sign_in_as(&host, ActionId::new(kr_ipc::new_uuid())),
+            async {
+                tokio::time::timeout(WAIT, arrived)
+                    .await
+                    .expect("the sign-in reaches the place it binds its address")
+                    .expect("the pause is armed");
+                host.controller().hold_fence(owed);
+                go.send(()).expect("the sign-in goes on");
+            }
+        );
+        host.controller().hold_fence(false);
+        if owed {
+            let refused = answered.expect_err("a sign-in under a fence this host owes is refused");
+            assert_eq!(
+                refused.code,
+                kr_protocol::error::ErrorCode::PermissionDenied,
+                "{refused:?}"
+            );
+            assert!(refused.message.contains("fence"), "{refused:?}");
+            assert_eq!(account.binds_made(), 0, "no address was bound");
+            assert_eq!(
+                account_report(&host).await.state,
+                AccountState::SignedOut,
+                "the account is not shown as waiting"
+            );
+        } else {
+            answered.expect("the control starts");
+            assert_eq!(
+                account.binds_made(),
+                1,
+                "the control binds the address once"
+            );
+            assert!(
+                matches!(
+                    account_report(&host).await.state,
+                    AccountState::WaitingForBrowser { .. }
+                ),
+                "the control waits for the browser"
+            );
+        }
+        host.stop().await;
+    }
+}
+
+/// KR-REQ-09.09 and 17.54: a sign-in whose person has completed it asks whether the authority it
+/// was started under still stands immediately before it raises the gate that holds other changes
+/// off, because the exchange with the service stands before that. A fence owed in that wait stops
+/// the sign-in before any gate is raised: no gate was raised, no grant is kept, what the service
+/// issued is revoked and the browser is told why. The control: with nothing owed the gate is raised
+/// once and the sign-in is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_that_meets_a_fence_before_its_change_gate_is_raised_raises_none() {
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+    for owed in [false, true] {
+        let broker = Broker::start().await;
+        let owner = DeviceKeys::generate().expect("owner keys");
+        let host =
+            net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+        listen_for_sign_ins(&host);
+        let (url, address) = start_sign_in(&host).await;
+        broker.expect_sign_in(&url);
+        let account = host.controller().host_account();
+        let (arrived, go) = account.pause_before_the_change_gate();
+        let (page, ()) = tokio::join!(browser_answers(&address, &url, "the-code"), async {
+            tokio::time::timeout(WAIT, arrived)
+                .await
+                .expect("the sign-in reaches the place it raises the gate")
+                .expect("the pause is armed");
+            host.controller().hold_fence(owed);
+            go.send(()).expect("the sign-in goes on");
+        });
+        host.controller().hold_fence(false);
+        let report = settled(&host).await;
+        if owed {
+            assert!(
+                page.contains("authority for this sign-in ended"),
+                "the browser is told why: {page}"
+            );
+            assert_eq!(account.change_gates_raised(), 0, "no gate was raised");
+            assert_eq!(report.state, AccountState::SignedOut, "no grant is kept");
+            assert_eq!(
+                broker.revoked(),
+                [broker.refresh(1)],
+                "what the service issued is revoked"
+            );
+        } else {
+            assert_eq!(
+                account.change_gates_raised(),
+                1,
+                "the control raises the gate once"
+            );
+            assert!(
+                matches!(report.state, AccountState::SignedIn { .. }),
+                "{report:?}"
+            );
+            assert!(broker.revoked().is_empty());
         }
         host.stop().await;
     }
