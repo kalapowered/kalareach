@@ -182,10 +182,15 @@ impl Landing {
 
     /// Where this host's own tests stop a record once its first write has been made and before
     /// its last ask, so that what lapses while that write stood can be seen refused at the
-    /// commit.
+    /// commit. A record that gets here is counted first, whether or not a test armed the pause, so
+    /// that a test can tell a record that refused before its first write from one that refused
+    /// after it.
     #[cfg(feature = "testing")]
     pub(crate) fn waits_after_the_first_write(&self) {
         if let Some(daemon) = &self.daemon {
+            daemon
+                .first_writes_reached
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             daemon.after_the_first_write.wait();
         }
     }

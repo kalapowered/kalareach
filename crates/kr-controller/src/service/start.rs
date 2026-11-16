@@ -1256,6 +1256,8 @@ impl Controller {
             #[cfg(feature = "testing")]
             after_the_first_write: ThreadPause::default(),
             #[cfg(feature = "testing")]
+            first_writes_reached: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "testing")]
             after_a_wait_for_room: ThreadPause::default(),
             #[cfg(feature = "testing")]
             before_the_record_begins: ThreadPause::default(),

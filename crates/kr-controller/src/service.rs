@@ -835,6 +835,11 @@ pub struct Controller {
     /// stands is seen refused at the commit. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     after_the_first_write: ThreadPause,
+    /// How many records of an owner's request or of its answer have made their first write. A
+    /// record that a lapse refuses before that write is not counted. Compiled away in every
+    /// shipped build.
+    #[cfg(feature = "testing")]
+    first_writes_reached: std::sync::atomic::AtomicUsize,
     /// Where this host's own tests stop a local connection's writer once the socket has room again
     /// after a wait for it, before the footing's question that precedes the next transport write.
     /// Compiled away in every shipped build.

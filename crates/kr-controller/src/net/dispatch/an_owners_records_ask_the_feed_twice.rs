@@ -28,6 +28,9 @@ struct Found {
     answered: Result<OwnerConfirmationRequestResult, ControllerError>,
     rows: i64,
     feed_refusal: Option<String>,
+    /// How many records had made their first write when the request ended: one where the write
+    /// was made, none where the feed's second ask refused the request before it.
+    first_writes: usize,
 }
 
 async fn recorded_where_the_feed_refuses(refuses: bool) -> Found {
@@ -111,6 +114,7 @@ async fn recorded_where_the_feed_refuses(refuses: bool) -> Found {
     }
     go.send(()).expect("the record goes on");
     let answered = asking.await.expect("the request ends");
+    let first_writes = controller.first_writes_reached();
     if let Some(raising) = raising {
         raising.await.expect("the raise ends once the record has");
     }
@@ -129,6 +133,7 @@ async fn recorded_where_the_feed_refuses(refuses: bool) -> Found {
         answered,
         rows,
         feed_refusal,
+        first_writes,
     }
 }
 
@@ -140,6 +145,7 @@ async fn a_request_is_recorded_where_the_feed_refuses_nothing() {
     assert_eq!(found.feed_refusal, None);
     found.answered.expect("the request is answered");
     assert_eq!(found.rows, 1, "the record is written once");
+    assert_eq!(found.first_writes, 1, "the record reached its first write");
 }
 
 /// KR-REQ-09.12: a refusal the feed raises in the last wait, after the first ask took its locks,
@@ -157,6 +163,12 @@ async fn a_request_is_refused_where_the_feed_refuses_in_the_last_wait() {
     };
     assert_eq!(told, detail);
     assert_eq!(found.rows, 0, "nothing is written");
+    // The last ask before the commit refuses what the second ask missed, in the same words, so
+    // what shows the second ask is that the record never reached its first write.
+    assert_eq!(
+        found.first_writes, 0,
+        "the record is refused before its first write"
+    );
 }
 
 /// What an answer found at its record.
@@ -164,6 +176,9 @@ struct Answered {
     answered: Result<OwnerConfirmationCompleteResult, ControllerError>,
     answers: i64,
     feed_refusal: Option<String>,
+    /// How many records made their first write while the answer ran: one where the answer's
+    /// writes were begun, none where the feed's second ask refused it before them.
+    first_writes: usize,
 }
 
 async fn answered_where_the_feed_refuses(refuses: bool) -> Answered {
@@ -230,6 +245,7 @@ async fn answered_where_the_feed_refuses(refuses: bool) -> Answered {
         Digest256::from_bytes([4; 32]),
     );
     let (arrived, go) = controller.pause_after_the_record_asks_the_feed();
+    let first_writes_before = controller.first_writes_reached();
     let answering = tokio::task::spawn_blocking(move || {
         owner.complete(&caller, &params, action, &AtomicBool::new(false))
     });
@@ -265,6 +281,7 @@ async fn answered_where_the_feed_refuses(refuses: bool) -> Answered {
     }
     go.send(()).expect("the record goes on");
     let answered = answering.await.expect("the answer ends");
+    let first_writes = controller.first_writes_reached() - first_writes_before;
     if let Some(raising) = raising {
         raising.await.expect("the raise ends once the record has");
     }
@@ -283,6 +300,7 @@ async fn answered_where_the_feed_refuses(refuses: bool) -> Answered {
         answered,
         answers,
         feed_refusal,
+        first_writes,
     }
 }
 
@@ -293,6 +311,7 @@ async fn an_answer_is_recorded_where_the_feed_refuses_nothing() {
     assert_eq!(found.feed_refusal, None);
     found.answered.expect("the answer is accepted");
     assert_eq!(found.answers, 1, "the acceptance is recorded once");
+    assert_eq!(found.first_writes, 1, "the record reached its first write");
 }
 
 /// KR-REQ-09.12: a refusal the feed raises while the answer's transaction runs, after the first ask
@@ -310,4 +329,8 @@ async fn an_answer_is_refused_where_the_feed_refuses_while_its_transaction_runs(
     };
     assert_eq!(told, detail);
     assert_eq!(found.answers, 0, "no acceptance is recorded");
+    assert_eq!(
+        found.first_writes, 0,
+        "the record is refused before its first write"
+    );
 }
