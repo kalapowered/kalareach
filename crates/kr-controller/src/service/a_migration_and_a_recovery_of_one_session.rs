@@ -962,3 +962,78 @@ async fn a_later_look_gives_a_reason_that_rests_on_a_fact_the_first_look_could_n
         );
     }
 }
+
+/// A repeat close's retry of a record of this daemon's own is a look at the worker's end, and a look
+/// that records nothing, because another recovery holds the session, starts the watch, which looks
+/// again until the session is free. The session's ownership is held while the retry runs and
+/// released after it; nothing else asks, and the registry must then hold the closure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_whose_look_records_nothing_is_followed_by_the_watch() {
+    let temp = TempHost::create();
+    let controller = daemon(&temp).await;
+    let session_id = recorded_ended_worker(&controller, &temp).await;
+    let display = AccountThatWasRefused::display_of(&controller, session_id).await;
+    let identity = kr_ipc::identity::ended_process_identity(4_000_003);
+    refuse_closures(&controller);
+    let refused = controller
+        .record_final(
+            session_id,
+            ClosureReason::WorkerCrash,
+            &identity,
+            &crate::archive::Fenced::nothing(session_id),
+            Death::Confirmed,
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "the first look's record is refused by the registry: {refused:?}"
+    );
+    assert!(
+        controller
+            .registry
+            .lock()
+            .await
+            .closure(session_id)
+            .expect("the registry answers")
+            .is_none(),
+        "and the registry holds no closure"
+    );
+    take_closures_again(&controller);
+
+    // Another recovery holds the session while the retry looks, so the look records nothing.
+    let recovery = controller
+        .archive()
+        .take_ownership(session_id, display, &identity)
+        .expect("another recovery holds the session");
+    assert!(
+        controller.knows_how_it_ended(session_id),
+        "a repeat close finds the record that the first look kept"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while controller.reconciliations_for_tests(session_id) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the retry's look runs");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    drop(recovery);
+
+    let recorded = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            if let Some(closure) = controller
+                .registry
+                .lock()
+                .await
+                .closure(session_id)
+                .expect("the registry answers")
+            {
+                return closure;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the watch that the retry started records the closure once the session is free");
+    assert_eq!(recorded.session_id, session_id);
+}
