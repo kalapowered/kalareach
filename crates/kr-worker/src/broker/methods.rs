@@ -368,21 +368,35 @@ pub struct MutationAdmission {
 /// transport's call, where the permit itself cannot go.
 ///
 /// It is the whole of what [`crate::broker::BrokerState::checks`] reads besides the broker's own
-/// state, so the admission and every later ask put the same question.
+/// state and what the first admission adds to the question ([`Ask::First`]), so the admission and
+/// every later ask put the same question.
 #[derive(Clone, Debug)]
 pub struct AdmittedAgainst {
     application_instance_id: ApplicationInstanceId,
     binding_revision: AgentBindingRevision,
-    /// The component answerable for the dispatch.
-    responsible: Responsible,
-    /// The capability the operation depends on, where it names one.
-    capability: Option<CapabilityId>,
     resource_id: Option<kr_protocol::ids::PendingResourceId>,
     /// The deadline the host accepted for the action this admission carries out, with the clock it
     /// is measured on, where the admission was made for one.
     accepted: Option<AcceptedUntil>,
     /// When the pending resource this admission answers stops accepting an answer.
     resource_deadline: Option<TimestampMs>,
+}
+
+/// Which ask of the broker's checks this is.
+///
+/// A component that stops being answerable, and a capability whose evidence lapses, say whether
+/// rich work would work from now on. A revocation or a fault ends them without ending what the
+/// broker already admitted, which finishes: so the first admission asks them and no later ask does.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Ask<'a> {
+    /// The first admission of a mutation, which also asks the component answerable for the
+    /// dispatch and the capability the operation depends on.
+    First {
+        responsible: Responsible,
+        capability: Option<&'a CapabilityId>,
+    },
+    /// Every later ask of an admission: the permit, the take and the marker.
+    Again,
 }
 
 /// The deadline the host accepted for an action, on the continuous clock it was derived on.
@@ -407,19 +421,14 @@ fn upstream_deadline_passed(
 
 impl AdmittedAgainst {
     /// What a mutation is admitted against, before the admission exists: the instance and the
-    /// binding revision the caller named, the component answerable for the dispatch and the
-    /// capability it depends on.
+    /// binding revision the caller named.
     pub(crate) const fn new(
         application_instance_id: ApplicationInstanceId,
         binding_revision: AgentBindingRevision,
-        responsible: Responsible,
-        capability: Option<CapabilityId>,
     ) -> Self {
         Self {
             application_instance_id,
             binding_revision,
-            responsible,
-            capability,
             resource_id: None,
             accepted: None,
             resource_deadline: None,
@@ -473,8 +482,6 @@ impl MutationAdmission {
         AdmittedAgainst {
             application_instance_id: self.application_instance_id,
             binding_revision: self.binding_revision,
-            responsible: self.responsible,
-            capability: self.capability.clone(),
             resource_id: self.resource_id,
             accepted: self.accepted.clone(),
             resource_deadline: self.resource_deadline,
@@ -2441,7 +2448,8 @@ impl Broker {
     /// The broker's checks, asked again under its lock, with the deadlines read on the clocks as
     /// they stand at the end of the checks.
     fn recheck_broker(&self, admitted: &AdmittedAgainst, request: &UpstreamRequest) -> Result<()> {
-        self.state().checks(admitted, request, self.deadline_now())
+        self.state()
+            .checks(admitted, request, self.deadline_now(), Ask::Again)
     }
 
     /// Takes one admitted mutation's permit without handing it to the transport, so the caller
@@ -2490,12 +2498,12 @@ impl crate::broker::BrokerState {
     /// against what the admission is made for (see [`AdmittedAgainst`]): that rich work is not
     /// fenced, that the instance exists and its mutations are not suspended, that its binding is
     /// the one named, that the turn still fits the operation, that the component answerable for
-    /// the dispatch and the capability the operation depends on are still working, that an
-    /// answer's decoder still holds its authority, and that no deadline that bounds the operation
-    /// has passed at `wall_now`.
+    /// the dispatch and the capability the operation depends on are still working (the first
+    /// admission's ask alone: see [`Ask`]), that an answer's decoder still holds its authority, and
+    /// that no deadline that bounds the operation has passed at `wall_now`.
     ///
     /// The first admission asks it, and every later ask of the same admission asks it again, so
-    /// that one question stands in both places. It makes no change: what the first admission does
+    /// that one list stands in both places. It makes no change: what the first admission does
     /// besides asking (counting a fenced refusal, taking the transport) stays with the caller.
     ///
     /// # Errors
@@ -2509,6 +2517,7 @@ impl crate::broker::BrokerState {
         against: &AdmittedAgainst,
         request: &UpstreamRequest,
         wall_now: TimestampMs,
+        ask: Ask<'_>,
     ) -> Result<()> {
         self.volatile.require_rich_work()?;
         let application_instance_id = against.application_instance_id();
@@ -2536,13 +2545,19 @@ impl crate::broker::BrokerState {
             request.turn_id.as_ref(),
             instance.turn_id.as_ref(),
         )?;
-        self.check_responsible(application_instance_id, against.responsible)?;
-        // The capability is rechecked independently of everything else, because it answers its own
-        // question: the grant says whether this actor may, and this says whether it would work. An
-        // operation that names none has none to recheck.
-        if let Some(capability_id) = against.capability.as_ref() {
-            self.capabilities
-                .recheck(application_instance_id, capability_id, None)?;
+        if let Ask::First {
+            responsible,
+            capability,
+        } = ask
+        {
+            self.check_responsible(application_instance_id, responsible)?;
+            // The capability is rechecked independently of everything else, because it answers
+            // its own question: the grant says whether this actor may, and this says whether it
+            // would work. An operation that names none has none to recheck.
+            if let Some(capability_id) = capability {
+                self.capabilities
+                    .recheck(application_instance_id, capability_id, None)?;
+            }
         }
         // An answer is trusted to its decoder's authority, which an owner or a narrower
         // installation withdraws without moving the revision either.
