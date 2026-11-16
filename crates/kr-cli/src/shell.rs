@@ -301,7 +301,7 @@ pub fn install(
 ) -> Result<ShellReport> {
     let targets = layout
         .try_targets(package.kind())
-        .map_err(|refusal| CliError::Other(crate::shown::startup_refusal(&refusal)))?;
+        .map_err(|error| profiles_failure(&error))?;
     install_targets(package, &targets, record, paths, nsh_bypass, dry_run)
 }
 
@@ -499,6 +499,18 @@ pub fn remove(
         package: None,
         entries,
     })
+}
+
+/// What a failure of the question about PowerShell's profiles says. A refusal is said alone, in the
+/// host's own words: it names no file, and says that nothing was written for PowerShell. A failure
+/// of this host to read the file that holds the answer is said as any failure of a file of this
+/// host's is: the file, and the system's error.
+fn profiles_failure(error: &std::io::Error) -> CliError {
+    match (Refusal::of(error), startup::unread_answer(error)) {
+        (Some(refusal), _) => CliError::Other(crate::shown::startup_refusal(refusal)),
+        (None, Some((file, source))) => startup_failure(file, source),
+        (None, None) => CliError::Other(Shown::io(error)),
+    }
 }
 
 /// What a failure to write into, or take out of, a startup file says: the file, and then why.
@@ -928,6 +940,48 @@ mod tests {
                     "{name}, dry run {dry_run}: a record was written"
                 );
             }
+        }
+    }
+
+    /// Where PowerShell answered and this host could not read the file that holds the answer, the
+    /// install says what failed as any failure of a file of this host's is said, the file and the
+    /// system's error, and not as a PowerShell that did not answer. Nothing is written.
+    #[cfg(unix)]
+    #[test]
+    fn an_install_where_the_host_could_not_read_the_answer_says_the_file_and_the_error() {
+        let root = tempfile::tempdir().expect("a directory");
+        let program = root.path().join("pwsh-takes-the-answer-away");
+        let text = root.path().join("pwsh-takes-the-answer-away.text");
+        std::fs::write(
+            &text,
+            "#!/bin/sh\n[ \"${1:-}\" = --version ] && exit 0\n\
+             rm -f \"$(dirname \"$XDG_CACHE_HOME\")/said\"\n",
+        )
+        .expect("writes the program's text");
+        kr_ipc::testing::place_and_start_once(&text, &program, &["--version"]);
+        std::fs::remove_file(&text).expect("the program's text goes once it is in place");
+        let home = tempfile::tempdir().expect("a directory");
+        let state = tempfile::tempdir().expect("a directory");
+        let record = EntryRecord::in_state_directory(&state.path().join("state"));
+        let layout = HomeLayout {
+            home: home.path().to_path_buf(),
+            zdotdir: None,
+            xdg_config_home: None,
+            powershell: Some(startup::PowerShell::plain(program)),
+        };
+        let package = a_package_that_is_never_started(ShellKind::PowerShell);
+        let before = held_under(home.path());
+        for dry_run in [true, false] {
+            let said = install(&package, &layout, &record, &host_paths(), false, dry_run)
+                .expect_err("the install ends")
+                .to_string();
+            assert!(said.contains("/said"), "dry run {dry_run}: {said}");
+            assert!(
+                !said.contains("profiles are"),
+                "dry run {dry_run}: said as PowerShell's own refusal: {said}"
+            );
+            assert_eq!(held_under(home.path()), before, "dry run {dry_run}");
+            assert!(!record.path().exists(), "dry run {dry_run}");
         }
     }
 

@@ -175,8 +175,10 @@ impl HomeLayout {
     /// Returns [`Refusal::ProfilesUnanswered`] when the shell did not answer in time, could not
     /// start or ended with an error, and [`Refusal::ProfilesNotUnderstood`] when it ended without an
     /// answer or said something other than two full paths: an answer too long, one that does not
-    /// decode and a path that is not full are that.
-    pub fn try_targets(&self, kind: ShellKind) -> Result<Vec<StartupTarget>, Refusal> {
+    /// decode and a path that is not full are that. Both are refusals of this host
+    /// ([`Refusal::of`]). Where this host could not read the shell's answer file, the error is its
+    /// own failure to read a file, and [`unread_answer`] names the file.
+    pub fn try_targets(&self, kind: ShellKind) -> std::io::Result<Vec<StartupTarget>> {
         self.targets_within(kind, PLACEMENT_DEADLINE)
     }
 
@@ -185,7 +187,7 @@ impl HomeLayout {
         &self,
         kind: ShellKind,
         allowed: std::time::Duration,
-    ) -> Result<Vec<StartupTarget>, Refusal> {
+    ) -> std::io::Result<Vec<StartupTarget>> {
         Ok(match kind {
             ShellKind::Zsh => vec![StartupTarget {
                 kind,
@@ -265,7 +267,7 @@ impl HomeLayout {
     fn powershell_profiles(
         &self,
         allowed: std::time::Duration,
-    ) -> Result<Option<(PathBuf, PathBuf)>, Refusal> {
+    ) -> std::io::Result<Option<(PathBuf, PathBuf)>> {
         let Some(shell) = self.powershell.as_ref() else {
             return Ok(None);
         };
@@ -292,11 +294,12 @@ impl HomeLayout {
         )
         .ok_or(Refusal::ProfilesUnanswered)?;
         match said {
-            Said::Text(text) => profiles_of(&text),
-            Said::Unreadable => None,
+            Said::Text(text) => profiles_of(&text)
+                .map(Some)
+                .ok_or_else(|| Refusal::ProfilesNotUnderstood.into()),
+            Said::Unreadable => Err(Refusal::ProfilesNotUnderstood.into()),
+            Said::Unread(error) => Err(error),
         }
-        .map(Some)
-        .ok_or(Refusal::ProfilesNotUnderstood)
     }
 
     /// Returns the login file Bash reads for this user, which is the first of three that exists.
@@ -423,6 +426,35 @@ enum Said {
     Text(String),
     /// An answer that is not read: longer than [`ANSWER_LIMIT`], or not text.
     Unreadable,
+    /// This host could not read its own answer file: the error names the file ([`unread_answer`]).
+    Unread(std::io::Error),
+}
+
+/// The answer file of a question that this host could not read, and why.
+#[derive(Debug)]
+struct AnswerUnread {
+    file: PathBuf,
+    error: std::io::Error,
+}
+
+impl std::fmt::Display for AnswerUnread {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.file.display(), self.error)
+    }
+}
+
+impl std::error::Error for AnswerUnread {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// Returns the file and the system's error where `error` is this host's own failure to read the
+/// answer file of a question it asked a shell, which is not the shell's refusal or failure to answer.
+#[must_use]
+pub fn unread_answer(error: &std::io::Error) -> Option<(&Path, &std::io::Error)> {
+    let unread = error.get_ref()?.downcast_ref::<AnswerUnread>()?;
+    Some((&unread.file, &unread.error))
 }
 
 /// Asks one program a question about some text and returns what it printed, or nothing when it did
@@ -560,7 +592,7 @@ fn ask_with(
     // be writing, and half an answer is worse than none. A successful one is read up to a bound.
     let answer = status
         .filter(std::process::ExitStatus::success)
-        .and_then(|_| read_answer(&said));
+        .map(|_| read_answer(&said));
     let _ = std::fs::remove_dir_all(&directory);
     answer
 }
@@ -569,21 +601,29 @@ fn ask_with(
 /// read at all: cut at the limit, it could show a start that the rest of it would deny.
 const ANSWER_LIMIT: u64 = 64 * 1024;
 
-/// Reads what a shell answered: its text, or that the answer is not read ([`Said::Unreadable`]).
-/// Nothing is returned where this host could not read its own answer file: it saw no answer.
-fn read_answer(path: &Path) -> Option<Said> {
+/// Reads what a shell answered: its text, or that the answer is not read ([`Said::Unreadable`]),
+/// or the error of this host's failure to read its own answer file ([`Said::Unread`]).
+fn read_answer(path: &Path) -> Said {
     use std::io::Read as _;
 
     let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .and_then(|file| file.take(ANSWER_LIMIT + 1).read_to_end(&mut bytes))
-        .ok()?;
-    Some(match u64::try_from(bytes.len()) {
+    let read = std::fs::File::open(path)
+        .and_then(|file| file.take(ANSWER_LIMIT + 1).read_to_end(&mut bytes));
+    if let Err(error) = read {
+        return Said::Unread(std::io::Error::new(
+            error.kind(),
+            AnswerUnread {
+                file: path.to_owned(),
+                error,
+            },
+        ));
+    }
+    match u64::try_from(bytes.len()) {
         Ok(held) if held <= ANSWER_LIMIT => {
             String::from_utf8(bytes).map_or(Said::Unreadable, Said::Text)
         }
         _ => Said::Unreadable,
-    })
+    }
 }
 
 /// Returns the PowerShell this host would launch, when one is on the path.
@@ -1140,8 +1180,10 @@ fn prologue_end(shell: &PowerShell, text: &str) -> std::io::Result<usize> {
         PLACEMENT_DEADLINE,
     )
     .ok_or(Refusal::PlacementUnanswered)?;
-    let Said::Text(said) = said else {
-        return Err(Refusal::PlacementNotUnderstood.into());
+    let said = match said {
+        Said::Text(said) => said,
+        Said::Unreadable => return Err(Refusal::PlacementNotUnderstood.into()),
+        Said::Unread(error) => return Err(error),
     };
     let said = said.trim();
     if let Some(code) = said.strip_prefix("kr-refused ") {
@@ -1211,8 +1253,10 @@ fn entry_refused(old: &str, new: &str, placement: &Placement) -> std::io::Result
         PLACEMENT_DEADLINE,
     )
     .ok_or(Refusal::CheckUnanswered)?;
-    let Said::Text(said) = said else {
-        return Err(Refusal::CheckNotUnderstood.into());
+    let said = match said {
+        Said::Text(said) => said,
+        Said::Unreadable => return Err(Refusal::CheckNotUnderstood.into()),
+        Said::Unread(error) => return Err(error),
     };
     let said = said.trim();
     if said == "kr-verified" {
@@ -5090,6 +5134,9 @@ mod tests {
         let refused = asking
             .try_targets(ShellKind::PowerShell)
             .expect_err("the question is refused");
+        let refused = Refusal::of(&refused)
+            .cloned()
+            .expect("the refusal is one of this host's");
         assert!(
             asking.targets(ShellKind::PowerShell).is_empty(),
             "the tolerant reading, which status and removal use, still has no target"
@@ -5239,6 +5286,38 @@ mod tests {
                 .try_targets(ShellKind::PowerShell)
                 .expect("no refusal where there is no PowerShell")
                 .is_empty()
+        );
+    }
+
+    /// A shell that answered, where this host then could not read its own answer file, did not
+    /// fail to answer and gave no answer that was not understood: the failure is this host's own,
+    /// said as any failure of a file of this host's is, with the file and the system's error.
+    #[cfg(unix)]
+    #[test]
+    fn an_answer_file_that_this_host_cannot_read_is_its_own_failure_and_not_a_refusal() {
+        let root = tempfile::tempdir().expect("a directory");
+        // The program ends with code 0 after it took the answer file away, which is in the call's
+        // folder, beside its cache folder.
+        let shell = program_that(
+            root.path(),
+            "pwsh-takes-the-answer-away",
+            "rm -f \"$(dirname \"$XDG_CACHE_HOME\")/said\"",
+        );
+        let asking = HomeLayout {
+            powershell: Some(shell),
+            ..layout(root.path())
+        };
+        let failed = asking
+            .try_targets(ShellKind::PowerShell)
+            .expect_err("the answer is not read");
+        assert_eq!(Refusal::of(&failed), None, "{failed}");
+        let (file, source) =
+            unread_answer(&failed).expect("this host's own failure, with its file");
+        assert!(file.ends_with("said"), "{file:?}");
+        assert_eq!(source.kind(), std::io::ErrorKind::NotFound, "{source}");
+        assert!(
+            asking.targets(ShellKind::PowerShell).is_empty(),
+            "status and removal go on without an answer"
         );
     }
 
