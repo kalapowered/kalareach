@@ -671,6 +671,13 @@ impl Controller {
             {
                 entry.writing = false;
             }
+            #[cfg(feature = "testing")]
+            if written.is_ok() && !recorded {
+                me.retries_that_recorded_nothing
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(record.session_id);
+            }
             if let Err(error) = written {
                 eprintln!(
                     "kr-controller: the closure of session {} was answered and could not be \

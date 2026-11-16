@@ -1259,6 +1259,8 @@ impl Controller {
             #[cfg(feature = "testing")]
             reconciliations: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "testing")]
+            retries_that_recorded_nothing: std::sync::Mutex::new(Vec::new()),
+            #[cfg(feature = "testing")]
             challenges_presented: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "testing")]
             before_the_leases_adopt: crate::attention::Pause::default(),
