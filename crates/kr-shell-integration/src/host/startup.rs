@@ -5297,7 +5297,8 @@ mod tests {
     }
 
     /// The call's folder is gone after a question that failed, whatever the way: a code other than
-    /// 0, a signal and a time-out. The program says where its cache folder is, which is inside it.
+    /// 0, a signal and a time-out, and a program that outlasts its time is killed and the question
+    /// does not wait for it. The program says where its cache folder is, which is inside it.
     #[cfg(unix)]
     #[test]
     fn the_calls_folder_is_gone_after_a_question_that_failed() {
@@ -5316,10 +5317,18 @@ mod tests {
                     seen.display()
                 ),
             );
+            let began = std::time::Instant::now();
             let said = ask_with(&shell, &[], &[], std::time::Duration::from_millis(400));
             assert!(
                 said.is_none(),
                 "{name}: a question that failed said something"
+            );
+            // A program that outlasts its time is killed, so the question ends with the time
+            // allowed and not with the program: the slow one would sleep for thirty seconds.
+            assert!(
+                began.elapsed() < std::time::Duration::from_secs(20),
+                "{name}: the question waited for the program, {:?}",
+                began.elapsed()
             );
             let cache = std::fs::read_to_string(&seen).expect("the program saw its cache folder");
             let folder = Path::new(cache.trim()).parent().expect("the call's folder");
