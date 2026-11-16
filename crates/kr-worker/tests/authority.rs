@@ -15,11 +15,12 @@ use kr_protocol::envelope::ControlFrame;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::identity::{DesktopBinding, WorkerProfile};
-use kr_protocol::ids::{BuildId, ControllerGeneration, SessionEpoch, SessionId};
+use kr_protocol::ids::{AuthorityRevision, BuildId, ControllerGeneration, SessionEpoch, SessionId};
 use kr_protocol::local::{ControllerConnectionRole, LocalClientKind};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::Nullable;
 use kr_protocol::session::{Dimensions, DisplayNumber, SessionReadParams, ShellMode};
+use kr_protocol::worker::{AuthorityRevisionNotice, RevisionReach};
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
@@ -1605,16 +1606,45 @@ async fn the_owners_own_connection_is_admitted_while_dead_presentations_wait() {
 
 /// A presentation whose peer goes as the hold ends has no effect.
 ///
-/// The presentation takes the boundary the moment the holder lets go, and stops inside it. Its peer
-/// goes there, between its last try and the take. What the worker asks once more under the
-/// boundary keeps the acceptance from running: no generation is accepted, and the next
-/// presentation finds a worker that nothing was done to.
+/// A connection holds the authority of generation 1 with an acknowledged revision, and a connection
+/// that said hello before it is on record as the earlier of the two. A presentation of generation 2
+/// takes the boundary the moment the holder lets go, and stops inside it. Its peer goes there,
+/// between its last try and the take. What the worker asks once more under the boundary keeps the
+/// acceptance from running at all, and an acceptance of a higher generation changes the records
+/// one after the other: the record of the hello order, the acknowledgement and the binding, and
+/// then the generation. So every one of them must stand: the order record, which refuses the
+/// earlier connection's presentation still; the acknowledged revision; the binding, which serves
+/// its connection still; and the accepted generation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_presentation_whose_peer_goes_as_the_hold_ends_has_no_effect() {
     let host = host(1).await;
     let service = &host.service;
+    let mut earlier = declared(&host, ControllerConnectionRole::Authority).await;
+    let mut holder = controller_client(&host, 1).await;
+    let acknowledged = holder
+        .announce_revision(AuthorityRevisionNotice {
+            environment_id: host.environment_id,
+            revision: AuthorityRevision::new(3),
+            reach: RevisionReach::Host,
+            evidence_from: 0,
+        })
+        .await
+        .expect("the worker acknowledges the revision");
+    assert_eq!(acknowledged.revision, AuthorityRevision::new(3));
+    read_session(&mut holder, host.session_id)
+        .await
+        .expect("the connection that holds the authority is served");
+    let start = service.connections_held_for_tests();
+    assert_eq!(
+        service.accepted_generation(),
+        Some(ControllerGeneration::new(1))
+    );
+    assert_eq!(
+        service.acknowledgement_for_tests(),
+        Some((ControllerGeneration::new(1), AuthorityRevision::new(3)))
+    );
+
     let boundary = Held::boundary(&host).await;
-    let accepted = service.accepted_generation();
     let (arrived, go) = service.pause_inside_presentation();
     let peer = presenting(&host, 2);
     settle(|| service.presentations_waiting_for_tests() == 1).await;
@@ -1629,20 +1659,25 @@ async fn a_presentation_whose_peer_goes_as_the_hold_ends_has_no_effect() {
     go.send(true)
         .expect("the presentation goes on, once the system says its peer has gone");
     settle(|| {
-        service.presentations_waiting_for_tests() == 0 && service.connections_held_for_tests() == 0
+        service.presentations_waiting_for_tests() == 0
+            && service.connections_held_for_tests() == start
     })
     .await;
-    assert_eq!(service.connections_held_for_tests(), 0);
+    assert_eq!(service.connections_held_for_tests(), start);
     assert_eq!(
         service.accepted_generation(),
-        accepted,
-        "nothing was accepted for a peer that had gone"
+        Some(ControllerGeneration::new(1)),
+        "no generation was accepted for a peer that had gone"
     );
-
-    let mut next = controller_client(&host, 2).await;
-    read_session(&mut next, host.session_id)
+    assert_eq!(
+        service.acknowledgement_for_tests(),
+        Some((ControllerGeneration::new(1), AuthorityRevision::new(3))),
+        "the acknowledgement was not cleared for a peer that had gone"
+    );
+    read_session(&mut holder, host.session_id)
         .await
-        .expect("the next presentation is accepted and served");
+        .expect("the connection that held the authority still holds it");
+    assert_refused_for_order(present(&mut earlier, host.signer(), 1).await);
 }
 
 /// A presentation whose peer has gone fences nobody, whether it comes from a newer connection of
