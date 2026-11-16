@@ -807,6 +807,12 @@ fn domain_state(host: &Host) -> SessionState {
     host.runtime.input().lock().state()
 }
 
+/// What the application is doing, as the input domain holds it, which is where a read of a held
+/// session finds it.
+fn domain_application_state(host: &Host) -> Option<kr_protocol::session::ApplicationState> {
+    host.runtime.input().lock().application_state()
+}
+
 /// The read of a session that nothing holds is the one that takes it: the control of the cases
 /// below. It carries the session's content and its state, as it always did.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -885,7 +891,7 @@ async fn a_read_of_a_held_session_names_the_application_the_session_had() {
 
 /// What the application is doing changes without its name changing, and the session counts the
 /// launches that wait for the reader. A read of the held session says both as the session has them:
-/// the summary is published when the state changes, and the count is read from the input domain.
+/// the state and the count are read from the input domain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_read_of_a_held_session_says_what_the_application_is_doing_and_the_launches_that_wait() {
     let host = host().await;
@@ -912,13 +918,15 @@ async fn a_read_of_a_held_session_says_what_the_application_is_doing_and_the_lau
         turn_running: true,
         ..Evidence::default()
     });
-    // What the case stands on: the state is published, and the name is the one it was.
-    let changed = host.runtime.published().latest();
-    assert_eq!(changed.application, named.application);
+    // What the case stands on: the domain holds the state, and the name is the one it was.
     assert_eq!(
-        changed.application_state.0,
+        host.runtime.published().latest().application,
+        named.application
+    );
+    assert_eq!(
+        domain_application_state(&host),
         Some(kr_protocol::session::ApplicationState::AgentBusy),
-        "the summary is published when what the application is doing changes"
+        "the producer writes what the application is doing to the input domain"
     );
     let mut control = host.client().await;
     let (_, taken) = read_within_its_bound(&mut control, &host, "control state").await;
@@ -954,6 +962,62 @@ async fn a_read_of_a_held_session_says_what_the_application_is_doing_and_the_lau
         "a held session says how many launches wait for the reader"
     );
     drop(waiting);
+}
+
+/// A turn ends and is published, a storage call then holds the session, and a new turn starts
+/// during the hold. The producer cannot take the session to publish it, but it has written the state
+/// to the input domain, so the read of the held session says the new turn: the host's sleep demand
+/// reads it, and a session that shows no demand under a turn lets the host sleep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_read_of_a_held_session_says_the_turn_that_began_during_the_hold() {
+    let host = host().await;
+    let producer = Producer::new(Arc::downgrade(&host.runtime));
+    producer.observe_holder(Holder::Program(Some("an editor".to_owned())));
+    producer.observe_evidence(Evidence {
+        turn_running: true,
+        ..Evidence::default()
+    });
+    producer.observe_evidence(Evidence::default());
+    // What the case stands on: the turn has ended and the session says nothing is happening.
+    assert_eq!(domain_application_state(&host), None);
+    assert_eq!(host.runtime.published().latest().application_state.0, None);
+    let (holder, mut reader) = (host.client().await, host.client().await);
+    let standing = stall(&host, Stalled::Prune, holder).await;
+    // The new turn starts while the session is held. The producer waits for the session to
+    // publish it, so it runs on a thread of its own, and it has written the state before it waits.
+    let beginning = {
+        let producer = Arc::clone(&producer);
+        std::thread::spawn(move || {
+            producer.observe_evidence(Evidence {
+                turn_running: true,
+                ..Evidence::default()
+            });
+        })
+    };
+    let began = Instant::now();
+    while domain_application_state(&host).is_none() {
+        assert!(
+            began.elapsed() < CLOSURE_WAIT,
+            "the producer did not write the new turn's state within {CLOSURE_WAIT:?} while the session was held"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (answered, read) = read_within_its_bound(&mut reader, &host, "held new turn").await;
+    let _ = standing.release.send(());
+    assert!(
+        answered <= READ_BOUND,
+        "the read of a held session was answered after {answered:?}, past {READ_BOUND:?}"
+    );
+    assert!(
+        read.launch_profile.0.is_none(),
+        "the read was answered while the session was held"
+    );
+    assert_eq!(
+        read.session.application_state.0,
+        Some(kr_protocol::session::ApplicationState::AgentBusy),
+        "a held session says the turn that began during the hold"
+    );
+    beginning.join().expect("the producer's thread ended");
 }
 
 /// A read that names another session is refused whether or not the session is held.
