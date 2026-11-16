@@ -1907,6 +1907,9 @@ impl AccountTokenSource for HostTokens {
 }
 
 #[cfg(test)]
+mod revocation_orders;
+
+#[cfg(test)]
 mod tests {
     /// A sign-in whose authority ended is told so in the browser, and what is said of the
     /// revocation is what the keep did: it is sent or queued (the host revokes what was issued),
@@ -1926,48 +1929,6 @@ mod tests {
         assert!(owed.contains("could not yet revoke what the account service issued"));
         assert!(owed.contains("tries again the next time it uses the account"));
         assert!(!owed.contains("The host revokes what"), "{owed}");
-    }
-
-    /// What the line of a failed revocation says is what the revocation knows, whole, in each state:
-    /// where the queue took the token and the send failed, where the service took it by a send of
-    /// its own, and where only memory holds it. A step that failed can have done more than it
-    /// reported, so the lines say "may" there.
-    #[test]
-    fn the_line_of_a_failed_revocation_says_no_more_than_the_revocation_knows() {
-        use kr_client::error::ClientError;
-        use kr_client::services::account::Unrevoked;
-        let failed = || {
-            ClientError::Host(kr_protocol::error::ProtocolError::new(
-                kr_protocol::error::ErrorCode::UpstreamUnavailable,
-                "the service cannot be reached".to_owned(),
-            ))
-        };
-        let error = failed().to_string();
-        assert_eq!(
-            super::failed_revocation_line("a withheld sign-in's", &Unrevoked::Queued(failed())),
-            format!(
-                "kr-controller: a withheld sign-in's token: the queue took the token and sending \
-                 the queue failed, and a send of the token alone was not acknowledged; the \
-                 service may have taken the token, and the queue may still hold its entry: {error}"
-            )
-        );
-        assert_eq!(
-            super::failed_revocation_line("a refused sign-in's", &Unrevoked::Ended(failed())),
-            format!(
-                "kr-controller: a refused sign-in's token: the service took the token by a send \
-                 of its own; the queue of revocations failed, and may still hold its entry: \
-                 {error}"
-            )
-        );
-        assert_eq!(
-            super::failed_revocation_line("a withheld sign-in's", &Unrevoked::Held(failed())),
-            format!(
-                "kr-controller: a withheld sign-in's token: queuing the token failed and a send \
-                 of the token alone was not acknowledged; a write that had begun may have left \
-                 its entry in place, and the service may have taken the token; the token is held \
-                 in memory for the next send: {error}"
-            )
-        );
     }
 
     use std::sync::atomic::{AtomicUsize, Ordering};
