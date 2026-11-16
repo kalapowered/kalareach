@@ -108,6 +108,14 @@ pub struct Admission {
     pub receipt: Receipt,
     /// True when an existing receipt was returned instead of a new one being committed.
     pub deduplicated: bool,
+    /// The sequence of the event that recorded this receipt's acceptance.
+    ///
+    /// The journal allocates each event sequence once, and removes a receipt's events with the
+    /// receipt, so no later receipt that takes the same identity has this sequence: a holder of it
+    /// can tell the receipt it accepted from another that retention made room for. For a duplicate it
+    /// is the retained receipt's own. It is `0`, which the journal never allocates, for a receipt that
+    /// an earlier build wrote with no event history.
+    pub sequence: u64,
 }
 
 /// What fencing this session for a revocation could and could not take back.
@@ -1462,9 +1470,11 @@ impl Journal {
                 });
             }
             // An exact retry returns the receipt as it stands, keeping its original deadline.
+            let sequence = self.acceptance_sequence(&submission.actor_id, submission.action_id)?;
             return Ok(Admission {
                 receipt: existing,
                 deduplicated: true,
+                sequence,
             });
         }
         let receipt = Receipt {
@@ -1521,7 +1531,61 @@ impl Journal {
         Ok(Admission {
             receipt,
             deduplicated: false,
+            sequence,
         })
+    }
+
+    /// Returns the sequence of the event that recorded the acceptance of a receipt: the first event
+    /// of its identity, which is the one `accept` allocated. It is `0` when the receipt has no event
+    /// history (a journal an earlier build wrote has rows and none), and `0` is not a sequence the
+    /// journal allocates.
+    ///
+    /// A receipt's events go with the receipt, so after retention removed one and another request
+    /// took its identity, this is the new acceptance's sequence and not the old one's.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn acceptance_sequence(&self, actor_id: &ActorId, action_id: ActionId) -> Result<u64> {
+        let sequence: i64 = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(MIN(sequence), 0) FROM receipt_events
+                 WHERE actor_id = ?1 AND action_id = ?2",
+                params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(|error| faulted(&self.health, error))?;
+        Ok(u64::try_from(sequence).unwrap_or(0))
+    }
+
+    /// Rejects an action that was accepted and will not be dispatched, when its receipt is still
+    /// the one that the acceptance at `accepted_at` made, and says whether it did.
+    ///
+    /// A receipt that has moved on is left as it is, and so is one that another acceptance made
+    /// under the same identity after retention removed the first: only the sequence of the
+    /// acceptance tells those apart, because every new receipt starts at revision 1.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the read or the write fails.
+    pub fn reject_if_accepted_at(
+        &mut self,
+        actor_id: ActorId,
+        action_id: ActionId,
+        accepted_at: u64,
+        reason: RejectionReason,
+        error: Option<ProtocolError>,
+        now_ms: TimestampMs,
+    ) -> Result<bool> {
+        let accepted = self
+            .read(actor_id.clone(), action_id)?
+            .is_some_and(|receipt| receipt.state == ReceiptState::Accepted);
+        if !accepted || self.acceptance_sequence(&actor_id, action_id)? != accepted_at {
+            return Ok(false);
+        }
+        self.reject(actor_id, action_id, reason, error, now_ms)?;
+        Ok(true)
     }
 
     /// Reads the recoverable intent an action was accepted with.
