@@ -1857,6 +1857,12 @@ fn a_worker_stopped_while_presentations_wait_ends_without_the_hold() {
         .build()
         .expect("a runtime");
     let host = runtime.block_on(host(1));
+    // The worker's own first maintenance pass takes the boundary as it starts serving, and a hold
+    // that came before it would keep that pass, and with it the runtime, waiting for the hold.
+    assert!(
+        runtime.block_on(settle(|| host.service.maintenance_passes_for_tests() >= 1)),
+        "the first maintenance pass finishes"
+    );
     let boundary = runtime.block_on(Held::boundary(&host));
     let peers = runtime.block_on(async { presenting_many(&host, 8, 1) });
     let waiting = runtime.block_on(settle(|| {

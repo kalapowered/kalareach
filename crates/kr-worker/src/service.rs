@@ -616,6 +616,10 @@ pub struct WorkerService {
     /// tests read. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     presentation_tries: std::sync::atomic::AtomicU64,
+    /// How many maintenance passes have finished, which this host's own tests read. It is compiled
+    /// away in every shipped build.
+    #[cfg(feature = "testing")]
+    maintenance_passes: std::sync::atomic::AtomicU64,
     /// A pause inside the dispatch boundary for the next presentation that takes it, which this
     /// host's own tests arm. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -1049,6 +1053,8 @@ impl WorkerService {
             presentation_tries: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "testing")]
             presentation_boundary_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            maintenance_passes: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "testing")]
             refusing_announcements: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "testing")]
@@ -1546,6 +1552,15 @@ impl WorkerService {
     #[must_use]
     pub fn connections_held_for_tests(&self) -> usize {
         self.connections.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many maintenance passes have finished, for this host's own tests. The first runs when
+    /// the host starts serving, and takes the dispatch boundary.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn maintenance_passes_for_tests(&self) -> u64 {
+        self.maintenance_passes
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// How many times a presentation has found the dispatch boundary held and tried again, for
@@ -2383,7 +2398,11 @@ impl WorkerService {
 
     /// One pass of the host's maintenance, made on a thread the executor can do without.
     fn maintain_pass(&self) -> MaintenancePass {
-        off_the_executor(|| self.maintain_once())
+        let pass = off_the_executor(|| self.maintain_once());
+        #[cfg(feature = "testing")]
+        self.maintenance_passes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        pass
     }
 
     /// Applies the byte caps of output retention again, for a host that found the host over its
@@ -4600,7 +4619,7 @@ impl WorkerService {
         let waiting = PresentationWaiting::begin(&self.presentations_waiting);
         let mut pause = PRESENTATION_FIRST_RETRY;
         let decided = loop {
-            match off_the_executor(|| self.present_once(state, &nonce, token)) {
+            match self.present_once(state, &nonce, token) {
                 Presentation::Decided(answer) => break Some(answer),
                 Presentation::PeerGone => break None,
                 Presentation::Held => {}
@@ -4638,15 +4657,20 @@ impl WorkerService {
                 panic!("the dispatch barrier is not poisoned")
             }
         };
-        #[cfg(feature = "testing")]
-        self.wait_inside_presentation(state);
-        // Asked again now that the boundary is held, before anything is taken, replaced or fenced
-        // for this presentation: a peer that went since the last try is not answered. This narrows
-        // the window and cannot close it, since a peer can go at any time after the question.
-        if state.peer_has_gone() {
-            return Presentation::PeerGone;
-        }
-        Presentation::Decided(self.accept_generation(state, nonce, token))
+        // Only the decision can wait, for the authority record and for the journal, so only it
+        // leaves the executor: a try that finds the boundary held asks the system and returns.
+        off_the_executor(|| {
+            #[cfg(feature = "testing")]
+            self.wait_inside_presentation(state);
+            // Asked again now that the boundary is held, before anything is taken, replaced or
+            // fenced for this presentation: a peer that went since the last try is not answered.
+            // This narrows the window and cannot close it, since a peer can go at any time after
+            // the question.
+            if state.peer_has_gone() {
+                return Presentation::PeerGone;
+            }
+            Presentation::Decided(self.accept_generation(state, nonce, token))
+        })
     }
 
     fn accept_generation(
