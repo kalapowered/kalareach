@@ -1769,11 +1769,12 @@ test.describe('the area in which a tap opens a link', () => {
         page
       }) => {
         // One line with two links and a plain run between their words: hair spaces joined by word joiners, so that no break opens in the run.
-        // The run's length is measured: the case sets the count of hair spaces that makes the gap between the words 36 to 41 px.
+        // The run's length is measured: the case sets the count of hair spaces that makes the gap between the words 36 px to twice the reach less 4 px
+        // (40 on iOS, 44 on Android): at those gaps at least two taps on each side of the middle lie past both engines' search and inside both targets.
         await pressPage(page, surface, { scale: ratio, only: [PLAIN, PLAIN, ...ORDER, PLAIN, PLAIN] })
         await wordsOf(page, ORDER_ONE)
         const fitted = await page.evaluate(
-          ({ one, two, unit }) => {
+          ({ one, two, unit, most }) => {
             const link = (href: string): HTMLElement | null => document.querySelector<HTMLElement>(`.m-node .md-link[title="${href}"]`)
             const words = (href: string): DOMRect[] => {
               const label = link(href)?.querySelector('.md-link-label')
@@ -1793,14 +1794,14 @@ test.describe('the area in which a tap opens a link', () => {
               const gap = right.left - left.right
               const sameLine = Math.abs(right.top - left.top) < 2
               tried.push(`${String(count)}: ${gap.toFixed(2)}${sameLine ? '' : ' (not on one line)'}`)
-              if (sameLine && gap >= 36 && gap <= 41) return { count, gap, tried: [] }
-              if (!sameLine || gap > 41) break
+              if (sameLine && gap >= 36 && gap <= most) return { count, gap, tried: [] }
+              if (!sameLine || gap > most) break
             }
             return { count: 0, gap: Number.NaN, tried }
           },
-          { one: ORDER_ONE, two: ORDER_TWO, unit: ' ⁠' }
+          { one: ORDER_ONE, two: ORDER_TWO, unit: ' ⁠', most: FINGER[surface] - 4 }
         )
-        expect(fitted.count, `a count of hair spaces that makes a gap of 36 to 41 px between the words (gaps tried ${fitted.tried.join(', ')})`).toBeGreaterThan(0)
+        expect(fitted.count, `a count of hair spaces that makes a gap of 36 px to the finger's size less 4 px between the words (gaps tried ${fitted.tried.join(', ')})`).toBeGreaterThan(0)
         const first = await wordsNow(page, ORDER_ONE, -1)
         const second = await wordsNow(page, ORDER_TWO)
         const reach = FINGER[surface] / 2
