@@ -50,6 +50,15 @@ enum Ends {
     /// The lease's time and the connection's registration: the caller is withdrawn.
     #[cfg(unix)]
     TheLeaseAndTheRegistrationEnd,
+    /// The lease's time passes before the writer begins, so that the list asked first is refused
+    /// with no byte written and the list that no lease serves is the frame whose own write waits
+    /// for room; nothing ends in that wait.
+    #[cfg(unix)]
+    TheReplacementWaitsAndStands,
+    /// As [`Ends::TheReplacementWaitsAndStands`], and the connection's registration ends in the
+    /// replacement's own wait for room.
+    #[cfg(unix)]
+    TheReplacementWaitsAndItsRegistrationEnd,
 }
 
 fn resolved(display: ConfirmationDisplay) -> Resolved {
@@ -188,8 +197,10 @@ async fn written_when(ends: Ends) -> (ControlFrame, ControlFrame, ControlFrame) 
         Ends::TheLeasesTime => continuous.advance(Duration::from_secs(16 * 60)),
         Ends::TheLeaseIsPresentedAgain => presenter.present(&[ActionRight::FilesRead]),
         #[cfg(unix)]
-        Ends::TheLeaseAndTheRegistrationEnd => {
-            unreachable!("the wait for room is where the registration ends")
+        Ends::TheLeaseAndTheRegistrationEnd
+        | Ends::TheReplacementWaitsAndStands
+        | Ends::TheReplacementWaitsAndItsRegistrationEnd => {
+            unreachable!("the wait for room is where these cases end what they end")
         }
     }
     let writing = {
@@ -378,6 +389,13 @@ async fn written_after_a_wait_for_room(ends: Ends) -> (ControlFrame, ControlFram
         ..
     } = staged().await;
     let fillers = filled(&mut writer, &mut reader).await;
+    let replacement_waits = matches!(
+        ends,
+        Ends::TheReplacementWaitsAndStands | Ends::TheReplacementWaitsAndItsRegistrationEnd
+    );
+    if replacement_waits {
+        continuous.advance(Duration::from_secs(16 * 60));
+    }
     let (arrived, go) = controller.pause_after_a_wait_for_room();
     let writing = {
         let controller = Arc::clone(&controller);
@@ -404,6 +422,14 @@ async fn written_after_a_wait_for_room(ends: Ends) -> (ControlFrame, ControlFram
     })
     .await
     .expect("the writer waits for room");
+    if replacement_waits {
+        assert_eq!(
+            controller.local_writes_blocked(),
+            1,
+            "the one wait for room is the replacement's own: the list asked first was refused \
+             with no byte written"
+        );
+    }
     filler(&mut reader).await;
     tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30)))
         .await
@@ -417,6 +443,8 @@ async fn written_after_a_wait_for_room(ends: Ends) -> (ControlFrame, ControlFram
             continuous.advance(Duration::from_secs(16 * 60));
             controller.deregister(connection_id);
         }
+        Ends::TheReplacementWaitsAndStands => {}
+        Ends::TheReplacementWaitsAndItsRegistrationEnd => controller.deregister(connection_id),
     }
     go.send(()).expect("the writer goes on");
     for _ in 1..fillers {
@@ -463,6 +491,30 @@ async fn a_list_whose_bound_ends_in_the_wait_for_room_is_written_under_the_close
 async fn a_caller_whose_registration_ends_in_the_wait_for_room_is_refused_and_no_list_is_written() {
     let (read, full, closed) =
         written_after_a_wait_for_room(Ends::TheLeaseAndTheRegistrationEnd).await;
+    assert_ne!(read, full);
+    assert_ne!(read, closed);
+    let refusal = crate::service::Lapse::Withdrawn.refusal();
+    assert_eq!(
+        read,
+        crate::service::error_reply(REQUEST, refusal.code(), refusal.to_string())
+    );
+}
+
+/// KR-REQ-17.54: a caller whose lease ended before the writer began is given the list under the
+/// scope that no lease serves from its first byte, and that frame's own write waits for room: where
+/// nothing ends in that wait it is written, whole; where the connection's registration ends in it,
+/// the question after the wait refuses it, the caller is told the refusal of the registration,
+/// whole, and no byte of either list is written.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_caller_whose_registration_ends_in_the_replacements_own_wait_is_refused_and_no_list_is_written()
+ {
+    let (read, full, closed) =
+        written_after_a_wait_for_room(Ends::TheReplacementWaitsAndStands).await;
+    assert_ne!(full, closed, "the two lists differ");
+    assert_eq!(read, closed);
+    let (read, full, closed) =
+        written_after_a_wait_for_room(Ends::TheReplacementWaitsAndItsRegistrationEnd).await;
     assert_ne!(read, full);
     assert_ne!(read, closed);
     let refusal = crate::service::Lapse::Withdrawn.refusal();
