@@ -2354,6 +2354,8 @@ impl Controller {
         let params: kr_protocol::session::SessionCloseParams =
             crate::service::parse(&mutation.params)?;
         let session_id = params.session_id;
+        // What a close of this session is given to answer from a record that cannot be read.
+        let budget = tokio::time::Instant::now() + crate::service::CLOSE_EXCHANGE;
         // Asked first, whatever the directory holds: a closure this daemon knows and its registry
         // has not yet recorded is written again when it is asked about, and a worker that is
         // still in the directory is not asked to close twice.
@@ -2368,7 +2370,7 @@ impl Controller {
             *retained = Retained::Record;
             return crate::given::network_door::kept(
                 crate::service::net::AtTheNetworkDoor::here(),
-                self.answer_from_the_closure(session_id).await,
+                self.answer_from_the_closure(session_id, budget).await,
             );
         }
         // The accepted deadline as it stands, and no dispatch lease behind it. Section 9 asks for
@@ -2414,7 +2416,7 @@ impl Controller {
                 *retained = Retained::Record;
                 return crate::given::network_door::kept(
                     crate::service::net::AtTheNetworkDoor::here(),
-                    self.answer_from_the_closure(session_id).await,
+                    self.answer_from_the_closure(session_id, budget).await,
                 );
             }
             Err(error) => return Err(error),

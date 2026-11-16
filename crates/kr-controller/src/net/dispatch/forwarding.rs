@@ -1179,7 +1179,10 @@ impl RemoteConnection {
         }
         let closed = self
             .controller
-            .answer_from_the_closure(session_id)
+            .answer_from_the_closure(
+                session_id,
+                tokio::time::Instant::now() + crate::service::CLOSE_EXCHANGE,
+            )
             .await
             .answered(mutation.request_id)?;
         Some((closed, read))
