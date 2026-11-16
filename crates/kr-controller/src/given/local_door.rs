@@ -348,13 +348,13 @@ pub(crate) async fn told(settled: Settled<ControlFrame>, standing: &Standing<'_>
         // The refusal says what was done before it, and under authority that no longer stands
         // that is not shown, whatever the check's own refusal would say of nothing having been done.
         Origin::AfterAnEffect => {
-            match own_withdrawal_or_standing(controller, footing, withdrew.as_ref()).await {
+            match own_withdrawal_or_standing(controller, footing, withdrew.as_ref()) {
                 Ok(()) => answer,
                 Err(_) => not_shown(),
             }
         }
         Origin::Fresh => {
-            match own_withdrawal_or_standing(controller, footing, withdrew.as_ref()).await {
+            match own_withdrawal_or_standing(controller, footing, withdrew.as_ref()) {
                 Ok(()) => answer,
                 // The check's refusal says nothing was done, which is true of a refusal and false of a
                 // result, or of any word that does not say so.
@@ -376,13 +376,13 @@ pub(crate) async fn told(settled: Settled<ControlFrame>, standing: &Standing<'_>
 /// What a fresh answer that is not a conflict stands on: the connection's registration and no
 /// fence owed, or, for a request whose own barrier withdrew the host, no fence owed and the
 /// revision that barrier set still in force.
-async fn own_withdrawal_or_standing(
+fn own_withdrawal_or_standing(
     controller: &Controller,
     footing: &Footing,
     withdrew: Option<&HostWithdrawal>,
 ) -> Result<(), ControllerError> {
     match withdrew {
-        Some(withdrew) => controller.withdrawal_stands(withdrew).await,
+        Some(withdrew) => controller.withdrawal_stands(withdrew),
         None => footing
             .ask(Ask::FRESH_REPLY)
             .map_err(|lapse| refusal_of(footing, Words::OwnEffect, lapse)),
