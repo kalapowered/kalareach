@@ -805,8 +805,8 @@ impl Session {
     /// Starts a session whose owner takes every notification in the order the host sent it.
     ///
     /// The session's reader hands each notification, whole and unfiltered, to the returned
-    /// [`crate::ordered::OrderedEvents`] through one channel of `capacity` items, and waits while
-    /// the channel is full. A delivery that the host starts again at sequence 0 reaches the owner
+    /// [`crate::ordered::OrderedEvents`] through one channel of `capacity` items (a capacity of 0
+    /// gives 1), and waits while the channel is full. A delivery that the host starts again at sequence 0 reaches the owner
     /// as it came, which the broadcast would not give it. The end of the connection comes through
     /// the same channel, behind every notification read before it, with how it ended
     /// ([`crate::ordered::Ended`]). The owner is in place before the first frame is read, so none
@@ -815,7 +815,16 @@ impl Session {
     /// The broadcast ([`Session::events`]) and the cursors work as they do on any session.
     /// Answers, receipts and window renewals are the session's own and never reach the channel.
     /// While the channel is full the reader reads nothing from the connection, so those wait
-    /// too: the owner keeps draining the channel while a call waits for its answer.
+    /// too: the owner keeps draining the channel while a call waits for its answer. That holds for
+    /// every call that waits for an answer, among them the creation of a lane on the network
+    /// transport ([`Session::input_lane`]), which asks the host to open its streams.
+    ///
+    /// A lane for the connection's data streams works on an ordered session as on any other: it
+    /// takes no notification from the channel or from the broadcast, and its sends reach the
+    /// transport as ever.
+    ///
+    /// The owner's close or drop ([`Session::close`]) loses nothing the reader had taken: see
+    /// [`crate::ordered::OrderedEvents::recv`].
     ///
     /// # Errors
     ///
@@ -984,12 +993,18 @@ impl Session {
     /// # Dropping the call
     ///
     /// The caller polls the call to its end. A call is not safe to drop at an await. Dropped while
-    /// its frame is being written, it leaves what the transport leaves: on the network transport
-    /// the rest of the frame is written by the next write, so the request may reach the host with
-    /// no one waiting for its answer; on the local link a drop inside the write closes the
-    /// connection. Dropped while it waits for the answer, or for a retry, it leaves nothing: its
-    /// place among the waiting requests is given back, and an answer that comes later is ignored.
-    /// A read sent with [`Session::read_unsignalled`] keeps its identifier on the list of such reads
+    /// its frame is being written, it leaves what the transport leaves. On the network transport a
+    /// write that stops part way leaves the control stream marked: what went is no whole frame, so
+    /// no request reaches the host from it, and the next write on that stream resets it and fails.
+    /// On the local link a frame of which a part went closes the connection, a frame of which
+    /// nothing went is taken back and the connection stands, and a frame that went whole has
+    /// reached the host with no one waiting for its answer.
+    ///
+    /// Dropped while it waits for the answer, or for a retry, it leaves nothing: its place among
+    /// the waiting requests is given back, and an answer that comes later is not delivered to
+    /// anyone. A late answer is still the host's word on the connection, though: one that
+    /// suggests the host withdrew what the connection was admitted under still raises the doubt
+    /// that [`Session::standing_in_doubt`] reports. A read sent with [`Session::read_unsignalled`] keeps its identifier on the list of such reads
     /// until its answer comes, so that a late answer raises nothing.
     ///
     /// # Errors
@@ -1187,14 +1202,17 @@ impl Session {
     ///
     /// The caller polls the call to its end. It is not safe to drop at an await, and it writes
     /// nothing until it is polled. Dropped while its frame is being written, it leaves what the
-    /// transport leaves: on the network transport the rest of the frame is written by the next
-    /// write, so the request may reach the host with no one waiting for its answer; on the local
-    /// link a drop inside the write closes the connection. Dropped once the frame is written, it
-    /// gives back its place among the outstanding mutations and its waiter. The action stays on
-    /// the book as unresolved, and the session settles it when the host's definite answer comes,
-    /// though no one waits for it: only an answer that says the outcome is unknown, or no answer,
-    /// leaves it there. An action whose call was dropped inside the write is on the book in the
-    /// same way. A caller that holds its own record of the action sends it with
+    /// transport leaves. On the network transport a write that stops part way leaves the control
+    /// stream marked: what went is no whole frame, so no request reaches the host from it, and the
+    /// next write on that stream resets it and fails. On the local link a frame of which a part
+    /// went closes the connection, a frame of which nothing went is taken back and the connection
+    /// stands, and a frame that went whole has reached the host with no one waiting for its
+    /// answer. Dropped once the frame is written, it gives back its place among the outstanding
+    /// mutations and its waiter. The action stays on the book as unresolved, and the session
+    /// settles it when the host's definite answer comes, though no one waits for it. An answer
+    /// that says the outcome is unknown leaves it there, and so does a transient refusal, which
+    /// marks it as refused for now, and so does no answer. An action whose call was dropped inside
+    /// the write is on the book in the same way. A caller that holds its own record of the action sends it with
     /// [`Session::send`] instead, which leaves the settling to the caller.
     ///
     /// # Errors
@@ -1508,9 +1526,12 @@ impl Session {
     /// # Dropping the call
     ///
     /// As [`Session::mutate`]: the caller polls the call to its end. A drop inside the write of the
-    /// frame leaves, on the network transport, a frame whose rest the next write sends, so the
-    /// request may reach the host with no one waiting; on the local link it closes the connection.
-    /// A drop once the frame is written, at the wait for the answer, gives back the request's
+    /// frame leaves what the transport leaves. On the network transport a write that stops part
+    /// way leaves the control stream marked: what went is no whole frame, so no request reaches
+    /// the host from it, and the next write on that stream resets it and fails. On the local link
+    /// a frame of which a part went closes the connection, a frame of which nothing went is taken
+    /// back and the connection stands, and a frame that went whole has reached the host with no
+    /// one waiting for its answer. A drop once the frame is written, at the wait for the answer, gives back the request's
     /// place and its waiter and leaves the action on the book as held and unresolved until its
     /// owner settles it ([`Session::settle`]): an answer that comes later does not clear it. An
     /// action whose call was dropped inside the write stays on the book in the same way.
@@ -1539,14 +1560,24 @@ impl Session {
     ///
     /// # Dropping the call
     ///
-    /// The caller polls the call to its end, as for [`Session::send`]; the answer's future, once
-    /// returned, is safe to drop and gives back the request's place among the outstanding ones.
-    /// The action it left stays on the book as held and unresolved until its owner settles it
-    /// ([`Session::settle`]): an answer that comes later does not clear it.
+    /// The caller polls the call to its end, as for [`Session::send`]. A drop inside the write
+    /// leaves what the transport leaves. On the network transport a write that stops part way
+    /// leaves the control stream marked: what went is no whole frame, so no request reaches the
+    /// host from it, and the next write on that stream resets it and fails. On the local link a
+    /// frame of which a part went closes the connection, a frame of which nothing went is taken
+    /// back and the connection stands, and a frame that went whole has reached the host with no
+    /// one waiting for its answer. The answer's future, once returned, is safe to drop and gives
+    /// back the request's place among the outstanding ones. The action it left stays on the book
+    /// as held and unresolved until its owner settles it ([`Session::settle`]): an answer that
+    /// comes later does not clear it.
     ///
     /// # Errors
     ///
-    /// As [`Session::send`], for everything that happens before the frame is written.
+    /// As [`Session::send`], for everything that happens before the frame is written: the call
+    /// refuses a mutation composed on another connection, one over the bound of outstanding
+    /// mutations ([`ClientError::TooManyOutstandingMutations`]) or of unresolved actions
+    /// ([`ClientError::TooManyUnresolvedActions`]), and an action that this client is still
+    /// accounting for ([`ClientError::StillAccounting`]), each before a byte is written.
     pub async fn send_whole(&self, composed: &ComposedMutation) -> Result<Answering> {
         if composed.composed_on != Some(self.id) {
             return Err(ClientError::Misdirected { repeating: false });
