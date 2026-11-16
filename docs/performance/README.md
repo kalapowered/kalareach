@@ -159,7 +159,7 @@ below against their recorded levels).
 
 The sum stays recorded and has no alarm. It counts each worker's mapped pages of one program once
 for each worker. Over 21 normal readings of builds whose worker program was nearly the same size
-(within 70 KiB on disk) it spread 13,932 KiB, more than the old step of 10,240 KiB, and with its old
+(35,022 to 35,101 KiB on disk, a span of 79 KiB) it spread 13,932 KiB, more than the old step of 10,240 KiB, and with its old
 level the old alarm fired in 4 of 8 runs of one build and in 8 of 13 readings of one commit. A
 newly set margin of 10,240 KiB would also pass the 25 normal readings; the two alarms below are
 chosen because each points at the place of a growth.
@@ -183,9 +183,10 @@ any mean that moves a level. Each level's comment in `crates/kr-worker/tests/per
 the date, the commit, the number of valid readings, their mean and their spread.
 
 Neither alarm sees a growth in the daemon's class, which is the case's own process: 16 MiB more
-heap there passes both alarms and the requirement. Neither sees file pages that every worker maps,
-which count once in the held figure and twenty times in the sum: 1 MiB of them adds 1 MiB to the
-held figure and 20 MiB to the sum. Neither growth is in the records so far, and the recorded sum
+heap there passes both alarms and the requirement. A growth of 1 MiB in file pages that every
+worker maps goes unseen too: those pages count once in the held figure, which it raises by 1 MiB,
+under that alarm's step, and twenty times in the sum, which it raises by 20 MiB. Neither growth is
+in the records so far, and the recorded sum
 line stays in the record so that a person can see it.
 
 Where no reader of the held figure is available, which is macOS (it has no page map a process of

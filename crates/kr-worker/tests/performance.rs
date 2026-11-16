@@ -72,8 +72,9 @@ const RESIDENT_BOUND_KIB: u64 = 500 * 1024;
 /// is under 168,000 KiB, which is where mapped pages were taken back (the file pages of the worker
 /// program and of the test program read lower in the same readings); none of the 13 was low, and a
 /// low reading stays out of every mean. Across the 25 normal readings (those 13, and 12 rows from the
-/// verifications of 11 earlier commits made from 2026-11-12 to 2026-11-15; two further commits read
-/// low and are kept out) the figure spans 1,284 KiB, where the sum spans 13,932 KiB over 21 of them.
+/// verifications of 12 earlier commits made from 2026-11-12 to 2026-11-15, one train having two
+/// verifications of two commits, 6efe9e867b and 4edf69f761; two further commits read low and are
+/// kept out) the figure spans 1,284 KiB, where the sum spans 13,932 KiB over 21 of them.
 /// A growth of private memory in a worker shows in it once for each of the twenty workers. See
 /// [`WORKERS_HELD_ALARM_STEP_KIB`].
 const WORKERS_HELD_RECORDED_KIB: u64 = 111_386;
@@ -92,8 +93,8 @@ const WORKERS_HELD_ALARM_STEP_KIB: u64 = 4 * 1024;
 /// each worker from, divided by 1,024 and rounded down, as `scripts/worker-size.sh` prints a size.
 /// Read on the build box on 2026-11-16: 35,328 KiB (36,176,328 bytes, one file) in the 8 of the 13
 /// valid readings of commit 3ace455c69 whose runs recorded the file's hash, and in 4 runs of commit
-/// 2bc513d435, which differs from it in this test file alone: a spread of 0 KiB and a mean of
-/// 35,328 KiB. A size has no low reading, because no reclaim of mapped pages moves it. The `worker
+/// 2bc513d435, which differs from it in this test file, the guide and a comment of
+/// `scripts/performance.sh`: a spread of 0 KiB and a mean of 35,328 KiB. A size has no low reading, because no reclaim of mapped pages moves it. The `worker
 /// size` line that `scripts/performance.sh` prints before the case is read from the program that
 /// `cargo build --workspace` leaves, which is another build of the same sources: 35,101 KiB at
 /// commit 3ace455c69, 227 KiB less than this file. Its sections show where the workspace build
