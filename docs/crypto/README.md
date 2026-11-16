@@ -482,7 +482,9 @@ name is reduced to its components first, so `store/` and `store/.` cannot slip a
 check on the directory itself.
 
 `open_store_in` records nothing. The `.store-kind` marker is `open_store`'s record of a choice made
-once for a host, and this choice is passed in at every start.
+once for a host, and this choice is passed in at every start. `StoreSelection::File` reads the
+record before it opens the directory and refuses a host whose record names the platform store,
+because none of that host's keys are in the directory.
 
 ### The recorded choice
 

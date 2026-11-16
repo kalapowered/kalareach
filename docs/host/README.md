@@ -1250,20 +1250,28 @@ until the first release after one in which every running worker states the finer
 
 ### Where the daemon keeps its keys
 
-`kr-controller --secret-store` chooses where the controller identity and this host's network
-device keys go. One selection covers both:
+`kr-controller --secret-store` chooses where the controller identity and this host's device keys
+go, the network's device keys among them. One selection covers all of them, and one state directory
+has one store:
 
 | Value | Store | Who uses it |
 | --- | --- | --- |
 | `platform` (the default) | the operating system's credential store, with the owner-only directory where section 10 offers it | an installed host |
 | `file` | this environment's own `secrets` directory | a test, a bench or a demonstration run |
 
-The two key sets are opened separately, because the identity is opened at startup, behind the
-singleton lock, and the network keys only when the environment selects a network. Under `platform`
-each takes the store it always took: the identity follows the `.store-kind` record this host made,
-and the network keys take the platform's credential store where there is one and the owner-only
-directory where there is not. On a Linux host whose secret service appeared after it recorded the
-directory, that is two different stores, which is what an installed host has.
+The daemon opens the store once for its device keys and hands that store to the network, so the
+endpoint identity that paired devices pinned is kept where the host's other keys are. Under
+`platform` the store is the one the `.store-kind` record names; with no record, the owner-only
+directory where it already holds files; otherwise the operating system's credential store where it
+opens, and on Linux the owner-only directory where it does not. The choice is recorded at the first
+start. A host whose record names the credential store is not started where that store does not open:
+the start is refused, and no key is made or moved. A host whose record names the directory keeps
+using it, even where a secret service appears later. On macOS and Windows there is one store and no
+record.
+
+`file` is refused for a host whose record names the credential store, because its keys are not in
+the directory and a start would make a new set. On macOS and Windows no record exists, so `file`
+there names a directory and the keys it finds in it.
 
 Under `file` both go in the environment's own `secrets` directory. `file` names where the keys go
 and nothing else: it allocates no directory and deletes nothing afterwards, so a run that wants its
