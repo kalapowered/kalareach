@@ -1,12 +1,23 @@
 # Every place that makes a value of the local protocol's error, read by error_makers.rs.
 # Columns: file | owner (impl type and function) | variant | n (times made there) | what makes it there | source | control | function
 #   what: own (this side's own check, file or directory operation) | arrived (a frame or a reply that arrived) | connect (the socket at a
-#         connect) | stream (the socket on a connected stream) | conversion (a From impl or #[from])
+#         connect) | stream (the socket on a connected stream) | conversion (a From impl or #[from]) | macro (inside the arguments of a macro, which
+#         the scan cannot classify, so it counts the occurrence as a maker and a person reads it)
 #   source: the failure's true source: reply | closure | own | closure+own (two makers of one row differ: the note names them)
+#         | pattern (a person read the occurrence as a pattern: it tests a value and makes none; its what is macro, its control and function are -)
 #   control: where a control connection of a command can return it: connect, greeting, request (joined by +); - where it cannot
 #   function: whether comes_from gives that source for the variant: agrees | differs | by-kind (the source depends on the socket's kind)
+apps/companion/src-tauri/src/push.rs | read_record | Io | 1 | macro | pattern | - | -   # a matches! on a read failure; no value is made
+crates/kr-cli/src/bridge/helper.rs | relay | PeerClosed | 1 | macro | pattern | - | -   # an arm of a select! that ends the relay; no value is made
 crates/kr-cli/src/export.rs | refuse_existing | Io | 1 | own | own | - | agrees
 crates/kr-cli/src/export.rs | write | Io | 1 | own | own | - | agrees
+crates/kr-cli/src/host_stop.rs | after_the_write_failed | NotInLevel | 1 | macro | pattern | - | -   # a matches! on the write's failure; no value is made
+crates/kr-cli/src/host_stop.rs | closed_by_the_daemon | PeerClosed | 1 | macro | pattern | - | -   # a matches! on the failure; no value is made
+crates/kr-cli/src/host_stop.rs | closed_by_the_daemon | TruncatedFrame | 1 | macro | pattern | - | -   # a matches! on the failure; no value is made
+crates/kr-cli/src/question.rs | connection_went | Frame | 1 | macro | pattern | - | -   # a matches! on the failure; no value is made
+crates/kr-cli/src/question.rs | connection_went | PeerClosed | 1 | macro | pattern | - | -   # a matches! on the failure; no value is made
+crates/kr-cli/src/question.rs | connection_went | Socket | 1 | macro | pattern | - | -   # a matches! on the failure; no value is made
+crates/kr-cli/src/question.rs | connection_went | TruncatedFrame | 1 | macro | pattern | - | -   # a matches! on the failure; no value is made
 crates/kr-cli/src/service_manager.rs | install | Io | 1 | own | own | - | agrees
 crates/kr-cli/src/service_manager.rs | remove | Io | 2 | own | own | - | agrees
 crates/kr-cli/src/share.rs | ask_again | UnexpectedMessage | 2 | arrived | reply | - | agrees
@@ -14,11 +25,15 @@ crates/kr-cli/src/share.rs | sent_within | UnexpectedMessage | 1 | arrived | rep
 crates/kr-cli/src/startup.rs | Log::from_file | Io | 1 | own | own | - | agrees
 crates/kr-cli/src/startup.rs | Log::open | Io | 1 | own | own | - | agrees
 crates/kr-cli/src/startup.rs | Log::output | Io | 1 | own | own | - | agrees
+crates/kr-cli/src/startup.rs | nothing_listening | Socket | 1 | macro | pattern | - | -   # a matches! on the failure; no value is made
+crates/kr-client/src/chunks.rs | LocalCarrier::exchange | Frame | 1 | macro | pattern | - | -   # a matches! in a guard; no value is made
 crates/kr-client/src/pairing/clock.rs | write_record | Io | 1 | own | own | - | agrees
 crates/kr-controller/src/attempt.rs | Marker::write | Io | 1 | own | own | - | agrees
 crates/kr-controller/src/net/proxy.rs | WorkerProxy::call | UnexpectedMessage | 1 | arrived | reply | - | agrees
 crates/kr-controller/src/service/attention_reach.rs | Controller::connect_role | Socket | 1 | connect | closure+own | - | by-kind
+crates/kr-controller/src/service/barrier.rs | refused_for_now | IdentityUnavailable | 1 | macro | pattern | - | -   # a matches! on the failure; no value is made
 crates/kr-controller/src/service/rendezvous.rs | Controller::rendezvous_claim | Frame | 1 | arrived | closure | - | agrees
+crates/kr-controller/src/service/workers.rs | is_displaced_by_a_later_connection | IdentityUnavailable | 1 | macro | pattern | - | -   # a matches! on the failure; no value is made
 crates/kr-controller/src/singleton.rs | SingletonLock::holder | Io | 1 | own | own | - | agrees
 crates/kr-controller/src/singleton.rs | SingletonLock::not_locked | Io | 1 | own | own | - | agrees
 crates/kr-controller/src/singleton.rs | SingletonLock::not_opened | Io | 1 | own | own | - | agrees
@@ -58,7 +73,7 @@ crates/kr-ipc/src/descriptor.rs | check_owner | Io | 1 | own | own | - | agrees
 crates/kr-ipc/src/descriptor.rs | check_owner | UntrustedFile | 3 | own | own | - | agrees
 crates/kr-ipc/src/descriptor.rs | clear_non_blocking | Io | 2 | own | own | - | agrees
 crates/kr-ipc/src/descriptor.rs | decode_under | Frame | 1 | arrived | closure | - | agrees
-crates/kr-ipc/src/descriptor.rs | decode_under | UnexpectedMessage | 1 | arrived | reply | - | agrees
+crates/kr-ipc/src/descriptor.rs | decode_under | UnexpectedMessage | 1 | own | own | - | differs   # made here, for a descriptor that no level reads and with no reply in hand; the function reads the variant as a reply
 crates/kr-ipc/src/descriptor.rs | retire | Io | 1 | own | own | - | agrees
 crates/kr-ipc/src/endpoint.rs | Accepted::refusal | PeerAccountRejected | 1 | own | own | - | agrees
 crates/kr-ipc/src/endpoint.rs | Connection::connect | PeerAccountRejected | 1 | own | own | connect | agrees
@@ -84,6 +99,7 @@ crates/kr-ipc/src/error.rs | IpcError::io | Io | 1 | own | own | - | agrees   # 
 crates/kr-ipc/src/error.rs | IpcError::socket | Socket | 1 | connect | closure+own | - | by-kind   # the constructor; its callers have the rows
 crates/kr-ipc/src/error.rs | IpcError::stream | PeerClosed | 1 | stream | closure | greeting+request | agrees   # a gone peer on a stream
 crates/kr-ipc/src/error.rs | IpcError::stream | Socket | 1 | stream | own | greeting+request | agrees   # the stream's other faults
+crates/kr-ipc/src/error.rs | carries_account_refusal | PeerAccountRejected | 1 | macro | pattern | - | -   # a matches! on the failure; no value is made
 crates/kr-ipc/src/floor.rs | FloorIdentity::fresh | IdentityUnavailable | 1 | own | own | - | agrees
 crates/kr-ipc/src/floor.rs | SharedFloor::create | Io | 1 | own | own | - | agrees
 crates/kr-ipc/src/floor.rs | SharedFloor::create | UntrustedFile | 1 | own | own | - | agrees
@@ -135,5 +151,6 @@ crates/kr-ipc/src/starter.rs | read_claim | Io | 1 | own | own | - | agrees
 crates/kr-ipc/src/starter.rs | take_claim | Io | 1 | own | own | - | agrees
 crates/kr-ipc/src/verify.rs | IpcError::from | IdentityUnavailable | 1 | conversion | own | - | agrees   # the verification of a worker's identity
 crates/kr-plugin-service/src/client.rs | write_offered | PeerClosed | 2 | stream | closure | - | agrees
+crates/kr-shell-integration/src/host/endpoint.rs | occupied | Socket | 1 | macro | pattern | - | -   # a matches! on the failure; no value is made
 crates/kr-shell-integration/src/host/startup.rs | EntryRecord::hold | Io | 1 | own | own | - | agrees
 crates/kr-shell-integration/src/host/terminal_profile/record.rs | ProfileRecord::hold | Io | 1 | own | own | - | agrees
