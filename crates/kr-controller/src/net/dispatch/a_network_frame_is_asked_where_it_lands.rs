@@ -32,6 +32,17 @@ enum Record {
     ReusedIdentifier,
 }
 
+/// Where the writer is stopped for a case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoppedAt {
+    /// Once the feed's refusal has been read and the bounds copied, before the standing's question.
+    AfterTheFeed,
+    /// In the attempt's own reading of the feed, before it takes the connection's shares lock: the
+    /// feed holds the connection table's read lock across the pause, so no barrier can move the
+    /// revision there.
+    TheAttemptsFeed,
+}
+
 /// What ends in the pause between the feed's refusal and the standing's question.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ends {
@@ -62,8 +73,8 @@ struct Found {
 }
 
 /// Writes `record` to a connection whose grant runs out ten minutes after the case begins, stops
-/// the writer once the feed's refusal is read, lets `ends` happen there and lets the writer go on.
-async fn written_with(record: Record, ends: Ends) -> Found {
+/// the writer at `at`, lets `ends` happen there and lets the writer go on.
+async fn written_with(record: Record, ends: Ends, at: StoppedAt) -> Found {
     let temp = kr_ipc::testing::TempHost::create();
     let (_continuous, wall, clocks) = super::super::tests::manual_clocks();
     let controller = super::super::tests::daemon_on(&temp, clocks).await;
@@ -105,7 +116,10 @@ async fn written_with(record: Record, ends: Ends) -> Found {
     };
 
     let connection_id = connection.connection_id;
-    let (arrived, go) = controller.pause_after_the_feed_is_read();
+    let (arrived, go) = match at {
+        StoppedAt::AfterTheFeed => controller.pause_after_the_feed_is_read(),
+        StoppedAt::TheAttemptsFeed => controller.pause_before_the_shares_lock(),
+    };
     let writing = tokio::spawn({
         let answer = answer.clone();
         async move {
@@ -124,7 +138,21 @@ async fn written_with(record: Record, ends: Ends) -> Found {
     tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30)))
         .await
         .expect("the wait ends")
-        .expect("the writer reaches the place after the feed's refusal is read");
+        .expect("the writer reaches the place it is stopped at");
+    let go = match at {
+        StoppedAt::AfterTheFeed => go,
+        StoppedAt::TheAttemptsFeed => {
+            // The first reading of the feed was the writer's decision before its attempt: let it
+            // go, and stop the attempt's own reading.
+            let (arrived, go_again) = controller.pause_before_the_shares_lock();
+            go.send(()).expect("the decision goes on");
+            tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30)))
+                .await
+                .expect("the wait ends")
+                .expect("the attempt's feed reaches the shares lock");
+            go_again
+        }
+    };
     match ends {
         Ends::Nothing => {}
         Ends::AFence => controller.hold_fence(true),
@@ -179,7 +207,7 @@ fn told_of_the_stop(found: &Found, record: Record) -> ControlFrame {
 
 /// An answer that nothing ended is written whole.
 async fn nothing_ends_and_the_answer_is_written_whole(record: Record) {
-    let found = written_with(record, Ends::Nothing).await;
+    let found = written_with(record, Ends::Nothing, StoppedAt::AfterTheFeed).await;
     assert!(found.stood, "the connection stands");
     assert_eq!(
         found.frames,
@@ -189,8 +217,12 @@ async fn nothing_ends_and_the_answer_is_written_whole(record: Record) {
 }
 
 /// An answer that the standing stopped is not handed to the stream, and the device is told why.
-async fn the_standing_ends_and_the_stream_is_handed_none_of_the_answer(record: Record, ends: Ends) {
-    let found = written_with(record, ends).await;
+async fn the_standing_ends_and_the_stream_is_handed_none_of_the_answer(
+    record: Record,
+    ends: Ends,
+    at: StoppedAt,
+) {
+    let found = written_with(record, ends, at).await;
     assert!(
         found.refusal.is_some(),
         "the door's own check refuses the request after {ends:?}"
@@ -208,7 +240,7 @@ async fn the_standing_ends_and_the_stream_is_handed_none_of_the_answer(record: R
 
 /// The connection ends with the grant's own end or its registration, and nothing is written.
 async fn the_connection_ends_and_the_stream_is_handed_nothing(record: Record, ends: Ends) {
-    let found = written_with(record, ends).await;
+    let found = written_with(record, ends, StoppedAt::AfterTheFeed).await;
     assert!(!found.stood, "the connection ends after {ends:?}");
     assert!(
         found.frames.is_empty(),
@@ -228,8 +260,12 @@ async fn a_kept_answer_is_written_whole_when_nothing_ends_after_the_feed_is_read
 /// answer, and the device is told the outcome is not shown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_kept_answer_is_not_written_when_a_fence_is_owed_after_the_feed_is_read() {
-    the_standing_ends_and_the_stream_is_handed_none_of_the_answer(Record::KeptAnswer, Ends::AFence)
-        .await;
+    the_standing_ends_and_the_stream_is_handed_none_of_the_answer(
+        Record::KeptAnswer,
+        Ends::AFence,
+        StoppedAt::AfterTheFeed,
+    )
+    .await;
 }
 
 /// KR-REQ-09.12: another device's revocation that moves the revision after the feed's refusal was
@@ -239,6 +275,7 @@ async fn a_kept_answer_is_not_written_when_the_revision_moves_after_the_feed_is_
     the_standing_ends_and_the_stream_is_handed_none_of_the_answer(
         Record::KeptAnswer,
         Ends::TheRevision,
+        StoppedAt::AfterTheFeed,
     )
     .await;
 }
@@ -272,6 +309,7 @@ async fn a_reused_identifier_is_not_written_when_a_fence_is_owed_after_the_feed_
     the_standing_ends_and_the_stream_is_handed_none_of_the_answer(
         Record::ReusedIdentifier,
         Ends::AFence,
+        StoppedAt::AfterTheFeed,
     )
     .await;
 }
@@ -283,6 +321,7 @@ async fn a_reused_identifier_is_not_written_when_the_revision_moves_after_the_fe
     the_standing_ends_and_the_stream_is_handed_none_of_the_answer(
         Record::ReusedIdentifier,
         Ends::TheRevision,
+        StoppedAt::AfterTheFeed,
     )
     .await;
 }
@@ -306,6 +345,33 @@ async fn a_reused_identifier_is_not_written_when_the_grant_ends_after_the_feed_i
     the_connection_ends_and_the_stream_is_handed_nothing(
         Record::ReusedIdentifier,
         Ends::TheGrantsOwnEnd,
+    )
+    .await;
+}
+
+/// KR-REQ-09.12: a fence this host comes to owe while the attempt's own reading of the feed waits for
+/// the connection's shares lock stops a kept answer: the standing is asked after the feed, and the
+/// device is told the outcome is not shown. Only that refusal reaches the stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kept_answer_is_not_written_when_a_fence_is_owed_while_the_feed_waits_for_the_shares_lock()
+ {
+    the_standing_ends_and_the_stream_is_handed_none_of_the_answer(
+        Record::KeptAnswer,
+        Ends::AFence,
+        StoppedAt::TheAttemptsFeed,
+    )
+    .await;
+}
+
+/// KR-REQ-09.09: the same for a reused identifier's answer, and the device is told the refusal of
+/// the check that failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reused_identifier_is_not_written_when_a_fence_is_owed_while_the_feed_waits_for_the_shares_lock()
+ {
+    the_standing_ends_and_the_stream_is_handed_none_of_the_answer(
+        Record::ReusedIdentifier,
+        Ends::AFence,
+        StoppedAt::TheAttemptsFeed,
     )
     .await;
 }
