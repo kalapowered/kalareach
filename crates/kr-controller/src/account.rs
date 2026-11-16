@@ -230,11 +230,33 @@ impl Outcome {
     }
 }
 
+/// What the authority a sign-in was started under rests on, given to whoever asks whether it still
+/// stands. The one who asks holds it until the write that the ask stands before has returned, so
+/// that the host is not let go of between the ask and the write.
+pub struct Guard {
+    _held: Box<dyn Send + Sync>,
+}
+
+impl Guard {
+    /// A guard that holds `held` until it is let go.
+    pub fn new(held: impl Send + Sync + 'static) -> Self {
+        Self {
+            _held: Box::new(held),
+        }
+    }
+}
+
+impl std::fmt::Debug for Guard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Guard").finish_non_exhaustive()
+    }
+}
+
 /// Whether the authority a sign-in was started under still stands, asked when the person completes
 /// it, after the request that started it has answered and its connection has ended. It asks the
 /// fence this host owes and the local owner's membership lease, and neither the request's deadline
-/// nor its connection.
-pub type Lasting = Arc<dyn Fn() -> Result<()> + Send + Sync>;
+/// nor its connection. Where it stands, it gives the [`Guard`] to hold until the write has returned.
+pub type Lasting = Arc<dyn Fn() -> Result<Guard> + Send + Sync>;
 
 /// What a finished attempt shows a person's browser.
 const fn page(outcome: AccountAttempt) -> &'static str {
@@ -295,6 +317,14 @@ impl Running {
     }
 }
 
+/// Why no listener was opened for a sign-in.
+enum NoListener {
+    /// The address could not be bound.
+    Bind(BindError),
+    /// The request no longer stands, so the address was not asked for.
+    Withheld(ControllerError),
+}
+
 /// What the host's two accounts share. Both sign in through the one loopback address the desktop
 /// client is registered with, so the sign-in that waits for the browser is one, whichever account
 /// it is of.
@@ -312,6 +342,23 @@ struct Accounts {
     /// Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     before_it_is_shown_as_waiting: crate::service::ReadPause,
+    /// Where this host's own tests stop a sign-in immediately before it asks whether its request
+    /// still stands for a try to bind the address a sign-in comes back to, so that the authority
+    /// can change in that wait. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    before_it_binds: crate::service::ReadPause,
+    /// How many times the address a sign-in comes back to was bound for a sign-in.
+    #[cfg(feature = "testing")]
+    binds: std::sync::atomic::AtomicUsize,
+    /// Where this host's own tests stop a sign-in that has its tokens, immediately before it asks
+    /// whether the authority it was started under still stands for the gate that holds other
+    /// changes off, so that the authority can change in that wait. Compiled away in every shipped
+    /// build.
+    #[cfg(feature = "testing")]
+    before_the_change_gate: crate::service::ReadPause,
+    /// How many times the gate that holds other changes off was raised.
+    #[cfg(feature = "testing")]
+    change_gates: std::sync::atomic::AtomicUsize,
 }
 
 /// Whether the request that asked for a change of the account still stands: the check every
@@ -433,6 +480,14 @@ impl HostAccount {
             before_it_asks_whether_it_stands: crate::service::ReadPause::default(),
             #[cfg(feature = "testing")]
             before_it_is_shown_as_waiting: crate::service::ReadPause::default(),
+            #[cfg(feature = "testing")]
+            before_it_binds: crate::service::ReadPause::default(),
+            #[cfg(feature = "testing")]
+            binds: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "testing")]
+            before_the_change_gate: crate::service::ReadPause::default(),
+            #[cfg(feature = "testing")]
+            change_gates: std::sync::atomic::AtomicUsize::new(0),
         });
         Self::build(store, environment_id, service, refused, accounts, None)
     }
@@ -856,6 +911,51 @@ impl HostAccount {
         self.inner.accounts.before_it_is_shown_as_waiting.arm()
     }
 
+    /// Arms the pause the next sign-in stops at immediately before it asks whether its request still
+    /// stands for a try to bind the address a sign-in comes back to. Returns the end that says the
+    /// sign-in has arrived, and the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_it_binds(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.inner.accounts.before_it_binds.arm()
+    }
+
+    /// How many times the address a sign-in comes back to was bound for a sign-in.
+    #[cfg(feature = "testing")]
+    pub fn binds_made(&self) -> usize {
+        self.inner
+            .accounts
+            .binds
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Arms the pause the next sign-in that has its tokens stops at immediately before it asks
+    /// whether the authority it was started under still stands for the gate that holds other
+    /// changes off. Returns the end that says the sign-in has arrived, and the end that lets it go.
+    /// The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_the_change_gate(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        self.inner.accounts.before_the_change_gate.arm()
+    }
+
+    /// How many times the gate that holds other changes off was raised.
+    #[cfg(feature = "testing")]
+    pub fn change_gates_raised(&self) -> usize {
+        self.inner
+            .accounts
+            .change_gates
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Starts a sign-in: ends the one that is waiting, whichever account it is of, listens for the
     /// browser's answer and returns when the daemon is ready for it. The address the person opens is in
     /// [`Self::report`].
@@ -895,9 +995,10 @@ impl HostAccount {
             None => false,
         };
         let started: Result<AccountSignInStarted> = async {
-            let listener = match self.listener().await {
+            let listener = match self.listener(stands).await {
                 Ok(listener) => listener,
-                Err(error) => {
+                Err(NoListener::Withheld(error)) => return Err(error),
+                Err(NoListener::Bind(error)) => {
                     let (attempt, detail) = match error {
                         BindError::Busy => (
                             AccountAttempt::PortBusy,
@@ -1049,27 +1150,38 @@ impl HostAccount {
         })
     }
 
-    /// Binds the address a sign-in comes back to.
+    /// Binds the address a sign-in comes back to, where `stands` says the request still stands.
     ///
     /// An address that is refused is tried again for a short while before it is called held. The
     /// daemon's own earlier listener on it has been closed, but the kernel lets the address go only
     /// when the last copy of that socket is closed, and a process that another part of this program
     /// is starting at that moment holds a copy until it has started: on a busy machine that is
-    /// longer than the close.
-    async fn listener(&self) -> std::result::Result<Listener, BindError> {
+    /// longer than the close. `stands` is asked immediately before each try, since a pause between
+    /// tries is a wait in which the request's authority can end, and binding the address takes it
+    /// from whoever else would hold it.
+    async fn listener(&self, stands: Stands<'_>) -> std::result::Result<Listener, NoListener> {
         let mut tries = 0;
         loop {
+            #[cfg(feature = "testing")]
+            self.inner.accounts.before_it_binds.wait().await;
+            stands().map_err(NoListener::Withheld)?;
             match self.bind() {
                 Err(BindError::Busy) if tries < BIND_TRIES => {
                     tries += 1;
                     tokio::time::sleep(BIND_PAUSE).await;
                 }
-                other => return other,
+                Err(error) => return Err(NoListener::Bind(error)),
+                Ok(listener) => return Ok(listener),
             }
         }
     }
 
     fn bind(&self) -> std::result::Result<Listener, BindError> {
+        #[cfg(feature = "testing")]
+        self.inner
+            .accounts
+            .binds
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         #[cfg(feature = "testing")]
         if let Some(address) = *self.inner.loopback.lock().expect("the test address") {
             return Listener::open_at(address, &address.to_string());
@@ -1283,6 +1395,10 @@ impl Inner {
                 detail: "this host's account is being changed; ask again when it has".to_owned(),
             });
         }
+        #[cfg(feature = "testing")]
+        self.accounts
+            .change_gates
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let change = Change { inner: self };
         if self.a_call_is_open() {
             return Err(Self::call_is_open());
@@ -1397,11 +1513,31 @@ impl Inner {
         match held.account.exchange(grant).await {
             Ok(Exchanged::Issued(issued)) => {
                 let refresh = issued.refresh_token.clone();
-                // The account changes now. A call that opened while the exchange was out leaves
-                // the new grant unused: it is revoked, and nothing the call holds changes.
-                // Another change is not one this attempt can be told apart from: a sign-out waits
-                // for an attempt, so only a call can refuse it here.
-                let Ok(_change) = self.begin_change() else {
+                // The account changes now, and the gate that holds other changes off is raised for
+                // it. The authority the sign-in was started under is asked immediately before the
+                // gate is raised, and its guard is held until the gate is up: the exchange was out
+                // and the person was in the browser, and the authority can end in either wait. A
+                // call that opened while the exchange was out leaves the new grant unused: it is
+                // revoked, and nothing the call holds changes. Another change is not one this
+                // attempt can be told apart from: a sign-out waits for an attempt, so only a call
+                // can refuse it here.
+                #[cfg(feature = "testing")]
+                self.accounts.before_the_change_gate.wait().await;
+                let Ok(guard) = lasting() else {
+                    // The authority the sign-in was started under ended while the person was in the
+                    // browser or the exchange was out, so no change is begun: what the service
+                    // issued is revoked, queued before it is sent, and nothing is kept.
+                    if let Err(error) = held.signed_in.revoke_unkept(refresh).await {
+                        eprintln!(
+                            "kr-controller: a withheld sign-in's token was sent to the service, \
+                             but the store failed: {error}"
+                        );
+                    }
+                    return Outcome::withheld(Commit::Withheld);
+                };
+                let change = self.begin_change();
+                drop(guard);
+                let Ok(_change) = change else {
                     // Queued before it is sent, so a service that cannot be reached is told again
                     // when the daemon next starts.
                     if let Err(error) = held.signed_in.revoke_unkept(refresh).await {
