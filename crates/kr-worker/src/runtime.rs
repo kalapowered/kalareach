@@ -555,6 +555,14 @@ struct RuntimePauses {
             std::sync::mpsc::Receiver<()>,
         )>,
     >,
+    /// Where the read loop says the write of a batch to the spool has ended, before it takes the
+    /// session for the discard that write left owed, and what lets it go on.
+    after_spool_write: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     /// Where the recogniser's timer says its deadline has passed, and what lets it go on to
     /// forward what it held.
     at_timer_deadline: Mutex<
@@ -590,6 +598,19 @@ impl RuntimePauses {
         if let Some((arrived, go)) = armed {
             let _ = arrived.send(());
             let _ = go.recv();
+        }
+    }
+
+    /// Waits at the pause after the write of a batch to the spool has ended, where one is armed.
+    async fn after_spool_write(&self) {
+        let armed = self
+            .after_spool_write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.await;
         }
     }
 
@@ -1202,6 +1223,8 @@ impl SessionRuntime {
         let ingest_domain = Arc::clone(&domain);
         let ingest_activity = Arc::clone(&activity);
         let ingest_trace = trace.clone();
+        #[cfg(feature = "testing")]
+        let ingest_pauses = Arc::clone(&progress.pauses);
         let task = tokio::spawn(async move {
             while let Some(event) = output_receiver.recv().await {
                 match event {
@@ -1251,6 +1274,8 @@ impl SessionRuntime {
                                 made
                             })
                             .await;
+                            #[cfg(feature = "testing")]
+                            ingest_pauses.after_spool_write().await;
                             // A write that failed, or was lost with the thread that made it, left
                             // its settlement in the spool, and the session settles it. A discard
                             // of the retained output that met this write in flight left it owed
@@ -1760,6 +1785,31 @@ impl SessionRuntime {
         std::sync::mpsc::Sender<()>,
     ) {
         self.session().pause_next_spool_write()
+    }
+
+    /// Stops the read loop after the next write of a batch to the spool has ended and before it
+    /// takes the session for the discard that write left owed, for this host's own tests.
+    ///
+    /// Returns the end that says the loop has arrived, and the end that lets it go; dropping the
+    /// second lets it go too. The pause fires once. While it holds, the loop makes no discard, so
+    /// any that is made is made by somebody else.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn pause_after_next_spool_write(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (arrived, watch) = tokio::sync::oneshot::channel();
+        let (release, go) = tokio::sync::oneshot::channel();
+        *self
+            .progress
+            .pauses
+            .after_spool_write
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
     }
 
     /// Holds the session on a thread of its own until it is let go, for this host's own tests.

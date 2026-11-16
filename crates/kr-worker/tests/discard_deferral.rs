@@ -390,6 +390,11 @@ async fn the_pump_makes_the_owed_discard_right_after_the_write_it_waited_for() {
 
 /// The privacy call answers complete when the write in flight ends inside its bound: the call
 /// waits for it with nothing held, and its second hold makes the discard.
+///
+/// The pump is stopped between the end of its write and its own hold, and let go only after the
+/// call's answer has been read, so the discard that the answer reports was made by the call's
+/// second hold and by nobody else: a call with no second hold answers that the history is
+/// unavailable, whichever of the two the scheduler runs first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_privacy_call_whose_write_ends_inside_its_bound_answers_complete() {
     let mut host = host(true).await;
@@ -397,6 +402,7 @@ async fn a_privacy_call_whose_write_ends_inside_its_bound_answers_complete() {
         .set_privacy_write_wait(Duration::from_secs(120));
     let mut authority = authority(&host).await;
     let resume = host.with_a_write_in_flight().await;
+    let (pump_arrived, pump_go) = host.runtime.pause_after_next_spool_write();
     let letting_go = {
         let (runtime, resume) = (Arc::clone(&host.runtime), resume.clone());
         tokio::spawn(async move {
@@ -415,6 +421,14 @@ async fn a_privacy_call_whose_write_ends_inside_its_bound_answers_complete() {
         ack.completion
     );
     assert_eq!(host.segments(), 0);
+    assert!(
+        matches!(
+            tokio::time::timeout(LIVENESS, pump_arrived).await,
+            Ok(Ok(()))
+        ),
+        "the pump's write ended and the pump stood at its pause, so it made no discard"
+    );
+    pump_go.send(()).expect("the pump is let go");
 }
 
 /// At its bound the call answers with the completion that lists history as unavailable, and no
@@ -486,8 +500,10 @@ async fn a_maintenance_pass_with_a_write_in_flight_does_not_wait_for_it() {
 }
 
 /// Sustained output does not starve the discard: the output typed while the write is stopped waits
-/// behind it, the pump makes the discard once the write ends and before it takes the next batch,
-/// and none of that output is retained.
+/// behind it, and the discard is made within one cycle of that output, by the pump's hold after the
+/// write or by the appender's gate at the next batch, whichever meets it first, so that none of
+/// that output is retained. The case does not tell the two apart: it proves the bound of one cycle,
+/// and no more.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_discard_is_made_within_one_cycle_of_sustained_output() {
     let mut host = host(false).await;
