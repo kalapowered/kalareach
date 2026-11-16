@@ -790,3 +790,92 @@ async fn a_repeat_close_retries_a_kept_record_through_a_look_that_reads_the_jour
         "the retry recorded the closure the worker wrote, not the record that was kept"
     );
 }
+
+/// A record of this daemon's own that an earlier look kept gives its reason alone. What it says of
+/// the journal, the endpoint and the session's processes is what the look that built it could read,
+/// remove and stop; the look that writes the record has made its own fence pass, and the record
+/// says what that pass found. The first look could not remove the endpoint, so its record says that
+/// nothing was looked for or stopped; the second finds one process ended, and the registry must
+/// hold the first reason, that process listed, and no item of an unfenced look.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kept_record_of_the_daemons_own_gives_its_reason_and_a_later_look_gives_the_rest() {
+    let temp = TempHost::create();
+    let controller = daemon(&temp).await;
+    let session_id = recorded_ended_worker(&controller, &temp).await;
+    let identity = kr_ipc::identity::ended_process_identity(4_000_003);
+    refuse_closures(&controller);
+    let refused = controller
+        .record_final(
+            session_id,
+            ClosureReason::WorkerCrash,
+            &identity,
+            &crate::archive::Fenced::unfenced(session_id, "Permission denied"),
+            Death::ConfirmedBeforeAFence,
+        )
+        .await;
+    assert!(
+        refused.is_err(),
+        "the first look's record is refused by the registry: {refused:?}"
+    );
+    assert!(
+        controller
+            .registry
+            .lock()
+            .await
+            .closure(session_id)
+            .expect("the registry answers")
+            .is_none(),
+        "and the registry holds no closure"
+    );
+
+    // The second look can remove the endpoint and read the journal, which holds no closure, and
+    // its pass sees one process of the session end.
+    written_journal(&controller, session_id, None);
+    take_closures_again(&controller);
+    let ended = crate::archive::Ended {
+        identity: kr_ipc::identity::ended_process_identity(4_000_021),
+        forced: false,
+        root: false,
+    };
+    let mut pass = crate::archive::Fenced::nothing(session_id);
+    pass.ended.push(ended.clone());
+    pass.coverage = OwnershipCoverage::Complete;
+    let written = controller
+        .record_final(
+            session_id,
+            ClosureReason::HostShutdown,
+            &identity,
+            &pass,
+            Death::Confirmed,
+        )
+        .await
+        .expect("the registry takes the record");
+
+    assert_eq!(
+        written.reason,
+        ClosureReason::WorkerCrash,
+        "the reason of the first look's record is the one written: {written:?}"
+    );
+    assert!(
+        written
+            .terminated
+            .iter()
+            .any(|process| process.identity == ended.identity),
+        "the process that this look's pass saw end is listed: {written:?}"
+    );
+    assert!(
+        written.surviving.is_empty(),
+        "and no item of an unfenced look is written: {written:?}"
+    );
+    assert_eq!(written.ownership_coverage, OwnershipCoverage::Complete);
+    assert_eq!(
+        controller
+            .registry
+            .lock()
+            .await
+            .closure(session_id)
+            .expect("the registry answers"),
+        Some(written),
+        "and the registry holds it"
+    );
+}
