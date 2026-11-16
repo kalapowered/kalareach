@@ -1132,31 +1132,41 @@ impl Controller {
         if let Some(existing) = self.registry.lock().await.closure(session_id)? {
             return Ok(existing);
         }
-        // What the worker said of its closure when this daemon asked it to close is its own
-        // account, as it gave it, and it stands whatever this host finds at the worker's end:
-        // an endpoint that cannot be removed, a journal that holds nothing, or a write of it that
-        // failed before. This daemon's own record of a worker that left nothing is never written
-        // over it. A record of its own that an earlier look could not write is the one that is
-        // written again, and not a new one from a new look, so that the registry gets the same
-        // record whichever retry runs first.
-        if let Some((known, whose)) = self.known_record(session_id) {
-            self.write_closure(&known, whose).await?;
-            return Ok(known);
-        }
-        // The worker's own journal is the authority on how its session ended. It recorded the
-        // root's exit status, what it stopped and how much of that it could account for; a record
-        // written from outside knows none of those.
+        // The order of what is written, in one place:
         //
-        // The worker's own journal is read only where the caller established that the worker
-        // ended and has not been told to leave it ([`Death::Confirmed`]). Writing this closure
-        // removes both the registry's worker row and the published descriptor, which are the two
-        // things a later read asks about, so a closure written over an unconfirmed death has to
-        // carry that fact itself - see `surviving` below - and must not open the store on the way.
+        // 1. What the worker said of its closure when this daemon asked it to close is its own
+        //    account, as it gave it, and it stands whatever this host finds at the worker's end:
+        //    an endpoint that cannot be removed, a journal that holds nothing, or a write of it
+        //    that failed before. This daemon's own record of a worker that left nothing is never
+        //    written over it.
+        // 2. The worker's own journal is the authority on how its session ended. It recorded the
+        //    root's exit status, what it stopped and how much of that it could account for; a
+        //    record written from outside knows none of those. It is read only where the caller
+        //    established that the worker ended and has not been told to leave it
+        //    ([`Death::Confirmed`]). Writing this closure removes both the registry's worker row
+        //    and the published descriptor, which are the two things a later read asks about, so a
+        //    closure written over an unconfirmed death has to carry that fact itself - see
+        //    `surviving` below - and must not open the store on the way. A journal that could not
+        //    be read at an earlier look may be read at this one, so it comes before the record
+        //    that the earlier look kept.
+        // 3. A record of this daemon's own that an earlier look could not write, which is written
+        //    again and not replaced by a new one from a new look, so that the registry gets the
+        //    same record whichever retry runs first.
+        // 4. A new record, below.
+        let kept = self.known_record(session_id);
+        if let Some((account, Whose::Worker)) = &kept {
+            self.write_closure(account, Whose::Worker).await?;
+            return Ok(account.clone());
+        }
         if death == Death::Confirmed
             && let Some(recovered) = self.recovered_closure(session_id)
         {
             self.write_closure(&recovered, Whose::Worker).await?;
             return Ok(recovered);
+        }
+        if let Some((own, Whose::Daemon)) = kept {
+            self.write_closure(&own, Whose::Daemon).await?;
+            return Ok(own);
         }
         // Nothing authoritative survived. What is written instead says so: the coverage is
         // incomplete and the root's result is absent rather than invented.
