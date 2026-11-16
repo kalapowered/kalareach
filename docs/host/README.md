@@ -5737,7 +5737,8 @@ each kind.
 
 Content-history retention, description inference, sync production and backup production are disabled
 prospectively, together. What this host holds itself is removed with them: the retained output goes,
-the spool with it, and the content a settled receipt carries (the intent envelope the caller sent
+the spool and the rows of the canonical grid above the live screen with it, and the content a
+settled receipt carries (the intent envelope the caller sent
 and the result the action produced) is taken out of the journal while the receipt's own metadata
 stays, its error message with it (the last list in this section says so). The semantic history each
 agent instance keeps in the worker goes too, and none is recorded while privacy mode is on; what is
@@ -5758,9 +5759,10 @@ archive takes that content out when it recovers or collects the session, whether
 still owes cleanup and whatever the daemon's privacy mode says by then, and it serves no result from
 a journal with such a record before then.
 
-Privacy mode does not reach the canonical grid's own scrollback, which a client can still page
-through, and the last list in this section names other things it leaves. That is not described here
-as though it were done.
+Privacy mode reaches the canonical grid's rows above the live screen as well. The grid gives up the
+rows it held when the mode goes on and keeps none while the mode is on, so a scroll finds no row
+above the live screen. The last list in this section names the live screen, which is not cleared,
+and the other things the steps leave.
 
 A cleanup that could not finish is not a cleanup that finished. A redaction the store refused and
 a spool file this host could not unlink are both content privacy mode was asked to remove and has
@@ -6065,9 +6067,12 @@ what it removes is exactly the thing a person cannot check for themselves.
   of each draft, while the mode is on and after it, and privacy cleanup removes none of this. An
   attachment goes by the transfer sweep, as the [transfer reference](../transfer/README.md) says, and
   a paired device is refused `download.begin`. Sync is the clients' own record.
-* **The canonical grid keeps its scrollback.** Retention stops at the spool and the resident window;
-  the projection's own history is not reached, because removing rows from it while keeping the live
-  screen needs an interface the projection does not have.
+* **The live screen stays as it is.** Turning privacy mode on does not clear or change the screen: a
+  terminal attached to the session, and a paired device, still draw what is on it, and its rows
+  leave it as new output pushes them off. A row that was on the screen when the mode went on is
+  given up when it leaves the screen, and so is a row printed while the mode is on. A row that is on
+  the screen when the mode goes off is given up in the same way when it leaves the screen. The grid
+  keeps rows again from the first row that comes onto the screen after that.
 * **Application notices keep their content.** A notification's title and body are written to the
   host-event store, and privacy cleanup removes neither the rows already there nor later ones.
 * **An invitation keeps what its issuer was shown.** `grant.create` stores the visible lines of a
