@@ -85,6 +85,13 @@ struct FenceState {
     leases: BTreeMap<u64, u64>,
 }
 
+/// The fence's own lock, held by a test.
+#[cfg(feature = "testing")]
+#[derive(Debug)]
+pub struct FenceHeld<'a> {
+    _state: MutexGuard<'a, FenceState>,
+}
+
 #[derive(Debug)]
 struct Current {
     connection_id: ConnectionId,
@@ -345,6 +352,16 @@ impl AttentionFence {
         state.transitions = state.transitions.saturating_add(1);
         let connection_id = state.current.as_ref().map(|current| current.connection_id);
         Self::statement(&mut state, connection_id, generation)
+    }
+
+    /// Takes the fence's own lock and holds it until the guard is dropped, for the host's own
+    /// tests: what a statement holds while it reads the journal. It is compiled away in every
+    /// shipped build.
+    #[cfg(feature = "testing")]
+    pub fn hold_for_tests(&self) -> FenceHeld<'_> {
+        FenceHeld {
+            _state: self.state(),
+        }
     }
 
     /// Returns whether a transition is in progress.

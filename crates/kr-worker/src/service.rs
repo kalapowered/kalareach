@@ -650,6 +650,28 @@ pub struct WorkerService {
     /// away in every shipped build.
     #[cfg(feature = "testing")]
     maintenance_passes: std::sync::atomic::AtomicU64,
+    /// How many requests wait for the dispatch boundary now: mutations, then the second passes of
+    /// prepared actions. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    boundary_waiting: [std::sync::atomic::AtomicUsize; 2],
+    /// The longest pause, in milliseconds, that any wait for the dispatch boundary asked its timer
+    /// for. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    largest_boundary_step_ms: std::sync::atomic::AtomicU64,
+    /// A pause inside the dispatch boundary before the look at the peer, for the next mutation or
+    /// prepared action that takes it, which this host's own tests arm. It is compiled away in every
+    /// shipped build.
+    #[cfg(feature = "testing")]
+    look_pause: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
+    /// What the owner of the clean-ups' work has done: rejections, detaches and unbinds, one count
+    /// for each entry it took. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    owed_done: [std::sync::atomic::AtomicU64; 3],
     /// A pause inside the dispatch boundary for the next presentation that takes it, which this
     /// host's own tests arm. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -851,10 +873,10 @@ enum Tried<T> {
 /// A presentation that is waiting for the dispatch boundary, counted for as long as it waits. It is
 /// compiled away in every shipped build.
 #[cfg(feature = "testing")]
-struct PresentationWaiting<'a>(&'a std::sync::atomic::AtomicUsize);
+struct WaitingCount<'a>(&'a std::sync::atomic::AtomicUsize);
 
 #[cfg(feature = "testing")]
-impl<'a> PresentationWaiting<'a> {
+impl<'a> WaitingCount<'a> {
     fn begin(count: &'a std::sync::atomic::AtomicUsize) -> Self {
         count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Self(count)
@@ -862,7 +884,7 @@ impl<'a> PresentationWaiting<'a> {
 }
 
 #[cfg(feature = "testing")]
-impl Drop for PresentationWaiting<'_> {
+impl Drop for WaitingCount<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
@@ -1251,6 +1273,21 @@ impl WorkerService {
             presentations_begun: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "testing")]
             presentation_boundary_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            boundary_waiting: [
+                std::sync::atomic::AtomicUsize::new(0),
+                std::sync::atomic::AtomicUsize::new(0),
+            ],
+            #[cfg(feature = "testing")]
+            largest_boundary_step_ms: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "testing")]
+            look_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            owed_done: [
+                std::sync::atomic::AtomicU64::new(0),
+                std::sync::atomic::AtomicU64::new(0),
+                std::sync::atomic::AtomicU64::new(0),
+            ],
             #[cfg(feature = "testing")]
             maintenance_passes: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "testing")]
@@ -1759,6 +1796,89 @@ impl WorkerService {
     ) -> usize {
         self.presentations_waiting[presentation_role_slot(role)]
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many mutations wait for the dispatch boundary now, for this host's own tests: each is a
+    /// request whose peer has not been answered and has not gone.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn mutations_waiting_for_tests(&self) -> usize {
+        self.boundary_waiting[0].load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many prepared actions wait for the dispatch boundary now, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn prepared_waiting_for_tests(&self) -> usize {
+        self.boundary_waiting[1].load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The longest pause any wait for the dispatch boundary asked its timer for so far, for this
+    /// host's own tests. It is what the wait requested and not how long anything took.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn largest_boundary_step_for_tests(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.largest_boundary_step_ms
+                .load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
+    /// Stops the next mutation or prepared action inside the dispatch boundary, the moment it
+    /// holds it and before it asks whether its peer has gone, for this host's own tests.
+    ///
+    /// Returns the end that says the request has arrived, and the end that lets it go. The pause
+    /// fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_the_look(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (arrived, watch) = std::sync::mpsc::sync_channel(1);
+        let (release, go) = std::sync::mpsc::sync_channel(1);
+        *self.look_pause.lock().expect("the pause is not poisoned") = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Waits at the pause above, where one is armed. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    fn wait_before_the_look(&self) {
+        let armed = self
+            .look_pause
+            .lock()
+            .expect("the pause is not poisoned")
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.recv();
+        }
+    }
+
+    /// Takes the attention fence's own lock and holds it until the guard is dropped, for this
+    /// host's own tests: what a statement holds while it reads the journal.
+    ///
+    /// The guard is taken on the calling thread and has to be dropped on it.
+    #[cfg(feature = "testing")]
+    pub fn hold_the_attention_fence_for_tests(&self) -> crate::attention_fence::FenceHeld<'_> {
+        self.attention_fence.hold_for_tests()
+    }
+
+    /// The attention connection the fence speaks through now, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn attention_connection_for_tests(&self) -> Option<ConnectionId> {
+        self.attention_fence.current_connection()
+    }
+
+    /// How many rejections, detaches and unbinds the owner has done, for this host's own tests: one
+    /// count for each entry it took, so an entry done twice shows as two.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn owed_done_for_tests(&self) -> (u64, u64, u64) {
+        let count = |slot: usize| self.owed_done[slot].load(std::sync::atomic::Ordering::SeqCst);
+        (count(0), count(1), count(2))
     }
 
     /// How many connections this worker is serving now, for this host's own tests.
@@ -2545,6 +2665,8 @@ impl WorkerService {
             let _ = tokio::task::spawn_blocking(move || {
                 for connection_id in owed {
                     service.unbind(connection_id);
+                    #[cfg(feature = "testing")]
+                    service.owed_done[2].fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
             })
             .await;
@@ -2560,8 +2682,14 @@ impl WorkerService {
                     actor_id,
                     action_id,
                     revision,
-                } => Self::reject_abandoned(&mut session, actor_id, action_id, Some(revision)),
+                } => {
+                    Self::reject_abandoned(&mut session, actor_id, action_id, Some(revision));
+                    #[cfg(feature = "testing")]
+                    self.owed_done[0].fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 SessionWork::Detach(attachment_id) => {
+                    #[cfg(feature = "testing")]
+                    self.owed_done[1].fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let _ = session.detach(attachment_id);
                     // The fence this detach moved, and any terminator it produced, reach the
                     // writer here.
@@ -4921,7 +5049,7 @@ impl WorkerService {
         #[cfg(feature = "testing")]
         let _decided = off_the_executor(|| self.wait_before_presentation());
         #[cfg(feature = "testing")]
-        let waiting = PresentationWaiting::begin(
+        let waiting = WaitingCount::begin(
             &self.presentations_waiting[presentation_role_slot(state.facts.controller_role)],
         );
         let decided = self
@@ -4950,6 +5078,11 @@ impl WorkerService {
                 Tried::PeerGone => return None,
                 Tried::Held => {}
             }
+            #[cfg(feature = "testing")]
+            self.largest_boundary_step_ms.fetch_max(
+                u64::try_from(pause.as_millis()).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::SeqCst,
+            );
             tokio::select! {
                 () = &mut released => {}
                 () = tokio::time::sleep(pause) => {
@@ -5029,6 +5162,8 @@ impl WorkerService {
         // The wait for the session and the commits are the body's, so only the body leaves the
         // executor.
         off_the_executor(|| {
+            #[cfg(feature = "testing")]
+            self.wait_before_the_look();
             // Asked again now that the boundary is held, before anything is read or written for
             // this request: a peer that went since the last try is not answered, and no receipt,
             // effect or answer is made for it. This narrows the window and cannot close it, since
@@ -5052,6 +5187,8 @@ impl WorkerService {
             return Self::after_a_failed_try(state);
         };
         off_the_executor(|| {
+            #[cfg(feature = "testing")]
+            self.wait_before_the_look();
             // Asked again now that the boundary is held, before the action's receipt is read or
             // changed: a peer that went since the last try is not answered, and the action is
             // rejected by the caller of this try, not dispatched.
@@ -6384,12 +6521,16 @@ impl WorkerService {
         // the session is for whatever else holds it: a thread that is in it is not one the
         // recogniser's timer, or any other task, can be run on.
         self.wait_before_the_boundary();
-        let Some(dispatched) = self
+        #[cfg(feature = "testing")]
+        let waiting = WaitingCount::begin(&self.boundary_waiting[0]);
+        let waited = self
             .wait_for_the_boundary(|| {
                 self.receipt_once(state, mutation, method, entry, caller, freshness)
             })
-            .await
-        else {
+            .await;
+        #[cfg(feature = "testing")]
+        drop(waiting);
+        let Some(dispatched) = waited else {
             // No receipt, no effect and no answer: the connection ends.
             state.ended = true;
             return None;
@@ -6538,9 +6679,13 @@ impl WorkerService {
         ready: ReadyPreparation,
     ) -> Option<ControlFrame> {
         let mut held = Some(ready);
+        #[cfg(feature = "testing")]
+        let waiting = WaitingCount::begin(&self.boundary_waiting[1]);
         let finished = self
             .wait_for_the_boundary(|| self.prepared_once(state, &mut held))
             .await;
+        #[cfg(feature = "testing")]
+        drop(waiting);
         let Some((pending, dispatched)) = finished else {
             if let Some(ready) = held.take() {
                 self.abandon_prepared(ready);
