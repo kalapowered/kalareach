@@ -728,8 +728,8 @@ fn named_daemon(environment: &EnvironmentPaths) -> Option<u64> {
         .map(|holder| holder.pid.get())
 }
 
-/// Whether a daemon holds the environment's lock, which the kernel gives up only when its process
-/// has gone. The look takes the lock for a moment, so a daemon that starts during it can find the
+/// Whether a daemon holds the environment's lock, which the kernel gives up when its process has
+/// gone and the daemon when it lets the environment go first. The look takes the lock for a moment, so a daemon that starts during it can find the
 /// lock taken and exit; only [`Installation::held`] in a store keeps a start out of that moment,
 /// by the install lock that a daemon's start holds.
 fn lock_held(environment: &EnvironmentPaths) -> std::result::Result<bool, Shown> {
@@ -1154,8 +1154,8 @@ fn unreached(id: EnvironmentId, error: &kr_ipc::IpcError, _cause: Unmade) -> Cli
 }
 
 /// The failure of a request that could not be made: what was not made and that the stop was not
-/// asked. A daemon's answer or this side's own fault makes it, and the words are the failure's
-/// own; `Unmade` says which.
+/// asked. A daemon's answer, this side's own fault or a connect that found nothing listening makes
+/// it, and the words are the failure's own; `Unmade` says which.
 fn unmade_request(id: EnvironmentId, why: &Shown, _cause: Unmade) -> CliError {
     CliError::HostUnavailable(shown!(
         "kr host stop could not make its request for the control daemon of environment {}: {}. \
@@ -1633,8 +1633,9 @@ async fn host_info(
 /// lock file names a live process named kr-controller that is not the old one, or a daemon of
 /// another generation answers. Anything else that holds the lock for a moment, another command's
 /// look among it, is waited through. Where no identity is known (always on Windows, where the
-/// holder cannot be read), the daemon has ended when the lock is free and nothing answers at its
-/// endpoint, and the command cannot name or wait for the process itself.
+/// holder cannot be read), or the system does not say whether the process runs, the daemon has
+/// ended when the lock is free and nothing answers at its endpoint, and the command cannot name or
+/// wait for the process itself.
 ///
 /// Each wait is bounded by what is left of the one deadline when it starts, counted after the wait
 /// before it: the install lock's wait, a look at the endpoint and the pause between two rounds. A
@@ -3193,9 +3194,11 @@ mod tests {
         assert_eq!(before_said(&before), the_end_said_for(id, Some(4000), &cut));
     }
 
-    /// Where the retry's connection finds nothing listening and the lock is held past the bound, no
-    /// daemon has answered anything: the command's result is its silence (exit 1), after the whole
-    /// bound, and never the failure of an answered request.
+    /// Where the retry's connection finds nothing listening and the end is not shown past the bound,
+    /// no daemon has answered anything: the decision is silence, with no connection accepted, after
+    /// the whole bound, and never the failure of an answered request. What the command says of it
+    /// then depends on the lock: exit 1 where it is held, exit 3 where it is not (the case below
+    /// and `a_connect_that_found_nothing_listening_is_no_connection_that_did_not_answer`).
     #[tokio::test(start_paused = true)]
     async fn nothing_listening_with_the_lock_held_past_the_bound_is_silence() {
         let process = asked_process();
@@ -3214,7 +3217,7 @@ mod tests {
                 the_deadline(),
             )
             .await;
-            assert_eq!(before_said(&before), "silent", "{kind:?}");
+            assert_eq!(before_said(&before), "silent, nothing accepted", "{kind:?}");
             assert_eq!(supplied.start.elapsed(), END_BOUND, "{kind:?}");
         }
     }
