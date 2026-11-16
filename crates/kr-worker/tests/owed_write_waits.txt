@@ -1,0 +1,55 @@
+# The calls of the four ways to append output and of every wait for the write that is in flight, and
+# the history's readers. Held in both directions by owed_write_waits.rs; what the scan cannot see is
+# said in its header.
+#
+# site <file> <function> <callee> <how many calls>
+# reader <method> via <standing | the method it answers through>
+# exempt <method> <why a completed discard leaves it as it is>
+
+# The one appender: the pump calls the session's entry point, which calls the history's, which waits
+# for its own earlier write at its head. The history's `append` calls the same entry point and has
+# no shipped caller outside it; `Session::ingest_output` has none.
+site crates/kr-worker/src/runtime.rs start_and_say_if_the_shell_ended ingest_output_deferring_the_spool 1
+site crates/kr-worker/src/session.rs ingest_output ingest_output_deferring_the_spool 1
+site crates/kr-worker/src/session.rs ingest_output_deferring_the_spool append_deferred 1
+site crates/kr-worker/src/history.rs append append_deferred 1
+site crates/kr-worker/src/history.rs append_deferred wait_for_owed_write 1
+
+# The waits for the write in flight. `wait_idle` has one caller, the appender's own wait. The test
+# helpers wait with the session held and are compiled only with the testing feature. The privacy
+# call's wait is bounded and holds no lock of the session's, which this scan does not see.
+site crates/kr-worker/src/history.rs wait_for_owed_write wait_idle 1
+site crates/kr-worker/src/history.rs wait_for_the_spool_write wait_for_owed_write 1
+site crates/kr-worker/src/session.rs wait_for_the_spool_write wait_for_the_spool_write 1
+site crates/kr-worker/src/runtime.rs wait_for_the_spool_write wait_for_the_spool_write 1
+site crates/kr-worker/src/history.rs wait_idle_for wait_idle_for 1
+site crates/kr-worker/src/service.rs take_privacy wait_idle_for 1
+
+# Other types that have a method named `append`, so that a new `append` anywhere is listed.
+site crates/kr-worker/src/history.rs append_deferred append 1  # the spool's own append, which the history makes under the session
+site crates/kr-worker/src/history.rs resume append 1  # the spool's own append, in the resumption of a stopped spool
+site crates/kr-worker/src/history.rs open_segment append 1  # the open options of a segment file
+site crates/kr-worker/src/output_times.rs flush append 1  # a vector's own append
+site crates/kr-worker/src/broker/semantic.rs append_reported append 1  # the semantic log, which is not a history
+site crates/kr-worker/src/broker/mod.rs note append 1  # the semantic log
+site crates/kr-worker/src/broker/mod.rs observe append 1  # the semantic log
+
+# The history's readers.
+reader time_index via standing
+reader flush_times via standing
+reader oldest_retained_cursor via standing
+reader suspended via standing
+reader holes via standing
+reader retained_bytes via standing
+reader oldest_written_at_ms via standing
+reader page via standing
+reader page_within via page
+reader page_without_files via page_within
+exempt next_cursor it is the session's own position, which a discard leaves
+exempt awaits_the_host_cap_lock it is about the host's cap, which a discard leaves
+exempt left_behind it is what the last retention pass left, which a discard does not touch
+exempt boundary_unreadable it is set when the session opens and no discard clears it
+exempt evictions it is what retention took, which a discard does not touch
+exempt spool_peak_bytes it is the most the spool held, which a discard does not touch
+exempt discard_deferred it says whether a discard met a write in flight, and holds no retained output
+exempt deferred_discard_watch it hands out a watch on the write in flight, and holds no retained output
