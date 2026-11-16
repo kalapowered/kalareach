@@ -540,9 +540,16 @@ impl Controller {
         };
         match closure {
             Some(closure) => encode(&answer_of_record(&closure)),
-            None => Err(ControllerError::UnknownSession {
-                session: session_id.to_string(),
-            }),
+            // A read that found no record can have waited while one was kept: the account of a
+            // worker's answer, or this daemon's own record of a worker that ended, which the
+            // registry then refused. What this daemon knows now is the answer, and not that the
+            // session is unknown.
+            None => match self.known_closure(session_id) {
+                Some(known) => encode(&known),
+                None => Err(ControllerError::UnknownSession {
+                    session: session_id.to_string(),
+                }),
+            },
         }
     }
 
