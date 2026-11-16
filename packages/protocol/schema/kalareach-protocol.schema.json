@@ -38473,6 +38473,10 @@
           ],
           "description": "The endpoint a local client can attach to, while the session is running."
         },
+        "held": {
+          "description": "Whether this answer was given while the session was held by a storage call.\n\nA worker whose session is held longer than it waits for it answers from what it keeps\noutside the session: the work and launch counts are what the worker last recorded, and the\nmembers that need the session are null. The daemon's sleep scan reads this member and no\nother reader does: it never lowers what it counted for a session on such an answer.\n\nAbsent from the wire when false, and from a worker of a release that wrote no such member,\nso a result of one is byte for byte what that release reads and reads as one given with the\nsession taken. The daemon's own answer to `session.read` never carries it.",
+          "type": "boolean"
+        },
         "last_command_block": {
           "anyOf": [
             {

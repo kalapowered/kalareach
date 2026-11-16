@@ -381,6 +381,22 @@ pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
                  lane. A worker of the retained level does not state it, so the daemon never \
                  declares the role to one. Nothing at this level sends it.",
         },
+        Compatible {
+            at: "SessionReadResult.held",
+            reason: "A member that is absent from the wire unless this build's worker answered a \
+                 read of its session while a storage call held the session, and a worker of the \
+                 retained level never writes it, so this build's daemon reads what that level \
+                 writes as an answer given with the session taken, which is what that level's \
+                 worker gave. A result that carries the member is written only by a worker of \
+                 this build. The daemon's sleep scan is its one reader: it never lowers what it \
+                 counted for the session on such an answer. The daemon's own answer to a client \
+                 never carries it. The retained level's daemon, whose result is a closed object, \
+                 cannot read a result that carries the member and takes the answer for a read \
+                 that failed, which is what it takes a read that is not answered for; its scan \
+                 keeps what it counted, as it does then. No client was released, so there is no \
+                 shim: the public contract may change with a level move until public 1.0 freezes \
+                 at the first client release (`docs/releases/packages.md`).",
+        },
     ],
 )
 .with_public_majors(include_str!("../retained/0.78/PUBLIC_MAJORS"))];

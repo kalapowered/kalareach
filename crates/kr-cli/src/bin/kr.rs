@@ -2309,6 +2309,7 @@ fn read_result(
                 last_command_block: Nullable::null(),
                 outstanding_launches: Nullable::null(),
                 metrics: None,
+                held: false,
             }),
             Err(_) => Err(CliError::Other(shown!(
                 "the host's answer could not be read: {}",
