@@ -1850,14 +1850,33 @@ async fn several_living_proxy_presentations_stay_admitted_through_a_hold_and_go_
     );
 }
 
+/// What one mutating client has sent and what has been answered to it: a mutation is counted as sent
+/// before it is written, and as answered when its answer has been read.
+#[derive(Default)]
+struct Progress {
+    sent: std::sync::atomic::AtomicU64,
+    answered: std::sync::atomic::AtomicU64,
+}
+
+impl Progress {
+    fn sent(&self) -> u64 {
+        self.sent.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn answered(&self) -> u64 {
+        self.answered.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// One local client that attaches a terminal and detaches it again, back to back, until `stop` is
-/// set: each is a mutation, and each takes the dispatch boundary. It counts the mutations it made.
+/// set: each is a mutation, and each takes the dispatch boundary. It counts what it sent and what
+/// was answered.
 async fn mutating(
     endpoint: kr_ipc::paths::Endpoint,
     environment_id: kr_protocol::ids::EnvironmentId,
     session_id: SessionId,
     stop: Arc<std::sync::atomic::AtomicBool>,
-    made: Arc<std::sync::atomic::AtomicU64>,
+    progress: Arc<Progress>,
 ) {
     use kr_protocol::attachment::{
         AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
@@ -1879,6 +1898,9 @@ async fn mutating(
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
         let mut requested = kr_protocol::scalars::CanonicalSet::new();
         requested.insert(AttachmentCapability::ObserveTerminal);
+        progress
+            .sent
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let attached: SessionAttachResult = client
             .mutate(
                 Method::SessionAttach,
@@ -1898,6 +1920,12 @@ async fn mutating(
             .expect("the terminal attaches")
             .to_typed()
             .expect("decodes");
+        progress
+            .answered
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        progress
+            .sent
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         client
             .mutate(
                 Method::SessionDetach,
@@ -1911,7 +1939,9 @@ async fn mutating(
             .await
             .expect("reaches the worker")
             .expect("detaches");
-        made.fetch_add(2, std::sync::atomic::Ordering::SeqCst);
+        progress
+            .answered
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -1932,17 +1962,21 @@ async fn await_state(what: &str, mut ready: impl FnMut() -> bool) {
 /// and is decided once they stop.
 ///
 /// Four local clients attach and detach back to back, so the boundary is free only between one
-/// mutation and the next. The stream is under way when the presentation comes, and its first try
-/// finds the boundary held. The case shows that, while the stream goes on, the presentation stays
-/// eligible: it tries at the releases, and its tries advance by twenty or it is decided at one of
-/// them. Then the stream stops, and the case shows that the presentation is decided, the boundary
-/// being free. It waits for that for as long as the suite waits for a state that must come, which
-/// is a guard against a hang and no time that the presentation is promised.
+/// mutation and the next. The case holds the boundary itself first, and starts the presentation,
+/// whose first try finds it held whatever the machine does. It starts the clients under the hold:
+/// every mutation takes the boundary, so none can be answered before the release, and the case
+/// waits until each of the four has sent one. It then lets the boundary go, and the stream goes on.
+/// The case shows that, while the stream goes on, the presentation stays eligible: it tries again,
+/// at a release or at its pause, and its tries advance by twenty or it is decided at one of them.
+/// Then the stream stops, and the case shows that the presentation is decided once it has stopped.
+/// It waits for that, and for each wait of its own, for as long as the suite waits for a state that
+/// must come, which is a guard against a hang and no time that the presentation is promised.
 ///
 /// It does not show that a stream cannot keep the presentation out. The boundary is an ordinary
 /// lock, and a release makes the presentation eligible and promises it nothing: where a mutation
 /// always waits, a presentation can find the boundary taken at every try for as long as the stream
-/// goes on, and how often it gets in depends on how fast the machine runs. The wake is shown by
+/// goes on, and whether and how soon it gets in depends on the lock's policy and on how fast the
+/// machine runs. The wake is shown by
 /// `a_living_presentation_is_decided_in_a_gap_shorter_than_its_pause`.
 ///
 /// The runtime is the case's own, so that a mutation that never ends, which holds a thread of it,
@@ -1964,29 +1998,10 @@ fn a_living_presentation_keeps_trying_through_mutations_and_is_decided_when_they
 }
 
 async fn presentation_keeps_trying_through_mutations() {
-    let host = host(1).await;
+    // The session's command outlives every wait of the case: the worker closes a session whose
+    // command has ended, and the clients' attaches would then fail. The host's drop ends it.
+    let host = host_producing(1, "sleep 3600").await;
     let service = &host.service;
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let made = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let streams: Vec<_> = (0..4)
-        .map(|_| {
-            let (stop, made) = (Arc::clone(&stop), Arc::clone(&made));
-            tokio::spawn(mutating(
-                host.endpoint.clone(),
-                host.environment_id,
-                host.session_id,
-                stop,
-                made,
-            ))
-        })
-        .collect();
-    await_state("twenty mutations of the stream", || {
-        made.load(std::sync::atomic::Ordering::SeqCst) >= 20
-    })
-    .await;
-
-    // The stream's mutations wait behind the case's own hold, so the presentation's first try finds
-    // the boundary held whatever the machine does, and the stream goes on at the release.
     let boundary = Held::boundary(&host).await;
     let first = service.presentation_tries_for_tests();
     let living = presenting(&host, 1);
@@ -1999,22 +2014,52 @@ async fn presentation_keeps_trying_through_mutations() {
         1,
         "the presentation waits for the held boundary"
     );
+
+    // Each client has sent a mutation that nothing can answer while the boundary is held. This is
+    // what the clients' own counts show: it does not show the worker's wait for the boundary.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let progress: Vec<Arc<Progress>> = (0..4).map(|_| Arc::default()).collect();
+    let streams: Vec<_> = progress
+        .iter()
+        .map(|progress| {
+            tokio::spawn(mutating(
+                host.endpoint.clone(),
+                host.environment_id,
+                host.session_id,
+                Arc::clone(&stop),
+                Arc::clone(progress),
+            ))
+        })
+        .collect();
+    await_state(
+        "a mutation of each of the four clients, sent while the boundary is held",
+        || progress.iter().all(|client| client.sent() >= 1),
+    )
+    .await;
+    assert!(
+        progress.iter().all(|client| client.answered() == 0),
+        "no mutation is answered while the boundary is held"
+    );
     boundary.release();
 
-    // While the stream goes on, the presentation tries again at the releases, or has been decided
-    // at one of them.
+    // While the stream goes on, the presentation tries again, or has been decided at a release.
     let released = service.presentation_tries_for_tests();
     await_state(
-        "twenty more tries of the presentation while mutations take the boundary",
+        "twenty more tries of the presentation, or its decision, after the release",
         || living.is_finished() || service.presentation_tries_for_tests() >= released + 20,
     )
     .await;
+    let made = || progress.iter().map(|client| client.answered()).sum::<u64>();
+    await_state("twenty mutations answered after the release", || {
+        made() >= 20
+    })
+    .await;
     let tries = service.presentation_tries_for_tests();
-    let during = made.load(std::sync::atomic::Ordering::SeqCst);
+    let during = made();
     let early = living.is_finished();
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
 
-    // The stream has stopped, and the boundary is free.
+    // The stream has stopped: each client ends its pair, and the boundary is then free.
     let (mut link, answer) = tokio::time::timeout(WAIT, living)
         .await
         .unwrap_or_else(|_| {
