@@ -1186,10 +1186,7 @@ impl WorkerService {
                 Arc::clone(&broker),
                 Arc::clone(&questions),
                 journal_changes.clone(),
-                move || crate::questions::Now {
-                    utc_ms: kr_ipc::now_ms(),
-                    boot_ms: clock.boot_elapsed_ms(),
-                },
+                clock,
                 wall,
             ));
             evidence.0 = Some(following.abort_handle());
