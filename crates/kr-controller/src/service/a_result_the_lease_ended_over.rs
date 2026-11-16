@@ -18,7 +18,7 @@ use kr_protocol::ids::RequestId;
 use kr_protocol::method::Method;
 
 use crate::given::local_door::WrittenUnder;
-use crate::service::Controller;
+use crate::service::{Ask, Controller, Lapse, LeasedLapse};
 
 /// The request the answer in these tests is to.
 const REQUEST: RequestId = RequestId::new(7);
@@ -685,34 +685,28 @@ async fn a_sign_in_ask_whose_bound_moves_to_a_lineage_that_ended_at_the_new_read
 }
 
 /// KR-REQ-17.54: the guard that a sign-in's ask gives holds the host and the footing the question
-/// was asked with, the lease's bound among them, until it is let go: the ask is made through it and
-/// nothing it holds is let go of between the question and the write that follows. The footing is
-/// counted through the host's copies that it holds, and the host through its own count.
+/// was asked with, the lease's bound among them. The case counts no reference, since the count of
+/// the host's references is moved by tasks of the daemon: it asks the question through the guard
+/// again. While the lease lives the guard's own question passes. After the lease's end the same
+/// question is refused in the lease's words, which only a guard that holds the footing and the
+/// bound it was asked with can do; a guard that held none, or a footing with no bound, lets it
+/// through. And the guard holds the host.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_guard_of_a_sign_in_ask_holds_the_host_and_the_footing_it_asked_with() {
-    let (_temp, controller, _continuous, _writer, _reader) = connected_under_a_lease().await;
+    let (_temp, controller, continuous, _writer, _reader) = connected_under_a_lease().await;
     let lasting = controller.sign_in_lasting(Method::AccountSignIn);
-    let host_before = Arc::strong_count(&controller);
-    let copies_before = Arc::strong_count(&controller.copies);
-    let guard = tokio::task::spawn_blocking(move || {
-        let guard = lasting().expect("the ask passes");
-        (lasting, guard)
-    })
-    .await
-    .expect("the ask ends");
-    let (lasting, guard) = guard;
+    let guard = tokio::task::spawn_blocking(move || lasting())
+        .await
+        .expect("the ask ends")
+        .expect("the ask passes");
+    assert!(guard.holds_the_host(), "the guard holds the host");
+    guard
+        .ask(Ask::SIGN_IN)
+        .expect("the control: while the lease lives the guard's question passes");
+    continuous.advance(std::time::Duration::from_secs(16 * 60));
     assert_eq!(
-        Arc::strong_count(&controller),
-        host_before + 1,
-        "the guard holds the host"
+        guard.ask(Ask::SIGN_IN),
+        Err(LeasedLapse::Lapse(Lapse::LeaseEnded)),
+        "the guard holds the footing and the bound that it was asked with"
     );
-    assert_eq!(
-        Arc::strong_count(&controller.copies),
-        copies_before + 1,
-        "the guard holds the footing the question was asked with"
-    );
-    drop(guard);
-    assert_eq!(Arc::strong_count(&controller), host_before);
-    assert_eq!(Arc::strong_count(&controller.copies), copies_before);
-    drop(lasting);
 }
