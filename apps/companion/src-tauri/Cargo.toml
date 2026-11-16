@@ -67,6 +67,8 @@ kr-protocol.workspace = true
 kr-transport.workspace = true
 # The connection type the budget of dials to a paired host passes through to the link it wraps.
 iroh.workspace = true
+# The set of calls that a terminal view's loop owns and polls before it takes its next command.
+futures-util = { workspace = true, features = ["alloc"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

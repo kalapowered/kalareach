@@ -1,25 +1,35 @@
 //! One raw terminal view's task: its link to the session's worker, its attachment, the screen the
 //! client library holds for it, and the size it reports.
 //!
-//! The task opens the link, attaches and subscribes, and then reads the link in one loop, the way
-//! the CLI's attach loop does: every report and resubscription is written without waiting for its
-//! answer, and the answer is matched by its request number when it arrives. A call that waited
-//! would let an answer to another call arrive first, and would keep the page's own close waiting on
-//! the host.
+//! The task opens the link, a session of the client library in the ordered mode that this view
+//! alone consumes, attaches and subscribes, and then serves it in one loop: every report and
+//! resubscription is a call whose future the loop owns and polls before it takes the next command,
+//! and the answer is matched by the view's own number for the call when its future completes. The
+//! loop never awaits a call inside a command, which would keep the page's own close waiting on the
+//! host.
 //!
 //! The view reports its size and where the page moved its window, one report at a time, through
 //! [`WindowReports`]: each report is settled by the screen its answer names, and the page is told a
 //! move is settled only with a screen that holds it.
 //!
 //! It takes control of the program when the person asks, and writes the wheel turns, keys, text
-//! and pastes they make under the input lease, through [`Lease`]. Each key is spelled by the
+//! and pastes they make under the input lease, through [`Lease`], on the session's input lane. A
+//! release, a detach and a launch stand behind the typing they follow: on a link that carries the
+//! typing as requests they are queued behind it, and on a link with a stream of its own they take
+//! the lane's mark first. Each key is spelled by the
 //! shared key encoder in the encoding the screen it holds says the program reads (`keys`); a
 //! screen that says the program reads a form the view does not produce ends control at once. A
 //! change of control is told to the page at once.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use kr_client::error::HostWord;
+use futures_util::future::BoxFuture;
+use futures_util::stream::FuturesUnordered;
+use futures_util::{FutureExt as _, StreamExt as _};
+use kr_client::error::{ClientError, HostWord};
+use kr_client::input::{EndCause, InputEvent, InputEvents, InputLane, InputRefusal, InputTarget};
+use kr_client::ordered::Ordered;
 use kr_client::projection::{Applied, Projection, decode, is_projection_event};
 use kr_client::shown::Shown;
 use kr_keys::{KeyEventKind, Modifiers};
@@ -27,18 +37,16 @@ use kr_protocol::attachment::{
     AttachMode, AttachmentCapability, AttachmentSummary, AttachmentViewportParams,
     AttachmentViewportResult, SessionAttachParams, SessionAttachResult, SessionDetachParams,
 };
-use kr_protocol::envelope::{
-    ActionTarget, ControlFrame, Notification, Outcome, ParamsValue, Request, Response,
-};
+use kr_protocol::envelope::{ActionTarget, Notification, Outcome, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::hello::PACKAGE_VERSION;
-use kr_protocol::ids::{BuildId, GrantId, RequestId, SessionId};
-use kr_protocol::input::{InputAcquireParams, InputContent, InputReleaseParams, InputWriteParams};
+use kr_protocol::ids::{BuildId, GrantId, InputLeaseEpoch, RequestId, SessionId};
+use kr_protocol::input::{InputAcquireParams, InputBarrier, InputReleaseParams};
 use kr_protocol::local::LocalBuild;
-use kr_protocol::method::{Method, MethodVersion};
+use kr_protocol::method::Method;
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
 use kr_protocol::root::{ShellLaunchResult, ShellLaunchSurfaceParams, ShellLaunchSurfaceResult};
-use kr_protocol::scalars::{Bytes, CanonicalSet, Nullable, U64};
+use kr_protocol::scalars::{CanonicalSet, Nullable, U64};
 use kr_protocol::session::{
     Dimensions, SESSION_CLOSED_EVENT, SessionReadParams, SessionReadResult,
 };
@@ -51,9 +59,9 @@ use crate::launch::{LaunchSurfaceAnswer, Press};
 
 use super::input::{Input, Lease, Owed, PROFILE, Refused, wheel_reports};
 use super::keys::{self, KeyAction, Keyboard, Pressed, TypedKey};
+use super::link::{self, Answered, Events, Link, Lost, REFUSAL_WAIT};
 use super::screen::{TerminalViewState, state_of};
 use super::window::{Answer, WindowReports};
-use super::wire::{Lost, Paired, Wire};
 use super::{Locate, Publish};
 
 /// What the page asks of a view once it is open.
@@ -95,12 +103,6 @@ const LAUNCH_UNANSWERED: &str =
 /// again.
 const RECOVERIES: u32 = 3;
 
-/// The first request number the view's own loop uses.
-///
-/// Numbered apart from the ones the client library gave the attach and the subscription, so an
-/// answer the loop reads is never taken for an answer to one of those.
-pub(super) const LOOP_REQUESTS: u64 = 1 << 32;
-
 /// The event a view is sent when the session asks it to take its screen again.
 const RESYNC_EVENT: &str = "session.resync";
 
@@ -109,12 +111,16 @@ const DETACHED_EVENT: &str = "session.detached";
 
 /// What the open answered: the link, what a mutation on it is about, and the attachment.
 struct Opened {
-    wire: Wire,
+    link: Link,
+    events: Events,
     target: ActionTarget,
     attached: SessionAttachResult,
     /// Whether the worker stated that it serves the launch surface, when a worker answered the
     /// hello on this link: none on a link to a paired host's daemon.
     serves_launch_surface: Option<bool>,
+    /// Whether the worker stated that it takes typing on the session's input lane, which only a
+    /// worker on this machine states.
+    states_input_lane: bool,
 }
 
 /// Where a view's session is reached.
@@ -249,14 +255,26 @@ pub(super) async fn run(
             };
         }
     };
-    let next_request = opened.wire.first_loop_request();
+    let networked = opened.link.session().transport().stream_opener().is_some();
     let mut view = View {
-        wire: opened.wire,
+        link: opened.link,
+        events: opened.events,
+        networked,
+        states_input_lane: opened.states_input_lane,
+        lane: None,
+        lane_events: None,
+        lane_epoch: None,
+        requests: FuturesUnordered::new(),
+        keys: BTreeMap::new(),
+        endings: Vec::new(),
+        holds: BTreeMap::new(),
+        next_launch: 0,
+        lane_lost: None,
         target: opened.target,
         session_id,
         attachment: opened.attached.attachment,
         projection: Projection::new(),
-        next_request,
+        next_request: 0,
         window,
         lease,
         resubscription: None,
@@ -270,17 +288,18 @@ pub(super) async fn run(
         drawn: None,
         told: 0,
         last: None,
+        heard_in_flight: false,
+        events_in_a_row: 0,
         publish: publish.clone(),
     };
     view.publish_state();
+    view.open_lane();
     let ended = view.serve(&mut commands).await;
     view.end_launches();
     if let Some(reason) = ended.reason {
         (view.publish)(TerminalViewState::Ended { reason });
     }
-    if ended.detach {
-        view.detach().await;
-    }
+    view.finish(ended.detach).await;
     ended.cause
 }
 
@@ -294,11 +313,11 @@ async fn open(
     session_id: SessionId,
     dimensions: Dimensions,
 ) -> Result<Opened, OpenFailure> {
-    let (mut wire, target, serves_launch_surface) = match reach {
+    let (link, mut events, target, serves_launch_surface, states_input_lane) = match reach {
         Reach::Local(locate) => open_local(locate, session_id).await?,
         Reach::Paired(dial, grant_id) => {
-            let (wire, target) = open_paired(dial, *grant_id, session_id).await?;
-            (wire, target, None)
+            let (link, events, target) = open_paired(dial, *grant_id, session_id).await?;
+            (link, events, target, None, false)
         }
     };
     let mut requested = CanonicalSet::new();
@@ -316,8 +335,11 @@ async fn open(
         terminal_profile_id: Nullable::some(PROFILE.to_owned()),
         requested,
     };
-    let answer = wire
-        .mutate(Method::SessionAttach, target.clone(), &params)
+    let answer = link
+        .request(
+            &mut events,
+            link.mutate(Method::SessionAttach, target.clone(), params),
+        )
         .await
         .map_err(|lost| OpenFailure::lost(&lost))?
         .map_err(|refusal| {
@@ -342,7 +364,7 @@ async fn open(
         streams,
         from_cursor: Nullable::some(attached.output_cursor),
     };
-    wire.request(Method::EventsSubscribe, &subscribe)
+    link.request(&mut events, link.read(Method::EventsSubscribe, subscribe))
         .await
         .map_err(|lost| OpenFailure::lost(&lost))?
         .map_err(|refusal| {
@@ -352,10 +374,12 @@ async fn open(
             ))
         })?;
     Ok(Opened {
-        wire,
+        link,
+        events,
         target,
         attached,
         serves_launch_surface,
+        states_input_lane,
     })
 }
 
@@ -363,25 +387,29 @@ async fn open(
 async fn open_local(
     locate: &Locate,
     session_id: SessionId,
-) -> Result<(Wire, ActionTarget, Option<bool>), String> {
+) -> Result<(Link, Events, ActionTarget, Option<bool>, bool), OpenFailure> {
     let paths = locate()?;
     // A descriptor is data on disk. Nothing is sent until the worker behind the endpoint has signed
     // a challenge only the descriptor's key could answer.
     let crate::worker::Reached {
         client,
         descriptor,
+        build,
         capabilities,
-        ..
     } = crate::worker::reach(&paths, session_id)
         .await
         .map_err(crate::worker::Unreached::words)?;
     // The worker has proved who it is, and it says what it is: the attach waits on its screens, so
     // a worker whose screens this view cannot read is refused before it is asked for anything.
-    check_build(client.acknowledgement().build.as_ref())?;
+    check_build(build.as_ref())?;
     let target = target(&descriptor);
     let serves = kr_protocol::ids::CapabilityId::new(kr_protocol::local::SHELL_LAUNCH_SURFACE_READ)
         .is_ok_and(|read| capabilities.contains(&read));
-    Ok((Wire::Local(Box::new(client)), target, Some(serves)))
+    let states_input_lane = kr_protocol::ids::CapabilityId::new(kr_protocol::local::INPUT_LANE)
+        .is_ok_and(|lane| capabilities.contains(&lane));
+    let transport = kr_client::ipc::IpcTransport::over(client).shared();
+    let (link, events) = Link::over(transport, None).map_err(|lost| OpenFailure::lost(&lost))?;
+    Ok((link, events, target, Some(serves), states_input_lane))
 }
 
 /// What a view's opening says of a connection that was not opened, by the cause and not by the code
@@ -433,28 +461,31 @@ async fn open_paired(
     dial: &crate::standing::Dial,
     grant_id: Option<GrantId>,
     session_id: SessionId,
-) -> Result<(Wire, ActionTarget), OpenFailure> {
+) -> Result<(Link, Events, ActionTarget), OpenFailure> {
     use kr_protocol::session::{SessionOpenParams, SessionOpenResult};
 
     let transport = dial.transport().await.map_err(not_opened)?;
-    let mut wire =
-        Wire::Paired(Paired::over(transport, grant_id).map_err(|lost| OpenFailure::lost(&lost))?);
-    let opened = wire
+    let (link, mut events) =
+        Link::over(transport, grant_id).map_err(|lost| OpenFailure::lost(&lost))?;
+    let opened = link
         .request(
-            Method::SessionOpen,
-            &SessionOpenParams {
-                session_id: Nullable::some(session_id),
-                grant_id: Nullable(grant_id),
-            },
+            &mut events,
+            link.read(
+                Method::SessionOpen,
+                SessionOpenParams {
+                    session_id: Nullable::some(session_id),
+                    grant_id: Nullable(grant_id),
+                },
+            ),
         )
         .await
         .map_err(|lost| OpenFailure::lost(&lost))?
         .map_err(|refusal| {
-            // The refusal the wire kept as the host's answer to the connection is told by its
+            // The refusal the link kept as the host's answer to the connection is told by its
             // cause, as a refusal of a first call on any connection is; any other is the refusal of
             // this request.
             not_opened(
-                Unopened::of_kept_refusal(wire.kept_refusal(), &refusal).unwrap_or_else(|| {
+                Unopened::of_kept_refusal(link.kept_refusal(), &refusal).unwrap_or_else(|| {
                     Unopened::Refused(Asked::SessionOpen, CommandError::from(refusal))
                 }),
             )
@@ -483,7 +514,7 @@ async fn open_paired(
                 application_instance_id: Nullable::null(),
                 agent_binding_revision: Nullable::null(),
             };
-            Ok((wire, target))
+            Ok((link, events, target))
         }
         SessionOpenResult::Ended { .. } => Err(OpenFailure::refused("This share has ended.")),
     }
@@ -551,6 +582,39 @@ fn build_name(build_id: &BuildId) -> &str {
         text
     } else {
         "[a build this application does not name]"
+    }
+}
+
+/// What the host said to a call that failed, when the failure is the host's answer or says nothing
+/// against the connection: the call is refused, and the view goes on. None when the failure is the
+/// link's, which the reader's end then tells.
+fn refusal_of(failed: &ClientError) -> Option<ProtocolError> {
+    match failed {
+        ClientError::Host(refusal) | ClientError::OutcomeUnknown { error: refusal, .. } => {
+            Some(refusal.clone())
+        }
+        ClientError::Transport(_)
+        | ClientError::Ipc(_)
+        | ClientError::ConnectionEnded
+        | ClientError::SubmissionUncertain { .. }
+        | ClientError::Withheld => None,
+        other => Some(ProtocolError::new(other.code(), other.to_string())),
+    }
+}
+
+/// What the person is told when the lane takes no more typing.
+const fn refused_words(refusal: InputRefusal) -> &'static str {
+    match refusal {
+        InputRefusal::Full => "too much input is waiting to be written",
+        InputRefusal::NotNow => "too much input is waiting to be written for it to fit now",
+        InputRefusal::TooLarge => "it is longer than one input can carry",
+        InputRefusal::Empty => "there is nothing to write",
+        InputRefusal::Ending | InputRefusal::Over(_) | InputRefusal::NoEpoch => {
+            "this view's input stream takes nothing more under this control"
+        }
+        InputRefusal::LaunchWaiting | InputRefusal::EpochNotNew | InputRefusal::NotLocal => {
+            "this view's input stream could not take it"
+        }
     }
 }
 
@@ -700,13 +764,64 @@ fn launch_read_step(stage: LaunchReadStage, serves: Option<bool>, outcome: Outco
     }
 }
 
+/// What a call the loop owns came to.
+enum Completed {
+    /// A call to the session, with its answer or why it failed.
+    Call(Answered),
+    /// The opening of the input lane, which on a paired host waits for the host's word.
+    Lane(Result<InputLane, ClientError>),
+}
+
+/// A call of the loop's set: the view's number for it, and what it came to.
+type Done = (RequestId, Completed);
+
+/// An ending that waits for the lane to say the host has the typing before it, on a link whose
+/// typing has a stream of its own.
+struct Barred {
+    tag: RequestId,
+    barrier: InputBarrier,
+    /// The ending's call, which names the barrier and has not been polled.
+    call: link::Call,
+}
+
+/// How many notifications the loop takes in a row before it looks at the page's commands first.
+const EVENTS_IN_A_ROW: u32 = 64;
+
 /// One open, attached view.
 struct View {
-    wire: Wire,
+    link: Link,
+    /// The session's notifications, which this view alone consumes.
+    events: Events,
+    /// Whether the typing has a stream of its own, as on a paired host that opens one, and an
+    /// ending then takes the lane's mark; otherwise the typing is requests on the connection and an
+    /// ending is queued behind it.
+    networked: bool,
+    /// Whether the worker stated that it takes typing on the input lane.
+    states_input_lane: bool,
+    /// The session's input lane, once it is open.
+    lane: Option<InputLane>,
+    lane_events: Option<InputEvents>,
+    /// The lease epoch the lane has begun.
+    lane_epoch: Option<InputLeaseEpoch>,
+    /// The calls the view has started, which the loop polls before it takes anything else. A call
+    /// is never dropped before it completes while the loop runs.
+    requests: FuturesUnordered<BoxFuture<'static, Done>>,
+    /// The keys the lane has taken and the host has not answered, by their epoch and number in
+    /// it, and the view's number for each, which the lease knows it by.
+    keys: BTreeMap<(u64, u64), RequestId>,
+    /// The endings that wait for the host to have the typing before them.
+    endings: Vec<Barred>,
+    /// The launches whose later typing the lane holds, by the view's number for the launch, and the
+    /// launch's number for the lane.
+    holds: BTreeMap<RequestId, u32>,
+    next_launch: u32,
+    /// Why the input lane could not be opened or ended, when it did.
+    lane_lost: Option<String>,
     target: ActionTarget,
     session_id: SessionId,
     attachment: AttachmentSummary,
     projection: Projection,
+    /// The last number the view gave one of its calls.
     next_request: u64,
     /// Where the window is, and the reports it owes.
     window: WindowReports,
@@ -735,23 +850,59 @@ struct View {
     told: u64,
     /// The state the page was last sent.
     last: Option<TerminalViewState>,
+    /// Whether the session said anything since the report in flight was sent.
+    heard_in_flight: bool,
+    /// Notifications taken in a row, so that a flood of output never keeps the page's commands
+    /// waiting.
+    events_in_a_row: u32,
     publish: Publish,
 }
 
 /// What the loop reads next.
 enum Next {
+    Done(Done),
+    Event(Option<Ordered>),
+    Lane(Option<InputEvent>),
     Command(Option<Command>),
-    Frame(Result<ControlFrame, Lost>),
+}
+
+/// What the loop reads next when it does not read a notification: a call that completed, which the
+/// loop polls before the page's next command, the lane's next event, or the page's next command.
+async fn next_but_events(
+    requests: &mut FuturesUnordered<BoxFuture<'static, Done>>,
+    lane_events: &mut Option<InputEvents>,
+    commands: &mut UnboundedReceiver<Command>,
+) -> Next {
+    tokio::select! {
+        biased;
+        Some(done) = requests.next() => Next::Done(done),
+        event = next_lane_event(lane_events) => Next::Lane(event),
+        command = commands.recv() => Next::Command(command),
+    }
+}
+
+/// The lane's next event, or never when there is no lane to hear from.
+async fn next_lane_event(events: &mut Option<InputEvents>) -> Option<InputEvent> {
+    match events {
+        Some(events) => events.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 impl View {
     /// The end of a view whose link is gone, in the account's words when this device ended the
     /// link because the account it was opened under left.
     fn lost(&self) -> Ending {
-        Ending::lost(self.wire.ended_by_this_device())
+        Ending::lost(self.link.ended_by_this_device())
     }
 
-    /// Reads the link and the page's commands until the view ends.
+    /// Serves the session's notifications, the lane's events and the page's commands until the view
+    /// ends.
+    ///
+    /// The notifications come first, then the calls the view has started, the lane's events and
+    /// the page's commands last: every call is polled before the next command is taken, a
+    /// notification is applied before a key is spelled by the screen it holds, and nothing is
+    /// awaited inside a command.
     async fn serve(&mut self, commands: &mut UnboundedReceiver<Command>) -> Ending {
         loop {
             // What goes next is asked after every event, so nothing owed waits on an event that
@@ -759,15 +910,44 @@ impl View {
             if let Some(ended) = self.dispatch().await {
                 return ended;
             }
-            let next = tokio::select! {
-                // The page first: a close is answered before anything more is read or drawn.
-                biased;
-                command = commands.recv() => Next::Command(command),
-                frame = self.wire.recv() => Next::Frame(frame),
+            // After a long run of notifications the rest is looked at first, once, so that a flood of
+            // output never keeps an answer or the page's commands waiting.
+            let urgent = if self.events_in_a_row >= EVENTS_IN_A_ROW {
+                self.events_in_a_row = 0;
+                next_but_events(&mut self.requests, &mut self.lane_events, commands).now_or_never()
+            } else {
+                None
+            };
+            let next = if let Some(next) = urgent {
+                next
+            } else {
+                tokio::select! {
+                    biased;
+                    // The notifications first: an answer and a notification reach the loop by two
+                    // paths, and the host sent the notification before the answer if it is in the
+                    // channel when the answer's call completes, since the reader hands a
+                    // notification on before it reads the next frame.
+                    item = self.events.recv() => Next::Event(item),
+                    next = next_but_events(&mut self.requests, &mut self.lane_events, commands) => next,
+                }
+            };
+            self.events_in_a_row = if matches!(next, Next::Event(_)) {
+                self.events_in_a_row + 1
+            } else {
+                0
             };
             // Whatever the session says lets a size it did not take for now go again.
-            if matches!(next, Next::Frame(Ok(_))) {
+            let heard = match &next {
+                Next::Done((_, Completed::Call(Ok(_))))
+                | Next::Event(Some(Ordered::Notification(_))) => true,
+                Next::Done((_, Completed::Call(Err(failed)))) => refusal_of(failed).is_some(),
+                _ => false,
+            };
+            if heard {
                 self.window.heard();
+            }
+            if matches!(next, Next::Event(Some(Ordered::Notification(_)))) {
+                self.heard_in_flight = true;
             }
             let ended = match next {
                 Next::Command(Some(Command::Resize(size))) => {
@@ -778,21 +958,23 @@ impl View {
                     self.window.take(asked);
                     None
                 }
-                Next::Command(Some(Command::Input(input, taken))) => self.input(input, taken).await,
-                Next::Command(Some(Command::LaunchSurface(reply))) => {
-                    self.launch_surface(reply).await
-                }
+                Next::Command(Some(Command::Input(input, taken))) => self.input(input, taken),
+                Next::Command(Some(Command::LaunchSurface(reply))) => self.launch_surface(reply),
                 Next::Command(Some(Command::Launch(press, reply))) => {
                     self.launch(press, reply).await
                 }
                 Next::Command(Some(Command::Lose)) => Some(self.lost()),
                 Next::Command(Some(Command::Close) | None) => Some(Ending::CLOSED),
-                Next::Frame(Ok(ControlFrame::Notification(notification))) => {
-                    self.notification(notification).await
+                Next::Event(Some(Ordered::Notification(notification))) => {
+                    self.notification(notification)
                 }
-                Next::Frame(Ok(ControlFrame::Response(response))) => self.response(response).await,
-                Next::Frame(Ok(_)) => None,
-                Next::Frame(Err(_)) => Some(self.lost()),
+                Next::Event(Some(Ordered::Ended(_)) | None) => Some(self.lost()),
+                Next::Lane(Some(event)) => self.lane_event(event),
+                Next::Lane(None) => {
+                    self.lane_events = None;
+                    None
+                }
+                Next::Done((tag, done)) => self.completed(tag, done).await,
             };
             if let Some(ended) = ended {
                 return ended;
@@ -800,7 +982,7 @@ impl View {
         }
     }
 
-    async fn notification(&mut self, notification: Notification) -> Option<Ending> {
+    fn notification(&mut self, notification: Notification) -> Option<Ending> {
         let event_type = notification.event_type.as_str();
         // Neither is ever dropped: whichever stream carries them, the attachment is over.
         if event_type == SESSION_CLOSED_EVENT {
@@ -820,7 +1002,7 @@ impl View {
             self.replaced_stream = false;
         }
         if event_type == RESYNC_EVENT {
-            return self.recover().await;
+            return self.recover();
         }
         if !is_projection_event(event_type) {
             // The output of a direct presentation and a gap's notice: neither draws anything in a
@@ -828,7 +1010,7 @@ impl View {
             return None;
         }
         let Some(event) = decode(event_type, &notification.payload) else {
-            return self.recover().await;
+            return self.recover();
         };
         match self.projection.apply(event) {
             // A reset waits for the snapshot that follows it. Asking again would loop, because
@@ -855,16 +1037,43 @@ impl View {
                 self.screen_changed();
                 None
             }
-            Applied::Refused(_) => self.recover().await,
+            Applied::Refused(_) => self.recover(),
         }
     }
 
-    async fn response(&mut self, response: Response) -> Option<Ending> {
-        if self.launch_reads.contains_key(&response.request_id) {
-            return self.launch_surface_answered(response).await;
+    /// A call of the loop's set completed: its answer is the one the view's number names.
+    async fn completed(&mut self, tag: RequestId, done: Completed) -> Option<Ending> {
+        let answered = match done {
+            Completed::Lane(opened) => return self.lane_opened(opened),
+            Completed::Call(answered) => answered,
+        };
+        // A launch's hold on the later typing ends with its answer, whatever the answer was.
+        if let Some(launch) = self.holds.remove(&tag)
+            && let Some(lane) = &self.lane
+        {
+            lane.release_hold(launch);
         }
-        if let Some(reply) = self.launches.remove(&response.request_id) {
-            let _ = reply.send(match response.outcome {
+        let outcome = match answered {
+            Ok(value) => Outcome::Ok(value),
+            Err(ClientError::Cbor(_)) => {
+                return Some(Ending::ended("This view's request could not be written."));
+            }
+            Err(failed) => match refusal_of(&failed) {
+                Some(refusal) => Outcome::Error(refusal),
+                // The link failed under the call: what the reader says of the end, and what arrived
+                // before it, still counts.
+                None => return Some(self.link_failed().await),
+            },
+        };
+        self.response(tag, outcome)
+    }
+
+    fn response(&mut self, request_id: RequestId, outcome: Outcome) -> Option<Ending> {
+        if self.launch_reads.contains_key(&request_id) {
+            return self.launch_surface_answered(request_id, outcome);
+        }
+        if let Some(reply) = self.launches.remove(&request_id) {
+            let _ = reply.send(match outcome {
                 Outcome::Ok(value) => value.to_typed::<ShellLaunchResult>().map_err(|error| {
                     CommandError::local_failure(format!(
                         "The session's answer to the launch could not be read: {}",
@@ -875,12 +1084,13 @@ impl View {
             });
             return None;
         }
-        if self.lease.owns(response.request_id) {
-            let outcome = match response.outcome {
+        if self.lease.owns(request_id) {
+            let outcome = match outcome {
                 Outcome::Ok(value) => Ok(value),
                 Outcome::Error(refusal) => Err(refusal),
             };
-            let changed = self.lease.answered(response.request_id, outcome);
+            let changed = self.lease.answered(request_id, outcome);
+            self.sync_epoch();
             // A take the session granted just before the program changed to a form the view does
             // not produce ends as its answer arrives, before the page is told it controls anything.
             let ended = !self.keyboard_supplied() && self.lease.unsupported();
@@ -889,13 +1099,13 @@ impl View {
             }
             return None;
         }
-        if self.window.is_in_flight(response.request_id) {
+        if self.window.is_in_flight(request_id) {
             // A definite refusal settles the report and changes nothing; an acceptance settles it
             // once a screen naming its revision has arrived, whichever came first. A refusal for
             // now, or an answer that cannot say what became of the report, settles no size: it is
             // owed again. A screen that waited for this answer is drawn now, with what the answer
             // settled.
-            let answer = match response.outcome {
+            let answer = match outcome {
                 Outcome::Ok(value) => match value.to_typed::<AttachmentViewportResult>() {
                     Ok(result) => {
                         // The page shows the presentation and its reason from this summary, and
@@ -914,6 +1124,12 @@ impl View {
                 Outcome::Error(_) => Answer::NotSettled,
             };
             self.window.answered(answer);
+            // A notification and an answer reach the loop by two paths, and the host may have sent
+            // the notification after the answer: a word heard while the report was in flight is
+            // taken for the word that lets a size the session did not take for now go again.
+            if self.heard_in_flight {
+                self.window.heard();
+            }
             if self.held {
                 self.held = false;
                 self.show();
@@ -922,9 +1138,9 @@ impl View {
             }
             return None;
         }
-        if self.resubscription == Some(response.request_id) {
+        if self.resubscription == Some(request_id) {
             self.resubscription = None;
-            if let Outcome::Error(refusal) = response.outcome {
+            if let Outcome::Error(refusal) = outcome {
                 // The recovery failed while the connection stays open: nothing will ever bring
                 // this view a screen again.
                 return Some(Ending::ended(format!(
@@ -937,7 +1153,7 @@ impl View {
     }
 
     /// Discards the screen and asks the session for a fresh one on this link, once.
-    async fn recover(&mut self) -> Option<Ending> {
+    fn recover(&mut self) -> Option<Ending> {
         if self.recoveries >= RECOVERIES {
             return Some(Ending::ended("The session's screen could not be read."));
         }
@@ -954,20 +1170,7 @@ impl View {
             streams,
             from_cursor: Nullable::null(),
         };
-        let request_id = self.next_id();
-        let Ok(params) = ParamsValue::from_typed(&params) else {
-            return Some(Ending::ended("This view's request could not be written."));
-        };
-        let request = Request {
-            request_id,
-            method: Method::EventsSubscribe.into(),
-            method_version: MethodVersion::V1,
-            params,
-        };
-        if !self.wire.send(&ControlFrame::Request(request)).await {
-            return Some(self.lost());
-        }
-        self.resubscription = Some(request_id);
+        self.resubscription = Some(self.read(Method::EventsSubscribe, params));
         self.replaced_stream = true;
         None
     }
@@ -982,17 +1185,11 @@ impl View {
                 position: Nullable(sending.position),
                 column: U64::new(sending.column),
             };
-            let request_id = self.next_id();
-            if !self
-                .mutation(request_id, Method::AttachmentViewport, &params)
-                .await
-            {
-                return Some(self.lost());
-            }
+            let request_id = self.mutation(Method::AttachmentViewport, params);
             self.window.sent(request_id);
+            self.heard_in_flight = false;
         }
         while let Some(owed) = self.lease.owed() {
-            let request_id = self.next_id();
             let sent = match owed {
                 Owed::Acquire => {
                     // An immediate takeover: whoever holds the lease loses it, without being asked.
@@ -1001,25 +1198,32 @@ impl View {
                         attachment_id: self.attachment.attachment_id,
                         expected_epoch: Nullable::null(),
                     };
-                    self.mutation(request_id, Method::InputAcquire, &params)
-                        .await
+                    self.mutation(Method::InputAcquire, params)
                 }
                 Owed::Release(epoch) => {
-                    let params = InputReleaseParams {
-                        session_id: self.session_id,
-                        attachment_id: self.attachment.attachment_id,
-                        epoch,
-                        after_input: None,
-                        fenced_report: false,
-                    };
-                    self.mutation(request_id, Method::InputRelease, &params)
-                        .await
+                    let session_id = self.session_id;
+                    let attachment_id = self.attachment.attachment_id;
+                    let ended = self
+                        .ending(
+                            Method::InputRelease,
+                            Some(epoch),
+                            None,
+                            move |after_input| InputReleaseParams {
+                                session_id,
+                                attachment_id,
+                                epoch,
+                                after_input,
+                                fenced_report: false,
+                            },
+                        )
+                        .await;
+                    match ended {
+                        Ok(request_id) => request_id,
+                        Err(ended) => return Some(ended),
+                    }
                 }
             };
-            if !sent {
-                return Some(self.lost());
-            }
-            self.lease.sent(owed, request_id);
+            self.lease.sent(owed, sent);
         }
         self.tell();
         None
@@ -1028,7 +1232,7 @@ impl View {
     /// Takes the person's `input`: a change of control, or a wheel turn or keys, written only while
     /// the view controls the program under the take they name. Says on `taken` whether it took it,
     /// and returns how the loop ended when writing it lost the link.
-    async fn input(&mut self, input: Input, taken: Taken) -> Option<Ending> {
+    fn input(&mut self, input: Input, taken: Taken) -> Option<Ending> {
         match input {
             Input::Take { number } => {
                 if self.lease.request(number, true) {
@@ -1078,11 +1282,11 @@ impl View {
                     let _ = taken.send(Ok(()));
                     return None;
                 };
-                self.write_input(take, reports, taken).await
+                self.write_input(take, reports, taken)
             }
             Input::Key { take, .. } => {
                 let (typed, action) = input.typed_key().expect("a key input names a key");
-                self.key(take, &typed, action, taken).await
+                self.key(take, &typed, action, taken)
             }
             Input::Text { take, text } => {
                 // Text is its UTF-8 in every encoding the view produces; the program's keyboard is
@@ -1091,7 +1295,7 @@ impl View {
                     let _ = taken.send(Err(refused));
                     return None;
                 }
-                self.write_or_nothing(take, text.into_bytes(), taken).await
+                self.write_or_nothing(take, text.into_bytes(), taken)
             }
             Input::Paste { take, text } => {
                 let keyboard = match self.keyboard(take, "That paste") {
@@ -1102,14 +1306,11 @@ impl View {
                     }
                 };
                 let bytes = kr_keys::paste(text.as_str(), keyboard.bracketed);
-                if bytes.len() > kr_protocol::limits::MAX_INPUT_FRAME_LEN {
-                    let _ = taken.send(Err(Refused::Unsent(keys::unsent(
-                        "That paste",
-                        "it is longer than one input can carry",
-                    ))));
+                if bytes.is_empty() {
+                    let _ = taken.send(Ok(()));
                     return None;
                 }
-                self.write_or_nothing(take, bytes, taken).await
+                self.write_paste(take, &bytes, taken)
             }
         }
     }
@@ -1118,7 +1319,7 @@ impl View {
     /// while the view controls the program under the take it names. A release is spelled from the
     /// press it ends, which the view recorded as it wrote it, and only where that press's encoding
     /// reports releases.
-    async fn key(
+    fn key(
         &mut self,
         take: u64,
         typed: &TypedKey,
@@ -1167,7 +1368,7 @@ impl View {
             },
         };
         match spelled {
-            Ok(bytes) => self.write_or_nothing(take, bytes, taken).await,
+            Ok(bytes) => self.write_or_nothing(take, bytes, taken),
             Err(unsupported) => {
                 let _ = taken.send(Err(Refused::Unsent(keys::unsent("That key", unsupported))));
                 None
@@ -1200,17 +1401,12 @@ impl View {
 
     /// Writes `bytes` under the take `take`, or answers at once when there is nothing to write:
     /// nothing takes a number in the view's input stream unless it is written.
-    async fn write_or_nothing(
-        &mut self,
-        take: u64,
-        bytes: Vec<u8>,
-        taken: Taken,
-    ) -> Option<Ending> {
+    fn write_or_nothing(&mut self, take: u64, bytes: Vec<u8>, taken: Taken) -> Option<Ending> {
         if bytes.is_empty() {
             let _ = taken.send(Ok(()));
             return None;
         }
-        self.write_input(take, bytes, taken).await
+        self.write_input(take, bytes, taken)
     }
 
     /// Tells the page of the screen the view now holds, unless it waits for its report's answer.
@@ -1245,43 +1441,208 @@ impl View {
 
     /// Writes `bytes` to the program under the lease the view holds for the page's take `take`.
     ///
-    /// The page is told the input is taken as soon as it has its place in the stream, before it is
-    /// written: the write waits on the link, and the page's call never waits on it.
-    async fn write_input(&mut self, take: u64, bytes: Vec<u8>, taken: Taken) -> Option<Ending> {
-        let writing = match self.lease.write(take) {
-            Ok(writing) => writing,
+    /// The page is told the input is taken as soon as the lane has admitted it and given it its
+    /// place in the stream, before it is written: the write waits on the link, and the page's call
+    /// never waits on it.
+    fn write_input(&mut self, take: u64, bytes: Vec<u8>, taken: Taken) -> Option<Ending> {
+        self.admit(
+            take,
+            |lane| lane.try_send(&bytes).map(|writing| vec![writing]),
+            taken,
+        )
+    }
+
+    /// Writes a paste to the program under the lease the view holds for the take `take`: the lane
+    /// cuts it into frames, and admits all of them or none.
+    fn write_paste(&mut self, take: u64, bytes: &[u8], taken: Taken) -> Option<Ending> {
+        self.admit(take, |lane| lane.try_send_paste(bytes), taken)
+    }
+
+    /// Has the lane admit what `send` gives it, and says on `taken` whether it did.
+    fn admit(
+        &mut self,
+        take: u64,
+        send: impl FnOnce(&InputLane) -> Result<Vec<kr_client::input::Writing>, InputRefusal>,
+        taken: Taken,
+    ) -> Option<Ending> {
+        if !self.lease.controls(take) {
+            let _ = taken.send(Err(Refused::NotControlling(
+                self.lease.write(take).err().unwrap_or_default(),
+            )));
+            return None;
+        }
+        let Some(lane) = &self.lane else {
+            let _ = taken.send(Err(Refused::Unsent(keys::unsent(
+                "That input",
+                self.lane_lost
+                    .as_deref()
+                    .unwrap_or("this view's input stream is not open yet"),
+            ))));
+            return None;
+        };
+        let writings = match send(lane) {
+            Ok(writings) => writings,
             Err(refusal) => {
-                let _ = taken.send(Err(Refused::NotControlling(refusal)));
+                let _ = taken.send(Err(Refused::Unsent(keys::unsent(
+                    "That input",
+                    refused_words(refusal),
+                ))));
                 return None;
             }
         };
         let _ = taken.send(Ok(()));
-        let params = InputWriteParams {
-            session_id: self.session_id,
-            attachment_id: self.attachment.attachment_id,
-            epoch: writing.epoch,
-            sequence: writing.sequence,
-            input: InputContent::Bytes {
-                bytes: Bytes::new(bytes),
-            },
-        };
-        let Ok(params) = ParamsValue::from_typed(&params) else {
-            return Some(Ending::ended("This view's input could not be written."));
-        };
-        let request_id = self.next_id();
-        // Raw input is an ordered stream, not a mutation: it carries no action identifier and gets
-        // no receipt, only the session's answer.
-        let request = Request {
-            request_id,
-            method: Method::InputWrite.into(),
-            method_version: MethodVersion::V1,
-            params,
-        };
-        if !self.wire.send(&ControlFrame::Request(request)).await {
-            return Some(self.lost());
+        // The lane gave each frame its number in the epoch, which is the one the host sees; the
+        // lease keeps its own count in step.
+        for writing in writings {
+            let _ = self.lease.write(take);
+            let (Some(epoch), Some(sequence)) = (self.lane_epoch, writing.sequence) else {
+                continue;
+            };
+            let tag = self.next_id();
+            self.lease.written(tag, epoch);
+            self.keys.insert((epoch.get(), sequence.get()), tag);
         }
-        self.lease.written(request_id, writing.epoch);
         None
+    }
+
+    /// Begins the lane's epoch for the lease the view holds, once, as the lease first holds it.
+    fn sync_epoch(&mut self) {
+        let (Some(lane), Some(epoch)) = (&self.lane, self.lease.held_epoch()) else {
+            return;
+        };
+        if self.lane_epoch == Some(epoch) {
+            return;
+        }
+        if lane.begin_epoch(epoch).is_ok() {
+            self.lane_epoch = Some(epoch);
+            // The frames of an older epoch are settled by the lane's own events for it, or are not
+            // written: none of them waits for an answer the view will read.
+            let older: Vec<(u64, u64)> = self
+                .keys
+                .keys()
+                .copied()
+                .filter(|(of, _)| *of < epoch.get())
+                .collect();
+            for key in older {
+                if let Some(tag) = self.keys.remove(&key) {
+                    self.lease.answered(tag, Ok(ParamsValue::empty()));
+                }
+            }
+        }
+    }
+
+    /// Starts the opening of the input lane, which a paired host answers once it has opened its
+    /// stream: a call of the loop's set, which no command awaits.
+    fn open_lane(&mut self) {
+        let target = InputTarget::new(
+            self.target.environment_id,
+            self.session_id,
+            self.attachment.attachment_id,
+        )
+        .worker_states_input_lane(self.states_input_lane);
+        let session = Arc::clone(self.link.session());
+        let tag = self.next_id();
+        self.requests.push(Box::pin(async move {
+            (tag, Completed::Lane(session.input_lane(target).await))
+        }));
+    }
+
+    /// The lane's opening ended: the lane is there to type on, or the words say why it is not.
+    fn lane_opened(&mut self, opened: Result<InputLane, ClientError>) -> Option<Ending> {
+        match opened {
+            Ok(lane) => {
+                self.lane_events = lane.events();
+                self.lane = Some(lane);
+                self.sync_epoch();
+            }
+            Err(failed) => {
+                self.lane_lost = Some(format!("its input stream could not be opened: {failed}"));
+            }
+        }
+        None
+    }
+
+    /// What the lane says of the typing and of the endings that wait behind it.
+    fn lane_event(&mut self, event: InputEvent) -> Option<Ending> {
+        match event {
+            InputEvent::Accepted { epoch, through, .. } => {
+                let accepted: Vec<(u64, u64)> = self
+                    .keys
+                    .range(..=(epoch.get(), through.get()))
+                    .map(|(key, _)| *key)
+                    .filter(|(of, _)| *of == epoch.get())
+                    .collect();
+                for key in accepted {
+                    if let Some(tag) = self.keys.remove(&key) {
+                        self.lease.answered(tag, Ok(ParamsValue::empty()));
+                    }
+                }
+                None
+            }
+            InputEvent::Refused {
+                epoch,
+                sequence,
+                error,
+                ..
+            } => {
+                let refused = self.keys.remove(&(epoch.get(), sequence.get()));
+                let later: Vec<(u64, u64)> = self
+                    .keys
+                    .range((epoch.get(), sequence.get())..)
+                    .map(|(key, _)| *key)
+                    .filter(|(of, _)| *of == epoch.get())
+                    .collect();
+                // The first refusal ends the epoch, and the frames after it are refused with it.
+                if let Some(tag) = refused
+                    && self.lease.answered(tag, Err(error))
+                {
+                    self.control_changed();
+                }
+                for key in later {
+                    if let Some(tag) = self.keys.remove(&key) {
+                        self.lease.answered(tag, Ok(ParamsValue::empty()));
+                    }
+                }
+                None
+            }
+            InputEvent::Reached(barrier) => {
+                self.send_barred(&barrier);
+                None
+            }
+            InputEvent::NotReached { barrier, .. } => {
+                // The host did not take the typing before the ending in time: the ending still
+                // goes, naming what it waited for, and the host answers for it.
+                self.send_barred(&barrier);
+                None
+            }
+            InputEvent::EpochEnded { .. } | InputEvent::LaunchReserved { .. } => None,
+            InputEvent::Ended { cause, .. } => match cause {
+                // The connection's end reaches the loop through the session's own notifications.
+                EndCause::Connection { .. } | EndCause::Finished | EndCause::Closed => {
+                    self.lane_events = None;
+                    None
+                }
+                EndCause::Reset | EndCause::Breach(_) | EndCause::Uncertain(_) => {
+                    self.lane_events = None;
+                    self.lane_lost = Some("its input stream ended".to_owned());
+                    self.lane = None;
+                    None
+                }
+            },
+        }
+    }
+
+    /// Sends the ending that waited for `barrier`.
+    fn send_barred(&mut self, barrier: &InputBarrier) {
+        let Some(at) = self
+            .endings
+            .iter()
+            .position(|barred| &barred.barrier == barrier)
+        else {
+            return;
+        };
+        let Barred { tag, call, .. } = self.endings.remove(at);
+        self.start(tag, call);
     }
 
     /// Tells the page that control changed, at once. A screen that waits for its report's answer
@@ -1303,38 +1664,38 @@ impl View {
     /// says whether this view does, and the page's buttons are lit only on that.
     ///
     /// A worker that did not state that it serves the read is not asked.
-    async fn launch_surface(&mut self, reply: Reply<LaunchSurfaceAnswer>) -> Option<Ending> {
+    fn launch_surface(&mut self, reply: Reply<LaunchSurfaceAnswer>) -> Option<Ending> {
         if self.serves_launch_surface == Some(false) {
             let _ = reply.send(Ok(LaunchSurfaceAnswer::NotServed));
             return None;
         }
-        match self.ask_launch_surface().await {
-            Ok(request_id) => {
-                self.launch_reads.insert(
-                    request_id,
-                    LaunchRead {
-                        stage: LaunchReadStage::Asked,
-                        reply,
-                    },
-                );
-                None
-            }
-            Err(ended) => Some(ended),
-        }
+        let request_id = self.ask_launch_surface();
+        self.launch_reads.insert(
+            request_id,
+            LaunchRead {
+                stage: LaunchReadStage::Asked,
+                reply,
+            },
+        );
+        None
     }
 
-    async fn ask_launch_surface(&mut self) -> Result<RequestId, Ending> {
+    fn ask_launch_surface(&mut self) -> RequestId {
         let params = ShellLaunchSurfaceParams {
             session_id: self.session_id,
         };
-        self.ask(Method::ShellLaunchSurface, &params).await
+        self.read(Method::ShellLaunchSurface, params)
     }
 
     /// Takes the answer to a launch surface read, or to the read that tells a host that does not
     /// serve it from a grant that lost its right, and asks the next question or says the answer.
-    async fn launch_surface_answered(&mut self, response: Response) -> Option<Ending> {
-        let mut read = self.launch_reads.remove(&response.request_id)?;
-        let step = launch_read_step(read.stage, self.serves_launch_surface, response.outcome);
+    fn launch_surface_answered(
+        &mut self,
+        request_id: RequestId,
+        outcome: Outcome,
+    ) -> Option<Ending> {
+        let mut read = self.launch_reads.remove(&request_id)?;
+        let step = launch_read_step(read.stage, self.serves_launch_surface, outcome);
         let stage = match step {
             Step::Say(answer) => {
                 let _ = read.reply.send(answer);
@@ -1346,36 +1707,44 @@ impl View {
             let params = SessionReadParams {
                 session_id: self.session_id,
             };
-            self.ask(Method::SessionRead, &params).await
+            self.read(Method::SessionRead, params)
         } else {
-            self.ask_launch_surface().await
+            self.ask_launch_surface()
         };
-        match asked {
-            Ok(request_id) => {
-                read.stage = stage;
-                self.launch_reads.insert(request_id, read);
-                None
-            }
-            Err(ended) => Some(ended),
-        }
+        read.stage = stage;
+        self.launch_reads.insert(asked, read);
+        None
     }
 
     /// Presses a launch on this view's link. The session accepts it only from the connection whose
     /// attachment holds its input, and refuses a quote of a prompt that has moved before anything
-    /// is typed; this view asks and says what the session answered.
+    /// is typed; this view asks and says what the session answered. The launch stands behind the
+    /// typing the lane holds, as the lane orders it.
     async fn launch(&mut self, press: Press, reply: Reply<ShellLaunchResult>) -> Option<Ending> {
         let params = press.for_session(self.session_id);
-        let request_id = self.next_id();
-        // Kept before the write: a write that failed may have left in part, and the launch is then
-        // not known to have failed.
-        self.launches.insert(request_id, reply);
-        if !self
-            .mutation(request_id, Method::ShellLaunch, &params)
-            .await
-        {
-            return Some(self.lost());
+        self.next_launch += 1;
+        let launch = self.next_launch;
+        let epoch = self.lane_epoch;
+        let ended = self
+            .ending(
+                Method::ShellLaunch,
+                epoch,
+                Some(launch),
+                move |after_input| kr_protocol::root::ShellLaunchParams {
+                    after_input,
+                    ..params
+                },
+            )
+            .await;
+        match ended {
+            Ok(request_id) => {
+                // Kept before the call is polled: a call that failed may have left in part, and the
+                // launch is then not known to have failed.
+                self.launches.insert(request_id, reply);
+                None
+            }
+            Err(ended) => Some(ended),
         }
-        None
     }
 
     /// Answers every launch still waiting when the view ends: the session may have installed it
@@ -1389,59 +1758,233 @@ impl View {
         }
     }
 
-    /// Writes one read on the link without waiting for its answer.
-    async fn ask<T: serde::Serialize>(
-        &mut self,
-        method: Method,
-        params: &T,
-    ) -> Result<RequestId, Ending> {
-        let Ok(params) = ParamsValue::from_typed(params) else {
-            return Err(Ending::ended("This view's request could not be written."));
-        };
-        let request_id = self.next_id();
-        let request = Request {
-            request_id,
-            method: method.into(),
-            method_version: MethodVersion::V1,
-            params,
-        };
-        if !self.wire.send(&ControlFrame::Request(request)).await {
-            return Err(self.lost());
-        }
-        Ok(request_id)
+    /// Starts `call` under `tag`: the loop polls it before it takes anything else, and gives its
+    /// answer back under `tag`.
+    fn start(&mut self, tag: RequestId, call: link::Call) {
+        self.requests
+            .push(Box::pin(async move { (tag, Completed::Call(call.await)) }));
     }
 
-    /// Writes the detach, and leaves the link to close when the view is dropped: the worker
-    /// detaches on either.
+    /// Starts a mutation on the session's target and returns the view's number for it.
+    fn mutation<P>(&mut self, method: Method, params: P) -> RequestId
+    where
+        P: serde::Serialize + Send + Sync + 'static,
+    {
+        let call = self.link.mutate(method, self.target.clone(), params);
+        let tag = self.next_id();
+        self.start(tag, call);
+        tag
+    }
+
+    /// Starts a read and returns the view's number for it.
+    fn read<P>(&mut self, method: Method, params: P) -> RequestId
+    where
+        P: serde::Serialize + Send + Sync + 'static,
+    {
+        let call = self.link.read(method, params);
+        let tag = self.next_id();
+        self.start(tag, call);
+        tag
+    }
+
+    /// Starts an ending, a release, a detach or a launch, so that it comes after the typing the
+    /// view has admitted and before any it admits later, and returns the view's number for it.
+    ///
+    /// `epoch` is the lease epoch the ending is for. On a link that carries the typing as requests
+    /// the ending is queued behind the typing, and nothing is on the wire for it until the lane
+    /// takes its turn, which is after the host has answered each key before it. On a link with a
+    /// stream of its own the ending takes the lane's mark, and is started once the lane says the host
+    /// has accepted the typing before it. Where the lane cannot place it, nothing was queued, and it
+    /// is started at once.
+    ///
+    /// # Errors
+    ///
+    /// Returns how the view ends when the request cannot be made.
+    async fn ending<P>(
+        &mut self,
+        method: Method,
+        epoch: Option<InputLeaseEpoch>,
+        launch: Option<u32>,
+        params: impl FnOnce(Option<InputBarrier>) -> P,
+    ) -> Result<RequestId, Ending>
+    where
+        P: serde::Serialize + Send + Sync + 'static,
+    {
+        let tag = self.next_id();
+        let placed = epoch.is_some() && epoch == self.lane_epoch;
+        let Some(lane) = self.lane.as_ref().filter(|_| placed) else {
+            let call = self.link.mutate(method, self.target.clone(), params(None));
+            self.start(tag, call);
+            return Ok(tag);
+        };
+        if self.networked {
+            let Ok(barrier) = lane.mark(launch) else {
+                let call = self.link.mutate(method, self.target.clone(), params(None));
+                self.start(tag, call);
+                return Ok(tag);
+            };
+            if launch.is_some() {
+                self.holds.insert(tag, launch.unwrap_or_default());
+            }
+            let call = self
+                .link
+                .mutate(method, self.target.clone(), params(Some(barrier.clone())));
+            self.endings.push(Barred { tag, barrier, call });
+            return Ok(tag);
+        }
+        let params = params(None);
+        let composed = self
+            .link
+            .compose(method, self.target.clone(), &params)
+            .await
+            .map_err(|_| Ending::ended("This view's request could not be written."))?;
+        let session = Arc::clone(self.link.session());
+        let queued = lane.after_keys({
+            let session = Arc::clone(&session);
+            let composed = Arc::clone(&composed);
+            move |limit| async move { session.send_written(&composed, &limit).await }
+        });
+        let call: link::Call = match queued {
+            Ok(answer) => Box::pin(async move {
+                match answer.await {
+                    Ok(Ok(settled)) => settled.to_typed::<ParamsValue>(),
+                    // The lane ended before its turn, or past its bound: the view sends it itself.
+                    Ok(Err(ClientError::Withheld)) => {
+                        session.send(&composed).await?.to_typed::<ParamsValue>()
+                    }
+                    Ok(Err(failed)) => Err(failed),
+                    Err(_) => Err(link::unknown()),
+                }
+            }),
+            Err(_) => self.link.mutate(method, self.target.clone(), params),
+        };
+        self.start(tag, call);
+        Ok(tag)
+    }
+
+    /// The call that failed took the link with it, or the link failed under it: reads on to the
+    /// end of the session, which is where what the host sent before it ended is, and says the view
+    /// is lost, with the account's words when this device ended the link. The host's refusal of the
+    /// connection comes before the end, and is kept.
+    async fn link_failed(&mut self) -> Ending {
+        let drained = tokio::time::timeout(REFUSAL_WAIT, async {
+            loop {
+                match self.events.recv().await {
+                    Some(Ordered::Notification(notification)) => {
+                        if let Some(ended) = self.notification(notification) {
+                            return Some(ended);
+                        }
+                    }
+                    Some(Ordered::Ended(_)) | None => return None,
+                }
+            }
+        })
+        .await;
+        match drained {
+            Ok(Some(ended)) => ended,
+            Ok(None) | Err(_) => self.lost(),
+        }
+    }
+
+    /// Ends the view: what the loop started is dropped, the detach is written whole while the
+    /// attachment still stands on a link that still stands, and then the session is closed and read
+    /// to its end, so that its reader is released.
+    async fn finish(&mut self, detach: bool) {
+        self.requests = FuturesUnordered::new();
+        if detach {
+            self.detach().await;
+        }
+        self.link.close();
+        self.events.drain().await;
+    }
+
+    /// Writes the detach whole, behind the typing the lane holds.
+    ///
+    /// On a link that carries the typing as requests it is queued behind the keys, and the view
+    /// waits for it to be written only when no key waits for the host's answer: a key that the host
+    /// has not answered holds the lane's writer, the view does not wait for it, and the connection's
+    /// end, which the worker detaches on, is what ends the attachment. On a link with a stream of
+    /// its own the detach waits for the lane to say the host has the typing, which the lane bounds.
     async fn detach(&mut self) {
-        let params = SessionDetachParams {
-            attachment_id: Nullable::some(self.attachment.attachment_id),
+        let attachment_id = self.attachment.attachment_id;
+        let params = move |after_input| SessionDetachParams {
+            attachment_id: Nullable::some(attachment_id),
             line_token: Nullable::null(),
-            after_input: None,
+            after_input,
             fenced_report: false,
         };
-        let request_id = self.next_id();
-        let _ = self
-            .mutation(request_id, Method::SessionDetach, &params)
-            .await;
+        let placed = self.lane_epoch.is_some();
+        if self.networked && placed {
+            let barrier = self.lane.as_ref().and_then(|lane| lane.mark(None).ok());
+            if let Some(barrier) = barrier {
+                self.barrier_passed(&barrier).await;
+                let Ok(composed) = self
+                    .link
+                    .compose(
+                        Method::SessionDetach,
+                        self.target.clone(),
+                        &params(Some(barrier)),
+                    )
+                    .await
+                else {
+                    return;
+                };
+                let _ = self.link.send_whole(&composed).await;
+                return;
+            }
+        }
+        let params = params(None);
+        let Ok(composed) = self
+            .link
+            .compose(Method::SessionDetach, self.target.clone(), &params)
+            .await
+        else {
+            return;
+        };
+        let queued = if placed && !self.networked {
+            self.lane.as_ref().map(|lane| {
+                let (written, wait) = tokio::sync::oneshot::channel::<()>();
+                let session = Arc::clone(self.link.session());
+                let composed = Arc::clone(&composed);
+                let queued = lane.after_keys(move |limit| async move {
+                    let sent = session.send_written(&composed, &limit).await;
+                    let _ = written.send(());
+                    sent
+                });
+                (queued, wait)
+            })
+        } else {
+            None
+        };
+        match queued {
+            Some((Ok(_answer), wait)) => {
+                if self.keys.is_empty() {
+                    let _ = wait.await;
+                }
+            }
+            // Nothing was queued: the lane cannot place it, or there is no lane.
+            Some((Err(_), _)) | None => {
+                let _ = self.link.send_whole(&composed).await;
+            }
+        }
     }
 
-    /// Writes one mutation on the link without waiting for its answer. Returns whether it left.
-    async fn mutation<T: serde::Serialize>(
-        &mut self,
-        request_id: RequestId,
-        method: Method,
-        params: &T,
-    ) -> bool {
-        let Ok(mutation) = self
-            .wire
-            .mutation(request_id, method, self.target.clone(), params)
-        else {
-            return false;
+    /// Waits until the lane says the host has the typing before `barrier`, or will not have it, or
+    /// the lane ended.
+    async fn barrier_passed(&mut self, barrier: &InputBarrier) {
+        let Some(events) = self.lane_events.as_mut() else {
+            return;
         };
-        self.wire
-            .send(&ControlFrame::Mutation(Box::new(mutation)))
-            .await
+        while let Some(event) = events.recv().await {
+            match event {
+                InputEvent::Reached(reached) if &reached == barrier => return,
+                InputEvent::NotReached {
+                    barrier: missed, ..
+                } if &missed == barrier => return,
+                InputEvent::Ended { .. } => return,
+                _ => {}
+            }
+        }
     }
 
     fn next_id(&mut self) -> RequestId {
