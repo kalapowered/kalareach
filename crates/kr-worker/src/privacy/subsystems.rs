@@ -67,8 +67,8 @@ impl PrivacySubsystem for RetainedHistory<'_> {
         self.fenced = true;
         self.history.stop_retaining();
         // Giving up the grid's rows cannot fail and is complete when it returns, so it owes no
-        // retry. The alternate buffer's case, where the rows cannot be reached yet, is the grid's
-        // own: it gives them up when the primary buffer shows again.
+        // retry. The grid reaches its primary buffer whichever buffer shows, so a full-screen
+        // program leaves nothing to wait for.
         self.grid.set_history_kept(false);
         Ok(Fenced {
             queues: 1,
