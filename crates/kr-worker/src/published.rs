@@ -6,11 +6,11 @@
 //! the session keeps a copy of its summary outside its own lock, a read takes the session for no
 //! longer than [`TAKE_BOUND`], and a read that did not get it answers from the copy.
 //!
-//! The copy is set when the session launches, when it builds its record again, when it admits a
-//! close and when it records its closure. It can therefore be older than the session: a close can
-//! be admitted a moment before the copy says so. What the answer says about the lifecycle is for
-//! that reason read from the input domain, which the admission of a close changes in the same
-//! step, and never from the copy's own state.
+//! The copy is set when the session launches, when it builds its record again, when what its
+//! application is doing changes, when it admits a close and when it records its closure. It can
+//! therefore be older than the session: a close can be admitted a moment before the copy says so.
+//! What the answer says about the lifecycle, and how many launches wait for the reader, is for that
+//! reason read from the input domain, which holds both as they are, and never from the copy.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -57,16 +57,37 @@ impl PublishedSummary {
     }
 
     /// Returns the answer to a read that could not take the session: the published summary with
-    /// the lifecycle state read from the input domain.
+    /// the lifecycle state read from the input domain, and how many launches the domain holds
+    /// for the reader to decide.
     ///
     /// This is the one place where the answer takes what the session's own admission of a close
     /// holds. Today that is the state alone, which the domain changes in the step that admits a
     /// close. The closing reason and the durability that an admission carries are put into the
-    /// answer here, and nowhere else.
+    /// answer here, and nowhere else. The domain is taken once, so the state and the count are
+    /// the domain's at one moment.
     #[must_use]
-    pub fn answer(&self, input: &InputShared) -> SessionSummary {
+    pub fn answer(&self, input: &InputShared) -> Held {
         let mut summary = self.latest();
-        summary.state = input.lock().state();
-        summary
+        let domain = input.lock();
+        summary.state = domain.state();
+        let outstanding_launches = summary
+            .state
+            .is_running()
+            .then(|| domain.outstanding_launches())
+            .flatten();
+        Held {
+            summary,
+            outstanding_launches,
+        }
     }
+}
+
+/// What a read that could not take the session answers.
+#[derive(Debug)]
+pub struct Held {
+    /// The published summary, with the lifecycle state the input domain holds now.
+    pub summary: SessionSummary,
+    /// How many callers wait for a launch the reader is deciding, for a running session with a
+    /// managed root editor, and none otherwise, as a read that takes the session gives it.
+    pub outstanding_launches: Option<u64>,
 }
