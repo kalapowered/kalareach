@@ -360,6 +360,11 @@ fn nothing_comes_back_when_privacy_mode_goes_off_and_new_rows_are_kept() {
     assert!(shows_only_the_screen(&scrolled, "while"), "{scrolled:?}");
 
     rig.print(&run("after"));
+    let scrolled = rig.scrolled(1000);
+    assert!(
+        numbers(&scrolled, "before").is_empty() && numbers(&scrolled, "while").is_empty(),
+        "the rows that were on the screen when privacy mode went off are not kept: {scrolled:?}"
+    );
     let scrolled = rig.scrolled(30);
     assert!(
         numbers(&scrolled, "after")
@@ -367,9 +372,6 @@ fn nothing_comes_back_when_privacy_mode_goes_off_and_new_rows_are_kept() {
             .any(|number| *number < ON_SCREEN),
         "rows printed afterwards are kept and can be scrolled to: {scrolled:?}"
     );
-    let scrolled = rig.scrolled(1000);
-    assert!(numbers(&scrolled, "before").is_empty(), "{scrolled:?}");
-    assert!(shows_only_the_screen(&scrolled, "while"), "{scrolled:?}");
 }
 
 #[test]
@@ -460,8 +462,8 @@ fn rows_owed_stay_owed_when_privacy_mode_goes_off_before_the_program_leaves() {
 
     let scrolled = rig.scrolled(1000);
     assert!(
-        shows_only_the_screen(&scrolled, "before"),
-        "no row from before comes back: {scrolled:?}"
+        numbers(&scrolled, "before").is_empty(),
+        "no row from before comes back, those on the screen included: {scrolled:?}"
     );
     assert!(!numbers(&scrolled, "after").is_empty(), "{scrolled:?}");
     let scrolled = rig.scrolled(30);
