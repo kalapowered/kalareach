@@ -542,6 +542,17 @@ impl Controller {
         known
     }
 
+    /// The worker's own account of `session_id` that this daemon holds and its registry has not
+    /// yet recorded: what a write that failed or has not returned leaves.
+    fn workers_known_account(&self, session_id: SessionId) -> Option<ClosureRecord> {
+        self.known_closures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&session_id)
+            .filter(|known| known.whose == Whose::Worker)
+            .map(|known| known.record.clone())
+    }
+
     /// Keeps `record` as what a close of its session is answered with, until the registry holds a
     /// record of the session.
     fn keep_known_closure(&self, record: &ClosureRecord, whose: Whose) {
@@ -1089,6 +1100,15 @@ impl Controller {
         let _finalising = self.finalising.lock().await;
         if let Some(existing) = self.registry.lock().await.closure(session_id)? {
             return Ok(existing);
+        }
+        // What the worker said of its closure when this daemon asked it to close is its own
+        // account, as it gave it, and it stands whatever this host finds at the worker's end:
+        // an endpoint that cannot be removed, a journal that holds nothing, or a write of it that
+        // failed before. This daemon's own record of a worker that left nothing is never written
+        // over it.
+        if let Some(known) = self.workers_known_account(session_id) {
+            self.write_closure(&known, Whose::Worker).await?;
+            return Ok(known);
         }
         // The worker's own journal is the authority on how its session ended. It recorded the
         // root's exit status, what it stopped and how much of that it could account for; a record
