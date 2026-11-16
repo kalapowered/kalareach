@@ -863,14 +863,7 @@ async fn stop_the_daemon(
                 tokio::time::Instant::now() + END_BOUND,
             )
             .await;
-            return match ended_by(before, environment, &none, json, earlier) {
-                Ok(completion) => completion,
-                Err(answered) => failed(
-                    unmade_request(id, &Shown::ipc(&error), answered),
-                    &none,
-                    json,
-                ),
-            };
+            return unmade_ended(before, &error, id, environment, &none, json, earlier);
         }
         Ok(Err(error)) => return failed(error, &none, json),
         Err(_) => return silent(environment, &none, json, startup::ANSWER_BOUND),
@@ -929,14 +922,7 @@ async fn stop_the_daemon(
                 deadline,
             )
             .await;
-            return match ended_by(before, environment, &none, json, earlier) {
-                Ok(completion) => completion,
-                Err(answered) => failed(
-                    unmade_request(id, &Shown::ipc(&error), answered),
-                    &none,
-                    json,
-                ),
-            };
+            return unmade_ended(before, &error, id, environment, &none, json, earlier);
         }
         Asked::Refused(error) => {
             // Nothing was taken, so an interrupt from here on has nothing to say but that.
@@ -1028,6 +1014,25 @@ async fn stop_the_daemon(
                 json,
             )
         }
+    }
+}
+
+/// Ends the command where its request could not be made, by what the failure came to: with the
+/// daemon's end, with silence (exit 1) where the end is not shown in the bound, and with the
+/// unmade request's failure (exit 3) only where a daemon answered. The read of `host.info` and the
+/// compose of the stop request end here.
+fn unmade_ended(
+    before: Before,
+    error: &kr_ipc::IpcError,
+    id: EnvironmentId,
+    environment: &KnownEnvironment,
+    none: &Facts,
+    json: bool,
+    earlier: &Earlier,
+) -> Completion {
+    match ended_by(before, environment, none, json, earlier) {
+        Ok(completion) => completion,
+        Err(answered) => failed(unmade_request(id, &Shown::ipc(error), answered), none, json),
     }
 }
 
@@ -1550,11 +1555,14 @@ async fn successor_of(
 /// The evidence that a daemon answered.
 mod answered {
     use kr_ipc::IpcError;
+    use kr_protocol::hostinfo::HostInfoResult;
     use kr_protocol::ids::ControllerGeneration;
 
     /// What shows that a daemon answered: its answer to a look (the generation that it reported),
-    /// or a reply of its own that cannot be used. Nothing else builds one, so no result that says
-    /// "a host still answers" can be made without an answer in hand.
+    /// or a reply of its own that cannot be used. The product builds one only from an answer's
+    /// content, a `host.info` result or a reply error, which no code of this command makes up; the
+    /// field is private to this module. Only a case can build one from nothing (`for_a_case`, in
+    /// test builds), so there the cases and not the type hold the rule.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) struct Answered {
         /// The generation that the answering daemon reported; none for an unusable reply.
@@ -1562,8 +1570,16 @@ mod answered {
     }
 
     impl Answered {
-        /// The answer of a look: a daemon reported `generation`.
-        pub(super) const fn of_look(generation: ControllerGeneration) -> Self {
+        /// The answer of a look: the `host.info` that a daemon gave.
+        pub(super) fn from_info(info: &HostInfoResult) -> Self {
+            Self {
+                generation: Some(info.generation),
+            }
+        }
+
+        /// An answer for a case, of a daemon that reported `generation`.
+        #[cfg(test)]
+        pub(super) const fn for_a_case(generation: ControllerGeneration) -> Self {
             Self {
                 generation: Some(generation),
             }
@@ -1625,7 +1641,7 @@ async fn endpoint_look(
                         Ok(now) if generation.is_some_and(|asked| now.generation != asked) => {
                             Endpoint::Another
                         }
-                        Ok(now) => Endpoint::Same(Answered::of_look(now.generation)),
+                        Ok(now) => Endpoint::Same(Answered::from_info(&now)),
                         Err(_) => Endpoint::Unclear,
                     },
                     _ => Endpoint::Unclear,
@@ -2657,7 +2673,7 @@ mod tests {
 
     /// The answer of a daemon of the first generation to a look.
     fn an_answer() -> Answered {
-        Answered::of_look(ControllerGeneration::new(1))
+        Answered::for_a_case(ControllerGeneration::new(1))
     }
 
     /// A frame that the daemon's end cut: the end of the stream, or a reset, inside a frame.
