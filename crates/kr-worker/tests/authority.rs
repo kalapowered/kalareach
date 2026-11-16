@@ -1850,11 +1850,6 @@ async fn several_living_proxy_presentations_stay_admitted_through_a_hold_and_go_
     );
 }
 
-/// The longest a daemon waits for a presentation to be answered before it gives up on the link: the
-/// start's rebuild drops its client after five seconds. A presentation whose peer is there is
-/// decided inside it while the boundary is taken again and again.
-const PRESENTATION_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// One local client that attaches a terminal and detaches it again, back to back, until `stop` is
 /// set: each is a mutation, and each takes the dispatch boundary. It counts the mutations it made.
 async fn mutating(
@@ -1920,17 +1915,57 @@ async fn mutating(
     }
 }
 
-/// A presentation whose peer is there gets in while mutations take the dispatch boundary again and
-/// again.
+/// Waits until `ready` holds, and fails with `what` when `WAIT` has passed first. It is for a state
+/// that must come: the time it allows is the guard against a hang, and no promise about speed.
+async fn await_state(what: &str, mut ready: impl FnMut() -> bool) {
+    let end = tokio::time::Instant::now() + WAIT;
+    while !ready() {
+        assert!(
+            tokio::time::Instant::now() < end,
+            "{what} did not come within {WAIT:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// A living presentation keeps trying while mutations take the dispatch boundary again and again,
+/// and is decided once they stop.
 ///
 /// Four local clients attach and detach back to back, so the boundary is free only between one
-/// mutation and the next. The case shows the five-second bound, the time a daemon waits for a
-/// presentation, against a real stream of mutations. It does not show the wake: without it a
-/// presentation can still get in on some machines, and the case that shows the wake is
+/// mutation and the next. The stream is under way when the presentation comes, and its first try
+/// finds the boundary held. The case shows that, while the stream goes on, the presentation stays
+/// eligible: it tries at the releases, and its tries advance by twenty or it is decided at one of
+/// them. Then the stream stops, and the case shows that the presentation is decided, the boundary
+/// being free. It waits for that for as long as the suite waits for a state that must come, which
+/// is a guard against a hang and no time that the presentation is promised.
+///
+/// It does not show that a stream cannot keep the presentation out. The boundary is an ordinary
+/// lock, and a release makes the presentation eligible and promises it nothing: where a mutation
+/// always waits, a presentation can find the boundary taken at every try for as long as the stream
+/// goes on, and how often it gets in depends on how fast the machine runs. The wake is shown by
 /// `a_living_presentation_is_decided_in_a_gap_shorter_than_its_pause`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_living_presentation_is_decided_while_mutations_take_the_boundary_again_and_again() {
+///
+/// The runtime is the case's own, so that a mutation that never ends, which holds a thread of it,
+/// ends the case as a failed assertion and does not keep the runtime's drop waiting.
+#[test]
+fn a_living_presentation_keeps_trying_through_mutations_and_is_decided_when_they_stop() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(presentation_keeps_trying_through_mutations());
+    }));
+    runtime.shutdown_background();
+    if let Err(failure) = outcome {
+        std::panic::resume_unwind(failure);
+    }
+}
+
+async fn presentation_keeps_trying_through_mutations() {
     let host = host(1).await;
+    let service = &host.service;
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let made = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let streams: Vec<_> = (0..4)
@@ -1945,31 +1980,62 @@ async fn a_living_presentation_is_decided_while_mutations_take_the_boundary_agai
             ))
         })
         .collect();
-    settle(|| made.load(std::sync::atomic::Ordering::SeqCst) >= 20).await;
-    assert!(
-        made.load(std::sync::atomic::Ordering::SeqCst) >= 20,
-        "the mutations are under way"
-    );
+    await_state("twenty mutations of the stream", || {
+        made.load(std::sync::atomic::Ordering::SeqCst) >= 20
+    })
+    .await;
 
-    let before = made.load(std::sync::atomic::Ordering::SeqCst);
+    // The stream's mutations wait behind the case's own hold, so the presentation's first try finds
+    // the boundary held whatever the machine does, and the stream goes on at the release.
+    let boundary = Held::boundary(&host).await;
+    let first = service.presentation_tries_for_tests();
     let living = presenting(&host, 1);
-    let decided = tokio::time::timeout(PRESENTATION_BOUND, living).await;
-    let during = made.load(std::sync::atomic::Ordering::SeqCst) - before;
+    await_state("the presentation's first try", || {
+        service.presentation_tries_for_tests() > first
+    })
+    .await;
+    assert_eq!(
+        service.presentations_waiting_for_tests(),
+        1,
+        "the presentation waits for the held boundary"
+    );
+    boundary.release();
+
+    // While the stream goes on, the presentation tries again at the releases, or has been decided
+    // at one of them.
+    let released = service.presentation_tries_for_tests();
+    await_state(
+        "twenty more tries of the presentation while mutations take the boundary",
+        || living.is_finished() || service.presentation_tries_for_tests() >= released + 20,
+    )
+    .await;
+    let tries = service.presentation_tries_for_tests();
+    let during = made.load(std::sync::atomic::Ordering::SeqCst);
+    let early = living.is_finished();
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
-    for stream in streams {
-        stream.await.expect("the mutating client ends");
-    }
-    let (mut link, answer) = decided
+
+    // The stream has stopped, and the boundary is free.
+    let (mut link, answer) = tokio::time::timeout(WAIT, living)
+        .await
         .unwrap_or_else(|_| {
             panic!(
-                "the living presentation was not decided within {PRESENTATION_BOUND:?} while {during} mutations took the boundary"
+                "the presentation was not decided within {WAIT:?} of the stream's stop, \
+                 with {tries} tries and {during} mutations before it"
             )
         })
         .expect("the task ends");
+    for stream in streams {
+        tokio::time::timeout(WAIT, stream)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("a mutating client did not end within {WAIT:?} of the stream's stop")
+            })
+            .expect("the mutating client ends");
+    }
     answer.expect("the presentation is accepted");
     eprintln!(
-        "presentation decided after {} tries while {during} mutations took the boundary",
-        host.service.presentation_tries_for_tests()
+        "presentation decided after {} tries while {during} mutations took the boundary (before the stop: {early})",
+        service.presentation_tries_for_tests()
     );
     read_session(&mut link, host.session_id)
         .await
