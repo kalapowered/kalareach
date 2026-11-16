@@ -1287,10 +1287,24 @@ fn the_terminal_answer_is_spent_for_the_end_of_exclusive_management_only_where_n
             )
             .proof
     };
-    let under = |exclusive| TerminalStanding::Recovery {
-        environment_id,
-        exclusive,
-        ceiling: None,
+    // Whether the host is exclusive is read from the stored policy, in the spend's transaction.
+    let set_exclusive = |exclusive: bool| {
+        let store =
+            kr_controller::grants::GrantDirectory::open(&path).expect("the grant store opens");
+        let mut policy = kr_controller::grants::HostPolicy::personal(
+            kr_protocol::ids::AuthorityRevision::new(0),
+        );
+        policy.set_exclusively_managed(exclusive);
+        store
+            .store_policy(&policy.snapshot())
+            .expect("the policy is stored");
+    };
+    let under = |exclusive: bool| {
+        set_exclusive(exclusive);
+        TerminalStanding::Recovery {
+            environment_id,
+            ceiling: None,
+        }
     };
 
     // The owner's device is live and never expires, so it can confirm, and the terminal cannot.
@@ -1301,9 +1315,9 @@ fn the_terminal_answer_is_spent_for_the_end_of_exclusive_management_only_where_n
 
     // Under a rights ceiling that removes host management from that device it cannot confirm,
     // whatever its stored grant carries, and the terminal's answer is spent.
+    set_exclusive(true);
     let narrowed = TerminalStanding::Recovery {
         environment_id,
-        exclusive: true,
         ceiling: Some(
             [kr_protocol::rights::ActionRight::SessionView]
                 .into_iter()

@@ -83,6 +83,9 @@ pub struct HostPairingClock {
     /// machine's own counter, which a test cannot move.
     #[cfg(any(test, feature = "testing"))]
     passed_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// How far a test has moved the wall reading on, apart from the monotonic one.
+    #[cfg(any(test, feature = "testing"))]
+    wall_passed_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl HostPairingClock {
@@ -98,6 +101,8 @@ impl HostPairingClock {
             boot: kr_pairing::platform::BootIdentity(digest),
             #[cfg(any(test, feature = "testing"))]
             passed_ms: std::sync::Arc::default(),
+            #[cfg(any(test, feature = "testing"))]
+            wall_passed_ms: std::sync::Arc::default(),
         }
     }
 
@@ -106,6 +111,14 @@ impl HostPairingClock {
     pub fn pass(&self, by: std::time::Duration) {
         let by = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
         self.passed_ms
+            .fetch_add(by, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Moves the wall reading on by `by`, for a test of an expiry decided on it.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn pass_the_wall(&self, by: std::time::Duration) {
+        let by = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
+        self.wall_passed_ms
             .fetch_add(by, std::sync::atomic::Ordering::SeqCst);
     }
 }
@@ -125,7 +138,13 @@ impl PairingClock for HostPairingClock {
     }
 
     fn wall_clock_ms(&self) -> u64 {
-        kr_ipc::now_ms().get()
+        let reading = kr_ipc::now_ms().get();
+        #[cfg(any(test, feature = "testing"))]
+        let reading = reading.saturating_add(
+            self.wall_passed_ms
+                .load(std::sync::atomic::Ordering::SeqCst),
+        );
+        reading
     }
 }
 

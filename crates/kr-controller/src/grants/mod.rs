@@ -62,7 +62,7 @@ pub use remote_refusal::RemoteRefusal;
 pub use store::{
     ActionClaim, ActionRecord, ClaimHold, CloseHold, ExclusiveEnding, GrantDirectory, GrantRecord,
     GrantRevocation, MAX_GRANTS_PER_TREE, OfferRecord, ShareSubject, an_owner_device_can_recover,
-    can_recover,
+    can_recover, the_host_is_exclusive,
 };
 pub use vocabulary::{rights_for, unconditional_rights_for};
 
