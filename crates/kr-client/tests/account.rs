@@ -1495,6 +1495,8 @@ struct FaultyStore {
     session_reads: Mutex<VecDeque<bool>>,
     /// Whether the next write of the revocation queue lands and then reports a failure.
     queue_lands: std::sync::atomic::AtomicBool,
+    /// Whether the next removal of the revocation queue lands and then reports a failure.
+    queue_removal_lands: std::sync::atomic::AtomicBool,
     /// A standing that ends once the next write of the revocation queue has landed: what the
     /// caller's authority is while the store takes its time.
     ends_after_queue_write: Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
@@ -1519,6 +1521,7 @@ impl FaultyStore {
             queue_plan: Mutex::new(VecDeque::new()),
             session_reads: Mutex::new(VecDeque::new()),
             queue_lands: std::sync::atomic::AtomicBool::new(false),
+            queue_removal_lands: std::sync::atomic::AtomicBool::new(false),
             ends_after_queue_write: Mutex::new(None),
             ends_after_session_read: Mutex::new(None),
             queue_reads: std::sync::atomic::AtomicUsize::new(0),
@@ -1572,6 +1575,12 @@ impl FaultyStore {
     /// Has the next write of the revocation queue install its contents and then report a failure.
     fn queue_write_lands_then_fails(&self) {
         self.queue_lands.store(true, Ordering::SeqCst);
+    }
+
+    /// Has the next removal of the revocation queue (how an emptied queue is written) happen and
+    /// then report a failure.
+    fn queue_removal_lands_then_fails(&self) {
+        self.queue_removal_lands.store(true, Ordering::SeqCst);
     }
 
     fn session_reads(&self, failing: &[bool]) {
@@ -1685,6 +1694,12 @@ impl SecretStore for FaultyStore {
             self.note_a_write("queue");
         }
         self.queue_write_allowed(name)?;
+        if name.as_str().ends_with("account/revoke")
+            && self.queue_removal_lands.swap(false, Ordering::SeqCst)
+        {
+            self.inner.delete(name)?;
+            return Err(refused());
+        }
         self.inner.delete(name)
     }
 
@@ -2931,23 +2946,24 @@ async fn ending_a_withheld_sign_ins_tokens_says_what_is_owed_and_how_the_revocat
     }
 }
 
-/// The two orders in which a failed revocation can leave more done than its first reading says. A
-/// queue write can install its entry and then be reported as failed: where the service does not
-/// take the token either, the token is held in memory, and the failure says `Held`, which the
-/// daemon's line words as an entry that may have been left in place. A send of the queue can reach
-/// the service and then fail to clean the queue up: where a send of the token alone is then not
-/// taken, the token is in the queue, and the failure says `Queued`, which the daemon's line words
-/// as a service that may have taken it in the first send.
+/// The orders in which a failed revocation can leave more done than its first reading says, each
+/// made through the store's own hooks, with the variant and what the queue holds. A queue write
+/// can install its entry and then be reported as failed: where the service takes nothing either,
+/// the token is held in memory and the queue holds its entry, and the failure says `Held`. A send
+/// of the queue can reach the service and then fail to clean the queue up, the clean-up either
+/// refused before it landed or landed before it failed: where a send of the token alone is then not
+/// acknowledged, the failure says `Queued`, with the entry in the queue in the first order and
+/// none in the second.
 #[tokio::test]
-async fn a_failed_revocation_says_where_the_token_stands_in_the_two_orders_that_leave_more_done() {
+async fn a_failed_revocation_says_where_the_token_stands_in_the_orders_that_leave_more_done() {
     let _clock = CLOCK.lock().await;
     rewind();
-    // The queue's write lands and is reported as failed, and the service takes nothing.
+    // The queue's write lands and is reported as failed, and the service takes nothing. The
+    // landing flag stands alone: the write is not refused first.
     let stub = Arc::new(Stub::new());
     stub.revoke_works.store(false, Ordering::SeqCst);
     let store = Arc::new(FaultyStore::new());
     let signed_in = account_on(&stub, &store);
-    store.queue_writes(&[true]);
     store.queue_write_lands_then_fails();
     let (commit, unrevoked) = signed_in
         .end_withheld(RefreshToken::new("grant-c").expect("a token"))
@@ -2957,9 +2973,12 @@ async fn a_failed_revocation_says_where_the_token_stands_in_the_two_orders_that_
         matches!(unrevoked, Some(Unrevoked::Held(_))),
         "neither took the token: {unrevoked:?}"
     );
+    let queued = queue_text(&store).expect("the write landed: the queue holds an entry");
+    assert!(queued.contains("grant-c"), "{queued}");
+    assert!(stub.revoked().is_empty());
 
-    // The send of the queue reaches the service, its clean-up fails, and the send of the token
-    // alone is not taken.
+    // The send of the queue reaches the service, its clean-up is refused before it lands, and the
+    // send of the token alone is not acknowledged: the queue still holds the entry.
     let stub = Arc::new(Stub::new());
     stub.revoke_once.store(true, Ordering::SeqCst);
     let store = Arc::new(FaultyStore::new());
@@ -2972,7 +2991,31 @@ async fn a_failed_revocation_says_where_the_token_stands_in_the_two_orders_that_
     assert_eq!(stub.revoked(), ["grant-d"], "the service took it once");
     assert!(
         matches!(unrevoked, Some(Unrevoked::Queued(_))),
-        "the queue holds the token: {unrevoked:?}"
+        "the send failed after the queue took the token: {unrevoked:?}"
+    );
+    let queued = queue_text(&store).expect("the clean-up was refused: the entry is still there");
+    assert!(queued.contains("grant-d"), "{queued}");
+
+    // The same, with the clean-up landing before it fails: the queue holds nothing, and the
+    // variant is the same, so the line says only that the queue may still hold its entry.
+    let stub = Arc::new(Stub::new());
+    stub.revoke_once.store(true, Ordering::SeqCst);
+    let store = Arc::new(FaultyStore::new());
+    let signed_in = account_on(&stub, &store);
+    store.queue_removal_lands_then_fails();
+    let (commit, unrevoked) = signed_in
+        .end_withheld(RefreshToken::new("grant-e").expect("a token"))
+        .await;
+    assert_eq!(commit, Commit::Withheld);
+    assert_eq!(stub.revoked(), ["grant-e"], "the service took it once");
+    assert!(
+        matches!(unrevoked, Some(Unrevoked::Queued(_))),
+        "the send failed after the queue took the token: {unrevoked:?}"
+    );
+    assert_eq!(
+        queue_text(&store),
+        None,
+        "the clean-up landed: the queue holds nothing"
     );
 }
 
