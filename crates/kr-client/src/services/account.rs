@@ -2035,32 +2035,6 @@ pub enum Unrevoked {
     Held(ClientError),
 }
 
-/// What is known of the token and the error, for the line that records a failed revocation: each
-/// says what the queue and the service did as far as the revocation knows, and says "may have"
-/// where a write can have landed before it was reported as failed.
-impl fmt::Display for Unrevoked {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Queued(error) => write!(
-                formatter,
-                "the queue took the token and sending the queue failed, and a send of the token \
-                 alone was not taken; the service may have taken the token in the first send, and \
-                 the queue holds its entry: {error}"
-            ),
-            Self::Ended(error) => write!(
-                formatter,
-                "the service took the token by a send of its own; the queue of revocations \
-                 failed, and may still hold its entry: {error}"
-            ),
-            Self::Held(error) => write!(
-                formatter,
-                "the service did not take the token and the queue's write failed, which may have \
-                 left its entry in place; the token is held in memory for the next send: {error}"
-            ),
-        }
-    }
-}
-
 impl Unrevoked {
     /// The error the revocation returned.
     fn into_error(self) -> ClientError {
