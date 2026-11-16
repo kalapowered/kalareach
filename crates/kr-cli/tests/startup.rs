@@ -5756,11 +5756,12 @@ fn kr_host_restart_replaces_the_daemon_and_the_new_one_is_the_one_it_started() {
 /// command says only what is true of the order it met. Nothing orders the two: a restart that
 /// finds the other's daemon answering restarts it again, so a command that says it started a daemon
 /// may name one that a later restart has stopped since: it names a daemon that ran, and the one
-/// that runs at the end is waited for, not read once. A command whose proof was cut by the other's
-/// stop starts nothing more and waits for the daemon that answers next. Both commands end with
-/// exit 0 wherever a daemon answers within the bounds; exit 1 comes only with the words of a bound
-/// that ran out (a holder that did not answer in the start's bound, or no daemon that answered
-/// within it after a proof that was cut). The case requires no order between the two processes.
+/// that runs at the end is waited for, not read once. A command whose proof's exchange does not
+/// complete starts nothing more and waits for the daemon that gives a whole exchange next. Both
+/// commands end with exit 0 wherever a daemon answers within the bounds; exit 1 comes only with
+/// the words of a bound that ran out (a holder that did not answer in the start's bound, or no
+/// daemon that answered within it after an exchange that did not complete). The case requires no
+/// order between the two processes.
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn two_kr_host_restarts_at_once_converge_on_one_daemon_and_neither_fails() {

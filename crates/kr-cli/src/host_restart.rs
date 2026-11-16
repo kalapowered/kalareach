@@ -103,15 +103,7 @@ async fn wait_for_the_holder(
         holder::Holder::Answers => {
             let named = operations.named_daemon();
             host_stop::done(
-                // PLACEHOLDER for the texts' round: the sentence that says this command stopped
-                // none and started none; its state is the wait's `Answers` (a daemon that held the
-                // environment and did not answer was found to answer), read by `holder::wait`.
-                &shown!(
-                    "A control daemon held environment {} and did not answer, and a control \
-                     daemon{} answers now. This command stopped none and started none.",
-                    id,
-                    host_stop::process_said(named)
-                ),
+                &holder_answers_said(id, named),
                 &Facts {
                     pid: named,
                     ..begun.none.clone()
@@ -127,6 +119,17 @@ async fn wait_for_the_holder(
             host_stop::holds_and_is_silent(Which::Restart, environment, &begun.none, json)
         }
     }
+}
+
+/// What the restart says where a process held the environment and did not answer, and a daemon
+/// answers now: that this command stopped none and started none.
+fn holder_answers_said(id: EnvironmentId, named: Option<u64>) -> Shown {
+    shown!(
+        "A control daemon held environment {} and did not answer, and a control daemon{} answers \
+         now. This command stopped none and started none.",
+        id,
+        host_stop::process_said(named)
+    )
 }
 
 /// What a restart that finds the start unmakeable says: the start's own refusal, and that nothing
@@ -239,23 +242,8 @@ async fn restart_the_daemon(
     match proved {
         Ok(Proved::Ours(started)) => {
             progress.remove_marker();
-            let processes = match (stopped.named, started.pid) {
-                (Some(old), Some(new)) => {
-                    shown!(" (process {} ended, process {} started)", old, new)
-                }
-                (Some(old), None) => shown!(" (process {} ended)", old),
-                (None, Some(new)) => shown!(" (process {} started)", new),
-                (None, None) => Shown::said(""),
-            };
             host_stop::done(
-                &shown!(
-                    "Restarted the control daemon for environment {}{} under the {} start. No \
-                     session was stopped.{}",
-                    id,
-                    processes,
-                    start_said(&started),
-                    creates
-                ),
+                &restarted_said(id, stopped.named, &started, creates),
                 &Facts {
                     started: Some(Some(started_fact(&started))),
                     ..facts
@@ -267,33 +255,23 @@ async fn restart_the_daemon(
         Ok(Proved::Another {
             serving,
             launched,
-            ended,
+            cut,
         }) => {
             progress.remove_marker();
             let said = match launched {
-                // PLACEHOLDER for the texts' round: the sentence that says this command stopped the
-                // control daemon and started one (process P), which answered and then ended, and
-                // that the control daemon that answers now is process Q. Its state is `ended`, set
-                // where the proof's exchange was cut and the daemon that answered next is not the
-                // one this command started (`proof::prove`).
-                Some(started) if ended => shown!(
-                    "This command stopped the control daemon for environment {}{} and started \
-                     one{}, which answered and then ended; the control daemon that answers now{}. \
-                     No session was stopped.{}",
+                Some(started) if cut => stopped_and_another_serves_after_a_cut(
                     id,
-                    host_stop::process_said(stopped.named),
-                    host_stop::process_said(started.pid.map(u64::from)),
-                    host_stop::process_said(serving),
-                    creates
+                    stopped.named,
+                    serving,
+                    &started,
+                    creates,
                 ),
-                launched => shown!(
-                    "Stopped the control daemon for environment {}{}; a control daemon already \
-                     serves it{}.{} No session was stopped.{}",
+                launched => stopped_and_another_already_serves_said(
                     id,
-                    host_stop::process_said(stopped.named),
-                    host_stop::process_said(serving),
-                    Proved::own_start_said(launched),
-                    creates
+                    stopped.named,
+                    serving,
+                    launched,
+                    creates,
                 ),
             };
             host_stop::done(&said, &facts, json, &begun.earlier)
@@ -325,7 +303,7 @@ async fn wait_for_the_successor(
         Ok(_) => Ok(Proved::Another {
             serving: successor,
             launched: None,
-            ended: false,
+            cut: false,
         }),
         Err(last) => Err(CliError::Unfinished {
             code: ErrorCode::EnvironmentUnavailable,
@@ -367,17 +345,8 @@ async fn start_where_none_ran(
     match result {
         Ok(Proved::Ours(started)) => {
             progress.remove_marker();
-            let process = host_stop::process_said(started.pid.map(u64::from));
-            let under_way = host_stop::under_way_said(environment);
             host_stop::done(
-                &shown!(
-                    "No control daemon was running for environment {}. Started one{} under the {} \
-                     start.{}",
-                    id,
-                    process,
-                    start_said(&started),
-                    under_way
-                ),
+                &none_ran_started_said(id, &started, host_stop::under_way_said(environment)),
                 &Facts {
                     started: Some(Some(started_fact(&started))),
                     ..none
@@ -389,37 +358,22 @@ async fn start_where_none_ran(
         Ok(Proved::Another {
             serving,
             launched,
-            ended,
+            cut,
         }) => {
             progress.remove_marker();
             let said = match launched {
-                // PLACEHOLDER for the texts' round: the sentence that says this command started a
-                // control daemon (process P), which answered and then ended, and that the control
-                // daemon that answers now is process Q. Its state is `ended` (see above).
-                Some(started) if ended => shown!(
-                    "No control daemon was running for environment {}. This command started \
-                     one{}, which answered and then ended; the control daemon that answers now{}.{}",
+                Some(started) if cut => none_ran_and_another_serves_after_a_cut(
                     id,
-                    host_stop::process_said(started.pid.map(u64::from)),
-                    host_stop::process_said(serving),
-                    host_stop::under_way_said(environment)
+                    serving,
+                    &started,
+                    host_stop::under_way_said(environment),
                 ),
-                launched => {
-                    // Where this command launched nothing it started none; where it launched a
-                    // process that lost the environment, it says that instead.
-                    let own = match launched {
-                        None => Shown::said(" This command started none."),
-                        Some(_) => Proved::own_start_said(launched),
-                    };
-                    shown!(
-                        "No control daemon was running for environment {}, and one serves it \
-                         now{}.{}{}",
-                        id,
-                        host_stop::process_said(serving),
-                        own,
-                        host_stop::under_way_said(environment)
-                    )
-                }
+                launched => none_ran_and_another_already_serves_said(
+                    id,
+                    serving,
+                    launched,
+                    host_stop::under_way_said(environment),
+                ),
             };
             host_stop::done(&said, &none, json, &begun.earlier)
         }
@@ -441,19 +395,21 @@ pub(crate) enum Proved {
     Another {
         /// The process that the answering daemon states, where it states one.
         serving: Option<u64>,
-        /// What this command launched, where it launched something that did not take the
-        /// environment or that answered and then ended, and none where its look found the daemon
-        /// already there.
+        /// What this command launched, where it launched something, and none where its look
+        /// found the daemon already there. The process that answers is not the one launched.
         launched: Option<Started>,
-        /// Whether what this command launched answered and then ended before the exchange that
-        /// proves it was read, as a daemon does that another command stops.
-        ended: bool,
+        /// Whether the exchange that proves which daemon answers was cut on the connection that
+        /// the start gave, so that the daemon that is named here was read on a later one. The
+        /// command then does not know what became of the daemon on the first connection, or
+        /// whether it was the one this command launched.
+        cut: bool,
     },
 }
 
 impl Proved {
-    /// This outcome for a proof whose exchange was cut after a daemon answered: what this command
-    /// launched, where it launched something, answered and then ended.
+    /// This outcome for a proof whose exchange was cut on the connection that the start gave and
+    /// was then read whole on another: where this command launched something and another process
+    /// answers, the outcome says that the exchange was cut.
     fn after_a_cut(self) -> Self {
         match self {
             Self::Another {
@@ -463,7 +419,7 @@ impl Proved {
             } => Self::Another {
                 serving,
                 launched: Some(started),
-                ended: true,
+                cut: true,
             },
             other => other,
         }
@@ -480,6 +436,154 @@ impl Proved {
             ),
         }
     }
+}
+
+/// What a restart says where the daemon that it started answers: the process that ended and the one
+/// that started, where it read them, and the start.
+fn restarted_said(id: EnvironmentId, old: Option<u64>, started: &Started, creates: Shown) -> Shown {
+    let processes = match (old, started.pid) {
+        (Some(old), Some(new)) => shown!(" (process {} ended, process {} started)", old, new),
+        (Some(old), None) => shown!(" (process {} ended)", old),
+        (None, Some(new)) => shown!(" (process {} started)", new),
+        (None, None) => Shown::said(""),
+    };
+    shown!(
+        "Restarted the control daemon for environment {}{} under the {} start. No session was \
+         stopped.{}",
+        id,
+        processes,
+        start_said(started),
+        creates
+    )
+}
+
+/// What a restart says where it stopped a daemon and another daemon already serves the
+/// environment: the process that answers, and where this command launched a start, that it did not
+/// take the environment.
+fn stopped_and_another_already_serves_said(
+    id: EnvironmentId,
+    stopped: Option<u64>,
+    serving: Option<u64>,
+    launched: Option<Started>,
+    creates: Shown,
+) -> Shown {
+    shown!(
+        "Stopped the control daemon for environment {}{}; a control daemon already serves it{}.{} \
+         No session was stopped.{}",
+        id,
+        host_stop::process_said(stopped),
+        host_stop::process_said(serving),
+        Proved::own_start_said(launched),
+        creates
+    )
+}
+
+/// What a restart says where no daemon ran and the one that it started answers.
+fn none_ran_started_said(id: EnvironmentId, started: &Started, under_way: Shown) -> Shown {
+    shown!(
+        "No control daemon was running for environment {}. Started one{} under the {} start.{}",
+        id,
+        host_stop::process_said(started.pid.map(u64::from)),
+        start_said(started),
+        under_way
+    )
+}
+
+/// What a restart says where no daemon ran and another daemon serves the environment now. Where
+/// this command launched nothing it started none; where it launched a process that did not take the
+/// environment, it says that instead.
+fn none_ran_and_another_already_serves_said(
+    id: EnvironmentId,
+    serving: Option<u64>,
+    launched: Option<Started>,
+    under_way: Shown,
+) -> Shown {
+    let own = match launched {
+        None => Shown::said(" This command started none."),
+        Some(_) => Proved::own_start_said(launched),
+    };
+    shown!(
+        "No control daemon was running for environment {}, and one serves it now{}.{}{}",
+        id,
+        host_stop::process_said(serving),
+        own,
+        under_way
+    )
+}
+
+/// What a restart says where it stopped a daemon, launched a start whose exchange was cut, and a
+/// daemon of another process then gave a whole exchange. It says what it read and nothing of what
+/// became of the daemon on the cut connection: the control daemon that serves the environment now
+/// (process Q), and that its own start (process P) does not serve it.
+fn stopped_and_another_serves_after_a_cut(
+    id: EnvironmentId,
+    stopped: Option<u64>,
+    serving: Option<u64>,
+    started: &Started,
+    creates: Shown,
+) -> Shown {
+    shown!(
+        "Stopped the control daemon for environment {}{}; a control daemon now serves it{}. This \
+         command's own start{} does not serve it. No session was stopped.{}",
+        id,
+        host_stop::process_said(stopped),
+        host_stop::process_said(serving),
+        host_stop::process_said(started.pid.map(u64::from)),
+        creates
+    )
+}
+
+/// What a restart says where no daemon ran, it launched a start whose exchange was cut, and a
+/// daemon of another process then gave a whole exchange: as the sentence above, without a stop.
+fn none_ran_and_another_serves_after_a_cut(
+    id: EnvironmentId,
+    serving: Option<u64>,
+    started: &Started,
+    under_way: Shown,
+) -> Shown {
+    shown!(
+        "No control daemon was running for environment {}; a control daemon now serves it{}. \
+         This command's own start{} does not serve it.{}",
+        id,
+        host_stop::process_said(serving),
+        host_stop::process_said(started.pid.map(u64::from)),
+        under_way
+    )
+}
+
+/// What a restart says where its start failed: what it had stopped, the start's own words, that the
+/// requested daemon may still start where a daemon was launched and not seen to end, that no
+/// session was stopped, and what to do.
+fn start_failed_said(id: EnvironmentId, had: Had, own: Shown, launched: bool) -> Shown {
+    let stop = match had {
+        Had::NoDaemon => shown!(
+            "No control daemon was running for environment {} and the start failed",
+            id
+        ),
+        Had::Daemon(pid) => shown!(
+            "The control daemon for environment {}{} was stopped and the start failed",
+            id,
+            host_stop::process_said(pid)
+        ),
+    };
+    let still = if launched {
+        Shown::said(" The requested daemon may still start.")
+    } else {
+        Shown::said("")
+    };
+    let sessions = match had {
+        Had::NoDaemon => Shown::said("Nothing was stopped."),
+        Had::Daemon(_) => Shown::said(
+            "No session was stopped: its workers keep running and a local attach still works.",
+        ),
+    };
+    shown!(
+        "{}: {}.{} {} Fix the cause and run kr host restart again.",
+        stop,
+        own,
+        still,
+        sessions
+    )
 }
 
 /// What the restart had stopped when its start failed.
@@ -524,36 +628,7 @@ impl StartFailed {
         {
             progress.remove_marker();
         }
-        let own = self.error.said();
-        let stop = match had {
-            Had::NoDaemon => shown!(
-                "No control daemon was running for environment {} and the start failed",
-                id
-            ),
-            Had::Daemon(pid) => shown!(
-                "The control daemon for environment {}{} was stopped and the start failed",
-                id,
-                host_stop::process_said(pid)
-            ),
-        };
-        let still = if self.launched {
-            Shown::said(" The requested daemon may still start.")
-        } else {
-            Shown::said("")
-        };
-        let sessions = match had {
-            Had::NoDaemon => Shown::said("Nothing was stopped."),
-            Had::Daemon(_) => Shown::said(
-                "No session was stopped: its workers keep running and a local attach still works.",
-            ),
-        };
-        let message = shown!(
-            "{}: {}.{} {} Fix the cause and run kr host restart again.",
-            stop,
-            own,
-            still,
-            sessions
-        );
+        let message = start_failed_said(id, had, self.error.said(), self.launched);
         let error = match self.error {
             CliError::HostUnavailable(_) => CliError::HostUnavailable(message),
             CliError::Unfinished { code, .. } => CliError::Unfinished { code, message },
@@ -609,7 +684,7 @@ fn judge(
         return Ok(Proved::Another {
             serving: answering.pid,
             launched: None,
-            ended: false,
+            cut: false,
         });
     };
     if !stopped.is_none_or(|old| answering.generation > old) {
@@ -624,7 +699,7 @@ fn judge(
         (Some(_), Some(answered)) => Ok(Proved::Another {
             serving: Some(answered),
             launched: Some(started),
-            ended: false,
+            cut: false,
         }),
         (Some(_), None) => Err(
             "the control daemon that answers did not state its process, so it \
@@ -817,7 +892,7 @@ mod tests {
             Ok(Proved::Another {
                 serving: Some(41),
                 launched: Some(launched),
-                ended: false
+                cut: false
             }) if launched.pid == Some(40)
         ));
     }
@@ -856,7 +931,7 @@ mod tests {
             Ok(Proved::Another {
                 serving: Some(9),
                 launched: None,
-                ended: false
+                cut: false
             })
         ));
         assert!(matches!(
@@ -864,7 +939,7 @@ mod tests {
             Ok(Proved::Another {
                 serving: None,
                 launched: None,
-                ended: false
+                cut: false
             })
         ));
     }
@@ -874,6 +949,338 @@ mod tests {
     fn where_none_was_stopped_any_generation_is_new() {
         let proved = proof(Some(started(Some(40))), None, &answering(1, Some(40)));
         assert!(matches!(proved, Ok(Proved::Ours(_))));
+    }
+
+    /// A restart that stopped a daemon and then read another process after a cut exchange says what
+    /// it read: the daemon that serves the environment now, and that its own start does not serve
+    /// it; it says nothing of what became of the daemon on the cut connection. The creates that the
+    /// stop went on without come after it.
+    #[test]
+    fn a_restart_that_read_another_daemon_after_a_cut_says_only_what_it_read() {
+        let host = kr_ipc::testing::TempHost::create();
+        let id = host.environment_id();
+        let said = stopped_and_another_serves_after_a_cut(
+            id,
+            Some(30),
+            Some(41),
+            &started(Some(40)),
+            Shown::said(""),
+        );
+        assert_eq!(
+            said.to_string(),
+            format!(
+                "Stopped the control daemon for environment {id} (process 30); a control daemon \
+                 now serves it (process 41). This command's own start (process 40) does not \
+                 serve it. No session was stopped."
+            )
+        );
+        let creates = host_stop::creates_under_way(Some(2));
+        let said =
+            stopped_and_another_serves_after_a_cut(id, None, Some(41), &started(Some(40)), creates);
+        assert!(
+            said.to_string().starts_with(&format!(
+                "Stopped the control daemon for environment {id}; a control daemon now serves it \
+                 (process 41). This command's own start (process 40) does not serve it. No \
+                 session was stopped. 2 session creates were still under way"
+            )),
+            "{said}"
+        );
+    }
+
+    /// The same where no daemon ran: no stop is said, and the attempts under way come after it.
+    #[test]
+    fn a_start_where_none_ran_that_read_another_daemon_after_a_cut_says_only_what_it_read() {
+        let host = kr_ipc::testing::TempHost::create();
+        let id = host.environment_id();
+        let said = none_ran_and_another_serves_after_a_cut(
+            id,
+            Some(41),
+            &started(Some(40)),
+            Shown::said(""),
+        );
+        assert_eq!(
+            said.to_string(),
+            format!(
+                "No control daemon was running for environment {id}; a control daemon now \
+                 serves it (process 41). This command's own start (process 40) does not serve it."
+            )
+        );
+    }
+
+    /// The outcome of a proof whose exchange was cut carries `cut` only where this command
+    /// launched a process and another one answers; a daemon that the start's look found, or the
+    /// started process that answers, is the outcome it was without the cut.
+    #[test]
+    fn only_a_launch_that_another_process_answers_after_a_cut_is_marked_cut() {
+        let another = |launched| Proved::Another {
+            serving: Some(41),
+            launched,
+            cut: false,
+        };
+        assert!(matches!(
+            another(Some(started(Some(40)))).after_a_cut(),
+            Proved::Another { cut: true, .. }
+        ));
+        assert!(matches!(
+            another(None).after_a_cut(),
+            Proved::Another { cut: false, .. }
+        ));
+        assert!(matches!(
+            Proved::Ours(started(Some(40))).after_a_cut(),
+            Proved::Ours(_)
+        ));
+    }
+
+    /// The daemon that the restart started answers: the processes that ended and started where the
+    /// command read them, and the start; where it read none, the sentence names none.
+    #[test]
+    fn a_restart_whose_started_daemon_answers_says_what_ended_and_what_started() {
+        let host = kr_ipc::testing::TempHost::create();
+        let id = host.environment_id();
+        let start = start_said(&started(None));
+        assert_eq!(
+            restarted_said(id, Some(30), &started(Some(40)), Shown::said("")).to_string(),
+            format!(
+                "Restarted the control daemon for environment {id} (process 30 ended, process 40 \
+                 started) under the {start} start. No session was stopped."
+            )
+        );
+        assert_eq!(
+            restarted_said(id, None, &started(None), Shown::said("")).to_string(),
+            format!(
+                "Restarted the control daemon for environment {id} under the {start} start. \
+                 No session was stopped."
+            )
+        );
+        assert_eq!(
+            none_ran_started_said(id, &started(Some(40)), Shown::said("")).to_string(),
+            format!(
+                "No control daemon was running for environment {id}. Started one (process 40) \
+                 under the {start} start."
+            )
+        );
+    }
+
+    /// Another daemon serves the environment and the exchange was not cut: where this command
+    /// launched a start, it says the start did not take the environment; where it launched none,
+    /// the restart after a stop says nothing of a start and the start where none ran says it
+    /// started none.
+    #[test]
+    fn another_daemon_that_serves_the_environment_is_said_with_this_commands_own_start() {
+        let host = kr_ipc::testing::TempHost::create();
+        let id = host.environment_id();
+        assert_eq!(
+            stopped_and_another_already_serves_said(
+                id,
+                Some(30),
+                Some(41),
+                Some(started(Some(40))),
+                Shown::said("")
+            )
+            .to_string(),
+            format!(
+                "Stopped the control daemon for environment {id} (process 30); a control daemon \
+                 already serves it (process 41). This command's own start (process 40) did not \
+                 take the environment. No session was stopped."
+            )
+        );
+        assert_eq!(
+            stopped_and_another_already_serves_said(id, Some(30), None, None, Shown::said(""))
+                .to_string(),
+            format!(
+                "Stopped the control daemon for environment {id} (process 30); a control daemon \
+                 already serves it. No session was stopped."
+            )
+        );
+        assert_eq!(
+            none_ran_and_another_already_serves_said(
+                id,
+                Some(41),
+                Some(started(Some(40))),
+                Shown::said("")
+            )
+            .to_string(),
+            format!(
+                "No control daemon was running for environment {id}, and one serves it now \
+                 (process 41). This command's own start (process 40) did not take the \
+                 environment."
+            )
+        );
+        assert_eq!(
+            none_ran_and_another_already_serves_said(id, None, None, Shown::said("")).to_string(),
+            format!(
+                "No control daemon was running for environment {id}, and one serves it now. This \
+                 command started none."
+            )
+        );
+    }
+
+    /// A holder that did not answer and a daemon that answers now: the restart stopped none and
+    /// started none, and names the process that answers where it reads one.
+    #[test]
+    fn a_holder_that_gives_way_to_a_daemon_says_that_nothing_was_stopped_or_started() {
+        let host = kr_ipc::testing::TempHost::create();
+        let id = host.environment_id();
+        assert_eq!(
+            holder_answers_said(id, Some(41)).to_string(),
+            format!(
+                "A control daemon held environment {id} and did not answer, and a control daemon \
+                 (process 41) answers now. This command stopped none and started none."
+            )
+        );
+        assert_eq!(
+            holder_answers_said(id, None).to_string(),
+            format!(
+                "A control daemon held environment {id} and did not answer, and a control daemon \
+                 answers now. This command stopped none and started none."
+            )
+        );
+    }
+
+    /// A start that fails says what had been stopped, the start's own words, and what to do; it
+    /// adds that the requested daemon may still start only where one was launched and not seen to
+    /// end.
+    #[test]
+    fn a_start_that_fails_says_what_was_stopped_and_what_to_do() {
+        let host = kr_ipc::testing::TempHost::create();
+        let id = host.environment_id();
+        let own = Shown::said("the daemon did not answer");
+        assert_eq!(
+            start_failed_said(id, Had::Daemon(Some(30)), own.clone(), true).to_string(),
+            format!(
+                "The control daemon for environment {id} (process 30) was stopped and the start \
+                 failed: the daemon did not answer. The requested daemon may still start. No \
+                 session was stopped: its workers keep running and a local attach still works. \
+                 Fix the cause and run kr host restart again."
+            )
+        );
+        assert_eq!(
+            start_failed_said(id, Had::NoDaemon, own, false).to_string(),
+            format!(
+                "No control daemon was running for environment {id} and the start failed: the \
+                 daemon did not answer. Nothing was stopped. Fix the cause and run kr host \
+                 restart again."
+            )
+        );
+    }
+
+    /// A start that cannot be made is refused before the stop with the start's own words, that
+    /// nothing was stopped, and the remedy where there is one; a setup that is wrong is
+    /// `HOST_NOT_CONFIGURED` (exit 3), and a manager or a lock that could not be asked is not (exit 1).
+    #[test]
+    fn a_start_that_cannot_be_made_says_that_nothing_was_stopped() {
+        let host = kr_ipc::testing::TempHost::create();
+        let id = host.environment_id();
+        let unstartable = |not_set_up| Unstartable {
+            why: Shown::said("no start is chosen"),
+            remedy: Some(Shown::said("Run kr host startup.")),
+            not_set_up,
+        };
+        let expected = format!(
+            "kr host restart can make no start for environment {id}: no start is chosen. Nothing \
+             was stopped. Run kr host startup."
+        );
+        match not_startable(id, unstartable(true)) {
+            CliError::HostUnavailable(message) => assert_eq!(message.to_string(), expected),
+            other => panic!("a setup that is wrong is HOST_NOT_CONFIGURED: {other:?}"),
+        }
+        match not_startable(id, unstartable(false)) {
+            CliError::Unfinished { message, .. } => assert_eq!(message.to_string(), expected),
+            other => panic!("a manager that could not be asked is unfinished: {other:?}"),
+        }
+    }
+
+    /// What a proof says where the process that answers is not the one that was started, or is not
+    /// stated, or is of the generation that was told to stop, and what a result says of its own
+    /// start where another daemon serves.
+    #[test]
+    fn what_the_proof_and_the_result_say_of_the_start_that_did_not_take_the_environment() {
+        assert!(
+            judge(
+                Some(started(Some(40))),
+                Some(ControllerGeneration::new(3)),
+                &answering(3, Some(40))
+            )
+            .is_err_and(|said| said
+                == "the control daemon that answers is of the generation that was told to stop")
+        );
+        assert!(
+            judge(
+                Some(started(Some(40))),
+                Some(ControllerGeneration::new(3)),
+                &answering(4, None)
+            )
+            .is_err_and(|said| said
+                == "the control daemon that answers did not state its process, so it cannot be \
+                    told from the one that was started")
+        );
+        assert_eq!(
+            Proved::own_start_said(Some(started(Some(40)))).to_string(),
+            " This command's own start (process 40) did not take the environment."
+        );
+        assert_eq!(Proved::own_start_said(None).to_string(), "");
+    }
+
+    /// What an interrupt says in each stage: the words of each, which name what was asked, what
+    /// was seen and what to run. None of them says that a daemon ended where the command did not
+    /// see an end.
+    #[test]
+    fn an_interrupt_says_in_each_stage_what_was_asked_and_what_was_seen() {
+        let host = kr_ipc::testing::TempHost::create();
+        let id = host.environment_id();
+        let said = |stage, ended| {
+            interrupt_says(&progress_of(&host, ended), stage)
+                .1
+                .to_string()
+        };
+        assert_eq!(
+            said(Stage::BeforeAsking, false),
+            format!(
+                "kr host restart was interrupted before it asked the control daemon for \
+                 environment {id} to stop. Nothing was stopped."
+            )
+        );
+        assert_eq!(
+            said(Stage::Asked, false),
+            format!(
+                "kr host restart was interrupted while it asked the control daemon for \
+                 environment {id} to stop. The daemon may have taken the request and may still \
+                 stop, and no new daemon was started; an interrupt does not cancel a stop. No \
+                 session stops. Run kr host restart to be sure of the result."
+            )
+        );
+        assert_eq!(
+            said(Stage::Refused, false),
+            format!(
+                "kr host restart was interrupted after the control daemon for environment {id} \
+                 refused the request. Nothing was stopped."
+            )
+        );
+        assert_eq!(
+            said(Stage::Told, false),
+            format!(
+                "The control daemon for environment {id} was told to stop. kr host restart was \
+                 interrupted before it asked for a new daemon, so none was started, and the old \
+                 one may still be ending, after which no control daemon runs. No session stops. \
+                 Run kr host restart to start one."
+            )
+        );
+        assert_eq!(
+            said(Stage::Ended, true),
+            format!(
+                "The control daemon for environment {id} ended. kr host restart was interrupted \
+                 before it asked for a new daemon, so it started none, and none may be running. \
+                 No session stops. Run kr host restart to start one."
+            )
+        );
+        assert_eq!(
+            said(Stage::Starting, true),
+            format!(
+                "kr host restart was interrupted while it asked for a new control daemon for \
+                 environment {id}, so one may be starting. No session stops. Run kr host restart \
+                 to be sure."
+            )
+        );
     }
 
     /// A progress with no record of the command's own, as an interrupt finds it where the record

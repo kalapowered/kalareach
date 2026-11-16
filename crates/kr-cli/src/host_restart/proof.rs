@@ -1,12 +1,12 @@
 //! The proof that the daemon which answers after a restart's start is the one the command started,
 //! and what the command does where the exchange that proves it is cut.
 //!
-//! The proof reads the daemon's generation and its process on the one connection that answered. A
-//! daemon that answered and went away before both were read leaves no proof, and that is not yet a
-//! failure: another command may have stopped it as this one stopped the daemon before it, and a
-//! daemon of that command's start comes up next. The command then starts nothing more. It waits,
-//! within the start's bound counted from the cut, for a daemon to answer, and judges what answers
-//! by the one exchange on its connection.
+//! The proof reads the daemon's generation and its process on the one connection that answered. An
+//! exchange that does not complete leaves no proof, and that is not yet a failure: the daemon that
+//! the connection reached may have been stopped by another command, as this one stopped the daemon
+//! before it, and a daemon of that command's start comes up next. The command then starts nothing
+//! more. It waits, within the start's bound counted from the cut, for a daemon to give a whole
+//! exchange, and judges what answers by that one exchange on its connection.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -174,11 +174,13 @@ pub(super) async fn prove<O: Operations>(
     Ok(if cut { proved.after_a_cut() } else { proved })
 }
 
-/// A daemon answered and went away before its generation and its process were read. This starts
-/// nothing: the daemon may have been stopped by another command, whose own start comes up next.
-/// It waits, within `bound` counted from here, for a daemon to answer, and gives what that daemon
-/// says on its connection. A wait that runs out is the failure of a proof that was cut, which
-/// says that no daemon answered within the bound.
+/// The exchange on the connection that the start gave did not complete: it failed, it reached its
+/// bound, or the daemon gave no process that could be read. This starts nothing: the daemon may
+/// have been stopped by another command, whose own start comes up next. It waits, within `bound`
+/// counted from here, for a daemon to give a whole exchange, and gives what that daemon says on
+/// its connection. A wait that runs out is the failure of a proof that was cut, which says that
+/// the command could not read which daemon serves the environment and that none answered within
+/// the bound.
 async fn after_a_cut<O: Operations>(
     operations: &O,
     started: Option<Started>,
@@ -194,23 +196,7 @@ async fn after_a_cut<O: Operations>(
             return Ok(answering);
         }
         if left().is_zero() {
-            // PLACEHOLDER for the texts' round: the sentence that says that the daemon this command
-            // started (process P) answered and then ended, and that no control daemon answered
-            // within the bound; its state is a start whose exchange was cut and a wait that
-            // `after_a_cut` ran to its bound.
-            let message = match started {
-                Some(started) => shown!(
-                    "the control daemon that this command started{} answered and then ended, and \
-                     no control daemon answered within {} seconds",
-                    host_stop::process_said(started.pid.map(u64::from)),
-                    bound.as_secs()
-                ),
-                None => shown!(
-                    "a control daemon answered and then ended, and no control daemon answered \
-                     within {} seconds",
-                    bound.as_secs()
-                ),
-            };
+            let message = cut_failed_said(started, bound);
             return Err(StartFailed {
                 error: CliError::Unfinished {
                     code: ErrorCode::EnvironmentUnavailable,
@@ -221,6 +207,25 @@ async fn after_a_cut<O: Operations>(
             });
         }
         operations.pause(LOOK_EVERY.min(left())).await;
+    }
+}
+
+/// What a proof whose exchange was cut says where no daemon gave a whole exchange within `bound`:
+/// that this command could not read which control daemon serves the environment, and the process
+/// it launched where it launched one. It says nothing of an end that the command did not see.
+fn cut_failed_said(started: Option<Started>, bound: Duration) -> Shown {
+    match started {
+        Some(started) => shown!(
+            "this command started a control daemon{} but could not read which control daemon \
+             serves the environment, and no control daemon answered within {} seconds",
+            host_stop::process_said(started.pid.map(u64::from)),
+            bound.as_secs()
+        ),
+        None => shown!(
+            "this command could not read which control daemon serves the environment, and no \
+             control daemon answered within {} seconds",
+            bound.as_secs()
+        ),
     }
 }
 
@@ -286,7 +291,7 @@ mod tests {
         }
     }
 
-    /// A daemon that went away before it said its generation.
+    /// A daemon whose exchange is cut before it says its generation.
     fn cut() -> Says {
         Says {
             generation: Err("the connection was cut"),
@@ -500,7 +505,7 @@ mod tests {
 
     /// A cut exchange followed by another process answering, of a generation newer than the daemon
     /// that was stopped, is the outcome for another daemon, which carries what this command
-    /// launched and that it ended.
+    /// launched and that the exchange was cut.
     #[tokio::test(start_paused = true)]
     async fn a_cut_then_another_process_is_another_and_carries_what_was_launched() {
         let supplied = Supplied::new(
@@ -515,7 +520,7 @@ mod tests {
             Ok(Proved::Another {
                 serving: Some(200),
                 launched: Some(launched),
-                ended: true
+                cut: true
             }) if launched.pid == Some(100)
         ));
         assert_eq!(supplied.starts(), 1, "no second start");
@@ -557,8 +562,8 @@ mod tests {
             failed_with(prove(&supplied, Some(ControllerGeneration::new(4)), BOUND).await);
         assert_eq!(
             said,
-            "the control daemon that this command started (process 100) answered and then ended, \
-             and no control daemon answered within 30 seconds"
+            "this command started a control daemon (process 100) but could not read which control \
+             daemon serves the environment, and no control daemon answered within 30 seconds"
         );
         assert!(!launched, "a daemon answered, so none may still start");
         let cut_at = Duration::from_secs(7);
@@ -579,6 +584,62 @@ mod tests {
             calls.get(2),
             Some(&(cut_at, Call::Connect(BOUND))),
             "the first attempt is at the cut with the whole bound"
+        );
+    }
+
+    /// The exchange is not complete where the generation was not read and where the generation was
+    /// read and the process was not: the failure at the bound says the same of both, with the
+    /// process this command launched, and with no launch where the start's look found a daemon.
+    #[tokio::test(start_paused = true)]
+    async fn each_way_the_exchange_is_not_complete_says_that_the_daemon_could_not_be_read() {
+        let process_not_read = Says {
+            process: Err("the process could not be read"),
+            ..says(5, Some(100))
+        };
+        for first in [cut(), process_not_read] {
+            let supplied = Supplied::new(
+                Duration::ZERO,
+                started(100),
+                vec![first],
+                vec![at_once(None)],
+            );
+            let (said, launched) =
+                failed_with(prove(&supplied, Some(ControllerGeneration::new(4)), BOUND).await);
+            assert_eq!(
+                said,
+                "this command started a control daemon (process 100) but could not read which \
+                 control daemon serves the environment, and no control daemon answered within \
+                 30 seconds"
+            );
+            assert!(!launched);
+        }
+        let supplied = Supplied::new(Duration::ZERO, None, vec![cut()], vec![at_once(None)]);
+        let (said, launched) =
+            failed_with(prove(&supplied, Some(ControllerGeneration::new(4)), BOUND).await);
+        assert_eq!(
+            said,
+            "this command could not read which control daemon serves the environment, and no \
+             control daemon answered within 30 seconds"
+        );
+        assert!(!launched);
+    }
+
+    /// The failure at the bound says where the start was made by a manager that states no process:
+    /// the launch without a process.
+    #[tokio::test(start_paused = true)]
+    async fn the_failure_at_the_bound_names_no_process_where_the_start_states_none() {
+        let started = Some(Started {
+            pid: None,
+            start: ControllerStartup::Standalone,
+            manager: None,
+        });
+        let supplied = Supplied::new(Duration::ZERO, started, vec![cut()], vec![at_once(None)]);
+        let (said, _) =
+            failed_with(prove(&supplied, Some(ControllerGeneration::new(4)), BOUND).await);
+        assert_eq!(
+            said,
+            "this command started a control daemon but could not read which control daemon \
+             serves the environment, and no control daemon answered within 30 seconds"
         );
     }
 
@@ -634,7 +695,7 @@ mod tests {
             Ok(Proved::Another {
                 serving: Some(200),
                 launched: None,
-                ended: false
+                cut: false
             })
         ));
         assert_eq!(supplied.starts(), 1, "no second start");
