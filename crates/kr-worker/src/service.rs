@@ -1621,6 +1621,19 @@ impl WorkerService {
         self.connections.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// The revision this worker acknowledged to a generation of the control daemon, and which
+    /// generation, as the authority record holds it, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn acknowledgement_for_tests(
+        &self,
+    ) -> Option<(ControllerGeneration, kr_protocol::ids::AuthorityRevision)> {
+        self.authority
+            .lock()
+            .expect("the authority lock is not poisoned")
+            .acknowledged
+    }
+
     /// How many maintenance passes have finished, for this host's own tests. The first runs when
     /// the host starts serving, and takes the dispatch boundary.
     #[cfg(feature = "testing")]
