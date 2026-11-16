@@ -27,6 +27,7 @@ use kr_client::shown::Shown;
 use kr_controller::attempt::{self, Marker, Standing};
 use kr_controller::singleton::SingletonLock;
 use kr_ipc::client::{Listed, LocalClient};
+use kr_ipc::error::ErrorSource;
 use kr_ipc::identity::{self, ProcessReading, ProcessState};
 use kr_ipc::paths::{EnvironmentPaths, HostPaths};
 use kr_protocol::backup_setup::BackupStatusParams;
@@ -465,7 +466,7 @@ async fn stop(
             .await;
             Ok(match ended_by(before, environment, &none, json, &earlier) {
                 Ok(completion) => completion,
-                Err(answered) => failed(unreached(id, &error, answered), &none, json),
+                Err(cause) => failed(unreached(id, &error, cause), &none, json),
             })
         }
     }
@@ -1032,13 +1033,13 @@ fn unmade_ended(
 ) -> Completion {
     match ended_by(before, environment, none, json, earlier) {
         Ok(completion) => completion,
-        Err(answered) => failed(unmade_request(id, &Shown::ipc(error), answered), none, json),
+        Err(cause) => failed(unmade_request(id, &Shown::ipc(error), cause), none, json),
     }
 }
 
 /// The failure of a greeting that a daemon answers with a failure: that the daemon could not be
 /// reached and that no stop was requested. A daemon's answer is the proof, as for an unmade request.
-fn unreached(id: EnvironmentId, error: &kr_ipc::IpcError, _answered: Answered) -> CliError {
+fn unreached(id: EnvironmentId, error: &kr_ipc::IpcError, _cause: Unmade) -> CliError {
     CliError::HostUnavailable(shown!(
         "the control daemon for environment {} could not be reached: {}. No stop was requested.",
         id,
@@ -1049,7 +1050,7 @@ fn unreached(id: EnvironmentId, error: &kr_ipc::IpcError, _answered: Answered) -
 /// The failure of a request that could not be made while a daemon answers: what was not made and
 /// that the stop was not asked. A daemon's answer is the proof that it stays, and nothing builds
 /// this failure without one.
-fn unmade_request(id: EnvironmentId, why: &Shown, _answered: Answered) -> CliError {
+fn unmade_request(id: EnvironmentId, why: &Shown, _cause: Unmade) -> CliError {
     CliError::HostUnavailable(shown!(
         "kr host stop could not make its request for the control daemon of environment {}: {}. \
          Nothing was sent, and nothing was stopped.",
@@ -1113,17 +1114,29 @@ enum Before {
     Ended { said: Shown, pid: Option<u64> },
     /// The daemon closed the connection and was not shown to have ended within the bound.
     Silent,
-    /// A daemon answered, by a look or by a reply that cannot be used: the failure keeps its own
-    /// words, with exit 3. It holds the answer.
+    /// A daemon answered, by a look or by a reply of its own: the failure keeps its own words,
+    /// with exit 3. It holds the answer.
     Answers(Answered),
+    /// The failure is this side's own: no daemon wrote it and no daemon's end causes it. It says
+    /// its own words, with exit 3, and nothing is looked at.
+    OwnFault,
+}
+
+/// What makes a failure that ends with exit 3 true: a daemon's answer, or this side's own fault.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unmade {
+    /// A daemon answered.
+    Answered(Answered),
+    /// This side's own fault.
+    OwnFault,
 }
 
 /// Decides what a failure of the connection before the command's request was made came to, as the
 /// arm for a request that could not be made decides it: by the daemon's end, looked for within
-/// `deadline`. A daemon's own reply that cannot be used is an answer. Otherwise a daemon that closed
-/// the connection, or a frame that the close cut, is waited for; any other failure is looked at
-/// once first. A daemon that answers a look leaves the failure its own words; where none answered,
-/// the end is proved or it is not shown in the bound.
+/// `deadline`. A daemon's own reply is an answer, and this side's own fault is said as it is. A
+/// closure is decided by the daemon's end: a closed connection, or a frame that the close cut, is
+/// waited for; any other closure is looked at once first. A daemon that answers a look leaves the
+/// failure its own words; where none answered, the end is proved or it is not shown in the bound.
 async fn failed_before_the_request(
     operations: &impl Operations,
     connection: impl Sized,
@@ -1132,9 +1145,19 @@ async fn failed_before_the_request(
     id: EnvironmentId,
     deadline: tokio::time::Instant,
 ) -> Before {
-    if let Some(answered) = Answered::of_reply(error) {
-        drop(connection);
-        return Before::Answers(answered);
+    // The source is read through the one function that names every variant. A reply shows that a
+    // daemon answers; this side's own fault is no daemon's and no end causes it, so it is not
+    // looked at; a closure is decided by the daemon's end.
+    match error.comes_from() {
+        ErrorSource::Reply => {
+            drop(connection);
+            return Answered::of_reply(error).map_or(Before::OwnFault, Before::Answers);
+        }
+        ErrorSource::OwnFault => {
+            drop(connection);
+            return Before::OwnFault;
+        }
+        ErrorSource::Closure => {}
     }
     let closed = closed_by_the_daemon(error);
     match ended_before_the_request(operations, connection, holder, closed, deadline).await {
@@ -1185,7 +1208,7 @@ fn ended_by(
     none: &Facts,
     json: bool,
     earlier: &Earlier,
-) -> std::result::Result<Completion, Answered> {
+) -> std::result::Result<Completion, Unmade> {
     match before {
         Before::Ended { said, pid } => {
             let facts = Facts {
@@ -1197,7 +1220,8 @@ fn ended_by(
             Ok(done(&said, &facts, json, earlier))
         }
         Before::Silent => Ok(silent(environment, none, json, END_BOUND)),
-        Before::Answers(answered) => Err(answered),
+        Before::Answers(answered) => Err(Unmade::Answered(answered)),
+        Before::OwnFault => Err(Unmade::OwnFault),
     }
 }
 
@@ -1555,6 +1579,7 @@ async fn successor_of(
 /// The evidence that a daemon answered.
 mod answered {
     use kr_ipc::IpcError;
+    use kr_ipc::error::ErrorSource;
     use kr_protocol::hostinfo::HostInfoResult;
     use kr_protocol::ids::ControllerGeneration;
 
@@ -1585,20 +1610,11 @@ mod answered {
             }
         }
 
-        /// The daemon's own reply, where `error` is one: a message of another kind, a version that
-        /// does not fit, or a rejection. A closure, a fault of the socket and a frame that cannot
-        /// be read are no reply: a daemon that goes can leave a frame that is cut or spoiled, and
-        /// that is judged by a look at the daemon's end.
+        /// The daemon's own reply, where `error` is one (a refusal of the hello, a version that
+        /// does not fit, a message of another kind). A closure, a frame that cannot be read and
+        /// this side's own fault (the check of the peer's credentials among them) are no reply.
         pub(super) fn of_reply(error: &IpcError) -> Option<Self> {
-            matches!(
-                error,
-                IpcError::UnexpectedMessage(_)
-                    | IpcError::VersionMismatch { .. }
-                    | IpcError::PeerRejected { .. }
-                    | IpcError::PeerUnknown { .. }
-                    | IpcError::PeerAccountRejected { .. }
-            )
-            .then_some(Self { generation: None })
+            (error.comes_from() == ErrorSource::Reply).then_some(Self { generation: None })
         }
     }
 }
@@ -1633,7 +1649,11 @@ async fn endpoint_look(
     tokio::time::timeout(within, async {
         match startup::reach(&endpoint, within, &[]).await {
             Reached::Refused(error) if startup::nothing_listening(&error) => Endpoint::Nobody,
-            Reached::Refused(_) | Reached::Silent => Endpoint::Unclear,
+            // A reply of the daemon's own (a refusal of the hello) shows that a daemon answers.
+            Reached::Refused(error) => {
+                Answered::of_reply(&error).map_or(Endpoint::Unclear, Endpoint::Same)
+            }
+            Reached::Silent => Endpoint::Unclear,
             Reached::Answered(listed) => match *listed {
                 Listed::Other(_) => Endpoint::Another,
                 Listed::Ours(mut client) => match client.request(Method::HostInfo, &()).await {
@@ -2653,6 +2673,7 @@ mod tests {
             Before::Ended { said, pid } => format!("ended ({pid:?}): {said}"),
             Before::Silent => "silent".to_owned(),
             Before::Answers(_) => "answers".to_owned(),
+            Before::OwnFault => "own fault".to_owned(),
         }
     }
 
@@ -2684,6 +2705,13 @@ mod tests {
         }
     }
 
+    /// A frame that cannot be read: a closure that is not a closed peer, so that it is looked at
+    /// once first.
+    fn a_spoiled_frame() -> kr_ipc::IpcError {
+        kr_ipc::IpcError::Frame(kr_protocol::frame::FrameError::EmptyPayload)
+    }
+
+    /// A fault of this side's own socket.
     fn a_fault_of_the_socket() -> kr_ipc::IpcError {
         kr_ipc::IpcError::socket("read the control frame", std::io::Error::other("a fault"))
     }
@@ -2728,14 +2756,7 @@ mod tests {
     async fn a_greeting_that_fails_on_the_socket_is_judged_by_one_look() {
         let id = an_environment();
         let supplied = Supplied::new().look(vec![at_once(Endpoint::Same(an_answer()))]);
-        let before = greeting_failed(
-            &supplied,
-            &a_fault_of_the_socket(),
-            None,
-            id,
-            the_deadline(),
-        )
-        .await;
+        let before = greeting_failed(&supplied, &a_spoiled_frame(), None, id, the_deadline()).await;
         assert_eq!(before_said(&before), "answers");
         assert_eq!(
             supplied.calls(),
@@ -2743,7 +2764,7 @@ mod tests {
         );
 
         let process = asked_process();
-        let fault = a_fault_of_the_socket();
+        let fault = a_spoiled_frame();
         let supplied = Supplied::new()
             .process(vec![at_once(ProcessState::Ended)])
             .look(vec![at_once(Endpoint::Nobody)]);
@@ -2833,7 +2854,7 @@ mod tests {
         let before = host_info_failed(
             &supplied,
             supplied.connection(),
-            &a_fault_of_the_socket(),
+            &a_spoiled_frame(),
             None,
             id,
             the_deadline(),
@@ -2852,7 +2873,7 @@ mod tests {
         let before = host_info_failed(
             &supplied,
             supplied.connection(),
-            &a_fault_of_the_socket(),
+            &a_spoiled_frame(),
             None,
             id,
             the_deadline(),
@@ -3041,7 +3062,7 @@ mod tests {
         let before = host_info_failed(
             &supplied,
             supplied.connection(),
-            &a_fault_of_the_socket(),
+            &a_spoiled_frame(),
             None,
             an_environment(),
             tokio::time::Instant::now() + seconds(3),
@@ -3062,7 +3083,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_daemon_that_answers_a_look_keeps_exit_3_and_the_unmade_requests_words() {
         let id = an_environment();
-        let fault = a_fault_of_the_socket();
+        let fault = a_spoiled_frame();
         let supplied = Supplied::new().look(vec![at_once(Endpoint::Same(an_answer()))]);
         let before = host_info_failed(
             &supplied,
@@ -3074,7 +3095,7 @@ mod tests {
         )
         .await;
         assert_eq!(before_said(&before), "answers");
-        let error = unmade_request(id, &Shown::ipc(&fault), an_answer());
+        let error = unmade_request(id, &Shown::ipc(&fault), Unmade::Answered(an_answer()));
         assert_eq!(error.exit_code(), 3);
         assert!(
             error
@@ -3182,7 +3203,7 @@ mod tests {
             _ => panic!("a silent end is a failure that the command has reported"),
         }
 
-        let fault = a_fault_of_the_socket();
+        let fault = a_spoiled_frame();
         let supplied = Supplied::new().look(vec![at_once(Endpoint::Same(an_answer()))]);
         let before = failed_before_the_request(
             &supplied,
@@ -3207,6 +3228,158 @@ mod tests {
         }
     }
 
+    /// The failures of this side's own checks, which no daemon wrote and no daemon's end causes,
+    /// among them the checks of the peer's credentials that are made before any hello.
+    fn own_faults() -> Vec<kr_ipc::IpcError> {
+        vec![
+            kr_ipc::IpcError::PeerRejected {
+                peer_uid: 501,
+                owner_uid: 502,
+            },
+            kr_ipc::IpcError::PeerUnknown {
+                source: std::io::Error::other("no credentials"),
+            },
+            kr_ipc::IpcError::PeerAccountRejected {
+                detail: "the access list".to_owned(),
+            },
+            a_fault_of_the_socket(),
+            kr_ipc::IpcError::NotInLevel("a field".to_owned()),
+        ]
+    }
+
+    /// The daemon's own refusal of the hello: a complete error response that the host wrote.
+    fn the_hellos_refusal() -> kr_ipc::IpcError {
+        kr_ipc::IpcError::HostRefused {
+            detail: "PERMISSION_DENIED: no".to_owned(),
+        }
+    }
+
+    /// At the greeting and at the read of `host.info`, each source does what it is: a reply is the
+    /// answer of a daemon with no look; this side's own fault says its own words with no look and
+    /// is never an answer; a closure is the daemon's end (its cases are above).
+    #[tokio::test(start_paused = true)]
+    async fn each_source_is_read_for_what_it_is_at_the_greeting_and_at_the_read() {
+        let id = an_environment();
+        let process = asked_process();
+        let mut replies = vec![the_hellos_refusal()];
+        replies.push(kr_ipc::IpcError::UnexpectedMessage(
+            "a frame of another kind",
+        ));
+        for (errors, said) in [(replies, "answers"), (own_faults(), "own fault")] {
+            for error in &errors {
+                let supplied = Supplied::new()
+                    .process(vec![at_once(ProcessState::Ended)])
+                    .look(vec![at_once(Endpoint::Nobody)]);
+                let before =
+                    greeting_failed(&supplied, error, Some(&process), id, the_deadline()).await;
+                assert_eq!(before_said(&before), said, "the greeting, {error}");
+                assert!(
+                    supplied.calls().is_empty(),
+                    "no look at the greeting, {error}"
+                );
+
+                let supplied = Supplied::new()
+                    .process(vec![at_once(ProcessState::Ended)])
+                    .look(vec![at_once(Endpoint::Nobody)]);
+                let before = host_info_failed(
+                    &supplied,
+                    supplied.connection(),
+                    error,
+                    Some(&process),
+                    id,
+                    the_deadline(),
+                )
+                .await;
+                assert_eq!(before_said(&before), said, "the read, {error}");
+                assert_eq!(
+                    supplied.calls(),
+                    vec![(Duration::ZERO, Call::ConnectionLetGo)],
+                    "only the connection is let go at the read, {error}"
+                );
+            }
+        }
+    }
+
+    /// At a look, a reply of the daemon's own (the refusal of the hello) shows that a daemon answers,
+    /// and nothing else of a failed connection does.
+    #[test]
+    fn a_look_reads_a_refusal_of_the_hello_as_an_answer() {
+        assert!(Answered::of_reply(&the_hellos_refusal()).is_some());
+        for error in own_faults() {
+            assert!(Answered::of_reply(&error).is_none(), "{error}");
+        }
+        for error in [
+            kr_ipc::IpcError::PeerClosed,
+            a_frame_cut_by_the_end(),
+            a_spoiled_frame(),
+        ] {
+            assert!(Answered::of_reply(&error).is_none(), "{error}");
+        }
+    }
+
+    /// This side's own fault ends with exit 3 and its own words, and never with the silence
+    /// sentence ("does not answer") or a word that a host still answers.
+    #[test]
+    fn this_sides_own_fault_says_its_own_words_with_exit_3() {
+        let id = an_environment();
+        for fault in own_faults() {
+            let why = Shown::ipc(&fault);
+            for error in [
+                unmade_request(id, &why, Unmade::OwnFault),
+                unreached(id, &fault, Unmade::OwnFault),
+            ] {
+                assert_eq!(error.exit_code(), 3, "{fault}");
+                let said = error.to_string();
+                assert!(said.contains(&why.to_string()), "{said}");
+                assert!(!said.contains("does not answer"), "{said}");
+            }
+        }
+    }
+
+    /// A lock that is held and a process that cannot be read (no identity, as on Windows) is a
+    /// daemon that is not shown to have ended: the silence sentence, exit 1, after the whole bound.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_lock_with_no_process_identity_is_silence_after_the_bound() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let paths = temp.environment();
+        let id = paths.environment_id();
+        let _held = SingletonLock::hold(&paths.singleton_lock(), id).expect("takes the lock");
+        let environment = KnownEnvironment {
+            environment_id: id,
+            paths,
+        };
+        let earlier = Earlier::read(&environment.paths);
+        let none = Facts::none(Vec::new());
+        let supplied = Supplied::new()
+            .held(vec![at_once(Ok(true))])
+            .look(vec![at_once(Endpoint::Nobody)])
+            .named(vec![at_once(None)]);
+        let closed = kr_ipc::IpcError::PeerClosed;
+        let before = failed_before_the_request(
+            &supplied,
+            supplied.connection(),
+            None,
+            &closed,
+            id,
+            the_deadline(),
+        )
+        .await;
+        assert_eq!(before_said(&before), "silent");
+        assert_eq!(supplied.start.elapsed(), END_BOUND);
+        match unmade_ended(before, &closed, id, &environment, &none, true, &earlier) {
+            Completion::Reported(error) => {
+                assert_eq!(error.exit_code(), 1);
+                assert!(
+                    error
+                        .to_string()
+                        .contains("does not answer, so it may be starting or stopping"),
+                    "{error}"
+                );
+            }
+            _ => panic!("a silent end is a failure that the command has reported"),
+        }
+    }
+
     fn a_refusal() -> ProtocolError {
         ProtocolError::new(
             ErrorCode::PermissionDenied,
@@ -3223,7 +3396,7 @@ mod tests {
             None,
             Some(Err(kr_ipc::IpcError::PeerClosed)),
             Some(Err(a_frame_cut_by_the_end())),
-            Some(Err(a_fault_of_the_socket())),
+            Some(Err(a_spoiled_frame())),
             Some(Err(kr_ipc::IpcError::UnexpectedMessage(
                 "a frame of another kind",
             ))),
