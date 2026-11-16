@@ -353,7 +353,7 @@ impl Scene {
             .await
             .expect("an end was shown");
         let state = {
-            let _finished = ReadFinished(&*calls);
+            let _finished = ReadFinished(&calls);
             self.state()
         };
         assert!(
