@@ -112,6 +112,14 @@ pub const LOCAL_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(
 /// would otherwise wait for the next request.
 pub const HOST_MAINTENANCE: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long the privacy call waits for a write of the session's output to its spool that is in
+/// flight, before it answers that the history is not yet removed.
+///
+/// The wait stands on the authority connection's own task, before that connection's next frame,
+/// and the write is one batch. A call that gives up here is asked again by the daemon, which
+/// repeats its notice until an answer is complete.
+const PRIVACY_WRITE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The shortest a host waits before it looks again at the host's output cap, when it found the host
 /// over the cap and another host holding the lock on it. The wait is drawn between this and this
 /// plus [`HOST_CAP_RETRY_SPREAD`], so that hosts waiting on the same lock do not look again
@@ -541,6 +549,10 @@ pub struct WorkerService {
     /// shipped build.
     #[cfg(feature = "testing")]
     host_cap_looks: std::sync::atomic::AtomicU64,
+    /// How long the privacy call waits for a write in flight, where a test sets it. It is
+    /// compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    privacy_write_wait: Mutex<std::time::Duration>,
     /// How many question subscriptions the long polls this service is serving hold at this moment,
     /// for this host's own tests. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -1121,6 +1133,8 @@ impl WorkerService {
             output_reasons: crate::diagnostics::OutputReasons::default(),
             #[cfg(feature = "testing")]
             host_cap_looks: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "testing")]
+            privacy_write_wait: Mutex::new(PRIVACY_WRITE_WAIT),
             #[cfg(feature = "testing")]
             subscriptions_held: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "testing")]
@@ -2663,6 +2677,28 @@ impl WorkerService {
     #[cfg(feature = "testing")]
     pub fn maintain_now(&self) {
         self.maintain_pass();
+    }
+
+    /// Sets how long the privacy call waits for a write of the session's output that is in flight,
+    /// for this host's own tests. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn set_privacy_write_wait(&self, wait: std::time::Duration) {
+        *self
+            .privacy_write_wait
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = wait;
+    }
+
+    /// How long the privacy call waits for a write in flight.
+    fn privacy_write_wait(&self) -> std::time::Duration {
+        #[cfg(feature = "testing")]
+        let wait = *self
+            .privacy_write_wait
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(not(feature = "testing"))]
+        let wait = PRIVACY_WRITE_WAIT;
+        wait
     }
 
     /// How many times this host has looked again at the host's output cap, having found the host
@@ -5493,41 +5529,49 @@ impl WorkerService {
                 self.runtime
                     .session()
                     .disable_privacy(generation)
-                    .map(|_| ())
+                    .map(|_| None)
             })
         } else if held.generation() == generation && held.is_enabled() {
             // Committed already, so there is no transition to raise: the cleanup is taken again.
             off_the_executor(|| {
-                self.runtime
-                    .session()
-                    .enable_privacy(
-                        generation,
-                        &mut [
-                            &mut attention as &mut dyn crate::privacy::PrivacySubsystem,
-                            &mut semantic,
-                        ],
-                    )
-                    .map(|_| ())
+                let mut session = self.runtime.session();
+                let enabled = session.enable_privacy(
+                    generation,
+                    &mut [
+                        &mut attention as &mut dyn crate::privacy::PrivacySubsystem,
+                        &mut semantic,
+                    ],
+                );
+                enabled.map(|_| session.deferred_discard_watch())
             })
         } else {
             let transition = self.raise_privacy_transition().await;
             let enabled = off_the_executor(|| {
-                self.runtime
-                    .session()
-                    .enable_privacy(
-                        generation,
-                        &mut [
-                            &mut attention as &mut dyn crate::privacy::PrivacySubsystem,
-                            &mut semantic,
-                        ],
-                    )
-                    .map(|_| ())
+                let mut session = self.runtime.session();
+                let enabled = session.enable_privacy(
+                    generation,
+                    &mut [
+                        &mut attention as &mut dyn crate::privacy::PrivacySubsystem,
+                        &mut semantic,
+                    ],
+                );
+                enabled.map(|_| session.deferred_discard_watch())
             });
             transition.settle().await;
             enabled
         };
-        if let Err(error) = applied {
-            return failure(RequestId::new(0), &error.to_protocol_error());
+        let watch = match applied {
+            Ok(watch) => watch,
+            Err(error) => return failure(RequestId::new(0), &error.to_protocol_error()),
+        };
+        // A discard that met a write in flight is owed. The wait is for that one write, after the
+        // transition has settled and with no lock held, and for at most the bound; the second hold
+        // asks only that the discard is still owed, and makes it. At the bound the write is still
+        // in flight, the discard defers again, and the answer lists the history as unavailable.
+        if let Some(watch) = watch {
+            let bound = self.privacy_write_wait();
+            let _ = off_the_executor(|| watch.wait_idle_for(bound));
+            off_the_executor(|| self.runtime.session().discard_history_if_owed());
         }
         let session = self.runtime.session();
         let completion = session.reconcile_privacy(&[
