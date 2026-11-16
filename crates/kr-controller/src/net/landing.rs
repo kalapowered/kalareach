@@ -7,6 +7,15 @@
 //! The authority feed's refusal is asked first, where it takes its locks, and again with no lock
 //! immediately before the write: it moves no revision, so the footing's question does not see it.
 //!
+//! The cover of that second ask is conditional. The transaction takes the pairing records' write
+//! lock before its body, and the raise of the refusal by `move_a_feed_refusal` waits for that
+//! lock before it returns, so that raise cannot return while a record's transaction is open; the
+//! word it sets stands inside the transaction, where the second ask reads it. Three raisers do not
+//! wait for the lock: the feed's removal (`refuse_the_grants_that_rest_on_the_feed`), the personal
+//! grants' mirror and the raise at start. A word one of them sets after the second ask lands
+//! inside that ask's stated limit: the instructions between it and the write, and the write call
+//! itself.
+//!
 //! A [`Landing`] is what a door gives the caller of such a mutation: the feed's ask, the footing
 //! made once at the door, and the held bound of the local owner's lease. The same parts give the
 //! admission of the pairing methods that ask their standing inside their own writes

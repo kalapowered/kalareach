@@ -794,13 +794,16 @@ impl OwnerAuthority {
     /// action asked for is recorded with the action before it is issued, so a retry of that
     /// mutation gets the same challenge, outstanding or not and across a restart, and the same
     /// identifier with another payload is `ID_CONFLICT`, whichever pairing method it was spent on.
-    /// `admission` is asked immediately before anything is written.
+    /// The caller's landing is asked in the record's own transaction, with nothing allocated or
+    /// awaited between its question and the write
+    /// ([`InvitationRows::record_requested`](super::invitations::InvitationRows::record_requested)).
     ///
     /// # Errors
     ///
     /// Returns `PERMISSION_DENIED` for a caller without owner authority, `ID_CONFLICT` for a
-    /// reused action, the admission's refusal, and an error when the random generator or the
-    /// records are unavailable.
+    /// reused action, the refusal of the caller's landing (that of a caller no door landed, of
+    /// the feed and of the footing), and an error when the random generator or the records are
+    /// unavailable.
     ///
     /// `copied` is set when the answer is the one an earlier submission of the action recorded.
     pub fn request(
@@ -1499,7 +1502,7 @@ impl OwnerAuthority {
     ///
     /// Returns `PERMISSION_DENIED` for a caller without owner authority,
     /// `OWNER_CONFIRMATION_REQUIRED` when no answered confirmation of the clock stands,
-    /// `ID_CONFLICT` for a reused action, and whatever the admission or the records refuse with.
+    /// `ID_CONFLICT` for a reused action, and whatever the caller's landing or the records refuse with.
     ///
     /// `copied` is set when the answer is the one an earlier submission of the action recorded.
     pub fn establish_clock(
