@@ -31,7 +31,7 @@ use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable, TimestampMs};
 use super::a_result_the_lease_ended_over::{
     Presenter, connected_under_a_lease_that_can_be_presented_again,
 };
-use super::an_owner_establishes_the_clock::{Door, paired, registry};
+use super::an_owner_establishes_the_clock::{Door, decides, paired, paired_in, registry};
 use super::an_owners_request_is_recorded_where_it_lands::present_and_hold;
 use crate::error::ControllerError;
 use crate::service::Controller;
@@ -504,21 +504,78 @@ async fn an_answer_whose_challenge_expires_in_the_last_wait_is_refused_and_recor
     assert_eq!(detail, "this action needs a fresh owner confirmation");
 }
 
+/// The owner device whose proof an answer carries.
+#[derive(Clone, Copy, Debug)]
+enum Device {
+    /// A grant that never ends and names no organisation.
+    Plain,
+    /// A grant that ends ten minutes on, which the host has anchored on the continuous clock.
+    Expiring,
+    /// A grant that names an organisation, which is what makes it rest on the authority feed.
+    Organisational,
+}
+
+/// What happens to the owner device, or to the feed, where the answer's record is stopped.
+#[derive(Clone, Copy, Debug)]
+enum DeviceEnds {
+    /// Nothing: the control.
+    Nothing,
+    /// The authority feed's refusal that removes every remote grant's standing rises.
+    AFeedRefusalRises,
+    /// The continuous clock passes the end of the device's grant.
+    TheGrantEnds,
+    /// The authority feed's removal of this host rises, which refuses the grants that rest on it.
+    TheFeedIsRemoved,
+}
+
 /// Asks for a challenge and answers it, as a local caller, with the proof of an owner device that
-/// this host holds; the answer's record is stopped in the last wait, where the authority feed's
-/// refusal that removes every remote grant's standing is raised when `raised` says so. A local
-/// connection has no grants for the feed to ask, so what refuses the device is the signer's own
-/// standing, read after the wait.
-async fn answered_by_an_owner_device(raised: bool) -> Found {
+/// this host holds; the answer's record is stopped and `ends` comes where it stands: in the last
+/// wait, at the end of the feed's locked ask, or, where `at_the_first_write` is set, once the
+/// first write has been made. A local connection has no grants for the feed to ask, so what
+/// refuses the device is the signer's own standing, read after the wait: early, in the wait of
+/// the feed's ask, and again immediately before the commit, in the wait between the writes.
+async fn answered_by_an_owner_device(
+    at_the_first_write: bool,
+    device: Device,
+    ends: DeviceEnds,
+) -> Found {
     let parts = parts(World::Plain).await;
     let controller = &parts.controller;
     let keys = kr_crypto::keys::DeviceKeys::generate().expect("keys");
-    paired(
-        controller,
-        &keys,
-        0x41,
-        &[ActionRight::HostManage],
-        kr_protocol::grant::GrantExpiry::Never,
+    let record = match device {
+        Device::Plain => paired(
+            controller,
+            &keys,
+            0x41,
+            &[ActionRight::HostManage],
+            kr_protocol::grant::GrantExpiry::Never,
+        ),
+        Device::Expiring => paired(
+            controller,
+            &keys,
+            0x41,
+            &[ActionRight::HostManage],
+            kr_protocol::grant::GrantExpiry::At {
+                expires_at_ms: TimestampMs::new(kr_ipc::now_ms().get() + 10 * 60 * 1000),
+            },
+        ),
+        Device::Organisational => paired_in(
+            controller,
+            &keys,
+            0x41,
+            &[ActionRight::HostManage],
+            kr_protocol::grant::GrantExpiry::Never,
+            Nullable::some(kr_protocol::grant::OrganisationRequirement {
+                organisation_id: kr_protocol::ids::OrganisationId::new(kr_ipc::new_uuid()),
+                policy_revision: kr_protocol::ids::AuthorityRevision::new(1),
+            }),
+        ),
+    };
+    // The host decides an expiring grant here for the first time, which anchors it: the signer's
+    // standing reads what has been anchored and writes nothing.
+    assert!(
+        decides(controller, &record),
+        "the grant is in force before the answer"
     );
     let door = Door::open(&parts.temp, controller).await;
     let revision = controller.admitted_revision(door.connection_id()).ok();
@@ -569,7 +626,11 @@ async fn answered_by_an_owner_device(raised: bool) -> Found {
         Digest256::from_bytes([9; 32]),
     );
     let caller = controller.local_caller(door.actor_id()).landed(landing());
-    let (arrived, go) = controller.pause_after_the_record_asks_the_feed();
+    let (arrived, go) = if at_the_first_write {
+        controller.pause_after_the_first_write()
+    } else {
+        controller.pause_after_the_record_asks_the_feed()
+    };
     let first_writes_before = controller.first_writes_reached();
     let before = kr_ipc::now_ms().get();
     let answering = tokio::task::spawn_blocking({
@@ -584,30 +645,50 @@ async fn answered_by_an_owner_device(raised: bool) -> Found {
         .await
         .expect("the wait ends")
         .expect("the record reaches the place it is stopped at");
-    // The raise sets the refusal's word and then waits for every write to the pairing records that
-    // is under way, and the paused record's transaction is one: the raise is started, the case
-    // waits until the word is up, and the raise ends once the record has.
-    let raising = raised.then(|| {
-        let controller = Arc::clone(controller);
-        tokio::spawn(async move {
-            controller
-                .move_a_feed_refusal(
-                    crate::grants::RemoteRefusal::WITHDRAWAL_UNVERIFIED,
-                    true,
-                    crate::grants::HostPolicy::withdrawal_unverified,
-                    crate::grants::HostPolicy::set_withdrawal_unverified,
-                )
-                .await;
-        })
-    });
+    // The raise of a refusal on every remote grant sets the refusal's word and then waits for every
+    // write to the pairing records that is under way, and the paused record's transaction is one:
+    // the raise is started, the case waits until the word is up, and the raise ends once the
+    // record has. The feed's removal of this host sets its word without that wait and then writes
+    // the removal down, which waits for the record's lock: it is started the same way.
+    let raising = match ends {
+        DeviceEnds::AFeedRefusalRises => Some(tokio::spawn({
+            let controller = Arc::clone(controller);
+            async move {
+                controller
+                    .move_a_feed_refusal(
+                        crate::grants::RemoteRefusal::WITHDRAWAL_UNVERIFIED,
+                        true,
+                        crate::grants::HostPolicy::withdrawal_unverified,
+                        crate::grants::HostPolicy::set_withdrawal_unverified,
+                    )
+                    .await;
+            }
+        })),
+        DeviceEnds::TheFeedIsRemoved => Some(tokio::spawn({
+            let controller = Arc::clone(controller);
+            async move {
+                controller
+                    .authority_feed_removed("https://feed.example")
+                    .await
+                    .expect("the removal is written down once the record has ended");
+            }
+        })),
+        DeviceEnds::Nothing | DeviceEnds::TheGrantEnds => None,
+    };
     if raising.is_some() {
         tokio::time::timeout(Duration::from_secs(30), async {
-            while !controller.policy().withdrawal_unverified() {
+            while !match ends {
+                DeviceEnds::TheFeedIsRemoved => controller.policy().feed_removed(),
+                _ => controller.policy().withdrawal_unverified(),
+            } {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
         .expect("the refusal's word is raised");
+    }
+    if matches!(ends, DeviceEnds::TheGrantEnds) {
+        parts.continuous.advance(Duration::from_secs(11 * 60));
     }
     go.send(()).expect("the record goes on");
     let (answered, copied) = answering.await.expect("the answer ends");
@@ -642,9 +723,10 @@ async fn answered_by_an_owner_device(raised: bool) -> Found {
 /// same answer is recorded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_answer_with_an_owner_devices_proof_meets_a_feed_refusal_raised_in_the_last_wait() {
-    let control = answered_by_an_owner_device(false).await;
+    let control = answered_by_an_owner_device(false, Device::Plain, DeviceEnds::Nothing).await;
     recorded_through(&control, ConfirmationChannel::OwnerDevicePresence);
-    let found = answered_by_an_owner_device(true).await;
+    let found =
+        answered_by_an_owner_device(false, Device::Plain, DeviceEnds::AFeedRefusalRises).await;
     let ControllerError::PermissionDenied { detail } = refused(&found) else {
         panic!("the answer is refused as the feed refuses the device's standing");
     };
@@ -726,4 +808,83 @@ async fn an_answer_whose_deadline_passes_between_its_writes_is_refused_at_the_co
         crate::service::Lapse::Admission(crate::authority::AdmissionLapse::Expired).refusal();
     assert_eq!(refusal.to_string(), expired.to_string());
     assert_eq!(refusal.code(), expired.code());
+}
+
+/// KR-REQ-10.05: the verification is asked again by the last ask, immediately before the commit: a
+/// confirmation that expires while the answer's first write stands, with the mutation's deadline
+/// an hour away, is refused at the commit as the owner's confirmation is required, whole, and
+/// neither row is recorded. The control: where it has not expired, the same answer is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_whose_challenge_expires_while_its_writes_stand_is_refused_at_the_commit_and_records_nothing()
+ {
+    let establishing = ConfirmationDisplay::EstablishClock;
+    recorded(
+        &answered_with_at(
+            true,
+            World::Plain,
+            Ends::Nothing,
+            establishing.clone(),
+            true,
+        )
+        .await,
+    );
+    let found = answered_with_at(
+        true,
+        World::Plain,
+        Ends::TheChallengeExpires,
+        establishing,
+        true,
+    )
+    .await;
+    let ControllerError::Refused { code, detail } = refused_at_the_commit(&found) else {
+        panic!("the answer is refused as the owner's confirmation is required");
+    };
+    assert_eq!(*code, ErrorCode::OwnerConfirmationRequired);
+    assert_eq!(detail, "this action needs a fresh owner confirmation");
+}
+
+/// KR-REQ-10.05: the signer's standing is asked again by the last ask, immediately before the
+/// commit: an owner device whose grant ends while the answer's first write stands, with the
+/// mutation's deadline an hour away and no feed grant for a local connection to ask, is refused at
+/// the commit in the signer check's own words, whole, and neither row is recorded. The control:
+/// where the grant stands, the same answer is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_whose_signers_grant_ends_while_its_writes_stand_is_refused_at_the_commit_and_records_nothing()
+ {
+    let control = answered_by_an_owner_device(true, Device::Expiring, DeviceEnds::Nothing).await;
+    recorded_through(&control, ConfirmationChannel::OwnerDevicePresence);
+    let found = answered_by_an_owner_device(true, Device::Expiring, DeviceEnds::TheGrantEnds).await;
+    let ControllerError::Refused { code, detail } = refused_at_the_commit(&found) else {
+        panic!("the answer is refused as the owner's confirmation is required");
+    };
+    assert_eq!(*code, ErrorCode::OwnerConfirmationRequired);
+    assert_eq!(
+        detail,
+        "the device that answered this confirmation is no longer an owner device of this host"
+    );
+}
+
+/// KR-REQ-09.12, KR-REQ-10.05: the feed's removal of this host, which takes no lock the record's
+/// transaction holds, rises while the answer's first write stands and refuses the signer's grant
+/// that rests on the feed: the answer is refused at the commit in the feed's words, whole, and
+/// neither row is recorded. The control: where the removal does not rise, the same answer is
+/// recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_whose_signers_grant_is_refused_by_the_feeds_removal_while_its_writes_stand_is_refused_at_the_commit()
+ {
+    let control =
+        answered_by_an_owner_device(true, Device::Organisational, DeviceEnds::Nothing).await;
+    recorded_through(&control, ConfirmationChannel::OwnerDevicePresence);
+    let found =
+        answered_by_an_owner_device(true, Device::Organisational, DeviceEnds::TheFeedIsRemoved)
+            .await;
+    let ControllerError::PermissionDenied { detail } = refused_at_the_commit(&found) else {
+        panic!("the answer is refused as the feed refuses the device's standing");
+    };
+    assert_eq!(
+        detail,
+        "the authority feed this host reads was removed, so grants that rest on it are refused \
+         until the owner acts at the host, by pointing `authority.origin` in its configuration \
+         document at another feed or at none"
+    );
 }

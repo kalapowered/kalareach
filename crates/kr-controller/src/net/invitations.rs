@@ -699,11 +699,11 @@ impl InvitationRows {
     /// decided under; the footing's question, with the copied bound; where that bound ended or
     /// moved, the subject decided again under the scope a caller is limited to once no lease
     /// serves it; the feed's refusal asked again with no lock; the write; and the last ask,
-    /// immediately before the commit, which takes a new copy of the bound and makes the question
-    /// and the feed's ask again, so that a refusal there rolls the transaction back and nothing is
-    /// recorded. The question reads atomics and clocks alone, and the write follows it with
-    /// nothing allocated or awaited between them: what the write needs is prepared before the
-    /// transaction.
+    /// immediately before the commit, which asks the caller's own owner check again first, then
+    /// takes a new copy of the bound and makes the question and the feed's ask again, so that a
+    /// refusal there rolls the transaction back and nothing is recorded. The question reads atomics
+    /// and clocks alone, and the write follows it with nothing allocated or awaited between them:
+    /// what the write needs is prepared before the transaction.
     ///
     /// # Errors
     ///
@@ -731,11 +731,16 @@ impl InvitationRows {
                 Some(_) => return Err(another_subject()),
             }
             let kept = landing.asks_the_feed()?;
-            if !caller.is_owner_now(&self.lifetimes) {
-                return Err(ControllerError::PermissionDenied {
-                    detail: "only this host's owner asks for an owner confirmation".to_owned(),
-                });
-            }
+            let is_the_owner = || {
+                if caller.is_owner_now(&self.lifetimes) {
+                    Ok(())
+                } else {
+                    Err(ControllerError::PermissionDenied {
+                        detail: "only this host's owner asks for an owner confirmation".to_owned(),
+                    })
+                }
+            };
+            is_the_owner()?;
             let copied = landing.copies_the_bound();
             match landing.asks(&copied) {
                 Ok(()) => {}
@@ -754,7 +759,7 @@ impl InvitationRows {
             insert_action(transaction, action, challenge.as_deref())?;
             #[cfg(feature = "testing")]
             landing.waits_after_the_first_write();
-            landing.asks_before_the_commit(&kept, scope, display)?;
+            landing.asks_before_the_commit(&kept, scope, display, is_the_owner)?;
             Ok(None)
         })
     }
@@ -778,11 +783,12 @@ impl InvitationRows {
     /// owner's lease that `caller` was decided under; the footing's question, with the copied
     /// bound; where that bound ended or moved, the challenge's `display` decided again under the
     /// scope that no lease serves; the feed's refusal asked again with no lock; the writes; and the
-    /// last ask, immediately before the commit, which takes a new copy of the bound and makes the
-    /// question and the feed's ask again, so that a refusal there rolls the transaction back and
-    /// nothing is recorded. The question reads atomics and clocks alone, and the first write
-    /// follows it with nothing allocated or awaited between them: what the writes need is prepared
-    /// before the transaction.
+    /// last ask, immediately before the commit, which asks the signer's standing and the
+    /// verification again first (the challenge's end among them), then takes a new copy of the
+    /// bound and makes the question and the feed's ask again, so that a refusal there rolls the
+    /// transaction back and nothing is recorded. The question reads atomics and clocks alone, and
+    /// the first write follows it with nothing allocated or awaited between them: what the writes
+    /// need is prepared before the transaction.
     ///
     /// # Errors
     ///
@@ -816,8 +822,17 @@ impl InvitationRows {
                 return Err(another_subject());
             }
             let kept = landing.asks_the_feed()?;
-            signer_still_authorised(transaction, &self.lifetimes, &self.refusal, proof, terminal)?;
-            verified()?;
+            let signer_stands = || {
+                signer_still_authorised(
+                    transaction,
+                    &self.lifetimes,
+                    &self.refusal,
+                    proof,
+                    terminal.clone(),
+                )?;
+                verified()
+            };
+            signer_stands()?;
             let copied = landing.copies_the_bound();
             match landing.asks(&copied) {
                 Ok(()) => {}
@@ -865,7 +880,7 @@ impl InvitationRows {
                     |row| row.get::<_, i64>(0),
                 )
                 .map_err(ControllerError::registry)?;
-            landing.asks_before_the_commit(&kept, scope, display)?;
+            landing.asks_before_the_commit(&kept, scope, display, signer_stands)?;
             Ok(TimestampMs::new(from_sql(answered_at_ms)))
         })
     }
