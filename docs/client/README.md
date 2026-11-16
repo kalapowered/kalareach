@@ -38,6 +38,11 @@ and words, in place of a connection that ended. A later error with that identifi
 nothing, and neither does an answer with it that succeeds. A client tells a refusal from an end by
 that code, never by its words: a transient one, such as a host that cannot take another connection
 from this device now, is asked again.
+A session that the owner closes after the host ended the connection, but before the reader handed
+that end on, ends as the owner's own close, `Finished`, and the host's cause is not told: closing
+this side's connection writes over the cause the host left. A caller that must know why the host
+ended the connection reads the refusal (`Session::connection_refusal`) or the ended item before it
+closes.
 
 The same refusal answers a call whose own write fails after it arrived: the write fails because the
 host closed the connection, and the call, a read or a mutation, gets the refusal and not the

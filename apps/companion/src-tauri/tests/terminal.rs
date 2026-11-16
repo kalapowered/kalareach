@@ -4687,12 +4687,18 @@ async fn a_restarted_delivery_drops_the_old_streams_frames_until_its_first_at_ze
     let shown = page.states(3).len();
     link.push("session.resync", &resync_marker(60)).await;
     let subscribe = link.expect(Method::EventsSubscribe).await;
-    screen(&mut link, 2, 50, vec![row(0, "stale before")], 0).await;
+    screen(&mut link, 4, 70, vec![row(0, "stale before")], 0).await;
+    link.push("session.resync", &resync_marker(70)).await;
     link.answer(&subscribe, &scripted_worker::subscribed())
         .await;
-    screen(&mut link, 2, 55, vec![row(0, "stale after")], 0).await;
+    screen(&mut link, 5, 80, vec![row(0, "stale after")], 0).await;
+    link.push("session.resync", &resync_marker(80)).await;
+    assert!(
+        link.quiet_for(QUIET).await,
+        "an old stream's marker, before and after the answer, starts no second recovery"
+    );
     link.restart_stream();
-    screen(&mut link, 3, 80, vec![row(0, "new")], 0).await;
+    screen(&mut link, 6, 100, vec![row(0, "new")], 0).await;
     page.newest(3, |state| {
         state["state"] == "showing" && text_of(state) == ["new"]
     })
@@ -4747,30 +4753,28 @@ async fn a_slow_view_loses_no_notification_and_ends_with_its_words() {
     assert_eq!(texts, expected, "every screen is shown, in order");
 }
 
-/// An answer that is ready is not kept waiting by a flood of notifications: the loop takes it after
-/// at most 64 of them, so the page is told what the answer said while most of the flood is still
-/// queued.
+/// A word heard while a size report waits for its answer lets the size go again when the session
+/// refuses it for now, whichever of the refusal and the word the loop takes first: the host sent the
+/// repaint before the refusal here, and the size goes again at once, with no further word.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_answer_that_is_ready_is_taken_after_at_most_64_notifications() {
+async fn a_refusal_for_now_after_a_word_heard_in_flight_lets_the_size_go_again() {
     let mut worker = ScriptedWorker::start(Challenge::Answered);
     let page = Page::new(worker.paths());
     let (view, mut link) = showing(&page, &mut worker, 3).await;
     page.resize(&view, 12, 3);
-    let asked = link.expect(Method::AttachmentViewport).await;
-    let before = page.states(3).len();
-    link.answer(&asked, &viewport_answer(1)).await;
-    for number in 0..300_u64 {
-        screen(&mut link, number + 2, 60 + number, vec![row(0, "flood")], 0).await;
-    }
+    let first = link.expect(Method::AttachmentViewport).await;
+    screen(&mut link, 2, 60, vec![row(0, "repaint")], 0).await;
     page.newest(3, |state| {
-        state["attachment"]["presentation_reason"] == "size_mismatch"
+        state["state"] == "showing" && text_of(state) == ["repaint"]
     })
     .await;
-    let at = page.states(3)[before..]
-        .iter()
-        .position(|state| state["attachment"]["presentation_reason"] == "size_mismatch")
-        .expect("the answer's state");
-    assert!(at <= 64, "the answer was taken after {at} states");
+    link.refuse_with(&first, ErrorCode::ResourceUnavailable, "not now")
+        .await;
+    let again = tokio::time::timeout(Duration::from_secs(5), link.call()).await;
+    assert!(
+        again.is_ok_and(|call| call.method == Method::AttachmentViewport.to_string()),
+        "the size goes again after a repaint was heard while it was in flight"
+    );
 }
 
 /// A call that the loop started is never dropped by the loop going on: a report that waits for its
