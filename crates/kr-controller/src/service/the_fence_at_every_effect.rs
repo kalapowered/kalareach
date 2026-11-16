@@ -1668,12 +1668,12 @@ async fn an_update_handover_step_that_waits_for_the_gates_lock_meets_a_fence_owe
 }
 
 /// KR-REQ-09.09: the checks a service asks (the registration check and the admission check inside
-/// a transaction) compare the admission's deadline after the last lock that they take. The last
-/// reading of the fence takes the fence's lock, and a deadline that passes while that lock is
-/// waited for is read afterwards: the check refuses as expired. The control: where the deadline
-/// stands after the wait, the checks pass.
+/// a transaction) compare the admission's deadline after the last wait that they make, which is the
+/// feed's reading of the connection's shares. A deadline that passes at the pause that stands there
+/// is read afterwards: the check refuses as expired. The control: where the deadline stands after
+/// the pause, the checks pass.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_check_that_waits_for_the_fences_lock_meets_a_deadline_that_passes_in_the_wait() {
+async fn a_check_meets_a_deadline_that_passes_at_the_pause_before_its_last_reading() {
     use crate::error::ControllerError;
     for registration_check in [true, false] {
         for passes in [false, true] {
@@ -1695,8 +1695,8 @@ async fn a_check_that_waits_for_the_fences_lock_meets_a_deadline_that_passes_in_
             let releasing = {
                 let clock = clock.clone();
                 tokio::spawn(async move {
-                    // Every earlier reading has passed, and the check is about to take the
-                    // fence's lock.
+                    // Every earlier reading and wait has passed, and the check is about to ask
+                    // the footing's question.
                     tokio::task::spawn_blocking(move || {
                         arrived.recv_timeout(Duration::from_secs(30))
                     })

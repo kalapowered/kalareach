@@ -829,10 +829,11 @@ async fn a_barrier_of_the_debt_pass_before_the_requests_own_proves_nothing() {
 }
 
 /// KR-REQ-09.09, 09.12: a fence owed by a restriction that published its debt after the proof was
-/// made and before the telling asks is seen, and the result is not shown: the revision and the
-/// fence are read from memory, so the telling does not wait for the registry that is held.
+/// made, at the pause where the door is about to tell the reply, is seen, and the result is not
+/// shown: the revision and the fence are read from memory, so the telling does not wait for the
+/// registry that is held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_debt_published_before_the_proof_is_asked_stops_the_result_without_the_registry() {
+async fn a_debt_published_as_the_reply_is_about_to_be_told_stops_the_result_without_the_registry() {
     let (_temp, controller, _clock) = daemon().await;
     let (connection_id, _) = admitted(&controller).await;
     let (_barrier, proof) = controller
@@ -844,14 +845,23 @@ async fn a_debt_published_before_the_proof_is_asked_stops_the_result_without_the
         .expect("the barrier");
     assert!(proof.is_some(), "its own debt, alone, is the proof");
     let registry = controller.registry.lock().await;
-    // Another request's restriction publishes its debt while the registry is held, as one does.
+    let (arrived, release) = controller.pause_before_a_reply_is_told();
+    let telling = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        async move { told_as(&controller, connection_id, a_result_carrying(proof)).await }
+    });
+    tokio::time::timeout(Duration::from_secs(30), arrived)
+        .await
+        .expect("the door reaches the place its reply is told")
+        .expect("the pause is armed");
+    // Another request's restriction publishes its debt while the registry is held, as one does,
+    // after the proof was made and before the telling asks.
     controller.hold_fence(true);
-    let told = tokio::time::timeout(
-        Duration::from_secs(30),
-        told_as(&controller, connection_id, a_result_carrying(proof)),
-    )
-    .await
-    .expect("the telling does not wait for the registry");
+    release.send(()).expect("the door goes on");
+    let told = tokio::time::timeout(Duration::from_secs(30), telling)
+        .await
+        .expect("the telling does not wait for the registry")
+        .expect("the telling ends");
     not_shown(&told);
     drop(registry);
     controller.hold_fence(false);
