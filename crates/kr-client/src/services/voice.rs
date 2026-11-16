@@ -1549,11 +1549,16 @@ pub fn read_start_answer(answer: &ServiceHttpAnswer) -> VoiceStart {
         .get("reason")
         .and_then(|value| serde_json::from_value::<VoiceRefusalReason>(value.clone()).ok())
         .unwrap_or(VoiceRefusalReason::Unrecognised);
-    let message = error
-        .get("message")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("Managed voice could not start this call.")
-        .to_owned();
+    // The service's words, and each path it names, become shown text in the one place that
+    // removes what a terminal acts on.
+    let said =
+        |text: &str| Shown::service(&ServiceMessage::from_refusal(text.to_owned())).into_string();
+    let message = said(
+        error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Managed voice could not start this call."),
+    );
     let attempt_id = error
         .get("attemptId")
         .and_then(serde_json::Value::as_str)
@@ -1598,7 +1603,7 @@ pub fn read_start_answer(answer: &ServiceHttpAnswer) -> VoiceStart {
                 entries
                     .iter()
                     .filter_map(serde_json::Value::as_str)
-                    .map(str::to_owned)
+                    .map(said)
                     .collect()
             })
             .unwrap_or_default(),
