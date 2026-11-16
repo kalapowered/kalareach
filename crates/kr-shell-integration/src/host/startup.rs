@@ -355,51 +355,6 @@ fn ask_with(
     inputs: &[(&str, &str)],
     allowed: std::time::Duration,
 ) -> Option<String> {
-    #[cfg(unix)]
-    let inherited = std::env::var_os(RUNTIME_DIRECTORY_VARIABLE);
-    #[cfg(not(unix))]
-    let inherited: Option<std::ffi::OsString> = None;
-    ask_given(program, arguments, inputs, allowed, inherited.as_deref())
-}
-
-/// The variable that names the per-user directory where the .NET 11 runtime keeps the files of its
-/// named mutexes and shared memory: `TMPDIR` on macOS and `XDG_RUNTIME_DIR` on Linux. Where it is
-/// unset the runtime keeps them in a `.dotnet` directory of the home, and on any other Unix system
-/// it always does, which a variable cannot change.
-#[cfg(unix)]
-const RUNTIME_DIRECTORY_VARIABLE: &str = if cfg!(target_os = "macos") {
-    "TMPDIR"
-} else {
-    "XDG_RUNTIME_DIR"
-};
-
-/// Whether the variables a shell is started with name a per-user runtime directory
-/// ([`RUNTIME_DIRECTORY_VARIABLE`]): the value that the program's own variables give it, or else the
-/// one this process has, and not empty.
-#[cfg(unix)]
-fn names_a_runtime_directory(
-    own: &[(String, String)],
-    inherited: Option<&std::ffi::OsStr>,
-) -> bool {
-    match own
-        .iter()
-        .rev()
-        .find(|(name, _)| name == RUNTIME_DIRECTORY_VARIABLE)
-    {
-        Some((_, value)) => !value.is_empty(),
-        None => inherited.is_some_and(|value| !value.is_empty()),
-    }
-}
-
-/// [`ask_with`], told the runtime directory this process has rather than reading it, so that a
-/// test can ask with none.
-fn ask_given(
-    program: &PowerShell,
-    arguments: &[&str],
-    inputs: &[(&str, &str)],
-    allowed: std::time::Duration,
-    inherited_runtime_directory: Option<&std::ffi::OsStr>,
-) -> Option<String> {
     // A directory of this call's own, created rather than opened and owner-only where the platform
     // has modes. `/tmp` is shared: a name another account can guess is a name it can pre-create,
     // and a file opened through it is a file this host writes on somebody else's behalf.
@@ -450,32 +405,40 @@ fn ask_given(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(to))
         .stderr(std::process::Stdio::null());
-    // A shell keeps a cache, an identifier and a module directory under the home's XDG directories
-    // whenever it starts, and answering a question must not put them in the person's home. They go
-    // under this call's own directory and leave with it.
-    #[cfg(unix)]
-    command
-        .env("XDG_CACHE_HOME", directory.join("cache"))
-        .env("XDG_DATA_HOME", directory.join("data"));
-    // The .NET 11 runtime of PowerShell keeps the files of its named mutexes and shared memory
-    // under the per-user directory that `RUNTIME_DIRECTORY_VARIABLE` names and, where that is
-    // unset, in a `.dotnet` directory of the home. A session usually has one, and a bare
-    // environment has none, so a question asked there would leave that directory in the person's
-    // home. A directory that is set is passed on as it stands; where there is none, this call's own
-    // directory has one, owner-only, which leaves with it. The answer does not depend on it.
+    // The shell runs in a closed set of folders of this call's own, all under its directory, all
+    // owner-only and all gone with it, and the person's are not among them: where the person's
+    // session names a cache, a data, a temporary or a runtime folder, this question still uses its
+    // own. A start leaves files in each of them, and none of them may be the person's.
+    //
+    // - The cache: every start reads the start-up profile file there and rewrites it at its end, and
+    //   a start that reads it while another rewrites it can crash. A new folder is shared with no
+    //   other start, so this question cannot be torn by the person's shells or tear theirs.
+    // - The data folder holds the module directory that a start makes.
+    // - The temporary and the runtime folder hold the files of the runtime's named mutexes and
+    //   shared memory (`TMPDIR` on macOS, `XDG_RUNTIME_DIR` on Linux), and where the second is unset
+    //   the runtime makes a `.dotnet` directory in the home.
+    //
+    // A start in a cache folder that is new also makes a new telemetry identity and, where the person
+    // has not opted out, reports a start to the shell's maker, for a question the person did not put
+    // to the shell. This host does not cause that: the opt-out is for this question's shell alone
+    // and reaches no shell the person starts.
     #[cfg(unix)]
     {
-        if !names_a_runtime_directory(&program.environment, inherited_runtime_directory) {
-            let own = directory.join("runtime");
+        for (variable, name) in [
+            ("XDG_CACHE_HOME", "cache"),
+            ("XDG_DATA_HOME", "data"),
+            ("TMPDIR", "tmp"),
+            ("XDG_RUNTIME_DIR", "runtime"),
+        ] {
+            let own = directory.join(name);
             if builder.create(&own).is_err() {
                 let _ = std::fs::remove_dir_all(&directory);
                 return None;
             }
-            command.env(RUNTIME_DIRECTORY_VARIABLE, own);
+            command.env(variable, own);
         }
+        command.env("POWERSHELL_TELEMETRY_OPTOUT", "1");
     }
-    #[cfg(not(unix))]
-    let _ = inherited_runtime_directory;
     let started = command.spawn();
     let mut child = match started {
         Ok(child) => child,
@@ -2855,19 +2818,31 @@ mod tests {
         );
     }
 
-    /// A program that prints the per-user runtime directory it is started with and the permissions
-    /// of the directory that names. Its text is written beside it and placed by a process of its
-    /// own, so this process never holds it open for writing while another test starts a child.
+    /// The variables that give a question's shell its folders, and the folder each one is.
     #[cfg(unix)]
-    fn program_that_prints_its_runtime_directory(root: &Path) -> PathBuf {
+    const QUESTION_FOLDERS: [(&str, &str); 4] = [
+        ("XDG_CACHE_HOME", "cache"),
+        ("XDG_DATA_HOME", "data"),
+        ("TMPDIR", "tmp"),
+        ("XDG_RUNTIME_DIR", "runtime"),
+    ];
+
+    /// A program that prints each folder variable it is started with and the permissions of the
+    /// folder that names, and then its telemetry setting. Its text is written beside it and placed
+    /// by a process of its own, so this process never holds it open for writing while another test
+    /// starts a child.
+    #[cfg(unix)]
+    fn program_that_prints_its_folders(root: &Path) -> PathBuf {
         let program = root.join("shell");
         let text = root.join("shell.text");
         std::fs::write(
             &text,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"${variable}\"\nls -ld \"${variable}\" | cut -c1-10\n",
-                variable = RUNTIME_DIRECTORY_VARIABLE
-            ),
+            "#!/bin/sh\n\
+             for name in XDG_CACHE_HOME XDG_DATA_HOME TMPDIR XDG_RUNTIME_DIR; do\n\
+             eval \"folder=\\${$name-unset}\"\n\
+             printf '%s %s %s\\n' \"$name\" \"$folder\" \"$(ls -ld \"$folder\" | cut -c1-10)\"\n\
+             done\n\
+             printf 'POWERSHELL_TELEMETRY_OPTOUT %s\\n' \"${POWERSHELL_TELEMETRY_OPTOUT-unset}\"\n",
         )
         .expect("writes the program's text");
         kr_ipc::testing::place_and_start_once(&text, &program, &["--version"]);
@@ -2875,87 +2850,119 @@ mod tests {
         program
     }
 
-    /// What a question puts at its program's runtime directory variable.
+    /// What a question gives its shell: each folder variable with its folder and the folder's
+    /// permissions, whether the folder is still there afterwards, and the telemetry setting.
     #[cfg(unix)]
-    fn what_a_question_gives_its_runtime_directory(
+    fn what_a_question_gives_its_shell(
         program: &Path,
-        own: &[(&str, &str)],
-        inherited: Option<&str>,
-    ) -> (String, String, bool) {
+        persons: &[(&str, &str)],
+    ) -> (Vec<(String, String, bool)>, String) {
         let shell = PowerShell {
             executable: program.to_owned(),
-            environment: own
+            environment: persons
                 .iter()
                 .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
                 .collect(),
         };
-        let said = ask_given(
-            &shell,
-            &[],
-            &[],
-            ASK_DEADLINE,
-            inherited.map(std::ffi::OsStr::new),
-        )
-        .expect("the program answers");
+        let said = ask(&shell, &[]).expect("the program answers");
         let mut lines = said.lines();
-        let directory = lines.next().expect("the variable").to_owned();
-        let mode = lines.next().unwrap_or_default().to_owned();
-        let remains = Path::new(&directory).exists();
-        (directory, mode, remains)
+        let mut folders = Vec::new();
+        for (variable, _) in QUESTION_FOLDERS {
+            let line = lines.next().expect("a line for the variable");
+            let mut parts = line.split(' ');
+            assert_eq!(parts.next(), Some(variable), "{line}");
+            let folder = parts.next().expect("the folder").to_owned();
+            let mode = parts.next().unwrap_or_default().to_owned();
+            assert!(
+                Path::new(&folder).is_absolute(),
+                "{variable} is not an absolute path: {line}"
+            );
+            let remains = Path::new(&folder).exists();
+            folders.push((folder, mode, remains));
+        }
+        let telemetry = lines
+            .next()
+            .and_then(|line| line.strip_prefix("POWERSHELL_TELEMETRY_OPTOUT "))
+            .expect("the telemetry line")
+            .to_owned();
+        (folders, telemetry)
     }
 
-    /// A question asked of a shell where no per-user runtime directory is set gives it one of the
-    /// call's own, owner-only, that is gone when the question has been answered; one that is set is
-    /// passed on as it stands.
+    /// A question runs its shell in four folders of its own (cache, data, temporary and runtime),
+    /// each owner-only and each gone when the question has been answered, whatever the person's
+    /// session sets for those variables, and the shell does not report its start to its maker.
     #[cfg(unix)]
     #[test]
-    fn a_question_is_given_a_runtime_directory_only_where_none_is_set() {
+    fn a_question_runs_in_folders_of_its_own_that_are_gone_when_it_ends() {
         let root = tempfile::tempdir().expect("a directory");
-        let program = program_that_prints_its_runtime_directory(root.path());
-        for (own, inherited) in [
-            (vec![], None),
-            (vec![], Some("")),
-            (
-                vec![(RUNTIME_DIRECTORY_VARIABLE, "")],
-                Some("/run/user/1000"),
-            ),
+        let program = program_that_prints_its_folders(root.path());
+        let persons_own = root.path().join("persons-own");
+        std::fs::create_dir(&persons_own).expect("a folder of the person's");
+        let persons = persons_own.to_string_lossy().into_owned();
+        let ours = std::env::temp_dir().join("kr-shell-ask-");
+        for set in [
+            Vec::new(),
+            QUESTION_FOLDERS
+                .iter()
+                .map(|(variable, _)| (*variable, persons.as_str()))
+                .collect(),
+            QUESTION_FOLDERS
+                .iter()
+                .map(|(variable, _)| (*variable, ""))
+                .collect(),
         ] {
-            let (directory, mode, remains) =
-                what_a_question_gives_its_runtime_directory(&program, &own, inherited);
-            assert!(
-                Path::new(&directory).starts_with(std::env::temp_dir()),
-                "{own:?} {inherited:?}: {directory} is not under the temporary area"
-            );
-            assert_eq!(mode, "drwx------", "{own:?} {inherited:?}");
-            assert!(
-                !remains,
-                "{own:?} {inherited:?}: {directory} is left behind"
-            );
+            let (folders, telemetry) = what_a_question_gives_its_shell(&program, &set);
+            assert_eq!(telemetry, "1", "{set:?}");
+            let mut distinct = std::collections::BTreeSet::new();
+            for ((variable, name), (folder, mode, remains)) in QUESTION_FOLDERS.iter().zip(&folders)
+            {
+                assert!(
+                    folder.starts_with(&*ours.to_string_lossy())
+                        && folder.ends_with(&format!("/{name}")),
+                    "{set:?}: {variable} is {folder}, which is not a folder of the question's own"
+                );
+                assert_eq!(mode, "drwx------", "{set:?}: {variable}");
+                assert!(!remains, "{set:?}: {folder} is left behind");
+                distinct.insert(folder.clone());
+            }
+            assert_eq!(distinct.len(), 4, "{set:?}: the four folders are four");
         }
-        // One the program's own variables set is passed on as it stands, whatever this process has.
-        for inherited in [None, Some(""), Some("/run/user/1000")] {
-            let (directory, _, _) = what_a_question_gives_its_runtime_directory(
-                &program,
-                &[(RUNTIME_DIRECTORY_VARIABLE, "/run/user/7")],
-                inherited,
-            );
-            assert_eq!(directory, "/run/user/7", "{inherited:?}");
-        }
-        // One this process has is the program's own, so the question gives none of its own.
-        assert!(names_a_runtime_directory(
-            &[],
-            Some(std::ffi::OsStr::new("/run/user/1000"))
-        ));
-        assert!(!names_a_runtime_directory(&[], None));
+        assert_eq!(
+            std::fs::read_dir(&persons_own).expect("reads").count(),
+            0,
+            "the person's folder is never written to"
+        );
+    }
+
+    /// A question leaves the environment of this process as it was: the variables it gives its shell
+    /// are the shell's alone, and a session this process starts is given none of them.
+    #[cfg(unix)]
+    #[test]
+    fn a_question_sets_nothing_in_the_environment_of_the_process_that_asks() {
+        let root = tempfile::tempdir().expect("a directory");
+        let program = program_that_prints_its_folders(root.path());
+        let names = [
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
+            "TMPDIR",
+            "XDG_RUNTIME_DIR",
+            "POWERSHELL_TELEMETRY_OPTOUT",
+        ];
+        let before: Vec<_> = names.iter().map(std::env::var_os).collect();
+        let _ = what_a_question_gives_its_shell(&program, &[]);
+        let after: Vec<_> = names.iter().map(std::env::var_os).collect();
+        assert_eq!(before, after);
     }
 
     /// The question that names a profile is answered from the home and `XDG_CONFIG_HOME`, whatever
-    /// runtime directory the shell is given, and asking it leaves the home as it was: the .NET 11
-    /// runtime makes a `.dotnet` directory in a home when it has no runtime directory to use.
+    /// folders the person's session names for the shell's cache, data, temporary and runtime
+    /// files, and asking it leaves the home and those folders as they were: the shell works in
+    /// folders of the question's own, and the .NET 11 runtime makes a `.dotnet` directory in a home
+    /// when it has no runtime directory to use.
     #[cfg(unix)]
     #[test]
     #[ignore = "needs a PowerShell on the path; it runs with --include-ignored where one is installed, as continuous integration's shell-packages job does"]
-    fn a_profile_question_leaves_the_home_as_it_was_whatever_runtime_directory_it_has() {
+    fn a_profile_question_leaves_the_home_as_it_was_whatever_folders_the_session_names() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let shell = powershell_on_path().expect("a PowerShell");
@@ -2964,10 +2971,6 @@ mod tests {
             let root = tempfile::tempdir().expect("a directory");
             let home = root.path().join("home");
             std::fs::create_dir(&home).expect("a home");
-            let runtime = root.path().join("run");
-            std::fs::create_dir(&runtime).expect("a runtime directory");
-            std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
-                .expect("owner-only");
             let mut environment = vec![
                 ("HOME".to_owned(), home.to_string_lossy().into_owned()),
                 (
@@ -2977,11 +2980,16 @@ mod tests {
             ];
             // Not given, the shell has what this process has: none, when this case is run in a bare
             // environment (`env -i`), which is where the fault shows.
+            let mut persons = Vec::new();
             if given {
-                environment.push((
-                    RUNTIME_DIRECTORY_VARIABLE.to_owned(),
-                    runtime.to_string_lossy().into_owned(),
-                ));
+                for (variable, name) in QUESTION_FOLDERS {
+                    let folder = root.path().join(format!("persons-{name}"));
+                    std::fs::create_dir(&folder).expect("a folder of the person's");
+                    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700))
+                        .expect("owner-only");
+                    environment.push((variable.to_owned(), folder.to_string_lossy().into_owned()));
+                    persons.push(folder);
+                }
             }
             let layout = HomeLayout {
                 home: home.clone(),
@@ -3001,9 +3009,17 @@ mod tests {
                 .collect();
             assert!(
                 held.is_empty(),
-                "a runtime directory {}: the question left {held:?} in the home",
+                "folders {}: the question left {held:?} in the home",
                 if given { "given" } else { "not given" }
             );
+            for folder in &persons {
+                assert_eq!(
+                    std::fs::read_dir(folder).expect("reads").count(),
+                    0,
+                    "the question left something in {}",
+                    folder.display()
+                );
+            }
             answers.push((
                 all_hosts
                     .strip_prefix(&home)
@@ -3017,7 +3033,7 @@ mod tests {
         }
         assert_eq!(
             answers[0], answers[1],
-            "the answer depends on the runtime directory"
+            "the answer depends on the folders the session names"
         );
         assert_eq!(
             answers[0],
