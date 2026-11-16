@@ -324,11 +324,25 @@ final class LinkTapTests: HarnessTestCase {
         !target.contains("md-link") && !target.hasPrefix("button")
     }
 
-    /// The look against what the tap did, or nil where they agree. A tap with no trusted click of the system's
-    /// does not agree (unless `clickExpected` is false). The look at the click is the link that opens: the link the system's
-    /// click names, or, where it names plain text, the link the page opens from it (none where it opens nothing); a control's
-    /// click has none. The look at the press is none on plain text and on a control, and on a link's own element it is
-    /// none or the link that the click then names.
+    /// The links that have the look at a time on the page's clock, from the changes of the look that this tap made (the tap
+    /// begins with none lit: the earlier tap's look ended during its own wait).
+    private func lit(_ result: Result, at time: Double) -> Set<String> {
+        var set = Set<String>()
+        for look in result.looks where look.at <= time {
+            if look.on { set.insert(look.name) } else { set.remove(look.name) }
+        }
+        return set
+    }
+
+    /// The look against what the tap did, or nil where they agree. A tap with no trusted click of the system's does not agree
+    /// (unless `clickExpected` is false). The rule:
+    /// (1) AT THE CLICK the lit link is the link that opens, at every step, with no exception: the link the system's click names,
+    /// or, where it names plain text, the link the page opens from it; a control's click and a click that opens nothing have none.
+    /// (2) AT THE PRESS the look is none, or the link that the click opens, or the link whose OWN element the pointer-down named;
+    /// a press on plain text, or on a control, stays none.
+    /// (3) Where the press lit another link than the click opens, that first link's look is OFF at the click: never two links
+    /// lit, never the first left lit. This is read from the record's look lines, not only from the one name the click's line gives.
+    /// (4) No link opens that is not lit at its click.
     private func lookDisagreement(_ result: Result, clickExpected: Bool = true) -> String? {
         // Without the system's click there is nothing to hold the look to: a tap that gets none fails, since the look
         // would then pass whatever it lit.
@@ -345,11 +359,27 @@ final class LinkTapTests: HarnessTestCase {
         } else {
             opens = result.opened.last.map { String($0.split(separator: "/").last ?? "") }
         }
+        // (1) The click's own line.
         if atClick != opens {
             return "the click named \(click.target), lit \(atClick ?? "nothing") at the click, the link that opens is \(opens ?? "none")"
         }
-        if let pressTarget, isPlainText(pressTarget), press != nil { return "lit \(press ?? "") at a press on plain text (\(pressTarget))" }
-        if press != nil && press != opens { return "lit \(press ?? "") at the press, the click opens \(opens ?? "none")" }
+        // (2) The press.
+        if let press {
+            let own = pressTarget.flatMap { $0.contains("md-link") ? linkName(of: $0) : nil }
+            if own == nil || (press != own && press != opens) {
+                return "lit \(press) at the press on \(pressTarget ?? "no press"), the click opens \(opens ?? "none")"
+            }
+        }
+        // (3) and (4) The links lit at the click, from the record's look lines.
+        if let time = click.at {
+            let set = lit(result, at: time)
+            let expected: Set<String> = opens.map { [$0] } ?? []
+            if set != expected { return "the links lit at the click: \(set.sorted()), the link that opens: \(opens ?? "none")" }
+        }
+        for address in result.opened {
+            let name = String(address.split(separator: "/").last ?? "")
+            if let time = click.at, !lit(result, at: time).contains(name) { return "\(name) opened and was not lit at the click" }
+        }
         return nil
     }
 
@@ -832,10 +862,10 @@ final class LinkTapTests: HarnessTestCase {
     /// What a tap between links did, for the log: the press's target, the click's, the link the nearest-words rule picks at the
     /// press's point, and whether the click named another link. The light and the opening are held by `tap` (the look at the
     /// click is the link that opens); here at most one link opens, and a click that names a link opens that link.
-    private func judge(_ result: Result, among all: [Link], what: String) -> (opens: String?, other: Bool) {
+    private func judge(_ result: Result, among all: [Link], what: String) -> (opens: String?, other: Bool, different: Bool) {
         guard let down = result.events.first(where: { $0.type == "pointerdown" }), let click = result.events.first(where: { $0.type == "click" && $0.trusted }) else {
             say("LINKLOOK \(what): no press or no trusted click: \(result.events.map(\.type))")
-            return (nil, false)
+            return (nil, false, false)
         }
         let named = click.target.contains("md-link") ? linkName(of: click.target) : nil
         let pick = nearest(down.point, among: all)
@@ -844,7 +874,13 @@ final class LinkTapTests: HarnessTestCase {
         if let named { XCTAssertTrue(result.opened.count == 1 && result.opened[0].hasSuffix("/" + named), "\(result.label): the click named \(named), opened \(result.opened)") }
         let opens = result.opened.last.map { String($0.split(separator: "/").last ?? "") }
         say("LINKLOOK \(what): press target \(down.target) at \(String(format: "%.2f %.2f", down.point.x, down.point.y)), click target \(click.target), nearest words \(pick ?? "none"), the click named the other link: \(other), lit at the press \(down.lit ?? "nothing"), lit at the click \(click.lit ?? "nothing"), opened \(opens ?? "nothing")")
-        return (opens, other)
+        // The press's own link element against the link the click named: where they differ, the times of the looks say how the look moved.
+        let pressed = down.target.contains("md-link") ? linkName(of: down.target) : nil
+        let different = pressed != nil && named != nil && pressed != named
+        if different {
+            say("LINKLOOK \(what): the pointer-down named the element of \(pressed ?? "") and the click named \(named ?? ""); \(timing(result))")
+        }
+        return (opens, other, different)
     }
 
     /// The look at every point of one text size that the part (a) rule gives it: touch-down on a link's words, no look under a
@@ -936,14 +972,19 @@ final class LinkTapTests: HarnessTestCase {
         }
         var walk: [String] = []
         var walkOther = 0
+        var band: [CGFloat] = []
         for step in -4...4 {
             let y = border + CGFloat(step) * 0.25
             let what = "\(named): stacked links, walk across the border, \(String(format: "%+.2f", Double(step) * 0.25)) px from \(String(format: "%.2f", Double(border)))"
             let result = tap(what, at: CGPoint(x: middle, y: y), shift: shift, within: 4)
             let verdict = judge(result, among: all, what: what)
             if verdict.other { walkOther += 1 }
+            if verdict.different { band.append(y) }
             walk.append(verdict.opens ?? "nothing")
         }
+        let width = Double(band.count) * 0.25
+        say("LINKLOOK \(named): stacked links border: the pointer-down and the click named different links at \(band.count) of 9 steps of a quarter point (\(band.map { String(format: "%.2f", Double($0)) }.joined(separator: " "))): a band of about \(width) points, between \(max(0, width - 0.25)) and \(width + 0.25)")
+        XCTAssertLessThanOrEqual(width, 1.0, "\(named): the band in which the press and the click name different links is \(width) points wide: a product question")
         say("LINKLOOK \(named): stacked links walk: the link that opened at each of nine steps of a quarter point: \(walk.joined(separator: " ")); \(walkOther) at which the click named another link than the nearest words")
     }
 
