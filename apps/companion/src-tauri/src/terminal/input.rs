@@ -21,9 +21,10 @@
 //! keys. Keys, text and paste reach it through the shared key encoder, in the encoding the
 //! program negotiated (`keys`); the page names keys and never spells a byte.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 
 use kr_client::projection::{ProjectedModeSpelling, Screen};
+use kr_client::shown::Shown;
 use kr_keys::{Modifiers, MouseAction, MouseEncoding, MouseEvent, WheelDirection};
 use kr_protocol::envelope::ParamsValue;
 use kr_protocol::error::{ErrorCode, ProtocolError};
@@ -299,6 +300,17 @@ pub enum Owed {
     Acquire,
     /// Give back the lease at this epoch.
     Release(InputLeaseEpoch),
+    /// Give back the lease at this epoch once more, with no position in the typing: the session
+    /// refused the first release because it had not taken all the typing before it.
+    ReleaseAgain(InputLeaseEpoch),
+}
+
+/// A release in flight: the epoch it gives back, and whether it is the second send of one that the
+/// session refused for the typing before it.
+#[derive(Clone, Copy, Debug)]
+struct Release {
+    epoch: InputLeaseEpoch,
+    again: bool,
 }
 
 /// Where a write goes: the lease's epoch, and its number in the view's input stream.
@@ -326,9 +338,12 @@ pub struct Lease {
     acquiring: Option<RequestId>,
     /// Leases the view holds and has to give back, oldest first.
     owed: VecDeque<InputLeaseEpoch>,
-    /// The releases in flight. Their answers change nothing: a release the session refuses is of a
-    /// lease the view no longer held.
-    releasing: BTreeSet<RequestId>,
+    /// Leases whose release the session refused for the typing before it, to be given back once
+    /// more with no position.
+    owed_again: VecDeque<InputLeaseEpoch>,
+    /// The releases in flight. A release the session refuses as of a lease the view no longer held
+    /// changes nothing.
+    releasing: BTreeMap<RequestId, Release>,
     /// The writes in flight, and the epoch each was written under.
     writes: BTreeMap<RequestId, InputLeaseEpoch>,
     /// Why control last ended or was refused, until a newer request.
@@ -355,6 +370,9 @@ impl Lease {
     /// The next call the lease owes the session, if any: leases to give back first, then the one
     /// acquire a take needs.
     pub fn owed(&mut self) -> Option<Owed> {
+        if let Some(epoch) = self.owed_again.pop_front() {
+            return Some(Owed::ReleaseAgain(epoch));
+        }
         if let Some(epoch) = self.owed.pop_front() {
             return Some(Owed::Release(epoch));
         }
@@ -365,8 +383,18 @@ impl Lease {
     pub fn sent(&mut self, call: Owed, request: RequestId) {
         match call {
             Owed::Acquire => self.acquiring = Some(request),
-            Owed::Release(_) => {
-                self.releasing.insert(request);
+            Owed::Release(epoch) => {
+                self.releasing.insert(
+                    request,
+                    Release {
+                        epoch,
+                        again: false,
+                    },
+                );
+            }
+            Owed::ReleaseAgain(epoch) => {
+                self.releasing
+                    .insert(request, Release { epoch, again: true });
             }
         }
     }
@@ -375,7 +403,7 @@ impl Lease {
     #[must_use]
     pub fn owns(&self, request: RequestId) -> bool {
         self.acquiring == Some(request)
-            || self.releasing.contains(&request)
+            || self.releasing.contains_key(&request)
             || self.writes.contains_key(&request)
     }
 
@@ -389,8 +417,19 @@ impl Lease {
             self.acquiring = None;
             return self.acquired(outcome);
         }
-        if self.releasing.remove(&request) {
-            return false;
+        if let Some(release) = self.releasing.remove(&request) {
+            return match outcome {
+                Ok(_) => false,
+                // The lease is not this view's any more: nothing is left to give back.
+                Err(refusal) if refusal.code == ErrorCode::LeaseLost => false,
+                // The session had not taken all the typing before the release: once more, with no
+                // position.
+                Err(refusal) if refusal.code == ErrorCode::DraftConflict && !release.again => {
+                    self.owed_again.push_back(release.epoch);
+                    false
+                }
+                Err(refusal) => self.release_refused(&refusal),
+            };
         }
         if let Some(epoch) = self.writes.remove(&request)
             && let Err(refusal) = outcome
@@ -407,6 +446,17 @@ impl Lease {
             return true;
         }
         false
+    }
+
+    /// The session refused the release of a lease. Control had been given back, so the page is told
+    /// what the session said and nothing of whether control ended; a newer take, or an end told
+    /// already, keeps its own words.
+    fn release_refused(&mut self, refusal: &ProtocolError) -> bool {
+        if self.wanted || self.ended.is_some() {
+            return false;
+        }
+        self.ended = Some(refused_release(refusal));
+        true
     }
 
     fn acquired(&mut self, outcome: Result<ParamsValue, ProtocolError>) -> bool {
@@ -538,6 +588,14 @@ fn refused_take(refusal: &ProtocolError) -> String {
     } else {
         format!("This view cannot take control: {}", refusal.message)
     }
+}
+
+/// What the person is told when the session refused to take back the control the view gave up.
+fn refused_release(refusal: &ProtocolError) -> String {
+    format!(
+        "The session did not accept this view's release of control: {}",
+        Shown::protocol(refusal)
+    )
 }
 
 /// Why control ended at a refused write, in words for the person.

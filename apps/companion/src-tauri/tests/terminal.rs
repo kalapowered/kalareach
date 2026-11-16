@@ -5592,3 +5592,272 @@ async fn a_paired_views_lane_opens_after_the_attach_and_its_keys_go_on_the_strea
         "none of the typing is a call on the control stream"
     );
 }
+
+/// How long a case waits for a call or a state of a lane that must come at once once the barrier's
+/// wait (the lane bounds that by two seconds) is over.
+const AFTER_BARRIER: Duration = Duration::from_secs(10);
+
+/// Three keys, `a`, `b` and `c`, taken by the view under the page's take 1 and read by the host, and
+/// none of them accepted: the lane's barrier for an ending that follows cannot be reached.
+async fn three_keys_the_host_has_read(page: &Page, view: &str, host: &ScriptedHost) {
+    for key in ["a", "b", "c"] {
+        page.text(view, 1, key).expect("the key is taken");
+    }
+    host.script
+        .until("three frames", |seen| seen.frames.len() == 3)
+        .await;
+}
+
+/// The release's position, as the host reads it: the epoch and the count of frames it names.
+fn position(release: &scripted_worker::Call) -> Option<(u64, u64)> {
+    release
+        .params::<InputReleaseParams>()
+        .after_input
+        .map(|barrier| (barrier.epoch.get(), barrier.count.get()))
+}
+
+/// KR-REQ-07 (the input stream), release: a release whose barrier the host did not reach (the lane
+/// waits two seconds for the host to accept the typing before it) goes at once, and names the typing
+/// that the host did accept, not what the view admitted: the first of three frames.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreached_release_goes_at_once_naming_the_typing_the_host_accepted() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    three_keys_the_host_has_read(&page, &view, &host).await;
+    host.script.accept(1, 0);
+    page.release(&view, 2);
+    let release = link
+        .call_within(AFTER_BARRIER)
+        .await
+        .expect("the release went within the bound after the barrier's wait");
+    assert_eq!(release.method, Method::InputRelease.to_string());
+    assert_eq!(
+        position(&release),
+        Some((1, 1)),
+        "the release names the one frame the host accepted, not the three admitted"
+    );
+}
+
+/// A release that the host refuses because it had not taken the typing before it goes once more,
+/// with no position, and the page is told nothing of a refusal.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_release_refused_for_the_typing_before_it_goes_once_more_with_no_position() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    three_keys_the_host_has_read(&page, &view, &host).await;
+    page.release(&view, 2);
+    let first = link
+        .call_within(AFTER_BARRIER)
+        .await
+        .expect("the release went");
+    assert_eq!(position(&first), Some((1, 0)), "nothing was accepted");
+    link.refuse_with(
+        &first,
+        ErrorCode::DraftConflict,
+        "the typing before this request has not all arrived",
+    )
+    .await;
+    let again = link
+        .call_within(AFTER_BARRIER)
+        .await
+        .expect("the release was sent once more within the bound");
+    assert_eq!(again.method, Method::InputRelease.to_string());
+    assert_eq!(position(&again), None, "the second send names no position");
+    lease.answer(&mut link, &again).await;
+    assert!(link.call_within(QUIET).await.is_none(), "no third send");
+    let state = newest_now(&page, 3);
+    assert_eq!(control(&state), (2, "watching".to_owned()));
+    assert!(
+        state["control"]["ended"].is_null(),
+        "the page is told of no refusal: {state}"
+    );
+}
+
+/// A second refusal of the release is shown once, in the shown rule's words for the session's own
+/// message, and claims nothing of whether control ended; nothing is sent a third time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_refusal_of_a_release_is_shown_once_and_claims_no_end_of_control() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    three_keys_the_host_has_read(&page, &view, &host).await;
+    page.release(&view, 2);
+    let first = link
+        .call_within(AFTER_BARRIER)
+        .await
+        .expect("the release went");
+    link.refuse_with(&first, ErrorCode::DraftConflict, "not all arrived")
+        .await;
+    let again = link
+        .call_within(AFTER_BARRIER)
+        .await
+        .expect("the release was sent once more within the bound");
+    link.refuse_with(&again, ErrorCode::PermissionDenied, "no way")
+        .await;
+    let words = "The session did not accept this view's release of control: no way";
+    let told = page
+        .newest_within(3, |state| state["control"]["ended"] == words)
+        .await
+        .expect("the second refusal was shown within the bound");
+    assert_eq!(control(&told), (2, "watching".to_owned()));
+    assert!(link.call_within(QUIET).await.is_none(), "no third send");
+    let shown = page
+        .states(3)
+        .iter()
+        .filter(|state| state["control"]["ended"] == words)
+        .count();
+    assert_eq!(shown, 1, "shown once");
+}
+
+/// A first refusal that is not the failed precondition and not a lost lease is shown once as well,
+/// and the release is not sent again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_release_refused_for_another_reason_is_shown_once_and_not_sent_again() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    page.release(&view, 2);
+    let first = link.expect(Method::InputRelease).await;
+    link.refuse_with(&first, ErrorCode::PermissionDenied, "not yours")
+        .await;
+    let words = "The session did not accept this view's release of control: not yours";
+    page.newest_within(3, |state| state["control"]["ended"] == words)
+        .await
+        .expect("the refusal was shown within the bound");
+    assert!(
+        link.call_within(QUIET).await.is_none(),
+        "the release is not sent again"
+    );
+}
+
+/// A lost lease is a release that is done: nothing is sent again, and nothing is shown.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_release_of_a_lease_already_lost_is_done_and_shows_nothing() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    page.release(&view, 2);
+    let first = link.expect(Method::InputRelease).await;
+    link.refuse_with(
+        &first,
+        ErrorCode::LeaseLost,
+        "this attachment does not hold it",
+    )
+    .await;
+    assert!(
+        link.call_within(QUIET).await.is_none(),
+        "the release is not sent again"
+    );
+    assert!(newest_now(&page, 3)["control"]["ended"].is_null());
+}
+
+/// The host refuses the third frame and says it took two before it: an ending that stood behind the
+/// typing names those two, the count that a refusal of the same epoch states.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refusal_that_states_what_was_accepted_moves_the_count_an_ending_names() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    three_keys_the_host_has_read(&page, &view, &host).await;
+    page.release(&view, 2);
+    host.script
+        .refuse(1, 2, Some(1), ErrorCode::PermissionDenied);
+    let release = link
+        .call_within(AFTER_BARRIER)
+        .await
+        .expect("the release went within the bound");
+    assert_eq!(position(&release), Some((1, 2)));
+}
+
+/// The close's detach is written whole, once, naming what the host accepted, and that counts what the
+/// host accepts while the close waits for the rest.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_close_names_what_the_host_accepted_including_what_it_accepted_while_it_waited() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    three_keys_the_host_has_read(&page, &view, &host).await;
+    host.script.accept(1, 0);
+    page.app
+        .state::<companion_tauri::terminal::TerminalViews>()
+        .closer(&view)();
+    host.script.accept(1, 1);
+    assert!(
+        ended_within_the_close_bound(&page, &view).await,
+        "the close ended the view within the bound"
+    );
+    // The view writes the detach and closes the connection at once, so the host may not read what
+    // the connection took whole: the case reads it where the connection took it.
+    let detaches: Vec<SessionDetachParams> = host
+        .written()
+        .into_iter()
+        .filter_map(|frame| match frame {
+            kr_protocol::envelope::ControlFrame::Mutation(mutation)
+                if mutation.method.to_string() == Method::SessionDetach.to_string() =>
+            {
+                mutation.params.to_typed().ok()
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(detaches.len(), 1, "the detach is written once");
+    let barrier = detaches[0]
+        .after_input
+        .clone()
+        .expect("the detach names a position");
+    assert_eq!((barrier.epoch.get(), barrier.count.get()), (1, 2));
+    let _ = link.closed().await;
+}
+
+/// A launch whose barrier the host did not reach is never sent: the page is told at once, in the
+/// ruled words, nothing of it is on the wire, and the typing held behind it goes out in order.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreached_launch_is_not_sent_and_the_typing_behind_it_goes_in_order() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    three_keys_the_host_has_read(&page, &view, &host).await;
+    let mut pressing = page.invoke_later(
+        "terminal_view_launch",
+        json!({ "view": view, "press": the_press() }),
+    );
+    page.text(&view, 1, "z").expect("the key is taken");
+    let told = tokio::time::timeout(AFTER_BARRIER, &mut pressing)
+        .await
+        .expect("the page was told within the bound")
+        .expect("joins")
+        .expect_err("the launch was not started");
+    assert_eq!(code(&told), "TERMINAL_UNAVAILABLE");
+    assert_eq!(
+        told["message"],
+        "The launch was not started: the session had not accepted all the typing before it."
+    );
+    host.script
+        .until_soon("the typing held behind the launch", |seen| {
+            seen.frames.len() == 4
+        })
+        .await;
+    assert_eq!(read_by(&host).last(), Some(&(1, 3, "z".to_owned())));
+    assert!(
+        link.call_within(QUIET).await.is_none(),
+        "no launch is on the wire"
+    );
+}
