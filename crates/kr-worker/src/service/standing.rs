@@ -1,11 +1,12 @@
 //! The checks of a mutation's admission that change nothing, in one place.
 //!
 //! A mutation is admitted once and dispatched later, and what was true of its caller at the first
-//! moment is asked again at the second. The checks that make no change (the authority, the
-//! validated revision, the local owner's access, the envelope, the uncertain outcome in the way,
-//! the subject's preconditions, the dispatch lease, the accepted deadline and the broker's own
-//! admission) are written here as the four pieces of one function, so that the first admission and
-//! every later ask of it put the same question and cannot drift apart.
+//! moment is asked again at the second. The checks that change no state of the authority or of
+//! the receipt (the authority, the validated revision, the local owner's access, the envelope, the
+//! uncertain outcome in the way, the subject's preconditions, the dispatch lease, the accepted
+//! deadline and the broker's own admission) are written here as the four pieces of one function,
+//! so that the first admission and every later ask of it put the same question and cannot drift
+//! apart.
 //!
 //! # The pieces
 //!
@@ -22,9 +23,22 @@
 //! # What stays outside
 //!
 //! The first admission's own work stands outside the pieces: the local owner's full check (which
-//! raises the host's clock floor, owes its record and keeps the readings) and the expiry sweep of
-//! the questions. A piece reads the clock only through the pure readers of the time contract, and
-//! writes nothing but the one note of a failed journal that the first admission makes.
+//! raises the host's clock floor, owes its record and keeps the readings), the session's take for
+//! the envelope, and the note of a journal that could not answer the limits' reads, which the
+//! limits hand back and the first admission makes. A piece reads the clock only through the pure
+//! readers of the time contract.
+//!
+//! # What a piece writes
+//!
+//! No piece notes a fault and none writes a receipt. Three writes are made inside the pieces, each
+//! as at the base:
+//!
+//! * `subject`, in the first mode, runs the expiry sweep of the questions (through `validate`)
+//!   before it reads the question a method names, so a question that is due or whose binding
+//!   moved is `expired` by the time the check refuses it;
+//! * a journal that fails a read of the limits records the fault itself, inside the read;
+//! * `dispatch`, for a mutation the broker owns, takes the broker's claim, its permit and its
+//!   token (`decidable`), which is the admission itself: a second pass cannot run it again.
 
 use super::{
     Caller, ConnectionFacts, ConnectionState, ContinuousInstant, Made, Method, MutationRequest,
@@ -64,6 +78,16 @@ pub(super) enum Sweep {
 /// the same question to the same value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ShownAtAdmission(pub(super) Option<u64>);
+
+/// What the limits read, for the pass's caller.
+pub(super) struct Limited {
+    /// What the person was shown, kept so that a later pass puts the same question to the same
+    /// value.
+    pub(super) shown: ShownAtAdmission,
+    /// The failure of a journal read that the method goes on without, which the first admission
+    /// notes for the session. The pass writes no note.
+    pub(super) unreadable: Option<String>,
+}
 
 /// One pass of the standing function, in one mode.
 pub(super) struct StandingPass<'a> {
@@ -115,11 +139,13 @@ impl StandingPass<'_> {
     /// Returns what the check that refused returns.
     pub(super) fn envelope(
         &self,
+        session: &Session,
         mutation: &MutationRequest,
         entry: &'static kr_protocol::authority::MethodEntry,
         caller: &Caller,
     ) -> Result<()> {
-        self.service.check_envelope(mutation, entry, caller)
+        self.service
+            .check_envelope(session, mutation, entry, caller)
     }
 
     /// Piece B1, the limits: the uncertain outcome that stands in the way of a fresh identifier,
@@ -142,10 +168,9 @@ impl StandingPass<'_> {
         method: Method,
         subject: kr_protocol::scalars::Digest256,
         shown: Option<ShownAtAdmission>,
-    ) -> Result<ShownAtAdmission> {
-        self.service.check_admission_limits(
-            self.mode, held, caller, state, mutation, method, subject, shown,
-        )
+    ) -> Result<Limited> {
+        self.service
+            .check_admission_limits(held, caller, state, mutation, method, subject, shown)
     }
 
     /// Piece B2: the request's parameters against the session, and the preconditions the caller
