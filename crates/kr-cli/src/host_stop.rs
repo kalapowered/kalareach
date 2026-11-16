@@ -53,7 +53,7 @@ pub(crate) const ANSWER_BOUND: Duration = Duration::from_millis(STOP_SETTLE_MS +
 pub(crate) const END_BOUND: Duration = handover::DAEMON_STOP;
 
 /// How often the end of the daemon is looked for.
-const LOOK_EVERY: Duration = Duration::from_millis(50);
+pub(crate) const LOOK_EVERY: Duration = Duration::from_millis(50);
 
 /// What a refusal says of the sessions meanwhile, for a command that stops the daemon.
 const SESSIONS_GO_ON: &str = "Sessions and local attachments go on while no daemon runs.";
@@ -584,6 +584,9 @@ pub(crate) enum Looked {
     Daemon(Box<Daemon>),
     /// Nothing listens, and no daemon holds the environment.
     NoDaemon,
+    /// A process holds the environment and does not answer, so it may be starting or stopping. Each
+    /// command says what it does about that: a stop does nothing, and a restart waits for it.
+    Holder,
     /// The look ended the command with this result.
     Ended(Completion),
 }
@@ -628,13 +631,7 @@ pub(crate) async fn look(
                 Ok(Ok(info)) => info,
                 Ok(Err(error)) => return Looked::Ended(failed(error, none, json)),
                 Err(_) => {
-                    return Looked::Ended(silent(
-                        which,
-                        environment,
-                        none,
-                        json,
-                        startup::ANSWER_BOUND,
-                    ));
+                    return silent(which, environment, none, json, startup::ANSWER_BOUND);
                 }
             };
             let holder = lock_holder(&environment.paths);
@@ -644,17 +641,11 @@ pub(crate) async fn look(
                 holder,
             }))
         }
-        Reached::Silent => Looked::Ended(silent(
-            which,
-            environment,
-            none,
-            json,
-            startup::ANSWER_BOUND,
-        )),
+        Reached::Silent => silent(which, environment, none, json, startup::ANSWER_BOUND),
         Reached::Refused(error) if startup::nothing_listening(&error) => {
             match lock_held(&environment.paths) {
                 Ok(false) => Looked::NoDaemon,
-                Ok(true) => Looked::Ended(holds_and_is_silent(which, environment, none, json)),
+                Ok(true) => Looked::Holder,
                 Err(error) => Looked::Ended(failed(
                     CliError::Other(shown!(
                         "whether a control daemon holds environment {} could not be read: {}. {}",
@@ -721,6 +712,7 @@ async fn stop(
             json,
             &begun.earlier,
         ),
+        Looked::Holder => holds_and_is_silent(Which::Stop, environment, &begun.none, json),
         Looked::Ended(ended) => ended,
     })
 }
@@ -857,10 +849,10 @@ fn silent(
     none: &Facts,
     json: bool,
     bound: Duration,
-) -> Completion {
+) -> Looked {
     match lock_held(&environment.paths) {
-        Ok(true) => holds_and_is_silent(which, environment, none, json),
-        _ => failed(
+        Ok(true) => Looked::Holder,
+        _ => Looked::Ended(failed(
             CliError::Unfinished {
                 code: ErrorCode::EnvironmentUnavailable,
                 message: shown!(
@@ -874,12 +866,12 @@ fn silent(
             },
             none,
             json,
-        ),
+        )),
     }
 }
 
 /// A daemon holds the environment and does not answer, so it may be starting or stopping.
-fn holds_and_is_silent(
+pub(crate) fn holds_and_is_silent(
     which: Which,
     environment: &KnownEnvironment,
     none: &Facts,
@@ -1719,7 +1711,7 @@ async fn successor_of(
 
 /// What answers at the environment's endpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Endpoint {
+pub(crate) enum Endpoint {
     /// Nothing listens there.
     Nobody,
     /// A daemon of the generation that was asked answers.
@@ -1814,7 +1806,7 @@ impl Installation {
 /// What the wait for a daemon's end and the look before it read of the machine and wait on, given
 /// to them so that a case can supply each answer and the pause, with the runtime's clock in its
 /// own hands. [`Real`] is the command's own.
-trait Operations {
+pub(crate) trait Operations {
     /// Whether a daemon holds the environment, waiting up to `within` for one that is starting.
     async fn held(&self, within: Duration) -> std::result::Result<bool, Shown>;
     /// What the system says of the process of the daemon that was asked.
@@ -1828,14 +1820,14 @@ trait Operations {
 }
 
 /// The operations on this machine: its locks, its processes, its endpoint and its timer.
-struct Real<'a> {
+pub(crate) struct Real<'a> {
     installation: Installation,
     environment: &'a EnvironmentPaths,
     generation: ControllerGeneration,
 }
 
 impl<'a> Real<'a> {
-    fn of(
+    pub(crate) fn of(
         host: &HostPaths,
         environment: &'a EnvironmentPaths,
         generation: ControllerGeneration,

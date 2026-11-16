@@ -14,6 +14,8 @@
 //! and at how the daemon was started (the launch comparison): a restart that would stop a daemon
 //! and then find no equivalent start refuses first, and says that nothing was stopped.
 
+mod holder;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use kr_client::shown;
@@ -27,7 +29,8 @@ use kr_protocol::ids::{ControllerGeneration, EnvironmentId};
 
 use crate::error::{CliError, Result};
 use crate::host_stop::{
-    self, Asked, Begun, Daemon, Facts, Knows, Looked, Progress, Stage, StartedFact, Which,
+    self, Asked, Begun, Daemon, Facts, Knows, Looked, Operations, Progress, Real, Stage,
+    StartedFact, Which,
 };
 use crate::report::Completion;
 use crate::resolve::KnownEnvironment;
@@ -72,11 +75,58 @@ pub(crate) async fn restart(
             Looked::NoDaemon => {
                 start_where_none_ran(host, environment, json, progress, &begun).await
             }
+            Looked::Holder => wait_for_the_holder(host, environment, json, progress, &begun).await,
             Looked::Daemon(daemon) => {
                 restart_the_daemon(host, environment, start, *daemon, json, progress, &begun).await
             }
         },
     )
+}
+
+/// A process holds the environment and does not answer, so it may be a daemon that is starting, as
+/// another restart's start makes one, or one that is stopping. This command stops nothing and starts
+/// nothing beside it: it waits, within the start's bound, for the holder to answer or to let go. A
+/// daemon that answers is the end of this command, which stopped none and started none; a
+/// holder that lets go leaves no daemon, and the restart starts one; one that does neither is said
+/// as the stop says it.
+async fn wait_for_the_holder(
+    host: &HostPaths,
+    environment: &KnownEnvironment,
+    json: bool,
+    progress: &Progress,
+    begun: &Begun,
+) -> Completion {
+    let id = environment.environment_id;
+    // No daemon was asked here, so no generation is the one that answers: any answer counts.
+    let operations = Real::of(host, &environment.paths, ControllerGeneration::new(0));
+    match holder::wait(&operations, startup::START_BOUND).await {
+        holder::Holder::Answers => {
+            let named = operations.named_daemon();
+            host_stop::done(
+                // PLACEHOLDER for the texts' round: the sentence that says this command stopped
+                // none and started none; its state is the wait's `Answers` (a daemon that held the
+                // environment and did not answer was found to answer), read by `holder::wait`.
+                &shown!(
+                    "A control daemon held environment {} and did not answer, and a control \
+                     daemon{} answers now. This command stopped none and started none.",
+                    id,
+                    host_stop::process_said(named)
+                ),
+                &Facts {
+                    pid: named,
+                    ..begun.none.clone()
+                },
+                json,
+                &begun.earlier,
+            )
+        }
+        holder::Holder::Gone => {
+            start_where_none_ran(host, environment, json, progress, begun).await
+        }
+        holder::Holder::Silent => {
+            host_stop::holds_and_is_silent(Which::Restart, environment, &begun.none, json)
+        }
+    }
 }
 
 /// What a restart that finds the start unmakeable says: the start's own refusal, and that nothing
