@@ -444,11 +444,11 @@ impl Account {
                 // them; a store that cannot say is settled, never revoked while it may hold them.
                 // The companion signs in its own account, which no host's deadline, lease or fence
                 // governs, so the check that the keep asks under the account's hold always stands.
-                match self
+                let kept = self
                     .signed_in
                     .keep(issued, grant.nonce(), || Some(()))
-                    .await
-                {
+                    .await;
+                match kept.answer {
                     Ok(Commit::Kept) => match self.signed_in.complete_identity(|| Some(())).await {
                         Ok(IdentityRead::Disagreed) => Some(Outcome::NotForThisSignIn),
                         _ => None,
@@ -468,7 +468,7 @@ impl Account {
                         Some(Outcome::NotKept)
                     }
                     Err(error) => {
-                        tracing::warn!(%error, "a sign-in could not be kept");
+                        tracing::warn!(%error, unrevoked = ?kept.unrevoked, "a sign-in could not be kept");
                         Some(Outcome::NotKept)
                     }
                 }

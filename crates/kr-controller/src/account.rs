@@ -198,6 +198,40 @@ const CALL_OPEN_REVOCATION_OWED_PAGE: &str = "A voice call is open on this host.
      in again. The host could not yet revoke what the account service issued. The host tries again \
      the next time it uses the account, and what was issued ends by itself when it expires.";
 
+/// What the browser shows when the grant could not be kept and the revocation of what the service
+/// issued reached neither the service nor the queue: the sentence of the page of a grant that was
+/// not kept, and the sentences of the owed revocation, as they stand there.
+const NOT_KEPT_REVOCATION_OWED_PAGE: &str = "This host could not keep the sign-in. The host could \
+     not yet revoke what the account service issued. The host tries again the next time it uses \
+     the account, and what was issued ends by itself when it expires.";
+
+/// What the browser shows when the service did not sign the host in and left a token whose
+/// revocation reached neither the service nor the queue: the sentence of the page of a refused
+/// sign-in, and the sentences of the owed revocation, as they stand there.
+const SERVICE_REFUSED_REVOCATION_OWED_PAGE: &str = "The account service did not sign this host in. \
+     The host could not yet revoke what the account service issued. The host tries again the next \
+     time it uses the account, and what was issued ends by itself when it expires.";
+
+/// Whose token a failed revocation was of, in each place that ends a token it does not keep: the
+/// words of the line begin with them.
+const WITHHELD: &str = "a withheld sign-in's";
+const REFUSED: &str = "a refused sign-in's";
+const UNKEPT: &str = "an unkept sign-in's";
+const REFUSED_EXCHANGE: &str = "a refused exchange's";
+
+/// Writes the line of a failed revocation of `whose` token, where it failed.
+fn say_failed_revocation(whose: &str, unrevoked: Option<&Unrevoked>) {
+    if let Some(unrevoked) = unrevoked {
+        eprintln!("{}", failed_revocation_line(whose, unrevoked));
+    }
+}
+
+/// Whether the revocation is still owed: neither the queue nor the service took the token, so
+/// this process holds it in memory for the next send.
+const fn owes(unrevoked: Option<&Unrevoked>) -> bool {
+    matches!(unrevoked, Some(Unrevoked::Held(_)))
+}
+
 /// The line that records a failed revocation of `whose` token: what the queue and the service are
 /// known to have done, and "may" where a step that failed can have done more than it reported (a
 /// write that landed before its flush failed, a send that reached the service).
@@ -237,6 +271,12 @@ enum Outcome {
     /// A call opened while the sign-in's code was exchanged, so no grant was kept
     /// ([`AccountAttempt::CallOpen`]); and the revocation of what the service issued is still owed.
     CallOpenRevocationOwed,
+    /// The grant could not be kept ([`AccountAttempt::NotKept`]); and the revocation of what the
+    /// service issued is still owed.
+    NotKeptRevocationOwed,
+    /// The service did not sign the host in ([`AccountAttempt::ServiceRefused`]), and left a token
+    /// whose revocation is still owed.
+    ServiceRefusedRevocationOwed,
 }
 
 impl Outcome {
@@ -260,12 +300,35 @@ impl Outcome {
         }
     }
 
+    /// What a sign-in came to when its grant could not be kept: `unrevoked` says whether the
+    /// revocation of what the service issued is still owed.
+    const fn not_kept(unrevoked: Option<&Unrevoked>) -> Self {
+        if owes(unrevoked) {
+            Self::NotKeptRevocationOwed
+        } else {
+            Self::Attempt(AccountAttempt::NotKept)
+        }
+    }
+
+    /// What a sign-in came to when the service refused it and left a token behind: `unrevoked`
+    /// says whether the revocation of that token is still owed.
+    const fn service_refused(unrevoked: Option<&Unrevoked>) -> Self {
+        if owes(unrevoked) {
+            Self::ServiceRefusedRevocationOwed
+        } else {
+            Self::Attempt(AccountAttempt::ServiceRefused)
+        }
+    }
+
     /// What the account's report names.
     const fn attempt(self) -> AccountAttempt {
         match self {
             Self::Attempt(attempt) => attempt,
-            Self::AuthorityEnded | Self::AuthorityEndedRevocationOwed => AccountAttempt::NotKept,
+            Self::AuthorityEnded
+            | Self::AuthorityEndedRevocationOwed
+            | Self::NotKeptRevocationOwed => AccountAttempt::NotKept,
             Self::CallOpenRevocationOwed => AccountAttempt::CallOpen,
+            Self::ServiceRefusedRevocationOwed => AccountAttempt::ServiceRefused,
         }
     }
 
@@ -276,6 +339,8 @@ impl Outcome {
             Self::AuthorityEnded => AUTHORITY_ENDED_PAGE,
             Self::AuthorityEndedRevocationOwed => AUTHORITY_ENDED_REVOCATION_OWED_PAGE,
             Self::CallOpenRevocationOwed => CALL_OPEN_REVOCATION_OWED_PAGE,
+            Self::NotKeptRevocationOwed => NOT_KEPT_REVOCATION_OWED_PAGE,
+            Self::ServiceRefusedRevocationOwed => SERVICE_REFUSED_REVOCATION_OWED_PAGE,
         }
     }
 }
@@ -1642,12 +1707,7 @@ impl Inner {
                     // issued is revoked, queued before it is sent, and nothing is kept. The person
                     // is told as the keep tells them, so a revocation that is still owed is said.
                     let (commit, unrevoked) = held.signed_in.end_withheld(refresh).await;
-                    if let Some(unrevoked) = unrevoked {
-                        eprintln!(
-                            "{}",
-                            failed_revocation_line("a withheld sign-in's", &unrevoked)
-                        );
-                    }
+                    say_failed_revocation(WITHHELD, unrevoked.as_ref());
                     return Outcome::withheld(commit);
                 };
                 let change = self.begin_change();
@@ -1657,12 +1717,7 @@ impl Inner {
                     // sign-in's is, queued before it is sent, and the browser is told of a
                     // revocation that is still owed as it is there.
                     let (commit, unrevoked) = held.signed_in.end_withheld(refresh).await;
-                    if let Some(unrevoked) = unrevoked {
-                        eprintln!(
-                            "{}",
-                            failed_revocation_line("a refused sign-in's", &unrevoked)
-                        );
-                    }
+                    say_failed_revocation(REFUSED, unrevoked.as_ref());
                     return Outcome::call_open(commit);
                 };
                 // The sign-in waited for the person, up to the end of its time, and the authority
@@ -1673,13 +1728,14 @@ impl Inner {
                 // its request to the service. Where they do not stand no grant is kept, and what
                 // the service issued is revoked, as a sign-out revokes it. The attempt holds the
                 // issue (the tokens the service gave for the spent code) and the account's gate.
-                match held
+                let kept = held
                     .signed_in
                     .keep(issued, grant.nonce(), || lasting().ok())
-                    .await
-                {
+                    .await;
+                match kept.answer {
                     Ok(Commit::Kept) => {}
                     Ok(withheld @ (Commit::Withheld | Commit::WithheldOwing)) => {
+                        say_failed_revocation(WITHHELD, kept.unrevoked.as_ref());
                         return Outcome::withheld(withheld);
                     }
                     Ok(Commit::Unsettled) => {
@@ -1698,9 +1754,11 @@ impl Inner {
                     }
                     Err(error) => {
                         // The grant is not kept, so its token was ended: queued where the store
-                        // allows, and sent once where it does not.
+                        // allows, and sent once where it does not. Where that failed, the
+                        // person is told as the keep tells them.
                         eprintln!("kr-controller: a host sign-in could not be kept: {error}");
-                        return Outcome::Attempt(AccountAttempt::NotKept);
+                        say_failed_revocation(UNKEPT, kept.unrevoked.as_ref());
+                        return Outcome::not_kept(kept.unrevoked.as_ref());
                     }
                 }
                 if let Ok(IdentityRead::Disagreed) =
@@ -1711,10 +1769,12 @@ impl Inner {
                 Outcome::Attempt(AccountAttempt::SignedIn)
             }
             Ok(Exchanged::Refused { leftover }) => {
+                let mut unrevoked = None;
                 if let Some(leftover) = leftover {
-                    let _ = held.signed_in.revoke_unkept(leftover).await;
+                    (_, unrevoked) = held.signed_in.end_withheld(leftover).await;
+                    say_failed_revocation(REFUSED_EXCHANGE, unrevoked.as_ref());
                 }
-                Outcome::Attempt(AccountAttempt::ServiceRefused)
+                Outcome::service_refused(unrevoked.as_ref())
             }
             Err(error) => {
                 eprintln!("kr-controller: a host sign-in's code could not be exchanged: {error}");

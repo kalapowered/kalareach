@@ -818,6 +818,7 @@ impl Rig {
         self.tokens
             .keep(grant_of(account), "a-nonce", || Some(()))
             .await
+            .answer
             .expect("the person signs in");
     }
 
@@ -829,6 +830,7 @@ impl Rig {
         self.tokens
             .keep(grant_of(account), "a-nonce", || Some(()))
             .await
+            .answer
             .expect("the person switches accounts");
     }
 
@@ -900,6 +902,7 @@ async fn signed_in_phone(
     tokens
         .keep(grant_of(ACCOUNT), "a-nonce", || Some(()))
         .await
+        .answer
         .expect("the device signs in");
     let deletion = companion_tauri::account::deletion::never_deleting(&origin, &tokens);
     let account = Arc::new(Account::new(

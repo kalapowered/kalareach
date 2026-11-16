@@ -1861,6 +1861,18 @@ const CALL_OPEN_REVOCATION_OWED_PAGE: &str = "A voice call is open on this host.
      in again. The host could not yet revoke what the account service issued. The host tries again \
      the next time it uses the account, and what was issued ends by itself when it expires.";
 
+/// What the browser is shown when the grant could not be kept and the revocation of what the
+/// service issued reached neither the service nor the queue.
+const NOT_KEPT_REVOCATION_OWED_PAGE: &str = "This host could not keep the sign-in. The host could \
+     not yet revoke what the account service issued. The host tries again the next time it uses \
+     the account, and what was issued ends by itself when it expires.";
+
+/// What the browser is shown when the service refused the exchange after issuing a token, and the
+/// revocation of that token reached neither the service nor the queue.
+const SERVICE_REFUSED_REVOCATION_OWED_PAGE: &str = "The account service did not sign this host in. \
+     The host could not yet revoke what the account service issued. The host tries again the next \
+     time it uses the account, and what was issued ends by itself when it expires.";
+
 /// The words of the one paragraph in the page the daemon answered a browser with, which is the
 /// whole of what the page tells the person.
 fn page_words(page: &str) -> &str {
@@ -2157,6 +2169,112 @@ async fn a_call_that_opens_while_a_sign_in_is_exchanged_owes_a_revocation_that_n
         revoked, both,
         "the next send ended the token that only memory held"
     );
+    host.stop().await;
+}
+
+/// KR-REQ-17.23: a sign-in whose grant cannot be kept, and whose revocation reaches neither the
+/// queue nor the service, is told to the person as a revocation that is still owed. A replacing
+/// sign-in's code is exchanged; from then the account's grant cannot be read, the queue cannot be
+/// read and the service refuses revocations. The attempt is reported as a grant that was not kept
+/// and the browser is shown the whole of the owed page; the token was sent to the service once, and
+/// refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_whose_grant_cannot_be_kept_owes_a_revocation_that_neither_took() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    listen_for_sign_ins(&host);
+    sign_in_with(&host, broker.issue_grant(600)).await;
+    let (url, address) = start_sign_in(&host).await;
+    broker.expect_sign_in(&url);
+    let kept = account_item_in(&host.tree().environment().secrets_dir(), "session");
+    let queue = kept.with_file_name("revoke");
+    let exchange = broker.hold("/auth/oauth2/token");
+
+    let (page, ()) = tokio::join!(browser_answers(&address, &url, "the-code"), async {
+        exchange.reached().await;
+        // The code is out at the service. From here the grant and the queue cannot be read and the
+        // service refuses what it is sent.
+        std::fs::remove_file(&kept).expect("the grant's file is taken away");
+        std::fs::create_dir(&kept).expect("a directory in the grant's place");
+        std::fs::create_dir(&queue).expect("a directory in the queue's place");
+        broker.refuse_revocations(true);
+        exchange.release();
+    });
+    let report = settled(&host).await;
+    assert_eq!(
+        page_words(&page),
+        NOT_KEPT_REVOCATION_OWED_PAGE,
+        "the browser is told that the revocation is owed"
+    );
+    assert_eq!(report.last_attempt.as_ref(), Some(&AccountAttempt::NotKept));
+    assert!(
+        broker.revoked().is_empty(),
+        "the service refused the revocation"
+    );
+    assert!(
+        broker
+            .seen()
+            .iter()
+            .any(|request| request.path == "/auth/oauth2/revoke"
+                && request.body["token"] == broker.refresh(2).as_str()),
+        "the token was sent to the service at once, and refused"
+    );
+    std::fs::remove_dir(&queue).expect("the queue's place is given back");
+    std::fs::remove_dir(&kept).expect("the grant's place is given back");
+    host.stop().await;
+}
+
+/// KR-REQ-17.23: a sign-in the service refuses after issuing a token, whose revocation reaches
+/// neither the queue nor the service, is told to the person as a revocation that is still owed. The
+/// answer to the code carries another nonce than the sign-in asked for; the queue cannot be read and
+/// the service refuses revocations from the moment the exchange is held. The attempt is reported as
+/// refused by the service, and the browser is shown the whole of the owed page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_the_service_refuses_after_issuing_a_token_owes_a_revocation_that_neither_took() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    listen_for_sign_ins(&host);
+    sign_in_with(&host, broker.issue_grant(600)).await;
+    let (url, address) = start_sign_in(&host).await;
+    broker.expect_sign_in(&url);
+    let kept = account_item_in(&host.tree().environment().secrets_dir(), "session");
+    let queue = kept.with_file_name("revoke");
+    broker.answer_with_another_nonce();
+    let exchange = broker.hold("/auth/oauth2/token");
+
+    let (page, ()) = tokio::join!(browser_answers(&address, &url, "the-code"), async {
+        exchange.reached().await;
+        std::fs::create_dir(&queue).expect("a directory in the queue's place");
+        broker.refuse_revocations(true);
+        exchange.release();
+    });
+    let report = settled(&host).await;
+    assert_eq!(
+        page_words(&page),
+        SERVICE_REFUSED_REVOCATION_OWED_PAGE,
+        "the browser is told that the revocation is owed"
+    );
+    assert_eq!(
+        report.last_attempt.as_ref(),
+        Some(&AccountAttempt::ServiceRefused)
+    );
+    assert!(
+        broker.revoked().is_empty(),
+        "the service refused the revocation"
+    );
+    assert!(
+        broker
+            .seen()
+            .iter()
+            .any(|request| request.path == "/auth/oauth2/revoke"
+                && request.body["token"] == broker.refresh(2).as_str()),
+        "the token was sent to the service at once, and refused"
+    );
+    std::fs::remove_dir(&queue).expect("the queue's place is given back");
     host.stop().await;
 }
 

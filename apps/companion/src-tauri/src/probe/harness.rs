@@ -255,6 +255,7 @@ async fn signed_in(origin: &str, token: &str) -> Result<Arc<Account>, String> {
     tokens
         .keep(service.grant(), "harness", || Some(()))
         .await
+        .answer
         .map_err(|error| error.to_string())?;
     let origin =
         kr_protocol::service::GatewayOrigin::new(origin).map_err(|error| error.to_string())?;
