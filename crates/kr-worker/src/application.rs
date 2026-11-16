@@ -160,10 +160,19 @@ pub struct Producer {
     runtime: Weak<SessionRuntime>,
     held: Mutex<Held>,
     published: tokio::sync::watch::Sender<Application>,
-    /// Tells the publisher that a publication is owed. It holds one wake, which stands for every
-    /// fact that joined before the publisher reads them, so a fact that joins while the publisher
-    /// waits for the session is published after it.
+    /// Tells the publisher that a publication may be owed. It holds one wake, which stands for
+    /// every fact that joined before the publisher reads them, so a fact that joins while the
+    /// publisher waits for the session, or while it makes a publication, is read after it. Every
+    /// change sends one, whatever has been published: what is published changes only when the
+    /// publisher makes a publication, and a change back to a value already published can join
+    /// while an older one is in flight.
     owed: std::sync::mpsc::SyncSender<Wake>,
+    /// Stand before the publisher takes the session and before it sends what it has read, for this
+    /// host's own tests.
+    #[cfg(feature = "testing")]
+    before_the_take: crate::testing::Stall,
+    #[cfg(feature = "testing")]
+    before_the_send: crate::testing::Stall,
     /// How many helper threads of this producer are alive: its publisher, and the reader of the
     /// question ledger that the evidence loop starts.
     #[cfg(feature = "testing")]
@@ -248,6 +257,10 @@ impl Producer {
                 held: Mutex::new(Held::default()),
                 published,
                 owed,
+                #[cfg(feature = "testing")]
+                before_the_take: crate::testing::Stall::default(),
+                #[cfg(feature = "testing")]
+                before_the_send: crate::testing::Stall::default(),
                 #[cfg(feature = "testing")]
                 helpers,
             }
@@ -348,8 +361,7 @@ impl Producer {
     }
 
     /// Writes what the facts held come to into the session's input domain, where a read of a
-    /// session that something holds finds it, and tells the publisher when that is not what was
-    /// published.
+    /// session that something holds finds it, and tells the publisher.
     ///
     /// It is made as the fact joins the others, with the facts locked, so the writes go in the
     /// order the facts were joined in, and it waits for nothing. A turn that begins while a storage
@@ -365,10 +377,10 @@ impl Producer {
             .input()
             .lock()
             .set_application_state(application.state);
-        if *self.published.borrow() != application {
-            // A full channel holds a wake already, and the publisher reads the facts after it.
-            let _ = self.owed.try_send(Wake::Owed);
-        }
+        // A full channel holds a wake already, and the publisher reads the facts after it. The
+        // publisher publishes only what differs from what is published, so a wake that finds
+        // nothing owed costs one read of the facts.
+        let _ = self.owed.try_send(Wake::Owed);
     }
 
     /// Publishes what the held facts come to, if that is not what was published.
@@ -381,6 +393,8 @@ impl Producer {
         let Some(runtime) = self.runtime.upgrade() else {
             return;
         };
+        #[cfg(feature = "testing")]
+        self.before_the_take.stand();
         let application = {
             let mut session = runtime.session();
             if !session.state().accepts_input() {
@@ -401,7 +415,37 @@ impl Producer {
             session.set_application(application.name.clone());
             application
         };
+        #[cfg(feature = "testing")]
+        self.before_the_send.stand();
         self.published.send_replace(application);
+    }
+
+    /// Stops the next publication before the publisher takes the session, for this host's own
+    /// tests. Returns the end that says the publisher has arrived there and the end that lets it
+    /// go on; the stop fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn pause_before_the_take(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.before_the_take.arm_blocking()
+    }
+
+    /// Stops the next publication after the publisher has read the facts and written the name, and
+    /// before it tells a receiver, for this host's own tests. Returns the end that says the
+    /// publisher has arrived there and the end that lets it go on; the stop fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn pause_before_the_send(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.before_the_send.arm_blocking()
     }
 }
 
