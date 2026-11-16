@@ -1125,20 +1125,28 @@ impl Drop for MemoryStore {
 /// a migration is available; moving the secrets is an explicit, verified step the host takes, not
 /// something that happens at startup.
 ///
+/// `owner` is the program that keeps the keys. A refusal names it to its person, and tells that
+/// person what to do in the words of the program they run: the daemon's person starts the host
+/// again, the companion's person opens the app again.
+///
 /// # Errors
 ///
 /// Returns [`CryptoError::SecretStore`] when neither store can be opened.
-pub fn open_store(service: &str, fallback_directory: &Path) -> Result<OpenedStore> {
+pub fn open_store(
+    service: &str,
+    fallback_directory: &Path,
+    owner: KeyOwner,
+) -> Result<OpenedStore> {
     if !FILE_FALLBACK_SUPPORTED {
         // There is no fallback on this platform, so there is nothing to record and nothing to
         // choose between: the protected store is the only store.
-        let store = PlatformStore::open(service).map_err(|error| CryptoError::SecretStore {
-            message: format!(
-                "This host keeps its keys in {PLATFORM_STORE_NAME}, which cannot be opened from \
-                 here: {}. Start the host from a session where it opens. No key was made or \
-                 changed.",
-                message_of(&error)
-            ),
+        let store = PlatformStore::open(service).map_err(|error| {
+            refusal(
+                owner,
+                &Refusal::OnlyStore {
+                    error: message_of(&error),
+                },
+            )
         })?;
         return Ok(OpenedStore {
             store: Box::new(store),
@@ -1157,13 +1165,13 @@ pub fn open_store(service: &str, fallback_directory: &Path) -> Result<OpenedStor
         Some(StoreKind::Platform) => {
             // The host's secrets are in the platform store. If it has gone away this is an error:
             // falling back would start from an empty store while the secrets still exist.
-            let store = platform.map_err(|error| CryptoError::SecretStore {
-                message: format!(
-                    "This host keeps its keys in the system credential store, which cannot be \
-                     opened from here: {}. Start the host from a session where that store opens, \
-                     such as your desktop session. No key was made or changed.",
-                    message_of(&error)
-                ),
+            let store = platform.map_err(|error| {
+                refusal(
+                    owner,
+                    &Refusal::RecordedStore {
+                        error: message_of(&error),
+                    },
+                )
             })?;
             Ok(OpenedStore {
                 store: Box::new(store),
@@ -1199,17 +1207,14 @@ pub fn open_store(service: &str, fallback_directory: &Path) -> Result<OpenedStor
                         migration_available: false,
                     })
                 }
-                Err(fallback_error) => Err(CryptoError::SecretStore {
-                    message: format!(
-                        "This host has nowhere to keep its keys. The system credential store \
-                         cannot be opened from here ({}), and the directory {} cannot be used \
-                         ({}). Make that directory usable, or start the host from a session where \
-                         the system credential store opens. No key was made.",
-                        message_of(&platform_error),
-                        fallback_directory.display(),
-                        message_of(&fallback_error)
-                    ),
-                }),
+                Err(fallback_error) => Err(refusal(
+                    owner,
+                    &Refusal::NowhereToKeep {
+                        platform_error: message_of(&platform_error),
+                        directory: fallback_directory.display().to_string(),
+                        directory_error: message_of(&fallback_error),
+                    },
+                )),
             },
         },
     }
@@ -1233,6 +1238,87 @@ fn message_of(error: &CryptoError) -> String {
     }
 }
 
+/// The program that keeps the keys, which a refusal names to its person.
+///
+/// The same door serves the control daemon and the companion, and what a person does after a
+/// refusal is not the same for both: the daemon's person starts the host again, the companion's
+/// person opens the app again. The caller says which it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyOwner {
+    /// The control daemon: the host's own keys.
+    Host,
+    /// The companion, or the client library's own store: a device's keys.
+    Device,
+}
+
+/// Why a store could not be opened, with what the person needs to read.
+enum Refusal {
+    /// The record names the platform store, and it does not open.
+    RecordedStore { error: String },
+    /// No store but the platform store exists here, and it does not open.
+    OnlyStore { error: String },
+    /// Nothing is recorded, the platform store does not open, and the directory cannot be used.
+    NowhereToKeep {
+        platform_error: String,
+        directory: String,
+        directory_error: String,
+    },
+}
+
+/// The refusal a person reads, in the words of the program that keeps the keys.
+///
+/// Each sentence says only what the code knows at that point: where the keys are kept, what could
+/// not be opened and that no key was made, moved or removed by this refusal.
+fn refusal(owner: KeyOwner, why: &Refusal) -> CryptoError {
+    let message = match (owner, why) {
+        (KeyOwner::Host, Refusal::RecordedStore { error }) => format!(
+            "This host keeps its keys in the system credential store, which cannot be opened from \
+             here: {error}. Start the host from a session where that store opens, such as your \
+             desktop session. No key was made or changed."
+        ),
+        (KeyOwner::Device, Refusal::RecordedStore { error }) => format!(
+            "This device keeps its keys in the system credential store, which cannot be opened \
+             from here: {error}. Open the app in a session where that store opens. No key was \
+             made or changed."
+        ),
+        (KeyOwner::Host, Refusal::OnlyStore { error }) => format!(
+            "This host keeps its keys in {PLATFORM_STORE_NAME}, which cannot be opened from here: \
+             {error}. Start the host from a session where it opens. No key was made or changed."
+        ),
+        (KeyOwner::Device, Refusal::OnlyStore { error }) => format!(
+            "This device keeps its keys in {PLATFORM_STORE_NAME}, which cannot be opened from \
+             here: {error}. Open the app in a session where it opens. No key was made or changed."
+        ),
+        (
+            KeyOwner::Host,
+            Refusal::NowhereToKeep {
+                platform_error,
+                directory,
+                directory_error,
+            },
+        ) => format!(
+            "This host has nowhere to keep its keys. The system credential store cannot be opened \
+             from here ({platform_error}), and the directory {directory} cannot be used \
+             ({directory_error}). Make that directory usable, or start the host from a session \
+             where the system credential store opens. No key was made."
+        ),
+        (
+            KeyOwner::Device,
+            Refusal::NowhereToKeep {
+                platform_error,
+                directory,
+                directory_error,
+            },
+        ) => format!(
+            "This device has nowhere to keep its keys. The system credential store cannot be \
+             opened from here ({platform_error}), and the directory {directory} cannot be used \
+             ({directory_error}). Make that directory usable, or open the app in a session where \
+             the system credential store opens. No key was made."
+        ),
+    };
+    CryptoError::SecretStore { message }
+}
+
 /// Which store a host was told to keep its secrets in.
 ///
 /// An installed host takes [`Self::Platform`], and nothing has to say so. A test, a bench or a
@@ -1252,14 +1338,20 @@ pub enum StoreSelection {
 impl StoreSelection {
     /// Opens the store this selection names, for a host whose secrets directory is `directory`.
     ///
+    /// `owner` names the program that keeps the keys, as [`open_store`] takes it. Only the host has
+    /// a command line that names [`Self::File`], so only the host is refused it over a recorded
+    /// platform store, in words that name that option.
+    ///
     /// # Errors
     ///
     /// Returns [`CryptoError::SecretStore`] when the selected store cannot be opened.
-    pub fn open(self, service: &str, directory: &Path) -> Result<OpenedStore> {
+    pub fn open(self, service: &str, directory: &Path, owner: KeyOwner) -> Result<OpenedStore> {
         match self {
-            Self::Platform => open_store(service, directory),
+            Self::Platform => open_store(service, directory, owner),
             Self::File => {
-                refuse_the_directory_over_a_recorded_platform_store(directory)?;
+                if owner == KeyOwner::Host {
+                    refuse_the_directory_over_a_recorded_platform_store(directory)?;
+                }
                 open_store_in(directory)
             }
         }
@@ -1268,10 +1360,10 @@ impl StoreSelection {
 
 /// Refuses the directory store for a host whose record names the platform store.
 ///
-/// The keys of a host that [`open_store`] recorded the platform store for are in that store. The
-/// directory store would find none there and make a new set, which is a new identity for the host,
-/// so the start that names it is refused. The record is written only where there is a choice to
-/// record, so on a platform with no fallback there is no record to read and nothing to refuse.
+/// A host that [`open_store`] recorded the platform store for keeps its keys there, and not in the
+/// directory, so a start that names the directory is refused. The record is written only where
+/// there is a choice to record, so on a platform with no fallback there is no record to read and
+/// nothing to refuse.
 ///
 /// # Errors
 ///
@@ -2497,7 +2589,7 @@ mod tests {
             .set(&SecretName::new("host/x").expect("a name"), b"seed")
             .expect("a write");
         record_kind(&base, StoreKind::FileFallback).expect("a record");
-        let opened = open_store("kalareach-test", &base).expect("a store");
+        let opened = open_store("kalareach-test", &base, KeyOwner::Host).expect("a store");
         assert_eq!(opened.kind, StoreKind::FileFallback);
         assert_eq!(
             opened
@@ -2686,7 +2778,7 @@ mod tests {
                 switch.closes();
                 std::sync::Arc::new(MemoryStore::new())
             };
-            let opened = StoreSelection::Platform.open(SELECTION_SERVICE, &base);
+            let opened = StoreSelection::Platform.open(SELECTION_SERVICE, &base, KeyOwner::Host);
             match answer {
                 Some(kind) => {
                     let opened = opened.unwrap_or_else(|error| panic!("{row}: {error}"));
@@ -2729,7 +2821,7 @@ mod tests {
         let base = scratch_directory("selection-only");
         let store = switch.opens();
         let opened = StoreSelection::Platform
-            .open(SELECTION_SERVICE, &base)
+            .open(SELECTION_SERVICE, &base, KeyOwner::Host)
             .expect("the platform store");
         assert_eq!(opened.kind, StoreKind::Platform);
         opened
@@ -2739,10 +2831,19 @@ mod tests {
         assert!(!store.is_empty(), "the item is in the platform's store");
 
         switch.closes();
-        let refused = StoreSelection::Platform.open(SELECTION_SERVICE, &base);
-        let refusal = refused.expect_err("no other store is taken");
-        assert_refusal_says_what_it_knows(&refusal.to_string());
-        assert!(!base.exists(), "nothing is made on disk");
+        for owner in [KeyOwner::Host, KeyOwner::Device] {
+            let refusal = StoreSelection::Platform
+                .open(SELECTION_SERVICE, &base, owner)
+                .expect_err("no other store is taken")
+                .to_string();
+            assert_refusal_says_what_it_knows(&refusal);
+            assert_refusal_is_said_to(owner, &refusal);
+            assert!(
+                refusal.contains(PLATFORM_STORE_NAME),
+                "the store is named: {refusal}"
+            );
+            assert!(!base.exists(), "nothing is made on disk");
+        }
     }
 
     /// A refusal names the store's own reason and says that no key was made, which is what the
@@ -2758,10 +2859,28 @@ mod tests {
         );
     }
 
+    /// A refusal names the program that keeps the keys and tells its person what to do in that
+    /// program's words: the host's person starts the host, the device's person opens the app.
+    fn assert_refusal_is_said_to(owner: KeyOwner, refusal: &str) {
+        match owner {
+            KeyOwner::Host => {
+                assert!(refusal.contains("This host "), "{refusal}");
+                assert!(refusal.contains("the host from a session"), "{refusal}");
+                assert!(!refusal.contains("device"), "{refusal}");
+                assert!(!refusal.contains("the app"), "{refusal}");
+            }
+            KeyOwner::Device => {
+                assert!(refusal.contains("This device "), "{refusal}");
+                assert!(refusal.contains("the app in a session"), "{refusal}");
+                assert!(!refusal.contains("host"), "{refusal}");
+            }
+        }
+    }
+
     /// KR-REQ-10.47: a host whose record names the platform store is not started with the
-    /// directory store: the keys are not in the directory, so it would make a new set. The start
-    /// is refused before any key is made, and a record that names the directory, or none, is
-    /// served by the directory as before.
+    /// directory store: the keys are not in the directory. The start is refused before any key is
+    /// made, and a record that names the directory, or none, is served by the directory as
+    /// before.
     #[cfg(all(
         unix,
         not(any(target_os = "macos", target_os = "ios", target_os = "android"))
@@ -2773,7 +2892,7 @@ mod tests {
         record_kind(&base, StoreKind::Platform).expect("a record");
 
         let refusal = StoreSelection::File
-            .open(SELECTION_SERVICE, &base)
+            .open(SELECTION_SERVICE, &base, KeyOwner::Host)
             .expect_err("the directory is not this host's store")
             .to_string();
         assert!(refusal.contains("No key was made or changed"), "{refusal}");
@@ -2793,7 +2912,7 @@ mod tests {
                 record_kind(&base, kind).expect("a record");
             }
             let opened = StoreSelection::File
-                .open(SELECTION_SERVICE, &base)
+                .open(SELECTION_SERVICE, &base, KeyOwner::Host)
                 .expect("the directory serves a named run");
             opened.store.set(&name, b"seed").expect("a write");
             let _ = std::fs::remove_dir_all(&base);
@@ -2817,14 +2936,49 @@ mod tests {
         std::os::unix::fs::symlink(&target, &base).expect("a link in the directory's place");
         switch.closes();
 
-        let refusal = StoreSelection::Platform
-            .open(SELECTION_SERVICE, &base)
-            .expect_err("a directory that is a link is not used")
-            .to_string();
-        assert!(refusal.contains(&base.display().to_string()), "{refusal}");
-        assert_refusal_says_what_it_knows(&refusal);
-        assert!(!fallback_holds_secrets(&target).expect("a read"));
+        for owner in [KeyOwner::Host, KeyOwner::Device] {
+            let refusal = StoreSelection::Platform
+                .open(SELECTION_SERVICE, &base, owner)
+                .expect_err("a directory that is a link is not used")
+                .to_string();
+            assert!(refusal.contains(&base.display().to_string()), "{refusal}");
+            assert!(
+                refusal.contains("has nowhere to keep its keys"),
+                "{refusal}"
+            );
+            assert_refusal_says_what_it_knows(&refusal);
+            assert_refusal_is_said_to(
+                owner,
+                &refusal.replace(&base.display().to_string(), "<directory>"),
+            );
+            assert!(!fallback_holds_secrets(&target).expect("a read"));
+        }
         let _ = std::fs::remove_file(&base);
         let _ = std::fs::remove_dir_all(&target);
+    }
+
+    /// KR-REQ-10.47: a record that names the platform store, with the platform store closed,
+    /// refuses in the words of the program that keeps the keys, and makes no key.
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+    ))]
+    #[test]
+    fn a_recorded_platform_store_that_is_closed_is_refused_in_the_owners_words() {
+        let switch = stand_in::Switch::take(SELECTION_SERVICE);
+        switch.closes();
+        for owner in [KeyOwner::Host, KeyOwner::Device] {
+            let base = scratch_directory("selection-recorded-closed");
+            record_kind(&base, StoreKind::Platform).expect("a record");
+            let refusal = StoreSelection::Platform
+                .open(SELECTION_SERVICE, &base, owner)
+                .expect_err("the recorded store is not open")
+                .to_string();
+            assert!(refusal.contains("keeps its keys in the system credential store"));
+            assert_refusal_says_what_it_knows(&refusal);
+            assert_refusal_is_said_to(owner, &refusal);
+            assert!(!fallback_holds_secrets(&base).expect("a read"));
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 }

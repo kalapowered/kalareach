@@ -16,7 +16,7 @@ use std::sync::Arc;
 use kr_controller::service::net::device_key_scope;
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_crypto::keys::DeviceKeys;
-use kr_crypto::store::{SecretStore, StoreSelection, load_device_keys, stand_in};
+use kr_crypto::store::{KeyOwner, SecretStore, StoreSelection, load_device_keys, stand_in};
 use kr_ipc::verify::{CONTROLLER_SECRET_SERVICE, ControllerIdentity};
 use kr_pairing::host::HostIdentity;
 use kr_protocol::hostinfo::configuration::ConfigurationDocument;
@@ -269,7 +269,7 @@ async fn start_once(
         environment_id,
         identity: Box::new(move || {
             let store = selection
-                .open(CONTROLLER_SECRET_SERVICE, &secrets)
+                .open(CONTROLLER_SECRET_SERVICE, &secrets, KeyOwner::Host)
                 .map_err(|error| {
                     kr_controller::ControllerError::NotConfigured(error.to_string())
                 })?;

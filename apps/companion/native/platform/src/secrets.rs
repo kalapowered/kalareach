@@ -99,8 +99,12 @@ pub fn open<R: Runtime>(app: &AppHandle<R>) -> Result<Arc<dyn SecretStore>, Plat
             .app_data_dir()
             .map_err(|error| PlatformError::new(format!("no application data directory: {error}")))?
             .join("secrets");
-        let opened = kr_crypto::store::open_store(STORE_NAME, &directory)
-            .map_err(|error| PlatformError::new(error.to_string()))?;
+        let opened = kr_crypto::store::open_store(
+            STORE_NAME,
+            &directory,
+            kr_crypto::store::KeyOwner::Device,
+        )
+        .map_err(|error| PlatformError::new(error.to_string()))?;
         Ok(Arc::from(opened.store))
     }
     #[cfg(target_os = "ios")]

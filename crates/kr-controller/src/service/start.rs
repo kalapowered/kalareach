@@ -746,6 +746,7 @@ impl Controller {
             .open(
                 kr_ipc::verify::CONTROLLER_SECRET_SERVICE,
                 &setup.paths.secrets_dir(),
+                kr_crypto::store::KeyOwner::Host,
             )
             .map_err(ControllerError::registry)?;
         let secret_store: Arc<dyn kr_crypto::store::SecretStore> = Arc::from(opened_store.store);
