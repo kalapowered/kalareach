@@ -154,6 +154,14 @@ impl Landing {
         }
     }
 
+    /// Where this host's own tests stop a record before its transaction begins.
+    #[cfg(feature = "testing")]
+    pub(crate) fn waits_before_the_record_begins(&self) {
+        if let Some(daemon) = &self.daemon {
+            daemon.before_the_record_begins.wait();
+        }
+    }
+
     /// The copy of the held bound's cell that the question compares. It is taken after the feed's
     /// locked ask and before the question: loading a cell can allocate, and the question after it
     /// allocates nothing.

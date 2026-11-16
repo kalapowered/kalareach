@@ -1329,7 +1329,7 @@ mod a_repeat_the_owner_authority_answers {
     }
 
     fn local() -> Caller {
-        Caller::local(ActorId::new("local:test").expect("a principal"))
+        Caller::local(ActorId::new("local:test").expect("a principal")).landed_for_ever()
     }
 
     /// KR-REQ-09.09: the repeat of a request for a confirmation is given the challenge the first was
@@ -1347,12 +1347,12 @@ mod a_repeat_the_owner_authority_answers {
 
         let performed = AtomicBool::new(false);
         let first = pairing
-            .request_confirmation(&caller, &params, action, &|| Ok(()), &performed)
+            .request_confirmation(&caller, &params, action, &performed)
             .expect("the request is answered with a challenge");
         assert!(!performed.load(Ordering::Acquire));
         let copied = AtomicBool::new(false);
         let again = pairing
-            .request_confirmation(&caller, &params, action, &|| Ok(()), &copied)
+            .request_confirmation(&caller, &params, action, &copied)
             .expect("the repeat is answered");
         assert_eq!(again, first);
         assert!(

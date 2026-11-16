@@ -786,7 +786,6 @@ impl OwnerAuthority {
         caller: &Caller,
         resolved: Resolved,
         action: (ActionId, Digest256),
-        admission: &dyn Fn() -> Result<()>,
         copied: &AtomicBool,
     ) -> Result<OwnerConfirmationRequestResult> {
         self.require_owner(caller)?;
@@ -819,7 +818,15 @@ impl OwnerAuthority {
             self.endpoint(),
         )
         .map_err(refusal)?;
-        // The admission is asked inside the transaction that records the request, after every wait
+        // The caller's scope as the door decides it now, with the bound of the local owner's lease
+        // it was decided under: the lease the door found can end in the waits before this, and the
+        // policy's lock is taken here, outside the transaction that records the request. The
+        // refusal is the door's own.
+        let now = caller.decided_now();
+        if !now.may_confirm_display(&resolved.display) {
+            return Err(now.refusal_to_confirm());
+        }
+        // The standing is asked inside the transaction that records the request, after every wait
         // before it; nothing is issued unless that record is written.
         let recorded = self.rows.record_requested(
             &PairingAction {
@@ -828,7 +835,8 @@ impl OwnerAuthority {
                 digest: action.1,
                 subject: ActionSubject::Requested(Box::new(request.clone())),
             },
-            admission,
+            &now,
+            &resolved.display,
         )?;
         if let Some(request) = recorded {
             copied.store(true, Ordering::Release);
@@ -1403,7 +1411,6 @@ impl OwnerAuthority {
         &self,
         caller: &Caller,
         action: (ActionId, Digest256),
-        admission: &dyn Fn() -> Result<()>,
         copied: &AtomicBool,
     ) -> Result<OwnerConfirmationRequestResult> {
         self.request(
@@ -1417,7 +1424,6 @@ impl OwnerAuthority {
                 bootstrap: true,
             },
             action,
-            admission,
             copied,
         )
     }

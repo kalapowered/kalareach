@@ -45,6 +45,7 @@ use kr_pairing::platform::{
     TransitionOutcome,
 };
 use kr_protocol::actor::ActorIngress;
+use kr_protocol::confirmation::ConfirmationDisplay;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::grant::Grant;
 use kr_protocol::ids::{
@@ -64,7 +65,9 @@ use serde::{Deserialize, Serialize};
 
 use super::devices::{DeviceDirectory, DeviceRecord, insert_record, unreadable_row};
 use super::lifetimes::GrantLifetimes;
+use super::owner::Caller;
 use crate::error::{ControllerError, Result};
+use crate::service::footing::{Lapse, LeasedLapse};
 
 /// Creates the pairing tables, and records an owner a host upgraded in place already had.
 ///
@@ -690,25 +693,57 @@ impl InvitationRows {
     /// Returns the challenge already on record when the same action and payload recorded one
     /// first: that is the challenge this action is owed, and the one just made is not issued.
     ///
+    /// The record is written in one transaction, in this order: the lookup of the action; the
+    /// authority feed's refusal, asked where it takes its locks; the copy of the bound of the
+    /// local owner's lease that `caller` was decided under; the footing's question, with the copied
+    /// bound; where that bound ended or moved, the subject decided again under the scope a caller
+    /// is limited to once no lease serves it; the feed's refusal asked again with no lock; and the
+    /// write. The question reads atomics and clocks alone, and the write follows it with nothing
+    /// allocated or awaited between them: what the write needs is prepared before the transaction.
+    ///
     /// # Errors
     ///
-    /// Returns the admission's refusal, `ID_CONFLICT` for an identifier recorded with another
-    /// payload, and a registry error when the row cannot be written.
+    /// Returns the refusal of a caller no door landed, of the feed, of the footing and of the
+    /// scope, `ID_CONFLICT` for an identifier recorded with another payload, and a registry error
+    /// when the row cannot be written.
     pub fn record_requested(
         &self,
         action: &PairingAction,
-        admission: &dyn Fn() -> Result<()>,
+        caller: &Caller,
+        display: &ConfirmationDisplay,
     ) -> Result<Option<OwnerConfirmationRequest>> {
+        let landing = caller.landing()?;
+        let scope = caller.scope();
+        let challenge = challenge_of(action)?;
+        #[cfg(feature = "testing")]
+        landing.waits_before_the_record_begins();
         self.directory.transaction(|transaction| {
-            admission()?;
-            match claim_action(transaction, action)? {
-                None => Ok(None),
+            match lookup_action(transaction, action)? {
+                None => {}
                 Some(PairingAction {
                     subject: ActionSubject::Requested(request),
                     ..
-                }) => Ok(Some(*request)),
-                Some(_) => Err(another_subject()),
+                }) => return Ok(Some(*request)),
+                Some(_) => return Err(another_subject()),
             }
+            let kept = landing.asks_the_feed()?;
+            let copied = landing.copies_the_bound();
+            match landing.asks(&copied) {
+                Ok(()) => {}
+                // The lease ended in the waits before the question, or ended and was established
+                // again: what the caller asked is decided again under the scope that no lease
+                // serves.
+                Err(LeasedLapse::BoundMoved | LeasedLapse::Lapse(Lapse::LeaseEnded)) => {
+                    let closed = scope.closed();
+                    if !closed.may_confirm_display(display) {
+                        return Err(closed.refusal());
+                    }
+                }
+                Err(LeasedLapse::Lapse(lapse)) => return Err(lapse.refusal()),
+            }
+            landing.feed_still_clear(&kept)?;
+            insert_action(transaction, action, challenge.as_deref())?;
+            Ok(None)
         })
     }
 
@@ -1174,15 +1209,49 @@ fn commit_pairing(
 /// another payload, for this pairing method or any other, is refused as `ID_CONFLICT`, which rolls
 /// the caller's transaction back with everything else it wrote.
 fn claim_action(transaction: &Connection, action: &PairingAction) -> Result<Option<PairingAction>> {
-    if let Some(raw) = read_action_row(transaction, &action.actor, action.action_id)
-        .map_err(ControllerError::registry)?
-    {
-        let recorded = decode_action(&action.actor, action.action_id, raw)?;
-        if recorded.digest != action.digest {
-            return Err(id_conflict(action.action_id));
-        }
+    if let Some(recorded) = lookup_action(transaction, action)? {
         return Ok(Some(recorded));
     }
+    insert_action(transaction, action, challenge_of(action)?.as_deref())?;
+    Ok(None)
+}
+
+/// Reads the record of `action`'s identifier inside the caller's transaction.
+///
+/// Returns the record already there, when it is for the same payload. An identifier recorded with
+/// another payload, for this pairing method or any other, is refused as `ID_CONFLICT`.
+fn lookup_action(
+    transaction: &Connection,
+    action: &PairingAction,
+) -> Result<Option<PairingAction>> {
+    let Some(raw) = read_action_row(transaction, &action.actor, action.action_id)
+        .map_err(ControllerError::registry)?
+    else {
+        return Ok(None);
+    };
+    let recorded = decode_action(&action.actor, action.action_id, raw)?;
+    if recorded.digest != action.digest {
+        return Err(id_conflict(action.action_id));
+    }
+    Ok(Some(recorded))
+}
+
+/// The challenge a request's record keeps, encoded: prepared before the transaction that writes
+/// it, so that nothing is encoded between the question that guards the write and the write.
+fn challenge_of(action: &PairingAction) -> Result<Option<Vec<u8>>> {
+    match &action.subject {
+        ActionSubject::Requested(request) => encode(request.as_ref()).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// Writes the record of `action` inside the caller's transaction, with the challenge
+/// [`challenge_of`] prepared for it.
+fn insert_action(
+    transaction: &Connection,
+    action: &PairingAction,
+    challenge: Option<&[u8]>,
+) -> Result<()> {
     transaction
         .execute(
             "INSERT INTO pairing_actions
@@ -1194,15 +1263,12 @@ fn claim_action(transaction: &Connection, action: &PairingAction) -> Result<Opti
                 action.subject.method().as_str(),
                 action.digest.as_bytes().as_slice(),
                 action.subject.identity().as_bytes().as_slice(),
-                match &action.subject {
-                    ActionSubject::Requested(request) => Some(encode(request.as_ref())?),
-                    _ => None,
-                },
+                challenge,
                 to_sql(kr_ipc::now_ms().get()),
             ],
         )
         .map_err(ControllerError::registry)?;
-    Ok(None)
+    Ok(())
 }
 
 /// Records the action a write is the effect of, inside that write's transaction.

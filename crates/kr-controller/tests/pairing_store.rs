@@ -14,6 +14,7 @@ use kr_controller::service::net::invitations::{
     device_record, prepare,
 };
 use kr_controller::service::net::lifetimes::GrantLifetimes;
+use kr_controller::service::net::owner::Caller;
 use kr_crypto::keys::DeviceKeys;
 use kr_ipc::clock::ManualSharedClock;
 use kr_pairing::PairingError;
@@ -32,6 +33,7 @@ use kr_pairing::platform::{
     TestClientBudgetStore, TestClock, TestLivePeer, TestRendezvousHost,
 };
 use kr_protocol::actor::ActorIngress;
+use kr_protocol::confirmation::ConfirmationDisplay;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope, SessionSelector};
 use kr_protocol::ids::{
@@ -1015,7 +1017,8 @@ fn an_action_identifier_is_spent_on_one_payload_across_the_pairing_methods() {
                     digest: other,
                     subject: ActionSubject::Requested(Box::new(asked)),
                 },
-                &|| Ok(()),
+                &Caller::local(actor.clone()).landed_for_ever(),
+                &ConfirmationDisplay::EstablishClock,
             )
             .map(|_| ())
         ),
@@ -1077,14 +1080,23 @@ fn an_action_identifier_is_spent_on_one_payload_across_the_pairing_methods() {
         digest,
         subject: ActionSubject::Requested(Box::new(request)),
     };
+    let caller = Caller::local(actor.clone()).landed_for_ever();
     assert_eq!(
-        rows.record_requested(&asking(first.clone()), &|| Ok(()))
-            .expect("recorded"),
+        rows.record_requested(
+            &asking(first.clone()),
+            &caller,
+            &ConfirmationDisplay::EstablishClock
+        )
+        .expect("recorded"),
         None
     );
     assert_eq!(
-        rows.record_requested(&asking(challenge(14)), &|| Ok(()))
-            .expect("recorded"),
+        rows.record_requested(
+            &asking(challenge(14)),
+            &caller,
+            &ConfirmationDisplay::EstablishClock
+        )
+        .expect("recorded"),
         Some(first)
     );
 
