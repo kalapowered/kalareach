@@ -4798,9 +4798,12 @@ impl Session {
                         // The state reads as off: privacy mode was never on here, or its removal
                         // finished before it was turned off, so what this session holds was never
                         // private. The history and the receipts stay whole, retention starts again
-                        // as it does when privacy mode is turned off, and the fence falls.
+                        // as it does when privacy mode is turned off, and the fence falls. Capture
+                        // of the description's facts, which stopped at the open for the same
+                        // reason, starts again into a record of its own.
                         self.privacy_cleanup.history = None;
                         self.privacy_cleanup.receipts = None;
+                        self.description_facts.release(self.privacy.generation());
                         self.history.resume_retaining();
                         self.history.set_discard_owed(false);
                         self.settle_receipt_fence();
