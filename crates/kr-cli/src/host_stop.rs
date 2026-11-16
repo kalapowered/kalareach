@@ -3229,7 +3229,8 @@ mod tests {
     }
 
     /// The failures of this side's own checks, which no daemon wrote and no daemon's end causes,
-    /// among them the checks of the peer's credentials that are made before any hello.
+    /// among them the checks of the peer's credentials that are made before any hello and the
+    /// failure to read this side's own clock-floor identity.
     fn own_faults() -> Vec<kr_ipc::IpcError> {
         vec![
             kr_ipc::IpcError::PeerRejected {
@@ -3244,6 +3245,10 @@ mod tests {
             },
             a_fault_of_the_socket(),
             kr_ipc::IpcError::NotInLevel("a field".to_owned()),
+            kr_ipc::IpcError::IdentityUnavailable {
+                what: "a clock floor identity",
+                detail: "no identity".to_owned(),
+            },
         ]
     }
 
@@ -3336,6 +3341,56 @@ mod tests {
         }
     }
 
+    /// Where the command ends a request that could not be made by what the failure came to, this
+    /// side's own fault ends with exit 3 and its own words, whole. It never ends with the silence
+    /// sentence, which is for a daemon that closed the connection and was not shown to have ended,
+    /// and it says no word that a host still answers.
+    #[tokio::test(start_paused = true)]
+    async fn an_own_fault_at_an_unmade_request_ends_with_exit_3_and_its_own_words() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let paths = temp.environment();
+        let id = paths.environment_id();
+        let environment = KnownEnvironment {
+            environment_id: id,
+            paths,
+        };
+        let earlier = Earlier::read(&environment.paths);
+        let none = Facts::none(Vec::new());
+        let process = asked_process();
+        for fault in own_faults() {
+            let supplied = Supplied::new()
+                .process(vec![at_once(ProcessState::Ended)])
+                .look(vec![at_once(Endpoint::Nobody)]);
+            let before = failed_before_the_request(
+                &supplied,
+                supplied.connection(),
+                Some(&process),
+                &fault,
+                id,
+                the_deadline(),
+            )
+            .await;
+            match unmade_ended(before, &fault, id, &environment, &none, true, &earlier) {
+                Completion::Reported(error) => {
+                    assert_eq!(error.exit_code(), 3, "{fault}");
+                    let said = error.to_string();
+                    assert_eq!(
+                        said,
+                        format!(
+                            "kr host stop could not make its request for the control daemon of \
+                             environment {id}: {}. Nothing was sent, and nothing was stopped.",
+                            Shown::ipc(&fault)
+                        ),
+                        "{fault}"
+                    );
+                    assert!(!said.contains("does not answer"), "{said}");
+                    assert!(!said.contains("still answers"), "{said}");
+                }
+                _ => panic!("this side's own fault is a failure that the command has reported"),
+            }
+        }
+    }
+
     /// A lock that is held and a process that cannot be read (no identity, as on Windows) is a
     /// daemon that is not shown to have ended: the silence sentence, exit 1, after the whole bound.
     #[tokio::test(start_paused = true)]
@@ -3400,6 +3455,7 @@ mod tests {
             Some(Err(kr_ipc::IpcError::UnexpectedMessage(
                 "a frame of another kind",
             ))),
+            Some(Err(a_fault_of_the_socket())),
         ] {
             match after_the_probe(id, a_refusal(), probe) {
                 CliError::Refused(refusal) => {
