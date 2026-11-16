@@ -1,5 +1,6 @@
 //! The device's one endpoint: its relays and lookups come from the hosts it dials, one host at a
-//! time, and no request for one host reaches another's connection.
+//! time, and no rule of the endpoint refuses, closes or restarts one host's connection on account
+//! of a request for another.
 //!
 //! Every relay is a real `iroh-relay` server in this process and every host and device is a real
 //! iroh endpoint on the loopback. Every wait ends on a state that the case names: an answer, a

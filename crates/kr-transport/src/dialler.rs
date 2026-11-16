@@ -1,9 +1,17 @@
 //! The device's one endpoint, and the hosts it dials through it.
 //!
-//! A device that dials several hosts keeps one endpoint for all of them. No request for one host
-//! can then refuse, close or restart the connection of another, which separate endpoints that
-//! share a relay cannot promise. The endpoint is built with no relay and no discovery service. It
-//! takes them one host at a time, when the device first dials that host:
+//! A device that dials several hosts keeps one endpoint for all of them. No rule of this endpoint
+//! refuses, closes or restarts the connection of one host on account of a request for another.
+//! Separate endpoints of one identity that share a relay cannot promise that, because the relay
+//! deactivates the older connection of an identity that connects again.
+//!
+//! The transport library limits that, at the release that core takes: its one relay actor serves
+//! every relay of an endpoint and reads a datagram to send only while no send of its own is
+//! pending, so a relay that stops reading can hold the sends to every relay until the library's own
+//! time-outs end the hold.
+//!
+//! The endpoint is built with no relay and no discovery service. It takes them one host at a time,
+//! when the device first dials that host:
 //!
 //! * a host's address lookups, its Pkarr resolver and its DNS origin, are registered under the
 //!   host's endpoint identity in one dispatcher, and a lookup is asked about that identity and no
