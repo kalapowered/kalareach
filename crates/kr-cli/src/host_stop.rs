@@ -992,20 +992,7 @@ async fn stop_the_daemon(
                 (Knows::MaybeAsked, Some(failure)) => Some(failure),
                 _ => None,
             };
-            let message = match why {
-                Why::Held => still_held(&environment.paths, id),
-                Why::Unlooked(why) => unlooked(id, not_known, &why),
-                Why::Running => {
-                    let what = match not_known {
-                        Some(failure) => shown!(
-                            "did not show whether it took the stop ({}), and it has not ended",
-                            *failure
-                        ),
-                        None => Shown::said("was told to stop and has not ended"),
-                    };
-                    not_ended(&environment.paths, id, &what, old)
-                }
-            };
+            let message = not_ended_said(why, not_known, &environment.paths, id, old);
             failed(
                 CliError::Unfinished {
                     code: ErrorCode::EnvironmentUnavailable,
@@ -1015,6 +1002,57 @@ async fn stop_the_daemon(
                 json,
             )
         }
+    }
+}
+
+/// What the command says where the wait for the end gave up at its bound with the request written:
+/// that the daemon has not ended only where the last round shows a sign of life, and otherwise what
+/// it knows.
+fn not_ended_said(
+    why: Why,
+    not_known: Option<&Shown>,
+    environment: &EnvironmentPaths,
+    id: EnvironmentId,
+    old: Option<&ProcessStartIdentity>,
+) -> Shown {
+    match why {
+        Why::Held => still_held(environment, id),
+        Why::Unlooked(why) => unlooked(id, not_known, &why),
+        Why::NotShown => not_shown(id, not_known),
+        Why::Running => {
+            let what = match not_known {
+                Some(failure) => shown!(
+                    "did not show whether it took the stop ({}), and it has not ended",
+                    *failure
+                ),
+                None => Shown::said("was told to stop and has not ended"),
+            };
+            not_ended(environment, id, &what, old)
+        }
+    }
+}
+
+/// The words where the lock was free and the last look showed neither that the daemon runs nor
+/// that it had gone.
+fn not_shown(id: EnvironmentId, not_known: Option<&Shown>) -> Shown {
+    match not_known {
+        None => shown!(
+            "The control daemon for environment {} was told to stop. After {} seconds the lock was \
+             free, and the last look at the endpoint showed neither that the daemon still runs nor \
+             that it had gone, so the command could not confirm the end. Run kr host stop again in \
+             a moment; it looks again.",
+            id,
+            END_BOUND.as_secs()
+        ),
+        Some(failure) => shown!(
+            "The control daemon for environment {} did not show whether it took the stop ({}). \
+             After {} seconds the lock was free, and the last look at the endpoint showed neither \
+             that the daemon still runs nor that it had gone, so the command could not confirm the \
+             end. Run kr host stop again in a moment; it looks again.",
+            id,
+            *failure,
+            END_BOUND.as_secs()
+        ),
     }
 }
 
@@ -1449,8 +1487,13 @@ fn unlooked(id: EnvironmentId, not_known: Option<&Shown>, why: &Shown) -> Shown 
 
 /// Why the daemon had not ended when the wait did.
 enum Why {
-    /// Its process runs, or nothing shows that it has gone: the daemon is told to stop and goes on.
+    /// Its process runs, a lock is held or the last look showed the daemon, or nothing shows that
+    /// it has gone where its process was read: the daemon is told to stop and goes on.
     Running,
+    /// No sign of life in the last round and no sign of an end: with no process identity the lock
+    /// was free and the last look showed neither the daemon nor its end. The command cannot say
+    /// that the daemon has not ended.
+    NotShown,
     /// Its process has gone and something holds the environment that nothing shows to be a daemon.
     Held,
     /// The lock could not be looked at.
@@ -1528,6 +1571,9 @@ async fn wait_for_the_end(
         let unlooked = held.as_ref().err().cloned();
         let process = old.map(|old| operations.process_state(old));
         let old_gone = matches!(process, Some(ProcessState::Ended));
+        // What this round shows of the daemon: the lock's reading and the look are this round's.
+        let lock_free = matches!(held, Ok(false));
+        let mut last_look = None;
         let seen = match (held, process) {
             (Ok(false), Some(ProcessState::Ended)) => Some(End::Gone),
             (Ok(true), Some(ProcessState::Ended)) => successor_of(operations, old, left())
@@ -1535,11 +1581,15 @@ async fn wait_for_the_end(
                 .map(End::Successor),
             // The process runs, or the system did not say: the daemon has not ended.
             (_, Some(ProcessState::Running | ProcessState::Unknown { .. })) => None,
-            (Ok(false), None) => match operations.look(left()).await {
-                Endpoint::Nobody => Some(End::Gone),
-                Endpoint::Another => Some(End::Successor(operations.named_daemon())),
-                Endpoint::Same(_) | Endpoint::Unclear => None,
-            },
+            (Ok(false), None) => {
+                let look = operations.look(left()).await;
+                last_look = Some(look);
+                match look {
+                    Endpoint::Nobody => Some(End::Gone),
+                    Endpoint::Another => Some(End::Successor(operations.named_daemon())),
+                    Endpoint::Same(_) | Endpoint::Unclear => None,
+                }
+            }
             (Ok(true), None) => successor_of(operations, None, left())
                 .await
                 .map(End::Successor),
@@ -1552,6 +1602,13 @@ async fn wait_for_the_end(
             return End::NotEnded(match (unlooked, old_gone) {
                 (Some(why), _) if old.is_none() || old_gone => Why::Unlooked(why),
                 (None, true) => Why::Held,
+                // The lock is free and the last look did not show the daemon: no sign of life.
+                _ if old.is_none()
+                    && lock_free
+                    && !matches!(last_look, Some(Endpoint::Same(_))) =>
+                {
+                    Why::NotShown
+                }
                 _ => Why::Running,
             });
         }
@@ -1931,8 +1988,8 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(waited, End::NotEnded(Why::Running)),
-            "a free lock and a listener that does not answer is not an end"
+            matches!(waited, End::NotEnded(Why::NotShown)),
+            "a free lock and a listener that does not answer is not an end, and no sign of life"
         );
         drop(listener);
 
@@ -2321,6 +2378,7 @@ mod tests {
             End::Gone => "gone".to_owned(),
             End::Successor(named) => format!("successor {named:?}"),
             End::NotEnded(Why::Running) => "not ended, running".to_owned(),
+            End::NotEnded(Why::NotShown) => "not ended, not shown".to_owned(),
             End::NotEnded(Why::Held) => "not ended, held".to_owned(),
             End::NotEnded(Why::Unlooked(_)) => "not ended, not looked at".to_owned(),
         }
@@ -2502,7 +2560,7 @@ mod tests {
         let supplied =
             Supplied::new().held(vec![after(millis(29_990), Ok(false)), at_once(Ok(false))]);
         let ended = wait_for_the_end(&supplied, None, END_BOUND).await;
-        assert_eq!(said(&ended), "not ended, running");
+        assert_eq!(said(&ended), "not ended, not shown");
         let calls = supplied.calls();
         assert_eq!(
             calls,
@@ -2525,7 +2583,7 @@ mod tests {
             .held(vec![whole(Ok(false))])
             .look(vec![whole(Endpoint::Unclear)]);
         let ended = wait_for_the_end(&supplied, None, END_BOUND).await;
-        assert_eq!(said(&ended), "not ended, running");
+        assert_eq!(said(&ended), "not ended, not shown");
         assert_eq!(
             supplied.calls(),
             vec![
@@ -2640,7 +2698,7 @@ mod tests {
             (Ok(false), Endpoint::Nobody, "gone"),
             (Ok(false), Endpoint::Another, "successor None"),
             (Ok(false), Endpoint::Same(an_answer()), "not ended, running"),
-            (Ok(false), Endpoint::Unclear, "not ended, running"),
+            (Ok(false), Endpoint::Unclear, "not ended, not shown"),
             (Ok(true), Endpoint::Another, "successor None"),
             (Ok(true), Endpoint::Nobody, "not ended, running"),
             (Ok(true), Endpoint::Same(an_answer()), "not ended, running"),
@@ -3395,6 +3453,89 @@ mod tests {
                 _ => panic!("this side's own fault is a failure that the command has reported"),
             }
         }
+    }
+
+    /// At the wait's bound with the request written, the command says that the daemon has not ended
+    /// only with a sign of life in the last round. With the lock free, no process identity and the
+    /// last look unclear (an earlier look that showed the same daemon is no sign at the bound), it
+    /// says what it knows and not that the daemon runs: exit 1, the whole text, for a daemon that was
+    /// told and for one whose answer was not shown.
+    #[tokio::test(start_paused = true)]
+    async fn a_free_lock_and_an_unclear_last_look_do_not_say_that_the_daemon_has_not_ended() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let paths = temp.environment();
+        let id = paths.environment_id();
+        let failure = Shown::said("the connection was lost");
+        for (early_same, not_known, expected) in [
+            (
+                false,
+                None,
+                format!(
+                    "The control daemon for environment {id} was told to stop. After 30 seconds \
+                     the lock was free, and the last look at the endpoint showed neither that the \
+                     daemon still runs nor that it had gone, so the command could not confirm the \
+                     end. Run kr host stop again in a moment; it looks again."
+                ),
+            ),
+            (
+                true,
+                Some(&failure),
+                format!(
+                    "The control daemon for environment {id} did not show whether it took the stop \
+                     (the connection was lost). After 30 seconds the lock was free, and the last \
+                     look at the endpoint showed neither that the daemon still runs nor that it \
+                     had gone, so the command could not confirm the end. Run kr host stop again in \
+                     a moment; it looks again."
+                ),
+            ),
+        ] {
+            let looks = if early_same {
+                vec![
+                    at_once(Endpoint::Same(an_answer())),
+                    at_once(Endpoint::Unclear),
+                ]
+            } else {
+                vec![at_once(Endpoint::Unclear)]
+            };
+            let supplied = Supplied::new().held(vec![at_once(Ok(false))]).look(looks);
+            let End::NotEnded(why) = wait_for_the_end(&supplied, None, END_BOUND).await else {
+                panic!("the daemon is not shown to have ended");
+            };
+            assert!(
+                matches!(why, Why::NotShown),
+                "early look of the daemon {early_same}"
+            );
+            let error = CliError::Unfinished {
+                code: ErrorCode::EnvironmentUnavailable,
+                message: not_ended_said(why, not_known, &paths, id, None),
+            };
+            assert_eq!(error.exit_code(), 1);
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    /// The last look that shows the same daemon, with the lock free, is a sign of life: the daemon
+    /// has not ended, and the words say so.
+    #[tokio::test(start_paused = true)]
+    async fn a_last_look_of_the_same_daemon_with_a_free_lock_says_that_it_has_not_ended() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let paths = temp.environment();
+        let id = paths.environment_id();
+        let supplied = Supplied::new().held(vec![at_once(Ok(false))]).look(vec![
+            at_once(Endpoint::Unclear),
+            at_once(Endpoint::Same(an_answer())),
+        ]);
+        let End::NotEnded(why) = wait_for_the_end(&supplied, None, END_BOUND).await else {
+            panic!("the daemon still answers");
+        };
+        assert!(matches!(why, Why::Running));
+        let said = not_ended_said(why, None, &paths, id, None).to_string();
+        assert!(
+            said.starts_with(&format!(
+                "The control daemon for environment {id} was told to stop and has not ended after 30 seconds."
+            )),
+            "{said}"
+        );
     }
 
     /// A lock that is held and a process that cannot be read (no identity, as on Windows) is a
