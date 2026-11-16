@@ -26,6 +26,7 @@ import {
   choiceWithRate,
   closureWords,
   endedWords,
+  unavailableWords,
   owedWords,
   problemWords,
   requestedSeconds,
@@ -800,7 +801,7 @@ export function VoiceRoute({
               return
             }
             if ('unavailable' in outcome) {
-              setNotice(outcome.unavailable.message)
+              setNotice(unavailableWords(outcome.unavailable))
               return
             }
             if ('creation_unknown' in outcome) {

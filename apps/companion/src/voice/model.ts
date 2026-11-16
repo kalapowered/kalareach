@@ -18,6 +18,7 @@
  * when nothing can reach the service.
  */
 
+import { UNTIL_THEN } from '../pairing/words'
 import type {
   VoiceAction,
   VoiceManagedTerms,
@@ -722,4 +723,19 @@ export type VoiceControl = (typeof LOCAL_ONLY_CONTROLS)[number] | 'cancel_task' 
 export function controlAvailable(control: VoiceControl, call: RunningCall): boolean {
   if ((LOCAL_ONLY_CONTROLS as readonly string[]).includes(control)) return true
   return call.hostReachable
+}
+
+/**
+ * What the start page says when the managed service refused to start a call: the service's own
+ * words, then "Until then:" and each path that still works, as the other pages say them (the
+ * devices page's mailbox line and the sync panel's failure). The words and each path were made
+ * into shown text where the client read them, so this adds nothing and removes nothing.
+ */
+export function unavailableWords(refusal: {
+  readonly message: string
+  readonly alternatives: readonly string[]
+}): string {
+  return refusal.alternatives.length === 0
+    ? refusal.message
+    : [refusal.message, UNTIL_THEN, ...refusal.alternatives].join(' ')
 }
