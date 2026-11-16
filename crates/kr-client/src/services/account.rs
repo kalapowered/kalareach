@@ -2020,6 +2020,30 @@ pub struct SignOut {
     pub service_told: bool,
 }
 
+/// How the revocation of a token that was not kept failed, and where the token stands then. The
+/// error is the one the revocation returned.
+#[derive(Debug)]
+pub enum Unrevoked {
+    /// The queue took the token and the service was not told: the queue holds it, and the next send
+    /// sends it.
+    Queued(ClientError),
+    /// The service took the token by a send of its own, so it is ended, and the queue of
+    /// revocations failed.
+    Ended(ClientError),
+    /// The queue could not take the token and the service did not: this process holds it in memory
+    /// for the next send, and loses it if the process stops before one runs.
+    Held(ClientError),
+}
+
+impl Unrevoked {
+    /// The error the revocation returned.
+    fn into_error(self) -> ClientError {
+        match self {
+            Self::Queued(error) | Self::Ended(error) | Self::Held(error) => error,
+        }
+    }
+}
+
 /// What keeping a sign-in came to when the store did not refuse it outright.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Commit {
@@ -2483,6 +2507,16 @@ impl SignedInAccount {
     /// entry can have left it there, and the token is then sent again at the next recovery, which
     /// the service does not mind.
     pub async fn revoke_unkept(&self, refresh_token: RefreshToken) -> Result<usize> {
+        self.revoke_unkept_placing(refresh_token)
+            .await
+            .map_err(Unrevoked::into_error)
+    }
+
+    /// [`Self::revoke_unkept`], with where the token stands when its revocation failed.
+    async fn revoke_unkept_placing(
+        &self,
+        refresh_token: RefreshToken,
+    ) -> std::result::Result<usize, Unrevoked> {
         let queued = match self.hold().await {
             Ok(_held) => self.queue("unkept", refresh_token.clone()),
             Err(error) => Err(error),
@@ -2492,12 +2526,39 @@ impl SignedInAccount {
             Ok(()) => self.send_pending().await,
             Err(error) => Err(error),
         };
-        if sent.is_err() && self.service.revoke(&refresh_token).await.is_err() && refused {
+        let error = match sent {
+            Ok(unacknowledged) => return Ok(unacknowledged),
+            Err(error) => error,
+        };
+        if self.service.revoke(&refresh_token).await.is_ok() {
+            return Err(Unrevoked::Ended(error));
+        }
+        if refused {
             // Neither the queue nor the service took it: memory keeps it for the next send. A token
             // the queue took is the queue's, and the send that failed leaves it there.
             self.keep_in_memory("unkept", refresh_token);
+            return Err(Unrevoked::Held(error));
         }
-        sent
+        Err(Unrevoked::Queued(error))
+    }
+
+    /// Ends the tokens of a sign-in whose caller's standing did not hold where the grant would
+    /// have been written, and says what the caller owes. The tokens are sent to the service, queued
+    /// first ([`Self::revoke_unkept`]). The outcome is [`Commit::WithheldOwing`] when the token is
+    /// held in this process's memory afterwards, because neither the queue nor the service took
+    /// it, and [`Commit::Withheld`] otherwise. Where the revocation failed, how it failed and where
+    /// the token stands is returned beside the outcome.
+    pub async fn end_withheld(&self, refresh_token: RefreshToken) -> (Commit, Option<Unrevoked>) {
+        let unrevoked = self
+            .revoke_unkept_placing(refresh_token.clone())
+            .await
+            .err();
+        let commit = if self.held_in_memory(&refresh_token) {
+            Commit::WithheldOwing
+        } else {
+            Commit::Withheld
+        };
+        (commit, unrevoked)
     }
 
     /// Keeps a sign-in's tokens, replacing any grant this device held, whose revocation is queued.
@@ -2679,16 +2740,9 @@ impl SignedInAccount {
         match self.commit(issued, nonce, stands).await {
             Ok(Commit::Kept) => Ok(Commit::Kept),
             Ok(Commit::Withheld) => {
-                // The caller's standing did not hold where the grant would have been written, so
-                // the tokens are ended at the service, queued first. A token that neither the
-                // queue nor the service took is still in memory afterwards, and the caller is
-                // told that its revocation is owed.
-                let _ = self.revoke_unkept(refresh.clone()).await;
-                Ok(if self.held_in_memory(&refresh) {
-                    Commit::WithheldOwing
-                } else {
-                    Commit::Withheld
-                })
+                // The caller's standing did not hold where the grant would have been written.
+                let (commit, _) = self.end_withheld(refresh).await;
+                Ok(commit)
             }
             Ok(Commit::WithheldOwing) => Ok(Commit::WithheldOwing),
             Ok(Commit::Unsettled) => {
