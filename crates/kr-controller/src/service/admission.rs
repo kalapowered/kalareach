@@ -163,6 +163,47 @@ impl Controller {
             })
     }
 
+    /// The grants the authority feed's refusal is asked of for `connection`, copied out, when it
+    /// came through the network: the pairing grant it was admitted under and each share it has
+    /// decided a request under. It takes the connection table's read lock and the connection's
+    /// shares lock, and allocates, so a writer that must not wait after its copies takes it before
+    /// them and asks [`Self::feed_refusal_in`] after, which reads one atomic word and takes no
+    /// lock. The owner at this machine and a connection that is no longer registered have none.
+    pub(crate) fn feed_grants_on(&self, connection: ConnectionId) -> Option<ConnectionGrants> {
+        self.admitted_read()
+            .get(&connection)
+            .filter(|connection| connection.door == Door::Network)
+            .map(|connection| {
+                #[cfg(feature = "testing")]
+                self.before_the_shares_lock.wait();
+                ConnectionGrants {
+                    grant: connection.grant.clone(),
+                    shares: connection
+                        .shares
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .values()
+                        .cloned()
+                        .collect(),
+                }
+            })
+    }
+
+    /// The refusal the authority feed puts on any of `grants` now, when one stands: the same
+    /// answer as [`Self::feed_refusal_of`] for the connection they were copied from, from the
+    /// feed's one atomic word and no lock.
+    pub(crate) fn feed_refusal_in(
+        &self,
+        grants: &ConnectionGrants,
+    ) -> Option<crate::grants::Refusal> {
+        self.feed_refusal(grants.grant.as_ref()).or_else(|| {
+            grants
+                .shares
+                .iter()
+                .find_map(|share| self.feed_refusal(Some(share)))
+        })
+    }
+
     /// The standing a remote request takes with it: the pairing grant of the device that makes it,
     /// the grant the request is decided under, and each share the connection has decided a request
     /// under.
@@ -1874,6 +1915,15 @@ impl From<EnvelopeRefused> for ControllerError {
     fn from(refusal: EnvelopeRefused) -> Self {
         refusal.error
     }
+}
+
+/// The grants the authority feed's refusal is asked of for one network connection, copied when a
+/// writer takes them ([`Controller::feed_grants_on`]) and asked of with no lock afterwards
+/// ([`Controller::feed_refusal_in`]).
+#[derive(Clone, Debug)]
+pub(crate) struct ConnectionGrants {
+    grant: Option<kr_protocol::grant::Grant>,
+    shares: Vec<kr_protocol::grant::Grant>,
 }
 
 /// The grants a remote request stands on, copied when the work starts

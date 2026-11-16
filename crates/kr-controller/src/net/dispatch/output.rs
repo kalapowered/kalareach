@@ -715,16 +715,23 @@ impl RemoteOutput {
             return Written::Withdrawn;
         }
         // The feed's refusal is the last read that takes a lock: the connection table's read lock
-        // and the connection's shares lock, which a withdrawal or a commit can hold. Nothing that
-        // is asked after it takes one.
-        let feed_refuses = || {
-            !matches!(answers, Answers::Nothing)
-                && self
-                    .authority
-                    .controller
-                    .feed_refusal_on(self.authority.connection_id)
-                    .is_some()
+        // and the connection's shares lock, which a withdrawal or a commit can hold. What it is
+        // asked of, the connection's grants, is copied under those locks and returned with the
+        // refusal, so that the attempt can ask it again after its copies with no lock.
+        let feed_taken = || {
+            if matches!(answers, Answers::Nothing) {
+                return (None, false);
+            }
+            let grants = self
+                .authority
+                .controller
+                .feed_grants_on(self.authority.connection_id);
+            let refuses = grants
+                .as_ref()
+                .is_some_and(|grants| self.authority.controller.feed_refusal_in(grants).is_some());
+            (grants, refuses)
         };
+        let feed_refuses = || feed_taken().1;
         // What stands at the stream, asked in one place and taking no lock: every bound the answer
         // is written under, the decision a relayed batch rides on, and last the standing a kept
         // answer or a conflict was admitted under (the fence this host owes, the revision in force
@@ -767,19 +774,29 @@ impl RemoteOutput {
                 None => None,
             };
             // The first fence is the early ask. The feed's refusal takes locks and is read next,
-            // and it is the last read that does. The bounds' cells are copied after it and before
-            // the first clock read of what stands, which is asked once, reading atomics and clocks
-            // alone, and the grant's own expiry, which the bounds leave out, is read after that:
-            // the last ask before the bytes are handed over. The copies are kept until the attempt
-            // has handed its bytes over.
+            // and it is the last read that does; the grants it was asked of are kept. The bounds'
+            // cells are copied after it, which allocates, and the feed's refusal is asked of the
+            // kept grants again before anything else is asked after the copies: it reads one
+            // atomic word, and a refusal that rose while the copies were taken stops the frame.
+            // What stands then is asked once, reading atomics and clocks alone, and the grant's
+            // own expiry, which the bounds leave out, is read after that: the last ask before the
+            // bytes are handed over. The copies and the grants are kept until the attempt has
+            // handed its bytes over.
             let mut copied = None;
+            let mut grants = None;
             let admitted = self.fence()
-                && !feed_refuses()
+                && {
+                    let (taken, refuses) = feed_taken();
+                    grants = taken;
+                    !refuses
+                }
                 && {
                     let taken = copied.insert(Copied::of(under, relaying.as_ref()));
                     #[cfg(feature = "testing")]
                     self.authority.controller.after_the_feed_is_read.wait();
-                    standing(taken)
+                    grants.as_ref().is_none_or(|grants| {
+                        self.authority.controller.feed_refusal_in(grants).is_none()
+                    }) && standing(taken)
                 }
                 && self.fence();
             if admitted {

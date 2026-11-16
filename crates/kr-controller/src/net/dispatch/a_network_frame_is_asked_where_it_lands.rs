@@ -58,6 +58,8 @@ enum Ends {
     TheRevision,
     /// The connection's grant runs out on the wall clock.
     TheGrantsOwnEnd,
+    /// The authority feed's refusal rises: the one member that moves no revision and sets no latch.
+    TheFeedRefuses,
 }
 
 /// What the case found after the writer had gone on.
@@ -173,6 +175,7 @@ async fn written_with(record: Record, ends: Ends, at: StoppedAt) -> Found {
                 .expect("the barrier is raised");
         }
         Ends::TheGrantsOwnEnd => wall.store(expires_at_ms + 1_000, Ordering::SeqCst),
+        Ends::TheFeedRefuses => controller.raise_the_unverified_withdrawal_refusal().await,
     }
     go.send(()).expect("the writer goes on");
     let (stood, connection) = writing.await.expect("the write ends");
@@ -249,6 +252,55 @@ async fn the_connection_ends_and_the_stream_is_handed_nothing(record: Record, en
         "{record:?} was not handed to the stream after {ends:?}: {:?}",
         found.frames
     );
+}
+
+/// A feed refusal that rises in the pause after the copies stops an answer read from a record: the
+/// writer asks the refusal again of the grants it took with the first reading, with no lock, so
+/// none of the answer is handed to the stream, and the device is told what the decision made again
+/// says, which is a refusal of its own and not the answer.
+async fn the_feed_refuses_after_the_copies_and_the_stream_is_handed_none_of_the_answer(
+    record: Record,
+) {
+    let found = written_with(record, Ends::TheFeedRefuses, StoppedAt::AfterTheFeed).await;
+    assert!(
+        found.stood,
+        "the connection stands: only the answer was stopped"
+    );
+    assert!(
+        !found.frames.contains(&found.answer),
+        "{record:?} was not written after the feed's refusal rose: {:?}",
+        found.frames
+    );
+    assert!(
+        matches!(
+            found.frames.as_slice(),
+            [ControlFrame::Response(Response {
+                outcome: Outcome::Error(_),
+                ..
+            })]
+        ),
+        "the device is told a refusal and nothing else: {:?}",
+        found.frames
+    );
+}
+
+/// KR-REQ-09.12: the authority feed's refusal that rises after the writer has read the feed and
+/// copied the bounds' cells stops a kept answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kept_answer_is_not_written_when_the_feed_refuses_after_the_copies() {
+    the_feed_refuses_after_the_copies_and_the_stream_is_handed_none_of_the_answer(
+        Record::KeptAnswer,
+    )
+    .await;
+}
+
+/// KR-REQ-09.09: the same for a reused identifier's answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reused_identifier_is_not_written_when_the_feed_refuses_after_the_copies() {
+    the_feed_refuses_after_the_copies_and_the_stream_is_handed_none_of_the_answer(
+        Record::ReusedIdentifier,
+    )
+    .await;
 }
 
 /// KR-REQ-09.12: a kept answer that the writer has stopped at after the feed's refusal was read is
