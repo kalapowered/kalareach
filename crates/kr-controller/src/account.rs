@@ -303,8 +303,12 @@ impl Guard {
         }
     }
 
-    /// The footing's question, asked through the guard ([`Footing::ask`]): no lock is taken,
-    /// nothing is awaited, allocated or let go of, and nothing is written.
+    /// The footing's question, asked through the guard (`Footing::ask`). No lock is taken and
+    /// nothing is awaited. A guard that holds the lease's bound first copies the snapshot its cell
+    /// publishes, which can allocate (the first use of a thread) and let go of a reference; it
+    /// reads the clocks, and the reading of the UTC clock raises the floor, an atomic raise that
+    /// never waits. After those, and on a guard that holds no bound, the question is comparisons
+    /// of atomics and clocks: nothing is allocated, freed or written after it.
     ///
     /// # Errors
     ///

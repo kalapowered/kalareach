@@ -578,7 +578,7 @@ async fn a_reply_read_from_a_record_is_not_written_when_the_lease_ends_after_it_
 /// reading and the question stops the sign-in: nothing is kept. The control: where the lease still
 /// stands at the question, the ask passes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_sign_in_ask_whose_lease_ends_while_the_fence_is_read_is_refused() {
+async fn a_sign_in_ask_whose_lease_ends_before_its_question_is_refused() {
     for ends in [false, true] {
         let (_temp, controller, continuous, _writer, _reader) = connected_under_a_lease().await;
         let lasting = controller.sign_in_lasting(Method::AccountSignIn);
@@ -608,7 +608,7 @@ async fn a_sign_in_ask_whose_lease_ends_while_the_fence_is_read_is_refused() {
 
 /// KR-REQ-09.09: a fence this host comes to owe in the wait that follows the reading of the owner's
 /// lease stops the sign-in's ask, which refuses in the fence's words, so nothing is kept. The
-/// control: with no fence owed the ask passes and gives the host as its guard.
+/// control: with no fence owed the ask passes and gives its guard.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sign_in_ask_whose_fence_comes_while_the_lease_is_read_is_refused() {
     for owed in [false, true] {
