@@ -9261,16 +9261,25 @@ impl WorkerService {
         actor_id: &ActorId,
         params: &kr_protocol::receipt::ActionReadParams,
     ) -> Result<(kr_protocol::receipt::Receipt, Option<Vec<u8>>)> {
+        // One deadline for the take, for the caller's wait and for the thread's own, so the
+        // thread's tries end where the caller's wait ends. A thread that takes the session after
+        // its caller was refused lets it go before it makes a call to the store.
+        let take_until = std::time::Instant::now() + crate::published::TAKE_BOUND;
         let (took_sender, took) = std::sync::mpsc::channel::<bool>();
         let (read_sender, read) = std::sync::mpsc::channel();
         let runtime = Arc::clone(&self.runtime);
         let (actor_id, action_id, named) = (actor_id.clone(), params.action_id, params.session_id);
         std::thread::spawn(move || {
-            let Some(mut session) = runtime.session_within(crate::published::TAKE_BOUND) else {
+            let left = take_until.saturating_duration_since(std::time::Instant::now());
+            let Some(mut session) = runtime.session_within(left) else {
                 let _ = took_sender.send(false);
                 return;
             };
-            let _ = took_sender.send(true);
+            // A caller that has gone has no use for the receipt: the thread lets the session go
+            // and makes no call to the store.
+            if took_sender.send(true).is_err() {
+                return;
+            }
             let outcome = (|| -> Result<(kr_protocol::receipt::Receipt, Option<Vec<u8>>)> {
                 // A worker serves the receipts of the one session it owns. A read that names a
                 // session names this one, as every other state recovery read does.
@@ -9293,7 +9302,7 @@ impl WorkerService {
             drop(session);
             let _ = read_sender.send(outcome);
         });
-        match took.recv_timeout(crate::published::TAKE_BOUND) {
+        match took.recv_timeout(take_until.saturating_duration_since(std::time::Instant::now())) {
             Ok(true) => {}
             Ok(false) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 return Err(WorkerError::JournalUnavailable {
