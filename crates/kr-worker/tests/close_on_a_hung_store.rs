@@ -1026,24 +1026,32 @@ async fn a_read_of_a_session_whose_close_is_underway_says_closing_from_the_domai
     );
 }
 
-/// The control of the case above: nothing holds the session after the close was admitted, so the
-/// read takes it and gives what it always gave.
+/// The control of the case above: the close was admitted and nothing holds the session, so the read
+/// takes it and gives what it always gave.
+///
+/// The case keeps the close's gate, which is what starts the stop that takes the session again and
+/// again, so that nothing but the case decides who holds the session. It first takes the session
+/// itself, with a wait that no loaded machine runs out, to show that nothing holds it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_read_of_a_session_whose_close_is_underway_and_nothing_holds_takes_it() {
     let host = host().await;
-    let (closer, mut reader) = (host.client().await, host.client().await);
-    let slot = send_close(&host, closer);
-    let began = Instant::now();
-    while look(&slot).is_none() {
-        assert!(
-            began.elapsed() < ANSWER_BOUND,
-            "the close was not answered within {ANSWER_BOUND:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let mut reader = host.client().await;
+    let (acceptance, _gate) = host
+        .runtime
+        .close(kr_protocol::session::ClosureReason::CloseRequested);
+    assert!(acceptance.initiated, "the close was admitted");
+    assert_eq!(domain_state(&host), SessionState::Closing);
+    drop(
+        host.runtime
+            .session_within(CLOSURE_WAIT)
+            .expect("nothing holds the session once the close is admitted and its gate is kept"),
+    );
     let (_, read) = read_within_its_bound(&mut reader, &host, "control closing").await;
     assert_eq!(read.session.state, SessionState::Closing);
-    assert!(read.launch_profile.0.is_some());
+    assert!(
+        read.launch_profile.0.is_some(),
+        "a read of a session that nothing holds takes it and gives its content"
+    );
 }
 
 /// A receipt is read from the journal under the session: while the session is held behind a storage
