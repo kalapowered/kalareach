@@ -1624,6 +1624,11 @@ async function missedInRing(page: Page, words: Words, size: number, href: string
 test.describe('the area in which a tap opens a link', () => {
   test.use({ hasTouch: true })
   // A grid of taps over the whole area and one step beyond it: some hundreds of taps for the larger areas.
+  // The limit of a case is at least 3.5 times the largest time that the case has been measured to take, so that
+  // a runner more than three times slower than the development machine still passes. Measured in Chromium, the
+  // slowest cases of the group (a link's words at the largest text size, about 790 and 860 taps) took 32.6 to
+  // 42.9 s in ten runs beside two CPU spinners, and every other case of the group at most 34.1 s: 3.5 times
+  // 42.9 s is 150.2 s, half of this limit.
   test.describe.configure({ timeout: 300_000 })
   for (const surface of SURFACES) {
     for (const [size, ratio] of SIZES) {
