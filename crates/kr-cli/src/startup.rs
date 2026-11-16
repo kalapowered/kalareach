@@ -890,7 +890,7 @@ pub(crate) fn nothing_listening(error: &kr_ipc::IpcError) -> bool {
 /// what is left of the deadline, and runs `between` after every attempt that failed.
 ///
 /// Returns the connection, or what the last attempt found.
-async fn answered_by(
+pub(crate) async fn answered_by(
     endpoint: &kr_ipc::paths::Endpoint,
     deadline: tokio::time::Instant,
     majors: &[u16],
