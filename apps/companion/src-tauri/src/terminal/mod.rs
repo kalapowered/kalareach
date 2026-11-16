@@ -72,6 +72,9 @@ enum Source {
         Box<crate::standing::Dial>,
         Option<kr_protocol::ids::GrantId>,
     ),
+    /// A connection that a test made, in place of the one a dial makes.
+    #[cfg(feature = "testing")]
+    Over(Arc<dyn kr_client::transport::ControlTransport>),
 }
 
 /// One view whose task is running, as the registry holds it.
@@ -94,6 +97,9 @@ pub struct TerminalViews {
     locate: Locate,
     held: Arc<Mutex<BTreeMap<u64, Held>>>,
     next: AtomicU64,
+    /// The connections that tests made for the next views, which each open of a view takes in turn.
+    #[cfg(feature = "testing")]
+    over: Mutex<std::collections::VecDeque<Arc<dyn kr_client::transport::ControlTransport>>>,
 }
 
 impl TerminalViews {
@@ -115,7 +121,22 @@ impl TerminalViews {
             locate,
             held: Arc::default(),
             next: AtomicU64::new(1),
+            #[cfg(feature = "testing")]
+            over: Mutex::default(),
         }
+    }
+
+    /// Gives the next view that opens, on this registry, `transport` as its connection in place of
+    /// the one a dial would make: the view then opens the session on it as it does on a paired
+    /// host's connection, and runs every step after that unchanged. For a test of what a paired link
+    /// carries.
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    pub fn over(&self, transport: Arc<dyn kr_client::transport::ControlTransport>) {
+        self.over
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back(transport);
     }
 
     /// Opens a view of `session_id` for the page `page`, `dimensions` in size, whose states go to
@@ -127,14 +148,16 @@ impl TerminalViews {
         dimensions: Dimensions,
         publish: Publish,
     ) -> String {
-        self.start(
-            page,
-            Source::Local(Arc::clone(&self.locate)),
-            session_id,
-            dimensions,
-            publish,
-            None,
-        )
+        #[cfg(feature = "testing")]
+        let source = self
+            .over
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+            .map_or_else(|| Source::Local(Arc::clone(&self.locate)), Source::Over);
+        #[cfg(not(feature = "testing"))]
+        let source = Source::Local(Arc::clone(&self.locate));
+        self.start(page, source, session_id, dimensions, publish, None)
     }
 
     /// Opens a view of `session_id` of a host this device is paired with, on a connection of its
@@ -189,6 +212,8 @@ impl TerminalViews {
             let reach = match &source {
                 Source::Local(locate) => view::Reach::Local(locate),
                 Source::Paired(dial, grant) => view::Reach::Paired(dial, *grant),
+                #[cfg(feature = "testing")]
+                Source::Over(transport) => view::Reach::Over(transport),
             };
             let cause = view::run(
                 reach, session_id, dimensions, receiver, &publish, queue_peak,

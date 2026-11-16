@@ -134,6 +134,9 @@ pub(super) enum Reach<'a> {
     /// A host this device is paired with, over a connection opened for the view under `grant`
     /// (the pairing when none).
     Paired(&'a crate::standing::Dial, Option<GrantId>),
+    /// A connection that a test made, opened as a paired host's is.
+    #[cfg(feature = "testing")]
+    Over(&'a Arc<dyn kr_client::transport::ControlTransport>),
 }
 
 /// Why a view's task ended, for whoever opened it.
@@ -324,6 +327,11 @@ async fn open(
         Reach::Paired(dial, grant_id) => {
             let transport = dial.transport().await.map_err(not_opened)?;
             let (link, events, target) = open_over(transport, *grant_id, session_id).await?;
+            (link, events, target, None, false)
+        }
+        #[cfg(feature = "testing")]
+        Reach::Over(transport) => {
+            let (link, events, target) = open_over(Arc::clone(transport), None, session_id).await?;
             (link, events, target, None, false)
         }
     };
