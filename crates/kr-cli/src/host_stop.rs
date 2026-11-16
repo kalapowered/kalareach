@@ -1089,11 +1089,9 @@ async fn ask(
         },
         // A refusal says nothing was done only where it is definite; a withheld or transient one
         // does not, and the daemon is waited for as one that took the stop.
-        Ok(Ok(Outcome::Error(error))) => match error.code.retry_category() {
-            RetryCategory::Transient | RetryCategory::OutcomeUnknown => {
-                Asked::Unknown(Shown::protocol(&error))
-            }
-            _ => Asked::Refused(error),
+        Ok(Ok(Outcome::Error(error))) => match split_of(error.code.retry_category()) {
+            Split::MaybeAsked => Asked::Unknown(Shown::protocol(&error)),
+            Split::Refused => Asked::Refused(error),
         },
         Ok(Err(said)) => Asked::Unknown(said),
         Err(_) => Asked::Unknown(shown!(
@@ -1103,12 +1101,55 @@ async fn ask(
     }
 }
 
+/// What the daemon's refusal of the stop says of the request, by the retry category of its code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Split {
+    /// The daemon refused the stop, and nothing was taken: no wait.
+    Refused,
+    /// The refusal does not say that nothing was done (its category is transient or its outcome is
+    /// unknown): the daemon is waited for as one that took the stop.
+    MaybeAsked,
+}
+
+/// Where a refusal of the stop goes, by the retry category of its code. Every category is an
+/// arm, with no catch-all, so that a new category is a compile error here until it is decided.
+fn split_of(category: RetryCategory) -> Split {
+    match category {
+        RetryCategory::Transient | RetryCategory::OutcomeUnknown => Split::MaybeAsked,
+        RetryCategory::NoRetry | RetryCategory::Resync | RetryCategory::ConfigurationChange => {
+            Split::Refused
+        }
+    }
+}
+
 /// Whether the record of the attempt is told that the daemon took the stop: for a request that the
 /// daemon took and answered, and for no request whose outcome is not known.
 fn marker_told(request: &Request) -> bool {
     match request {
         Request::Told => true,
         Request::MaybeAsked(_) => false,
+    }
+}
+
+/// The process that the end of a stop is waited for by, and the one that `--json` shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Waited<'a> {
+    /// The process that the wait is for by its start identity: the one that the lock file named
+    /// before the request, where the answer named the same process or none.
+    old: Option<&'a ProcessStartIdentity>,
+    /// The process that `--json` shows: the one that the answer named, and otherwise the one that
+    /// the lock file named.
+    pid: Option<u64>,
+}
+
+/// Which process a stop is waited for by, from the one that the lock file named before the request
+/// (`holder`) and the one that the daemon's answer named (`answered`). A lock file that names a
+/// process other than the answer's says nothing about the daemon that answered, so the wait is not
+/// for that process by its identity.
+fn process_waited_for(holder: Option<&ProcessStartIdentity>, answered: Option<u64>) -> Waited<'_> {
+    Waited {
+        old: holder.filter(|holder| answered.is_none_or(|answered| answered == holder.pid.get())),
+        pid: answered.or_else(|| holder.map(|holder| holder.pid.get())),
     }
 }
 
@@ -1230,12 +1271,9 @@ async fn stop_the_daemon(
 
     // The process that is waited for by its start identity is the one that answered: a lock file
     // that names another says nothing about this daemon. Where there is none, the wait is for the
-    // lock and the endpoint, and no text names a process.
-    let old = holder
-        .as_ref()
-        .filter(|holder| pid.is_none_or(|answered| answered == holder.pid.get()));
-    // For `--json`: the process the answer gave, and otherwise the one the lock file named.
-    let pid = pid.or_else(|| holder.as_ref().map(|holder| holder.pid.get()));
+    // lock and the endpoint, and no text names the asked process by its identity; a text names
+    // only a process that the lock file names, where that is a live process named kr-controller.
+    let Waited { old, pid } = process_waited_for(holder.as_ref(), pid);
     let operations = Real::of(host, &environment.paths, Some(info.generation));
     let ended = wait_for_the_end(&operations, old, END_BOUND).await;
     let said = said_after_the_request(ended, &request);
@@ -1430,14 +1468,31 @@ async fn ended_before_the_request(
     // first instance.
     drop(connection);
     let left = || deadline.saturating_duration_since(tokio::time::Instant::now());
-    let first = if closed {
-        Endpoint::Unclear
-    } else {
-        operations.look(startup::ANSWER_BOUND.min(left())).await
+    let first = match first_look(closed) {
+        FirstLook::NotMade => Endpoint::Unclear,
+        FirstLook::Made => operations.look(startup::ANSWER_BOUND.min(left())).await,
     };
     match first_look_answers(first) {
         Some(answered) => Decided::Answers(answered),
         None => decided_by_the_wait(wait_for_the_end(operations, old, left()).await),
+    }
+}
+
+/// Whether a request that could not be made is looked at first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FirstLook {
+    /// A daemon that closed the connection is going: no look is made, and the wait decides.
+    NotMade,
+    /// The connection was not closed by the daemon: the endpoint is looked at once first.
+    Made,
+}
+
+/// Whether the first look is made, by whether the daemon closed the connection.
+fn first_look(closed: bool) -> FirstLook {
+    if closed {
+        FirstLook::NotMade
+    } else {
+        FirstLook::Made
     }
 }
 
@@ -1505,32 +1560,69 @@ async fn failed_before_the_request(
     id: EnvironmentId,
     deadline: tokio::time::Instant,
 ) -> Before {
-    // The source is read through the one function that names every variant. A reply shows that a
-    // daemon answers; this side's own fault is no daemon's and no end causes it, so it is not
-    // looked at; a closure is decided by the daemon's end.
-    match error.comes_from() {
-        ErrorSource::Reply => {
+    // The source is read through the one function that names every variant, and [`route_of`]
+    // says where each goes.
+    match route_of(error.comes_from()) {
+        Route::Reply => {
             drop(connection);
             return Answered::of_reply(error).map_or(Before::OwnFault, Before::Answers);
         }
-        ErrorSource::OwnFault => {
+        Route::OwnFault => {
             drop(connection);
             return Before::OwnFault;
         }
-        ErrorSource::Closure => {}
+        Route::TheEnd => {}
     }
     let closed = closed_by_the_daemon(error);
-    match ended_before_the_request(operations, connection, holder, closed, deadline).await {
-        Decided::Ended(ended) => {
-            let pid = holder.map(|holder| holder.pid.get());
-            Before::Ended {
-                said: ended_before_the_request_said(id, pid, &ended, &Shown::ipc(error)),
-                pid,
-            }
-        }
-        Decided::NotShown => Before::Silent {
-            accepted: !startup::nothing_listening(error),
+    let decided = ended_before_the_request(operations, connection, holder, closed, deadline).await;
+    before_by_the_wait(
+        decided,
+        !startup::nothing_listening(error),
+        id,
+        holder.map(|holder| holder.pid.get()),
+        &Shown::ipc(error),
+    )
+}
+
+/// Where a failure of the connection before the request goes, by where it comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    /// A daemon wrote it: it is an answer, and nothing is looked at.
+    Reply,
+    /// This side's own fault: no daemon's end causes it, so nothing is looked at.
+    OwnFault,
+    /// A daemon's end can cause it: the end is looked for within the deadline.
+    TheEnd,
+}
+
+/// Where a failure goes, by its source. Every source is an arm, with no catch-all, so that a new
+/// source is a compile error here until it is decided.
+fn route_of(source: ErrorSource) -> Route {
+    match source {
+        ErrorSource::Reply => Route::Reply,
+        ErrorSource::OwnFault => Route::OwnFault,
+        ErrorSource::Closure => Route::TheEnd,
+    }
+}
+
+/// What a failure that a daemon's end can cause came to, by what the wait decided: the daemon had
+/// ended (`pid` is the process that the lock file named before the request, and `why` the
+/// failure's words), no end was shown and no daemon answered (`accepted` is whether a connection
+/// was accepted before the failure), or a daemon answered. Every decision is an arm, with no
+/// catch-all, so that a new decision is a compile error here until it is decided.
+fn before_by_the_wait(
+    decided: Decided,
+    accepted: bool,
+    id: EnvironmentId,
+    pid: Option<u64>,
+    why: &Shown,
+) -> Before {
+    match decided {
+        Decided::Ended(ended) => Before::Ended {
+            said: ended_before_the_request_said(id, pid, &ended, why),
+            pid,
         },
+        Decided::NotShown => Before::Silent { accepted },
         Decided::Answers(answered) => Before::Answers(answered),
     }
 }
