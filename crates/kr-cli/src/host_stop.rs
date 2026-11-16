@@ -2203,6 +2203,13 @@ mod answered {
         pub(super) fn of_reply(error: &IpcError) -> Option<Self> {
             (error.comes_from() == ErrorSource::Reply).then_some(Self { generation: None })
         }
+
+        /// The daemon's own reply that cannot be used, at a place that has already read it as one:
+        /// a failure whose source is a reply, a refusal of the read, or a result that does not
+        /// decode. The argument is that failure itself, which is what makes the reply the daemon's.
+        pub(super) fn of_unusable_reply(_reply: &impl std::fmt::Display) -> Self {
+            Self { generation: None }
+        }
     }
 }
 
@@ -2215,14 +2222,16 @@ enum Endpoint {
     Nobody,
     /// A daemon answers and reports the generation that was asked: the same daemon, proved.
     Same(Answered),
-    /// Something answers and no generation is proved: a refusal of the greeting (the daemon's own
-    /// reply, which names no generation), or an answer where the generation that was asked is not
-    /// known. It shows that something answers at the endpoint, and neither that the daemon that
-    /// was asked runs nor that it has ended.
+    /// Something answers and no generation is proved: a reply of the daemon's own that cannot be
+    /// used (a refusal of the greeting or of the read, a version that does not fit, a message of
+    /// another kind, a result that does not decode), or an answer where the generation that was
+    /// asked is not known. It shows that something answers at the endpoint, and neither that the
+    /// daemon that was asked runs nor that it has ended.
     Unproved(Answered),
     /// A daemon of another generation answers.
     Another,
-    /// Something listens and does not answer, or the look could not be made.
+    /// Nothing came within the bound, or the look itself failed (its address could not be made, or
+    /// the link failed): it shows neither that something answers nor that nothing does.
     Unclear,
 }
 
@@ -2236,40 +2245,123 @@ fn by_generation(asked: Option<ControllerGeneration>, reported: ControllerGenera
     }
 }
 
-/// Looks at the environment's endpoint, the connection, the hello and `host.info` together bounded
-/// by `within` and by one second, and treats a daemon that does not answer as unclear.
+/// What the exchange of a look gave: one value for each way it can end, from the address of the
+/// endpoint to the answer of `host.info`. [`label_of`] takes each to what answers at the endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gave {
+    /// The address of the endpoint could not be made, so nothing was tried.
+    NoAddress,
+    /// Nothing came within the bound: the connection and the greeting did not finish, or `host.info`
+    /// was not answered.
+    NothingInTime,
+    /// The connection found nothing listening.
+    NothingListens,
+    /// The link failed and no reply of the daemon's came with it: a peer that closed, a stream cut
+    /// short, a frame that cannot be read, or this side's own fault (a check of the peer's
+    /// credentials, a fault of this side's socket, a request that this side cannot encode).
+    LinkFailed,
+    /// The daemon replied to the greeting with something that cannot be used: a refusal of the hello,
+    /// a version that does not fit, or a message that is not the acknowledgement.
+    GreetingReplied(Answered),
+    /// A daemon that states another major than this command's answered the greeting.
+    GreetingOfAnotherMajor,
+    /// The daemon answered `host.info` and reported this generation.
+    Reported(ControllerGeneration),
+    /// The daemon refused the read of `host.info`.
+    ReadRefused(Answered),
+    /// The result of `host.info` does not decode.
+    ReadUndecodable(Answered),
+    /// The daemon replied to the read with something that is not its answer: a message of another
+    /// kind, or a refusal of the link.
+    ReadReplied(Answered),
+}
+
+/// What an exchange that gave `gave` shows at the endpoint, where the generation of the daemon
+/// that was asked is `asked`, if the command knows it. Every way that an exchange ends is an arm,
+/// with no catch-all, so that a new way is a compile error here until it is labelled. An answer
+/// that came within the bound and proves no generation is unproved, whatever its kind; nothing
+/// is unclear but an exchange where nothing came within the bound or the look itself failed.
+fn label_of(asked: Option<ControllerGeneration>, gave: Gave) -> Endpoint {
+    match gave {
+        Gave::NothingListens => Endpoint::Nobody,
+        Gave::Reported(reported) => by_generation(asked, reported),
+        Gave::GreetingReplied(answered) => Endpoint::Unproved(answered),
+        Gave::ReadRefused(answered) => Endpoint::Unproved(answered),
+        Gave::ReadUndecodable(answered) => Endpoint::Unproved(answered),
+        Gave::ReadReplied(answered) => Endpoint::Unproved(answered),
+        Gave::GreetingOfAnotherMajor => Endpoint::Another,
+        Gave::NoAddress => Endpoint::Unclear,
+        Gave::NothingInTime => Endpoint::Unclear,
+        Gave::LinkFailed => Endpoint::Unclear,
+    }
+}
+
+/// What the failure of the connection or of the greeting gave.
+fn gave_by_the_greeting(error: &kr_ipc::IpcError) -> Gave {
+    if startup::nothing_listening(error) {
+        return Gave::NothingListens;
+    }
+    match error.comes_from() {
+        ErrorSource::Reply => Gave::GreetingReplied(Answered::of_unusable_reply(error)),
+        ErrorSource::Closure => Gave::LinkFailed,
+        ErrorSource::OwnFault => Gave::LinkFailed,
+    }
+}
+
+/// What the read of `host.info` gave.
+fn gave_by_the_read(
+    read: kr_ipc::Result<std::result::Result<kr_protocol::envelope::ParamsValue, ProtocolError>>,
+) -> Gave {
+    match read {
+        Ok(Ok(value)) => match value.to_typed::<HostInfoResult>() {
+            Ok(info) => Gave::Reported(info.generation),
+            Err(error) => Gave::ReadUndecodable(Answered::of_unusable_reply(&error)),
+        },
+        Ok(Err(refusal)) => Gave::ReadRefused(Answered::of_unusable_reply(&refusal)),
+        Err(error) => match error.comes_from() {
+            ErrorSource::Reply => Gave::ReadReplied(Answered::of_unusable_reply(&error)),
+            ErrorSource::Closure => Gave::LinkFailed,
+            ErrorSource::OwnFault => Gave::LinkFailed,
+        },
+    }
+}
+
+/// The connection, the greeting and the read of `host.info`, as the exchange of a look.
+async fn the_exchange(endpoint: &kr_ipc::paths::Endpoint, within: Duration) -> Gave {
+    match startup::reach(endpoint, within, &[]).await {
+        Reached::Silent => Gave::NothingInTime,
+        Reached::Refused(error) => gave_by_the_greeting(&error),
+        Reached::Answered(listed) => match *listed {
+            Listed::Other(_) => Gave::GreetingOfAnotherMajor,
+            Listed::Ours(mut client) => {
+                gave_by_the_read(client.request(Method::HostInfo, &()).await)
+            }
+        },
+    }
+}
+
+/// What the exchange of a look at the environment's endpoint gave, bounded as a whole by `within`
+/// and by one second: the address, then the connection, the hello and `host.info` together.
+async fn the_look_gave(environment: &EnvironmentPaths, within: Duration) -> Gave {
+    match environment.controller_endpoint().ok() {
+        Some(endpoint) => {
+            let within = within.min(LOOK_EVERY * 20);
+            tokio::time::timeout(within, the_exchange(&endpoint, within))
+                .await
+                .unwrap_or(Gave::NothingInTime)
+        }
+        None => Gave::NoAddress,
+    }
+}
+
+/// Looks at the environment's endpoint and says what answers there: what the exchange gave,
+/// labelled by [`label_of`].
 async fn endpoint_look(
     environment: &EnvironmentPaths,
     generation: Option<ControllerGeneration>,
     within: Duration,
 ) -> Endpoint {
-    let Ok(endpoint) = environment.controller_endpoint() else {
-        return Endpoint::Unclear;
-    };
-    let within = within.min(LOOK_EVERY * 20);
-    tokio::time::timeout(within, async {
-        match startup::reach(&endpoint, within, &[]).await {
-            Reached::Refused(error) if startup::nothing_listening(&error) => Endpoint::Nobody,
-            // A reply of the daemon's own (a refusal of the hello) shows that a daemon answers, and
-            // names no generation.
-            Reached::Refused(error) => {
-                Answered::of_reply(&error).map_or(Endpoint::Unclear, Endpoint::Unproved)
-            }
-            Reached::Silent => Endpoint::Unclear,
-            Reached::Answered(listed) => match *listed {
-                Listed::Other(_) => Endpoint::Another,
-                Listed::Ours(mut client) => match client.request(Method::HostInfo, &()).await {
-                    Ok(Ok(value)) => match value.to_typed::<HostInfoResult>() {
-                        Ok(now) => by_generation(generation, now.generation),
-                        Err(_) => Endpoint::Unclear,
-                    },
-                    _ => Endpoint::Unclear,
-                },
-            },
-        }
-    })
-    .await
-    .unwrap_or(Endpoint::Unclear)
+    label_of(generation, the_look_gave(environment, within).await)
 }
 
 /// What a failed look at the lock says, in this command's words. The store's start lock, which
@@ -4493,6 +4585,15 @@ mod tests {
         listener: &kr_ipc::endpoint::Listener,
         id: EnvironmentId,
     ) -> (kr_ipc::framed::FrameReader, kr_ipc::framed::FrameWriter) {
+        greet_selecting(listener, id, kr_protocol::hello::PROTOCOL_VERSION).await
+    }
+
+    /// The daemon's side of a greeting that answers the hello with `selected_version`.
+    async fn greet_selecting(
+        listener: &kr_ipc::endpoint::Listener,
+        id: EnvironmentId,
+        selected_version: kr_protocol::hello::ProtocolVersion,
+    ) -> (kr_ipc::framed::FrameReader, kr_ipc::framed::FrameWriter) {
         use kr_protocol::scalars::CanonicalSet;
 
         let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
@@ -4510,7 +4611,7 @@ mod tests {
             "the client says hello"
         );
         let ack = kr_protocol::local::LocalHelloAck {
-            selected_version: kr_protocol::hello::PROTOCOL_VERSION,
+            selected_version,
             role: kr_protocol::local::LocalRole::Controller,
             connection_id,
             environment_id: id,
@@ -4539,7 +4640,7 @@ mod tests {
     }
 
     /// How a daemon closes the connection after its hello.
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     enum Closure {
         /// With nothing more to say: the end of the stream at a frame boundary.
         Clean,
@@ -4547,6 +4648,25 @@ mod tests {
         BadFrame,
         /// After a frame of which the last bytes are missing: the end of the stream inside a frame.
         HalfFrame,
+    }
+
+    /// What a daemon writes before it closes the connection after its hello, as `closure` says.
+    async fn close_after_the_hello(writer: &mut kr_ipc::framed::FrameWriter, closure: Closure) {
+        let codec = kr_protocol::frame::FrameCodec::new(kr_protocol::frame::StreamKind::Control);
+        match closure {
+            Closure::Clean => {}
+            Closure::BadFrame => {
+                let bytes = codec.encode(&[0xff, 0xff]).expect("frames");
+                writer.write_frame(&bytes).await.expect("the bad frame");
+            }
+            Closure::HalfFrame => {
+                let bytes = codec.encode(&[0_u8; 16]).expect("frames");
+                writer
+                    .write_frame(&bytes[..bytes.len() - 3])
+                    .await
+                    .expect("half a frame");
+            }
+        }
     }
 
     /// What `ask` makes of a request it cannot compose on a connection whose daemon says its hello
@@ -4563,22 +4683,7 @@ mod tests {
         let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
         let daemon = tokio::spawn(async move {
             let (_reader, mut writer) = greet(&listener, id).await;
-            let codec =
-                kr_protocol::frame::FrameCodec::new(kr_protocol::frame::StreamKind::Control);
-            match closure {
-                Closure::Clean => {}
-                Closure::BadFrame => {
-                    let bytes = codec.encode(&[0xff, 0xff]).expect("frames");
-                    writer.write_frame(&bytes).await.expect("the bad frame");
-                }
-                Closure::HalfFrame => {
-                    let bytes = codec.encode(&[0_u8; 16]).expect("frames");
-                    writer
-                        .write_frame(&bytes[..bytes.len() - 3])
-                        .await
-                        .expect("half a frame");
-                }
-            }
+            close_after_the_hello(&mut writer, closure).await;
             // The connection closes here, with the answer and the frame already written.
         });
         let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, crate::build_id())
@@ -4700,6 +4805,394 @@ mod tests {
             Err(other) => panic!("a closed connection leaves the transport error, not {other}"),
             Ok(_) => panic!("the read was refused"),
         }
+    }
+
+    // The look's exchange at its producers: a stand-in daemon on a real link does each thing that
+    // the exchange can meet, and the look's value and label are read from the real client.
+
+    /// A `host.info` result as a daemon of `generation` answers it.
+    fn host_info_of(generation: ControllerGeneration) -> HostInfoResult {
+        use kr_protocol::scalars::{Nullable, TimestampMs, U64};
+
+        HostInfoResult {
+            build_id: kr_protocol::ids::BuildId::new("kr-test/0").expect("a build identifier"),
+            protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+            environment_id: EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([3; 16])),
+            generation,
+            boot_identity: kr_protocol::identity::BootIdentity {
+                source: kr_protocol::identity::BootIdentitySource::BootTime,
+                value: kr_protocol::scalars::Bytes::new(Vec::new()),
+            },
+            started_at_ms: TimestampMs::new(1_700_000_000_000),
+            live_sessions: U64::new(0),
+            session_limit: U64::new(8),
+            default_worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+            power: kr_protocol::desktop::SleepInhibitionState {
+                holder: Nullable::null(),
+                withheld_reason: Nullable::null(),
+                ..kr_protocol::desktop::SleepInhibitionState::off(
+                    kr_protocol::desktop::InhibitionMechanism::None,
+                    kr_protocol::desktop::PowerSource::Unknown,
+                )
+            },
+            machine: None,
+            privacy: None,
+            default_shell_mode: None,
+        }
+    }
+
+    /// What a stand-in daemon does with the exchange of a look.
+    #[derive(Clone, Copy, Debug)]
+    enum Peer {
+        /// Nothing listens at the endpoint.
+        NobodyListens,
+        /// It accepts the connection, reads the hello and says nothing.
+        SaysNothingToTheHello,
+        /// It answers the hello with a refusal.
+        RefusesTheHello,
+        /// It answers the hello with a version that does not fit.
+        AnswersAnotherVersion,
+        /// It answers the hello with a frame that is not an acknowledgement.
+        AnswersTheHelloWithAnotherKind,
+        /// It acknowledges the hello and closes the connection as the closure says.
+        ClosesAfterTheHello(Closure),
+        /// It acknowledges the hello and says nothing to the read.
+        SaysNothingToTheRead,
+        /// It acknowledges the hello and answers the read with the generation that it reports.
+        Reports(ControllerGeneration),
+        /// It acknowledges the hello and refuses the read.
+        RefusesTheRead,
+        /// It acknowledges the hello and answers the read with a result that does not decode.
+        AnswersWhatDoesNotDecode,
+        /// It acknowledges the hello and answers the read with a frame for another request.
+        AnswersAnotherKind,
+        /// It acknowledges the hello and answers the read with a refusal of the link.
+        FencesTheLink,
+        /// It acknowledges the hello and answers the read after the look's bound.
+        AnswersAfterTheBound,
+    }
+
+    /// The bound of a look at a peer that answers, and of one that does not: the look is made with
+    /// the shorter one where the peer's answer does not come within it, so that the case waits for
+    /// the bound and no longer.
+    const LOOK_BOUND_FOR_AN_ANSWER: Duration = Duration::from_secs(1);
+    const LOOK_BOUND_FOR_SILENCE: Duration = Duration::from_millis(300);
+
+    /// A frame that a daemon writes as an outcome.
+    async fn write_outcome(
+        writer: &mut kr_ipc::framed::FrameWriter,
+        request_id: kr_protocol::ids::RequestId,
+        outcome: Outcome,
+    ) {
+        // The look may have ended and let go of its end of the connection.
+        let _ = writer
+            .write_message(&ControlFrame::Response(kr_protocol::envelope::Response {
+                request_id,
+                outcome,
+            }))
+            .await;
+    }
+
+    /// The daemon's refusal, as a protocol error that may fence the link.
+    fn refused(link_fenced: bool) -> Outcome {
+        Outcome::Error(ProtocolError {
+            link_fenced,
+            ..ProtocolError::new(ErrorCode::PermissionDenied, "the daemon will not say")
+        })
+    }
+
+    /// The stand-in daemon's side of the exchange: the connection, then what `peer` does.
+    async fn stand_in(listener: kr_ipc::endpoint::Listener, id: EnvironmentId, peer: Peer) {
+        use kr_protocol::ids::RequestId;
+
+        match peer {
+            Peer::NobodyListens => {}
+            Peer::SaysNothingToTheHello => {
+                let (connection, _peer) = listener.accept().await.expect("a connection");
+                let (mut reader, _writer) =
+                    kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+                reader
+                    .read_message::<ControlFrame>()
+                    .await
+                    .expect("a hello");
+                std::future::pending::<()>().await;
+            }
+            Peer::RefusesTheHello | Peer::AnswersTheHelloWithAnotherKind => {
+                let (connection, _peer) = listener.accept().await.expect("a connection");
+                let (mut reader, mut writer) =
+                    kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+                reader
+                    .read_message::<ControlFrame>()
+                    .await
+                    .expect("a hello");
+                let outcome = if matches!(peer, Peer::RefusesTheHello) {
+                    refused(false)
+                } else {
+                    Outcome::Ok(kr_protocol::envelope::ParamsValue::empty())
+                };
+                write_outcome(&mut writer, RequestId::new(0), outcome).await;
+            }
+            Peer::AnswersAnotherVersion => {
+                let version = kr_protocol::hello::ProtocolVersion::new(
+                    kr_protocol::hello::PROTOCOL_VERSION.major + 1,
+                    0,
+                );
+                let _ = greet_selecting(&listener, id, version).await;
+            }
+            Peer::ClosesAfterTheHello(closure) => {
+                let (_reader, mut writer) = greet(&listener, id).await;
+                close_after_the_hello(&mut writer, closure).await;
+            }
+            read_peer => {
+                let (mut reader, mut writer) = greet(&listener, id).await;
+                let ControlFrame::Request(request) = reader
+                    .read_message::<ControlFrame>()
+                    .await
+                    .expect("the read request")
+                else {
+                    panic!("the look asks for host.info");
+                };
+                answer_the_read(read_peer, request.request_id, &mut writer).await;
+            }
+        }
+    }
+
+    /// What a daemon that acknowledged the hello does with the read of `host.info`.
+    async fn answer_the_read(
+        peer: Peer,
+        asked: kr_protocol::ids::RequestId,
+        writer: &mut kr_ipc::framed::FrameWriter,
+    ) {
+        let empty = || Outcome::Ok(kr_protocol::envelope::ParamsValue::empty());
+        let info = |generation| {
+            Outcome::Ok(
+                kr_protocol::envelope::ParamsValue::from_typed(&host_info_of(generation))
+                    .expect("a host.info result"),
+            )
+        };
+        match peer {
+            Peer::Reports(generation) => write_outcome(writer, asked, info(generation)).await,
+            Peer::RefusesTheRead => write_outcome(writer, asked, refused(false)).await,
+            Peer::FencesTheLink => write_outcome(writer, asked, refused(true)).await,
+            Peer::AnswersWhatDoesNotDecode => write_outcome(writer, asked, empty()).await,
+            Peer::AnswersAnotherKind => {
+                write_outcome(writer, kr_protocol::ids::RequestId::new(u64::MAX), empty()).await;
+            }
+            Peer::AnswersAfterTheBound => {
+                tokio::time::sleep(LOOK_BOUND_FOR_SILENCE * 4).await;
+                write_outcome(writer, asked, info(ControllerGeneration::new(1))).await;
+            }
+            other => {
+                assert!(
+                    matches!(other, Peer::SaysNothingToTheRead),
+                    "{other:?} answers before the read"
+                );
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    /// The environment that a stand-in daemon listens for, the bound of a look at it, and the
+    /// stand-in's task, where one listens.
+    fn a_stand_in_for(
+        peer: Peer,
+    ) -> (
+        kr_ipc::testing::TempHost,
+        EnvironmentPaths,
+        Duration,
+        Option<tokio::task::JoinHandle<()>>,
+    ) {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = temp.environment();
+        let id = environment.environment_id();
+        let within = if matches!(
+            peer,
+            Peer::SaysNothingToTheHello | Peer::SaysNothingToTheRead | Peer::AnswersAfterTheBound
+        ) {
+            LOOK_BOUND_FOR_SILENCE
+        } else {
+            LOOK_BOUND_FOR_AN_ANSWER
+        };
+        let daemon = if matches!(peer, Peer::NobodyListens) {
+            None
+        } else {
+            let endpoint = environment.controller_endpoint().expect("an endpoint");
+            let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
+            Some(tokio::spawn(stand_in(listener, id, peer)))
+        };
+        (temp, environment, within, daemon)
+    }
+
+    /// What the exchange of a look at `peer` gave, from the real client on a real link.
+    async fn the_exchange_with(peer: Peer) -> Gave {
+        let (_temp, environment, within, daemon) = a_stand_in_for(peer);
+        let gave = the_look_gave(&environment, within).await;
+        if let Some(daemon) = daemon {
+            daemon.abort();
+        }
+        gave
+    }
+
+    /// What a look at `peer` says answers at the endpoint, where the generation asked is `asked`.
+    async fn look_at(peer: Peer, asked: Option<ControllerGeneration>) -> Endpoint {
+        let (_temp, environment, within, daemon) = a_stand_in_for(peer);
+        let look = endpoint_look(&environment, asked, within).await;
+        if let Some(daemon) = daemon {
+            daemon.abort();
+        }
+        look
+    }
+
+    /// Every way that the exchange of a look can end that a stand-in daemon makes, the value that
+    /// the exchange gives and the label that the look says, for the generation asked. The address
+    /// that cannot be made has its own case; a daemon of another major cannot answer a look, which
+    /// offers no other major.
+    fn the_ways_the_exchange_ends() -> Vec<(Peer, Option<u64>, &'static str, &'static str)> {
+        vec![
+            (Peer::NobodyListens, Some(1), "nothing_listens", "nobody"),
+            (
+                Peer::SaysNothingToTheHello,
+                Some(1),
+                "nothing_in_time",
+                "unclear",
+            ),
+            (
+                Peer::RefusesTheHello,
+                Some(1),
+                "greeting_replied",
+                "unproved",
+            ),
+            (
+                Peer::AnswersAnotherVersion,
+                Some(1),
+                "greeting_replied",
+                "unproved",
+            ),
+            (
+                Peer::AnswersTheHelloWithAnotherKind,
+                Some(1),
+                "greeting_replied",
+                "unproved",
+            ),
+            (
+                Peer::ClosesAfterTheHello(Closure::Clean),
+                Some(1),
+                "link_failed",
+                "unclear",
+            ),
+            (
+                Peer::ClosesAfterTheHello(Closure::BadFrame),
+                Some(1),
+                "link_failed",
+                "unclear",
+            ),
+            (
+                Peer::ClosesAfterTheHello(Closure::HalfFrame),
+                Some(1),
+                "link_failed",
+                "unclear",
+            ),
+            (
+                Peer::SaysNothingToTheRead,
+                Some(1),
+                "nothing_in_time",
+                "unclear",
+            ),
+            (
+                Peer::AnswersAfterTheBound,
+                Some(1),
+                "nothing_in_time",
+                "unclear",
+            ),
+            (
+                Peer::Reports(ControllerGeneration::new(1)),
+                Some(1),
+                "reported",
+                "same",
+            ),
+            (
+                Peer::Reports(ControllerGeneration::new(2)),
+                Some(1),
+                "reported",
+                "another",
+            ),
+            (
+                Peer::Reports(ControllerGeneration::new(1)),
+                None,
+                "reported",
+                "unproved",
+            ),
+            (Peer::RefusesTheRead, Some(1), "read_refused", "unproved"),
+            (
+                Peer::AnswersWhatDoesNotDecode,
+                Some(1),
+                "read_undecodable",
+                "unproved",
+            ),
+            (
+                Peer::AnswersAnotherKind,
+                Some(1),
+                "read_replied",
+                "unproved",
+            ),
+            (Peer::FencesTheLink, Some(1), "read_replied", "unproved"),
+        ]
+    }
+
+    /// Each way that the exchange ends gives its own value, and the look says what that value is
+    /// labelled: the producers of the look's value, on a real link with a stand-in daemon.
+    #[tokio::test]
+    async fn the_exchange_of_a_look_gives_a_value_for_each_way_it_ends() {
+        for (peer, asked, gave, label) in the_ways_the_exchange_ends() {
+            assert_eq!(
+                the_exchange_with(peer).await.label(),
+                gave,
+                "the value of the exchange with {peer:?}"
+            );
+            let asked = asked.map(ControllerGeneration::new);
+            assert_eq!(
+                Some(look_at(peer, asked).await).label(),
+                label,
+                "the label of the look at {peer:?}, asked {asked:?}"
+            );
+        }
+    }
+
+    /// A refusal of the hello is an answer of the daemon's own: a look that reads it as the same
+    /// daemon, or as no answer, is wrong. It shows that something answers, and no generation.
+    #[tokio::test]
+    async fn a_refused_greeting_is_an_answer_that_proves_no_generation() {
+        for asked in [None, Some(ControllerGeneration::new(1))] {
+            assert!(
+                matches!(
+                    look_at(Peer::RefusesTheHello, asked).await,
+                    Endpoint::Unproved(_)
+                ),
+                "asked {asked:?}"
+            );
+        }
+    }
+
+    /// An address that cannot be made is a look that did not happen, whatever the generation asked:
+    /// nothing was tried.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_address_that_cannot_be_made_gives_no_answer() {
+        let parent = tempfile::tempdir().expect("a folder");
+        let long = parent.path().join("a".repeat(150));
+        std::fs::create_dir_all(&long).expect("a long folder");
+        let temp = kr_ipc::testing::TempHost::create_in(&long);
+        let environment = temp.environment();
+        assert!(
+            environment.controller_endpoint().is_err(),
+            "the address is too long for a socket"
+        );
+        let gave = the_look_gave(&environment, LOOK_BOUND_FOR_AN_ANSWER).await;
+        assert_eq!(gave.label(), "no_address");
+        assert!(matches!(
+            endpoint_look(&environment, None, LOOK_BOUND_FOR_AN_ANSWER).await,
+            Endpoint::Unclear
+        ));
     }
 
     /// With an identity whose process state the system did not say, and a lock that cannot be read
@@ -5377,6 +5870,294 @@ mod tests {
         }
     }
 
+    /// A reply of the daemon's own that cannot be used, for the walk.
+    fn a_reply() -> Answered {
+        Answered::of_unusable_reply(&"a reply")
+    }
+
+    impl Every for Gave {
+        fn first() -> Self {
+            Self::NoAddress
+        }
+
+        fn after(&self) -> Option<Self> {
+            match self {
+                Self::NoAddress => Some(Self::NothingInTime),
+                Self::NothingInTime => Some(Self::NothingListens),
+                Self::NothingListens => Some(Self::LinkFailed),
+                Self::LinkFailed => Some(Self::GreetingReplied(a_reply())),
+                Self::GreetingReplied(_) => Some(Self::GreetingOfAnotherMajor),
+                Self::GreetingOfAnotherMajor => Some(Self::Reported(ControllerGeneration::new(1))),
+                Self::Reported(_) => Some(Self::ReadRefused(a_reply())),
+                Self::ReadRefused(_) => Some(Self::ReadUndecodable(a_reply())),
+                Self::ReadUndecodable(_) => Some(Self::ReadReplied(a_reply())),
+                Self::ReadReplied(_) => None,
+            }
+        }
+    }
+
+    impl Label for Gave {
+        fn label(&self) -> String {
+            match self {
+                Self::NoAddress => "no_address",
+                Self::NothingInTime => "nothing_in_time",
+                Self::NothingListens => "nothing_listens",
+                Self::LinkFailed => "link_failed",
+                Self::GreetingReplied(_) => "greeting_replied",
+                Self::GreetingOfAnotherMajor => "greeting_of_another_major",
+                Self::Reported(_) => "reported",
+                Self::ReadRefused(_) => "read_refused",
+                Self::ReadUndecodable(_) => "read_undecodable",
+                Self::ReadReplied(_) => "read_replied",
+            }
+            .to_owned()
+        }
+    }
+
+    /// The generation that the command asked, as the label table has it: not known, the one that
+    /// the daemon reports, or another.
+    #[derive(Clone, Copy)]
+    enum AskedGeneration {
+        Unknown,
+        Reported,
+        Another,
+    }
+
+    impl Every for AskedGeneration {
+        fn first() -> Self {
+            Self::Unknown
+        }
+
+        fn after(&self) -> Option<Self> {
+            match self {
+                Self::Unknown => Some(Self::Reported),
+                Self::Reported => Some(Self::Another),
+                Self::Another => None,
+            }
+        }
+    }
+
+    impl Label for AskedGeneration {
+        fn label(&self) -> String {
+            match self {
+                Self::Unknown => "none",
+                Self::Reported => "same",
+                Self::Another => "another",
+            }
+            .to_owned()
+        }
+    }
+
+    impl AskedGeneration {
+        /// The generation that the walk's `Gave::Reported` reports is the first.
+        fn generation(self) -> Option<ControllerGeneration> {
+            match self {
+                Self::Unknown => None,
+                Self::Reported => Some(ControllerGeneration::new(1)),
+                Self::Another => Some(ControllerGeneration::new(2)),
+            }
+        }
+    }
+
+    /// One row of the look's label table: what the exchange gave, the generation asked, and the
+    /// label that `label` gives.
+    struct LookRow {
+        gave: Gave,
+        asked: AskedGeneration,
+        look: Endpoint,
+    }
+
+    /// Every row of the look's label, made by `label`.
+    fn look_rows(label: impl Fn(Option<ControllerGeneration>, Gave) -> Endpoint) -> Vec<LookRow> {
+        let mut rows = Vec::new();
+        for gave in every::<Gave>() {
+            for asked in every::<AskedGeneration>() {
+                rows.push(LookRow {
+                    gave,
+                    asked,
+                    look: label(asked.generation(), gave),
+                });
+            }
+        }
+        rows
+    }
+
+    const LOOK_TABLE_HEADER: &str = "\
+# Generated by the lib case host_stop::tests::the_table_of_the_look_is_the_file of kr-cli. Make it again: KR_WRITE_LOOK_TABLE=1 cargo test -p kr-cli --lib host_stop::tests::the_table_of_the_look_is_the_file (the case fails once after it writes; run it again without the variable).
+# One line for each way that the exchange of a look at the endpoint can end (`gave`) and each generation asked (`asked`: none where the command does not know it, same where it is the one that the daemon reports, another), and what answers at the endpoint.
+# The label is unclear only where nothing came within the bound or the look itself failed (no address, no answer in time, a link that failed). An answer that came within the bound and proves no generation is unproved, whatever its kind.
+";
+
+    /// The look's label table, as the file holds it.
+    fn the_look_table() -> String {
+        let mut out = String::from(LOOK_TABLE_HEADER);
+        out.push_str("\n## what the exchange gave, the generation asked, and what answers\n");
+        for row in look_rows(label_of) {
+            out.push_str(&format!(
+                "gave={} asked={} -> {}\n",
+                row.gave.label(),
+                row.asked.label(),
+                Some(row.look).label()
+            ));
+        }
+        out
+    }
+
+    /// Fails with the first lines where `made` and the file `held` differ; writes the file where
+    /// `variable` is set.
+    fn is_the_file(made: &str, held: &str, file: &str, variable: &str) {
+        let path = format!("{}/tests/{file}", env!("CARGO_MANIFEST_DIR"));
+        if std::env::var_os(variable).is_some() {
+            std::fs::write(&path, made).expect("the table is written");
+            panic!(
+                "the table was written to {path}; build and run the case again without {variable}"
+            );
+        }
+        if made != held {
+            let (made_lines, held_lines): (Vec<_>, Vec<_>) =
+                (made.lines().collect(), held.lines().collect());
+            let first = (0..made_lines.len().max(held_lines.len()))
+                .find(|index| made_lines.get(*index) != held_lines.get(*index))
+                .unwrap_or(0);
+            let said: Vec<String> = (first..first + 6)
+                .filter(|index| *index < made_lines.len().max(held_lines.len()))
+                .map(|index| {
+                    format!(
+                        "line {}:\n  file: {}\n  made: {}",
+                        index + 1,
+                        held_lines.get(index).unwrap_or(&"(none)"),
+                        made_lines.get(index).unwrap_or(&"(none)")
+                    )
+                })
+                .collect();
+            panic!(
+                "the table that the code makes differs from crates/kr-cli/tests/{file} from line {}:\n{}",
+                first + 1,
+                said.join("\n")
+            );
+        }
+    }
+
+    /// The look's label table that the code makes is the table that the repository holds.
+    #[test]
+    fn the_table_of_the_look_is_the_file() {
+        is_the_file(
+            &the_look_table(),
+            include_str!("../tests/host_stop_look_table.txt"),
+            "host_stop_look_table.txt",
+            "KR_WRITE_LOOK_TABLE",
+        );
+    }
+
+    /// What the rows of the look's label break of the principle that an answer that came within the
+    /// bound and proves no generation is unproved, and that nothing is unclear but a look where
+    /// nothing came within the bound or the look itself failed.
+    fn look_violations(rows: &[LookRow]) -> Vec<String> {
+        let mut found = Vec::new();
+        for row in rows {
+            let said = format!("gave={} asked={}", row.gave.label(), row.asked.label());
+            let nothing_came = matches!(
+                row.gave,
+                Gave::NoAddress | Gave::NothingInTime | Gave::LinkFailed
+            );
+            let replied = matches!(
+                row.gave,
+                Gave::GreetingReplied(_)
+                    | Gave::ReadRefused(_)
+                    | Gave::ReadUndecodable(_)
+                    | Gave::ReadReplied(_)
+            );
+            let unproved = replied
+                || matches!(
+                    (row.gave, row.asked),
+                    (Gave::Reported(_), AskedGeneration::Unknown)
+                );
+            if matches!(row.look, Endpoint::Unclear) != nothing_came {
+                found.push(format!(
+                    "{said}: unclear is for a look where nothing came or it failed, and only there"
+                ));
+            }
+            if matches!(row.look, Endpoint::Unproved(_)) != unproved {
+                found.push(format!(
+                    "{said}: an answer that proves no generation is unproved, and only that"
+                ));
+            }
+            if matches!(row.look, Endpoint::Nobody) != matches!(row.gave, Gave::NothingListens) {
+                found.push(format!(
+                    "{said}: nobody is for a connection that found nothing listening, and only that"
+                ));
+            }
+            if matches!(row.look, Endpoint::Same(_))
+                != matches!(
+                    (row.gave, row.asked),
+                    (Gave::Reported(_), AskedGeneration::Reported)
+                )
+            {
+                found.push(format!(
+                    "{said}: the same daemon is proved only by the generation that was asked"
+                ));
+            }
+            if matches!(row.look, Endpoint::Another)
+                != (matches!(row.gave, Gave::GreetingOfAnotherMajor)
+                    || matches!(
+                        (row.gave, row.asked),
+                        (Gave::Reported(_), AskedGeneration::Another)
+                    ))
+            {
+                found.push(format!(
+                    "{said}: another daemon is a daemon of another major or of another generation"
+                ));
+            }
+        }
+        found
+    }
+
+    /// The label of the look holds its principle in every row.
+    #[test]
+    fn the_look_label_holds_its_principle_in_every_row() {
+        assert_eq!(look_violations(&look_rows(label_of)), Vec::<String>::new());
+    }
+
+    /// The property has teeth: a label that reads a refused greeting as the same daemon, one that
+    /// reads a reply that cannot be used as no answer, and one that reads a silent peer as an
+    /// answer each break exactly the rows that they change.
+    #[test]
+    fn the_look_label_property_fails_for_a_label_that_reads_an_answer_wrongly() {
+        let as_the_same = |asked: Option<ControllerGeneration>, gave: Gave| match gave {
+            Gave::GreetingReplied(answered) => Endpoint::Same(answered),
+            other => label_of(asked, other),
+        };
+        let broken = look_violations(&look_rows(as_the_same));
+        assert_eq!(broken.len(), 6, "{broken:?}");
+        assert!(
+            broken
+                .iter()
+                .all(|line| line.starts_with("gave=greeting_replied"))
+        );
+        let as_unclear = |asked: Option<ControllerGeneration>, gave: Gave| match gave {
+            Gave::ReadRefused(_) => Endpoint::Unclear,
+            other => label_of(asked, other),
+        };
+        let broken = look_violations(&look_rows(as_unclear));
+        assert_eq!(broken.len(), 6, "{broken:?}");
+        assert!(
+            broken
+                .iter()
+                .all(|line| line.starts_with("gave=read_refused"))
+        );
+        let as_an_answer = |asked: Option<ControllerGeneration>, gave: Gave| match gave {
+            Gave::NothingInTime => Endpoint::Unproved(a_reply()),
+            other => label_of(asked, other),
+        };
+        let broken = look_violations(&look_rows(as_an_answer));
+        assert_eq!(broken.len(), 6, "{broken:?}");
+        assert!(
+            broken
+                .iter()
+                .all(|line| line.starts_with("gave=nothing_in_time"))
+        );
+    }
+
     /// The exit code of a result.
     fn code_of(exit: Exit) -> u8 {
         exit.failure(Shown::said("a failure"))
@@ -5585,38 +6366,12 @@ mod tests {
     /// decision, a sentence's kind, an exit or a `stop` member shows as a change of the file.
     #[test]
     fn the_table_of_the_end_is_the_file() {
-        let made = the_table();
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/host_stop_end_table.txt");
-        if std::env::var_os("KR_WRITE_END_TABLE").is_some() {
-            std::fs::write(path, &made).expect("the table is written");
-            panic!(
-                "the table was written to {path}; build and run the case again without KR_WRITE_END_TABLE"
-            );
-        }
-        let held = include_str!("../tests/host_stop_end_table.txt");
-        if made != held {
-            let (made_lines, held_lines): (Vec<_>, Vec<_>) =
-                (made.lines().collect(), held.lines().collect());
-            let first = (0..made_lines.len().max(held_lines.len()))
-                .find(|index| made_lines.get(*index) != held_lines.get(*index))
-                .unwrap_or(0);
-            let said: Vec<String> = (first..first + 6)
-                .filter(|index| *index < made_lines.len().max(held_lines.len()))
-                .map(|index| {
-                    format!(
-                        "line {}:\n  file: {}\n  made: {}",
-                        index + 1,
-                        held_lines.get(index).unwrap_or(&"(none)"),
-                        made_lines.get(index).unwrap_or(&"(none)")
-                    )
-                })
-                .collect();
-            panic!(
-                "the table that the code makes differs from crates/kr-cli/tests/host_stop_end_table.txt from line {}:\n{}",
-                first + 1,
-                said.join("\n")
-            );
-        }
+        is_the_file(
+            &the_table(),
+            include_str!("../tests/host_stop_end_table.txt"),
+            "host_stop_end_table.txt",
+            "KR_WRITE_END_TABLE",
+        );
     }
 
     /// The rounds that the wait can make, asked of the two small functions, are the combinations
