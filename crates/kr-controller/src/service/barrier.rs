@@ -1600,13 +1600,13 @@ impl Controller {
     /// The registry's lock is not taken: it did not order this read against the request's own
     /// restriction, since a grant's revocation lets go of the registry before it publishes its
     /// debts ([`Controller::revoke_grant`]), and what that publication adds is read through the
-    /// flag. The function is async so that its callers keep their form; it awaits nothing.
+    /// flag.
     ///
     /// # Errors
     ///
     /// Returns the fence's refusal while a fence is owed, and a refusal that the authority has
     /// withdrawn when a later barrier moved the revision.
-    pub(crate) async fn withdrawal_stands(&self, withdrew: &HostWithdrawal) -> Result<()> {
+    pub(crate) fn withdrawal_stands(&self, withdrew: &HostWithdrawal) -> Result<()> {
         super::footing::Footing::untargeted(Arc::clone(&self.copies))
             .stands(super::footing::Ask::own_withdrawal(withdrew.revision))
     }
