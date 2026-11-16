@@ -78,7 +78,7 @@ use kr_client::services::account::{
     AccountHttp, AccountService, AccountStatus, AccountTokenSource, Answer, AnswerFault,
     AuthorisationGrant, AuthorisationRequest, BACKUP_WRITE_SCOPE, Client, Commit, Exchanged,
     IdentityRead, ManagedAccountService, PendingAuthorisation, RELAY_LEASE_SCOPE, Redirect,
-    SignedInAccount, TokenOfAccount, Unrevoked,
+    SignedInAccount, TokenOfAccount,
 };
 use kr_client::services::{AccountToken, HttpDeadlines, ServiceFuture};
 use kr_crypto::store::SecretStore;
