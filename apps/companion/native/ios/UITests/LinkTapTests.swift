@@ -1177,19 +1177,15 @@ final class LinkTapTests: HarnessTestCase {
         return (offset(of: last), pane().room, last.words[last.words.count - 1])
     }
 
-    /// A click that WebKit moves onto the composer focuses it and raises the keyboard, which moves the pane and the gap with it. A tap on
-    /// plain text of the conversation, away from every link, ends the focus; then the conversation is scrolled to its end and the gap's
-    /// geometry is read again, so that the next tap in the gap is a tap in the gap and not on the keyboard.
+    /// A click that WebKit moves onto the composer focuses it and raises the keyboard, which moves the pane and the gap with it. The
+    /// harness's own way of putting the keyboard away (`putTheKeyboardAway`: a tap at the screen's left edge, where no text field and no link
+    /// lies, and a wait for the keyboard to go) ends the focus; a tap on the pane cannot, since with the keyboard up the page moves under the
+    /// finger and the click can land on the text field again (run 7: a press on `p` got its click on the `textarea`). Then the conversation is
+    /// scrolled to its end and the gap's geometry is read again, so that the next tap in the gap is a tap in the gap.
     private func settleBelowThePane() -> (shift: CGVector, room: CGRect, words: CGRect) {
-        for attempt in 1...3 where app.keyboards.count > 0 {
-            guard let away = awayFromLinks() else {
-                XCTFail("the keyboard is up and no point of the conversation lies a line away from every link: \(pane().room)")
-                break
-            }
-            _ = tap("the gap: ending the composer's focus, attempt \(attempt)", at: away, shift: offset(of: link("last-line")))
-            Thread.sleep(forTimeInterval: 1.5)
-        }
-        XCTAssertEqual(app.keyboards.count, 0, "the keyboard stayed up after the composer's focus was ended")
+        putTheKeyboardAway()
+        Thread.sleep(forTimeInterval: 1.5)
+        XCTAssertFalse(app.keyboards.firstMatch.exists, "the keyboard stayed up after the composer's focus was ended")
         scrollToEnd()
         return geometryBelowThePane()
     }
