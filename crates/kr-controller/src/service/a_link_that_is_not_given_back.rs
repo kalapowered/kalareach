@@ -1179,6 +1179,7 @@ async fn an_announcement_whose_wait_for_the_link_runs_out_gives_nothing_up() {
 async fn a_request_for_evidence_whose_wait_for_the_link_runs_out_gives_nothing_up() {
     let (silent, _heard) = stalled().await;
     let controller = &silent.controller;
+    let _pass = without_an_evidence_pass(controller).await;
     let session_id = silent.session_id;
     let revision = controller.leases.authority_revision();
     let binding = controller.leases.binding(session_id);
@@ -1407,9 +1408,9 @@ async fn the_first_exchange_of_an_ask_ends_by_the_deadline_it_was_given() {
 /// sees the time that the wait took: no page goes, the link is in its slot, the worker's lease goes
 /// on renewing, and the names that were not asked for stay owed to the pass that collects them.
 ///
-/// The case holds a round while it runs, as an announcement does, so that the daemon's own pass,
-/// which gives way to one, does not collect those names while the case waits and send a page of its
-/// own to the worker.
+/// The case holds a round while it runs, as an announcement does, and takes it before the
+/// acknowledgement that makes the worker owe names, so that the daemon's own pass, which gives way to
+/// one, does not collect those names while the case waits and send a page of its own to the worker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_collection_whose_wait_for_the_link_left_too_little_time_gives_the_link_back_whole() {
     let (silent, heard) = stalled().await;
@@ -1417,12 +1418,12 @@ async fn a_collection_whose_wait_for_the_link_left_too_little_time_gives_the_lin
     let session_id = silent.session_id;
     let revision = controller.leases.authority_revision();
     let binding = controller.leases.binding(session_id);
+    let _round = controller.leases.begin_round();
     assert!(
         controller
             .leases
             .acknowledge(session_id, binding, revision, Some(evidence(3)))
     );
-    let _round = controller.leases.begin_round();
     let mut elsewhere = controller
         .worker_client(&silent.worker)
         .await
