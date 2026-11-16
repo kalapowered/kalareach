@@ -684,6 +684,22 @@ fn started_fact(started: &Started) -> StartedFact {
 
 /// What an interrupt says in each stage of a restart.
 pub(crate) fn interrupted(progress: &Progress, stage: Stage, json: bool) -> Completion {
+    let (knows, said) = interrupt_says(progress, stage);
+    host_stop::failed(
+        CliError::Unfinished {
+            code: ErrorCode::EnvironmentUnavailable,
+            message: said,
+        },
+        &Facts {
+            knows,
+            ..Facts::none(progress.said_earlier()).of_a_restart()
+        },
+        json,
+    )
+}
+
+/// What an interrupt at `stage` knows of the stop, and says.
+fn interrupt_says(progress: &Progress, stage: Stage) -> (Knows, Shown) {
     let id = progress.environment_id;
     // Whether the daemon that was stopped was seen to end: what this command did, and not what
     // its record names, which a host that cannot read the lock's holder leaves out.
@@ -754,17 +770,7 @@ pub(crate) fn interrupted(progress: &Progress, stage: Stage, json: bool) -> Comp
             ),
         ),
     };
-    host_stop::failed(
-        CliError::Unfinished {
-            code: ErrorCode::EnvironmentUnavailable,
-            message: said,
-        },
-        &Facts {
-            knows,
-            ..Facts::none(progress.said_earlier()).of_a_restart()
-        },
-        json,
-    )
+    (knows, said)
 }
 
 #[cfg(test)]
@@ -868,5 +874,53 @@ mod tests {
     fn where_none_was_stopped_any_generation_is_new() {
         let proved = proof(Some(started(Some(40))), None, &answering(1, Some(40)));
         assert!(matches!(proved, Ok(Proved::Ours(_))));
+    }
+
+    /// A progress with no record of the command's own, as an interrupt finds it where the record
+    /// could not be read: only the flag says whether the stop's request returned.
+    fn progress_of(host: &kr_ipc::testing::TempHost, daemon_ended: bool) -> Progress {
+        Progress {
+            stage: std::sync::atomic::AtomicU8::new(Stage::BeforeAsking as u8),
+            marker: std::sync::Mutex::new(None),
+            environment_id: host.environment_id(),
+            earlier: std::sync::Mutex::new(Vec::new()),
+            daemon_ended: std::sync::atomic::AtomicBool::new(daemon_ended),
+        }
+    }
+
+    /// An interrupt after the stop's request returned and before the start's own exchange says that
+    /// the daemon was stopped, from the flag that the stop set and not from a record, which a host
+    /// that cannot read the lock's holder leaves out; with the flag unset it says nothing was asked.
+    #[test]
+    fn an_interrupt_after_the_stop_and_before_the_start_says_the_daemon_was_stopped_from_the_flag()
+    {
+        let host = kr_ipc::testing::TempHost::create();
+        let (knows, said) = interrupt_says(&progress_of(&host, true), Stage::Starting);
+        assert_eq!(knows, Knows::Ended, "{said}");
+        let (knows, said) = interrupt_says(&progress_of(&host, false), Stage::Starting);
+        assert_eq!(knows, Knows::NotAsked, "{said}");
+        let (knows, said) = interrupt_says(&progress_of(&host, true), Stage::Ended);
+        assert_eq!(knows, Knows::Ended, "{said}");
+        assert!(
+            said.to_string()
+                .contains("interrupted before it asked for a new daemon"),
+            "{said}"
+        );
+    }
+
+    /// An interrupt in each stage before the stop returned knows what the request came to, and the
+    /// flag, which is set only where the stop returned, changes none of them.
+    #[test]
+    fn an_interrupt_before_the_stop_returned_knows_what_the_request_came_to() {
+        let host = kr_ipc::testing::TempHost::create();
+        for (stage, expected) in [
+            (Stage::BeforeAsking, Knows::NotAsked),
+            (Stage::Asked, Knows::MaybeAsked),
+            (Stage::Refused, Knows::Refused),
+            (Stage::Told, Knows::Told),
+        ] {
+            let (knows, said) = interrupt_says(&progress_of(&host, false), stage);
+            assert_eq!(knows, expected, "{stage:?}: {said}");
+        }
     }
 }
