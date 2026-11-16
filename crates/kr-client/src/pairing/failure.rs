@@ -18,19 +18,6 @@ use serde::{Serialize, Serializer};
 use crate::services::{Alternatives, RelayRefusal};
 use crate::shown::{Said, Shown};
 
-/// The mark of a kind of the managed relay service that was made with its wait. Only
-/// [`PairingFailure::of_relay`] can make one, so such a kind cannot be built without the figure an
-/// interface says.
-///
-/// ```compile_fail
-/// use kr_client::pairing::failure::{FailureKind, PairingFailure};
-///
-/// // Neither the kind nor its mark can be made outside this module.
-/// let _ = PairingFailure::new(FailureKind::RelayCapacity, "no figure");
-/// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Waited(());
-
 /// Which of the outcomes a person is told apart an attempt ended with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(into = "String")]
@@ -67,11 +54,17 @@ pub enum FailureKind {
     HostUnreachable,
     /// The relay this device would reach the host through is the managed service's, and the service
     /// has no free capacity to admit this device through it now: not a failure of the host.
-    RelayCapacity(Waited),
+    RelayCapacity {
+        /// The device's own wait, in seconds, until it asks the service again.
+        retry_after_seconds: u64,
+    },
     /// The relay this device would reach the host through is the managed service's, and the service
     /// failed on its side when it was asked to admit this device through it: not a failure of the
     /// host, and not a refusal for want of capacity.
-    RelayFault(Waited),
+    RelayFault {
+        /// The device's own wait, in seconds, until it asks the service again.
+        retry_after_seconds: u64,
+    },
     /// The host did not match its invitation, so nothing was sent to it.
     HostMismatch,
     /// This device is already paired with the host the invitation is for.
@@ -95,6 +88,23 @@ pub enum FailureKind {
     ApprovalUnknown,
 }
 
+impl FailureKind {
+    /// The device's own wait, in seconds, until it asks the managed relay service again: held by the
+    /// two kinds that the service's answer explains, and by no other.
+    #[must_use]
+    pub const fn retry_after_seconds(self) -> Option<u64> {
+        match self {
+            Self::RelayCapacity {
+                retry_after_seconds,
+            }
+            | Self::RelayFault {
+                retry_after_seconds,
+            } => Some(retry_after_seconds),
+            _ => None,
+        }
+    }
+}
+
 impl Said for FailureKind {
     fn said(&self) -> Shown {
         Shown::said(match self {
@@ -113,8 +123,8 @@ impl Said for FailureKind {
             Self::HostRestarted => "HostRestarted",
             Self::AnotherDeviceWaiting => "AnotherDeviceWaiting",
             Self::HostUnreachable => "HostUnreachable",
-            Self::RelayCapacity(_) => "RelayCapacity",
-            Self::RelayFault(_) => "RelayFault",
+            Self::RelayCapacity { .. } => "RelayCapacity",
+            Self::RelayFault { .. } => "RelayFault",
             Self::HostMismatch => "HostMismatch",
             Self::AlreadyPaired => "AlreadyPaired",
             Self::NotAnInvitation => "NotAnInvitation",
@@ -150,40 +160,59 @@ impl From<FailureKind> for String {
 /// secret or anything a host, a service, a store or a payload wrote, and an interface shows the
 /// kind's own words rather than it.
 ///
-/// A failure that the managed relay service's answer explains also carries the device's own wait,
-/// in seconds, until it asks the service again, and for lack of capacity the paths that still work,
-/// each as the service wrote it. The wait is always there for these two kinds and for no other; the
-/// paths are absent from what an interface is sent when the answer named none. Nothing is made up
-/// for either: an interface shows each path as received or not at all.
+/// A failure that the managed relay service's answer explains has one of two kinds, and each holds
+/// the device's own wait, in seconds, until it asks the service again, so that neither can be made
+/// without it. For lack of capacity the failure also carries the paths that still work, each as the
+/// service wrote it. The paths are absent from what an interface is sent when the answer named none.
+/// Nothing is made up for either: an interface shows each path as received or not at all.
 #[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(into = "Sent")]
 pub struct PairingFailure {
     /// Which outcome it was.
     pub kind: FailureKind,
     /// How many tries this device has left with the code, when the attempt was charged.
     pub tries_left: Option<u32>,
     /// The paths that still work, as the managed relay service named them, when it named any.
-    #[serde(
-        skip_serializing_if = "Alternatives::is_empty",
-        serialize_with = "as_received"
-    )]
     pub alternatives: Alternatives,
-    /// The device's own wait, in seconds: from now until it asks the managed relay service again,
-    /// and not less than what remains of the delay the service named, when it named one. It is the
-    /// wait after which a new attempt is answered afresh, and is present on a failure that the
-    /// service's answer explains. At most a day, by the cache's own cap on a delay; an interface
-    /// caps what it says all the same and never makes a timer from it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub retry_after_seconds: Option<u64>,
     /// Whether the attempt failed after the host had locked its invitation to it, so that the
     /// invitation can no longer be used and the same code or text, brought in again, is refused. Only
     /// an attempt that was under way through a rendezvous service, and failed on the way to the host,
     /// says so: an attempt that never reached the host, a direct invitation whose dial was lost, and
     /// one that was resumed after a restart do not. Sent only when it is true.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub invitation_spent: bool,
     /// What happened, for a log.
-    #[serde(skip)]
     pub detail: Shown,
+}
+
+/// What an interface is sent of a failure: the failure without its detail, and with the wait that
+/// its kind holds, when it holds one. The wait is not a member of the failure, so it cannot differ
+/// from the kind's. It is at most a day, by the cache's own cap on a delay, and an interface caps
+/// what it says all the same and never makes a timer from it.
+#[derive(Serialize)]
+struct Sent {
+    kind: FailureKind,
+    tries_left: Option<u32>,
+    #[serde(
+        skip_serializing_if = "Alternatives::is_empty",
+        serialize_with = "as_received"
+    )]
+    alternatives: Alternatives,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_after_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    invitation_spent: bool,
+}
+
+impl From<PairingFailure> for Sent {
+    fn from(failure: PairingFailure) -> Self {
+        Self {
+            kind: failure.kind,
+            tries_left: failure.tries_left,
+            alternatives: failure.alternatives,
+            retry_after_seconds: failure.kind.retry_after_seconds(),
+            invitation_spent: failure.invitation_spent,
+        }
+    }
 }
 
 /// Writes each path as the service wrote it, and nothing else.
@@ -196,15 +225,13 @@ fn as_received<S: Serializer>(
 }
 
 impl PairingFailure {
-    /// A failure of `kind`, with `detail` for a log. The two kinds of the managed relay service
-    /// cannot be given here: [`Self::of_relay`] makes them, with their wait.
+    /// A failure of `kind`, with `detail` for a log.
     #[must_use]
     pub fn new(kind: FailureKind, detail: impl Into<Shown>) -> Self {
         Self {
             kind,
             tries_left: None,
             alternatives: Alternatives::none(),
-            retry_after_seconds: None,
             invitation_spent: false,
             detail: detail.into(),
         }
@@ -221,21 +248,21 @@ impl PairingFailure {
                 retry_after_seconds,
             } => Self {
                 alternatives,
-                retry_after_seconds: Some(retry_after_seconds),
                 ..Self::new(
-                    FailureKind::RelayCapacity(Waited(())),
+                    FailureKind::RelayCapacity {
+                        retry_after_seconds,
+                    },
                     "the managed relay has no free capacity to admit this device now",
                 )
             },
             RelayRefusal::Fault {
                 retry_after_seconds,
-            } => Self {
-                retry_after_seconds: Some(retry_after_seconds),
-                ..Self::new(
-                    FailureKind::RelayFault(Waited(())),
-                    "the managed relay service could not admit this device now",
-                )
-            },
+            } => Self::new(
+                FailureKind::RelayFault {
+                    retry_after_seconds,
+                },
+                "the managed relay service could not admit this device now",
+            ),
         }
     }
 
@@ -340,6 +367,62 @@ mod tests {
             consumed(PairingConsumedReason::HostRestarted),
             FailureKind::HostRestarted
         );
+    }
+
+    /// An interface reads a kind by its name, so each kind is sent under the name it has always had,
+    /// whatever it holds.
+    #[test]
+    fn every_kind_is_sent_under_its_name() {
+        let kinds = [
+            (FailureKind::Malformed, "malformed"),
+            (FailureKind::DeviceTriesUsed, "device_tries_used"),
+            (FailureKind::ServiceUnreachable, "service_unreachable"),
+            (FailureKind::ServiceNotPairing, "service_not_pairing"),
+            (FailureKind::NoHostAnswered, "no_host_answered"),
+            (FailureKind::NotAuthenticated, "not_authenticated"),
+            (FailureKind::HostTriesUsed, "host_tries_used"),
+            (FailureKind::Expired, "expired"),
+            (FailureKind::TimedOut, "timed_out"),
+            (FailureKind::DidNotFinish, "did_not_finish"),
+            (FailureKind::Declined, "declined"),
+            (FailureKind::Withdrawn, "withdrawn"),
+            (FailureKind::HostRestarted, "host_restarted"),
+            (FailureKind::AnotherDeviceWaiting, "another_device_waiting"),
+            (FailureKind::HostUnreachable, "host_unreachable"),
+            (
+                FailureKind::RelayCapacity {
+                    retry_after_seconds: 7,
+                },
+                "relay_capacity",
+            ),
+            (
+                FailureKind::RelayFault {
+                    retry_after_seconds: 0,
+                },
+                "relay_fault",
+            ),
+            (FailureKind::HostMismatch, "host_mismatch"),
+            (FailureKind::AlreadyPaired, "already_paired"),
+            (FailureKind::NotAnInvitation, "not_an_invitation"),
+            (FailureKind::NewerInvitation, "newer_invitation"),
+            (FailureKind::NothingToPaste, "nothing_to_paste"),
+            (FailureKind::CameraDenied, "camera_denied"),
+            (FailureKind::NoCodeFound, "no_code_found"),
+            (FailureKind::ReaderFailed, "reader_failed"),
+            (FailureKind::StoreFailed, "store_failed"),
+            (FailureKind::ApprovalUnknown, "approval_unknown"),
+        ];
+        assert_eq!(kinds.len(), 27);
+        for (kind, name) in kinds {
+            let sent = serde_json::to_value(PairingFailure::new(kind, "a kind")).expect("ok");
+            assert_eq!(sent["kind"], serde_json::json!(name), "{name}");
+            assert_eq!(
+                sent.get("retry_after_seconds")
+                    .and_then(serde_json::Value::as_u64),
+                kind.retry_after_seconds(),
+                "{name}"
+            );
+        }
     }
 
     /// A failure's detail is for a log: it never reaches what an interface is sent.
