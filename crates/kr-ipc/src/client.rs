@@ -757,7 +757,14 @@ impl<C: Codec> Client<C> {
         Ok(proof)
     }
 
-    /// Answers the worker's generation challenge.
+    /// Answers the worker's generation challenge, and waits on this connection for the answer.
+    ///
+    /// A worker whose dispatch boundary is held answers a presentation only when the hold ends,
+    /// which can take long, and while it waits it asks the operating system, at short intervals,
+    /// whether this connection's peer has gone. A peer that has gone is not answered: the worker
+    /// ends the connection and decides nothing for it. A client that wants its answer therefore
+    /// sends nothing after the token, and does not end the side it sends on, until the worker has
+    /// answered. It ends the connection when it no longer wants the answer, and not before.
     ///
     /// # Errors
     ///
