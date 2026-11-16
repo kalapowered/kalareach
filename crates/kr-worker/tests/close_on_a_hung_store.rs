@@ -20,6 +20,7 @@
 
 #![cfg(unix)]
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,16 +28,20 @@ use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::identity::{ProcessState, process_state};
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
+use kr_protocol::broker::IntegrationMode;
 use kr_protocol::envelope::ActionTarget;
+use kr_protocol::gateway::NativeFraming;
 use kr_protocol::hello::PROTOCOL_VERSION;
-use kr_protocol::identity::{DesktopBinding, WorkerProfile};
+use kr_protocol::identity::{
+    DesktopBinding, ProcessStartIdentity, ProcessStartSource, WorkerProfile,
+};
 use kr_protocol::ids::{
-    ActionId, BuildId, ControllerGeneration, EnvironmentId, InputLeaseEpoch, SessionEpoch,
-    SessionId,
+    ActionId, ApplicationInstanceId, BrokerBindingId, BuildId, ConnectionId, ControllerGeneration,
+    EnvironmentId, InputLeaseEpoch, SessionEpoch, SessionId,
 };
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
-use kr_protocol::scalars::Nullable;
+use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
 use kr_protocol::session::{
     ApplicationState, Dimensions, DisplayNumber, SessionCloseParams, SessionCloseResult,
     SessionReadParams, SessionReadResult, SessionState, ShellMode,
@@ -44,11 +49,20 @@ use kr_protocol::session::{
 use kr_shell_integration::contract::fence::LeaseView;
 use kr_shell_integration::contract::requests::LaunchTransactionId;
 use kr_worker::application::{Holder, Producer};
+use kr_worker::broker::binder::MatchedExecutable;
+use kr_worker::broker::catalogue::{Admissions, testing};
+use kr_worker::broker::connectors::{
+    ConnectorSources, InstalledConnector, QualifiedExecutable, fixture,
+};
+use kr_worker::broker::{
+    BrokerTransport, Carried, Credential, Duplex, Framing, ManagedProcess, TransportHandle,
+};
 use kr_worker::fence::FenceDriver;
 use kr_worker::published::TAKE_BOUND;
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
+use tokio::io::AsyncReadExt as _;
 
 /// What a person waits for the answer to a close: the whole exchange the daemon allows.
 const ANSWER_BOUND: Duration = Duration::from_secs(7);
@@ -813,6 +827,220 @@ fn domain_application_state(host: &Host) -> Option<kr_protocol::session::Applica
     host.runtime.input().lock().application_state()
 }
 
+/// Waits until the input domain holds `expected`, which the evidence loop writes when it reads
+/// what the broker holds. The case does not call the producer: the wait ends the case when the
+/// loop does not read the fact within [`CLOSURE_WAIT`].
+async fn domain_application_state_becomes(
+    host: &Host,
+    expected: Option<kr_protocol::session::ApplicationState>,
+    what: &str,
+) {
+    let began = Instant::now();
+    while domain_application_state(host) != expected {
+        assert!(
+            began.elapsed() < CLOSURE_WAIT,
+            "{what}: the input domain did not come to say {expected:?} within {CLOSURE_WAIT:?}, it says {:?}",
+            domain_application_state(host)
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Reads the held session until its application state is `expected`, for no longer than
+/// [`CLOSURE_WAIT`], and returns the state the last read gave. Each read is answered within its
+/// bound while the session is held, and none of them takes the session.
+async fn held_application_state_becomes(
+    reader: &mut LocalClient,
+    host: &Host,
+    expected: Option<kr_protocol::session::ApplicationState>,
+    what: &str,
+) -> Option<kr_protocol::session::ApplicationState> {
+    let began = Instant::now();
+    loop {
+        let (_, read) = read_within_its_bound(reader, host, what).await;
+        assert!(
+            read.launch_profile.0.is_none(),
+            "{what}: the read was answered while the session was held"
+        );
+        let said = read.session.application_state.0;
+        if said == expected || began.elapsed() >= CLOSURE_WAIT {
+            return said;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+const AGENT_NOW: TimestampMs = TimestampMs::new(10);
+const AGENT_START: &str = r#"{"id":1,"method":"thread/start","params":{}}"#;
+const TURN_7_STARTED: &str =
+    r#"{"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-7"}}}"#;
+const TURN_7_ENDED: &str =
+    r#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-7"}}}"#;
+const TURN_8_STARTED: &str =
+    r#"{"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-8"}}}"#;
+const TURN_8_ENDED: &str =
+    r#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-8"}}}"#;
+
+/// One gateway instance bound to the host's own broker, and the connection that its application's
+/// frames reach the broker by. What the host's evidence loop reads is what these frames change.
+struct Agent {
+    owner: Arc<Duplex>,
+    /// What the owner wrote to the server.
+    upstream: tokio::io::DuplexStream,
+    /// What the owner wrote to the terminal.
+    _client: tokio::io::DuplexStream,
+    writes: tokio::task::JoinHandle<()>,
+    _package: tempfile::TempDir,
+}
+
+impl Drop for Agent {
+    fn drop(&mut self) {
+        self.writes.abort();
+    }
+}
+
+/// Binds an instance of the answering gateway package to the host's broker and opens the native
+/// connection that the application's frames travel on.
+async fn bind_agent(host: &Host) -> Agent {
+    let instance = ApplicationInstanceId::new(Uuid::from_bytes([2; 16]));
+    let process = || ProcessStartIdentity::new(41, ProcessStartSource::MacosProcBsdInfo, 900);
+    let executable = Digest256::from_bytes([3; 32]);
+    let package = tempfile::tempdir().expect("a directory for the package");
+    let mut source = fixture::package(
+        package.path(),
+        Path::new(fixture::FORWARDER),
+        &fixture::Shape::codex_backend_answering(),
+    )
+    .expect("the package is written");
+    source.qualified = vec![QualifiedExecutable {
+        digest: executable,
+        version: fixture::GATEWAY_QUALIFIED_VERSION.to_owned(),
+    }];
+    let connector = InstalledConnector::read(source.clone()).expect("the package is read");
+    let broker = host.service.broker();
+    let frame = testing::admit(
+        &Admissions::new(),
+        &ConnectorSources::new(),
+        broker,
+        vec![testing::admitted(&source)],
+        1,
+    );
+    broker
+        .register_instance(
+            instance,
+            IntegrationMode::Gateway,
+            None,
+            Some(ManagedProcess::new(
+                instance,
+                process(),
+                TransportHandle {
+                    transport: BrokerTransport::PrivateSocket,
+                    application_instance_id: instance,
+                    executable_digest: executable,
+                    process: process(),
+                },
+                Credential::from_bytes([9; 32]),
+                TimestampMs::new(1),
+            )),
+        )
+        .expect("the instance is registered");
+    broker
+        .bind(
+            BrokerBindingId::new(Uuid::from_bytes([7; 16])),
+            instance,
+            source.package_digest,
+            frame,
+            MatchedExecutable {
+                path: "/usr/local/bin/codex".to_owned(),
+                digest: executable,
+            },
+            AGENT_NOW,
+        )
+        .expect("the package is bound");
+    broker
+        .withhold_thread(instance)
+        .expect("the instance withholds its thread");
+    let tables = broker
+        .pin_compiled(instance, &connector, &executable)
+        .expect("the compiled tables are pinned");
+    let connection = broker
+        .open_native_connection(
+            instance,
+            &[9; 32],
+            &process(),
+            &connector.plugin_id(),
+            &tables.protocol_version,
+        )
+        .expect("a native connection opens");
+    let (upstream_here, upstream) = tokio::io::duplex(1 << 20);
+    let (client_here, client) = tokio::io::duplex(1 << 20);
+    let (owner, writes) = Duplex::new(
+        Arc::clone(broker),
+        connection,
+        Framing::new(NativeFraming::JsonLines),
+        upstream_here,
+        client_here,
+        EnvironmentId::new(Uuid::from_bytes([4; 16])),
+        "agent-user",
+    );
+    let dispatch = owner.dispatch().expect("the connection has a dispatch");
+    broker.bind_connection_dispatch(connection, dispatch.clone());
+    broker
+        .bind_dispatch(instance, dispatch)
+        .expect("the instance has a transport");
+    Agent {
+        owner,
+        upstream,
+        _client: client,
+        writes: tokio::spawn(writes),
+        _package: package,
+    }
+}
+
+impl Agent {
+    /// The server says something of its own, as the broker receives it from the application. It
+    /// is carried within [`REACH`], so a frame that waits for the session fails the case here.
+    async fn says(&self, frame: &str) {
+        tokio::time::timeout(REACH, self.owner.from_upstream(frame.as_bytes(), AGENT_NOW))
+            .await
+            .unwrap_or_else(|_| panic!("the frame was not carried within {REACH:?}"))
+            .expect("the frame is carried");
+    }
+
+    /// The terminal selects a thread and the server answers, so that the binding names it.
+    async fn selects_a_thread(&mut self) {
+        let selecting = match self
+            .owner
+            .from_client(AGENT_START.as_bytes(), AGENT_NOW)
+            .await
+            .expect("the request is carried")
+        {
+            Carried::ClientRequest {
+                upstream_request_id,
+                ..
+            } => upstream_request_id,
+            other => panic!("not a request of the terminal's: {other:?}"),
+        };
+        self.reads_a_line().await;
+        self.says(&format!(
+            r#"{{"id":{},"result":{{"thread":{{"id":"thread-1"}}}}}}"#,
+            selecting.as_str()
+        ))
+        .await;
+    }
+
+    /// Reads the next line the owner wrote to the server.
+    async fn reads_a_line(&mut self) {
+        let mut byte = [0_u8; 1];
+        loop {
+            self.upstream.read_exact(&mut byte).await.expect("a byte");
+            if byte[0] == b'\n' {
+                return;
+            }
+        }
+    }
+}
+
 /// The read of a session that nothing holds is the one that takes it: the control of the cases
 /// below. It carries the session's content and its state, as it always did.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -1008,6 +1236,275 @@ async fn a_fact_the_producer_takes_during_the_hold_is_in_the_read_of_the_held_se
         "a held session says the turn that the producer took during the hold"
     );
     producer.settle();
+}
+
+/// A turn that the daemon's last scan saw ends and a new turn starts, in ONE hold. The host's own
+/// evidence loop reads both from the real broker, as the connector's frames change it, and the
+/// read of the held session says that the new turn runs: the sleep demand counts it, and a session
+/// that shows no demand under a turn lets the host sleep.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_read_of_a_held_session_says_the_new_turn_when_a_turn_ended_and_a_new_one_began_in_the_hold()
+ {
+    let host = host().await;
+    let mut agent = bind_agent(&host).await;
+    agent.selects_a_thread().await;
+    agent.says(TURN_7_STARTED).await;
+    // What the case stands on: the loop has read the turn, and the scan could have seen it.
+    domain_application_state_becomes(&host, Some(ApplicationState::AgentBusy), "first turn").await;
+    let (holder, mut reader) = (host.client().await, host.client().await);
+    let standing = stall(&host, Stalled::Prune, holder).await;
+    agent.says(TURN_7_ENDED).await;
+    // The loop reads the end during the hold. What it does next is what the case is about.
+    domain_application_state_becomes(&host, Some(ApplicationState::ShellReady), "turn ended").await;
+    agent.says(TURN_8_STARTED).await;
+    let said = held_application_state_becomes(
+        &mut reader,
+        &host,
+        Some(ApplicationState::AgentBusy),
+        "held read after the new turn",
+    )
+    .await;
+    let _ = standing.release.send(());
+    assert_eq!(
+        said,
+        Some(ApplicationState::AgentBusy),
+        "the read of a held session said {said:?} for {CLOSURE_WAIT:?} after a new turn began in the same hold in which the previous one ended"
+    );
+}
+
+/// A turn that the daemon's last scan saw ends before a storage call holds the session, and the
+/// host's evidence loop reads the end. The read of the held session says what the application is
+/// doing now, and not the turn that the summary the session published last still carries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_read_of_a_held_session_says_that_the_turn_ended_before_the_hold() {
+    let host = host().await;
+    let mut agent = bind_agent(&host).await;
+    agent.selects_a_thread().await;
+    agent.says(TURN_7_STARTED).await;
+    domain_application_state_becomes(&host, Some(ApplicationState::AgentBusy), "turn").await;
+    agent.says(TURN_7_ENDED).await;
+    domain_application_state_becomes(&host, Some(ApplicationState::ShellReady), "turn ended").await;
+    let (holder, mut reader) = (host.client().await, host.client().await);
+    let standing = stall(&host, Stalled::Prune, holder).await;
+    let said = held_application_state_becomes(
+        &mut reader,
+        &host,
+        Some(ApplicationState::ShellReady),
+        "held read after the turn ended",
+    )
+    .await;
+    let _ = standing.release.send(());
+    assert_eq!(
+        said,
+        Some(ApplicationState::ShellReady),
+        "the read of a held session said {said:?} for a turn that ended before the hold"
+    );
+}
+
+/// A turn starts while a storage call holds the session, after the evidence loop read a session
+/// that showed no demand. The read of the held session says that the agent works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_read_of_a_held_session_says_the_turn_that_began_after_a_read_that_saw_no_demand() {
+    let host = host().await;
+    let mut agent = bind_agent(&host).await;
+    agent.selects_a_thread().await;
+    agent.says(TURN_7_STARTED).await;
+    domain_application_state_becomes(&host, Some(ApplicationState::AgentBusy), "turn").await;
+    agent.says(TURN_7_ENDED).await;
+    domain_application_state_becomes(&host, Some(ApplicationState::ShellReady), "turn ended").await;
+    let (holder, mut reader) = (host.client().await, host.client().await);
+    let standing = stall(&host, Stalled::Prune, holder).await;
+    agent.says(TURN_8_STARTED).await;
+    let said = held_application_state_becomes(
+        &mut reader,
+        &host,
+        Some(ApplicationState::AgentBusy),
+        "held read after the turn began",
+    )
+    .await;
+    let _ = standing.release.send(());
+    assert_eq!(
+        said,
+        Some(ApplicationState::AgentBusy),
+        "the read of a held session said {said:?} for a turn that began in the hold"
+    );
+}
+
+/// A turn ends while a storage call holds the session and none follows. The read of the held
+/// session says that nothing is happening: a session that shows a turn that has ended keeps the
+/// host awake for nothing, until the hold ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_read_of_a_held_session_says_that_the_turn_ended_in_the_hold_when_none_followed() {
+    let host = host().await;
+    let mut agent = bind_agent(&host).await;
+    agent.selects_a_thread().await;
+    agent.says(TURN_7_STARTED).await;
+    domain_application_state_becomes(&host, Some(ApplicationState::AgentBusy), "turn").await;
+    let (holder, mut reader) = (host.client().await, host.client().await);
+    let standing = stall(&host, Stalled::Prune, holder).await;
+    agent.says(TURN_7_ENDED).await;
+    let said = held_application_state_becomes(
+        &mut reader,
+        &host,
+        Some(ApplicationState::ShellReady),
+        "held read after the turn ended",
+    )
+    .await;
+    let _ = standing.release.send(());
+    assert_eq!(
+        said,
+        Some(ApplicationState::ShellReady),
+        "the read of a held session said {said:?} for a turn that ended in the hold"
+    );
+}
+
+/// A question's commit stands in the question ledger and holds the ledger's lock, as a commit to a
+/// disk that has stopped does, while a storage call holds the session. A turn starts. The evidence
+/// loop reads the broker's facts although the ledger's reader is blocked, so the read of the held
+/// session says that the agent works. Once the commit returns, the ledger's reader says the
+/// question.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_read_of_a_held_session_says_the_turn_while_a_question_commit_stands_in_the_ledger() {
+    let host = host().await;
+    let mut agent = bind_agent(&host).await;
+    agent.selects_a_thread().await;
+    let (arrived, let_go) = host.service.questions().stall_next_commit();
+    let asking = {
+        let service = Arc::clone(&host.service);
+        let session_id = host.session_id;
+        std::thread::spawn(move || ask_a_question(&service, session_id))
+    };
+    reached(arrived, "the question's commit").await;
+    // The session is held by the seam that takes it and waits: a stalled prune would need the
+    // store that the ledger's commit stands in, and the maintenance pass sweeps the ledger first.
+    let mut reader = host.client().await;
+    let (held, hold) = host.runtime.hold_the_session();
+    reached(held, "the session's hold").await;
+    agent.says(TURN_7_STARTED).await;
+    let said = held_application_state_becomes(
+        &mut reader,
+        &host,
+        Some(ApplicationState::AgentBusy),
+        "held read while the ledger's commit stands",
+    )
+    .await;
+    let _ = let_go.send(());
+    let _ = hold.send(());
+    asking.join().expect("the question's thread ended");
+    assert_eq!(
+        said,
+        Some(ApplicationState::AgentBusy),
+        "the read of a held session said {said:?} for a turn that began while a commit stood in the ledger"
+    );
+    domain_application_state_becomes(
+        &host,
+        Some(ApplicationState::AwaitingInput),
+        "the question once its commit returned",
+    )
+    .await;
+}
+
+/// A question is created from the host's own process, which stands in its commit when the case has
+/// armed the ledger's stall.
+fn ask_a_question(service: &WorkerService, session_id: SessionId) {
+    let source = kr_worker::questions::VerifiedSource {
+        process: kr_ipc::identity::current_process_start_identity().expect("a process identity"),
+        executable: Some("/bin/agent".to_owned()),
+        session_member: true,
+        ancestry: true,
+        launch_channel: true,
+        connection_id: ConnectionId::new(kr_ipc::new_uuid()),
+    };
+    service
+        .questions()
+        .create(
+            &source,
+            &kr_protocol::question::QuestionCreateParams {
+                session_id,
+                request_id: "req-1".to_owned(),
+                agent_name: Nullable::some("an agent".to_owned()),
+                context: "two ways to do it".to_owned(),
+                question: "which one".to_owned(),
+                kind: kr_protocol::question::QuestionKind::Confirm,
+                choices: Vec::new(),
+                requested_expiry_ms: Nullable::null(),
+                wait_ms: Nullable::null(),
+            },
+            kr_worker::questions::Now {
+                utc_ms: kr_ipc::now_ms(),
+                boot_ms: kr_ipc::clock::boot_elapsed_ms(),
+            },
+        )
+        .expect("a verified source creates a question");
+}
+
+/// Facts that join while the publisher waits for the session are published once the session is
+/// let go, and what reaches the session is the latest the facts say: the name that joined while the
+/// publisher already waited, not the one that woke it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_publication_that_waited_for_the_held_session_is_the_latest_the_facts_say() {
+    let host = host().await;
+    let producer = Producer::new(Arc::downgrade(&host.runtime));
+    let standing = stall(&host, Stalled::Prune, host.client().await).await;
+    producer.observe_holder(Holder::Program(Some("first".to_owned())));
+    // The publisher has been told and waits for the session; the second fact joins after that.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    producer.observe_holder(Holder::Program(Some("second".to_owned())));
+    assert_eq!(
+        host.runtime.published().latest().application,
+        None,
+        "nothing is published to the session while it is held"
+    );
+    let _ = standing.release.send(());
+    let began = Instant::now();
+    while host.runtime.published().latest().application.as_deref() != Some("second") {
+        assert!(
+            began.elapsed() < CLOSURE_WAIT,
+            "the session was not told the latest name within {CLOSURE_WAIT:?} of its release: {:?}",
+            host.runtime.published().latest().application
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    producer.settle();
+    assert_eq!(producer.application().name.as_deref(), Some("second"));
+}
+
+/// The application's two helper threads end with their owners: the reader of the question ledger
+/// with the evidence loop, when the session closes, and the publisher with the producer, when the
+/// service goes. A producer that is dropped ends its publisher too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_helper_threads_of_the_application_end_with_their_owners() {
+    let alone = Producer::new(std::sync::Weak::new());
+    let alive = alone.helpers_alive();
+    assert_eq!(alive.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(alone);
+    helpers_alive_become(&alive, 0, "a producer that was dropped").await;
+
+    let host = host_of(true).await;
+    let alive = host.service.application().helpers_alive();
+    helpers_alive_become(&alive, 2, "a worker that follows its application").await;
+    let (_, gate) = host
+        .runtime
+        .close(kr_protocol::session::ClosureReason::CloseRequested);
+    gate.release();
+    tokio::time::timeout(CLOSURE_WAIT, host.runtime.wait_closed())
+        .await
+        .expect("the session closes");
+    helpers_alive_become(&alive, 1, "a worker whose session has closed").await;
+    drop(host);
+    helpers_alive_become(&alive, 0, "a worker that has gone").await;
+}
+
+async fn helpers_alive_become(alive: &std::sync::atomic::AtomicUsize, expected: usize, what: &str) {
+    let began = Instant::now();
+    while alive.load(std::sync::atomic::Ordering::SeqCst) != expected {
+        assert!(
+            began.elapsed() < CLOSURE_WAIT,
+            "{what}: {} helper threads were alive {CLOSURE_WAIT:?} on, and {expected} were expected",
+            alive.load(std::sync::atomic::Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// A read that names another session is refused whether or not the session is held.
