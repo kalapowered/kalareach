@@ -104,6 +104,19 @@ enum Goes {
     BehindAFrame,
 }
 
+/// What happens before the action that waits for the boundary is accepted, or while its preparation
+/// stands at its stop.
+#[derive(Clone, Copy)]
+enum Before {
+    /// Nothing: the action is the first that the journal accepts.
+    Nothing,
+    /// The action is cancelled while its preparation is stopped.
+    ItIsCancelled,
+    /// Another action is accepted and finished first, so that the journal's event for this action's
+    /// acceptance has a sequence above 1 while its receipt is at revision 1.
+    AnotherActionIsDone,
+}
+
 /// An accepted action whose component has answered and which waits for the dispatch boundary.
 struct Waiting {
     acting: Acting,
@@ -118,18 +131,26 @@ struct Waiting {
     held: Held,
     /// The connections the worker serves while the action waits.
     start: usize,
+    /// How many frames the upstream had been written when the action was sent.
+    upstream_before: usize,
 }
 
 /// Starts the world, sends a `turn.cancel` action on a connection of its own and waits until it is
-/// accepted and its preparation stands at its stop. A cancellation by `cancel_first`, when asked
-/// for, is made then. The holder takes `hold`, the preparation is let go, and the function returns
+/// accepted and its preparation stands at its stop. What `before` asks for is done then: the
+/// cancellation of the action, or another action finished first. The holder takes `hold`, the preparation is let go, and the function returns
 /// once the action waits for the dispatch boundary. It returns nothing where the world cannot be
 /// started, which the fixture has said in words.
-async fn waiting_for_the_boundary(hold: Hold, cancel_first: bool) -> Option<Waiting> {
+async fn waiting_for_the_boundary(hold: Hold, before: Before) -> Option<Waiting> {
     let acting = Acting::start_on(Arc::new(kr_transport::clock::ManualClock::new())).await?;
     let service = Arc::clone(&acting.hosted._service);
     let mut watcher = acting.client().await;
     let mut asking = acting.client().await;
+    if matches!(before, Before::AnotherActionIsDone) {
+        let earlier = acting.invocation(&watcher, "turn.cancel", b"{}");
+        let done = send(&mut watcher, earlier).await;
+        assert!(matches!(done, Outcome::Ok(_)), "{done:?}");
+    }
+    let upstream_before = acting.frames().len();
     let mutation = acting.invocation(&asking, "turn.cancel", b"{}");
     let action_id = mutation.action_id;
     let (arrived, release) = service.stall_next_preparation();
@@ -143,7 +164,23 @@ async fn waiting_for_the_boundary(hold: Hold, cancel_first: bool) -> Option<Wait
         .await
         .expect("the preparation reaches its stop")
         .expect("the stop is not dropped before the preparation reaches it");
-    if cancel_first {
+    if matches!(before, Before::AnotherActionIsDone) {
+        // The state this arrangement stands on: the journal's event for this acceptance and the
+        // receipt's revision are two numbers, and they differ.
+        let sequence = service
+            .runtime()
+            .session()
+            .journal()
+            .expect("a journal")
+            .acceptance_sequence(&accepted.actor_id, action_id)
+            .expect("reads the acceptance's sequence");
+        assert!(
+            sequence > accepted.revision.get(),
+            "the acceptance's sequence {sequence} is above the receipt's revision {}",
+            accepted.revision.get()
+        );
+    }
+    if matches!(before, Before::ItIsCancelled) {
         let mut cancel = acting.invocation(&watcher, "turn.cancel", b"{}");
         cancel.method = Method::ActionCancel.into();
         cancel.action_id = ActionId::new(kr_ipc::new_uuid());
@@ -179,6 +216,7 @@ async fn waiting_for_the_boundary(hold: Hold, cancel_first: bool) -> Option<Wait
         accepted,
         held,
         start,
+        upstream_before,
     })
 }
 
@@ -225,7 +263,8 @@ impl Waiting {
 async fn kr_req_23_30_a_prepared_action_whose_client_goes_under_a_held_boundary_is_rejected_at_once()
  {
     for how in [Goes::Plainly, Goes::BehindAFrame] {
-        let Some(mut waiting) = waiting_for_the_boundary(Hold::Boundary, false).await else {
+        let Some(mut waiting) = waiting_for_the_boundary(Hold::Boundary, Before::Nothing).await
+        else {
             return;
         };
         let gone = waiting.client_goes(how).await;
@@ -272,7 +311,8 @@ async fn kr_req_23_30_a_prepared_action_whose_client_goes_under_a_held_boundary_
 async fn kr_req_23_30_a_prepared_action_whose_client_goes_under_the_session_is_rejected_when_it_is_let_go()
  {
     for how in [Goes::Plainly, Goes::BehindAFrame] {
-        let Some(mut waiting) = waiting_for_the_boundary(Hold::BoundaryAndSession, false).await
+        let Some(mut waiting) =
+            waiting_for_the_boundary(Hold::BoundaryAndSession, Before::Nothing).await
         else {
             return;
         };
@@ -316,6 +356,58 @@ async fn kr_req_23_30_a_prepared_action_whose_client_goes_under_the_session_is_r
     }
 }
 
+/// KR-REQ-23.30: the owner's rejection finds the receipt it was owed for by the journal's sequence
+/// of the acceptance, which is not the receipt's revision.
+///
+/// Another action is accepted and finished first, so the event that recorded this action's
+/// acceptance has a sequence above 1 (the journal numbers its events across receipts and never
+/// reuses a number) while the receipt is at revision 1, as every new receipt is; the arrangement
+/// asserts both numbers. The client goes with the boundary and the session held, and when they are
+/// let go the owner rejects the action once: a rejection that named the revision in place of the
+/// sequence would not find its receipt and would leave it `accepted`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_30_an_owed_rejection_finds_its_receipt_by_the_journals_sequence_not_the_revision()
+ {
+    let Some(mut waiting) =
+        waiting_for_the_boundary(Hold::BoundaryAndSession, Before::AnotherActionIsDone).await
+    else {
+        return;
+    };
+    let gone = waiting.client_goes(Goes::Plainly).await;
+    waiting.given_back("another action first").await;
+    waiting.held.release();
+    drop(gone);
+    assert!(
+        settles(|| waiting.service.owed_done_for_tests().0 == 1).await,
+        "the owner took the action's entry when the session was let go: {:?}",
+        waiting.service.owed_done_for_tests()
+    );
+    let receipt = read_receipt(&mut waiting.watcher, waiting.action_id)
+        .await
+        .expect("a receipt");
+    assert_eq!(
+        receipt.state,
+        ReceiptState::Rejected,
+        "the owner's rejection found the receipt it was owed for: {receipt:?}"
+    );
+    assert_eq!(
+        receipt.reason.as_ref(),
+        Some(&RejectionReason::AdmissionFailed),
+        "{receipt:?}"
+    );
+    assert_eq!(
+        receipt.revision.get(),
+        waiting.accepted.revision.get() + 1,
+        "rejected once, one revision higher: {receipt:?}"
+    );
+    assert_eq!(
+        waiting.acting.frames().len(),
+        waiting.upstream_before,
+        "nothing was written to the upstream for the dropped action: {:?}",
+        waiting.acting.frames()
+    );
+}
+
 /// KR-REQ-23.30: a cancellation that came before the client went stays what it was: the owner's
 /// rejection finds the receipt no longer accepted and leaves it.
 ///
@@ -325,7 +417,9 @@ async fn kr_req_23_30_a_prepared_action_whose_client_goes_under_the_session_is_r
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_a_cancellation_that_came_first_stays_when_the_owner_rejects_a_dropped_action()
 {
-    let Some(mut waiting) = waiting_for_the_boundary(Hold::BoundaryAndSession, true).await else {
+    let Some(mut waiting) =
+        waiting_for_the_boundary(Hold::BoundaryAndSession, Before::ItIsCancelled).await
+    else {
         return;
     };
     let cancelled = waiting.accepted.clone();
@@ -369,7 +463,7 @@ async fn kr_req_23_30_a_cancellation_that_came_first_stays_when_the_owner_reject
 /// action's is written when the upstream has answered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_a_cancel_sent_behind_a_waiting_prepared_action_is_read_after_the_action() {
-    let Some(mut waiting) = waiting_for_the_boundary(Hold::Boundary, false).await else {
+    let Some(mut waiting) = waiting_for_the_boundary(Hold::Boundary, Before::Nothing).await else {
         return;
     };
     let asking = waiting.asking.as_mut().expect("the client is there");
