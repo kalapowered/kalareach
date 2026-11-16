@@ -33,6 +33,7 @@ use kr_client::organisation::LeaseStop;
 use kr_client::services::account::AccountStatus;
 use kr_client::transport::{ControlTransport, Reach, StreamOpener, TransportFuture};
 use kr_protocol::envelope::ControlFrame;
+use kr_client::transport::DeviceEnd;
 use kr_protocol::error::ProtocolError;
 use kr_protocol::frame::StreamHeader;
 use kr_protocol::hello::{ActionWindow, ReceiveLimits};
@@ -57,7 +58,7 @@ pub struct Binding {
     presented: AtomicBool,
     inner: Arc<dyn ControlTransport>,
     /// Why the connection ended, once it did: the first reason is the one kept.
-    stop: OnceLock<ProtocolError>,
+    stop: OnceLock<DeviceEnd>,
 }
 
 impl Binding {
@@ -79,7 +80,7 @@ impl Binding {
 
     /// The reason the connection has ended, finding out first whether it should have: nothing is
     /// read of the account's store, only what it published.
-    fn check(&self) -> Option<ProtocolError> {
+    fn check(&self) -> Option<DeviceEnd> {
         if let Some(stop) = self.stop.get() {
             return Some(stop.clone());
         }
@@ -102,10 +103,13 @@ impl Binding {
 
     /// Keeps `stop` as the reason (unless one is kept), then ends the connection, so that whoever
     /// is woken by the end finds the reason.
-    fn end(&self, stop: &LeaseStop) -> ProtocolError {
+    fn end(&self, stop: &LeaseStop) -> DeviceEnd {
         let error = self
             .stop
-            .get_or_init(|| ProtocolError::new(stop.code(), stop.to_string()))
+            .get_or_init(|| DeviceEnd {
+                error: ProtocolError::new(stop.code(), stop.to_string()),
+                action: stop.user_action(),
+            })
             .clone();
         self.inner.close();
         error
@@ -115,7 +119,7 @@ impl Binding {
     /// a lease the host took allows and the keeper of this sign-in holds none. The presentation of
     /// a lease is what gets one, so it is always allowed, and a connection that has made one is
     /// judged by the host on it.
-    fn gate(&self, frame: &ControlFrame) -> Option<ProtocolError> {
+    fn gate(&self, frame: &ControlFrame) -> Option<DeviceEnd> {
         let method = match frame {
             ControlFrame::Request(request) => request.method.as_str(),
             ControlFrame::Mutation(request) => request.method.as_str(),
@@ -130,7 +134,7 @@ impl Binding {
 
     /// The gate for what only a lease the host took allows, with no frame to read it from: a data
     /// stream, which the host judges on the connection's lease like any request.
-    fn gate_use(&self) -> Option<ProtocolError> {
+    fn gate_use(&self) -> Option<DeviceEnd> {
         if self.presented.load(Ordering::Acquire) {
             return None;
         }
@@ -189,7 +193,7 @@ impl BoundTransport {
 
     /// Why the connection ended, when it has, and the moment it should have if it has not.
     #[must_use]
-    pub fn stopped(&self) -> Option<ProtocolError> {
+    pub fn stopped(&self) -> Option<DeviceEnd> {
         self.binding.check()
     }
 }
@@ -217,7 +221,7 @@ impl ControlTransport for BoundTransport {
         self.binding.inner.reach()
     }
 
-    fn ended_by_this_device(&self) -> Option<ProtocolError> {
+    fn ended_by_this_device(&self) -> Option<DeviceEnd> {
         self.stopped()
     }
 
@@ -333,7 +337,7 @@ mod tests {
             unreachable!("the connection is only asked whether it ended")
         }
 
-        fn ended_by_this_device(&self) -> Option<ProtocolError> {
+        fn ended_by_this_device(&self) -> Option<kr_client::transport::DeviceEnd> {
             None
         }
 

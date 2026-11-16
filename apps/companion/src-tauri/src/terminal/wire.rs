@@ -135,7 +135,7 @@ impl Wire {
             Self::Paired(paired) => paired
                 .transport
                 .ended_by_this_device()
-                .map(|refusal| refusal.message),
+                .map(|end| end.error.message),
         }
     }
 
@@ -418,7 +418,7 @@ mod tests {
             }
         }
 
-        fn ended_by_this_device(&self) -> Option<ProtocolError> {
+        fn ended_by_this_device(&self) -> Option<kr_client::transport::DeviceEnd> {
             None
         }
 

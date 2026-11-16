@@ -158,6 +158,18 @@ impl From<kr_protocol::error::ProtocolError> for CommandError {
 }
 
 impl CommandError {
+    /// As [`Self::unavailable`], with the action that what made the failure says, rather than the
+    /// one its code gives.
+    #[must_use]
+    pub fn unavailable_asking(
+        message: impl Into<String>,
+        action: kr_client::retry::UserAction,
+    ) -> Self {
+        let mut failure = Self::unavailable(message);
+        failure.user_action = action.as_str().into();
+        failure
+    }
+
     /// The failure of an error that this application made itself, with the action that what made
     /// it says, rather than the one its code gives. A stop whose words say when to try again asks
     /// for nothing more, so no second wait follows them. Where nothing but a code is known (an

@@ -82,9 +82,8 @@ pub enum LinkError {
     /// as the host's decision about that does not read this as one.
     ///
     /// The action is what a person is asked to do after the words, as the stop of the lease that
-    /// made this failure says it: a stop whose words say when the device asks again asks nothing
-    /// more. A failure that comes with no stop of the lease (see [`Self::membership_by_code`])
-    /// carries the action its code gives.
+    /// made this failure says it: a stop whose words say their own next step asks nothing more, and
+    /// one that states only a fact asks what tells the person what to do.
     Membership(ProtocolError, UserAction),
     /// The host refused the connection itself, with the error it answers a device with at
     /// admission, before the device had presented what the host needs of it: the connection was
@@ -114,15 +113,6 @@ impl LinkError {
     /// The host could not be reached, for the reason `reason` says.
     pub(crate) fn lost(reason: Shown) -> Self {
         Self::Lost(reason.into_string())
-    }
-
-    /// A failure to give the host the lease it needs that comes with no stop of the lease to say
-    /// what to do about it, as when a connection recorded why it ended: the action is the one the
-    /// error's code gives.
-    #[must_use]
-    pub fn membership_by_code(error: ProtocolError) -> Self {
-        let action = crate::retry::user_action(error.code);
-        Self::Membership(error, action)
     }
 }
 

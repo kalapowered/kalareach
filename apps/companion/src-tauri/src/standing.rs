@@ -293,12 +293,12 @@ impl Dial {
             Ok(Err(other)) => {
                 // This device ended the connection, because the account left or the keeper holds
                 // no lease the host took, and says so.
-                let words = session
-                    .transport()
-                    .ended_by_this_device()
-                    .map_or_else(|| other.said().into_string(), |refusal| refusal.message);
+                let unopened = match session.transport().ended_by_this_device() {
+                    Some(end) => Unopened::unreached_asking(end.error.message, end.action),
+                    None => Unopened::unreached(other.said().into_string()),
+                };
                 session.close();
-                return Err(Unopened::unreached(words));
+                return Err(unopened);
             }
             Err(_) => {
                 session.close();
@@ -1274,7 +1274,7 @@ impl PairedLinks {
                 let lost = SessionStanding::Reconnecting {
                     reason: held.session.transport().ended_by_this_device().map_or_else(
                         || "contact with this session was lost".to_owned(),
-                        |refusal| refusal.message,
+                        |end| end.error.message,
                     ),
                     capacity: false,
                 };
@@ -1620,7 +1620,6 @@ pub(crate) mod tests {
     use kr_client::error::Result as ClientResult;
     use kr_client::transport::{ControlTransport, TransportFuture};
     use kr_protocol::envelope::{ActionTarget, ControlFrame};
-    use kr_protocol::error::ProtocolError;
     use kr_protocol::hello::{ActionWindow, ReceiveLimits};
     use kr_protocol::ids::{ActionId, ActionWindowId, BootEpoch, ConnectionId};
     use kr_protocol::scalars::{DurationMs, TimestampMs, Uuid};
@@ -1648,7 +1647,7 @@ pub(crate) mod tests {
             }
         }
 
-        fn ended_by_this_device(&self) -> Option<ProtocolError> {
+        fn ended_by_this_device(&self) -> Option<kr_client::transport::DeviceEnd> {
             None
         }
 

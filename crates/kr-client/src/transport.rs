@@ -79,6 +79,17 @@ pub trait StreamOpener: Send + Sync + std::fmt::Debug {
     fn revoked(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
+/// A connection this device ended itself, and why: the error the connection's calls are answered
+/// with, and what a person is asked to do after its words. A stop whose words say their own next
+/// step asks nothing more; one that states only a fact asks what the code of the error gives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceEnd {
+    /// The error the connection's calls are answered with.
+    pub error: ProtocolError,
+    /// What a person is asked to do after the error's words.
+    pub action: crate::retry::UserAction,
+}
+
 /// What a client needs from whichever transport it connected over.
 ///
 /// The trait is narrow on purpose: everything above it works in control frames and data streams,
@@ -99,15 +110,16 @@ pub trait ControlTransport: Send + Sync + std::fmt::Debug {
         None
     }
 
-    /// Why this device ended the connection itself, in the words a person is told, when it did:
-    /// the account the connection was opened under signed out or was replaced, or the connection
-    /// presents no lease of its own and the keeper of that account's lease holds none the host
-    /// took, in which case the words are the keeper's stop. A transport that ends only as the host
-    /// or the network ends it, or has not ended, says none. Asking also settles whether the account
-    /// has changed since the connection was opened, so that answer is the latest one; a connection
-    /// that presents no lease of its own is ended for want of a lease only when a request is sent
-    /// on it. A transport that wraps another forwards the question or loses the words.
-    fn ended_by_this_device(&self) -> Option<ProtocolError>;
+    /// Why this device ended the connection itself, in the words a person is told and with what the
+    /// person is asked to do after them, when it did: the account the connection was opened under
+    /// signed out or was replaced, or the connection presents no lease of its own and the keeper of
+    /// that account's lease holds none the host took, in which case the words and the action are
+    /// the keeper's stop's. A transport that ends only as the host or the network ends it, or has
+    /// not ended, says none. Asking also settles whether the account has changed since the
+    /// connection was opened, so that answer is the latest one; a connection that presents no
+    /// lease of its own is ended for want of a lease only when a request is sent on it. A transport
+    /// that wraps another forwards the question or loses the words.
+    fn ended_by_this_device(&self) -> Option<DeviceEnd>;
 
     /// Sends one control frame.
     fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()>;
@@ -290,7 +302,7 @@ impl ControlTransport for NetworkTransport {
         Some(self.reach.clone())
     }
 
-    fn ended_by_this_device(&self) -> Option<ProtocolError> {
+    fn ended_by_this_device(&self) -> Option<DeviceEnd> {
         None
     }
 

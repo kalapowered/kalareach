@@ -895,7 +895,7 @@ async fn a_transport_with_no_data_streams_is_refused_before_the_probe() {
                 valid_for_ms: DurationMs::new(60_000),
             }
         }
-        fn ended_by_this_device(&self) -> Option<ProtocolError> {
+        fn ended_by_this_device(&self) -> Option<kr_client::transport::DeviceEnd> {
             None
         }
         fn send<'a>(&'a self, _: &'a ControlFrame) -> TransportFuture<'a, ()> {
@@ -1507,7 +1507,7 @@ impl ControlTransport for Counted {
     fn initial_action_window(&self) -> ActionWindow {
         self.inner.initial_action_window()
     }
-    fn ended_by_this_device(&self) -> Option<ProtocolError> {
+    fn ended_by_this_device(&self) -> Option<kr_client::transport::DeviceEnd> {
         self.inner.ended_by_this_device()
     }
     fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()> {
@@ -1571,10 +1571,13 @@ impl ControlTransport for Ending {
     fn initial_action_window(&self) -> ActionWindow {
         self.inner.initial_action_window()
     }
-    fn ended_by_this_device(&self) -> Option<ProtocolError> {
+    fn ended_by_this_device(&self) -> Option<kr_client::transport::DeviceEnd> {
         self.ended
             .load(Ordering::Acquire)
-            .then(|| ProtocolError::new(self.code, "the account signed out"))
+            .then(|| kr_client::transport::DeviceEnd {
+                error: ProtocolError::new(self.code, "the account signed out"),
+                action: kr_client::retry::user_action(self.code),
+            })
     }
     fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()> {
         let called = match frame {

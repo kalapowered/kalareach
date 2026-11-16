@@ -28,7 +28,7 @@ use kr_client::{ClientError, Session};
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::agent::AgentMutationTarget;
 use kr_protocol::envelope::ActionTarget;
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::gateway::PendingResource;
 use kr_protocol::ids::{
     ActionId, AgentBindingRevision, ApplicationInstanceId, CapabilityId, EnvironmentId, GrantId,
@@ -674,8 +674,14 @@ pub(crate) fn ends_the_link(error: &ClientError) -> bool {
 /// What a call that failed answers. A call that found the connection ended answers why, in the
 /// account's words, when this device ended it for the account's sake, and not that the connection
 /// was lost.
-fn answered(error: ClientError, ended_by_this_device: Option<ProtocolError>) -> CommandError {
-    ended_by_this_device.map_or_else(|| CommandError::from(error), CommandError::from)
+fn answered(
+    error: ClientError,
+    ended_by_this_device: Option<kr_client::transport::DeviceEnd>,
+) -> CommandError {
+    ended_by_this_device.map_or_else(
+        || CommandError::from(error),
+        |end| CommandError::asking(end.error, end.action),
+    )
 }
 
 /// Whether a failure means the host let go of the snapshot a page was continuing.
@@ -719,9 +725,19 @@ mod tests {
     /// why; one that finds it lost answers that it was lost.
     #[test]
     fn a_connection_this_device_ended_answers_why() {
-        let why = ProtocolError::new(ErrorCode::HostNotConfigured, "sign in to use this host");
+        let why = kr_client::transport::DeviceEnd {
+            error: kr_protocol::error::ProtocolError::new(
+                ErrorCode::HostNotConfigured,
+                "sign in to use this host",
+            ),
+            action: kr_client::retry::UserAction::Nothing,
+        };
         let ended = answered(ClientError::ConnectionEnded, Some(why.clone()));
-        assert_eq!((ended.code, ended.message), (why.code, why.message));
+        assert_eq!(
+            (ended.code, ended.message, ended.user_action),
+            (why.error.code, why.error.message, "nothing".to_owned()),
+            "the words and the action the stop said"
+        );
         let lost = answered(ClientError::ConnectionEnded, None);
         assert_eq!(lost.code, ErrorCode::ResourceUnavailable);
     }

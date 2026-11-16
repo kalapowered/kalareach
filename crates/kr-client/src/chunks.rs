@@ -1129,7 +1129,7 @@ impl NetworkCarrier {
         }
         self.transport
             .ended_by_this_device()
-            .map_or(error, ClientError::Host)
+            .map_or(error, |end| ClientError::Host(end.error))
     }
 
     /// The window a call carries.

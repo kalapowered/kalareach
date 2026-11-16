@@ -717,7 +717,7 @@ pub async fn send(
         Err(ClientError::ConnectionEnded) => Err(session
             .transport()
             .ended_by_this_device()
-            .map_or(ClientError::ConnectionEnded, ClientError::Host)),
+            .map_or(ClientError::ConnectionEnded, |end| ClientError::Host(end.error))),
         done => done,
     }
 }
@@ -825,8 +825,8 @@ async fn drive(
                         // asked first, so that the caller is told the reason, nothing is read on
                         // the ended connection, and the refused-window retry below acts only on a
                         // host's answer to a chunk.
-                        if let Some(reason) = session.transport().ended_by_this_device() {
-                            return Err(ClientError::Host(reason));
+                        if let Some(end) = session.transport().ended_by_this_device() {
+                            return Err(ClientError::Host(end.error));
                         }
                         let delay = if error.code()
                             == kr_protocol::error::ErrorCode::PermissionDenied

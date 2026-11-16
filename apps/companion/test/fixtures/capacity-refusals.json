@@ -34,6 +34,41 @@
     }
   },
   "inbox": {
+    "sign_in": {
+      "code": "PERMISSION_DENIED",
+      "message": "sign in to your account again: this device cannot ask your organisation for the lease that lets it use this host",
+      "user_action": "nothing",
+      "page": "sign in to your account again: this device cannot ask your organisation for the lease that lets it use this host",
+      "row": "sign in to your account again: this device cannot ask your organisation for the lease that lets it use this host. It answered, so contact is not lost. Its sessions may still be running; nothing here says they are not."
+    },
+    "token_refused": {
+      "code": "PERMISSION_DENIED",
+      "message": "sign in to your account again: your organisation's service does not take the sign-in this device holds",
+      "user_action": "nothing",
+      "page": "sign in to your account again: your organisation's service does not take the sign-in this device holds",
+      "row": "sign in to your account again: your organisation's service does not take the sign-in this device holds. It answered, so contact is not lost. Its sessions may still be running; nothing here says they are not."
+    },
+    "not_a_member": {
+      "code": "PERMISSION_DENIED",
+      "message": "this account is not a member of the organisation this host answers to; sign in with an account that is a member, or ask your organisation's administrator",
+      "user_action": "nothing",
+      "page": "this account is not a member of the organisation this host answers to; sign in with an account that is a member, or ask your organisation's administrator",
+      "row": "this account is not a member of the organisation this host answers to; sign in with an account that is a member, or ask your organisation's administrator. It answered, so contact is not lost. Its sessions may still be running; nothing here says they are not."
+    },
+    "refused": {
+      "code": "PERMISSION_DENIED",
+      "message": "this host refused the lease your organisation signed (bad_signature); ask your organisation's administrator",
+      "user_action": "nothing",
+      "page": "this host refused the lease your organisation signed (bad_signature); ask your organisation's administrator",
+      "row": "this host refused the lease your organisation signed (bad_signature); ask your organisation's administrator. It answered, so contact is not lost. Its sessions may still be running; nothing here says they are not."
+    },
+    "unusable": {
+      "code": "INVALID_ARGUMENT",
+      "message": "your organisation's service refused the request for a lease; update this app",
+      "user_action": "nothing",
+      "page": "your organisation's service refused the request for a lease; update this app",
+      "row": "your organisation's service refused the request for a lease; update this app. It answered, so contact is not lost. Its sessions may still be running; nothing here says they are not."
+    },
     "lease_wait": {
       "code": "RATE_LIMITED",
       "message": "your organisation's service asks this device to wait 60 minutes before it asks for the lease this host needs",
@@ -41,12 +76,34 @@
       "page": "your organisation's service asks this device to wait 60 minutes before it asks for the lease this host needs",
       "row": "your organisation's service asks this device to wait 60 minutes before it asks for the lease this host needs. It answered, so contact is not lost. Its sessions may still be running; nothing here says they are not."
     },
-    "refusal_by_code": {
+    "unreachable": {
       "code": "RESOURCE_UNAVAILABLE",
-      "message": "this device could not ask your organisation's service for the lease just now",
-      "user_action": "wait",
-      "page": "this device could not ask your organisation's service for the lease just now. Wait a moment and try again.",
-      "row": "this device could not ask your organisation's service for the lease just now. Wait a moment and try again. It answered, so contact is not lost. Its sessions may still be running; nothing here says they are not."
+      "message": "your organisation's service did not give this device the lease it needs just now; this app asks again",
+      "user_action": "nothing",
+      "page": "your organisation's service did not give this device the lease it needs just now; this app asks again",
+      "row": "your organisation's service did not give this device the lease it needs just now; this app asks again. It answered, so contact is not lost. Its sessions may still be running; nothing here says they are not."
+    },
+    "account_changed": {
+      "code": "RESOURCE_UNAVAILABLE",
+      "message": "the account signed in on this device changed; this app asks for the lease again as the new one",
+      "user_action": "nothing",
+      "page": "the account signed in on this device changed; this app asks for the lease again as the new one",
+      "row": "the account signed in on this device changed; this app asks for the lease again as the new one. It answered, so contact is not lost. Its sessions may still be running; nothing here says they are not."
+    },
+    "presenting": {
+      "code": "RESOURCE_UNAVAILABLE",
+      "message": "this device is still presenting its lease to this host; this app tries again once the host has taken it",
+      "user_action": "nothing",
+      "page": "this device is still presenting its lease to this host; this app tries again once the host has taken it",
+      "row": "this device is still presenting its lease to this host; this app tries again once the host has taken it. It answered, so contact is not lost. Its sessions may still be running; nothing here says they are not."
+    }
+  },
+  "agent_page": {
+    "lease_wait": {
+      "code": "RESOURCE_UNAVAILABLE",
+      "message": "your organisation's service asks this device to wait 60 minutes before it asks for the lease this host needs",
+      "user_action": "nothing",
+      "page": "your organisation's service asks this device to wait 60 minutes before it asks for the lease this host needs"
     }
   }
 }

@@ -119,7 +119,7 @@ impl std::fmt::Debug for LeaseDesk {
 ///
 /// The stop says what is asked of the person after its words ([`LeaseStop::user_action`]), and the
 /// failure carries that beside them.
-fn failed(stop: &LeaseStop) -> LinkError {
+pub fn failed(stop: &LeaseStop) -> LinkError {
     match stop {
         LeaseStop::ConnectionEnded => LinkError::Lost(stop.to_string()),
         other => LinkError::Membership(
@@ -346,9 +346,9 @@ impl LeaseDesk {
 /// keeper was doing when it stopped, as when it was still asking the organisation's service.
 fn failed_on(session: &Session, stop: &LeaseStop) -> LinkError {
     if *stop == LeaseStop::ConnectionEnded
-        && let Some(error) = session.transport().ended_by_this_device()
+        && let Some(end) = session.transport().ended_by_this_device()
     {
-        return LinkError::membership_by_code(error);
+        return LinkError::Membership(end.error, end.action);
     }
     if let Some(refused) = crate::connection::Unopened::refusal_kept_by(session) {
         return refused;
@@ -393,7 +393,7 @@ impl MembershipPresenter for LeaseDesk {
                 BoundTransport::over(transport, signed.sign_in, gate_changes, task_changes, lease);
             // The account may have left while the connection was dialled: nothing is opened.
             match bound.ended_by_this_device() {
-                Some(error) => Err(LinkError::membership_by_code(error)),
+                Some(end) => Err(LinkError::Membership(end.error, end.action)),
                 None => Ok(bound),
             }
         })

@@ -304,7 +304,7 @@ impl ControlTransport for IpcTransport {
         reach_of(&self.context)
     }
 
-    fn ended_by_this_device(&self) -> Option<kr_protocol::error::ProtocolError> {
+    fn ended_by_this_device(&self) -> Option<crate::transport::DeviceEnd> {
         None
     }
 

@@ -39,7 +39,8 @@
 //! | KR-REQ-17.53 | `a_sign_in_made_since_clears_what_was_held_against_the_account` |
 //! | KR-REQ-17.48 | `a_kept_visit_the_service_asks_to_wait_is_sent_with_its_own_wait_and_no_action_beside_it` |
 //! | KR-REQ-17.48 | `a_new_visit_the_service_asks_to_wait_is_sent_with_its_own_wait_and_no_action_beside_it` |
-//! | KR-REQ-17.48 | `a_membership_refusal_that_names_no_wait_keeps_the_line_of_its_code` |
+//! | KR-REQ-17.48 | `each_stop_of_the_lease_is_sent_to_the_inbox_as_its_own_words_and_its_own_action` |
+//! | KR-REQ-17.48 | `a_session_read_after_a_wait_stop_is_sent_with_its_own_wait_and_no_action_beside_it` |
 //! | KR-REQ-17.53 | `a_visit_does_not_ask_for_the_chain_of_keys_while_the_service_asks_for_a_wait` |
 //! | KR-REQ-17.53 | `a_reused_lease_lasts_until_the_first_refresh_of_the_connection_that_keeps_it` |
 //! | KR-REQ-17.53 | `a_presentation_its_caller_cuts_off_while_the_service_is_silent_holds_the_service_off` |
@@ -81,7 +82,7 @@ use companion_tauri::inbox::{HostInbox, HostInboxState, InboxDesk};
 use companion_tauri::lease::LeaseDesk;
 use companion_tauri::owner::Owner;
 use kr_client::Session;
-use kr_client::organisation::LeaseTimer;
+use kr_client::organisation::{LeaseStop, LeaseTimer};
 use kr_client::pairing::BoxFuture;
 use kr_client::pairing::link::LinkError;
 use kr_client::pairing::owner::{Ceremony, CeremonyKind, CeremonyOutcome, ReviewOutcome};
@@ -96,7 +97,7 @@ use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::MemoryStore;
 use kr_protocol::account::{MembershipLease, PolicyAuthority};
 use kr_protocol::confirmation::ConfirmationSubject;
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::grant::OrganisationRequirement;
 use kr_protocol::ids::SessionId;
 use kr_protocol::invitation::{InviteGrantKind, InviteModeKind};
@@ -1864,13 +1865,18 @@ async fn a_kept_visit_goes_on_when_the_host_distrusts_its_clock_at_the_new_lease
     );
 }
 
-/// What native code sent the page for the inbox's refusal `kind`, from the golden file the page's
-/// own cases read, so that both sides hold the same whole text.
-fn inbox_sent(kind: &str) -> serde_json::Value {
+/// What native code sent the page for the `kind` of refusal on `surface`, from the golden file the
+/// page's own cases read, so that both sides hold the same whole text.
+fn golden_sent(surface: &str, kind: &str) -> serde_json::Value {
     let all: serde_json::Value =
         serde_json::from_str(include_str!("../../test/fixtures/capacity-refusals.json"))
             .expect("the golden file reads");
-    all["inbox"][kind].clone()
+    all[surface][kind].clone()
+}
+
+/// What native code sent the page for the inbox's refusal `kind`.
+fn inbox_sent(kind: &str) -> serde_json::Value {
+    golden_sent("inbox", kind)
 }
 
 /// The failure the inbox's row holds, as the page is sent it: its code, its words and its action.
@@ -1941,26 +1947,84 @@ async fn a_new_visit_the_service_asks_to_wait_is_sent_with_its_own_wait_and_no_a
     assert_eq!(as_sent(&row), native_part(&inbox_sent("lease_wait")));
 }
 
-/// KR-REQ-17.53 and KR-REQ-17.48: a refusal to give the host the lease that comes with no stop of
-/// the lease to say what to do (here, a presentation that fails with a code and words that name no
-/// wait) keeps the line its code gives, so a person who is told to try later is still told.
+/// KR-REQ-17.53 and KR-REQ-17.48: every stop of the lease reaches the page, by both routes of the
+/// inbox (a kept visit presents again, a new visit opens its own connection), as its own words and
+/// the one action it says: a stop whose words say their own next step asks nothing more, so the
+/// person reads one instruction and never the same one twice. The golden file holds the whole
+/// text of each stop's refusal; the page's own case reads the same file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_membership_refusal_that_names_no_wait_keeps_the_line_of_its_code() {
+async fn each_stop_of_the_lease_is_sent_to_the_inbox_as_its_own_words_and_its_own_action() {
     let rig = Rig::start().await;
     rig.connection(true).await;
     let _elsewhere = rig.uses_another_host().await;
-    let desk = Arc::new(InboxDesk::default());
-    let first = rig.inbox_of(&desk).await;
-    assert_eq!(first.state, HostInboxState::Read, "{:?}", first.refusal);
+    let stops = [
+        ("sign_in", LeaseStop::SignIn),
+        ("token_refused", LeaseStop::TokenRefused),
+        ("not_a_member", LeaseStop::NotAMember),
+        ("refused", LeaseStop::Refused("bad_signature")),
+        ("unusable", LeaseStop::Unusable),
+        ("lease_wait", LeaseStop::Later(Duration::from_secs(3600))),
+        ("unreachable", LeaseStop::Unreachable),
+        ("account_changed", LeaseStop::AccountChanged),
+        ("presenting", LeaseStop::Presenting),
+    ];
+    for (key, stop) in stops {
+        let sent = native_part(&inbox_sent(key));
 
-    let sent = inbox_sent("refusal_by_code");
-    rig.control.fail_presentation(Some(ProtocolError::new(
-        ErrorCode::ResourceUnavailable,
-        sent["message"].as_str().expect("the words"),
-    )));
-    let row = rig.inbox_of(&desk).await;
-    assert_eq!(row.state, HostInboxState::Refused, "{row:?}");
-    assert_eq!(as_sent(&row), native_part(&sent));
+        // A new visit opens its own connection.
+        rig.control.fail_presentation(Some(stop.clone()));
+        let fresh = rig.inbox_of(&Arc::new(InboxDesk::default())).await;
+        assert_eq!(fresh.state, HostInboxState::Refused, "{key}: {fresh:?}");
+        assert_eq!(as_sent(&fresh), sent, "{key}: a new visit");
+
+        // A kept visit presents again over the connection it keeps.
+        rig.control.fail_presentation(None);
+        let desk = Arc::new(InboxDesk::default());
+        let first = rig.inbox_of(&desk).await;
+        assert_eq!(first.state, HostInboxState::Read, "{key}: {:?}", first.refusal);
+        rig.control.fail_presentation(Some(stop));
+        let kept = rig.inbox_of(&desk).await;
+        assert_eq!(kept.state, HostInboxState::Refused, "{key}: {kept:?}");
+        assert_eq!(as_sent(&kept), sent, "{key}: a kept visit");
+    }
+    rig.control.fail_presentation(None);
+}
+
+/// KR-REQ-17.53 and KR-REQ-17.48: a session read over a link of its own, which sends its first
+/// request with no presentation of its own, is ended by the keeper's stop when the service has
+/// asked this device to wait, and the page is sent the stop's words and the stop's action: one
+/// sentence that says how long, and no wait of the code's after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_read_after_a_wait_stop_is_sent_with_its_own_wait_and_no_action_beside_it() {
+    let rig = Rig::start_with(SERVED, 1).await;
+    rig.connection(true).await;
+    rig.waits.until_asked(1).await;
+    rig.refuses_the_next_lease(Moment::Refuse {
+        status: 429,
+        code: "RATE_LIMITED",
+        retry_after_seconds: Some(3600),
+    });
+    let rig = rig.restarted().await;
+    // The application's own connection asks first and is told to wait; the read then finds the same
+    // stop held against the service.
+    let _ = rig.down_because("wait").await;
+
+    let refused = rig
+        .companion()
+        .call(
+            "session_agents",
+            json!({ "sessionId": rig.session().to_string(), "opening": null }),
+        )
+        .expect_err("the read is refused");
+    let sent = golden_sent("agent_page", "lease_wait");
+    assert_eq!(
+        json!({
+            "code": refused["code"],
+            "message": refused["message"],
+            "user_action": refused["user_action"],
+        }),
+        native_part(&sent)
+    );
 }
 
 /// KR-REQ-17.53: a visit that cannot give the host the device's lease says why. A host that is
@@ -2288,11 +2352,7 @@ async fn an_owner_that_cannot_get_its_lease_is_shown_why_and_is_not_out_of_conta
     let owned = Host::start(&keys).await;
     let data = tempfile::tempdir().expect("a directory");
     let control = LinkControl::new();
-    control.fail_presentation(Some(ProtocolError::new(
-        ErrorCode::PermissionDenied,
-        "sign in to your account again: this device cannot ask your organisation for the lease \
-         that lets it use this host",
-    )));
+    control.fail_presentation(Some(LeaseStop::SignIn));
     let device = support::owner_device_governed(&owned, &keys, data.path(), &control);
     let watcher = Owner::new(Arc::clone(&device), Arc::new(NoOwner), || {});
     watcher.start();
