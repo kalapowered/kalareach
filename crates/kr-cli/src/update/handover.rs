@@ -820,3 +820,35 @@ fn nothing_listening(error: &kr_ipc::IpcError) -> bool {
         _ => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A wait for the store's install lock that another holder keeps ends at its bound and no
+    /// later: the pause between two tries is cut to what is left of the bound, so that the wait
+    /// takes exactly its bound on the runtime's paused clock, and then it is refused.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_install_lock_ends_the_wait_at_its_bound() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let store = Store::at(directory.path().join("host"));
+        store.create_directories().expect("the store's directories");
+        let held = store
+            .try_lock_install()
+            .expect("the lock is tried")
+            .expect("the lock is free");
+        let within = Duration::from_millis(30);
+        let started = tokio::time::Instant::now();
+        let refused = install_lock(&store, within, "kr host update").await;
+        assert!(
+            matches!(refused, Err(CliError::UpdateDeferred(_))),
+            "a lock that stays held is refused"
+        );
+        assert_eq!(started.elapsed(), within, "the wait ends at its bound");
+        drop(held);
+        assert!(
+            install_lock(&store, within, "kr host update").await.is_ok(),
+            "a lock that is free is taken"
+        );
+    }
+}
