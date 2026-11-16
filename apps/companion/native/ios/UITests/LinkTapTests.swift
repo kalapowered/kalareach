@@ -543,8 +543,9 @@ final class LinkTapTests: HarnessTestCase {
     }
 
     /// A conversation shorter than the pane: the link alone, so the link's area is whole and the pane's bare area lies
-    /// under it. A tap there gets the system's click on the pane itself, which opens nothing and lights nothing. This
-    /// runs at both sizes.
+    /// under it. A tap there gets the system's click on the pane itself, which opens nothing and lights nothing, or the click
+    /// of the link's own button where the platform's adjustment reaches it, which opens the link and lights it at the click.
+    /// This runs at both sizes.
     private func runShort(size: String?, named: String) {
         continueAfterFailure = true
         start(size: size, short: true)
@@ -562,10 +563,9 @@ final class LinkTapTests: HarnessTestCase {
             let y = min(lowest + below, room.maxY - 2)
             let bare = tap("\(named): the pane's bare area \(Int(below)) points under the link's area", at: CGPoint(x: words.midX, y: y), shift: shift)
             XCTAssertTrue(bare.events.contains { $0.type == "click" && $0.trusted }, "\(bare.label): the system sent no click to the bare area: \(bare.events.map(\.type))")
-            XCTAssertFalse(bare.events.contains { $0.type == "click" && !$0.trusted }, "\(bare.label): the page added a click")
-            XCTAssertTrue(bare.opened.isEmpty, "\(bare.label): opened \(bare.opened)")
-            XCTAssertNil(pressLook(bare), "\(bare.label): the look lit at the press")
-            XCTAssertNil(clickLook(bare), "\(bare.label): the look lit at the click")
+            // The page opens nothing here and lights nothing at the press. Where the platform's own adjustment moves the click onto
+            // the link's button (the system's click names it), the link opens by that click and has the look at the click.
+            expectNotOpenedByThePage(bare, "short-last")
         }
         let atBottom = tap("\(named): the pane's bottom row", at: CGPoint(x: words.midX, y: room.maxY - 1), shift: shift)
         XCTAssertTrue(atBottom.opened.isEmpty, "\(atBottom.label): opened \(atBottom.opened)")
