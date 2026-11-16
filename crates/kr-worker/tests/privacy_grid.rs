@@ -2,9 +2,9 @@
 //!
 //! The host's own terminal scrolls above the live page and is served those rows from the grid. Under
 //! privacy mode the grid holds none of them: it gives up what it held when privacy mode went on,
-//! keeps none while it is on, and starts empty when it goes off. The live screen is left alone, and
-//! a paired device, which is shown the live screen and nothing above it, is told the same before and
-//! after.
+//! keeps none while it is on, and gives up each row that was on the screen when it went off as that
+//! row leaves. The live screen is left alone, and a paired device, which is shown the live screen
+//! and nothing above it, is told the same before and after.
 //!
 //! Every case runs a session of this process with a shell that only waits, so the output is what a
 //! case gives it and no step waits for anything: a scroll is answered when it is asked for.
@@ -387,6 +387,22 @@ fn a_session_opened_under_privacy_mode_keeps_no_rows() {
     let scrolled = rig.scrolled(1000);
     assert!(!numbers(&scrolled, "while").is_empty());
     assert!(shows_only_the_screen(&scrolled, "while"), "{scrolled:?}");
+
+    // Privacy mode goes off: the rows of the interval that were on the screen are given up as they
+    // leave it, and rows after them are kept.
+    rig.disable();
+    rig.print(&run("after"));
+    let scrolled = rig.scrolled(1000);
+    assert!(
+        numbers(&scrolled, "while").is_empty(),
+        "no earlier row is kept: {scrolled:?}"
+    );
+    assert!(
+        numbers(&rig.scrolled(30), "after")
+            .iter()
+            .any(|number| *number < ON_SCREEN),
+        "rows printed after it are kept"
+    );
 }
 
 #[test]
@@ -430,10 +446,51 @@ fn a_session_that_cannot_read_its_state_keeps_no_rows_until_it_reads_off() {
             .any(|number| *number < ON_SCREEN),
         "rows printed after it reads off are kept: {scrolled:?}"
     );
+    assert!(
+        numbers(&rig.scrolled(1000), "unknown").is_empty(),
+        "no row printed while it could not say comes back"
+    );
 }
 
 #[test]
-fn rows_owed_while_a_full_screen_program_runs_are_gone_when_it_leaves() {
+fn a_session_that_cannot_read_its_state_keeps_none_when_the_retry_reads_it_on() {
+    let rig = Rig::open();
+    let (temp, session_id) = (rig.temp, rig.session_id);
+    drop(rig.session);
+    let journal = temp.environment().journal_database(session_id);
+    rusqlite::Connection::open(&journal)
+        .expect("the journal")
+        .execute(
+            "UPDATE privacy SET generation = 'unreadable' WHERE id = 1",
+            [],
+        )
+        .expect("the record is made unreadable");
+    let session = Session::open(config(&temp, session_id)).expect("opens again");
+    let mut rig = Rig::around(temp, session_id, session);
+    rig.print(&run("unknown"));
+
+    // The record reads as on: the rows stay out of the grid.
+    rusqlite::Connection::open(&journal)
+        .expect("the journal")
+        .execute(
+            "UPDATE privacy SET generation = 1, enabled = 1 WHERE id = 1",
+            [],
+        )
+        .expect("the record is put right");
+    rig.session.collect_expired();
+    rig.print(&run("known"));
+
+    let scrolled = rig.scrolled(1000);
+    assert!(!numbers(&scrolled, "known").is_empty(), "{scrolled:?}");
+    assert!(
+        numbers(&scrolled, "unknown").is_empty(),
+        "no earlier row is kept: {scrolled:?}"
+    );
+    assert!(shows_only_the_screen(&scrolled, "known"), "{scrolled:?}");
+}
+
+#[test]
+fn rows_given_up_while_a_full_screen_program_runs_are_gone_when_it_leaves() {
     let mut rig = Rig::open();
     rig.print(&run("before"));
     rig.print(ENTER_ALTERNATE);
@@ -453,7 +510,7 @@ fn rows_owed_while_a_full_screen_program_runs_are_gone_when_it_leaves() {
 }
 
 #[test]
-fn rows_owed_stay_owed_when_privacy_mode_goes_off_before_the_program_leaves() {
+fn privacy_mode_going_off_inside_a_full_screen_program_keeps_no_earlier_row() {
     let mut rig = Rig::open();
     rig.print(&run("before"));
     rig.print(ENTER_ALTERNATE);
