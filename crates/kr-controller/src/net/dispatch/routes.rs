@@ -1841,11 +1841,11 @@ impl RemoteConnection {
                     .confirming_recovery_only(
                         decided.decision.decided.permitted.confirms_recovery_only,
                     );
-                let admission = self.controller.pairing_admission(
+                let caller = caller.landed(self.controller.pairing_landing(
                     self.connection_id(),
                     Some(validated),
                     Some(accepted.deadline),
-                );
+                ));
                 let guard = self.controller.pairing_guard(
                     self.connection_id(),
                     Some(validated),
@@ -1859,15 +1859,7 @@ impl RemoteConnection {
                     crate::service::net::AtTheNetworkDoor::here(),
                     &mut origin,
                     self.controller
-                        .pairing_write(
-                            caller,
-                            entry.method,
-                            mutation,
-                            admission,
-                            retained,
-                            guard,
-                            life,
-                        )
+                        .pairing_write(caller, entry.method, mutation, retained, guard, life)
                         .await
                         .map(|answer| framed(mutation.request_id, answer)),
                 )

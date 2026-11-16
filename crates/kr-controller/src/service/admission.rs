@@ -871,27 +871,25 @@ impl Controller {
     /// The footing of a mutation that a handler carries to its effect, made once at the handler's
     /// entry: one read of the connection table finds the registration the mutation was admitted
     /// under, and every later question of the footing reads atomics and clocks alone. A
-    /// registration that has gone, or was replaced under another revision, refuses in the
-    /// registration's own words, as [`Self::check_registration`] does.
+    /// registration that has gone, or was replaced under another revision, has no footing, and the
+    /// lapse says which: a door that must refuse tells it in the registration's own words with
+    /// [`super::footing::admission_refusal`], as [`Self::check_registration`] does, and a door
+    /// that hands the mutation on gives the lapse to what refuses for it.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::PermissionDenied`] for a registration that has been withdrawn or
-    /// replaced.
+    /// Returns [`crate::authority::AdmissionLapse::Deregistered`] for a registration that has been
+    /// withdrawn and [`crate::authority::AdmissionLapse::Revoked`] for one that was replaced.
     pub(super) fn footing_of_a_mutation(
         &self,
         admission: &crate::authority::AdmittedMutation,
-    ) -> Result<super::footing::Footing> {
+    ) -> std::result::Result<super::footing::Footing, crate::authority::AdmissionLapse> {
         let admitted = self.admitted_read();
         let Some(connection) = admitted.get(&admission.connection_id) else {
-            return Err(super::footing::admission_refusal(
-                crate::authority::AdmissionLapse::Deregistered,
-            ));
+            return Err(crate::authority::AdmissionLapse::Deregistered);
         };
         if connection.admitted_revision != admission.admitted_revision {
-            return Err(super::footing::admission_refusal(
-                crate::authority::AdmissionLapse::Revoked,
-            ));
+            return Err(crate::authority::AdmissionLapse::Revoked);
         }
         Ok(self.footing_of(admission, connection))
     }

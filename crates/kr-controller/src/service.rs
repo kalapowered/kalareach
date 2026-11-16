@@ -818,6 +818,12 @@ pub struct Controller {
     /// grant's own end can come after the last wait. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     after_the_feed_is_read: ThreadPause,
+    /// Where this host's own tests stop the record of an owner's request or of its answer once the
+    /// authority feed's refusal has been asked where it takes its locks, and before the bound of
+    /// the local owner's lease is copied, so that the lease, the feed's refusal, a fence or the
+    /// grant's own end can come after the last wait. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    after_the_record_asks_the_feed: ThreadPause,
     /// Where this host's own tests stop an admission check just before the footing's question,
     /// which is its last reading, so that the deadline can pass at that pause. Compiled away in
     /// every shipped build.

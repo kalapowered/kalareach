@@ -38,10 +38,13 @@ async fn a_repeated_request_to_end_exclusive_management_is_answered_as_a_copy_of
     for _ in 0..2 {
         let given = controller
             .pairing_write(
-                Caller::local(door.actor_id().clone()),
+                Caller::local(door.actor_id().clone()).landed(controller.pairing_landing(
+                    door.connection_id(),
+                    revision,
+                    deadline,
+                )),
                 Method::OwnerConfirmationRequest,
                 &request,
-                controller.pairing_admission(door.connection_id(), revision, deadline),
                 controller.pairing_standing(door.connection_id(), revision),
                 controller.pairing_guard(door.connection_id(), revision, deadline),
                 controller.pairing_life(deadline),
@@ -81,10 +84,13 @@ async fn a_repeated_request_to_end_exclusive_management_is_answered_as_a_copy_of
     );
     let reused = controller
         .pairing_write(
-            Caller::local(door.actor_id().clone()),
+            Caller::local(door.actor_id().clone()).landed(controller.pairing_landing(
+                door.connection_id(),
+                revision,
+                deadline,
+            )),
             Method::OwnerConfirmationRequest,
             &other,
-            controller.pairing_admission(door.connection_id(), revision, deadline),
             controller.pairing_standing(door.connection_id(), revision),
             controller.pairing_guard(door.connection_id(), revision, deadline),
             controller.pairing_life(deadline),

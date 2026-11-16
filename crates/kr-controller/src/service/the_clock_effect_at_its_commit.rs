@@ -324,11 +324,14 @@ async fn a_connection_that_goes_away_does_not_cut_the_establishment() {
     let deadline = Some(door.accepted().deadline);
     let task = tokio::spawn({
         let controller = Arc::clone(&controller);
-        let caller = Caller::local(door.actor_id().clone());
         let connection_id = door.connection_id();
+        let caller = Caller::local(door.actor_id().clone()).landed(controller.pairing_landing(
+            connection_id,
+            revision,
+            deadline,
+        ));
         let mutation = original.clone();
         async move {
-            let admission = controller.pairing_admission(connection_id, revision, deadline);
             let guard = controller.pairing_guard(connection_id, revision, deadline);
             let life = controller.pairing_life(deadline);
             let retained = controller.pairing_standing(connection_id, revision);
@@ -337,7 +340,6 @@ async fn a_connection_that_goes_away_does_not_cut_the_establishment() {
                     caller,
                     Method::HostClockEstablish,
                     &mutation,
-                    admission,
                     retained,
                     guard,
                     life,

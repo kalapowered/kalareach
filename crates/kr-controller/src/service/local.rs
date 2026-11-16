@@ -584,6 +584,17 @@ impl Controller {
         self.after_the_feed_is_read.arm()
     }
 
+    /// Arms the pause the next record of an owner's request or of its answer stops at once the
+    /// authority feed's refusal has been asked, before the bound of the local owner's lease is
+    /// copied. Returns the end that says the record has arrived, and the end that lets it go. The
+    /// pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_after_the_record_asks_the_feed(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.after_the_record_asks_the_feed.arm()
+    }
+
     /// Arms the pause the next admission check stops at before its last reading of the fence. Returns
     /// the end that says the check has arrived, and the end that lets it go. The pause fires once.
     #[cfg(feature = "testing")]

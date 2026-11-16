@@ -459,12 +459,15 @@ impl Controller {
                 #[cfg(feature = "testing")]
                 self.after_the_pairing_caller.wait().await;
                 let deadline = accepted.map(|accepted| accepted.deadline);
-                let admission = self.pairing_admission(connection_id, admitted, deadline);
+                // The landing the caller takes to the records: the feed's ask, the footing made
+                // once here, and no bound until the caller's scope is read again where the record
+                // is made.
+                let caller = caller.landed(self.pairing_landing(connection_id, admitted, deadline));
                 let guard = self.pairing_guard(connection_id, admitted, deadline);
                 let life = self.pairing_life(deadline);
                 let retained = self.pairing_standing(connection_id, admitted);
                 Settled::of(
-                    self.pairing_write(caller, method, mutation, admission, retained, guard, life)
+                    self.pairing_write(caller, method, mutation, retained, guard, life)
                         .await
                         .map(|outcome| respond(request_id, outcome)),
                 )

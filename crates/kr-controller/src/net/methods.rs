@@ -67,35 +67,6 @@ pub const fn serves(method: Method) -> bool {
 pub type CommitGuard = Arc<CommitFn>;
 
 impl Controller {
-    /// Returns the admission check of one mutation: its connection's registration under the
-    /// revision it was admitted at, and the deadline it was accepted with.
-    ///
-    /// A mutation that carries no freshness at all may be answered from what this host already
-    /// holds and may not write, so its check refuses.
-    pub(crate) fn pairing_admission(
-        self: &Arc<Self>,
-        connection_id: ConnectionId,
-        admitted: Option<AuthorityRevision>,
-        deadline: Option<ContinuousInstant>,
-    ) -> Admission {
-        let (Some(admitted_revision), Some(deadline)) = (admitted, deadline) else {
-            return Arc::new(|| {
-                Err(ControllerError::WindowExpired {
-                    detail: "this action carries no freshness, so it may be answered from what \
-                             this host holds and may not write"
-                        .to_owned(),
-                })
-            });
-        };
-        let controller = Arc::clone(self);
-        let carried = AdmittedMutation {
-            connection_id,
-            admitted_revision,
-            deadline: Some(deadline),
-        };
-        Arc::new(move || controller.check_registration(&carried))
-    }
-
     /// Returns the check a recorded answer of one pairing mutation is owed: its connection's
     /// registration under the revision it was admitted at, and the fence this host owes, without
     /// the deadline a receipt outlives. A mutation admitted under no revision has no registration
@@ -275,14 +246,13 @@ impl Controller {
         caller: Caller,
         method: Method,
         mutation: &MutationRequest,
-        admission: Admission,
         retained: Admission,
         guard: CommitGuard,
         life: Life,
     ) -> Given<Result<ParamsValue>> {
         let copied = Arc::new(AtomicBool::new(false));
         let answer = self
-            .write_pairing(caller, method, mutation, admission, guard, life, &copied)
+            .write_pairing(caller, method, mutation, guard, life, &copied)
             .await;
         // Another request's use of the action's identifier, however the pairing store came to meet
         // it, is no copy of a record, but it tells the caller of another attempt, so it goes back
@@ -306,12 +276,15 @@ impl Controller {
         caller: Caller,
         method: Method,
         mutation: &MutationRequest,
-        admission: Admission,
         guard: CommitGuard,
         life: Life,
         copied: &Arc<AtomicBool>,
     ) -> Result<ParamsValue> {
         let action = (mutation.action_id, mutation_digest(mutation, &caller)?);
+        // The admission of the methods that ask their standing inside their own writes comes from
+        // the landing the caller carries, the same parts that the records of a request and of an
+        // answer take.
+        let admission = caller.admission();
         let copied = Arc::clone(copied);
         match method {
             // The effect that spends an owner's confirmation of the clock, and the confirmation
