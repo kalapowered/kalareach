@@ -2856,21 +2856,22 @@ fn doctor_reports_the_faults_a_running_sessions_terminal_met() {
         "#!/bin/sh\nprintf 'ok\\355\\240\\200more'\nexec cat\n",
     );
     let cwd = host.tree.root().display().to_string();
-    let output = start(host.kr(&[
-        "--json",
-        "new",
-        "--invisible",
-        "--headless",
-        "--cwd",
-        &cwd,
-        "--shell",
-        &shell.display().to_string(),
-        "--shell-mode",
-        "native_compat",
-        "--startup",
-        "interactive",
-    ]))
-    .finish("kr new");
+    let output = host.finish_through_a_slow_start("kr new", || {
+        host.kr(&[
+            "--json",
+            "new",
+            "--invisible",
+            "--headless",
+            "--cwd",
+            &cwd,
+            "--shell",
+            &shell.display().to_string(),
+            "--shell-mode",
+            "native_compat",
+            "--startup",
+            "interactive",
+        ])
+    });
     let created = document(&output, "kr new");
     assert!(output.status.success(), "{created}");
 
