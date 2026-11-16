@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use kr_client::shown;
 use kr_client::shown::{Said, Shown};
 use kr_controller::attempt::{self, Marker};
+use kr_ipc::client::LocalClient;
 use kr_ipc::paths::HostPaths;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::hostinfo::configuration::ControllerStartup;
@@ -446,9 +447,91 @@ fn begin_the_record(
     Ok(())
 }
 
+/// What one connection to a daemon says of the daemon behind it. Both are read on the connection
+/// that answered, so they are of one process: a daemon that ends and another that takes its place
+/// cannot be told apart by two reads that are not made on the same connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Answering {
+    /// Its generation.
+    generation: ControllerGeneration,
+    /// Its process, as the daemon states it; none where it did not.
+    pid: Option<u64>,
+}
+
+/// Reads, on the connection that answered, the daemon's generation and then its process. The
+/// process comes from a request for the launch alone, which answers the daemon's process and stops
+/// nothing.
+async fn answering(
+    client: &mut LocalClient,
+    environment: &KnownEnvironment,
+    progress: &Progress,
+) -> std::result::Result<Answering, Shown> {
+    let info = match tokio::time::timeout(
+        startup::ANSWER_BOUND,
+        host_stop::host_info(client, &environment.paths),
+    )
+    .await
+    {
+        Ok(Ok(info)) => info,
+        Ok(Err(error)) => {
+            return Err(shown!(
+                "a control daemon answered and its generation could not be read: {}",
+                error.said()
+            ));
+        }
+        Err(_) => {
+            return Err(Shown::said(
+                "a control daemon answered and did not state its generation in time",
+            ));
+        }
+    };
+    let pid = match host_stop::ask(client, environment.environment_id, false, progress, true).await
+    {
+        Asked::Taken(result) => Some(result.pid.get()),
+        Asked::Unknown(_) | Asked::Refused(_) | Asked::NotComposed { .. } => None,
+    };
+    Ok(Answering {
+        generation: info.generation,
+        pid,
+    })
+}
+
+/// Whether the daemon that answered is the one that was started, from what one connection said of
+/// it. `started` is what the start made, and none where its look found a daemon already there.
+///
+/// The daemon is the one that was started where it is of a newer generation than the one that was
+/// stopped and its process is the started one. Where the start has no process to name (the
+/// scheduled task, a manager that does not say), a newer generation alone is the proof, and that is
+/// a named limit.
+fn judge(
+    started: Option<Started>,
+    stopped: Option<ControllerGeneration>,
+    answering: &Answering,
+) -> std::result::Result<Proved, &'static str> {
+    // The look found a daemon: another restart's, or a manager's.
+    let Some(started) = started else {
+        return Ok(Proved::Another(answering.pid));
+    };
+    if !stopped.is_none_or(|old| answering.generation > old) {
+        return Err("the control daemon that answers is of the generation that was told to stop");
+    }
+    match (started.pid, answering.pid) {
+        (None, _) => Ok(Proved::Ours(started)),
+        (Some(process), Some(answered)) if answered == u64::from(process) => {
+            Ok(Proved::Ours(started))
+        }
+        // The child that was started lost the environment to another daemon, which answers.
+        (Some(_), Some(answered)) => Ok(Proved::Another(Some(answered))),
+        (Some(_), None) => Err(
+            "the control daemon that answers did not state its process, so it \
+             cannot be told from the one that was started",
+        ),
+    }
+}
+
 /// Starts a daemon as `kr new` does, and proves that the daemon that answers is the one this
-/// command started: it is of a newer generation than the one that was stopped, and where the start
-/// knows its process, that process holds the environment's lock. Where the start has no process to
+/// command started: the connection that answered gives a generation newer than the one that was
+/// stopped and, where the start knows its process, that process. Where the start has no process to
 /// name (the scheduled task, a manager that does not say), a newer generation is the proof, and
 /// that is a named limit.
 pub(crate) async fn start_and_prove(
@@ -472,47 +555,19 @@ pub(crate) async fn start_and_prove(
                 });
             }
         };
-    let unproved = |message: Shown| StartFailed {
+    let unproved = |message: Shown, launched: bool| StartFailed {
         error: CliError::Unfinished {
             code: ErrorCode::EnvironmentUnavailable,
             message,
         },
-        launched: true,
+        launched,
     };
-    let info = match tokio::time::timeout(
-        startup::ANSWER_BOUND,
-        host_stop::host_info(&mut client, &environment.paths),
-    )
-    .await
-    {
-        Ok(Ok(info)) => info,
-        Ok(Err(error)) => {
-            return Err(unproved(shown!(
-                "a control daemon answered and its generation could not be read: {}",
-                error.said()
-            )));
-        }
-        Err(_) => {
-            return Err(unproved(Shown::said(
-                "a control daemon answered and did not state its generation in time",
-            )));
-        }
-    };
-    let holder = host_stop::lock_holder(&environment.paths).map(|holder| holder.pid.get());
-    let Some(started) = started else {
-        // The look found a daemon: another restart's, or a manager's.
-        return Ok(Proved::Another(holder));
-    };
-    let newer = stopped.is_none_or(|old| info.generation > old);
-    match (started.pid, holder) {
-        (Some(pid), Some(held)) if newer && held == u64::from(pid) => Ok(Proved::Ours(started)),
-        // The child that was started lost the environment to another daemon, which answers.
-        (Some(_), _) if newer => Ok(Proved::Another(holder)),
-        (None, _) if newer => Ok(Proved::Ours(started)),
-        _ => Err(unproved(Shown::said(
-            "the control daemon that answers is of the generation that was told to stop",
-        ))),
-    }
+    // A daemon answered, so there is no requested daemon that may still start.
+    let answering = answering(&mut client, environment, progress)
+        .await
+        .map_err(|message| unproved(message, false))?;
+    judge(started, stopped, &answering)
+        .map_err(|message| unproved(Shown::said(message), started.is_some()))
 }
 
 /// The start as a person names it.
@@ -620,4 +675,93 @@ pub(crate) fn interrupted(progress: &Progress, stage: Stage, json: bool) -> Comp
         },
         json,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn started(pid: Option<u32>) -> Started {
+        Started {
+            pid,
+            start: ControllerStartup::Standalone,
+            manager: None,
+        }
+    }
+
+    fn answering(generation: u64, pid: Option<u64>) -> Answering {
+        Answering {
+            generation: ControllerGeneration::new(generation),
+            pid,
+        }
+    }
+
+    fn proof(
+        started: Option<Started>,
+        stopped: Option<u64>,
+        answering: &Answering,
+    ) -> std::result::Result<Proved, &'static str> {
+        judge(started, stopped.map(ControllerGeneration::new), answering)
+    }
+
+    /// The daemon that answers is the started one only where the connection that answered says the
+    /// started process, with a newer generation.
+    #[test]
+    fn the_answering_connection_names_the_started_process_with_a_newer_generation() {
+        let proved = proof(Some(started(Some(40))), Some(3), &answering(4, Some(40)));
+        assert!(matches!(proved, Ok(Proved::Ours(ours)) if ours.pid == Some(40)));
+    }
+
+    /// A daemon of another process that answers is another's, whatever process the start made.
+    #[test]
+    fn a_newer_daemon_of_another_process_is_another() {
+        let proved = proof(Some(started(Some(40))), Some(3), &answering(4, Some(41)));
+        assert!(matches!(proved, Ok(Proved::Another(Some(41)))));
+    }
+
+    /// The generation that was told to stop proves nothing, with the started process or without.
+    #[test]
+    fn the_generation_that_was_told_to_stop_is_no_proof() {
+        for pid in [Some(40), Some(41), None] {
+            let proved = proof(Some(started(Some(40))), Some(3), &answering(3, pid));
+            assert!(proved.is_err(), "{pid:?}");
+        }
+        assert!(proof(Some(started(None)), Some(3), &answering(3, None)).is_err());
+    }
+
+    /// A daemon that does not state its process cannot be told from the started one, so it is no
+    /// proof; and with no process to name, a newer generation alone is the named limit.
+    #[test]
+    fn a_process_that_is_not_stated_proves_only_where_the_start_names_none() {
+        assert!(proof(Some(started(Some(40))), Some(3), &answering(4, None)).is_err());
+        assert!(matches!(
+            proof(Some(started(None)), Some(3), &answering(4, None)),
+            Ok(Proved::Ours(_))
+        ));
+        assert!(matches!(
+            proof(Some(started(None)), Some(3), &answering(4, Some(9))),
+            Ok(Proved::Ours(_))
+        ));
+    }
+
+    /// A daemon that the start's look found is another's, named by the process it states, and the
+    /// process the start would have made is none.
+    #[test]
+    fn a_daemon_that_the_look_found_is_another_and_is_named_by_what_it_states() {
+        assert!(matches!(
+            proof(None, Some(3), &answering(4, Some(9))),
+            Ok(Proved::Another(Some(9)))
+        ));
+        assert!(matches!(
+            proof(None, None, &answering(1, None)),
+            Ok(Proved::Another(None))
+        ));
+    }
+
+    /// With no daemon stopped (a start where none ran), any generation is new.
+    #[test]
+    fn where_none_was_stopped_any_generation_is_new() {
+        let proved = proof(Some(started(Some(40))), None, &answering(1, Some(40)));
+        assert!(matches!(proved, Ok(Proved::Ours(_))));
+    }
 }
