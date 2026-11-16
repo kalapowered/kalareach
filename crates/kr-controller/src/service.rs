@@ -2039,6 +2039,10 @@ mod a_repeat_of_an_exclusive_management_request;
 #[cfg(test)]
 mod an_owners_request_is_recorded_where_it_lands;
 
+/// Where an owner's answer to a confirmation lands: the signer's standing, the bound, the question.
+#[cfg(test)]
+mod an_owners_answer_is_recorded_where_it_lands;
+
 /// A closure whose recording is dropped while it waits for the locks after the record.
 #[cfg(test)]
 mod a_closure_that_is_cancelled;

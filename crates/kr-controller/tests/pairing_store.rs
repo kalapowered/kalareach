@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use kr_controller::error::ControllerError;
 use kr_controller::service::net::devices::DeviceDirectory;
 use kr_controller::service::net::invitations::{
     ActionSubject, HostOwner, InvitationRows, IssueTerms, PairingAction, TerminalStanding,
@@ -876,12 +877,15 @@ fn a_spent_confirmation_cannot_be_spent_again() {
         .record_answered(
             &approval.proof,
             &PairingAction {
-                actor: owner,
+                actor: owner.clone(),
                 action_id: ActionId::new(kr_ipc::new_uuid()),
                 digest: Digest256::from_bytes([4; 32]),
                 subject: ActionSubject::Completed(approval.request.confirmation_id),
             },
             TimestampMs::new(10),
+            &Caller::local(owner).landed_for_ever(),
+            &ConfirmationDisplay::EstablishClock,
+            TerminalStanding::Bootstrap,
             &|| Ok(()),
         )
         .expect("answered");
@@ -983,6 +987,9 @@ fn an_action_identifier_is_spent_on_one_payload_across_the_pairing_methods() {
         &approval.proof,
         &completed,
         TimestampMs::new(10),
+        &Caller::local(actor.clone()).landed_for_ever(),
+        &ConfirmationDisplay::EstablishClock,
+        TerminalStanding::Bootstrap,
         &|| Ok(()),
     )
     .expect("answered");
@@ -1577,5 +1584,60 @@ fn an_owner_grant_that_runs_out_by_utc_first_commits_nothing() {
     assert!(
         expired.expired_at_ms.is_some(),
         "the expiry found inside the transaction is on record"
+    );
+}
+
+/// KR-REQ-10.05: the record of an answer verifies the confirmation again inside its transaction,
+/// after the lookup and before anything is written: a confirmation that no longer verifies is
+/// refused in the words the verification gives, and nothing is recorded.
+#[test]
+fn an_answer_whose_confirmation_no_longer_verifies_is_refused_and_records_nothing() {
+    let temp = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.sqlite3");
+    let (_, rows) = open(&path);
+    let harness = Harness::new(rows.clone());
+    let approval = harness.approval(
+        SensitiveAction::ChangeHostAuthority,
+        Digest256::from_bytes([2; 32]),
+        None,
+    );
+    let owner = ActorId::new("local:501").expect("a principal");
+    let verified = std::sync::atomic::AtomicUsize::new(0);
+    let refused = rows
+        .record_answered(
+            &approval.proof,
+            &PairingAction {
+                actor: owner.clone(),
+                action_id: ActionId::new(kr_ipc::new_uuid()),
+                digest: Digest256::from_bytes([4; 32]),
+                subject: ActionSubject::Completed(approval.request.confirmation_id),
+            },
+            TimestampMs::new(10),
+            &Caller::local(owner).landed_for_ever(),
+            &ConfirmationDisplay::EstablishClock,
+            TerminalStanding::Bootstrap,
+            &|| {
+                verified.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(ControllerError::Refused {
+                    code: ErrorCode::OwnerConfirmationRequired,
+                    detail: "the confirmation has expired".to_owned(),
+                })
+            },
+        )
+        .expect_err("the answer is refused");
+    assert_eq!(
+        refused.to_string(),
+        ControllerError::Refused {
+            code: ErrorCode::OwnerConfirmationRequired,
+            detail: "the confirmation has expired".to_owned(),
+        }
+        .to_string()
+    );
+    assert_eq!(verified.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(
+        rows.acceptance(approval.request.confirmation_id)
+            .expect("readable")
+            .is_none(),
+        "nothing is recorded"
     );
 }

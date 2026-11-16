@@ -385,7 +385,7 @@ mod write_boundary;
 mod a_network_frame_is_asked_where_it_lands;
 
 #[cfg(test)]
-mod an_owners_request_asks_the_feed_twice;
+mod an_owners_records_ask_the_feed_twice;
 
 #[cfg(test)]
 mod a_share_a_device_holds;

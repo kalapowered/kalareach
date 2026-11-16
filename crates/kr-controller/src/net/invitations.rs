@@ -758,28 +758,67 @@ impl InvitationRows {
     ///
     /// Returns when the proof was accepted, as the acceptance record holds it.
     ///
+    /// The record is written in one transaction, in this order: the lookup of the action; the
+    /// signer's standing, read from the rows of this transaction (`terminal` is what the terminal
+    /// is accepted under), and `verified`, which verifies the confirmation again; the authority
+    /// feed's refusal, asked where it takes its locks; the copy of the bound of the local owner's
+    /// lease that `caller` was decided under; the footing's question, with the copied bound; where
+    /// that bound ended or moved, the challenge's `display` decided again under the scope that no
+    /// lease serves; the feed's refusal asked again with no lock; and the write. The question reads
+    /// atomics and clocks alone, and the write follows it with nothing allocated or awaited between
+    /// them: what the write needs is prepared before the transaction.
+    ///
     /// # Errors
     ///
-    /// Returns the admission's refusal, `ID_CONFLICT` for an identifier recorded with another
-    /// payload, and a registry error when a row cannot be written.
+    /// Returns the refusal of a caller no door landed, of the signer's standing, of the
+    /// verification, of the feed, of the footing and of the scope, `ID_CONFLICT` for an identifier
+    /// recorded with another payload, and a registry error when a row cannot be written.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_answered(
         &self,
         proof: &OwnerConfirmationProof,
         action: &PairingAction,
         now: TimestampMs,
-        admission: &dyn Fn() -> Result<()>,
+        caller: &Caller,
+        display: &ConfirmationDisplay,
+        terminal: TerminalStanding,
+        verified: &dyn Fn() -> Result<()>,
     ) -> Result<TimestampMs> {
+        let landing = caller.landing()?;
+        let scope = caller.scope();
         let request = encode(&proof.request)?;
         let kind = text_of(&proof.request.action)?;
         let channel = proof.channel.as_str();
         let stored_proof = encode(proof)?;
         let confirmation_id = proof.request.confirmation_id;
+        let challenge = challenge_of(action)?;
+        #[cfg(feature = "testing")]
+        landing.waits_before_the_record_begins();
         self.directory.transaction(|transaction| {
-            admission()?;
-            match claim_action(transaction, action)? {
-                None => {}
-                Some(recorded) if recorded == *action => {}
-                Some(_) => return Err(another_subject()),
+            let recorded = lookup_action(transaction, action)?;
+            if recorded.as_ref().is_some_and(|recorded| recorded != action) {
+                return Err(another_subject());
+            }
+            signer_still_authorised(transaction, &self.lifetimes, &self.refusal, proof, terminal)?;
+            verified()?;
+            let kept = landing.asks_the_feed()?;
+            let copied = landing.copies_the_bound();
+            match landing.asks(&copied) {
+                Ok(()) => {}
+                // The lease ended in the waits before the question, or ended and was established
+                // again: what the caller answered is decided again under the scope that no lease
+                // serves.
+                Err(LeasedLapse::BoundMoved | LeasedLapse::Lapse(Lapse::LeaseEnded)) => {
+                    let closed = scope.closed();
+                    if !closed.may_confirm_display(display) {
+                        return Err(closed.refusal());
+                    }
+                }
+                Err(LeasedLapse::Lapse(lapse)) => return Err(lapse.refusal()),
+            }
+            landing.feed_still_clear(&kept)?;
+            if recorded.is_none() {
+                insert_action(transaction, action, challenge.as_deref())?;
             }
             transaction
                 .execute(
