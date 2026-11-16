@@ -29,6 +29,196 @@ use kr_protocol::scalars::{AuthorisationKey, EndpointKey, Nullable, Signature64}
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 use kr_service_stand_in::{AdmissionBehaviour, Moment, ServiceWeb};
 
+/// An answer that the service is unable, naming `delay` and the paths that still work.
+fn unable(delay: Option<u64>) -> Result<AdmissionAnswer> {
+    Ok(AdmissionAnswer::Unavailable {
+        message: "Managed capacity for new pairing invitations is not available now.".to_owned(),
+        alternatives: STILL_WORK.iter().map(|path| (*path).to_owned()).collect(),
+        retry_after_seconds: delay,
+    })
+}
+
+/// A request that got no answer.
+fn no_answer() -> Result<AdmissionAnswer> {
+    Err(Error::refusal(
+        ErrorCode::ResourceUnavailable,
+        "no answer".into(),
+    ))
+}
+
+/// What [`waits_at`] finds at each of `probes` for a service that gives `script`, the last of which
+/// repeats.
+async fn waits_for(
+    script: Vec<Result<AdmissionAnswer>>,
+    probes: &[u64],
+) -> Vec<(u64, usize, Option<u64>)> {
+    let clock = AdmissionClock::default();
+    let service = Scripted::new(script);
+    let admissions = scripted_admissions(Arc::clone(&service), &clock);
+    waits_at(&service, &clock, &admissions, probes).await
+}
+
+/// KR-REQ-17.48: a request that fails lifts the time the answer is kept to the time the device asks
+/// again, so that no failed dial between them is told nothing. The answer names 50 seconds and is
+/// kept to 60; the request at 50 fails, and the device asks again at 70.
+#[tokio::test]
+async fn kr_req_17_48_a_failed_request_keeps_the_answer_until_the_device_asks_again() {
+    let seen = waits_for(
+        vec![unable(Some(50)), no_answer()],
+        &[0, 50, 59, 60, 65, 69],
+    )
+    .await;
+    assert_eq!(
+        seen,
+        [
+            (0, 1, Some(50)),
+            (50, 2, Some(20)),
+            (59, 2, Some(11)),
+            (60, 2, Some(10)),
+            (65, 2, Some(5)),
+            (69, 2, Some(1)),
+        ]
+    );
+}
+
+/// KR-REQ-17.48: an answer that stood as a request was made stands when the failure of that request
+/// comes after the time it was kept to: it is kept until the device asks again, and not dropped for
+/// the late failure.
+#[tokio::test]
+async fn kr_req_17_48_a_failure_that_comes_after_the_keep_time_keeps_the_answer_that_stood() {
+    let clock = AdmissionClock::default();
+    let (service, gate) = Scripted::gated_script(vec![unable(Some(50)), no_answer()]);
+    let admissions = scripted_admissions(Arc::clone(&service), &clock);
+    let (host, relays) = (key(0x11), network(&[MANAGED]));
+
+    // The answer names 50 seconds and is kept to 60. The request at 50 is not answered until 65.
+    gate.notify_one();
+    admissions.before_dial(&relays, &host, key(0x22)).await;
+    clock.advance(Duration::from_secs(50));
+    admissions.before_dial(&relays, &host, key(0x22)).await;
+    assert_eq!(service.asks(), 2);
+    clock.advance(Duration::from_secs(15));
+    gate.notify_one();
+    service.answered_to(2).await;
+
+    assert_eq!(handed_on(&admissions.refusal(&relays, &host)), Some(20));
+    clock.advance(Duration::from_secs(19));
+    assert_eq!(handed_on(&admissions.refusal(&relays, &host)), Some(1));
+}
+
+/// KR-REQ-17.48: an answer that had stopped before the third request does not come back when that
+/// request fails. The answers come at 0 and 21 seconds and are kept to 81; the request at 199 fails,
+/// and a failed dial is told nothing until the device asks again ten minutes later.
+#[tokio::test]
+async fn kr_req_17_48_an_answer_that_had_stopped_does_not_come_back_after_a_failed_third_ask() {
+    let seen = waits_for(
+        vec![unable(None), unable(None), no_answer()],
+        &[0, 21, 26, 199, 205, 700, 798, 799],
+    )
+    .await;
+    assert_eq!(
+        seen,
+        [
+            (0, 1, Some(20)),
+            (21, 2, Some(20)),
+            (26, 2, Some(15)),
+            (199, 3, None),
+            (205, 3, None),
+            (700, 3, None),
+            (798, 3, None),
+            (799, 4, None),
+        ]
+    );
+}
+
+/// KR-REQ-17.48: an answer that had stopped is not read while the request that follows it is on its
+/// way, and not after that request fails. The third request is made at 200 seconds, after the answers
+/// of 0 and 21 were kept to 81.
+#[tokio::test]
+async fn kr_req_17_48_an_answer_that_had_stopped_is_not_read_while_the_next_request_is_on_its_way()
+{
+    let clock = AdmissionClock::default();
+    let (service, gate) = Scripted::gated_script(vec![unable(None), unable(None), no_answer()]);
+    let admissions = scripted_admissions(Arc::clone(&service), &clock);
+    let (host, relays) = (key(0x11), network(&[MANAGED]));
+
+    gate.notify_one();
+    admissions.before_dial(&relays, &host, key(0x22)).await;
+    clock.advance(Duration::from_secs(21));
+    gate.notify_one();
+    admissions.before_dial(&relays, &host, key(0x22)).await;
+    assert_eq!(
+        handed_on(&admissions.refusal(&relays, &host)),
+        Some(20),
+        "the second answer stands"
+    );
+
+    clock.advance(Duration::from_secs(179));
+    admissions.before_dial(&relays, &host, key(0x22)).await;
+    assert_eq!(service.asks(), 3);
+    assert_eq!(
+        handed_on(&admissions.refusal(&relays, &host)),
+        None,
+        "the request is on its way"
+    );
+
+    gate.notify_one();
+    service.answered_to(3).await;
+    assert_eq!(handed_on(&admissions.refusal(&relays, &host)), None);
+}
+
+/// KR-REQ-17.48, unchanged: a request that fails before the answer's keep time ends changes nothing
+/// the service said. The device asks again at 41 seconds, and the answer is kept to 60.
+#[tokio::test]
+async fn kr_req_17_48_a_failed_request_inside_the_keep_time_changes_only_the_time_it_asks_again() {
+    let seen = waits_for(vec![unable(None), no_answer()], &[0, 21, 26, 40]).await;
+    assert_eq!(
+        seen,
+        [
+            (0, 1, Some(20)),
+            (21, 2, Some(20)),
+            (26, 2, Some(15)),
+            (40, 2, Some(1)),
+        ]
+    );
+}
+
+/// KR-REQ-17.48, unchanged: an answer that had stopped is not brought back by a failed second
+/// request: it was kept to 60 seconds and the request at 100 fails.
+#[tokio::test]
+async fn kr_req_17_48_an_answer_that_had_stopped_is_not_brought_back_by_a_failed_second_ask() {
+    let seen = waits_for(vec![unable(None), no_answer()], &[0, 100, 105, 119]).await;
+    assert_eq!(
+        seen,
+        [
+            (0, 1, Some(20)),
+            (100, 2, None),
+            (105, 2, None),
+            (119, 2, None),
+        ]
+    );
+}
+
+/// KR-REQ-17.48, unchanged: where no answer is held, a failed dial is told nothing, through two failed
+/// requests and the ten minutes after the third.
+#[tokio::test]
+async fn kr_req_17_48_where_nothing_is_held_a_failed_request_leaves_a_dial_with_no_reason() {
+    let seen = waits_for(vec![no_answer()], &[0, 5, 20, 25, 40, 45, 639, 640]).await;
+    assert_eq!(
+        seen,
+        [
+            (0, 1, None),
+            (5, 1, None),
+            (20, 2, None),
+            (25, 2, None),
+            (40, 3, None),
+            (45, 3, None),
+            (639, 3, None),
+            (640, 4, None),
+        ]
+    );
+}
+
 /// The canonical bytes an admission request's body digest covers, for [`vector_request`], and
 /// their digest. The same strings are the `admission_request_body` case of
 /// `infra/relay/vectors/admission.json`.
@@ -234,6 +424,7 @@ async fn the_services_four_answers_are_read() {
 struct Scripted {
     answers: Mutex<Vec<Result<AdmissionAnswer>>>,
     asked: AtomicUsize,
+    answered: AtomicUsize,
     gate: Option<Arc<tokio::sync::Notify>>,
 }
 
@@ -242,16 +433,27 @@ impl Scripted {
         Arc::new(Self {
             answers: Mutex::new(answers),
             asked: AtomicUsize::new(0),
+            answered: AtomicUsize::new(0),
             gate: None,
         })
     }
 
     fn gated(answer: AdmissionAnswer) -> (Arc<Self>, Arc<tokio::sync::Notify>) {
+        Self::gated_script(vec![Ok(answer)])
+    }
+
+    /// A service that answers a request only when its gate lets it: a `notify_one` before a dial
+    /// lets that dial's request through at once, and one after it lets a request that is on its way
+    /// finish.
+    fn gated_script(
+        answers: Vec<Result<AdmissionAnswer>>,
+    ) -> (Arc<Self>, Arc<tokio::sync::Notify>) {
         let gate = Arc::new(tokio::sync::Notify::new());
         (
             Arc::new(Self {
-                answers: Mutex::new(vec![Ok(answer)]),
+                answers: Mutex::new(answers),
                 asked: AtomicUsize::new(0),
+                answered: AtomicUsize::new(0),
                 gate: Some(Arc::clone(&gate)),
             }),
             gate,
@@ -260,6 +462,20 @@ impl Scripted {
 
     fn asks(&self) -> usize {
         self.asked.load(Ordering::SeqCst)
+    }
+
+    /// Waits until `count` requests have been answered, and so kept by the cache.
+    async fn answered_to(&self, count: usize) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while self.answered.load(Ordering::SeqCst) < count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the request is answered");
+        // The cache keeps an answer in the same turn of the task that read it; one more turn of
+        // this one is enough to be sure it has.
+        tokio::task::yield_now().await;
     }
 }
 
@@ -271,6 +487,7 @@ impl PairingAdmissionService for Scripted {
                 gate.notified().await;
             }
             let mut answers = self.answers.lock().expect("the script");
+            self.answered.fetch_add(1, Ordering::SeqCst);
             if answers.len() > 1 {
                 answers.remove(0)
             } else {
