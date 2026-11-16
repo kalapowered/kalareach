@@ -1080,6 +1080,72 @@ async fn a_repeat_of_a_revocation_asks_the_worker_that_is_still_pending() {
     drop(workers);
 }
 
+/// KR-REQ-09.12, KR-ACC-022: a repeat of a revocation does not ask a worker whose presentation of the
+/// host is still waiting, and so does not wait for it.
+///
+/// The first answer carries the worker as pending behind a held boundary, and its link is gone, so
+/// the pass's ask begins a presentation that waits for the whole hold. A repeat asks the workers that
+/// were pending before it answers, but not one whose presentation is under way: that ask would wait
+/// for the presentation, as long as an exchange may take, and the repeat's answer with it. The
+/// repeat answers inside five seconds with the worker still pending, and begins no presentation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_repeat_of_a_revocation_does_not_wait_for_a_presentation_that_is_under_way() {
+    let Adopted {
+        host,
+        owner,
+        workers,
+    } = Adopted::start(1).await;
+    let worker = &workers[0];
+    let (mut client, mutation) = a_revocation_to_repeat(&host, &owner, worker, 3).await;
+    let begun_before_the_repeat =
+        authority_presentations_with_the_link_up(host.controller(), worker).await;
+    let held = worker.hold_the_dispatch_boundary().await;
+    let (_, first) = the_answer_to(&mut client, &mutation, worker.session_id).await;
+    assert!(
+        !first.state.holds(),
+        "the first answer carries the worker as pending behind the held boundary: {first:?}"
+    );
+    host.controller()
+        .forget_the_worker_link_for_tests(worker.session_id)
+        .await;
+    until(
+        Duration::from_secs(40),
+        "the pass's ask of the worker, which begins a presentation that waits",
+        || worker.service.presentations_waiting_for_tests() == 1,
+    )
+    .await;
+
+    let asked_at = tokio::time::Instant::now();
+    let (_, repeated) = the_answer_to(&mut client, &mutation, worker.session_id).await;
+    assert!(
+        asked_at.elapsed() < Duration::from_secs(5),
+        "the repeat took {:?}, which is as long as an ask that waits for the presentation under way",
+        asked_at.elapsed()
+    );
+    assert!(
+        !repeated.state.holds(),
+        "the repeat carries the worker as still pending: {repeated:?}"
+    );
+    assert_eq!(
+        authority_presentations_since(worker, begun_before_the_repeat),
+        1,
+        "the authority presentations the host began while one waited, counted from \
+         {begun_before_the_repeat} with the daemon's link up (now, by role: {})",
+        presentations_by_role(worker)
+    );
+
+    held.release();
+    until_nobody_is_pending(
+        host.controller(),
+        DEBT_PASS_INTERVAL * 3 + SLACK,
+        "the worker acknowledged once its boundary was free",
+    )
+    .await;
+    drop(client);
+    host.stop().await;
+    drop(workers);
+}
+
 /// KR-REQ-09.12, KR-REQ-10.45: a repeat of a revocation says so when the worker no longer holds the
 /// names.
 ///
