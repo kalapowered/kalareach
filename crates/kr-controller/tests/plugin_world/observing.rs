@@ -35,7 +35,7 @@ use kr_worker::broker::{
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
 use super::acting::{installed, rich};
-use super::{Epoch, Hosted, PATIENCE, component, hosted_running, until};
+use super::{Epoch, Hosted, PATIENCE, Wire, component, hosted_running, until, wire};
 
 /// The plugin host's compile gate and the file it makes beside it when a compile is queued behind
 /// the closed gate (`COMPILE_GATE` and `COMPILE_GATE_REACHED` in `kr-plugin-runtime`'s
@@ -299,7 +299,7 @@ pub fn digest(bytes: &[u8]) -> u64 {
 pub struct Terminal {
     lines: Mutex<Vec<String>>,
     arrived: tokio::sync::Notify,
-    writes: tokio::sync::Mutex<tokio::io::WriteHalf<tokio::net::UnixStream>>,
+    writes: tokio::sync::Mutex<tokio::io::WriteHalf<Wire>>,
 }
 
 impl Terminal {
@@ -513,9 +513,9 @@ impl Observing {
         broker
             .open_native_connection(instance(), &[9; 32], &process, &package(), "1")
             .expect("the native connection is authenticated");
-        let (here, there) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (here, there) = wire();
         let (upstream_reads, upstream_writes) = tokio::io::split(here);
-        let (client_here, client_there) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (client_here, client_there) = wire();
         let (client_reads, client_writes) = tokio::io::split(client_here);
         let (owner, writes) = kr_worker::broker::Duplex::new(
             Arc::clone(broker),
@@ -1307,7 +1307,7 @@ pub fn unlisted() -> serde_json::Value {
 /// The scripted upstream: it records what the worker writes, answers the terminal's own requests,
 /// and writes what a case sends.
 async fn upstream(
-    stream: tokio::net::UnixStream,
+    stream: Wire,
     written: Arc<Mutex<Vec<String>>>,
     mut injected: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) {

@@ -20,10 +20,6 @@
 //! What this suite does not show is the daemon's own report of the barrier, which the cases in
 //! `barrier.rs` show. The daemon does not hold the worker here, so the test speaks to the worker as
 //! its daemon does, over connections of its own: it forwards the action and announces the revision.
-//!
-//! Not claimed: Windows, where the plugin world these cases run in is not built.
-
-#![cfg(unix)]
 
 use std::sync::Arc;
 

@@ -8,8 +8,6 @@
 //! them is the product: the broker, the decode queue and the task that asks components, the link,
 //! the plugin service protocol, and the engine that runs the component.
 
-#![cfg(unix)]
-
 mod plugin_world;
 
 use kr_protocol::broker::BrokerGrant;

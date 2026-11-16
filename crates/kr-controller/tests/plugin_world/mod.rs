@@ -14,10 +14,8 @@
     reason = "each suite that includes this harness uses the part of it that it needs"
 )]
 
-#[cfg(unix)]
 pub mod acting;
 mod ended;
-#[cfg(unix)]
 pub mod observing;
 
 use std::path::{Path, PathBuf};
@@ -107,6 +105,39 @@ pub fn beside_this_test(name: &str) -> PathBuf {
         program.display()
     );
     program
+}
+
+/// One end of an in-process wire: what the broker's transport and its scripted peers are typed by,
+/// the same on every platform.
+pub type Wire = tokio::io::DuplexStream;
+
+/// A wire with room for a megabyte each way. A write that finds it full waits for the other end to
+/// read, as a write to a socket does.
+pub fn wire() -> (Wire, Wire) {
+    tokio::io::duplex(1 << 20)
+}
+
+/// The client's connection ends at once, and what the case keeps of it is returned.
+///
+/// On Unix the socket is shut down before it is dropped: a process another case has started holds
+/// a copy of the descriptor until it executes, and the connection does not end while a copy is
+/// held. On Windows the client's handle is the pipe's only one, so dropping it ends the pipe, and
+/// nothing is kept.
+pub fn client_goes(client: LocalClient) -> Option<LocalClient> {
+    #[cfg(unix)]
+    {
+        let mut client = client;
+        client
+            .writer()
+            .shut_down(std::net::Shutdown::Both)
+            .expect("shuts the client's socket down");
+        Some(client)
+    }
+    #[cfg(not(unix))]
+    {
+        drop(client);
+        None
+    }
 }
 
 /// What the daemon asked its supervisor to start that is not a worker, with the process each start

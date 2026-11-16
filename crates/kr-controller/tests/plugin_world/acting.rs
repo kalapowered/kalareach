@@ -41,7 +41,9 @@ use kr_worker::broker::{
     BrokerTransport, Credential, ManagedProcess, TransportHandle, UpstreamDispatch, subject,
 };
 
-use super::{Epoch, Hosted, PATIENCE, build, component, hosted_on, install};
+use super::{
+    Epoch, Hosted, PATIENCE, Wire, build, client_goes, component, hosted_on, install, wire,
+};
 
 pub fn instance() -> ApplicationInstanceId {
     ApplicationInstanceId::new(Uuid::from_bytes([2; 16]))
@@ -158,8 +160,8 @@ pub struct Acting {
 /// The native terminal's end of the production transport: the frames it writes go to the upstream
 /// through the broker's native admission, and the upstream's replies come back to it.
 pub struct NativeTerminal {
-    lines: tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::net::UnixStream>>>,
-    writes: tokio::io::WriteHalf<tokio::net::UnixStream>,
+    lines: tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<Wire>>>,
+    writes: tokio::io::WriteHalf<Wire>,
 }
 
 /// What the world is started with, beyond how its component is registered.
@@ -415,9 +417,9 @@ impl Acting {
         broker
             .open_native_connection(instance(), &[9; 32], &process, &package(), "1")
             .expect("the native connection is authenticated");
-        let (here, there) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (here, there) = wire();
         let (upstream_reads, upstream_writes) = tokio::io::split(here);
-        let (client_here, client_there) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (client_here, client_there) = wire();
         let (client_reads, client_writes) = tokio::io::split(client_here);
         let (owner, writes) = kr_worker::broker::Duplex::new(
             Arc::clone(broker),
@@ -734,6 +736,7 @@ impl Drop for Acting {
     }
 }
 
+#[cfg(unix)]
 pub fn signal(process: &ProcessStartIdentity, signal: rustix::process::Signal) {
     let pid = rustix::process::Pid::from_raw(i32::try_from(process.pid.get()).expect("a pid"))
         .expect("a process");
@@ -850,7 +853,7 @@ pub fn rich() -> kr_protocol::gateway::RichMethodTable {
 /// The upstream: records each line it is written and answers it with a success carrying the
 /// request's own identifier.
 pub async fn scripted_upstream(
-    stream: tokio::net::UnixStream,
+    stream: Wire,
     written: Written,
     behaviour: Arc<Mutex<Upstream>>,
     environment: String,
@@ -1252,15 +1255,9 @@ impl Acting {
                     .await
                     .expect("the worker installs the revision");
             }
-            // The socket is shut down before it is dropped: a process another case has started
-            // holds a copy of the descriptor until it executes, and the connection does not end
-            // while a copy is held.
             Change::Connection => {
-                if let Some(mut client) = asking.take() {
-                    client
-                        .writer()
-                        .shut_down(std::net::Shutdown::Both)
-                        .expect("shuts the client's socket down");
+                if let Some(client) = asking.take() {
+                    drop(client_goes(client));
                 }
             }
         }

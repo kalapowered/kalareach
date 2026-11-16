@@ -10,8 +10,6 @@
 //! runs the component. A case reads what a component was offered from the component itself, through
 //! its checkpoint, since nothing in the worker presents a component's document.
 
-#![cfg(unix)]
-
 mod plugin_world;
 
 use kr_protocol::gateway::{PendingKind, PendingState};
@@ -262,6 +260,8 @@ async fn kr_req_11_38_a_full_lane_loses_observations_counts_them_and_never_the_r
 /// seconds, or does not answer the link's health question twice running, has stopped reading, and
 /// the link lets the connection go: the component is no longer ready. When the runtime goes on, the
 /// link reaches it again and the component is ready, and enabled.
+// The runtime is stopped and resumed by a signal, which Windows has no counterpart of.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_11_39_the_terminal_drains_and_is_answered_while_the_runtime_has_stopped_reading() {
     let gate = std::env::temp_dir().join(format!("kr-observe-gate-{}", kr_ipc::new_uuid()));
