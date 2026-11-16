@@ -925,7 +925,7 @@ async fn settle_when_definite(
     let definite = match answered {
         Ok(Settled::Result(_)) => true,
         Ok(Settled::Receipt(_)) => false,
-        Err(ClientError::Host(refusal)) => HostWord::of(refusal.code).is_definite(),
+        Err(ClientError::Host(refusal)) => HostWord::of_refusal(refusal).is_definite(),
         Err(ClientError::ResyncRequired) => true,
         Err(_) => false,
     };
