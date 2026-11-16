@@ -1278,28 +1278,32 @@ Two limits remain:
 
 - When the first write of a host's keys to the credential store fails after the record was made,
   the host stays tied to the credential store although no key exists there. A later start where
-  that store opens makes the keys there. Until then, a start where it does not open, or a start
-  with `--secret-store file`, is refused; a person who wants the directory instead removes the
-  `.store-kind` record before any key is made.
-- On macOS a Keychain that cannot be used from a remote shell fails the start at its first read,
-  with the Keychain's own words.
+  that store opens and accepts the write makes the keys there. Until then, a start where it does
+  not open, or a start with `--secret-store file`, is refused. A person who wants the directory
+  instead removes the `.store-kind` record before any key is made. The next start then chooses as
+  a first start does: it takes the directory with `--secret-store file` or where the credential
+  store does not open, and a start without that option records the credential store again where
+  that store opens. The daemon writes the file `controller-identity` in the state directory just
+  after it makes the host's identity, so a host without that file has made no identity, unless a
+  start ended between the two writes.
+- On macOS a Keychain that cannot be used from a remote shell fails the start when the daemon
+  first uses the Keychain, with the Keychain's own words after the library's prefix.
 
 A state directory can hold its network keys in the credential store and its device keys in the
 directory, if an earlier start chose the two stores apart. The daemon now uses the directory's set
-for everything, so the host's endpoint identity is the directory set's. To bring such a host to one
-set:
+for everything, so the host's endpoint identity is the directory set's. Nothing is repaired by hand
+for such a host, and no step removes or moves a key. Three facts apply:
 
-1. Find the devices to pair again. A device that pinned the credential store's set no longer
-   reaches the host, because the host's endpoint identity is now the directory set's. A device
+1. Find the devices that no longer reach the host. A device that pinned the credential store's set
+   no longer reaches it, because the host's endpoint identity is now the directory set's. A device
    that pinned the directory's set is not affected.
-2. On each device that no longer reaches the host, remove its own record of this host before it
-   pairs again, because both pairing forms refuse a host that the device already holds. On the
-   companion that is the `Forget <host name>` button on the pairing screen, which asks twice. Then
-   pair the device again.
-3. Before removing anything from the credential store, read the daemon's first line
-   (`kr-controller: keys in ...`). If it names the platform store, stop: the items there are then
-   the host's own keys. If it names the directory, remove the credential store's
-   `{environment}/network-device` items, which nothing reads.
+2. A device that no longer reaches the host cannot pair with it again with the keys that it holds.
+   The host keeps that device's record and refuses a second record for the same device endpoint.
+   Forgetting the host on the device does not change this: do not forget the host as a repair.
+3. Keep both sets of keys. This build does not read the credential store's items for such a host,
+   and they are the only copy of the identity that those devices pinned. Never copy keys from one
+   store to the other: a copy of the credential store's set over the directory's would break each
+   device that pinned the directory's set.
 
 The daemon used the directory's set for the membership key, the delivery module, backup
 enrolment, the authority feed's signer and the relay lease scope. A copy of the keyring's set over
