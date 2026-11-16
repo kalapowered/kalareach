@@ -288,6 +288,49 @@ fn a_full_reset_gives_up_the_next_screen_of_rows_and_keeps_the_rows_after_it() {
 }
 
 #[test]
+fn a_screen_clear_gives_up_the_next_screen_of_rows_like_a_full_reset() {
+    let mut engine = after_a_private_interval();
+    feed(&mut engine, "\x1b[2J\x1b[H");
+    feed(&mut engine, &printed("after", 0, 20));
+
+    assert_eq!(retained(&engine), numbered("after", 4, 17));
+}
+
+/// A line of ten columns whose first part was printed while rows were not kept and whose rest was
+/// printed on a new line after that, then the rows that push both above a screen of four rows.
+fn a_wrapped_line_that_began_in_the_interval(resize_first: bool) -> Vec<String> {
+    let mut engine = engine(10, 4);
+    engine.set_history_kept(false);
+    feed(&mut engine, "a\r\nb\r\nc\r\nABCDEFGHIJ");
+    engine.set_history_kept(true);
+    // The rest wraps onto a new line, which was not on the screen at the disabling.
+    feed(&mut engine, "klmno");
+    if resize_first {
+        // Wider, so the library joins the two parts into one line again.
+        engine.resize(GridSize::new(20, 4), 0).expect("wider");
+    }
+    feed(&mut engine, &format!("\r\n{}", printed("z", 0, 12)));
+    retained(&engine)
+}
+
+#[test]
+fn a_resize_gives_up_the_rest_of_a_wrapped_line_whose_first_part_is_given_up_and_nothing_else() {
+    let kept = a_wrapped_line_that_began_in_the_interval(false);
+    let rejoined = a_wrapped_line_that_began_in_the_interval(true);
+
+    assert_eq!(
+        kept,
+        [vec!["klmno".to_string()], numbered("z", 0, 9)].concat(),
+        "without a resize the rest is its own row, and it is kept"
+    );
+    assert_eq!(
+        rejoined,
+        numbered("z", 0, 9),
+        "the resize joined it to the first part, and the whole line is given up"
+    );
+}
+
+#[test]
 fn rows_are_kept_through_a_height_only_resize_that_gives_up_nothing_of_its_own() {
     let mut engine = after_a_private_interval();
     feed(&mut engine, &printed("after", 0, 3));
