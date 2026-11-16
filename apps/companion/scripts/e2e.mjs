@@ -13,6 +13,8 @@
 // the same machine is never the server this one tests. Each server ends with this run, however it
 // ends.
 import { spawn, spawnSync } from 'node:child_process'
+import { readFileSync, readdirSync } from 'node:fs'
+import { join } from 'node:path'
 import { clearTimeout, setTimeout } from 'node:timers'
 import { URL, fileURLToPath } from 'node:url'
 
@@ -30,6 +32,26 @@ const run = (tool, args, env = {}) => {
   }
   if (result.status !== 0) process.exit(result.status ?? 1)
 }
+
+/**
+ * Strings that only the test harness's tap record writes (its element ids and the labels of its lines). The record exists to let a
+ * test read the events the platform sends, so it must be in the harness bundle and in no bundle that ships.
+ */
+const TAP_RECORD_MARKERS = ['kr-taps-log', 'kr-taps-lit', 'TAPLOG', 'TAPLINKS', 'TAPLIT']
+
+/** The files under a directory, with their folders. */
+const filesUnder = (directory) =>
+  readdirSync(directory, { withFileTypes: true }).flatMap((entry) =>
+    entry.isDirectory() ? filesUnder(join(directory, entry.name)) : [join(directory, entry.name)]
+  )
+
+/** The files of a bundle that hold a marker of the tap record, with the marker each holds. */
+const holdingTapRecord = (directory) =>
+  filesUnder(directory).flatMap((file) => {
+    const text = readFileSync(file, 'utf8')
+    const found = TAP_RECORD_MARKERS.filter((marker) => text.includes(marker))
+    return found.length > 0 ? [`${file} (${found.join(', ')})`] : []
+  })
 
 /**
  * How long a server is given to say its port before it is called not started. A server says it as
@@ -87,6 +109,17 @@ const serve = (script) =>
 
 run('vite', ['build'], { KR_COMPANION_HARNESS: '1' })
 run('vite', ['build'], { KR_COMPANION_HARNESS: '0' })
+// The tap record is searched for in both bundles after they are built: the harness bundle must hold it, or the search would find nothing in
+// any bundle, and the bundle that ships must not.
+if (holdingTapRecord(fileURLToPath(new URL('../dist-harness/', import.meta.url))).length === 0) {
+  console.error('the harness bundle holds no tap record, so a search of the production bundle for it proves nothing')
+  process.exit(1)
+}
+const shipping = holdingTapRecord(fileURLToPath(new URL('../dist/', import.meta.url)))
+if (shipping.length > 0) {
+  console.error(`the tap record of the test harness is in the production bundle: ${shipping.join('; ')}`)
+  process.exit(1)
+}
 process.on('exit', () => {
   for (const child of servers) child.kill('SIGTERM')
 })
