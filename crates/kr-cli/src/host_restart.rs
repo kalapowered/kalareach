@@ -15,13 +15,13 @@
 //! and then find no equivalent start refuses first, and says that nothing was stopped.
 
 mod holder;
+mod proof;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 use kr_client::shown;
 use kr_client::shown::{Said, Shown};
 use kr_controller::attempt::{self, Marker};
-use kr_ipc::client::LocalClient;
 use kr_ipc::paths::HostPaths;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::hostinfo::configuration::ControllerStartup;
@@ -264,10 +264,29 @@ async fn restart_the_daemon(
                 &begun.earlier,
             )
         }
-        Ok(Proved::Another { serving, launched }) => {
+        Ok(Proved::Another {
+            serving,
+            launched,
+            ended,
+        }) => {
             progress.remove_marker();
-            host_stop::done(
-                &shown!(
+            let said = match launched {
+                // PLACEHOLDER for the texts' round: the sentence that says this command stopped the
+                // control daemon and started one (process P), which answered and then ended, and
+                // that the control daemon that answers now is process Q. Its state is `ended`, set
+                // where the proof's exchange was cut and the daemon that answered next is not the
+                // one this command started (`proof::prove`).
+                Some(started) if ended => shown!(
+                    "This command stopped the control daemon for environment {}{} and started \
+                     one{}, which answered and then ended; the control daemon that answers now{}. \
+                     No session was stopped.{}",
+                    id,
+                    host_stop::process_said(stopped.named),
+                    host_stop::process_said(started.pid.map(u64::from)),
+                    host_stop::process_said(serving),
+                    creates
+                ),
+                launched => shown!(
                     "Stopped the control daemon for environment {}{}; a control daemon already \
                      serves it{}.{} No session was stopped.{}",
                     id,
@@ -276,10 +295,8 @@ async fn restart_the_daemon(
                     Proved::own_start_said(launched),
                     creates
                 ),
-                &facts,
-                json,
-                &begun.earlier,
-            )
+            };
+            host_stop::done(&said, &facts, json, &begun.earlier)
         }
         Err(failed) => {
             failed
@@ -308,6 +325,7 @@ async fn wait_for_the_successor(
         Ok(_) => Ok(Proved::Another {
             serving: successor,
             launched: None,
+            ended: false,
         }),
         Err(last) => Err(CliError::Unfinished {
             code: ErrorCode::EnvironmentUnavailable,
@@ -368,26 +386,42 @@ async fn start_where_none_ran(
                 &begun.earlier,
             )
         }
-        Ok(Proved::Another { serving, launched }) => {
+        Ok(Proved::Another {
+            serving,
+            launched,
+            ended,
+        }) => {
             progress.remove_marker();
-            // Where this command launched nothing it started none; where it launched a process
-            // that lost the environment, it says that instead.
-            let own = match launched {
-                None => Shown::said(" This command started none."),
-                Some(_) => Proved::own_start_said(launched),
-            };
-            host_stop::done(
-                &shown!(
-                    "No control daemon was running for environment {}, and one serves it now{}.{}{}",
+            let said = match launched {
+                // PLACEHOLDER for the texts' round: the sentence that says this command started a
+                // control daemon (process P), which answered and then ended, and that the control
+                // daemon that answers now is process Q. Its state is `ended` (see above).
+                Some(started) if ended => shown!(
+                    "No control daemon was running for environment {}. This command started \
+                     one{}, which answered and then ended; the control daemon that answers now{}.{}",
                     id,
+                    host_stop::process_said(started.pid.map(u64::from)),
                     host_stop::process_said(serving),
-                    own,
                     host_stop::under_way_said(environment)
                 ),
-                &none,
-                json,
-                &begun.earlier,
-            )
+                launched => {
+                    // Where this command launched nothing it started none; where it launched a
+                    // process that lost the environment, it says that instead.
+                    let own = match launched {
+                        None => Shown::said(" This command started none."),
+                        Some(_) => Proved::own_start_said(launched),
+                    };
+                    shown!(
+                        "No control daemon was running for environment {}, and one serves it \
+                         now{}.{}{}",
+                        id,
+                        host_stop::process_said(serving),
+                        own,
+                        host_stop::under_way_said(environment)
+                    )
+                }
+            };
+            host_stop::done(&said, &none, json, &begun.earlier)
         }
         Err(failed) => {
             failed
@@ -408,12 +442,33 @@ pub(crate) enum Proved {
         /// The process that the answering daemon states, where it states one.
         serving: Option<u64>,
         /// What this command launched, where it launched something that did not take the
-        /// environment, and none where its look found the daemon already there.
+        /// environment or that answered and then ended, and none where its look found the daemon
+        /// already there.
         launched: Option<Started>,
+        /// Whether what this command launched answered and then ended before the exchange that
+        /// proves it was read, as a daemon does that another command stops.
+        ended: bool,
     },
 }
 
 impl Proved {
+    /// This outcome for a proof whose exchange was cut after a daemon answered: what this command
+    /// launched, where it launched something, answered and then ended.
+    fn after_a_cut(self) -> Self {
+        match self {
+            Self::Another {
+                serving,
+                launched: Some(started),
+                ..
+            } => Self::Another {
+                serving,
+                launched: Some(started),
+                ended: true,
+            },
+            other => other,
+        }
+    }
+
     /// What a result says where another daemon serves: that this command's own start, where it
     /// made one, did not take the environment.
     fn own_start_said(launched: Option<Started>) -> Shown {
@@ -537,44 +592,6 @@ struct Answering {
     pid: Option<u64>,
 }
 
-/// Reads, on the connection that answered, the daemon's generation and then its process. The
-/// process comes from a request for the launch alone, which answers the daemon's process and stops
-/// nothing.
-async fn answering(
-    client: &mut LocalClient,
-    environment: &KnownEnvironment,
-    progress: &Progress,
-) -> std::result::Result<Answering, Shown> {
-    let info = match tokio::time::timeout(
-        startup::ANSWER_BOUND,
-        host_stop::host_info(client, &environment.paths),
-    )
-    .await
-    {
-        Ok(Ok(info)) => info,
-        Ok(Err(error)) => {
-            return Err(shown!(
-                "a control daemon answered and its generation could not be read: {}",
-                error.said()
-            ));
-        }
-        Err(_) => {
-            return Err(Shown::said(
-                "a control daemon answered and did not state its generation in time",
-            ));
-        }
-    };
-    let pid = match host_stop::ask(client, environment.environment_id, false, progress, true).await
-    {
-        Asked::Taken(result) => Some(result.pid.get()),
-        Asked::Unknown(_) | Asked::Refused(_) | Asked::NotComposed { .. } => None,
-    };
-    Ok(Answering {
-        generation: info.generation,
-        pid,
-    })
-}
-
 /// Whether the daemon that answered is the one that was started, from what one connection said of
 /// it. `started` is what the start made, and none where its look found a daemon already there.
 ///
@@ -592,6 +609,7 @@ fn judge(
         return Ok(Proved::Another {
             serving: answering.pid,
             launched: None,
+            ended: false,
         });
     };
     if !stopped.is_none_or(|old| answering.generation > old) {
@@ -606,6 +624,7 @@ fn judge(
         (Some(_), Some(answered)) => Ok(Proved::Another {
             serving: Some(answered),
             launched: Some(started),
+            ended: false,
         }),
         (Some(_), None) => Err(
             "the control daemon that answers did not state its process, so it \
@@ -618,41 +637,28 @@ fn judge(
 /// command started: the connection that answered gives a generation newer than the one that was
 /// stopped and, where the start knows its process, that process. Where the start has no process to
 /// name (the scheduled task, a manager that does not say), a newer generation is the proof, and
-/// that is a named limit.
+/// that is a named limit. A proof whose exchange is cut after a daemon answered starts nothing
+/// more, and waits within the start's bound for a daemon to answer (`proof::prove`).
 pub(crate) async fn start_and_prove(
     host: &HostPaths,
     environment: &KnownEnvironment,
     stopped: Option<ControllerGeneration>,
     progress: &Progress,
 ) -> std::result::Result<Proved, StartFailed> {
-    let launched = AtomicBool::new(false);
     // Written before the start is asked for: a command that is killed from here on leaves the word
     // that it had asked.
     let _ = progress.with_marker(|marker| marker.starting());
     progress.enter(Stage::Starting);
-    let (mut client, started) =
-        match startup::open_or_start_telling(host, environment, &launched).await {
-            Ok(found) => found,
-            Err(error) => {
-                return Err(StartFailed {
-                    error,
-                    launched: launched.load(Ordering::SeqCst),
-                });
-            }
-        };
-    let unproved = |message: Shown, launched: bool| StartFailed {
-        error: CliError::Unfinished {
-            code: ErrorCode::EnvironmentUnavailable,
-            message,
+    proof::prove(
+        &proof::Real {
+            host,
+            environment,
+            progress,
         },
-        launched,
-    };
-    // A daemon answered, so there is no requested daemon that may still start.
-    let answering = answering(&mut client, environment, progress)
-        .await
-        .map_err(|message| unproved(message, false))?;
-    judge(started, stopped, &answering)
-        .map_err(|message| unproved(Shown::said(message), started.is_some()))
+        stopped,
+        startup::START_BOUND,
+    )
+    .await
 }
 
 /// The start as a person names it.
@@ -804,7 +810,8 @@ mod tests {
             proved,
             Ok(Proved::Another {
                 serving: Some(41),
-                launched: Some(launched)
+                launched: Some(launched),
+                ended: false
             }) if launched.pid == Some(40)
         ));
     }
@@ -842,14 +849,16 @@ mod tests {
             proof(None, Some(3), &answering(4, Some(9))),
             Ok(Proved::Another {
                 serving: Some(9),
-                launched: None
+                launched: None,
+                ended: false
             })
         ));
         assert!(matches!(
             proof(None, None, &answering(1, None)),
             Ok(Proved::Another {
                 serving: None,
-                launched: None
+                launched: None,
+                ended: false
             })
         ));
     }

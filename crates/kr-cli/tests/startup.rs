@@ -5753,13 +5753,14 @@ fn kr_host_restart_replaces_the_daemon_and_the_new_one_is_the_one_it_started() {
 }
 
 /// KR-REQ-07.12 (two restarts at once): one daemon runs at the end and it is a new one, and each
-/// command says only what is true of the order it met. A restart that finds the other's daemon
-/// answering restarts it again, so a command that says it started a daemon may name one that a later
-/// restart has stopped since: it names a daemon that ran, and the one that runs at the end is
-/// waited for, not read once. A command ends with exit 1 only with the words of a bound that ran
-/// out (a holder that did not answer in the start's bound) or of a proof that was cut (the daemon it
-/// started was stopped by the other restart before it could be proved); at least one command
-/// succeeds.
+/// command says only what is true of the order it met. Nothing orders the two: a restart that
+/// finds the other's daemon answering restarts it again, so a command that says it started a daemon
+/// may name one that a later restart has stopped since: it names a daemon that ran, and the one
+/// that runs at the end is waited for, not read once. A command whose proof was cut by the other's
+/// stop starts nothing more and waits for the daemon that answers next. Both commands end with
+/// exit 0 wherever a daemon answers within the bounds; exit 1 comes only with the words of a bound
+/// that ran out (a holder that did not answer in the start's bound, or no daemon that answered
+/// within it after a proof that was cut). The case requires no order between the two processes.
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn two_kr_host_restarts_at_once_converge_on_one_daemon_and_neither_fails() {
@@ -5795,8 +5796,12 @@ fn two_kr_host_restarts_at_once_converge_on_one_daemon_and_neither_fails() {
             let message = said["message"].as_str().expect("a message");
             assert!(
                 message.contains("does not answer, so it may be starting or stopping")
-                    || message.contains("a control daemon answered and"),
-                "an exit 1 is a bound that ran out or a proof that was cut: {said}"
+                    || message.contains("no control daemon answered within"),
+                "an exit 1 is the words of a bound that ran out: {said}"
+            );
+            assert!(
+                !message.contains("generation could not be read"),
+                "a proof that was cut is waited through and does not end the command: {said}"
             );
         }
     }
