@@ -84,4 +84,4 @@ question=check way=wrong_form stand-in=a refusal that this host does not know
 
 ## ways that the walk through the install does not make
 way=timed_out: the install gives each question sixty seconds, and each of the three would wait them; a case of kr-shell-integration ends each question by a limit of 400 ms and compares the error with the one that this table's row comes from, and a case there shows that the install gives each question more than the five seconds of a report
-way=timed_out (this host could not wait for the program): no stand-in makes a failed wait on a child that this host started; the question ends as a time-out does, the program is ended and reaped, and both sections of the last read found "did not answer in time" true of it
+way=timed_out (this host could not wait for the program): no stand-in makes a failed wait on a child that this host started; the question ends as a time-out does, the program is ended and reaped, so "did not answer in time" is true of it
