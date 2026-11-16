@@ -43,6 +43,10 @@ const BUNDLE: &str = "tauri://localhost";
 /// How long a view that should send nothing is watched.
 const QUIET: Duration = Duration::from_millis(300);
 
+/// How long a case waits for a state that it asserts, where a missing state is to fail the case by
+/// its own assertion. The states of a correct view come within a fraction of a second.
+const STATE_BOUND: Duration = Duration::from_secs(10);
+
 /// The page: an application with the view's commands, and every state each channel was sent.
 struct Page {
     app: tauri::App<MockRuntime>,
@@ -1669,6 +1673,24 @@ impl Page {
         .expect("the return is taken");
     }
 
+    /// The newest state `channel` has been sent, once it is one `holds` accepts, and none when no
+    /// state of that kind comes within [`STATE_BOUND`]: a case that must fail by an assertion of
+    /// its own, and not by the harness's watchdog, asks for a state this way.
+    async fn newest_within(&self, channel: u32, holds: impl Fn(&Value) -> bool) -> Option<Value> {
+        tokio::time::timeout(STATE_BOUND, async {
+            loop {
+                if let Some(state) = self.states(channel).last()
+                    && holds(state)
+                {
+                    return state.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .ok()
+    }
+
     /// The newest state `channel` has been sent, once it is one `holds` accepts.
     async fn newest(&self, channel: u32, holds: impl Fn(&Value) -> bool) -> Value {
         tokio::time::timeout(WATCHDOG, async {
@@ -3173,9 +3195,12 @@ async fn an_acquire_answered_after_looking_around_is_released_and_restores_nothi
     );
 }
 
-/// A release and a take made one after the other each go in order under their own epochs; a late
-/// answer for the old epoch changes nothing, and an input made under the old take is refused once
-/// the new one controls the program.
+/// A release and a take made one after the other each go in order under their own epochs: the
+/// take's acquire goes while the release stands behind the key that the worker has not answered, and
+/// when the worker has answered the acquire and the page is told that the take controls, a late
+/// refusal of the old epoch's key and the release of that older epoch change nothing. An input made
+/// under the old take is refused once the new one controls the program, and one made under the new
+/// take is written under the new epoch.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_release_and_a_new_take_keep_their_epochs_apart() {
     let mut worker = ScriptedWorker::start(Challenge::Answered);
@@ -3194,23 +3219,18 @@ async fn a_release_and_a_new_take_keep_their_epochs_apart() {
     page_view.release(&view, 2);
     page_view.take(&view, 3);
     // The release stands behind the key the worker has not answered, so the take's acquire goes
-    // first, and the release follows the key's answer.
+    // first. The worker answers it, and the page is told that the take controls.
     let acquire = link.expect(Method::InputAcquire).await;
+    lease.answer(&mut link, &acquire).await;
+    let controls = page_view
+        .newest(3, |state| control(state) == (3, "controlling".to_owned()))
+        .await;
+    // Only then is the old key refused, late, and the release of the older epoch follows it.
     link.refuse_with(&old_write, ErrorCode::LeaseLost, "the lease has moved on")
         .await;
     let release = link.expect(Method::InputRelease).await;
     assert_eq!(release.params::<InputReleaseParams>().epoch.get(), 5);
     lease.answer(&mut link, &release).await;
-    lease.answer(&mut link, &acquire).await;
-    page_view
-        .newest(3, |state| control(state) == (3, "controlling".to_owned()))
-        .await;
-    tokio::time::sleep(QUIET).await;
-    assert_eq!(
-        control(&newest_now(&page_view, 3)),
-        (3, "controlling".to_owned()),
-        "an old epoch's answer changes nothing"
-    );
     assert_eq!(
         code(
             &page_view
@@ -3219,12 +3239,27 @@ async fn a_release_and_a_new_take_keep_their_epochs_apart() {
         ),
         "LEASE_LOST"
     );
+    // The lane writes the new take's key after the release's answer, so the key on the wire shows
+    // that the view has taken both answers, and what it was told since the take controlled is the
+    // same state of control.
     page_view.text(&view, 3, "b").expect("the text is taken");
     let write = link.expect(Method::InputWrite).await;
     let asked: InputWriteParams = write.params();
-    assert_eq!((asked.epoch.get(), asked.sequence.get()), (7, 0));
+    assert_eq!((asked.epoch.get(), asked.sequence.get()), (6, 0));
     lease.answer(&mut link, &write).await;
-    assert_eq!(lease.written, vec![(7, 0, b"b".to_vec())]);
+    assert_eq!(lease.written, vec![(6, 0, b"b".to_vec())]);
+    let told = page_view.states(3);
+    let from = told
+        .iter()
+        .position(|state| state == &controls)
+        .expect("the state in which the take controls");
+    assert!(
+        told[from..]
+            .iter()
+            .all(|state| control(state) == (3, "controlling".to_owned())),
+        "an old epoch's answer changes nothing: {:?}",
+        &told[from..]
+    );
 }
 
 /// Section 8 ¶3: while the program reads keys in a form the view does not produce, the session
@@ -4229,16 +4264,22 @@ async fn text_is_its_utf8_and_a_paste_is_bracketed_when_the_program_asks() {
         b"\x1b[200~rm -rf /\ninnocent\x1b[201~",
         "a paste cannot end itself"
     );
-    // A paste of 64 KiB with its marks is more than one frame carries: the lane cuts it, in frames
-    // of at most the level's input bytes, and never inside a mark.
-    let longest = "x".repeat(64 * 1024 - 12);
-    page_view.paste(&view, 1, &longest).expect("taken");
+    // A paste of more than one frame carries: the lane cuts it, in frames of at most the level's
+    // input bytes, and never inside a mark. Its size is chosen so that the closing mark stands
+    // across the place where the frame ends, three bytes of it before that place, so that a cut made
+    // there would fall inside the mark.
     let start = b"\x1b[200~".as_slice();
     let end = b"\x1b[201~".as_slice();
+    let frame_bytes = kr_protocol::input::max_input_bytes(64 * 1024);
+    let longest = "x".repeat(frame_bytes - start.len() - 3);
+    page_view.paste(&view, 1, &longest).expect("taken");
     let mut expected = start.to_vec();
     expected.extend_from_slice(longest.as_bytes());
     expected.extend_from_slice(end);
-    let frame_bytes = kr_protocol::input::max_input_bytes(64 * 1024);
+    assert!(
+        expected.len() - end.len() < frame_bytes && frame_bytes < expected.len(),
+        "the closing mark stands across the cut at the frame's size"
+    );
     let mut writes: Vec<Vec<u8>> = Vec::new();
     let mut joined = Vec::new();
     while joined.len() < expected.len() {
@@ -4714,13 +4755,10 @@ async fn a_lease_refusal_of_a_key_ends_control_with_the_sessions_words() {
     let key = link.expect(Method::InputWrite).await;
     link.refuse_with(&key, ErrorCode::LeaseLost, "the lease has moved on")
         .await;
-    tokio::time::sleep(QUIET).await;
-    let ended = newest_now(&page, 3);
-    assert_eq!(
-        control(&ended),
-        (1, "watching".to_owned()),
-        "the refusal ended control"
-    );
+    let ended = page
+        .newest_within(3, |state| control(state) == (1, "watching".to_owned()))
+        .await
+        .expect("the refusal ended control within the bound");
     let words = ended["control"]["ended"]
         .as_str()
         .expect("words of the end");
@@ -4860,38 +4898,115 @@ async fn a_restarted_delivery_drops_the_old_streams_frames_until_its_first_at_ze
     }
 }
 
-/// A view that is slower than the host loses no notification: every screen the host sent is
-/// shown, in order, and when the host's connection goes the view ends with the words it always
-/// had.
+/// A view that is slower than the host loses no notification: the page holds the view inside its
+/// first state while the host writes 262 notifications, more than the 256 that the session's
+/// channel holds, so the session's reader waits for room. The few frames beyond the channel's are
+/// what the socket holds: a host that writes more than about 268 while the view is held waits for
+/// the view with no end. Every screen the host sent is then shown, in order, and when the host's
+/// connection goes the view ends with the words it always had.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slow_view_loses_no_notification_and_ends_with_its_words() {
+    const SCREENS: u64 = 262;
     let mut worker = ScriptedWorker::start(Challenge::Answered);
     let page = Page::new(worker.paths());
     let (_view, mut link) = showing(&page, &mut worker, 3).await;
     let shown = page.states(3).len();
-    let screens = 150_u64;
-    for number in 0..screens {
-        screen(
-            &mut link,
-            number + 2,
-            60 + number,
-            vec![row(0, &format!("screen {number}"))],
-            0,
+    let held = Held::new(&page.gate);
+    for number in 0..SCREENS {
+        link.push(
+            PROJECTION_DELTA_EVENT,
+            &delta(
+                1,
+                40 + number,
+                41 + number,
+                10,
+                2,
+                0,
+                vec![row(1, &format!("screen {number}"))],
+            ),
         )
         .await;
     }
     drop(link);
+    page.state(3, shown).await;
+    assert_eq!(
+        page.states(3).len(),
+        shown + 1,
+        "the page held the view inside the first state while the host wrote all of them"
+    );
+    drop(held);
     let ended = page.newest(3, |state| state["state"] == "ended").await;
     assert_eq!(ended["reason"], "The connection to this session ended.");
-    let texts: Vec<String> = page.states(3)[shown..]
-        .iter()
-        .filter(|state| state["state"] == "showing")
-        .map(|state| text_of(state)[0].clone())
-        .collect();
-    let expected: Vec<String> = (0..screens)
+    let expected: Vec<String> = (0..SCREENS)
         .map(|number| format!("screen {number}"))
         .collect();
-    assert_eq!(texts, expected, "every screen is shown, in order");
+    assert_eq!(
+        flood_texts(&page.states(3), shown),
+        expected,
+        "every screen is shown, in order"
+    );
+}
+
+/// A delivery that restarts may begin before the subscription's answer: the first notification of
+/// the new stream, at 0, comes after the old stream's last ones and before the answer. The view
+/// shows the new screen, and the answer that follows changes nothing: the next update applies to the
+/// new screen and nothing is asked again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_stream_that_begins_before_the_subscriptions_answer_is_shown() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let (_view, mut link) = showing(&page, &mut worker, 3).await;
+    link.push("session.resync", &resync_marker(60)).await;
+    let subscribe = link.expect(Method::EventsSubscribe).await;
+    screen(&mut link, 4, 70, vec![row(0, "stale")], 0).await;
+    link.restart_stream();
+    screen(&mut link, 5, 80, vec![row(0, "fresh")], 0).await;
+    let fresh = page
+        .newest_within(3, |state| {
+            state["state"] == "showing" && text_of(state) == ["fresh"]
+        })
+        .await;
+    assert!(
+        fresh.is_some(),
+        "the new stream's first screen was shown before the subscription was answered: {:?}",
+        page.states(3)
+    );
+    link.answer(&subscribe, &scripted_worker::subscribed())
+        .await;
+    link.push(
+        PROJECTION_DELTA_EVENT,
+        &delta(5, 80, 90, 10, 1, 0, vec![row(0, "next")]),
+    )
+    .await;
+    let next = page
+        .newest_within(3, |state| {
+            state["state"] == "showing" && text_of(state) == ["next"]
+        })
+        .await;
+    assert!(
+        next.is_some(),
+        "the update after the answer applied to the new screen: {:?}",
+        page.states(3)
+    );
+    assert!(
+        link.call_now().is_none(),
+        "the answer started no second recovery"
+    );
+    let shown: Vec<Vec<String>> = page
+        .states(3)
+        .iter()
+        .filter(|state| state["state"] == "showing")
+        .map(text_of)
+        .collect();
+    assert_eq!(
+        shown,
+        vec![
+            vec!["first".to_owned(), "second".to_owned()],
+            vec!["fresh".to_owned()],
+            vec!["next".to_owned()]
+        ],
+        "nothing of the old stream was shown"
+    );
 }
 
 /// A word heard while a size report waits for its answer lets the size go again when the session
