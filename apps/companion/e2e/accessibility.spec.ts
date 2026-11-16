@@ -1134,6 +1134,7 @@ test.describe('a tap on the plain text near a link of a message', () => {
         expect(handlers(made.clicks), `clicks that the page added ${String(below)} px below the pane`).toEqual([])
       }
       console.log(`gap ${browserName} ${surface}: ${String(gap.length)} taps in the gap below the pane (${String(gap[0])} to ${String(gap[gap.length - 1])} px), the click named the link at ${String(moved)}`)
+      expect(moved, 'taps in the gap below the pane at which the browser moved the click onto the link').toBeGreaterThan(0)
       expect(disagreements, 'taps in the gap at which the look and the opening disagree').toEqual([])
     })
   }

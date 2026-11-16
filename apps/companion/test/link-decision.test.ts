@@ -228,7 +228,7 @@ describe('the link that has the look at a click', () => {
     expect(lookAt('touch', click({ names: 'control' }), null, decision('control'))).toBeNull()
   })
 
-  it('is none where the last press was a mouse’s or where no press in the pane came before the click', () => {
+  it('is none where the last primary press was a mouse’s or where no primary press came before the click', () => {
     expect(lookAt('mouse', click({ names: 'link' }), NAMED, decision('link'))).toBeNull()
     expect(lookAt('mouse', click(), null, STAND)).toBeNull()
     expect(lookAt(null, click({ names: 'link' }), NAMED, decision('link'))).toBeNull()
