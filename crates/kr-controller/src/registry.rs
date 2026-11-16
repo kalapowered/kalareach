@@ -432,6 +432,10 @@ pub struct Registry {
     /// It settles the records the previous build made in whole seconds; a test states what the
     /// kernel says instead.
     current_process: fn(&ProcessStartIdentity) -> CurrentProcess,
+    /// Where this host's own tests stop the next read of a closure, as a disk that does not answer
+    /// does. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    read_stall: crate::attention::Pause,
 }
 
 /// The two columns a worker's desktop identity is kept in.
@@ -884,6 +888,8 @@ impl Registry {
             connection,
             environment_id,
             current_process: kr_ipc::identity::current_process,
+            #[cfg(feature = "testing")]
+            read_stall: crate::attention::Pause::default(),
         })
     }
 
@@ -924,6 +930,8 @@ impl Registry {
             connection,
             environment_id,
             current_process,
+            #[cfg(feature = "testing")]
+            read_stall: crate::attention::Pause::default(),
         };
         registry.migrate()?;
         registry.settle_whole_seconds()?;
@@ -2957,6 +2965,8 @@ impl Registry {
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the read fails.
     pub fn closure(&self, session_id: SessionId) -> Result<Option<ClosureRecord>> {
+        #[cfg(feature = "testing")]
+        self.read_stall.wait();
         let encoded: Option<Vec<u8>> = self
             .connection
             .query_row(
@@ -2972,6 +2982,21 @@ impl Registry {
                     .map_err(ControllerError::registry)
             })
             .transpose()
+    }
+}
+
+#[cfg(feature = "testing")]
+impl Registry {
+    /// Stops the next read of a closure, as a disk that does not answer does. Returns the end that
+    /// says the read has arrived and the end that lets it go.
+    #[must_use]
+    pub(crate) fn stall_the_next_closure_read(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.read_stall.arm()
     }
 }
 
@@ -3988,6 +4013,8 @@ mod tests {
                 connection: Connection::open(&path).expect("opens"),
                 environment_id: environment(),
                 current_process: kernel,
+                #[cfg(feature = "testing")]
+                read_stall: crate::attention::Pause::default(),
             };
             let error = stopped
                 .migrate_6_to_7_compacting(|_| Err(rusqlite::Error::SqliteFailure(failure, None)))
@@ -4036,6 +4063,8 @@ mod tests {
             connection: Connection::open(&path).expect("opens"),
             environment_id: environment(),
             current_process: kernel,
+            #[cfg(feature = "testing")]
+            read_stall: crate::attention::Pause::default(),
         };
         let error = stopped
             .migrate_6_to_7_compacting(|_| Ok(()))

@@ -301,20 +301,21 @@ impl Controller {
         carried: crate::authority::AdmittedMutation,
     ) -> std::result::Result<ParamsValue, Ended> {
         let params: SessionCloseParams = parse(&mutation.params)?;
-        // A closure this daemon already knows is the answer, before anything is asked of the
-        // directory, the worker or the registry: the registry is this daemon's disk, and a write
-        // to it that has not returned is no reason to hold a close that has its answer.
-        if self.knows_how_it_ended(params.session_id) {
-            return Err(Ended::Answer(
-                self.answer_from_the_closure(params.session_id).await,
-            ));
-        }
         // One budget for the whole exchange, started before the first wait of it. Section 7
         // gives a closure five seconds to stop its processes and two more to drain them, and this
         // daemon holds one connection per worker: a worker that stops answering would otherwise
         // hold that connection for every later caller, and the wait for it would be unbounded on
         // both sides of the handover.
         let budget = tokio::time::Instant::now() + CLOSE_EXCHANGE;
+        // A closure this daemon already knows is the answer, before anything is asked of the
+        // directory, the worker or the registry: the registry is this daemon's disk, and a write
+        // to it that has not returned is no reason to hold a close that has its answer.
+        if self.knows_how_it_ended(params.session_id) {
+            return Err(Ended::Answer(
+                self.answer_from_the_closure(params.session_id, budget)
+                    .await,
+            ));
+        }
         let Ok(directory) = tokio::time::timeout_at(budget, self.directory.lock()).await else {
             // Nothing was dispatched: whoever holds the directory has held it past what a closure
             // is allowed to take, and this close never reached the worker.
@@ -329,7 +330,8 @@ impl Controller {
         let Some(worker) = worker else {
             // A duplicate close returns the existing state rather than closing anything again.
             return Err(Ended::Answer(
-                self.answer_from_the_closure(params.session_id).await,
+                self.answer_from_the_closure(params.session_id, budget)
+                    .await,
             ));
         };
         #[cfg(test)]
@@ -346,7 +348,8 @@ impl Controller {
                 // close that came after the closure.
                 Ok(Err(ControllerError::UnknownSession { .. })) => {
                     return Err(Ended::Answer(
-                        self.answer_from_the_closure(params.session_id).await,
+                        self.answer_from_the_closure(params.session_id, budget)
+                            .await,
                     ));
                 }
                 Ok(Err(error)) => return Err(error.into()),
@@ -483,32 +486,49 @@ impl Controller {
     /// # Errors
     ///
     /// Returns [`ControllerError::UnknownSession`] when no closure is known or recorded, and
-    /// [`ControllerError::Uncertain`] when the registry does not answer within the time a close is
-    /// given.
+    /// [`ControllerError::Uncertain`] when the registry does not answer before `budget`, the
+    /// instant the close this answers must be over by.
     pub(super) async fn answer_from_the_closure(
         &self,
         session_id: SessionId,
+        budget: tokio::time::Instant,
     ) -> Recorded<Result<ParamsValue>> {
-        Recorded::read(self.closure_answer(session_id).await)
+        Recorded::read(self.closure_answer(session_id, budget).await)
     }
 
     /// What a close of `session_id` is answered with where no worker is left to ask: the closure
     /// this daemon knows, then the registry's, read inside the time a close is given. A registry
     /// that does not answer in that time has not said that no closure is recorded, so the answer
     /// is that it is not known, and never that the session is unknown.
-    async fn closure_answer(&self, session_id: SessionId) -> Result<ParamsValue> {
+    async fn closure_answer(
+        &self,
+        session_id: SessionId,
+        budget: tokio::time::Instant,
+    ) -> Result<ParamsValue> {
         if let Some(known) = self.known_closure(session_id) {
             return encode(&known);
         }
-        let read = tokio::time::timeout(CLOSE_EXCHANGE, async {
-            self.registry.lock().await.closure(session_id)
-        })
+        let unreadable = || ControllerError::Uncertain {
+            detail: "The host could not read its record of this session. This request closed \
+                     nothing, and whether an earlier request closed the session is not known."
+                .to_owned(),
+        };
+        // The read is a storage call that may not return, so it runs on a thread of its own and
+        // is waited for inside the close's budget: a disk that does not answer holds neither the
+        // close nor a thread of the runtime past it.
+        let Some(daemon) = self.me.upgrade() else {
+            return Err(unreadable());
+        };
+        let read = tokio::time::timeout_at(
+            budget,
+            tokio::task::spawn_blocking(move || {
+                daemon.registry.blocking_lock().closure(session_id)
+            }),
+        )
         .await;
         let closure = match read {
-            Ok(Ok(closure)) => closure,
-            Ok(Err(_)) | Err(_) => {
-                return Err(ControllerError::record_unreadable("closed sessions"));
-            }
+            Ok(Ok(Ok(closure))) => closure,
+            Ok(Ok(Err(_)) | Err(_)) | Err(_) => return Err(unreadable()),
         };
         match closure {
             Some(closure) => encode(&answer_of_record(&closure)),
