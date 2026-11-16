@@ -377,7 +377,9 @@ pub struct InputDomain {
     state: SessionState,
     /// What the session's application is doing. It lives here, beside the lifecycle state, because
     /// a read of a session that something holds finds it here: the application's producer writes
-    /// it before it waits for the session, so demand that begins during a hold is in the answer.
+    /// it as each fact joins, and nothing that writes it waits for the session, so a turn that
+    /// begins during a hold is in the answer from the evidence loop's next read of the broker. A
+    /// question cannot begin during a hold: its creation runs with the session taken.
     application_state: Option<ApplicationState>,
     /// The session this domain belongs to, which a keystroke's request names.
     session_id: SessionId,
