@@ -359,6 +359,9 @@ impl Shown {
             IpcError::IdentityUnavailable { what, .. } => {
                 crate::shown!("{} is not available", *what)
             }
+            IpcError::HostRefused { .. } => {
+                Self::said("the host refused the connection is not available")
+            }
             // The connection stands: the request is in a form the peer's release cannot read, and
             // it was not written.
             IpcError::NotInLevel(_) => {
