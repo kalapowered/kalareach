@@ -1111,6 +1111,18 @@ pub struct SessionReadResult {
     /// added to those lists later changes nothing in this member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<crate::metrics::WorkerMetrics>,
+    /// Whether this answer was given while the session was held by a storage call.
+    ///
+    /// A worker whose session is held longer than it waits for it answers from what it keeps
+    /// outside the session: the work and launch counts are what the worker last recorded, and the
+    /// members that need the session are null. The daemon's sleep scan reads this member and no
+    /// other reader does: it never lowers what it counted for a session on such an answer.
+    ///
+    /// Absent from the wire when false, and from a worker of a release that wrote no such member,
+    /// so a result of one is byte for byte what that release reads and reads as one given with the
+    /// session taken. The daemon's own answer to `session.read` never carries it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held: bool,
 }
 
 /// Parameters of `session.close`.

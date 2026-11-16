@@ -3681,6 +3681,7 @@ mod tests {
             last_command_block: Nullable::null(),
             outstanding_launches: Nullable::null(),
             metrics: None,
+            held: false,
         };
         let owner = read(Some(socket));
         let device = read_by_a_device(&owner);
@@ -3723,6 +3724,7 @@ mod tests {
             }),
             outstanding_launches: Nullable::null(),
             metrics: None,
+            held: false,
         };
         // What the person typed and where it ran are shown to a device whose grant reaches the
         // command, as they are shown to the person: the grant decides, and this rule does not.
@@ -4016,6 +4018,7 @@ mod tests {
             last_command_block: Nullable::null(),
             outstanding_launches: Nullable::null(),
             metrics: None,
+            held: false,
         };
         let created = kr_protocol::session::SessionCreateResult {
             session: owner.clone(),
