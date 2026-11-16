@@ -1393,14 +1393,38 @@ pub enum HostCommand {
     /// not cancel the stop.
     Stop,
     /// Stop this installation's control daemon as `kr host stop` does, and start one the way `kr
-    /// new` starts one, where this environment chooses a start: `kr host startup` shows it. No
-    /// session is stopped: its workers keep running, a local attach keeps working, and the new
-    /// daemon finds the sessions again. Nothing is stopped where no start is chosen or where the
-    /// daemon was started with arguments or variables that this command's start does not give.
-    /// The command refuses where `KR_SESSION` or `KR_ATTACHMENT` is set or a session's worker says
-    /// the command runs inside its session; run it in a terminal window that was not opened
-    /// through the KalaReach profile, or an SSH login. An interrupt after the request has left does
-    /// not cancel the stop.
+    /// new` starts one, under the start that `kr host startup` shows. Where no daemon runs, it
+    /// starts one. No session is stopped: its workers keep running, a local attach keeps working,
+    /// and the new daemon finds the sessions again.
+    ///
+    /// Nothing is stopped where no start is chosen, where the program the start runs or its log
+    /// cannot be used, or where the daemon was started with arguments or variables that this
+    /// command's start does not give; the refusal says what differs, and `kr host stop` still
+    /// works. The command refuses where `KR_SESSION` or `KR_ATTACHMENT` is set or a session's
+    /// worker says the command runs inside its session; run it in a terminal window that was not
+    /// opened through the KalaReach profile, or an SSH login. The refusal guards against an
+    /// accident and is no boundary: code that runs as your account can end the daemon with the
+    /// platform's own tools, so the command is for the host's local owner. An interrupt after the
+    /// request has left does not cancel the stop.
+    ///
+    /// Exit 0: a daemon that this command started answers, or another daemon serves the
+    /// environment and the result names it. Exit 1: the start failed after the stop (the message
+    /// says so and that no session was stopped), no daemon answered within 30 seconds, the old
+    /// daemon had not ended after 30 seconds, a holder does not answer, or an interrupt. Exit 3:
+    /// nothing was stopped, because no start can be made or the daemon's launch differs from it.
+    /// Exit 8: the refusal inside a session, or a daemon of another build that takes no stop
+    /// request. With `--json`, `stop`, `pid`, `unsettled` and `started` carry the result.
+    ///
+    /// The command proves that the daemon which answers is the one it started, by the process that
+    /// daemon states on the connection that answered. A daemon that does not state its process
+    /// cannot be told from the one that was started: where the start made a process the command
+    /// fails and says so, and where the start names none (the scheduled task, a service manager
+    /// that does not say) a daemon of a newer generation is the proof. Where the exchange with
+    /// the daemon does not complete, the command starts nothing more, waits up to 30 seconds for a
+    /// whole one, and says what it could not read. On macOS, a `launchctl kickstart` that does not
+    /// answer in time is reported with the line that the requested daemon may still start; a
+    /// `launchctl bootstrap` that does not answer in time is reported as a failed start without
+    /// that line.
     Restart,
     /// Show which network and services this host selects, join the service that publishes a
     /// description of itself, or leave it.
