@@ -2985,7 +2985,7 @@ impl Registry {
     }
 }
 
-#[cfg(feature = "testing")]
+#[cfg(all(test, feature = "testing"))]
 impl Registry {
     /// Stops the next read of a closure, as a disk that does not answer does. Returns the end that
     /// says the read has arrived and the end that lets it go.
