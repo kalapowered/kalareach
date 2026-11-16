@@ -106,6 +106,7 @@ afterEach(() => {
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
   Reflect.deleteProperty(document, 'elementFromPoint')
+  document.getSelection()?.removeAllRanges()
   document.body.replaceChildren()
 })
 
@@ -183,6 +184,29 @@ const fire = (type: string, event: Event): void => {
 }
 
 const isLit = (link: HTMLElement | undefined): boolean => link?.hasAttribute('data-pressed') === true
+
+/** Makes the page's selection a range over the contents of `node`. */
+function selectRange(node: Node): void {
+  const range = document.createRange()
+  range.selectNodeContents(node)
+  const selection = document.getSelection()
+  selection?.removeAllRanges()
+  selection?.addRange(range)
+}
+
+/** Makes the page's selection a caret in `node`, or a collapsed range there (`'range'`). */
+function selectCaret(node: Node, as: 'caret' | 'range' = 'caret'): void {
+  const selection = document.getSelection()
+  selection?.removeAllRanges()
+  if (as === 'caret') {
+    selection?.collapse(node, 0)
+    return
+  }
+  const range = document.createRange()
+  range.setStart(node, 0)
+  range.collapse(true)
+  selection?.addRange(range)
+}
 
 /** Whether a press lives: the listeners that a press registers stand until its end takes them off. */
 const lives = (): boolean => listening.has('pointerup')
@@ -409,6 +433,7 @@ describe('where the handler’s listeners stand', () => {
       'pointermove',
       'pointerup',
       'scroll',
+      'selectionchange',
       'viewport resize',
       'viewport scroll',
       'visibilitychange',
@@ -420,14 +445,14 @@ describe('where the handler’s listeners stand', () => {
     expect([...listening.keys()]).toEqual([])
   })
 
-  it('takes the scroll, viewport, capture, visibility and blur listeners off when the press ends: at the release, at a cancel, at a move past the slop, at a lost capture, at a blur, at a pointer down that is not primary and at a hidden page', () => {
+  it('takes the scroll, selection, viewport, capture, visibility and blur listeners off when the press ends: at the release, at a cancel, at a move past the slop, at a lost capture, at a blur, at a pointer down that is not primary and at a hidden page', () => {
     viewportOf({ left: 0, top: 0, right: 390, bottom: 844 })
     const { pane } = between({ left: 0, top: 0, right: 8, bottom: 17 })
     start(pane)
     clock(100)
     const standing = (): string[] =>
-      [...listening.keys()].filter((type) => type === 'scroll' || type.startsWith('viewport') || type === 'lostpointercapture' || type === 'window blur').sort()
-    const during = ['lostpointercapture', 'scroll', 'viewport resize', 'viewport scroll', 'window blur']
+      [...listening.keys()].filter((type) => type === 'scroll' || type === 'selectionchange' || type.startsWith('viewport') || type === 'lostpointercapture' || type === 'window blur').sort()
+    const during = ['lostpointercapture', 'scroll', 'selectionchange', 'viewport resize', 'viewport scroll', 'window blur']
     fire('pointerdown', pointer(pane, { clientX: 4, clientY: 25 }))
     expect(standing(), 'listeners during the press').toEqual(during)
     expect([...listening.keys()], 'the page’s visibility change is heard during the press').toContain('visibilitychange')
@@ -942,6 +967,127 @@ describe('the end of a press at every pointer down', () => {
     fire('pointerdown', pointer(links[2]?.[0], { pointerType: 'mouse', pointerId: 2, button: 2, clientX: 18, clientY: 228 }))
     fire('click', click(links[3]?.[0], { clientX: 18, clientY: y }))
     expect(isLit(links[3]?.[0]), 'the look at the click that follows a touch press and a mouse’s right button').toBe(true)
+  })
+})
+
+describe('a touch’s or a pen’s press while the page’s selection is not collapsed', () => {
+  // The first link of message 3 has its words at x 10 to 26 and y 320 to 337; the tap on plain text is 6 px before it.
+  const y = 328
+  const own = { clientX: 18, clientY: y }
+  const touchOrPen = ['touch', 'pen']
+
+  it('lights no link at the pointer down, wherever the selection lies, keeps the press, and gives the look at the click', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100, 130)
+    for (const type of touchOrPen) {
+      for (const [where, node] of [
+        ['in another message', texts[1]],
+        ['over the paragraph of the pressed link', texts[3]]
+      ] as const) {
+        selectRange(node)
+        fire('pointerdown', pointer(links[3]?.[0], { ...own, pointerType: type }))
+        expect(isLit(links[3]?.[0]), `the look of a ${type} press with a selection ${where}`).toBe(false)
+        expect(lives(), `the ${type} press with a selection ${where}`).toBe(true)
+        release(links[3]?.[0], own, { pointerType: type })
+        expect(isLit(links[3]?.[0]), `the look at the click of a ${type} press with a selection ${where}`).toBe(true)
+        fire('pointerdown', pointer(texts[1], { pointerId: 2, clientX: 300, clientY: 150 }))
+      }
+    }
+  })
+
+  it('keeps the record: a tap on plain text near a link opens it by the rule, and the click gives the look', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100, 130)
+    selectRange(texts[1])
+    fire('pointerdown', pointer(texts[3], { clientY: y }))
+    expect(lives(), 'the press on plain text with a selection elsewhere').toBe(true)
+    release(texts[3], { clientY: y })
+    expect(opened, 'links opened by the tap on plain text').toEqual([links[3]?.[0]])
+    expect(isLit(links[3]?.[0]), 'the look at the click').toBe(true)
+  })
+
+  it('is not held back by a caret or a collapsed range: the look comes at the pointer down', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100)
+    for (const as of ['caret', 'range'] as const) {
+      selectCaret(texts[3], as)
+      expect(document.getSelection()?.isCollapsed, `the ${as} is collapsed`).toBe(true)
+      expect(document.getSelection()?.rangeCount, `the page has a ${as}`).toBe(1)
+      fire('pointerdown', pointer(links[3]?.[0], own))
+      expect(isLit(links[3]?.[0]), `the look of a touch press with a ${as} in the page`).toBe(true)
+      fire('pointerdown', pointer(texts[1], { pointerId: 2, clientX: 300, clientY: 150 }))
+    }
+  })
+
+  it('does not give the look again at a scroll that leaves the press live', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100)
+    selectRange(texts[3])
+    fire('pointerdown', pointer(links[3]?.[0], own))
+    scrolled(3)
+    fire('scroll', {} as Event)
+    expect(lives(), 'the press after a scroll of 3 px').toBe(true)
+    expect(isLit(links[3]?.[0]), 'the look after a scroll of 3 px').toBe(false)
+  })
+
+  it('leaves a mouse press as it was: the look at the pointer down and at a selection that comes during it', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100)
+    selectRange(texts[1])
+    fire('pointerdown', pointer(links[3]?.[0], { ...own, pointerType: 'mouse' }))
+    expect(isLit(links[3]?.[0]), 'the look of a mouse press with a selection in the page').toBe(true)
+    selectRange(texts[2])
+    fire('selectionchange', {} as Event)
+    expect(isLit(links[3]?.[0]), 'the look of a mouse press after the selection changed').toBe(true)
+    fire('pointerup', pointer(links[3]?.[0], { ...own, pointerType: 'mouse', timeStamp: 120 }))
+    expect(isLit(links[3]?.[0]), 'the look after the release').toBe(false)
+  })
+
+  it('puts out the look of a press that is down when a selection comes, keeps the press and its record, and gives the look at the click', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100, 130)
+    for (const type of touchOrPen) {
+      fire('pointerdown', pointer(links[3]?.[0], { ...own, pointerType: type }))
+      expect(isLit(links[3]?.[0]), `the look of a ${type} press with no selection`).toBe(true)
+      selectRange(texts[1])
+      fire('selectionchange', {} as Event)
+      expect(isLit(links[3]?.[0]), `the look of a ${type} press after a selection came`).toBe(false)
+      expect(lives(), `the ${type} press after a selection came`).toBe(true)
+      release(links[3]?.[0], own, { pointerType: type })
+      expect(isLit(links[3]?.[0]), `the look at the click after a selection came during a ${type} press`).toBe(true)
+      document.getSelection()?.removeAllRanges()
+    }
+  })
+
+  it('leaves the open of a press on plain text that is down when a selection comes: the tap still opens the link', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100, 130)
+    fire('pointerdown', pointer(texts[3], { clientY: y }))
+    selectRange(texts[1])
+    fire('selectionchange', {} as Event)
+    expect(lives(), 'the press on plain text after a selection came').toBe(true)
+    release(texts[3], { clientY: y })
+    expect(opened, 'links opened by the tap').toEqual([links[3]?.[0]])
+    expect(isLit(links[3]?.[0]), 'the look at the click').toBe(true)
+  })
+
+  it('keeps the look of a press that is down when the selection changes to a caret or to a collapsed range', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(links[3]?.[0], own))
+    for (const as of ['caret', 'range'] as const) {
+      selectCaret(texts[3], as)
+      fire('selectionchange', {} as Event)
+      expect(isLit(links[3]?.[0]), `the look after the selection changed to a ${as}`).toBe(true)
+    }
   })
 })
 
