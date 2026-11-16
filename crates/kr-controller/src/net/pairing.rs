@@ -380,7 +380,6 @@ impl PairingHost {
         caller: &Caller,
         params: &OwnerConfirmationRequestParams,
         action: (ActionId, Digest256),
-        admission: &dyn Fn() -> Result<()>,
         copied: &AtomicBool,
     ) -> Result<OwnerConfirmationRequestResult> {
         // A retry is answered before anything about the subject is resolved again: the invitation
@@ -444,7 +443,7 @@ impl PairingHost {
                 }
             }
             ConfirmationSubject::EstablishClock => {
-                return self.owner.request_clock(caller, action, admission, copied);
+                return self.owner.request_clock(caller, action, copied);
             }
             ConfirmationSubject::TransferControl(_) => {
                 // A transfer is described from the grant and the two devices this daemon holds,
@@ -501,8 +500,7 @@ impl PairingHost {
                 }
             }
         };
-        self.owner
-            .request(caller, resolved, action, admission, copied)
+        self.owner.request(caller, resolved, action, copied)
     }
 
     /// Refuses a caller that is not this host's owner before the catalogue resolves a subject for
@@ -527,14 +525,12 @@ impl PairingHost {
         caller: &Caller,
         resolved: Resolved,
         action: (ActionId, Digest256),
-        admission: &dyn Fn() -> Result<()>,
         copied: &AtomicBool,
     ) -> Result<OwnerConfirmationRequestResult> {
         if let Some(requested) = self.owner.requested(caller, action) {
             return noted_as_a_copy(requested, copied);
         }
-        self.owner
-            .request(caller, resolved, action, admission, copied)
+        self.owner.request(caller, resolved, action, copied)
     }
 
     /// `pair.invite`: issues one invitation under a fresh owner confirmation naming its grant.

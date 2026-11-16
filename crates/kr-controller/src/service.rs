@@ -830,6 +830,12 @@ pub struct Controller {
     /// grant's own end can come after the last wait. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     after_the_record_asks_the_feed: ThreadPause,
+    /// Where this host's own tests stop the record of an owner's request or of its answer just
+    /// before its transaction begins, which stands for the wait for the pairing records' write
+    /// lock, so that a policy commit, which needs that lock, can land in it. Compiled away in
+    /// every shipped build.
+    #[cfg(feature = "testing")]
+    before_the_record_begins: ThreadPause,
     /// Where this host's own tests stop an admission check just before the footing's question,
     /// which is its last reading, so that the deadline can pass at that pause. Compiled away in
     /// every shipped build.
@@ -2056,6 +2062,10 @@ mod the_clock_effect_at_its_commit;
 /// A request for the owner's confirmation of a change of exclusive management, asked again.
 #[cfg(test)]
 mod a_repeat_of_an_exclusive_management_request;
+
+/// Where an owner's request for a confirmation lands: the last wait, the bound, the question.
+#[cfg(test)]
+mod an_owners_request_is_recorded_where_it_lands;
 
 /// A closure whose recording is dropped while it waits for the locks after the record.
 #[cfg(test)]

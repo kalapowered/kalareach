@@ -905,7 +905,6 @@ fn racing_request(
                         subject: ConfirmationSubject::EstablishClock,
                     },
                     (action, Digest256::from_bytes([9; 32])),
-                    &|| Ok(()),
                     &AtomicBool::new(false),
                 )
                 .expect("the request records the identifier first");
@@ -1329,7 +1328,7 @@ mod a_repeat_the_owner_authority_answers {
     }
 
     fn local() -> Caller {
-        Caller::local(ActorId::new("local:test").expect("a principal"))
+        Caller::local(ActorId::new("local:test").expect("a principal")).landed_for_ever()
     }
 
     /// KR-REQ-09.09: the repeat of a request for a confirmation is given the challenge the first was
@@ -1347,12 +1346,12 @@ mod a_repeat_the_owner_authority_answers {
 
         let performed = AtomicBool::new(false);
         let first = pairing
-            .request_confirmation(&caller, &params, action, &|| Ok(()), &performed)
+            .request_confirmation(&caller, &params, action, &performed)
             .expect("the request is answered with a challenge");
         assert!(!performed.load(Ordering::Acquire));
         let copied = AtomicBool::new(false);
         let again = pairing
-            .request_confirmation(&caller, &params, action, &|| Ok(()), &copied)
+            .request_confirmation(&caller, &params, action, &copied)
             .expect("the repeat is answered");
         assert_eq!(again, first);
         assert!(
@@ -1364,7 +1363,6 @@ mod a_repeat_the_owner_authority_answers {
             &caller,
             &params,
             (action.0, Digest256::from_bytes([32; 32])),
-            &|| Ok(()),
             &reused,
         );
         assert!(is_id_conflict(&refused), "{refused:?}");
@@ -1390,7 +1388,6 @@ mod a_repeat_the_owner_authority_answers {
                 &caller,
                 resolved(Digest256::from_bytes([7; 32])),
                 action,
-                &|| Ok(()),
                 &performed,
             )
             .expect("the request is answered with a challenge");
@@ -1401,7 +1398,6 @@ mod a_repeat_the_owner_authority_answers {
                 &caller,
                 resolved(Digest256::from_bytes([7; 32])),
                 action,
-                &|| Ok(()),
                 &copied,
             )
             .expect("the repeat is answered");
@@ -1415,7 +1411,6 @@ mod a_repeat_the_owner_authority_answers {
             &caller,
             resolved(Digest256::from_bytes([7; 32])),
             (action.0, Digest256::from_bytes([33; 32])),
-            &|| Ok(()),
             &reused,
         );
         assert!(is_id_conflict(&refused), "{refused:?}");
@@ -1430,7 +1425,6 @@ mod a_repeat_the_owner_authority_answers {
             &caller,
             resolved(Digest256::from_bytes([7; 32])),
             (action.0, Digest256::from_bytes([36; 32])),
-            &|| Ok(()),
             &by_the_owner,
         );
         assert!(is_id_conflict(&refused), "{refused:?}");
