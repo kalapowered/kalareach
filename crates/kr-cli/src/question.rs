@@ -2411,8 +2411,9 @@ mod tests {
         );
     }
 
-    /// The worker's refusal to show an action it holds no receipt for is followed, for a later
-    /// cancellation, by one sentence that says what holds if the host holds none.
+    /// The worker's refusal to show an action it holds no receipt for is shown in the worker's words
+    /// and one sentence, for a later cancellation, that says what holds if the host holds none: no
+    /// action line from the code stands before it, and the `--json` message is the one it had.
     #[test]
     fn a_refused_read_of_the_earlier_cancellation_says_that_the_plain_command_asks_again() {
         let action = ActionId::new(Uuid::from_bytes([7; 16]));
@@ -2421,20 +2422,27 @@ mod tests {
             ErrorCode::InvalidArgument,
             shown!("no receipt for action {}", action),
         );
-        let today = CliError::Refused(worker.clone()).said();
-        let said = crate::unknown::read_refused(
-            worker,
+        let ended = crate::unknown::read_refused(
+            worker.clone(),
             action,
             "cancellation",
             &cancel_unknown(shown!("5"), question),
-        )
-        .said();
+        );
         assert_eq!(
-            said.as_str(),
+            ended.said().as_str(),
             format!(
-                "{today}\nIf the host holds no receipt for action {action}, there is nothing for a \
-                 later cancellation to name: `kr question cancel {question}` asks again."
+                "no receipt for action {action}\nIf the host holds no receipt for action {action}, \
+                 there is nothing for a later cancellation to name: `kr question cancel \
+                 {question}` asks again."
             )
+        );
+        assert_eq!(
+            ended.machine_message().as_str(),
+            format!("INVALID_ARGUMENT: no receipt for action {action}")
+        );
+        assert_eq!(
+            ended.machine_message().as_str(),
+            CliError::Refused(worker).machine_message().as_str()
         );
     }
 }

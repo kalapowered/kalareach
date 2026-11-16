@@ -55,6 +55,20 @@ pub enum CliError {
         /// What a person does about it.
         action: kr_client::retry::UserAction,
     },
+    /// The host refused to show the receipt of the earlier action that a later request names, and
+    /// the command says what holds if the host holds no receipt for it.
+    ///
+    /// A person is told the host's words and then that sentence. No action is chosen by the code
+    /// after them: the code says an argument cannot be used, the command did not read a cause, and
+    /// the standing action for the code ("update this app or the host") names a version mismatch
+    /// that the sentence contradicts in the commonest state. A `--json` failure carries the code and
+    /// the host's words alone, as it did before the sentence was added.
+    ReadRefused {
+        /// What the host said was wrong.
+        error: kr_protocol::error::ProtocolError,
+        /// What holds if the host holds no receipt, and what a person does then.
+        then: Shown,
+    },
     /// The attached session closed, and not cleanly: its shell failed or something ended it.
     ///
     /// The attachment itself did what it was for, so this is no refusal and no lost host. It is
@@ -113,6 +127,9 @@ impl Said for CliError {
             Self::NotATerminal => Shown::said("this command needs a terminal"),
             Self::Refused(error) => refusal_said(error, kr_client::retry::user_action(error.code)),
             Self::ServiceRefused { error, action } => refusal_said(error, *action),
+            Self::ReadRefused { error, then } => {
+                shown!("{}\n{}", Shown::protocol(error), then.clone())
+            }
             Self::Ipc(error) => Shown::ipc(error),
         }
     }
@@ -172,7 +189,9 @@ impl CliError {
     #[must_use]
     pub fn machine_message(&self) -> Shown {
         match self {
-            Self::Refused(error) | Self::ServiceRefused { error, .. } => {
+            Self::Refused(error)
+            | Self::ServiceRefused { error, .. }
+            | Self::ReadRefused { error, .. } => {
                 shown!("{}: {}", error.code, Shown::protocol(error))
             }
             other => other.said(),
@@ -190,7 +209,7 @@ impl CliError {
             Self::ShellIntegrationUnsupported(_) => 2,
             Self::NotATerminal | Self::Terminal(_) | Self::TerminalProbeFailed(_) => 6,
             Self::TerminalUnavailable(_) => 7,
-            Self::Refused(_) | Self::ServiceRefused { .. } => 8,
+            Self::Refused(_) | Self::ServiceRefused { .. } | Self::ReadRefused { .. } => 8,
             Self::UpdateDeferred(_) => 9,
             Self::Ipc(_) | Self::AnswerKept { .. } => 3,
             Self::SessionClosed(_) | Self::Unfinished { .. } | Self::Other(_) => 1,
@@ -215,7 +234,9 @@ impl CliError {
                 kr_protocol::error::ErrorCode::TerminalProbeFailed
             }
             Self::TerminalUnavailable(_) => kr_protocol::error::ErrorCode::TerminalUnavailable,
-            Self::Refused(error) | Self::ServiceRefused { error, .. } => error.code,
+            Self::Refused(error)
+            | Self::ServiceRefused { error, .. }
+            | Self::ReadRefused { error, .. } => error.code,
             Self::SessionClosed(_) => kr_protocol::error::ErrorCode::SessionClosed,
             Self::Unfinished { code, .. } | Self::AnswerKept { code, .. } => *code,
             Self::UpdateDeferred(_) | Self::Other(_) => {
