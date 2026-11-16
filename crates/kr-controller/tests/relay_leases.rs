@@ -5186,7 +5186,7 @@ async fn a_device_that_is_refused_free_capacity_is_told_so_when_it_cannot_pair()
         .expect("the attempt ends")
         .expect("the attempt ran")
         .expect_err("a relay that takes no session carries nothing");
-    assert_eq!(failure.kind, FailureKind::RelayCapacity);
+    assert!(matches!(failure.kind, FailureKind::RelayCapacity(_)));
     // The host never saw this device, so its invitation is as it was.
     assert!(!failure.invitation_spent);
     // The failure holds the paths the service named, as it wrote them.
@@ -5220,7 +5220,7 @@ async fn a_device_that_is_refused_free_capacity_is_told_so_when_it_pairs_by_code
         .expect("the attempt ends")
         .expect("the attempt ran")
         .expect_err("a relay that takes no session carries nothing");
-    assert_eq!(failure.kind, FailureKind::RelayCapacity);
+    assert!(matches!(failure.kind, FailureKind::RelayCapacity(_)));
 }
 
 /// A link that counts what the host answers a device on the connections it opens, and the
@@ -5517,7 +5517,7 @@ async fn a_device_that_is_refused_free_capacity_is_handed_its_own_wait() {
         .expect("the attempt ends")
         .expect("the attempt ran")
         .expect_err("a relay that takes no session carries nothing");
-    assert_eq!(failure.kind, FailureKind::RelayCapacity);
+    assert!(matches!(failure.kind, FailureKind::RelayCapacity(_)));
     assert!(!failure.invitation_spent);
     // What a person is told to wait is the device's own wait, what is left until it asks again,
     // which is no more than the delay the service named and at least a second until it has passed.
