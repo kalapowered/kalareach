@@ -1646,7 +1646,7 @@ test.describe('the area in which a tap opens a link', () => {
         const inside = ringPoints(settled, pane, size)
         const top = inside[0]
         const atTop = await tapAndRead(page, top?.x ?? 0, top?.y ?? 0)
-        expect(atTop.lit, 'the pressed look at the press at the far point of the area, above the words').toEqual([null])
+        expect(lookDisagrees(atTop), 'the look and the opening at the far point of the area, above the words').toBeNull()
         expect(atTop.litAtClick.filter((look) => look === LAST).length, 'the look at the click at the far point of the area, above the words').toBe(1)
         const above = await tapAndRead(page, settled.x, settled.y - size - 12)
         expect(above.lit, 'the pressed look above the area').toEqual([null])
