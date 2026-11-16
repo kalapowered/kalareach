@@ -283,9 +283,21 @@ export function failureAlternatives(
 }
 
 /**
+ * The endings after which the host has consumed or ended the invitation, whatever the person is
+ * offered next: the owner declined this device, the owner withdrew the invitation, and the host
+ * stopped it for too many wrong codes.
+ */
+const INVITATION_ENDED: ReadonlySet<PairingFailure['kind']> = new Set([
+  'declined',
+  'withdrawn',
+  'host_tries_used'
+])
+
+/**
  * The whole sentence for a failure, with the tries line whenever the attempt was charged, except
- * after an ending that starts again: the tries are those of a code that can no longer be used, so
- * the line would count what the person cannot spend.
+ * after an ending at which the invitation can no longer be used: one that starts again, and one that
+ * the host consumed or ended. The tries are those of a code that is spent, so the line would count
+ * what the person cannot spend.
  */
 export function failureSentence(
   failure: PairingFailure,
@@ -294,7 +306,13 @@ export function failureSentence(
   reading: Reading = 'pasteboard'
 ): string {
   const { sentence, action } = failureWords(failure, service, mode, reading)
-  if (failure.tries_left === null || action === 'start_again') return sentence
+  if (
+    failure.tries_left === null ||
+    action === 'start_again' ||
+    INVITATION_ENDED.has(failure.kind)
+  ) {
+    return sentence
+  }
   const tries = failure.tries_left === 1 ? '1 try' : `${failure.tries_left} tries`
   return `${sentence} ${tries} left on this device.`
 }
