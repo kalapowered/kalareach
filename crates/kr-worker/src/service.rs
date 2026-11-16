@@ -4800,10 +4800,12 @@ impl WorkerService {
     /// - A peer can go at any time after the last question, the one asked under the boundary, and
     ///   the acceptance then runs for a peer that has just gone. No design closes that window. Such
     ///   a presentation cannot collect: its answer fails to write and its connection ends.
-    /// - A peer that sent bytes behind its token, and then went, is taken as there for as long as
-    ///   the system counts those bytes as waiting, which is the whole hold. On Unix that is every
-    ///   byte; on Windows it is what the runtime's own read of the pipe did not take. A client
-    ///   sends nothing behind its token until the worker has answered.
+    /// - A peer that sent bytes behind its token and stays open is there. One that sent bytes and
+    ///   then closed is gone on Unix, where the system reports the hang-up beside the bytes. On
+    ///   Windows it is taken as there for as long as the pipe counts those bytes as waiting, which
+    ///   is what the runtime's own read of the pipe did not take. On Linux a peer that only ended
+    ///   what it sends is there until its bytes have been read. A client sends nothing behind its
+    ///   token until the worker has answered.
     /// - A peer that stops using a link without closing it is there, as far as the system can say.
     /// - On Windows a client that dropped its link is reported gone once its own runtime has
     ///   released the handle, which happens when that runtime next turns. A client whose runtime
@@ -11424,8 +11426,7 @@ impl ConnectionState {
             writer
                 .lock()
                 .expect("the connection writer is not poisoned")
-                .peer_state()
-                == PeerState::Gone
+                .has_gone()
         })
     }
 

@@ -691,6 +691,15 @@ pub(crate) fn lock_session(
     }
 }
 
+/// Takes the session when nobody holds it, and never waits.
+pub(crate) fn try_lock_session(session: &Mutex<Session>) -> Option<MutexGuard<'_, Session>> {
+    match session.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+        Err(std::sync::TryLockError::Poisoned(_)) => panic!("the session lock is not poisoned"),
+    }
+}
+
 /// Where batches for the terminal's writer are handed over, and who is told they were.
 ///
 /// Whoever holds the input domain takes what it has queued and sends it here before letting the
@@ -1611,6 +1620,19 @@ impl SessionRuntime {
     /// session state and the state can no longer be trusted.
     pub fn session(&self) -> MutexGuard<'_, Session> {
         lock_session(&self.session).expect("the session lock is not poisoned")
+    }
+
+    /// Locks the session for one operation when nobody holds it, and never waits.
+    ///
+    /// The clean-up of a connection whose peer has gone uses this: it does what it can at once and
+    /// leaves the rest to the service's owner, so that no connection keeps its place in the
+    /// worker's count while a holder of the session works.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lock is poisoned, as [`Self::session`] does.
+    pub fn try_session(&self) -> Option<MutexGuard<'_, Session>> {
+        try_lock_session(&self.session)
     }
 
     /// Returns what a keystroke and the recogniser's timer touch.

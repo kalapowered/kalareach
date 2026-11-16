@@ -128,6 +128,53 @@ async fn a_peer_that_sent_a_frame_and_went_is_gone_once_the_frame_is_read() {
     assert_eq!(pair.server.1.peer_state(), PeerState::Gone);
 }
 
+/// A peer that is there with a frame waiting is not gone. One that sent the frame and closed has
+/// hung up beside it, and the system says so at once, where `peer_state` reports the frame until it
+/// is read.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_peer_that_sent_a_frame_and_closed_has_gone_beside_the_frame() {
+    let mut pair = pair().await;
+    let length = send(&mut pair.client.1);
+    assert_eq!(pair.server.1.peer_state(), PeerState::Unread(length));
+    assert!(!pair.server.1.has_gone(), "a peer that is there");
+    let Pair {
+        _tree,
+        server,
+        client,
+    } = pair;
+    drop(client);
+    assert_eq!(server.1.peer_state(), PeerState::Unread(length));
+    assert!(server.1.has_gone(), "a peer that closed behind its frame");
+}
+
+/// A peer that only ended what it sends, with a frame waiting: macOS reports a hang-up, and Linux
+/// reports the end behind the frame, so the peer is there until the frame has been read and gone
+/// after it. A peer that ended what it sends with nothing waiting is gone on both.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_peer_that_ended_what_it_sends_is_gone_where_the_system_says_so() {
+    let mut pair = pair().await;
+    let length = send(&mut pair.client.1);
+    pair.client
+        .1
+        .shut_down(std::net::Shutdown::Write)
+        .expect("ends what the client sends");
+    assert_eq!(pair.server.1.peer_state(), PeerState::Unread(length));
+    assert_eq!(
+        pair.server.1.has_gone(),
+        cfg!(target_os = "macos"),
+        "with a frame waiting"
+    );
+    let mut waiting = length;
+    pair.server
+        .0
+        .read_message_within::<ControlFrame>(&mut waiting)
+        .await
+        .expect("reads the frame that was waiting");
+    assert!(pair.server.1.has_gone(), "with nothing waiting");
+}
+
 /// A read bounded by what was waiting returns the frames that are whole in it, leaves the one it
 /// only begins to the next read, and never waits for the peer to send the rest.
 #[cfg(unix)]
