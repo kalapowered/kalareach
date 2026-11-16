@@ -1220,6 +1220,32 @@ impl Broker {
         let _ = self.session_notices.set(notices);
     }
 
+    /// Holds the broker's state lock, as a commit to a store that has stopped does while it waits,
+    /// until the returned end lets it go, for this host's own tests. Every call that needs the
+    /// broker's state waits meanwhile.
+    ///
+    /// Returns the end that says the lock is held and the end that lets it go; dropping the second
+    /// lets it go too. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn hold_the_state(
+        self: &Arc<Self>,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let broker = Arc::clone(self);
+        let (held, watch) = tokio::sync::oneshot::channel();
+        let (release, go) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let guard = broker.state();
+            let _ = held.send(());
+            let _ = go.recv();
+            drop(guard);
+        });
+        (watch, release)
+    }
+
     fn state(&self) -> std::sync::MutexGuard<'_, BrokerState> {
         // A poisoned lock means a caller panicked mid-decision. Every write here is planned
         // against the state, written to the ledger and only then applied, so what a panic leaves
