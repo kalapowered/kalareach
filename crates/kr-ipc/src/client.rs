@@ -513,8 +513,7 @@ async fn hello(
             outcome: Outcome::Error(error),
             ..
         }) => {
-            return Err(IpcError::IdentityUnavailable {
-                what: "the host refused the connection",
+            return Err(IpcError::HostRefused {
                 detail: error.to_string(),
             });
         }
