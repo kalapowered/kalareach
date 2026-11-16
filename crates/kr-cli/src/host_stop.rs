@@ -2170,6 +2170,7 @@ async fn wait_for_the_end(
 mod answered {
     use kr_ipc::IpcError;
     use kr_ipc::error::ErrorSource;
+    use kr_protocol::error::ProtocolError;
     use kr_protocol::ids::ControllerGeneration;
 
     /// What shows that a daemon answered: its answer to a look (the generation that it reported),
@@ -2202,14 +2203,23 @@ mod answered {
         /// The daemon's own reply, where `error` is one (a refusal of the hello, a version that
         /// does not fit, a message of another kind). A closure, a frame that cannot be read and
         /// this side's own fault (the check of the peer's credentials among them) are no reply.
+        /// Every source is an arm, so that a new source is a compile error here until it is decided.
         pub(super) fn of_reply(error: &IpcError) -> Option<Self> {
-            (error.comes_from() == ErrorSource::Reply).then_some(Self { generation: None })
+            match error.comes_from() {
+                ErrorSource::Reply => Some(Self { generation: None }),
+                ErrorSource::Closure | ErrorSource::OwnFault => None,
+            }
         }
 
-        /// The daemon's own reply that cannot be used, at a place that has already read it as one:
-        /// a failure whose source is a reply, a refusal of the read, or a result that does not
-        /// decode. The argument is that failure itself, which is what makes the reply the daemon's.
-        pub(super) fn of_unusable_reply(_reply: &impl std::fmt::Display) -> Self {
+        /// The daemon's own refusal of a request, as the protocol carries it. The argument is
+        /// that refusal, which is what makes the reply the daemon's.
+        pub(super) const fn of_refusal(_refusal: &ProtocolError) -> Self {
+            Self { generation: None }
+        }
+
+        /// The daemon's own result that does not decode. The argument is that decode error,
+        /// which is what makes the reply the daemon's.
+        pub(super) const fn of_undecodable(_error: &kr_cbor::CborError) -> Self {
             Self { generation: None }
         }
     }
@@ -2303,10 +2313,9 @@ fn gave_by_the_greeting(error: &kr_ipc::IpcError) -> Gave {
     if startup::nothing_listening(error) {
         return Gave::NothingListens;
     }
-    match error.comes_from() {
-        ErrorSource::Reply => Gave::GreetingReplied(Answered::of_unusable_reply(error)),
-        ErrorSource::Closure => Gave::LinkFailed,
-        ErrorSource::OwnFault => Gave::LinkFailed,
+    match Answered::of_reply(error) {
+        Some(answered) => Gave::GreetingReplied(answered),
+        None => Gave::LinkFailed,
     }
 }
 
@@ -2317,13 +2326,12 @@ fn gave_by_the_read(
     match read {
         Ok(Ok(value)) => match value.to_typed::<HostInfoResult>() {
             Ok(info) => Gave::Reported(info.generation),
-            Err(error) => Gave::ReadUndecodable(Answered::of_unusable_reply(&error)),
+            Err(error) => Gave::ReadUndecodable(Answered::of_undecodable(&error)),
         },
-        Ok(Err(refusal)) => Gave::ReadRefused(Answered::of_unusable_reply(&refusal)),
-        Err(error) => match error.comes_from() {
-            ErrorSource::Reply => Gave::ReadReplied(Answered::of_unusable_reply(&error)),
-            ErrorSource::Closure => Gave::LinkFailed,
-            ErrorSource::OwnFault => Gave::LinkFailed,
+        Ok(Err(refusal)) => Gave::ReadRefused(Answered::of_refusal(&refusal)),
+        Err(error) => match Answered::of_reply(&error) {
+            Some(answered) => Gave::ReadReplied(answered),
+            None => Gave::LinkFailed,
         },
     }
 }
@@ -6318,7 +6326,7 @@ mod tests {
 
     /// A reply of the daemon's own that cannot be used, for the walk.
     fn a_reply() -> Answered {
-        Answered::of_unusable_reply(&"a reply")
+        Answered::of_refusal(&a_refusal())
     }
 
     impl Every for Gave {
