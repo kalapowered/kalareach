@@ -1852,6 +1852,15 @@ const AUTHORITY_ENDED_REVOCATION_OWED_PAGE: &str = "This host's authority for th
      account service issued. The host tries again the next time it uses the account, and what was \
      issued ends by itself when it expires. To sign in, start again on the host.";
 
+/// What the browser is shown when a call opened while a sign-in's code was exchanged.
+const CALL_OPEN_PAGE: &str = "A voice call is open on this host. End it, then sign in again.";
+
+/// What the browser is shown when the same happened and the revocation of what the service issued
+/// reached neither the service nor the queue.
+const CALL_OPEN_REVOCATION_OWED_PAGE: &str = "A voice call is open on this host. End it, then sign \
+     in again. The host could not yet revoke what the account service issued. The host tries again \
+     the next time it uses the account, and what was issued ends by itself when it expires.";
+
 /// The words of the one paragraph in the page the daemon answered a browser with, which is the
 /// whole of what the page tells the person.
 fn page_words(page: &str) -> &str {
@@ -2054,6 +2063,89 @@ async fn a_sign_in_whose_authority_ended_before_its_change_gate_owes_a_revocatio
 
     // The token is in memory alone: the queue never held it. The next send ends it, with the grant
     // that sign-out ends.
+    std::fs::remove_dir(&queue).expect("the queue's place is given back");
+    broker.refuse_revocations(false);
+    let _ = sign_out(&host).await;
+    let mut revoked = broker.revoked();
+    revoked.sort();
+    let mut both = vec![broker.refresh(1), broker.refresh(2)];
+    both.sort();
+    assert_eq!(
+        revoked, both,
+        "the next send ended the token that only memory held"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-17.23 and 15.17: a call that opens while a sign-in's code is exchanged leaves the account
+/// as it was, and where the revocation of what the exchange brought reaches neither the queue nor
+/// the service, the browser is told that it is still owed, as it is where the authority ended. The
+/// queue's place is a directory and the service refuses revocations; the browser is shown the whole
+/// of the page, the attempt is reported as a call that was open, the token is sent once and refused,
+/// and the next send, with the queue and the service back, ends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_that_opens_while_a_sign_in_is_exchanged_owes_a_revocation_that_neither_took() {
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    listen_for_sign_ins(&host);
+    sign_in_with(&host, broker.issue_grant(600)).await;
+    let (url, address) = start_sign_in(&host).await;
+    broker.expect_sign_in(&url);
+    let kept = account_item_in(&host.tree().environment().secrets_dir(), "session");
+    let queue = kept.with_file_name("revoke");
+    let exchange = broker.hold("/auth/oauth2/token");
+
+    let (page, call) = tokio::join!(browser_answers(&address, &url, "the-code"), async {
+        exchange.reached().await;
+        // The code is out at the service. From here the queue cannot be read and the service
+        // refuses what it is sent, and a call opens under the account signed in.
+        std::fs::create_dir(&queue).expect("a directory in the queue's place");
+        broker.refuse_revocations(true);
+        let started = start_a_call(&host, &owner).await;
+        exchange.release();
+        started
+    });
+    let (_device, session, call) = call;
+    let report = settled(&host).await;
+    assert_eq!(
+        page_words(&page),
+        CALL_OPEN_REVOCATION_OWED_PAGE,
+        "the browser is told that the revocation is owed"
+    );
+    assert_eq!(
+        report.last_attempt.as_ref(),
+        Some(&AccountAttempt::CallOpen)
+    );
+    assert!(
+        matches!(report.state, AccountState::SignedIn { .. }),
+        "the account is as it was: {report:?}"
+    );
+    assert!(
+        broker.revoked().is_empty(),
+        "the service refused the revocation"
+    );
+    assert!(
+        broker
+            .seen()
+            .iter()
+            .any(|request| request.path == "/auth/oauth2/revoke"
+                && request.body["token"] == broker.refresh(2).as_str()),
+        "the token was sent to the service at once, and refused"
+    );
+
+    // The call ends, the queue and the service are back, and the next send ends the token that only
+    // memory held, with the grant that sign-out ends.
+    let _ = mutate(
+        &session,
+        host.environment_id,
+        Method::VoiceStop,
+        &VoiceStopParams {
+            voice_session_id: call.voice_session_id,
+        },
+    )
+    .await;
     std::fs::remove_dir(&queue).expect("the queue's place is given back");
     broker.refuse_revocations(false);
     let _ = sign_out(&host).await;
@@ -2825,7 +2917,7 @@ async fn a_call_that_opens_while_a_sign_in_is_exchanged_leaves_the_account_as_it
         exchange.release();
         started
     });
-    assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+    assert_eq!(page_words(&page), CALL_OPEN_PAGE);
     let (_device, session, call) = call;
     let report = settled(&host).await;
     assert_eq!(
