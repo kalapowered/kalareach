@@ -810,7 +810,7 @@ impl Rig {
             .sign_out(|| Ok::<(), std::convert::Infallible>(()))
             .await;
         self.tokens
-            .keep(grant_of(account), "a-nonce", || true)
+            .keep(grant_of(account), "a-nonce", || Some(()))
             .await
             .expect("the person signs in");
     }
@@ -821,7 +821,7 @@ impl Rig {
         account_system_knows(&self.served, account);
         self.signing.admits(account);
         self.tokens
-            .keep(grant_of(account), "a-nonce", || true)
+            .keep(grant_of(account), "a-nonce", || Some(()))
             .await
             .expect("the person switches accounts");
     }
@@ -892,7 +892,7 @@ async fn signed_in_phone(
         Client::Mobile,
     ));
     tokens
-        .keep(grant_of(ACCOUNT), "a-nonce", || true)
+        .keep(grant_of(ACCOUNT), "a-nonce", || Some(()))
         .await
         .expect("the device signs in");
     let deletion = companion_tauri::account::deletion::never_deleting(&origin, &tokens);

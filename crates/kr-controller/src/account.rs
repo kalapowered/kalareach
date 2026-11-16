@@ -679,7 +679,7 @@ impl HostAccount {
         let held = self.inner.held.as_ref().expect("a service to sign in at");
         let committed = held
             .signed_in
-            .commit(issued, "a-nonce", || true)
+            .commit(issued, "a-nonce", || Some(()))
             .await
             .expect("the grant is kept");
         assert_eq!(committed, Commit::Kept);
@@ -1422,7 +1422,7 @@ impl Inner {
                 // issue (the tokens the service gave for the spent code) and the account's gate.
                 match held
                     .signed_in
-                    .keep(issued, grant.nonce(), || lasting().is_ok())
+                    .keep(issued, grant.nonce(), || lasting().ok())
                     .await
                 {
                     Ok(Commit::Kept) => {}
@@ -1451,7 +1451,7 @@ impl Inner {
                     }
                 }
                 if let Ok(IdentityRead::Disagreed) =
-                    held.signed_in.complete_identity(|| lasting().is_ok()).await
+                    held.signed_in.complete_identity(|| lasting().ok()).await
                 {
                     return Outcome::Attempt(AccountAttempt::NotForThisAttempt);
                 }

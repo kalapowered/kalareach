@@ -145,7 +145,7 @@ async fn closed_account_with(origin: &str, service_http: Arc<Closing>) -> Arc<Ac
                 subject: "account-one".to_owned(),
             },
             "a-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("the sign-in is kept");

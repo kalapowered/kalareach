@@ -122,7 +122,7 @@ async fn account_named(
                     subject: subject.to_owned(),
                 },
                 "a-nonce",
-                || true,
+                || Some(()),
             )
             .await
             .expect("the sign-in is kept");
@@ -3717,7 +3717,7 @@ async fn a_record_is_noted_as_the_account_whose_token_wrote_the_bundle_though_an
                 subject: "account-two".to_owned(),
             },
             "another-nonce",
-            || true,
+            || Some(()),
         )
         .await
         .expect("another account signs in");
