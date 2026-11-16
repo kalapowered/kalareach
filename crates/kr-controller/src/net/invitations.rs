@@ -727,6 +727,11 @@ impl InvitationRows {
                 Some(_) => return Err(another_subject()),
             }
             let kept = landing.asks_the_feed()?;
+            if !caller.is_owner_now(&self.lifetimes) {
+                return Err(ControllerError::PermissionDenied {
+                    detail: "only this host's owner asks for an owner confirmation".to_owned(),
+                });
+            }
             let copied = landing.copies_the_bound();
             match landing.asks(&copied) {
                 Ok(()) => {}
@@ -799,9 +804,9 @@ impl InvitationRows {
             if recorded.as_ref().is_some_and(|recorded| recorded != action) {
                 return Err(another_subject());
             }
+            let kept = landing.asks_the_feed()?;
             signer_still_authorised(transaction, &self.lifetimes, &self.refusal, proof, terminal)?;
             verified()?;
-            let kept = landing.asks_the_feed()?;
             let copied = landing.copies_the_bound();
             match landing.asks(&copied) {
                 Ok(()) => {}
@@ -1484,12 +1489,11 @@ pub enum TerminalStanding {
     /// Only while the host has no owner yet.
     Bootstrap,
     /// And also, for the end of exclusive organisation management, while the host has an owner but
-    /// no device that can confirm for it. `exclusive` is whether the host is exclusive now.
+    /// no device that can confirm for it and the host is exclusive, which the spend's transaction
+    /// reads from the stored policy.
     Recovery {
         /// The environment the host serves.
         environment_id: kr_protocol::ids::EnvironmentId,
-        /// Whether the host is exclusively organisation-managed now.
-        exclusive: bool,
         /// The rights ceiling in force, which narrows what a device's grant can do.
         ceiling: Option<kr_protocol::scalars::CanonicalSet<kr_protocol::rights::ActionRight>>,
     },
@@ -1585,9 +1589,9 @@ fn signer_still_authorised(
             match terminal {
                 TerminalStanding::Recovery {
                     environment_id,
-                    exclusive: true,
                     ceiling,
                 } if proof.request.action == SensitiveAction::ChangeHostAuthority
+                    && crate::grants::the_host_is_exclusive(transaction)?
                     && !crate::grants::an_owner_device_can_recover(
                         transaction,
                         environment_id,

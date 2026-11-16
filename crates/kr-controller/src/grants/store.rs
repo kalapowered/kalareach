@@ -278,6 +278,30 @@ pub struct ExclusiveEnding {
     pub organisation_ids: kr_protocol::scalars::CanonicalSet<kr_protocol::ids::OrganisationId>,
 }
 
+/// Whether the stored policy of this host says that it is exclusively organisation-managed, read
+/// through `connection`: a caller inside a transaction on this file reads the flag from the
+/// snapshot it writes under, with no lock of the policy taken. A host with no stored policy is not.
+///
+/// # Errors
+///
+/// Returns a storage error when the row cannot be read or does not decode.
+pub fn the_host_is_exclusive(connection: &Connection) -> Result<bool> {
+    let held: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT value FROM host_authority WHERE key = 'policy'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(ControllerError::registry)?;
+    let Some(bytes) = held else {
+        return Ok(false);
+    };
+    let policy: StoredPolicy = kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
+        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+    Ok(policy.exclusively_managed)
+}
+
 /// Whether a paired device in this file can confirm for an exclusively organisation-managed host
 /// that no lease serves: one whose grant carries host management, never expires, requires no
 /// organisation and reaches this host's environment.

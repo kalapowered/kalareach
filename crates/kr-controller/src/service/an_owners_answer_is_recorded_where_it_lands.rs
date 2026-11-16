@@ -29,7 +29,7 @@ use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable};
 use super::a_result_the_lease_ended_over::{
     Presenter, connected_under_a_lease_that_can_be_presented_again,
 };
-use super::an_owner_establishes_the_clock::{Door, registry};
+use super::an_owner_establishes_the_clock::{Door, paired, registry};
 use crate::error::ControllerError;
 use crate::service::Controller;
 use crate::service::net::owner::{Caller, Resolved};
@@ -54,6 +54,9 @@ enum Ends {
     TheLeaseIsPresentedAgain,
     /// An owner is established in the wait for the write lock, which ends the terminal's standing.
     AnOwnerIsEstablished,
+    /// The challenge's time passes in the last wait, inside the transaction: the pairing clock's
+    /// wall reading moves past its expiry.
+    TheChallengeExpires,
 }
 
 struct Found {
@@ -185,7 +188,9 @@ async fn answered_with(
         caller
     };
     let (arrived, go) = match ends {
-        Ends::Nothing | Ends::TheLeasesTime => controller.pause_after_the_record_asks_the_feed(),
+        Ends::Nothing | Ends::TheLeasesTime | Ends::TheChallengeExpires => {
+            controller.pause_after_the_record_asks_the_feed()
+        }
         Ends::TheLeaseIsPresentedAgain | Ends::AnOwnerIsEstablished => {
             controller.pause_before_the_record_begins()
         }
@@ -206,6 +211,9 @@ async fn answered_with(
         match ends {
             Ends::Nothing => {}
             Ends::TheLeasesTime => parts.continuous.advance(Duration::from_secs(16 * 60)),
+            Ends::TheChallengeExpires => controller
+                .owner_authority()
+                .pass_the_wall(Duration::from_secs(3 * 60)),
             Ends::TheLeaseIsPresentedAgain => parts
                 .presenter
                 .as_ref()
@@ -343,5 +351,182 @@ async fn an_answer_from_a_caller_with_no_landing_is_refused_and_records_nothing(
         detail,
         "this action carries no freshness, so it may be answered from what this host holds and \
          may not write"
+    );
+}
+
+/// KR-REQ-10.05: a confirmation that expires in the last wait, after the feed's locked ask and
+/// before the bound is copied, is verified again after that wait: the answer is refused as the
+/// owner's confirmation is required, whole, and nothing is recorded. The control: where it has
+/// not expired, the same answer is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_whose_challenge_expires_in_the_last_wait_is_refused_and_records_nothing() {
+    recorded(
+        &answered_with(
+            World::Plain,
+            Ends::Nothing,
+            ConfirmationDisplay::EstablishClock,
+            true,
+        )
+        .await,
+    );
+    let found = answered_with(
+        World::Plain,
+        Ends::TheChallengeExpires,
+        ConfirmationDisplay::EstablishClock,
+        true,
+    )
+    .await;
+    let ControllerError::Refused { code, detail } = refused(&found) else {
+        panic!("the answer is refused as the owner's confirmation is required");
+    };
+    assert_eq!(*code, ErrorCode::OwnerConfirmationRequired);
+    assert_eq!(detail, "this action needs a fresh owner confirmation");
+}
+
+/// Asks for a challenge and answers it, as a local caller, with the proof of an owner device that
+/// this host holds; the answer's record is stopped in the last wait, where the authority feed's
+/// refusal that removes every remote grant's standing is raised when `raised` says so. A local
+/// connection has no grants for the feed to ask, so what refuses the device is the signer's own
+/// standing, read after the wait.
+async fn answered_by_an_owner_device(raised: bool) -> Found {
+    let parts = parts(World::Plain).await;
+    let controller = &parts.controller;
+    let keys = kr_crypto::keys::DeviceKeys::generate().expect("keys");
+    paired(
+        controller,
+        &keys,
+        0x41,
+        &[ActionRight::HostManage],
+        kr_protocol::grant::GrantExpiry::Never,
+    );
+    let door = Door::open(&parts.temp, controller).await;
+    let revision = controller.admitted_revision(door.connection_id()).ok();
+    let deadline = controller
+        .clock
+        .now()
+        .checked_add(Duration::from_secs(3600))
+        .expect("a deadline");
+    let landing = || controller.pairing_landing(door.connection_id(), revision, Some(deadline));
+    let owner = Arc::clone(controller.owner_authority());
+    let challenge = {
+        let owner = Arc::clone(&owner);
+        let caller = controller.local_caller(door.actor_id()).landed(landing());
+        tokio::task::spawn_blocking(move || {
+            owner.request(
+                &caller,
+                Resolved {
+                    action: SensitiveAction::ChangeHostAuthority,
+                    digest: Digest256::from_bytes([7; 32]),
+                    destination: None,
+                    rights: CanonicalSet::new(),
+                    display: ConfirmationDisplay::EstablishClock,
+                    bootstrap: false,
+                },
+                (
+                    ActionId::new(kr_ipc::new_uuid()),
+                    Digest256::from_bytes([8; 32]),
+                ),
+                &AtomicBool::new(false),
+            )
+        })
+        .await
+        .expect("the request ends")
+        .expect("the challenge is issued")
+    };
+    let params = OwnerConfirmationCompleteParams {
+        proof: sign_confirmation(
+            &keys.authorisation,
+            &challenge.request,
+            ConfirmationChannel::OwnerDevicePresence,
+        )
+        .expect("a proof"),
+        bootstrap_signer: Nullable::null(),
+    };
+    let confirmation = challenge.request.confirmation_id;
+    let action = (
+        ActionId::new(kr_ipc::new_uuid()),
+        Digest256::from_bytes([9; 32]),
+    );
+    let caller = controller.local_caller(door.actor_id()).landed(landing());
+    let (arrived, go) = controller.pause_after_the_record_asks_the_feed();
+    let answering = tokio::task::spawn_blocking({
+        let owner = Arc::clone(&owner);
+        move || {
+            let copied = AtomicBool::new(false);
+            let answered = owner.complete(&caller, &params, action, &copied);
+            (answered, copied.load(Ordering::Acquire))
+        }
+    });
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30)))
+        .await
+        .expect("the wait ends")
+        .expect("the record reaches the place it is stopped at");
+    // The raise sets the refusal's word and then waits for every write to the pairing records that
+    // is under way, and the paused record's transaction is one: the raise is started, the case
+    // waits until the word is up, and the raise ends once the record has.
+    let raising = raised.then(|| {
+        let controller = Arc::clone(controller);
+        tokio::spawn(async move {
+            controller
+                .move_a_feed_refusal(
+                    crate::grants::RemoteRefusal::WITHDRAWAL_UNVERIFIED,
+                    true,
+                    crate::grants::HostPolicy::withdrawal_unverified,
+                    crate::grants::HostPolicy::set_withdrawal_unverified,
+                )
+                .await;
+        })
+    });
+    if raising.is_some() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !controller.policy().withdrawal_unverified() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the refusal's word is raised");
+    }
+    go.send(()).expect("the record goes on");
+    let (answered, copied) = answering.await.expect("the answer ends");
+    if let Some(raising) = raising {
+        raising.await.expect("the raise ends once the record has");
+    }
+    Found {
+        answered,
+        confirmation,
+        copied,
+        answers: count(
+            &parts.temp,
+            "SELECT COUNT(*) FROM owner_confirmations WHERE confirmation_id = ?1",
+            confirmation.get().as_bytes().as_slice(),
+        ),
+        actions: count(
+            &parts.temp,
+            "SELECT COUNT(*) FROM pairing_actions WHERE action_id = ?1",
+            action.0.get().as_bytes().as_slice(),
+        ),
+    }
+}
+
+/// KR-REQ-09.12, KR-REQ-10.05: a local caller carries the proof of an owner device, and a refusal
+/// that removes every remote grant's standing rises in the last wait. The feed's asks read nothing
+/// for a local connection, so the signer's standing is read after that wait: the answer is refused
+/// in the feed's words, whole, and nothing is recorded. The control: with no refusal raised, the
+/// same answer is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_with_an_owner_devices_proof_meets_a_feed_refusal_raised_in_the_last_wait() {
+    let control = answered_by_an_owner_device(false).await;
+    let answered = control.answered.as_ref().expect("the answer is accepted");
+    assert_eq!(answered.confirmation_id, control.confirmation);
+    assert_eq!(answered.channel, ConfirmationChannel::OwnerDevicePresence);
+    assert_eq!(control.answers, 1, "the acceptance is recorded once");
+    let found = answered_by_an_owner_device(true).await;
+    let ControllerError::PermissionDenied { detail } = refused(&found) else {
+        panic!("the answer is refused as the feed refuses the device's standing");
+    };
+    assert_eq!(
+        detail,
+        "this host's authority feed shows a revocation by an owner this host does not know, so it \
+         refuses remote access until the owner at this machine has revoked what it names"
     );
 }

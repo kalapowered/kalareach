@@ -336,6 +336,23 @@ impl Caller {
             _ => Ok(false),
         }
     }
+
+    /// Whether this caller holds owner authority on this host at this moment, read as the
+    /// lifetimes judge a grant without a connection ([`GrantLifetimes::in_force_now`]): for a
+    /// record's transaction, which holds the pairing records' write lock and reads nothing that
+    /// would write.
+    #[must_use]
+    pub(crate) fn is_owner_now(&self, lifetimes: &GrantLifetimes) -> bool {
+        match (&self.device, self.ingress) {
+            (None, ActorIngress::LocalIpc) => true,
+            (Some(device), ActorIngress::PairedDevice) => {
+                device.is_paired()
+                    && device.grant.permits(ActionRight::HostManage)
+                    && lifetimes.in_force_now(device.device_id, &device.grant)
+            }
+            _ => false,
+        }
+    }
 }
 
 /// An action the host has resolved from a caller's subject: exactly what a challenge will name.
@@ -634,11 +651,16 @@ impl OwnerAuthority {
         match (enrolment, &self.recovery) {
             (HostEnrolment::Recovery, Some(recovery)) => TerminalStanding::Recovery {
                 environment_id: recovery.environment_id,
-                exclusive: (recovery.exclusive)(),
                 ceiling: self.ceiling_in_force(),
             },
             _ => TerminalStanding::Bootstrap,
         }
+    }
+
+    /// Moves the pairing clock's wall reading on by `by`, for a test of an expiry decided on it.
+    #[cfg(feature = "testing")]
+    pub fn pass_the_wall(&self, by: std::time::Duration) {
+        self.clock.pass_the_wall(by);
     }
 
     /// Returns whether this host has an owner yet.

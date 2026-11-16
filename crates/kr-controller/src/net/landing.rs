@@ -124,10 +124,14 @@ impl Landing {
             return Ok(Kept(None));
         };
         let grants = daemon.feed_grants_on(self.connection_id);
-        match grants
+        let refused = grants
             .as_ref()
-            .and_then(|grants| daemon.feed_refusal_in(grants))
-        {
+            .and_then(|grants| daemon.feed_refusal_in(grants));
+        // The last wait of a record: where this host's own tests stop it, after the locks of the
+        // ask have been taken and let go, and before anything that follows the ask is read.
+        #[cfg(feature = "testing")]
+        daemon.after_the_record_asks_the_feed.wait();
+        match refused {
             Some(refusal) => Err(ControllerError::PermissionDenied {
                 detail: refusal.detail(),
             }),
@@ -167,10 +171,6 @@ impl Landing {
     /// allocates nothing.
     #[must_use]
     pub(crate) fn copies_the_bound(&self) -> CopiedBound {
-        #[cfg(feature = "testing")]
-        if let Some(daemon) = &self.daemon {
-            daemon.after_the_record_asks_the_feed.wait();
-        }
         match &self.standing {
             Ok(Standing {
                 leased: Some(leased),
