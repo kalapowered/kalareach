@@ -442,12 +442,12 @@ pub async fn follow_evidence(
     broker: Arc<Broker>,
     questions: Arc<Questions>,
     journal_changes: Option<Arc<tokio::sync::Notify>>,
-    now: impl Fn() -> Now + Send + 'static,
+    clock: Arc<dyn kr_ipc::clock::SharedClock>,
     deadlines: DeadlineClock,
 ) {
     let changes = broker.application_changes();
     let ledger_read = Arc::new(tokio::sync::Notify::new());
-    let ask = read_the_ledger_apart(&producer, &questions, Arc::clone(&ledger_read), now);
+    let ask = read_the_ledger_apart(&producer, &questions, Arc::clone(&ledger_read), clock);
     loop {
         let moved_questions = questions.subscribe();
         let moved_ledger = ledger_read.notified();
@@ -519,7 +519,7 @@ fn read_the_ledger_apart(
     producer: &Arc<Producer>,
     questions: &Arc<Questions>,
     moved: Arc<tokio::sync::Notify>,
-    now: impl Fn() -> Now + Send + 'static,
+    clock: Arc<dyn kr_ipc::clock::SharedClock>,
 ) -> std::sync::mpsc::SyncSender<()> {
     let (ask, asked) = std::sync::mpsc::sync_channel(1);
     #[cfg(feature = "testing")]
@@ -536,7 +536,11 @@ fn read_the_ledger_apart(
                 else {
                     return;
                 };
-                let open = questions.any_open(now()).unwrap_or(false);
+                let now = Now {
+                    utc_ms: kr_ipc::now_ms(),
+                    boot_ms: clock.boot_elapsed_ms(),
+                };
+                let open = questions.any_open(now).unwrap_or(false);
                 if producer.observe_questions(open) {
                     moved.notify_waiters();
                 }
