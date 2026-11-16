@@ -446,3 +446,23 @@ async fn a_bound_that_moved_is_decided_by_the_writers_own_reading_of_the_lease()
         "the presentation started another run of the bound"
     );
 }
+
+/// KR-REQ-17.54: the ask that finds a bound moved does not refuse it. Asked by itself, with no
+/// offer of the frame again behind it (the attention release asks once), it reads the lease again
+/// and goes by that reading: the lease stands, so it passes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_ask_that_finds_a_bound_moved_reads_the_lease_again_and_does_not_refuse() {
+    let (_temp, controller, _continuous, presenter, _writer, _reader) =
+        connected_under_a_lease_that_can_be_presented_again().await;
+    let (_, _, footing) = registered(&controller);
+    let under = WrittenUnder::for_an_own_effect_case(footing);
+    let (arrived, go) = controller.pause_after_the_lease_is_read();
+    let asking = tokio::task::spawn_blocking({
+        let controller = Arc::clone(&controller);
+        move || controller.ask_where_a_frame_lands(Some(Method::PrivacySet), &under)
+    });
+    arrival(arrived).await;
+    presenter.present(&[kr_protocol::rights::ActionRight::FilesRead]);
+    go.send(()).expect("the ask goes on");
+    assert_eq!(asking.await.expect("the ask ends"), Ok(()));
+}
