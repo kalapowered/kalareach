@@ -993,11 +993,6 @@ async fn barrier_passed(
             InputEvent::Accepted { epoch, through, .. } => {
                 proven.accepted(epoch.get(), through.get());
             }
-            InputEvent::Refused {
-                epoch,
-                accepted_through: Some(through),
-                ..
-            } => proven.accepted(epoch.get(), through.get()),
             InputEvent::Reached(reached) if &reached == barrier => return true,
             InputEvent::NotReached {
                 barrier: missed, ..
@@ -1761,13 +1756,11 @@ impl View {
             InputEvent::Refused {
                 epoch,
                 sequence,
-                accepted_through,
                 error,
                 ..
             } => {
-                if let Some(through) = accepted_through {
-                    self.proven.accepted(epoch.get(), through.get());
-                }
+                // What the host accepted before the refused frame came in the lane's own
+                // `Accepted` event, which it says first.
                 if self.refused(epoch, sequence, error) {
                     self.control_changed();
                 }
@@ -2193,13 +2186,9 @@ impl View {
                 InputEvent::Refused {
                     epoch,
                     sequence,
-                    accepted_through,
                     error,
                     ..
                 } => {
-                    if let Some(through) = accepted_through {
-                        self.proven.accepted(epoch.get(), through.get());
-                    }
                     let _ = self.refused(epoch, sequence, error);
                 }
                 _ => {}
