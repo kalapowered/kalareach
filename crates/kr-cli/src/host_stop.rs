@@ -873,7 +873,8 @@ async fn stop_the_daemon(
             )
             .await;
             let ended = ended_by(before, environment, &none, json, earlier);
-            return ended.unwrap_or_else(|| failed(CliError::Ipc(error), &none, json));
+            return ended
+                .unwrap_or_else(|| failed(unmade_request(id, &Shown::ipc(&error)), &none, json));
         }
         Ok(Err(error)) => return failed(error, &none, json),
         Err(_) => return silent(environment, &none, json, startup::ANSWER_BOUND),
@@ -940,16 +941,7 @@ async fn stop_the_daemon(
                     earlier,
                 );
             }
-            return failed(
-                CliError::HostUnavailable(shown!(
-                    "kr host stop could not make its request for the control daemon of \
-                     environment {}: {}. Nothing was sent, and nothing was stopped.",
-                    id,
-                    why
-                )),
-                &none,
-                json,
-            );
+            return failed(unmade_request(id, &why), &none, json);
         }
         Asked::Refused(error) => {
             // Nothing was taken, so an interrupt from here on has nothing to say but that.
@@ -1044,6 +1036,17 @@ async fn stop_the_daemon(
     }
 }
 
+/// The failure of a request that could not be made while the daemon stays: what was not made and
+/// that the stop was not asked.
+fn unmade_request(id: EnvironmentId, why: &Shown) -> CliError {
+    CliError::HostUnavailable(shown!(
+        "kr host stop could not make its request for the control daemon of environment {}: {}. \
+         Nothing was sent, and nothing was stopped.",
+        id,
+        *why
+    ))
+}
+
 /// Where the request could not be made, whether the daemon had ended when it could not be: the end,
 /// where the daemon's process has gone and the environment's lock is free or another control
 /// daemon holds it. A daemon that closed the connection is going, and a listener that is gone is
@@ -1078,7 +1081,6 @@ async fn ended_before_the_request(
 
 /// How the failure of the command's connection to the daemon came out, where it failed before the
 /// command could make its request.
-#[expect(dead_code)]
 enum Before {
     /// The daemon had ended: what the command says, and the process that it names.
     Ended { said: Shown, pid: Option<u64> },
@@ -1089,29 +1091,60 @@ enum Before {
     Stays,
 }
 
-/// The command's greeting of the daemon failed with `error`: what the failure came to.
-async fn greeting_failed(
-    _operations: &impl Operations,
-    _error: &kr_ipc::IpcError,
-    _holder: Option<&ProcessStartIdentity>,
-    _id: EnvironmentId,
-    _deadline: tokio::time::Instant,
+/// Decides what a failure of the connection before the command's request was made came to, as the
+/// arm for a request that could not be made decides it: by the daemon's end, looked for within
+/// `deadline`. A daemon that closed the connection is going and is waited for; any other failure
+/// is looked at once, and the daemon that still answers leaves the failure its own words.
+async fn failed_before_the_request(
+    operations: &impl Operations,
+    connection: impl Sized,
+    holder: Option<&ProcessStartIdentity>,
+    error: &kr_ipc::IpcError,
+    id: EnvironmentId,
+    deadline: tokio::time::Instant,
 ) -> Before {
-    Before::Stays
+    let closed = closed_by_the_daemon(error);
+    match ended_before_the_request(operations, connection, holder, closed, deadline).await {
+        Some(ended) => {
+            let pid = holder.map(|holder| holder.pid.get());
+            Before::Ended {
+                said: ended_before_the_request_said(id, pid, ended, &Shown::ipc(error)),
+                pid,
+            }
+        }
+        None if closed => Before::Silent,
+        None => Before::Stays,
+    }
 }
 
-/// The command's read of `host.info` failed with `error`: what the failure came to. The command
-/// owns `connection` and lets it go.
-async fn host_info_failed(
-    _operations: &impl Operations,
-    connection: impl Sized,
-    _error: &kr_ipc::IpcError,
-    _holder: Option<&ProcessStartIdentity>,
-    _id: EnvironmentId,
-    _deadline: tokio::time::Instant,
+/// The command's greeting of the daemon failed with `error`: what the failure came to. Only a
+/// closed peer says that a daemon is ending; a rejection, a mismatch or a fault of another kind
+/// keeps its words and nothing is looked at.
+async fn greeting_failed(
+    operations: &impl Operations,
+    error: &kr_ipc::IpcError,
+    holder: Option<&ProcessStartIdentity>,
+    id: EnvironmentId,
+    deadline: tokio::time::Instant,
 ) -> Before {
-    drop(connection);
-    Before::Stays
+    if !closed_by_the_daemon(error) {
+        return Before::Stays;
+    }
+    failed_before_the_request(operations, (), holder, error, id, deadline).await
+}
+
+/// The command's read of `host.info` failed with `error`: what the failure came to. The stop was
+/// not asked yet, so the failure is judged as an unmade request is, whatever its kind. The
+/// command owns `connection` and lets it go before anything is looked at.
+async fn host_info_failed(
+    operations: &impl Operations,
+    connection: impl Sized,
+    error: &kr_ipc::IpcError,
+    holder: Option<&ProcessStartIdentity>,
+    id: EnvironmentId,
+    deadline: tokio::time::Instant,
+) -> Before {
+    failed_before_the_request(operations, connection, holder, error, id, deadline).await
 }
 
 /// Ends the command by what a failed connection came to: with the daemon's end where it had
@@ -1280,8 +1313,7 @@ fn after_the_probe(
             )
         }
         Some(Ok(Err(other))) => CliError::Refused(other),
-        Some(Err(error)) => CliError::Ipc(error),
-        None => CliError::Refused(refusal),
+        Some(Err(_)) | None => CliError::Refused(refusal),
     }
 }
 
