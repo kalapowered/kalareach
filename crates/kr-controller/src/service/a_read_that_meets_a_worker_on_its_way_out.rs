@@ -1351,47 +1351,56 @@ async fn close(world: &Silent) -> SessionCloseResult {
         .expect("decodes")
 }
 
-/// A worker that gave its volatile closure, and ended without a durable one of its own, is recorded
-/// as it said: the account stands, volatile, and is not replaced by one that says less of how the
-/// session ended.
+/// A worker's volatile closure is its final account, and it is recorded at once as the worker gave
+/// it, on a task of the daemon's own: the registry holds it with the word the worker gave it, and
+/// it is not replaced by one that says less of how the session ended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_worker_that_ended_after_its_volatile_closure_is_recorded_as_it_said() {
+async fn a_volatile_closure_is_recorded_at_once_as_the_worker_gave_it() {
     let script = Scripted::new();
     script.accepts_with_its_closure();
     script.its_closure_is_volatile(true);
     let world = scripted(&script).await;
     let answered = close(&world).await;
     assert_eq!(answered.durability, Durability::Volatile, "{answered:?}");
-    assert!(
-        !recorded(&world).await,
-        "a volatile closure is held and not recorded"
-    );
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while !recorded(&world).await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a volatile closure is recorded at once");
     let record = world
         .controller
-        .record_final(
-            world.session_id,
-            ClosureReason::WorkerCrash,
-            &world.worker.descriptor.process_start_identity,
-            &crate::archive::Fenced::nothing(world.session_id),
-            super::close::Death::Confirmed,
-        )
+        .registry
+        .lock()
         .await
-        .expect("the closure of a worker that ended is recorded");
+        .closure(world.session_id)
+        .expect("the registry answers")
+        .expect("the closure is recorded");
     assert_eq!(
         (record.reason, record.durability),
         (ClosureReason::CloseRequested, Durability::Volatile),
-        "the worker's own account stands: {record:?}"
+        "the worker's own account stands, volatile: {record:?}"
     );
-    assert_eq!(
-        world
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while world
             .controller
-            .registry
+            .directory
             .lock()
             .await
-            .closure(world.session_id)
-            .expect("the registry answers"),
-        Some(record),
-        "and it is the one recorded"
+            .get(world.session_id)
+            .is_some()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the worker leaves the directory with its closure");
+    let repeated = close(&world).await;
+    assert_eq!(
+        (repeated.state, repeated.durability),
+        (SessionState::Closed, Durability::Volatile),
+        "a close after it says volatile too: {repeated:?}"
     );
     world.serving.abort();
 }
