@@ -161,7 +161,7 @@ pub use admission::{
     AdmissionAnswer, AdmissionClock, AdmissionRequest, ManagedPairingAdmission,
     PairingAdmissionService, PairingAdmissions, RelayRefusal,
 };
-pub use alternatives::{Alternative, Alternatives, Offered, is_told_capacity, told_capacity};
+pub use alternatives::{Alternative, Alternatives, Offered, says_its_own_next_step, told_capacity};
 pub use authority::{
     AnnouncementOutcome, AnnouncementPlacement, AuthorityFeedClient, AuthorityFeedRecord,
     AuthorityFeedState, AuthorityFeedSummary, FeedAnnouncement, RejectionReason,

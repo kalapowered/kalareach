@@ -1937,7 +1937,7 @@ mod tests {
                     "{status} {code:?}"
                 );
                 assert!(
-                    !kr_client::services::is_told_capacity(&error.to_string()),
+                    !kr_client::services::says_its_own_next_step(&error.to_string()),
                     "{status} {code:?}"
                 );
             }

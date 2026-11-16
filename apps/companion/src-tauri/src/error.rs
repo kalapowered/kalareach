@@ -125,6 +125,10 @@ impl From<kr_client::ClientError> for CommandError {
     /// A service with no managed capacity for what it was asked names what still works. Every line
     /// that carries the service's own words carries those alternatives after them: "Until then:"
     /// and each one as the service wrote it, and no delay of their own.
+    ///
+    /// A text that says when to try again, or what to do meanwhile, is not followed by a second
+    /// instruction that the code chooses: the failure then asks for nothing more, and the page adds
+    /// no line to it.
     fn from(error: kr_client::ClientError) -> Self {
         let code = error.code();
         let mut message = error.to_string();
@@ -132,10 +136,15 @@ impl From<kr_client::ClientError> for CommandError {
             message.push(' ');
             message.push_str(told.as_str());
         }
+        let action = if kr_client::services::says_its_own_next_step(&message) {
+            kr_client::retry::UserAction::Nothing
+        } else {
+            error.user_action()
+        };
         Self {
             code,
             message,
-            user_action: error.user_action().as_str().into(),
+            user_action: action.as_str().into(),
             retry: code.retry_category(),
         }
     }
@@ -236,6 +245,46 @@ mod tests {
         assert_eq!(named.code, alone.code);
         assert_eq!(named.user_action, alone.user_action);
         assert_eq!(named.retry, alone.retry);
+    }
+
+    /// KR-REQ-17.48: a failure whose text says when to try again, or what to do meanwhile, asks
+    /// nothing more of the page, whatever action the service or the code would call for, so the
+    /// page adds no second instruction. A failure whose text says neither keeps the action.
+    #[test]
+    fn kr_req_17_48_a_text_that_says_its_own_next_step_asks_nothing_more_of_the_page() {
+        use kr_client::ClientError;
+        use kr_client::retry::UserAction;
+        use kr_client::services::Alternatives;
+
+        let refusal = |delay: Option<u64>, alternatives: &[&str], action: UserAction| {
+            CommandError::from(ClientError::Refused {
+                error: kr_protocol::error::ProtocolError::new(
+                    ErrorCode::ServiceCapacity,
+                    "There is no room for new feeds right now.",
+                ),
+                retry_after_seconds: delay,
+                action,
+                service_code: Some("SERVICE_UNAVAILABLE"),
+                alternatives: Alternatives::for_test(alternatives),
+            })
+        };
+        let path = ["A feed service that you run yourself."];
+        for action in [UserAction::Wait, UserAction::SignIn] {
+            for (delay, alternatives) in [
+                (Some(600), &[][..]),
+                (None, &path[..]),
+                (Some(600), &path[..]),
+            ] {
+                let told = refusal(delay, alternatives, action);
+                assert_eq!(told.user_action, "nothing", "{action:?} {delay:?} {told}");
+            }
+            let plain = refusal(None, &[], action);
+            assert_eq!(plain.user_action, action.as_str(), "{action:?}: {plain}");
+        }
+        assert_eq!(
+            refusal(None, &[], UserAction::Wait).message,
+            "SERVICE_CAPACITY: There is no room for new feeds right now."
+        );
     }
 
     /// The scripted hosts the page is tested against give every code the retry category the

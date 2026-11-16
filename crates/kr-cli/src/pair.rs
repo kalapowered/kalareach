@@ -1317,13 +1317,13 @@ fn decode<T: kr_protocol::wire::WireMessage>(value: &ParamsValue) -> Result<T> {
 /// to wait a moment, is not added after it. It is added to every other refusal under that code,
 /// which is the service being unavailable, and every other refusal is as it was.
 ///
-/// The kind is told by the text itself (`kr_client::services::is_told_capacity`), because the code
+/// The kind is told by the text itself (`kr_client::services::says_its_own_next_step`), because the code
 /// is the same for both and the wire carries nothing else.
 fn capacity_in_its_own_words(error: CliError) -> CliError {
     match error {
         CliError::Refused(refused)
             if refused.code == ErrorCode::RendezvousUnavailable
-                && kr_client::services::is_told_capacity(&refused.message) =>
+                && kr_client::services::says_its_own_next_step(&refused.message) =>
         {
             CliError::ServiceRefused {
                 error: refused,
