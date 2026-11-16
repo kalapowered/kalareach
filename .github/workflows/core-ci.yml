@@ -1223,6 +1223,20 @@ jobs:
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-controller --test plugin_runtime_service
 
+      # The daemon's plugin world on this platform: a real daemon, this process for its worker, a real
+      # plugin host with the components built above, and the broker's production transport over an
+      # in-process wire. The cases hold the host's epoch still, which only a host built with the
+      # `testing` feature does, so it is built that way first. The cases that need a socket's half
+      # close or a signal are Unix's and are not built here.
+      - name: Build the plugin host with its epoch held
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo build --locked -p kr-plugin-host --features testing --bins
+
+      - name: Test the plugin actions, their decoding, their attachments and the observation of terminals
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        timeout-minutes: 40
+        run: cargo test --locked -p kr-controller --test worker_waits_prepared --test plugin_actions --test plugin_decoding --test plugin_insertion --test plugin_observation --test revocation_of_a_held_action
+
       # The launcher that starts the plugin host and publishes its descriptor. The name of the
       # endpoint a host of another release derives for its protocol is held there as a literal, and
       # on this platform it is a pipe's name, which no Unix leg can run.

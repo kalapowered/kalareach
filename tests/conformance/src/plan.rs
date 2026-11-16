@@ -1251,6 +1251,46 @@ fn windows() -> Vec<Step> {
                 "plugin_runtime_service",
             ],
         ),
+        // The plugin world's programs hold the plugin host's epoch still, which only a host built
+        // with the `testing` feature does.
+        Step {
+            reading: Reading::Build,
+            ..Step::cargo(
+                Group::Rust,
+                "the plugin host with its epoch held, which the plugin world's programs start",
+                &[
+                    "build",
+                    "--locked",
+                    "-p",
+                    "kr-plugin-host",
+                    "--features",
+                    "testing",
+                    "--bins",
+                ],
+            )
+        },
+        Step::cargo(
+            Group::Rust,
+            "the plugin actions, their decoding, their attachments and the observation of terminals",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "--test",
+                "worker_waits_prepared",
+                "--test",
+                "plugin_actions",
+                "--test",
+                "plugin_decoding",
+                "--test",
+                "plugin_insertion",
+                "--test",
+                "plugin_observation",
+                "--test",
+                "revocation_of_a_held_action",
+            ],
+        ),
         qualified_only(
             "the plugin host's launcher",
             &[
