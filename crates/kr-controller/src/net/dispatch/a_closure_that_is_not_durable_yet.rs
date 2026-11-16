@@ -253,3 +253,91 @@ async fn a_close_after_the_worker_stopped_accepting_is_answered_from_what_the_da
         world.serving.abort();
     }
 }
+
+/// A paired device's repeat of a close records the account that this daemon knows, where the worker
+/// has left the directory with its account not written and nothing else writes it: the device's
+/// door asks what the daemon knows before it asks the directory, so the write that failed is made
+/// again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeat_from_a_paired_device_records_the_account_of_a_worker_that_left_the_directory() {
+    for volatile in [false, true] {
+        let given = if volatile {
+            Durability::Volatile
+        } else {
+            Durability::Durable
+        };
+        let script = Scripted::new();
+        script.accepts_with_its_closure();
+        script.its_closure_is_volatile(volatile);
+        let world = scripted::scripted(&script).await;
+        let controller = &world.controller;
+        let (connection, _) = paired_connection(controller, 36, EVERY_RIGHT);
+        let registry = || {
+            rusqlite::Connection::open(controller.paths.registry_database())
+                .expect("the registry opens beside the daemon's own handle")
+        };
+        registry()
+            .execute_batch(
+                "CREATE TRIGGER the_closure_is_not_kept BEFORE INSERT ON tombstones
+                 BEGIN SELECT RAISE(ABORT, 'the registry keeps no closure'); END;",
+            )
+            .expect("the registry is made to refuse the write that records a closure");
+        // The admission of a close at the local door reads the registry, which the stalled write
+        // holds.
+        let carried = fake::admission(controller, world.accepted).await;
+        let (arrived, release) = controller.stall_the_next_closure_write();
+        let first = closed_at_the_local_door(&world, carried).await;
+        let reached = tokio::task::spawn_blocking(move || {
+            arrived.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await;
+        // Let go before any assertion, so that a write that did not arrive holds nothing.
+        let _ = release.send(());
+        reached
+            .expect("the wait for the write ends")
+            .expect("the closure's write reaches the registry");
+        // The write holds the registry's lock until the registry has answered it: the lock is
+        // taken once the write is over, and finds that it was refused.
+        let held = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            controller.registry.lock(),
+        )
+        .await
+        .expect("the registry is free once its write has been refused");
+        assert!(
+            held.closure(world.session_id)
+                .expect("the registry answers")
+                .is_none(),
+            "the first write of the account was refused: the registry holds no closure"
+        );
+        drop(held);
+        assert_eq!(first.durability, given, "{first:?}");
+
+        // The worker leaves the directory with its account not written, and the registry takes a
+        // closure again. Only a repeat from the paired device is asked from here on.
+        controller.forget_worker_for_tests(world.session_id).await;
+        registry()
+            .execute_batch("DROP TRIGGER the_closure_is_not_kept;")
+            .expect("the registry takes a closure again");
+        let mut action = 91;
+        let asked = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let paired = closed_at_the_paired_door(&world, &connection, action).await;
+                assert_eq!(
+                    (paired.state, paired.durability),
+                    (SessionState::Closed, given),
+                    "{paired:?}"
+                );
+                if recorded_durability(&world).await.is_some() {
+                    return;
+                }
+                action += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        asked.expect("a repeat from a paired device records the account the daemon knows");
+        assert_eq!(recorded_durability(&world).await, Some(given));
+        world.serving.abort();
+    }
+}
