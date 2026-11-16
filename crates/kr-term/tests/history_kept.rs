@@ -1,8 +1,10 @@
 //! The rows above the live screen, and what it takes to keep none of them.
 //!
 //! An engine whose history is not kept gives up every row held above the live screen when that is
-//! asked for and holds none between two calls afterwards. The live screen is the same before and
-//! after, and turning the history back on starts it empty.
+//! asked for and holds none between two calls afterwards, whichever buffer shows. The live screen
+//! is the same before and after. A row that is on the screen when the history is kept again was
+//! printed before that point, so it is given up when it leaves the screen, wherever the library
+//! has moved it to by then. Rows are kept again after that.
 
 use kr_term::budget::GridSize;
 use kr_term::diag::DiagnosticKind;
@@ -20,24 +22,54 @@ fn engine(cols: u32, rows: u32) -> Engine {
     .expect("engine")
 }
 
+fn feed(engine: &mut Engine, text: &str) {
+    engine.feed(text.as_bytes(), 0);
+}
+
 fn printed(word: &str, from: usize, to: usize) -> String {
     (from..to)
         .map(|index| format!("{word} {index}\r\n"))
         .collect()
 }
 
+fn numbered(word: &str, from: usize, to: usize) -> Vec<String> {
+    (from..to).map(|index| format!("{word} {index}")).collect()
+}
+
 fn text_of(rows: &[GridRow]) -> Vec<String> {
     rows.iter()
-        .map(|row| row.runs.iter().map(|run| run.text.as_str()).collect())
+        .map(|row| {
+            row.runs
+                .iter()
+                .map(|run| run.text.as_str())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
         .collect()
 }
 
-/// The text of every row the engine holds above the live screen, oldest first.
+/// The text of every row the engine holds above the live screen, oldest first. The primary buffer
+/// is showing.
 fn retained(engine: &Engine) -> Vec<String> {
     let grid = engine.grid();
+    assert!(!grid.alternate_active(), "the primary buffer shows");
     let (oldest, _) = grid.stable_range();
     let count = usize::try_from(grid.visible_top_row() - oldest).expect("rows above the screen");
     text_of(&grid.history_rows(oldest, count))
+}
+
+/// How many rows the primary buffer holds above its screen, whichever buffer shows.
+fn held_above_primary(engine: &Engine) -> usize {
+    let grid = engine.grid();
+    let (start, end) = if grid.alternate_active() {
+        grid.inactive_stable_range()
+    } else {
+        grid.stable_range()
+    };
+    usize::try_from(end - start)
+        .expect("rows held")
+        .saturating_sub(grid.size().rows as usize)
 }
 
 fn truncations(engine: &Engine) -> u64 {
@@ -65,10 +97,50 @@ fn screen_of(engine: &mut Engine) -> (Vec<GridRow>, Vec<GridRow>, String) {
     )
 }
 
+/// The whole state of both screens: the cells, the cursor, both saved cursors, the margins, the
+/// deferred wrap and the pen.
+fn state_of(engine: &Engine) -> String {
+    let grid = engine.grid();
+    format!(
+        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+        grid.visible_rows(),
+        grid.inactive_rows(),
+        grid.cursor(),
+        grid.saved_cursor(false),
+        grid.saved_cursor(true),
+        grid.margins_vertical(),
+        grid.margins_horizontal(),
+        grid.pending_wrap(),
+        grid.pen(),
+    )
+}
+
+/// An engine of twenty columns and four rows that had twenty rows printed while the history was
+/// not being kept, and keeps it again. The screen holds `while 17` to `while 19` and the empty row
+/// the cursor is on.
+fn after_a_private_interval() -> Engine {
+    let mut engine = engine(20, 4);
+    engine.set_history_kept(false);
+    feed(&mut engine, &printed("while", 0, 20));
+    engine.set_history_kept(true);
+    engine
+}
+
+fn assert_none_of(rows: &[String], words: &[&str]) {
+    for row in rows {
+        for word in words {
+            assert!(
+                !row.contains(word),
+                "{word:?} is in a row that is kept: {rows:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn the_rows_above_the_screen_are_given_up_and_the_screen_is_not_changed() {
     let mut engine = engine(20, 4);
-    engine.feed(printed("before", 0, 40).as_bytes(), 0);
+    feed(&mut engine, &printed("before", 0, 40));
     assert!(
         retained(&engine).iter().any(|row| row.contains("before 0")),
         "the rows are held before the call"
@@ -90,11 +162,39 @@ fn the_rows_above_the_screen_are_given_up_and_the_screen_is_not_changed() {
 }
 
 #[test]
+fn the_whole_state_of_the_screen_is_the_same_at_the_enabling_and_at_the_disabling() {
+    let mut engine = engine(20, 6);
+    feed(&mut engine, &printed("before", 0, 30));
+    // A saved cursor, margins on both axes, a pending wrap and a rendition on the pen.
+    feed(
+        &mut engine,
+        "\x1b[2;4H\x1b7\x1b[?69h\x1b[3;12s\x1b[2;5r\x1b[1;31mred",
+    );
+    feed(&mut engine, "\x1b[5;20Hz");
+    let sequence = engine.grid().sequence_number();
+    let state = state_of(&engine);
+
+    engine.set_history_kept(false);
+    assert_eq!(state_of(&engine), state, "at the enabling");
+    assert!(
+        engine.grid().changed_rows_since(sequence).is_empty(),
+        "no row reads as changed at the enabling"
+    );
+
+    engine.set_history_kept(true);
+    assert_eq!(state_of(&engine), state, "at the disabling");
+    assert!(
+        engine.grid().changed_rows_since(sequence).is_empty(),
+        "no row reads as changed at the disabling"
+    );
+}
+
+#[test]
 fn a_wrapped_line_and_a_wide_character_at_the_boundary_are_not_changed() {
     // Twenty columns of wide characters on a screen of eight: the line wraps over three rows, and
     // the next line pushes the first of them above a screen of three rows.
     let mut engine = engine(8, 3);
-    engine.feed(format!("{}\r\nx", "\u{5168}".repeat(10)).as_bytes(), 0);
+    feed(&mut engine, &format!("{}\r\nx", "\u{5168}".repeat(10)));
     assert!(!retained(&engine).is_empty(), "the first row is held");
     let screen = screen_of(&mut engine);
     let first = screen.0.first().expect("the first row of the screen");
@@ -112,15 +212,15 @@ fn a_wrapped_line_and_a_wide_character_at_the_boundary_are_not_changed() {
 #[test]
 fn nothing_is_held_between_two_calls_and_nothing_is_recorded_as_cut() {
     let mut engine = engine(20, 4);
-    engine.feed(printed("before", 0, 10).as_bytes(), 0);
+    feed(&mut engine, &printed("before", 0, 10));
     engine.set_history_kept(false);
 
     // A read of many screens, and then a row at a time.
-    engine.feed(printed("while", 0, 5_000).as_bytes(), 0);
+    feed(&mut engine, &printed("while", 0, 5_000));
     assert!(retained(&engine).is_empty());
     assert_eq!(engine.grid().scrollback_rows(), 0);
     for index in 5_000..5_010 {
-        engine.feed(printed("while", index, index + 1).as_bytes(), 0);
+        feed(&mut engine, &printed("while", index, index + 1));
         assert!(retained(&engine).is_empty());
         assert_eq!(engine.grid().history_bytes(), 0);
     }
@@ -137,44 +237,85 @@ fn nothing_is_held_between_two_calls_and_nothing_is_recorded_as_cut() {
 }
 
 #[test]
-fn the_history_is_kept_again_from_the_first_row_that_comes_onto_the_screen() {
-    let mut engine = engine(20, 4);
-    engine.feed(printed("before", 0, 20).as_bytes(), 0);
-    engine.set_history_kept(false);
-    engine.feed(printed("while", 0, 20).as_bytes(), 0);
+fn exactly_the_rows_printed_after_the_screen_has_gone_are_kept() {
+    let mut engine = after_a_private_interval();
+    assert!(retained(&engine).is_empty(), "turning it on starts empty");
+
+    feed(&mut engine, &printed("after", 0, 20));
+
+    // `after 0` was printed onto the row the cursor was on at the disabling, which is a row that
+    // was on the screen then, so it is given up with the rows of the interval. Nothing after it is.
+    assert_eq!(retained(&engine), numbered("after", 1, 17));
+    assert_eq!(
+        text_of(&engine.grid().visible_rows()),
+        vec!["after 17", "after 18", "after 19", ""]
+    );
+}
+
+#[test]
+fn a_clear_scrollback_and_a_buffer_switch_without_a_clear_change_nothing_about_that() {
+    // The program's own clear of the rows above the screen.
+    let mut engine = after_a_private_interval();
+    feed(&mut engine, "\x1b[3J");
+    feed(&mut engine, &printed("after", 0, 20));
+    assert_eq!(retained(&engine), numbered("after", 1, 17), "after CSI 3 J");
+
+    // A switch to the alternate buffer that does not clear it, and back.
+    let mut engine = after_a_private_interval();
+    feed(&mut engine, "\x1b[?1047h");
+    assert!(engine.grid().alternate_active());
+    feed(&mut engine, "\x1b[?1047l");
+    assert!(!engine.grid().alternate_active());
+    feed(&mut engine, &printed("after", 0, 20));
+    assert_eq!(
+        retained(&engine),
+        numbered("after", 1, 17),
+        "after a switch"
+    );
+}
+
+#[test]
+fn a_full_reset_gives_up_the_next_screen_of_rows_and_keeps_the_rows_after_it() {
+    let mut engine = after_a_private_interval();
+    feed(&mut engine, "\x1bc");
     assert!(retained(&engine).is_empty());
 
-    engine.set_history_kept(true);
-    assert!(
-        retained(&engine).is_empty(),
-        "turning it on starts with no rows"
-    );
-    engine.feed(printed("after", 0, 20).as_bytes(), 0);
+    feed(&mut engine, &printed("after", 0, 20));
 
-    let rows = retained(&engine);
-    assert!(rows.iter().any(|row| row.contains("after")));
-    assert!(
-        rows.iter().all(|row| row.contains("after")),
-        "nothing that was on the screen when it was turned on is kept: {rows:?}"
-    );
-    assert!(
-        !rows.iter().any(|row| row.contains("after 0")),
-        "the row the cursor was on is given up with the rest: {rows:?}"
+    // The reset blanks the lines on the screen in place. They still stand for the interval, so
+    // the first screen of rows goes: this is what the rule gives up that it could keep.
+    assert_eq!(retained(&engine), numbered("after", 4, 17));
+}
+
+#[test]
+fn rows_are_kept_through_a_height_only_resize_that_gives_up_nothing_of_its_own() {
+    let mut engine = after_a_private_interval();
+    feed(&mut engine, &printed("after", 0, 3));
+    engine.resize(GridSize::new(20, 5), 0).expect("taller");
+    feed(&mut engine, &printed("later", 0, 10));
+
+    assert_eq!(
+        retained(&engine),
+        [numbered("after", 1, 3), numbered("later", 0, 6)].concat()
     );
 }
 
 #[test]
 fn a_resize_does_not_let_the_rows_on_the_screen_be_kept() {
-    // Rows of eighteen columns on a screen of twenty. Narrowed to ten, each splits in two, so the
-    // library's numbers of rows move and the mark has to move with them.
+    // Rows of seventeen columns on a screen of twenty. Narrowed to ten, each splits in two, so the
+    // library's numbers of rows move.
     let mut engine = engine(20, 4);
-    engine.feed(printed("before 0123456", 0, 20).as_bytes(), 0);
+    feed(&mut engine, &printed("before 0123456", 0, 20));
     engine.set_history_kept(false);
-    engine.feed(printed("while 0123456", 0, 6).as_bytes(), 0);
+    feed(&mut engine, &printed("while 0123456", 0, 6));
     engine.set_history_kept(true);
 
     engine.resize(GridSize::new(10, 4), 0).expect("narrower");
-    engine.feed(printed("after", 0, 20).as_bytes(), 0);
+    assert!(
+        retained(&engine).is_empty(),
+        "the rows a narrower screen moved above it are given up in the call"
+    );
+    feed(&mut engine, &printed("after", 0, 20));
 
     let rows = retained(&engine);
     assert!(rows.iter().any(|row| row.contains("after")));
@@ -185,70 +326,319 @@ fn a_resize_does_not_let_the_rows_on_the_screen_be_kept() {
 }
 
 #[test]
-fn rows_owed_while_the_alternate_buffer_shows_go_in_the_call_that_leaves_it() {
+fn a_shorter_resize_while_rows_are_not_kept_holds_nothing_when_it_returns() {
     let mut engine = engine(20, 4);
-    engine.feed(printed("before", 0, 20).as_bytes(), 0);
-    let shell = screen_of(&mut engine);
-    engine.feed(ENTER_ALTERNATE.as_bytes(), 0);
-    engine.feed(b"\x1b[2J\x1b[Happ", 0);
+    engine.set_history_kept(false);
+    feed(&mut engine, &printed("while", 0, 20));
+
+    engine.resize(GridSize::new(20, 2), 0).expect("shorter");
+
+    assert!(retained(&engine).is_empty(), "read at once, before output");
+    assert_eq!(engine.grid().history_bytes(), 0);
+    assert_eq!(text_of(&engine.grid().visible_rows()), vec!["while 19", ""]);
+}
+
+#[test]
+fn a_width_only_resize_after_a_clear_brings_no_earlier_row_onto_the_screen() {
+    let mut engine = engine(20, 4);
+    feed(&mut engine, &printed("before", 0, 20));
+    engine.set_history_kept(false);
+    // Ctrl-L: the shell clears the screen and draws its prompt at the top.
+    feed(&mut engine, "\x1b[H\x1b[2Jprompt");
+
+    engine.resize(GridSize::new(21, 4), 0).expect("wider");
+
+    assert_none_of(&text_of(&engine.grid().visible_rows()), &["before"]);
+    assert!(retained(&engine).is_empty());
+}
+
+#[test]
+fn a_reverse_index_does_not_carry_an_earlier_row_into_the_kept_rows() {
+    let mut engine = after_a_private_interval();
+    feed(&mut engine, "after 0\r\n\x1b[H\x1bM\x1bM");
+    feed(&mut engine, "\x1b[4;1H\n\n\n\n");
+
+    assert_none_of(&retained(&engine), &["while"]);
+    assert!(retained(&engine).is_empty(), "{:?}", retained(&engine));
+}
+
+#[test]
+fn an_insert_line_does_not_carry_an_earlier_row_into_the_kept_rows() {
+    let mut engine = after_a_private_interval();
+    feed(&mut engine, "after 0\r\n\x1b[H\x1b[2L");
+    feed(&mut engine, "\x1b[4;1H\n\n\n\n");
+
+    assert_none_of(&retained(&engine), &["while"]);
+    assert!(retained(&engine).is_empty(), "{:?}", retained(&engine));
+}
+
+#[test]
+fn a_scroll_down_does_not_carry_an_earlier_row_into_the_kept_rows() {
+    // The sequence of the second section's order: the row of the interval is the cursor's row.
+    let mut engine = engine(20, 4);
+    engine.set_history_kept(false);
+    feed(&mut engine, "A\r\nB\r\nC\r\nSECRET\r");
+    engine.set_history_kept(true);
+
+    feed(&mut engine, "\n\x1b[1T\x1b[4;1H\n\n\n\n");
+
+    assert_none_of(&retained(&engine), &["SECRET", "A", "B", "C"]);
+}
+
+#[test]
+fn a_region_at_the_top_keeps_no_row_while_a_row_of_the_interval_stays_below_it() {
+    let mut engine = engine(20, 4);
+    engine.set_history_kept(false);
+    feed(&mut engine, &printed("while", 0, 6));
+    feed(&mut engine, "\x1b[4;1HSTATUS");
+    engine.set_history_kept(true);
+
+    // Three rows at the top scroll, and STATUS stays on the screen below them.
+    feed(&mut engine, "\x1b[1;3r\x1b[3;1H");
+    feed(&mut engine, &printed("in", 0, 10));
+    assert!(
+        retained(&engine).is_empty(),
+        "no row leaves the region while STATUS stays below it: {:?}",
+        retained(&engine)
+    );
+
+    // The region ends, STATUS leaves, and the rows after it are kept.
+    feed(&mut engine, "\x1b[r\x1b[4;1H");
+    feed(&mut engine, &printed("later", 0, 12));
+    let rows = retained(&engine);
+    assert_none_of(&rows, &["STATUS", "while", "in "]);
+    assert!(rows.iter().any(|row| row.contains("later")), "{rows:?}");
+}
+
+#[test]
+fn a_downward_copy_inside_margins_carries_the_row_of_the_interval_with_it() {
+    let mut engine = after_a_private_interval();
+    // One scroll gives the screen a fresh last row, then two copies of cells downward inside the
+    // columns 1 to 10 put `while 19` into it. The margins are put back before the rows scroll off.
+    feed(&mut engine, "\n");
+    feed(&mut engine, "\x1b[?69h\x1b[1;10s\x1bM\x1bM");
+    assert_eq!(
+        text_of(&engine.grid().visible_rows())[3],
+        "while 19",
+        "the cells were copied into the fresh row"
+    );
+    feed(&mut engine, "\x1b[1;20s\x1b[?69l\x1b[4;1H\n\n\n\n");
+
+    assert_none_of(&retained(&engine), &["while"]);
+}
+
+#[test]
+fn an_upward_copy_inside_margins_carries_the_row_of_the_interval_with_it() {
+    let mut engine = after_a_private_interval();
+    // Two line feeds and three reverse indexes put three fresh rows above `while 19`, which is the
+    // last row. A copy of cells upward inside the columns 1 to 10 puts `while 19` into the third
+    // fresh row and blanks it where it was, and one more reverse index removes that row.
+    feed(&mut engine, "\n\n\x1b[H\x1bM\x1bM\x1bM");
+    assert_eq!(text_of(&engine.grid().visible_rows())[3], "while 19");
+    feed(&mut engine, "\x1b[?69h\x1b[1;10s\x1b[S");
+    assert_eq!(
+        text_of(&engine.grid().visible_rows()),
+        vec!["", "", "while 19", ""],
+        "the cells were copied into a fresh row"
+    );
+    feed(&mut engine, "\x1b[1;20s\x1b[?69l\x1b[H\x1bM");
+    feed(&mut engine, "\x1b[4;1H\n\n\n\n\n");
+
+    assert_none_of(&retained(&engine), &["while"]);
+}
+
+#[test]
+fn the_newest_marked_row_split_by_a_narrower_screen_is_given_up_whole() {
+    let mut engine = engine(20, 4);
+    engine.set_history_kept(false);
+    feed(&mut engine, &printed("while", 0, 20));
+    feed(&mut engine, "while 20 xxxxxxxxx");
+    engine.set_history_kept(true);
+
+    feed(&mut engine, "\n");
+    engine.resize(GridSize::new(10, 10), 0).expect("narrower");
+    feed(&mut engine, &printed("after", 0, 30));
+
+    assert_none_of(&retained(&engine), &["while", "xxxx"]);
+}
+
+#[test]
+fn the_newest_marked_row_joined_to_a_row_of_the_interval_is_given_up_whole() {
+    let mut engine = engine(20, 4);
+    engine.set_history_kept(false);
+    feed(&mut engine, &printed("while", 0, 20));
+    feed(&mut engine, "while 20");
+    engine.set_history_kept(true);
+
+    // The row moves to the second line of the screen, a fresh row goes above it, and letters that
+    // wrap from the fresh row onto it make the two one logical line.
+    feed(&mut engine, "\n\n\n\x1b[H\x1bMABCDEFGHIJKLMNOPQRSTUVW");
+    engine.resize(GridSize::new(30, 4), 0).expect("wider");
+    feed(&mut engine, &printed("after", 0, 30));
+
+    assert_none_of(&retained(&engine), &["le 20", "while"]);
+}
+
+#[test]
+fn a_blank_row_that_holds_a_link_is_given_up_when_a_narrower_screen_rebuilds_it() {
+    let mut engine = engine(20, 4);
+    engine.set_history_kept(false);
+    feed(&mut engine, &printed("while", 0, 20));
+    feed(
+        &mut engine,
+        "\x1b]8;;https://link.example/\x1b\\     \x1b]8;;\x1b\\",
+    );
+    engine.set_history_kept(true);
+
+    engine.resize(GridSize::new(10, 4), 0).expect("narrower");
+    feed(&mut engine, &printed("after", 0, 30));
+
+    assert!(
+        engine.grid().link_census().links.is_empty(),
+        "no row that is kept holds the link: {:?}",
+        engine.grid().link_census().links
+    );
+}
+
+#[test]
+fn a_full_reset_while_rows_are_not_kept_keeps_none_and_changes_no_other_rule() {
+    let mut engine = engine(20, 4);
+    engine.set_history_kept(false);
+    feed(&mut engine, &printed("while", 0, 10));
+    feed(&mut engine, "\x1bc");
+    feed(&mut engine, &printed("while", 10, 30));
+    assert!(retained(&engine).is_empty());
+    engine.set_history_kept(true);
+    feed(&mut engine, &printed("after", 0, 20));
+    assert_eq!(retained(&engine), numbered("after", 1, 17));
+}
+
+// The alternate buffer. The primary buffer's rows are given up in the call that asks, and a resize
+// that the library does on both buffers brings none of them back.
+
+fn print_then_enter_the_alternate_buffer() -> Engine {
+    let mut engine = engine(20, 4);
+    feed(&mut engine, &printed("before", 0, 20));
+    feed(&mut engine, ENTER_ALTERNATE);
+    feed(&mut engine, "\x1b[2J\x1b[Happ");
     assert!(engine.grid().alternate_active());
+    engine
+}
+
+#[test]
+fn the_rows_are_given_up_at_the_enabling_while_the_alternate_buffer_shows() {
+    let mut engine = print_then_enter_the_alternate_buffer();
+    assert!(held_above_primary(&engine) > 0, "held before the call");
     let app = screen_of(&mut engine);
 
     engine.set_history_kept(false);
 
-    assert!(
-        engine.grid().scrollback_rows() > 0,
-        "the primary buffer's rows cannot be reached while the alternate buffer shows"
-    );
+    assert_eq!(held_above_primary(&engine), 0, "nothing is owed");
     assert_eq!(
         screen_of(&mut engine),
         app,
         "neither buffer's screen is changed"
     );
-
-    // The program leaves, and writes more in the same read.
-    engine.feed(
-        format!("{LEAVE_ALTERNATE}{}", printed("while", 0, 3)).as_bytes(),
-        0,
-    );
-    assert!(!engine.grid().alternate_active());
-    assert!(
-        retained(&engine).is_empty(),
-        "nothing from before is held once the primary buffer shows again: {:?}",
-        retained(&engine)
-    );
-    assert_eq!(engine.grid().history_bytes(), 0);
-    assert_ne!(
-        screen_of(&mut engine),
-        shell,
-        "the later rows are on the screen"
+    assert_eq!(
+        text_of(&engine.grid().inactive_rows()),
+        vec!["before 17", "before 18", "before 19", ""],
+        "the primary buffer's own screen is as it was"
     );
 }
 
 #[test]
-fn rows_owed_are_still_owed_when_the_history_is_turned_on_before_the_program_leaves() {
+fn a_taller_resize_under_the_alternate_buffer_brings_no_earlier_row_back() {
+    let mut engine = print_then_enter_the_alternate_buffer();
+    engine.set_history_kept(false);
+
+    engine.resize(GridSize::new(20, 8), 0).expect("taller");
+
+    assert_eq!(held_above_primary(&engine), 0);
+    assert_eq!(
+        text_of(&engine.grid().inactive_rows()),
+        vec!["before 17", "before 18", "before 19", "", "", "", "", ""],
+        "the page the host reads at once"
+    );
+    feed(&mut engine, LEAVE_ALTERNATE);
+    assert_eq!(
+        text_of(&engine.grid().visible_rows()),
+        vec!["before 17", "before 18", "before 19", "", "", "", "", ""],
+        "the screen when the program leaves"
+    );
+    assert!(retained(&engine).is_empty());
+}
+
+#[test]
+fn a_taller_resize_then_the_disabling_before_the_program_leaves_brings_no_earlier_row_back() {
+    let mut engine = print_then_enter_the_alternate_buffer();
+    engine.set_history_kept(false);
+    engine.resize(GridSize::new(20, 8), 0).expect("taller");
+    engine.set_history_kept(true);
+
+    feed(&mut engine, LEAVE_ALTERNATE);
+
+    assert_eq!(
+        text_of(&engine.grid().visible_rows()),
+        vec!["before 17", "before 18", "before 19", "", "", "", "", ""]
+    );
+    assert!(retained(&engine).is_empty());
+}
+
+#[test]
+fn a_width_only_resize_after_a_clear_under_the_alternate_buffer_brings_no_earlier_row_back() {
     let mut engine = engine(20, 4);
-    engine.feed(printed("before", 0, 20).as_bytes(), 0);
-    engine.feed(ENTER_ALTERNATE.as_bytes(), 0);
+    feed(&mut engine, &printed("before", 0, 20));
+    // Ctrl-L before the program starts, then the program.
+    feed(&mut engine, "\x1b[H\x1b[2Jprompt");
+    feed(&mut engine, ENTER_ALTERNATE);
+    engine.set_history_kept(false);
+
+    engine.resize(GridSize::new(21, 4), 0).expect("wider");
+    assert_none_of(&text_of(&engine.grid().inactive_rows()), &["before"]);
+    feed(&mut engine, LEAVE_ALTERNATE);
+
+    assert_none_of(&text_of(&engine.grid().visible_rows()), &["before"]);
+    assert!(
+        text_of(&engine.grid().visible_rows())
+            .iter()
+            .any(|row| row == "prompt")
+    );
+}
+
+#[test]
+fn growth_and_shrink_then_growth_under_the_alternate_buffer_bring_no_earlier_row_back() {
+    let mut engine = print_then_enter_the_alternate_buffer();
+    engine.set_history_kept(false);
+
+    engine.resize(GridSize::new(20, 2), 0).expect("shorter");
+    assert_eq!(held_above_primary(&engine), 0, "read at once after it");
+    engine.resize(GridSize::new(20, 8), 0).expect("taller");
+    assert_eq!(held_above_primary(&engine), 0);
+    assert_none_of(
+        &text_of(&engine.grid().inactive_rows()),
+        &["before 17", "before 18", "before 16"],
+    );
+    feed(&mut engine, LEAVE_ALTERNATE);
+
+    assert_none_of(
+        &text_of(&engine.grid().visible_rows()),
+        &["before 17", "before 18", "before 16"],
+    );
+    assert!(retained(&engine).is_empty());
+}
+
+#[test]
+fn rows_printed_after_the_program_leaves_are_kept_once_the_screen_has_gone() {
+    let mut engine = print_then_enter_the_alternate_buffer();
     engine.set_history_kept(false);
     engine.set_history_kept(true);
-    assert!(
-        engine.grid().scrollback_rows() > 0,
-        "the rows are still held while the alternate buffer shows"
+
+    feed(
+        &mut engine,
+        &format!("{LEAVE_ALTERNATE}{}", printed("after", 0, 20)),
     );
 
-    engine.feed(
-        format!("{LEAVE_ALTERNATE}{}", printed("after", 0, 20)).as_bytes(),
-        0,
-    );
-
-    let rows = retained(&engine);
-    assert!(
-        rows.iter().any(|row| row.contains("after")),
-        "rows printed afterwards are kept"
-    );
-    assert!(
-        rows.iter().all(|row| row.contains("after")),
-        "no row from before comes back, those on the screen included: {rows:?}"
-    );
+    // The primary screen holds `before 17` to `before 19` and the row the cursor was on, all
+    // printed before the disabling, and the rows after them are kept.
+    assert_eq!(retained(&engine), numbered("after", 1, 17));
 }
