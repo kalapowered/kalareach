@@ -588,8 +588,9 @@ pub async fn follow_evidence(
         let moved_journal = journal_changes.as_ref().map(|journal| journal.notified());
         let moved_broker = changes.notified();
         let moved_closed = runtime.closure_notified();
-        // Counted once the round hears every wake, so that a case which sees the count after its
-        // own change knows that the round it counted is one that has the change to hear.
+        // Counted once the round hears every wake: a case that reads the count BEFORE it makes a
+        // change knows that the round it counted hears that change. A round that subscribes after
+        // the change hears no wake for it and only reads what the change made.
         #[cfg(feature = "testing")]
         producer
             .rounds
