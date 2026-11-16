@@ -56,12 +56,62 @@ pub const DEMAND_BUDGET: std::time::Duration = std::time::Duration::from_secs(2)
 /// ask about has ended, so what each session last answered is kept here and counted again. Only a
 /// session's own answer changes what that session contributes, and an entry lives exactly as long
 /// as its session is in the directory: a closed session's work goes with its entry.
+///
+/// An answer that the worker gave while a storage call held its session does not lower an entry
+/// (see [`SessionDemand::observed`]): the host does not stop counting what it counted because the
+/// worker could not take its own session.
 #[derive(Debug, Default)]
 pub(super) struct DemandScan {
     /// Where the last scan stopped, so the next one starts after it.
     cursor: usize,
     /// What each live session was last observed to have outstanding.
     seen: BTreeMap<SessionId, SessionDemand>,
+}
+
+/// What the scan was given for one worker.
+enum Said<'a> {
+    /// The worker answered.
+    Read(&'a SessionReadResult),
+    /// The worker did not answer inside its bound, or its answer was an error.
+    Nothing,
+    /// The worker did not answer, and the kernel says its process has ended.
+    Ended,
+}
+
+impl DemandScan {
+    /// Takes what one worker said, or that it said nothing, into what the scan has for its session.
+    ///
+    /// A worker that did not answer has not said its work ended, so what it last said stands: the
+    /// entry is not touched. One whose process the kernel says is gone is not running an agent
+    /// and is not waiting for an answer, whatever it last said, so those go. What does not go with
+    /// it is a closure this host accepted, because finishing that is this host's own work and not
+    /// the worker's: it is outstanding until the closure is recorded, which is also when the
+    /// session leaves the directory and this record with it.
+    fn hear(&mut self, session_id: SessionId, said: Said<'_>) {
+        match said {
+            Said::Read(read) => {
+                let observed = SessionDemand::observed(read, self.seen.get(&session_id));
+                self.seen.insert(session_id, observed);
+            }
+            Said::Nothing => {}
+            Said::Ended => {
+                if self.seen.get(&session_id).is_some_and(|seen| seen.closing) {
+                    self.seen.insert(
+                        session_id,
+                        SessionDemand {
+                            work: false,
+                            waiting: false,
+                            closing: true,
+                            // Its process is gone, so nothing is waiting on its reader.
+                            launches: 0,
+                        },
+                    );
+                } else {
+                    self.seen.remove(&session_id);
+                }
+            }
+        }
+    }
 }
 
 /// What one session was last observed to have outstanding.
@@ -88,12 +138,19 @@ struct SessionDemand {
 }
 
 impl SessionDemand {
-    /// What one worker's answer says its session has outstanding.
+    /// What one worker's answer says its session has outstanding, given what the scan had for the
+    /// session before (`previous`, none for a session it sees for the first time).
     ///
-    /// `closing_before` is whether this host already had a closure for the session: a closure
-    /// counts from the first sign of one until the host has recorded it, whatever the worker says
-    /// after that.
-    fn observed(read: &SessionReadResult, closing_before: bool) -> Self {
+    /// A closure counts from the first sign of one until this host has recorded it, whatever the
+    /// worker says after that.
+    ///
+    /// An answer that says `held` was given while a storage call held the worker's session: its
+    /// counts are what the worker last recorded and not what the session holds, and the read that
+    /// would have said more may not return for as long as the storage call stands. Such an answer
+    /// takes the greater of each count and the one the scan had, so that a hold can raise what is
+    /// counted and never lowers it. The floor ends with the first answer that is not held, which
+    /// replaces the entry as before.
+    fn observed(read: &SessionReadResult, previous: Option<&Self>) -> Self {
         let summary = &read.session;
         let mut observed = Self {
             // A launch the reader has not answered is work outstanding, and it stays outstanding
@@ -126,9 +183,26 @@ impl SessionDemand {
         // `closed` once they are stopped, and what is left then is this host recording the
         // closure, which is also what takes the session out of the list above. So a closure
         // counts from the first sign of one until then.
-        observed.closing =
-            matches!(summary.state, SessionState::Closing | SessionState::Closed) || closing_before;
-        observed
+        observed.closing = matches!(summary.state, SessionState::Closing | SessionState::Closed)
+            || previous.is_some_and(|previous| previous.closing);
+        match previous {
+            Some(previous) if read.held => observed.at_least(previous),
+            _ => observed,
+        }
+    }
+
+    /// Each count of `self`, or the one `floor` has where that is greater.
+    const fn at_least(self, floor: &Self) -> Self {
+        Self {
+            work: self.work || floor.work,
+            waiting: self.waiting || floor.waiting,
+            closing: self.closing || floor.closing,
+            launches: if self.launches > floor.launches {
+                self.launches
+            } else {
+                floor.launches
+            },
+        }
     }
 
     /// The sessions with an agent at work, and the requests outstanding across all of them: what
@@ -260,6 +334,12 @@ impl Controller {
     /// that is the kernel saying its process has gone, which this scan asks about, or the session
     /// leaving this host's list of workers.
     ///
+    /// A worker whose session is held by a storage call answers from what it last recorded, and
+    /// says so. Such an answer can raise what a session counts for and never lowers it: the read
+    /// that would have said more does not return while the storage call stands, and a host that
+    /// stopped counting what it had counted would sleep under work the worker can no longer say
+    /// it still has.
+    ///
     /// What a scan cannot ask about inside its budget it counts as it last found it. A partial
     /// scan says nothing about the sessions it skipped, so counting those as idle would release
     /// the assertion in the middle of a closure it had just taken one for. The other side of that
@@ -298,48 +378,26 @@ impl Controller {
                 .read_from_worker_within(&worker, Some(DEMAND_PATIENCE.min(left)))
                 .await
                 .ok();
+            let session_id = worker.descriptor.session_id;
             let Some(read) = read else {
-                // A worker that did not answer has not said its work ended, so what it last said
-                // stands. A worker whose process the kernel says is gone is different: it is not
-                // running an agent and it is not waiting for an answer, whatever it last said, so
-                // those go. What does not go with it is a closure this host accepted, because
-                // finishing that is this host's own work and not the worker's; it is outstanding
-                // until the closure is recorded, which is also when the session leaves the list
-                // above and this record with it. So the host is asked to finish it rather than
-                // left to notice another time.
+                // A worker that did not answer has said nothing about its work. If the kernel says
+                // its process has gone, the host is asked to finish the closure rather than left
+                // to notice another time.
                 if matches!(
                     kr_ipc::identity::process_state(&worker.descriptor.process_start_identity),
                     kr_ipc::identity::ProcessState::Ended
                 ) {
-                    let session_id = worker.descriptor.session_id;
-                    let closing = scan.seen.get(&session_id).is_some_and(|seen| seen.closing);
-                    if closing {
-                        scan.seen.insert(
-                            session_id,
-                            SessionDemand {
-                                work: false,
-                                waiting: false,
-                                closing: true,
-                                // Its process is gone, so nothing is waiting on its reader.
-                                launches: 0,
-                            },
-                        );
-                    } else {
-                        scan.seen.remove(&session_id);
-                    }
+                    scan.hear(session_id, Said::Ended);
                     let controller = Arc::clone(self);
                     tokio::spawn(async move {
                         let _ = controller.reconcile(session_id).await;
                     });
+                } else {
+                    scan.hear(session_id, Said::Nothing);
                 }
                 continue;
             };
-            let closing_before = scan
-                .seen
-                .get(&worker.descriptor.session_id)
-                .is_some_and(|seen| seen.closing);
-            let observed = SessionDemand::observed(&read, closing_before);
-            scan.seen.insert(worker.descriptor.session_id, observed);
+            scan.hear(session_id, Said::Read(&read));
         }
         scan.cursor = scan.cursor.wrapping_add(asked);
         let (sessions_with_work, outstanding) = SessionDemand::total(scan.seen.values());
@@ -387,9 +445,153 @@ mod tests {
     use super::*;
     use crate::service::a_close_a_worker_never_answers::read_result;
 
-    /// What the sleep demand counts for one worker's answer, with no closure recorded before.
+    /// What the sleep demand counts for one worker's answer, with nothing counted before.
     fn demand_of(read: &SessionReadResult) -> (u64, u64) {
-        SessionDemand::total([SessionDemand::observed(read, false)].iter())
+        SessionDemand::total([SessionDemand::observed(read, None)].iter())
+    }
+
+    /// An answer that says what the application is doing, and how many launches wait.
+    fn answer(
+        state: Option<kr_protocol::session::ApplicationState>,
+        launches: Option<u64>,
+        held: bool,
+    ) -> SessionReadResult {
+        let mut read = read_result(SessionId::new(kr_ipc::new_uuid()));
+        read.session.application_state = Nullable(state);
+        read.outstanding_launches = Nullable(launches.map(U64::new));
+        read.held = held;
+        read
+    }
+
+    /// What the scan counts for one session after it has heard each of `said` in turn.
+    fn counted_after(said: &[&SessionReadResult]) -> (u64, u64) {
+        let mut scan = DemandScan::default();
+        let session = said[0].session.session_id;
+        for read in said {
+            scan.hear(session, Said::Read(read));
+        }
+        SessionDemand::total(scan.seen.values())
+    }
+
+    use kr_protocol::session::ApplicationState::{AgentBusy, AwaitingApproval, ShellReady};
+
+    /// An answer given with the session taken is the whole truth and replaces what the scan had,
+    /// lower or higher: the floor is only for a hold.
+    #[test]
+    fn an_answer_that_was_not_given_in_a_hold_replaces_what_the_scan_had() {
+        let busy = answer(Some(AgentBusy), Some(2), false);
+        let idle = answer(Some(ShellReady), Some(0), false);
+        assert_eq!(counted_after(&[&busy]), (1, 2));
+        assert_eq!(counted_after(&[&busy, &idle]), (0, 0), "a count that falls");
+        assert_eq!(counted_after(&[&idle, &busy]), (1, 2), "a count that rises");
+    }
+
+    /// An answer with no state is an answer, and says no work: given with the session taken it
+    /// replaces what the scan had with nothing.
+    #[test]
+    fn an_answer_with_no_state_that_was_not_given_in_a_hold_counts_no_work() {
+        let busy = answer(Some(AgentBusy), None, false);
+        let none = answer(None, None, false);
+        assert_eq!(counted_after(&[&busy, &none]), (0, 0));
+    }
+
+    /// A worker that says nothing, inside its bound or with an error, keeps what the scan had.
+    #[test]
+    fn no_answer_keeps_what_the_scan_had() {
+        let busy = answer(Some(AgentBusy), Some(1), false);
+        let mut scan = DemandScan::default();
+        let session = busy.session.session_id;
+        scan.hear(session, Said::Read(&busy));
+        scan.hear(session, Said::Nothing);
+        assert_eq!(SessionDemand::total(scan.seen.values()), (1, 1));
+    }
+
+    /// A held answer never counts less than the scan had, for each count on its own.
+    #[test]
+    fn a_held_answer_never_lowers_a_count() {
+        let busy = answer(Some(AgentBusy), Some(2), false);
+        let held_idle = answer(Some(ShellReady), Some(0), true);
+        let held_none = answer(None, None, true);
+        assert_eq!(counted_after(&[&busy, &held_idle]), (1, 2));
+        assert_eq!(counted_after(&[&busy, &held_none]), (1, 2));
+        let asking = answer(Some(AwaitingApproval), Some(0), false);
+        assert_eq!(
+            counted_after(&[&asking, &held_idle]),
+            (0, 1),
+            "a request waiting for a person"
+        );
+    }
+
+    /// A held answer can raise what the scan counts, and a count that the old entry did not have
+    /// is kept beside one that it did, so the sum is never below what either said.
+    #[test]
+    fn a_held_answer_can_raise_a_count() {
+        let idle = answer(Some(ShellReady), Some(0), false);
+        let held_busy = answer(Some(AgentBusy), Some(0), true);
+        assert_eq!(counted_after(&[&idle, &held_busy]), (1, 0));
+        let busy = answer(Some(AgentBusy), Some(0), false);
+        let held_asking = answer(Some(AwaitingApproval), Some(1), true);
+        assert_eq!(
+            counted_after(&[&busy, &held_asking]),
+            (1, 2),
+            "the work that was counted, and the request and the launch that now are"
+        );
+    }
+
+    /// A session that the scan hears for the first time in a hold counts what the answer says:
+    /// there is nothing to floor it with, and main counts nothing for a session whose read does
+    /// not return.
+    #[test]
+    fn the_first_answer_in_a_hold_stands() {
+        assert_eq!(
+            counted_after(&[&answer(Some(AgentBusy), Some(1), true)]),
+            (1, 1)
+        );
+        assert_eq!(
+            counted_after(&[&answer(Some(ShellReady), Some(0), true)]),
+            (0, 0)
+        );
+    }
+
+    /// The floor ends at the first answer that is not held, which counts what it says, and a later
+    /// hold floors against that and not against what came before.
+    #[test]
+    fn the_floor_ends_with_the_first_answer_that_is_not_held() {
+        let busy = answer(Some(AgentBusy), Some(0), false);
+        let held_idle = answer(Some(ShellReady), Some(0), true);
+        let idle = answer(Some(ShellReady), Some(0), false);
+        assert_eq!(counted_after(&[&busy, &held_idle, &held_idle]), (1, 0));
+        assert_eq!(counted_after(&[&busy, &held_idle, &idle]), (0, 0));
+        assert_eq!(counted_after(&[&busy, &idle, &held_idle]), (0, 0));
+    }
+
+    /// A closure counts from the first sign of one, in a hold or not, and a worker's later answer
+    /// that says the session is live does not end it.
+    #[test]
+    fn a_closure_stays_counted_through_a_held_answer() {
+        let mut closing = answer(None, None, false);
+        closing.session.state = SessionState::Closing;
+        let live = answer(Some(ShellReady), Some(0), true);
+        assert_eq!(counted_after(&[&closing, &live]), (0, 1));
+        let live_not_held = answer(Some(ShellReady), Some(0), false);
+        assert_eq!(counted_after(&[&closing, &live_not_held]), (0, 1));
+    }
+
+    /// A worker whose process has ended counts nothing, except a closure this host accepted.
+    #[test]
+    fn a_worker_that_has_ended_counts_nothing_unless_it_is_closing() {
+        let mut scan = DemandScan::default();
+        let busy = answer(Some(AgentBusy), Some(1), false);
+        let session = busy.session.session_id;
+        scan.hear(session, Said::Read(&busy));
+        scan.hear(session, Said::Ended);
+        assert_eq!(SessionDemand::total(scan.seen.values()), (0, 0));
+        let mut closing = answer(Some(AgentBusy), Some(1), false);
+        closing.session.session_id = session;
+        closing.session.state = SessionState::Closing;
+        scan.hear(session, Said::Read(&closing));
+        scan.hear(session, Said::Ended);
+        assert_eq!(SessionDemand::total(scan.seen.values()), (0, 1));
     }
 
     /// KR-REQ-03.27: a launch confirmation the reader has not answered is a request this host has
