@@ -21,8 +21,9 @@ pub enum Question {
     Check,
 }
 
-/// This host's own failure, in a folder or file of the call that asks a question: the file, and the
-/// system's error.
+/// This host's own failure in a call that asks a question: the path that failed, and the system's
+/// error. The path is a folder or file of the call, or the program that this host could not wait
+/// for.
 ///
 /// It is the failure of this host and not of PowerShell, so it is said as any failure of a file of
 /// this host's is said, and not as a refusal. [`host_fault`] finds one in an error.
@@ -58,8 +59,8 @@ impl From<HostFault> for std::io::Error {
     }
 }
 
-/// Returns the file and the system's error where `error` is this host's own failure in a folder or
-/// file of the call that asked a question, which is not PowerShell's refusal or failure to answer.
+/// Returns the path and the system's error where `error` is this host's own failure in a call that
+/// asked a question, which is not PowerShell's refusal or failure to answer.
 #[must_use]
 pub fn host_fault(error: &std::io::Error) -> Option<(&Path, &std::io::Error)> {
     let fault = error.get_ref()?.downcast_ref::<HostFault>()?;
@@ -78,8 +79,7 @@ pub enum Ending<T> {
     /// The program ended with code 0 and its answer is text that the question does not take: none,
     /// or another form than the one it asked for.
     WrongForm,
-    /// The program did not end in time, or this host could not wait for it: it was ended with no
-    /// answer.
+    /// The program did not end in time: this host ended it, reaped it and read no answer.
     TimedOut,
     /// The program could not be started.
     NotStarted,
@@ -90,6 +90,9 @@ pub enum Ending<T> {
     /// This host could not prepare the call: its folder, the file for the answer, a file for an
     /// input or one of the folders the program runs in. The program was not started.
     NotPrepared(HostFault),
+    /// This host could not wait for the program: whether it answered, ended or still runs is not
+    /// known, so no answer is read and the program is not ended. The failure names the program.
+    WaitFailed(HostFault),
     /// The program ended with code 0, and this host could not read the file that holds its answer.
     Unread(HostFault),
 }
@@ -98,7 +101,8 @@ pub enum Ending<T> {
 /// error that ends the install.
 ///
 /// A refusal ([`Refusal::of`]) where PowerShell did not answer, or answered what is not understood;
-/// this host's own failure ([`host_fault`]) where it could not prepare the call or read the answer.
+/// this host's own failure ([`host_fault`]) where it could not prepare the call, could not wait for
+/// the program or could not read the answer.
 ///
 /// # Errors
 ///
@@ -126,8 +130,9 @@ pub fn conclude<T>(question: Question, ending: Ending<T>) -> std::io::Result<T> 
         (Check, Ending::TimedOut | Ending::NotStarted | Ending::Failed | Ending::Signalled) => {
             Err(Refusal::CheckUnanswered.into())
         }
-        (Profiles | Placement | Check, Ending::NotPrepared(fault) | Ending::Unread(fault)) => {
-            Err(fault.into())
-        }
+        (
+            Profiles | Placement | Check,
+            Ending::NotPrepared(fault) | Ending::WaitFailed(fault) | Ending::Unread(fault),
+        ) => Err(fault.into()),
     }
 }
