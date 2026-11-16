@@ -153,13 +153,40 @@ which the measurement fails), `by class` (the daemon, the session workers and th
 class's own figure beside the resident pages the scan counted for each of its processes, so a file
 page two classes map counts once in each), `scan` (the pages present and the pages in swap for each
 class, and the excess over the kernel's sizes), `worker program` (how much of the worker program
-one worker holds resident, which the sum counts twenty times) and `largest files`.
+one worker holds resident, which the sum counts twenty times), `largest files`, `worker file` (the
+size on disk of the program the daemon starts each worker from) and `growth watch` (the two figures
+below against their recorded levels).
 
-The sum stays recorded because it shows a growth of the worker program twenty times enlarged. It
-carries an alarm: `SUM_RECORDED_KIB` is where it stood when the figure was last read on a 64-processor
-Linux host, and a sum more than `SUM_ALARM_STEP_KIB` above that fails the measurement with the
-words that a ruling is needed, and the record gets an `alarm` line. The alarm is not the requirement,
-and a low sum, which the kernel's reclaim of mapped pages gives, does not fire it.
+The sum stays recorded and has no alarm. It counts each worker's mapped pages of one program once
+for each worker. Over 21 normal readings of builds whose worker program was nearly the same size
+(within 70 KiB on disk) it spread 13,932 KiB, more than the old step of 10,240 KiB, and with its old
+level the old alarm fired in 4 of 8 runs of one build and in 8 of 13 readings of one commit. A
+newly set margin of 10,240 KiB would also pass the 25 normal readings; the two alarms below are
+chosen because each points at the place of a growth.
+
+Two figures carry an alarm that asks for a ruling when it rises. The session workers' held figure,
+the first figure of the session workers on the `by class` line, is held to
+`WORKERS_HELD_RECORDED_KIB` plus `WORKERS_HELD_ALARM_STEP_KIB`; it spans 1,076 KiB in 13 readings of
+one commit and 1,284 KiB in 25 normal readings, and a growth of private memory in each worker shows
+in it once for each worker. The worker program's size on disk, read from the file the daemon starts
+each worker from, is held to `WORKER_SIZE_RECORDED_KIB` plus `WORKER_SIZE_ALARM_STEP_KIB`; the
+`worker file` line prints that figure. Ordinary growth of the program reaches that step in time, on
+purpose: someone then looks at what the program gained and moves the level by a ruling. The `worker
+size` line that `scripts/performance.sh` prints before the case is read from the program the workspace
+build leaves, which is another build of the same sources (227 KiB smaller than the file the case
+starts, at the recorded commit), so its sections are that build's and not the case's. A figure past
+its step fails the measurement with the words that a ruling is needed, names the `by class` and
+`worker size` lines, and says that the alarm is not the requirement; the record gets an `alarm`
+line. A low reading, which the kernel's reclaim of mapped pages gives, does not fire either alarm: a
+reading is low when the memory the group holds is under 168,000 KiB, and a low reading stays out of
+any mean that moves a level. Each level's comment in `crates/kr-worker/tests/performance.rs` carries
+the date, the commit, the number of valid readings, their mean and their spread.
+
+Neither alarm sees a growth in the daemon's class, which is the case's own process: 16 MiB more
+heap there passes both alarms and the requirement. Neither sees file pages that every worker maps,
+which count once in the held figure and twenty times in the sum: 1 MiB of them adds 1 MiB to the
+held figure and 20 MiB to the sum. Neither growth is in the records so far, and the recorded sum
+line stays in the record so that a person can see it.
 
 Where no reader of the held figure is available, which is macOS (it has no page map a process of
 the same user can read, and the memory-object counts of `proc_pidinfo` describe the object and not
