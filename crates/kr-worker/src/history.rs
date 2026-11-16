@@ -610,7 +610,7 @@ impl OutputHistory {
     ///
     /// While one is owed every reader is told the history as it stands once the discard is done:
     /// the window and the spool are still there, and nothing of them is read or counted.
-    pub fn set_discard_owed(&mut self, owed: bool) {
+    pub(crate) fn set_discard_owed(&mut self, owed: bool) {
         self.discard_owed = owed;
     }
 

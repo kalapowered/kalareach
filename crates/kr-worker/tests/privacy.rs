@@ -1320,11 +1320,12 @@ fn a_disable_while_the_write_is_in_flight_is_refused_and_a_later_discard_removes
     let refused = session
         .disable_privacy(PrivacyGeneration::new(2))
         .expect_err("the cleanup is unfinished");
-    assert!(
-        refused
-            .to_string()
-            .contains("privacy mode is not turned off while its own cleanup is unfinished"),
-        "{refused}"
+    // The whole refusal, with the reason that the write in flight gives and no other.
+    assert_eq!(
+        refused.to_string(),
+        "the session journal is unavailable: privacy mode is not turned off while its own cleanup \
+         is unfinished: this session's retained output is still being written to its spool, so it \
+         was left where it was"
     );
     tell.send(()).expect("the write is waiting to be told");
     making.join().expect("the write is made");

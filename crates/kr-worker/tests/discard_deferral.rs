@@ -468,16 +468,26 @@ async fn a_privacy_call_whose_write_outlasts_its_bound_lists_history_unavailable
 async fn a_maintenance_pass_with_a_write_in_flight_does_not_wait_for_it() {
     let mut host = host(false).await;
     let resume = host.with_a_write_in_flight().await;
+    // The first hold, with the write in flight, under a watchdog that lets the write go if the hold
+    // waits for it, so that a regression ends this case by a failed assertion and not by a limit.
+    let enabled = Arc::new(AtomicBool::new(false));
+    let (held_for_the_write, first_watchdog) = release_after_a_while(resume.clone(), &enabled);
     let runtime = Arc::clone(&host.runtime);
-    tokio::task::spawn_blocking(move || {
+    let enabling = tokio::task::spawn_blocking(move || {
         runtime
             .session()
             .enable_privacy(PrivacyGeneration::new(1), &mut [])
             .map(|_| ())
     })
     .await
-    .expect("the first hold ends")
-    .expect("privacy is enabled");
+    .expect("the first hold ends");
+    enabled.store(true, Ordering::Release);
+    first_watchdog.join().expect("the watchdog ends");
+    enabling.expect("privacy is enabled");
+    assert!(
+        !held_for_the_write.load(Ordering::Acquire),
+        "the first hold waited for the write in flight until it was let go"
+    );
 
     let done = Arc::new(AtomicBool::new(false));
     let (let_go, watchdog) = release_after_a_while(resume.clone(), &done);
