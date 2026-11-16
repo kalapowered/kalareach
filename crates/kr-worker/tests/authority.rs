@@ -1319,8 +1319,18 @@ async fn settle(mut settled: impl FnMut() -> bool) -> bool {
     true
 }
 
-/// Holds one of the worker's locks on a thread of its own until it is released: the dispatch
-/// boundary, or the authority record.
+/// What a holder takes, in the order a holder inside the worker takes them: the boundary, then the
+/// session or the authority record.
+#[derive(Clone, Copy)]
+enum Hold {
+    Boundary,
+    Authority,
+    BoundaryAndSession,
+    BoundaryAndAuthority,
+}
+
+/// Holds some of the worker's locks on a thread of its own until it is released: the dispatch
+/// boundary, the authority record or the session.
 struct Held {
     release: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -1328,22 +1338,39 @@ struct Held {
 
 impl Held {
     async fn boundary(host: &Host) -> Self {
-        Self::take(host, false).await
+        Self::take(host, Hold::Boundary).await
     }
 
     /// The authority record, which a generation that is being decided holds while it reads the
     /// journal.
     async fn authority(host: &Host) -> Self {
-        Self::take(host, true).await
+        Self::take(host, Hold::Authority).await
     }
 
-    async fn take(host: &Host, authority: bool) -> Self {
+    /// What a mutation holds: the boundary and, inside it, the session.
+    async fn boundary_and_session(host: &Host) -> Self {
+        Self::take(host, Hold::BoundaryAndSession).await
+    }
+
+    /// What a generation that is being decided holds: the boundary and the authority record.
+    async fn boundary_and_authority(host: &Host) -> Self {
+        Self::take(host, Hold::BoundaryAndAuthority).await
+    }
+
+    async fn take(host: &Host, hold: Hold) -> Self {
         let (release, wait) = std::sync::mpsc::channel::<()>();
         let (held, confirmed) = tokio::sync::oneshot::channel::<()>();
         let service = Arc::clone(&host.service);
         let thread = std::thread::spawn(move || {
-            let _boundary = (!authority).then(|| service.hold_the_dispatch_boundary());
-            let _authority = authority.then(|| service.hold_the_authority_for_tests());
+            let _boundary = matches!(
+                hold,
+                Hold::Boundary | Hold::BoundaryAndSession | Hold::BoundaryAndAuthority
+            )
+            .then(|| service.hold_the_dispatch_boundary());
+            let _session =
+                matches!(hold, Hold::BoundaryAndSession).then(|| service.runtime().session());
+            let _authority = matches!(hold, Hold::Authority | Hold::BoundaryAndAuthority)
+                .then(|| service.hold_the_authority_for_tests());
             let _ = held.send(());
             let _ = wait.recv();
         });
@@ -1362,6 +1389,14 @@ impl Held {
         if let Some(thread) = self.thread.take() {
             thread.join().expect("the holding thread finishes");
         }
+    }
+}
+
+/// A holder that is dropped by a case that failed lets go, so that the worker's threads that wait for
+/// it end and the program ends with the case's own message.
+impl Drop for Held {
+    fn drop(&mut self) {
+        drop(self.release.take());
     }
 }
 
@@ -2130,4 +2165,375 @@ fn a_worker_stopped_while_presentations_wait_ends_without_the_hold() {
         stopped.is_ok(),
         "the runtime ended while the boundary was still held"
     );
+}
+
+// ---- Requests whose clients have gone, and the clean-up of a connection whose peer has gone.
+
+/// A host whose first maintenance pass has finished: that pass takes the dispatch boundary as the
+/// host starts serving, and a hold that came before it would keep it waiting.
+async fn host_ready() -> Host {
+    let host = host(1).await;
+    assert!(
+        settle(|| host.service.maintenance_passes_for_tests() >= 1).await,
+        "the first maintenance pass finishes"
+    );
+    host
+}
+
+/// A local client that sends one Blocking mutation, an attach, on a task of its own and waits for
+/// the answer. Ending the task is the client going away. The whole task is bounded, so a worker
+/// that never admits it ends the task and not the program.
+fn attaching_once(
+    host: &Host,
+    action_id: kr_protocol::ids::ActionId,
+) -> tokio::task::JoinHandle<()> {
+    let endpoint = host.endpoint.clone();
+    let (environment_id, session_id) = (host.environment_id, host.session_id);
+    tokio::spawn(async move {
+        let _ = tokio::time::timeout(WAIT, async {
+            let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+                .await
+                .expect("connects");
+            let _ = client
+                .mutate(
+                    Method::SessionAttach,
+                    action_id,
+                    target(environment_id, session_id),
+                    &attach_params(session_id),
+                )
+                .await;
+        })
+        .await;
+    })
+}
+
+/// Whether the worker holds a receipt for `action_id`, which a client of its own asks. A request
+/// that was dropped before the worker took it into its serial path has none.
+async fn receipt_exists(host: &Host, action_id: kr_protocol::ids::ActionId) -> bool {
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    client
+        .request(
+            Method::ActionRead,
+            &kr_protocol::receipt::ActionReadParams {
+                action_id,
+                session_id: None,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .is_ok()
+}
+
+/// Ends the tasks, which closes each client's connection: the clients have gone.
+async fn clients_go(clients: Vec<tokio::task::JoinHandle<()>>) {
+    for client in &clients {
+        client.abort();
+    }
+    for client in clients {
+        let _ = client.await;
+    }
+}
+
+/// Mutations whose clients have gone do not keep their connections while the boundary is held.
+///
+/// Three rounds of thirty local clients send a Blocking mutation and go while the boundary is still
+/// held. Each round's connections are given back before the next begins, so the third finds the
+/// worker where the first did, and nothing was done for any of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mutations_whose_clients_have_gone_do_not_keep_their_connections_while_the_boundary_is_held()
+ {
+    let host = host_ready().await;
+    let service = &host.service;
+    let boundary = Held::boundary(&host).await;
+    let start = service.connections_held_for_tests();
+    let mut asked = Vec::new();
+    for round in 1..=3 {
+        let ids: Vec<_> = (0..30)
+            .map(|_| kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()))
+            .collect();
+        let clients: Vec<_> = ids.iter().map(|id| attaching_once(&host, *id)).collect();
+        asked.extend(ids);
+        settle(|| service.mutations_waiting_for_tests() == 30).await;
+        assert_eq!(
+            service.mutations_waiting_for_tests(),
+            30,
+            "round {round}: the mutations wait at the held boundary"
+        );
+        clients_go(clients).await;
+        settle(|| {
+            service.connections_held_for_tests() == start
+                && service.mutations_waiting_for_tests() == 0
+        })
+        .await;
+        assert_eq!(
+            service.connections_held_for_tests(),
+            start,
+            "round {round}: the connections of the clients that went are given back while the boundary is still held"
+        );
+        assert_eq!(
+            service.mutations_waiting_for_tests(),
+            0,
+            "round {round}: no mutation of a client that went still waits"
+        );
+    }
+    boundary.release();
+    for action_id in asked {
+        assert!(
+            !receipt_exists(&host, action_id).await,
+            "a receipt was written for a client that was not there"
+        );
+    }
+}
+
+/// A mutation whose client goes at the pause before the look leaves nothing, and one whose client
+/// goes at the pause after it is carried out.
+///
+/// Both pauses are inside the boundary on a free worker, so the peer is gone when the look comes
+/// at the first and gone after it at the second. The look is the check under the boundary, which no
+/// try that failed has made: a mutation that took the boundary at once is checked there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mutation_whose_client_goes_before_the_look_is_dropped_and_after_it_is_carried_out() {
+    let host = host_ready().await;
+    let service = &host.service;
+    let start = service.connections_held_for_tests();
+
+    let before = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+    let (arrived, go) = service.pause_before_the_look();
+    let client = attaching_once(&host, before);
+    arrived
+        .recv_timeout(SETTLE)
+        .expect("the mutation reaches the pause before the look");
+    clients_go(vec![client]).await;
+    go.send(()).expect("lets the mutation go");
+    assert!(
+        settle(|| service.connections_held_for_tests() == start).await,
+        "the connection of the client that went is given back"
+    );
+    assert!(
+        !receipt_exists(&host, before).await,
+        "a client that went before the look has no receipt"
+    );
+
+    let after = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+    let (arrived, go) = service.pause_inside_boundary();
+    let client = attaching_once(&host, after);
+    arrived
+        .recv_timeout(SETTLE)
+        .expect("the mutation reaches the pause after the look");
+    clients_go(vec![client]).await;
+    go.send(()).expect("lets the mutation go");
+    // The receipt is the record of the effect that a connection's end does not undo.
+    let mut written = false;
+    for _ in 0..1500 {
+        if receipt_exists(&host, after).await {
+            written = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(written, "a client that went after the look has its receipt");
+}
+
+/// What the requests wait with is a pause that doubles to a quarter of a second and no more.
+///
+/// A living mutation waits at the held boundary. The case reads the longest pause the wait asked
+/// its timer for, which is a value the wait requested and not how long anything took, once it has
+/// reached the cap: a cap that stood higher would have asked for more by then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_waiting_request_asks_its_timer_for_a_quarter_of_a_second_at_most() {
+    let host = host_ready().await;
+    let service = &host.service;
+    let boundary = Held::boundary(&host).await;
+    let client = attaching_once(&host, kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()));
+    settle(|| service.mutations_waiting_for_tests() == 1).await;
+    assert_eq!(service.mutations_waiting_for_tests(), 1);
+    let reached = settle(|| {
+        service.largest_boundary_step_for_tests() >= std::time::Duration::from_millis(250)
+    })
+    .await;
+    assert!(
+        reached,
+        "the wait never reached the cap: {:?}",
+        service.largest_boundary_step_for_tests()
+    );
+    assert!(
+        service.largest_boundary_step_for_tests() <= std::time::Duration::from_millis(250),
+        "a pause of more than a quarter of a second was asked for: {:?}",
+        service.largest_boundary_step_for_tests()
+    );
+    boundary.release();
+    clients_go(vec![client]).await;
+}
+
+/// A controller link that goes does not keep its connection while a holder has the authority
+/// record, and its place in the authority record is taken out when the holder lets go.
+///
+/// The link presents before the hold, as a link does that was admitted before it. The owner does
+/// the unbind once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_controller_link_that_goes_while_the_authority_is_held_is_unbound_once_when_it_is_let_go()
+{
+    let host = host_ready().await;
+    let service = &host.service;
+    let link = controller_client(&host, 1).await;
+    let start = service.connections_held_for_tests();
+    let holder = Held::boundary_and_authority(&host).await;
+    drop(link);
+    assert!(
+        settle(|| service.connections_held_for_tests() == start - 1).await,
+        "the connection of the link that went is given back while the authority is held"
+    );
+    assert_eq!(
+        service.owed_done_for_tests().2,
+        0,
+        "nothing is unbound while the authority is held"
+    );
+    holder.release();
+    assert!(
+        settle(|| service.owed_done_for_tests().2 == 1).await,
+        "the owner unbinds the link when the authority is let go"
+    );
+    assert_eq!(service.owed_done_for_tests().2, 1, "once");
+}
+
+/// Connections that keep identifiers of attachments that another connection detached do not keep
+/// their places while the boundary and the session are held.
+///
+/// Sixty clients each attach in turn, and the owner's own connection detaches each attachment at
+/// once, so no more than a few attachments are live while sixty connections keep an identifier. All
+/// sixty go under a holder of the boundary and the session. Their connections are given back, and
+/// each identifier is detached once, to no effect, when the holder lets go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn connections_that_keep_detached_identifiers_do_not_keep_their_places_while_the_session_is_held()
+ {
+    use kr_protocol::attachment::{SessionAttachResult, SessionDetachParams};
+    let host = host_ready().await;
+    let service = &host.service;
+    let mut owner = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let mut clients = Vec::new();
+    for _ in 0..60 {
+        let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects");
+        let attached: SessionAttachResult = client
+            .mutate(
+                Method::SessionAttach,
+                kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+                target(host.environment_id, host.session_id),
+                &attach_params(host.session_id),
+            )
+            .await
+            .expect("reaches the worker")
+            .expect("the terminal attaches")
+            .to_typed()
+            .expect("decodes");
+        owner
+            .mutate(
+                Method::SessionDetach,
+                kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+                target(host.environment_id, host.session_id),
+                &SessionDetachParams {
+                    attachment_id: Nullable::some(attached.attachment.attachment_id),
+                    line_token: Nullable::null(),
+                },
+            )
+            .await
+            .expect("reaches the worker")
+            .expect("the owner detaches it");
+        clients.push(client);
+    }
+    let start = service.connections_held_for_tests() - clients.len();
+    let holder = Held::boundary_and_session(&host).await;
+    drop(clients);
+    assert!(
+        settle(|| service.connections_held_for_tests() == start).await,
+        "the connections that kept a detached identifier are given back while the session is held: {} of {} still held",
+        service.connections_held_for_tests() - start,
+        60
+    );
+    assert_eq!(
+        service.owed_done_for_tests().1,
+        0,
+        "nothing is detached while the session is held"
+    );
+    holder.release();
+    assert!(
+        settle(|| service.owed_done_for_tests().1 == 60).await,
+        "the owner detaches each identifier once when the session is let go: {:?}",
+        service.owed_done_for_tests()
+    );
+    assert_eq!(service.owed_done_for_tests().1, 60, "once each");
+    assert!(
+        service.runtime().session().attachments().is_empty(),
+        "no attachment is left"
+    );
+}
+
+/// A presentation whose peer hung up with bytes queued behind its token ends at once on Unix, where
+/// the system reports the hang-up beside the bytes.
+///
+/// The frame is larger than 4 KiB so that on every platform some of it stays in the connection. On
+/// Windows the peek counts those bytes as waiting and the peer is taken as there until they are
+/// read, which a worker that waits for the boundary does not do, so this case is Unix's alone.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_presentation_whose_peer_hung_up_with_bytes_behind_its_token_ends_at_once() {
+    let host = host_ready().await;
+    let service = &host.service;
+    let start = service.connections_held_for_tests();
+    let boundary = Held::boundary(&host).await;
+    let mut link = BoundLink::connect(&host.endpoint, build())
+        .await
+        .expect("connects");
+    let mut nonce = None;
+    link.present_generation(|challenge| {
+        nonce = Some(*challenge);
+        Err(kr_ipc::IpcError::UnexpectedMessage(
+            "the test sends the token itself",
+        ))
+    })
+    .await
+    .expect_err("the signing step is failed on purpose");
+    let signer = host.signer();
+    let token = signer
+        .identity
+        .generation_token(
+            ControllerGeneration::new(1),
+            &signer.boot,
+            &nonce.expect("the link issued a challenge"),
+        )
+        .expect("signs");
+    link.send(&ControlFrame::GenerationToken(Box::new(token)))
+        .await
+        .expect("sends the token");
+    settle(|| service.presentations_waiting_for_tests() == 1).await;
+    assert_eq!(service.presentations_waiting_for_tests(), 1);
+    let large =
+        kr_protocol::envelope::ParamsValue::from_typed(&"x".repeat(5 * 1024)).expect("encodes");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        link.send(&ControlFrame::Request(kr_protocol::envelope::Request {
+            request_id: kr_protocol::ids::RequestId::new(7),
+            method: Method::SessionRead.into(),
+            method_version: kr_protocol::method::MethodVersion::V1,
+            params: large,
+        })),
+    )
+    .await
+    .expect("the send of the 5 KiB frame behind the token did not complete within 10 s")
+    .expect("sends a frame behind the token");
+    drop(link);
+    assert!(
+        settle(|| service.presentations_waiting_for_tests() == 0
+            && service.connections_held_for_tests() == start)
+        .await,
+        "a presentation whose peer hung up behind its bytes still waits: {} waiting, {} connections over the start",
+        service.presentations_waiting_for_tests(),
+        service.connections_held_for_tests() - start
+    );
+    boundary.release();
 }
