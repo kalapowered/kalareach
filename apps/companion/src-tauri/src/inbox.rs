@@ -429,10 +429,6 @@ async fn present(
             LinkError::Refused(refusal) | LinkError::Declined(refusal) => {
                 Missed::Refused(Asked::Connection, CommandError::from(refusal))
             }
-            // The stop of the lease says what the person is asked after its words.
-            LinkError::Membership(refusal, action) => {
-                Missed::Refused(Asked::Connection, CommandError::asking(refusal, action))
-            }
             LinkError::Lost(_) | LinkError::Configuration(_) | LinkError::Selection(_) => {
                 Missed::Unreached
             }

@@ -154,7 +154,7 @@ impl Connection {
         self.session
             .transport()
             .ended_by_this_device()
-            .map(|end| CommandError::asking(end.error, end.action))
+            .map(|end| Unopened::of_stop(end.error, end.action, HeldAs::Refused).into_error())
     }
 
     /// This connection, with the way another to the same host is opened.
@@ -274,10 +274,7 @@ impl Connection {
             (Ok(asked), None) => asked,
             (_, Some(end)) => {
                 session.close();
-                return Err(Unopened::Refused(
-                    Asked::Connection,
-                    CommandError::asking(end.error, end.action),
-                ));
+                return Err(Unopened::of_stop(end.error, end.action, HeldAs::Refused));
             }
             (Err(failed), None) => {
                 session.close();
@@ -438,6 +435,16 @@ impl std::fmt::Display for HostWords {
     }
 }
 
+/// How a route holds the failure of a stop of the lease ([`Unopened::of_stop`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum HeldAs {
+    /// The host was reached and asked nothing: the stop's words say why.
+    Refused,
+    /// The stop is waited out: the opening stands and its watch dials again, as for a host that did
+    /// not answer.
+    Waited,
+}
+
 /// Why a dial or a call did not get its connection to a paired host.
 ///
 /// The cause is made where it is known and carried on unchanged: no text for a person is chosen
@@ -475,17 +482,36 @@ pub enum Unopened {
 }
 
 impl Unopened {
-    pub(crate) fn unreached(reason: impl Into<String>) -> Self {
+    /// A host that was not reached, in words fixed in this program. It takes no other text, so a
+    /// route that holds a stop of the lease cannot be given the failure of a host that did not
+    /// answer, whose action is a wait: a stop goes through [`Self::of_stop`], and another
+    /// cause of a failure through the constructor of its own ([`Self::unreached_by`],
+    /// [`Self::lost`]).
+    pub(crate) fn unreached(reason: &'static str) -> Self {
         Self::Unreached(CommandError::unavailable(reason))
     }
 
-    /// As [`Self::unreached`], for a connection this device ended for a stop of the lease, with
-    /// the action that stop says: a stop whose words say when to try again asks nothing more.
-    pub(crate) fn unreached_asking(
-        reason: impl Into<String>,
+    /// A host that was not reached for the reason a client error says.
+    pub(crate) fn unreached_by(error: &kr_client::ClientError) -> Self {
+        Self::Unreached(CommandError::unavailable(error.said().into_string()))
+    }
+
+    /// The ONE conversion of a stop of the lease into what a route shows: its words and the action
+    /// the stop says, which no other value stands in for. How the route holds it is `held`.
+    pub(crate) fn of_stop(
+        error: kr_protocol::error::ProtocolError,
         action: kr_client::retry::UserAction,
+        held: HeldAs,
     ) -> Self {
-        Self::Unreached(CommandError::unavailable_asking(reason, action))
+        let mut failure = match held {
+            HeldAs::Refused => CommandError::from(error),
+            HeldAs::Waited => CommandError::unavailable(error.message),
+        };
+        failure.user_action = action.as_str().into();
+        match held {
+            HeldAs::Refused => Self::Refused(Asked::Connection, failure),
+            HeldAs::Waited => Self::Unreached(failure),
+        }
     }
 
     /// What a failed dial of the link says.
@@ -499,7 +525,7 @@ impl Unopened {
             // the lease it needs, or the account it was to be opened under left, and the words say
             // why.
             LinkError::Membership(refusal, action) => {
-                Self::Refused(Asked::Connection, CommandError::asking(refusal, action))
+                Self::of_stop(refusal, action, HeldAs::Refused)
             }
             // The host refused the connection itself while the lease it needs was being
             // presented, and its refusal is what the session kept: the same cause as one that
@@ -507,7 +533,10 @@ impl Unopened {
             LinkError::ConnectionRefused(refusal) => Self::of_refused_connection(refusal),
             // This application's own budget refused the dial, so no host was asked.
             LinkError::Declined(_) => Self::BudgetFull,
-            other => Self::unreached(other.said().into_string()),
+            other
+            @ (LinkError::Lost(_) | LinkError::Configuration(_) | LinkError::Selection(_)) => {
+                Self::Unreached(CommandError::unavailable(other.said().into_string()))
+            }
         }
     }
 
