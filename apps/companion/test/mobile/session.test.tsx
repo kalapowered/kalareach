@@ -14,6 +14,7 @@ import userEvent from '@testing-library/user-event'
 
 import { AppProvider } from '../../src/app/state'
 import { fakeHost, LOST_CONTROL, terminalScreen, type HeldReads } from '../../src/host/fake'
+import { receivedFailure } from '../../src/host/tauri'
 import capacityRefusals from '../fixtures/capacity-refusals.json'
 import { DraftBook } from '../../src/model/draft-book'
 import { describeMode } from '../../src/mobile/model/gestures'
@@ -175,12 +176,14 @@ describe("the phone's session view keeps each read to its own session", () => {
           port={{
             ...port,
             sessionAgents: () =>
-              Promise.reject({
-                code: sent.code,
-                message: sent.message,
-                user_action: sent.user_action,
-                retry: 'transient'
-              })
+              Promise.reject(
+                receivedFailure({
+                  code: sent.code,
+                  message: sent.message,
+                  user_action: sent.user_action,
+                  retry: 'transient'
+                })
+              )
           }}
         >
           <OnSession sessionId={SESSION_MAIN} />

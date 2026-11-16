@@ -13,6 +13,7 @@ import { App } from '../src/App'
 import { AppProvider, type Place } from '../src/app/state'
 import { fakeHost, type FakeHostControls } from '../src/host/fake'
 import type { HostPort } from '../src/host/port'
+import { receivedFailure } from '../src/host/tauri'
 import { CommitButton } from '../src/components/ui'
 
 function start(initialPlace: Place = { view: 'attention' }): { controls: FakeHostControls } {
@@ -432,11 +433,14 @@ describe('the semantic view', () => {
     // A failure as native code sends it: the code and a colon in front of the host's words, and the
     // key of the action the code maps to.
     await act(async () => {
-      fail({
-        code: 'STORAGE_UNAVAILABLE',
-        message: 'STORAGE_UNAVAILABLE: the staging area is full',
-        user_action: 'wait'
-      })
+      fail(
+        receivedFailure({
+          code: 'STORAGE_UNAVAILABLE',
+          message: 'STORAGE_UNAVAILABLE: the staging area is full',
+          user_action: 'wait',
+          retry: 'transient'
+        })
+      )
       await Promise.resolve()
     })
     expect(await screen.findByTestId('insertion-refusal')).toHaveTextContent(
@@ -1361,11 +1365,14 @@ describe('one session at a time', () => {
     const refusing = {
       ...port,
       composerSubmit: () =>
-        Promise.reject({
-          code: 'UPSTREAM_UNAVAILABLE',
-          message: 'the agent is not reachable',
-          user_action: 'wait'
-        })
+        Promise.reject(
+          receivedFailure({
+            code: 'UPSTREAM_UNAVAILABLE',
+            message: 'the agent is not reachable',
+            user_action: 'wait',
+            retry: 'transient'
+          })
+        )
     }
     render(
       <AppProvider

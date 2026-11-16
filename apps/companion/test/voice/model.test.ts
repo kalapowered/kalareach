@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import type { VoiceManagedTerms, VoicePrepareResult } from '@kalareach/protocol'
 
 import type { VoiceCallState, VoiceClosure, VoiceEnded } from '../../src/host/port'
+import { receivedFailure } from '../../src/host/tauri'
 
 import {
   CAPTURE_DISPLAY,
@@ -460,12 +461,12 @@ describe('what the screen says when it ends a call', () => {
     const words = closureWords(
       none({
         fence: null,
-        host_failure: {
+        host_failure: receivedFailure({
           code: 'RESOURCE_UNAVAILABLE',
           message: 'RESOURCE_UNAVAILABLE: No answer.',
           user_action: 'wait',
           retry: 'transient'
-        }
+        })
       })
     )
     expect(words).toContain("This device's call is closed.")

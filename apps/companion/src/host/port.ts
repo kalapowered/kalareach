@@ -118,14 +118,21 @@ import type {
 } from '../model/deletion'
 import type { Supersession } from '../model/receipt-reads'
 
-/** A failure a command answered with. */
+/**
+ * A failure the page holds, as `receivedFailure` (`./tauri`) makes it from what native code
+ * answered with. It has no member for what a person can do about it: the line the page shows
+ * already says that where the words do not, and nothing past the boundary can say it a second time.
+ */
 export interface HostError {
   /** The protocol error code. */
   readonly code: string
-  /** Plain text for a person. */
+  /** Plain text for a person: the host's words, with the code the client library put before them. */
   readonly message: string
-  /** What the person can do about it, where the client knows. */
-  readonly user_action: string
+  /**
+   * The line to show: the host's words and, where they do not say it themselves, what the person
+   * can do about it. A failure that did not come through the boundary has none, and shows its words.
+   */
+  readonly line?: string
   /**
    * The retry category of the code, as the protocol sorts it: `transient` is the host saying it
    * cannot take the request now, `outcome_unknown` that it cannot establish what became of it,
@@ -2907,45 +2914,24 @@ export function isHostError(value: unknown): value is HostError {
 }
 
 /**
- * What a person can do about a failure, in words, for each key native code names an action by.
- *
- * Section 23 has the interface translate a code into a direct action rather than show the code.
- * Native code attaches the key of the action a code maps to (`UserAction::as_str` in the client
- * library) to every failure it answers with, and these are the words for each key, the library's own
- * (`UserAction::message`). `nothing` has none: the host's words are all there is to say.
- */
-export const USER_ACTIONS: Readonly<Record<string, string>> = {
-  pair_again: 'Pair this device with the host again.',
-  sign_in: 'Sign in to your account.',
-  update: 'Update this app or the host: their versions do not agree.',
-  wait: 'Wait a moment and try again.',
-  resync: 'Refresh: this view has fallen behind.',
-  check_the_outcome: 'Check whether this went through before trying it again.',
-  fix_configuration: 'Change a setting on this device or on the host.'
-}
-
-/**
  * The message to show for a failure, whatever shape it arrived in, and never an empty one: a
- * failure that came with no words of its own is still a failure, and says so in these. A host
- * failure whose code maps to something the person can do says that after the host's words.
- *
- * The client library says a host's refusal as its code, a colon and the host's words. The words are
- * for the person and the code is not, so the code goes: section 23 has the interface translate a
- * code into a direct action, and not show the code by default.
+ * failure that came with no words of its own is still a failure, and says so in these. A failure
+ * that came through the boundary (`receivedFailure`) carries the line the boundary made, which says
+ * after the host's words what the person can do about it where they do not say it; anything else
+ * shows its words.
  */
 export function failureMessage(value: unknown): string {
-  const said = failureWords(value)
-  const key = isHostError(value) ? value.user_action : undefined
-  const action = typeof key === 'string' && Object.hasOwn(USER_ACTIONS, key) ? USER_ACTIONS[key] : undefined
-  if (action === undefined) return said
-  const sentence = said.trimEnd()
-  return `${sentence}${/[.!?…]$/.test(sentence) ? '' : '.'} ${action}`
+  return isHostError(value) && typeof value.line === 'string' ? value.line : failureWords(value)
 }
 
 /**
  * The words of a failure, without the code the client library puts before a host's and without
- * the action, for a place that says what a person can do about it in its own words, or where
- * nothing can be done.
+ * what the boundary says after them, for a place that says what a person can do about it in its
+ * own words, or where nothing can be done.
+ *
+ * The client library says a host's refusal as its code, a colon and the host's words. The words are
+ * for the person and the code is not, so the code goes: section 23 has the interface translate a
+ * code into a direct action, and not show the code by default.
  */
 export function failureWords(value: unknown): string {
   const failure = isHostError(value) ? value : null

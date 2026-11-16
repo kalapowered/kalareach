@@ -10,7 +10,7 @@
  * than sending a request whose shape nobody agrees on.
  */
 
-import { Channel, invoke } from '@tauri-apps/api/core'
+import { Channel, invoke, type InvokeArgs, type InvokeOptions } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 
 import type { AccountView, ServiceLine, UsageView } from '../model/account'
@@ -41,6 +41,7 @@ import type {
   PairingUnavailable,
   PairingView,
   PushView,
+  HostError,
   HostInbox,
   IntakeView,
   RecoveryView,
@@ -63,7 +64,7 @@ import type {
   VoiceScope,
   Written
 } from './port'
-import { receivedConnection, viewMoveArguments, viewSizeArguments } from './port'
+import { failureWords, receivedConnection, viewMoveArguments, viewSizeArguments } from './port'
 
 /** The event the backend publishes each host notification on. */
 export const HOST_EVENT = 'kr://event'
@@ -91,6 +92,83 @@ export const PUSH_EVENT = 'kr://push'
 
 /** The event the backend publishes the owner confirmations on. */
 export const CONFIRMATIONS_EVENT = 'kr://confirmations'
+
+/**
+ * What a person can do about a failure, in words, for each key native code names an action by.
+ *
+ * Section 23 has the interface translate a code into a direct action rather than show the code.
+ * Native code attaches the key of the action a code maps to (`UserAction::as_str` in the client
+ * library) to every failure it answers with, and these are the words for each key, the library's own
+ * (`UserAction::message`). `nothing` has none: the host's words are all there is to say.
+ *
+ * Only `receivedFailure` reads this table.
+ */
+const ACTION_WORDS: Readonly<Record<string, string>> = {
+  pair_again: 'Pair this device with the host again.',
+  sign_in: 'Sign in to your account.',
+  update: 'Update this app or the host: their versions do not agree.',
+  wait: 'Wait a moment and try again.',
+  resync: 'Refresh: this view has fallen behind.',
+  check_the_outcome: 'Check whether this went through before trying it again.',
+  fix_configuration: 'Change a setting on this device or on the host.'
+}
+
+/**
+ * THE BOUNDARY. This file is the one place that takes in what native code answers with, and it turns
+ * a failure into what the page shows the moment it arrives: the host's words and, after them, what
+ * the person can do about it. The line it makes is the page's failure (`HostError`), which has no
+ * member for the action, so nothing past this file can read the action, or add it a second time.
+ *
+ * The shape native code sends a failure in (`CommandError` in the backend) is the parameter's type,
+ * written out here and named nowhere else. The function is exported for the stand-ins of native
+ * code (`fake*.ts`), which build that shape and hand it through the conversion that the real
+ * commands go through.
+ *
+ * The client library says a host's refusal as its code, a colon and the host's words. The words are
+ * for the person and the code is not, so the line leaves the code out. A failure that came with no
+ * words of its own is still a failure, and says so in `failureWords`' own. The line ends the words
+ * with a full stop where they do not end a sentence before it adds the action.
+ */
+export function receivedFailure(native: {
+  readonly code: string
+  readonly message: string
+  readonly user_action: string
+  readonly retry: HostError['retry']
+}): HostError {
+  const said = failureWords(native)
+  const action = Object.hasOwn(ACTION_WORDS, native.user_action) ? ACTION_WORDS[native.user_action] : undefined
+  const sentence = said.trimEnd()
+  return {
+    code: native.code,
+    message: native.message,
+    retry: native.retry,
+    line: action === undefined ? said : `${sentence}${/[.!?…]$/.test(sentence) ? '' : '.'} ${action}`
+  }
+}
+
+/** The shape native code sends a failure in. It is not exported: only this file holds it. */
+type NativeFailure = Parameters<typeof receivedFailure>[0]
+
+/** A host's inbox as native code answers with it, before its refusal is made the page's failure. */
+type NativeInbox = Omit<HostInbox, 'refusal'> & { readonly refusal: NativeFailure | null }
+
+/** A call's closure as native code answers with it, before its host failure is made the page's. */
+type NativeClosure = Omit<VoiceClosure, 'host_failure'> & { readonly host_failure: NativeFailure | null }
+
+/** What a command rejected with: a failure in native code's shape is the page's failure from here. */
+function rejected(raw: unknown): unknown {
+  const native = raw as Partial<NativeFailure> | null
+  return typeof native === 'object' && native !== null && typeof native.code === 'string' && typeof native.message === 'string'
+    ? receivedFailure(raw as NativeFailure)
+    : raw
+}
+
+/** One `invoke` of one named command, with its rejection turned into the page's failure. */
+function invoking<T>(command: string, args?: InvokeArgs, options?: InvokeOptions): Promise<T> {
+  return invoke<T>(command, args, options).catch((raw: unknown) => {
+    throw rejected(raw)
+  })
+}
 
 /**
  * Listens for one backend event. Resolves, with the function that stops listening, once the
@@ -142,7 +220,7 @@ export function tauriPort(): HostPort {
   }
 
   const call = <T,>(command: string, args: Record<string, unknown>): Promise<T> =>
-    invoke<T>(command, args)
+    invoking<T>(command, args)
 
   /**
    * Asks native code to use or forget a host. While it is asked, nothing of the old host is the new
@@ -264,7 +342,7 @@ export function tauriPort(): HostPort {
       }),
     // The bytes are the call's raw body; the name and the subject travel as its two headers.
     attachmentUploadBytes: (file, subject) =>
-      invoke<AttachmentHandle>('attachment_upload_bytes', file.bytes, {
+      invoking<AttachmentHandle>('attachment_upload_bytes', file.bytes, {
         headers: {
           'kr-file-name': encodeURIComponent(file.name),
           'kr-subject': JSON.stringify(subject)
@@ -362,15 +440,31 @@ export function tauriPort(): HostPort {
         },
         subject
       ),
+    // The host's failure to take the stop is a native failure inside the answer: the page's before it
+    // leaves here.
     voiceStop: (voiceSessionId, subject) =>
-      call<VoiceClosure>('voice_stop', { voiceSessionId, subject }),
+      call<NativeClosure>('voice_stop', { voiceSessionId, subject }).then(
+        (closure): VoiceClosure => ({
+          ...closure,
+          host_failure: closure.host_failure === null ? null : receivedFailure(closure.host_failure)
+        })
+      ),
     voiceContext: (params) => read('voice_context', params),
     voiceSetMuted: (what, muted) => call<VoiceCallState>('voice_set_muted', { what, muted }),
     voiceCallState: () => call<VoiceCallState>('voice_call_state', {}),
 
     hostsUse: (reference) => choose('hosts_use', reference),
     hostsForget: (reference) => choose('hosts_forget', reference),
-    inboxHosts: () => call<readonly HostInbox[]>('inbox_hosts', {}),
+    // A host's refusal is a native failure inside the answer: it is the page's before it leaves here.
+    inboxHosts: () =>
+      call<readonly NativeInbox[]>('inbox_hosts', {}).then((hosts) =>
+        hosts.map(
+          (host): HostInbox => ({
+            ...host,
+            refusal: host.refusal === null ? null : receivedFailure(host.refusal)
+          })
+        )
+      ),
     pushView: () => call<PushView>('push_view', {}),
     pushEnable: (reference, afterUnknown) =>
       call<PushView>('push_enable', { reference, afterUnknown }),

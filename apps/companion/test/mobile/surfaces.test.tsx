@@ -19,6 +19,7 @@ import type { AttentionItem } from '@kalareach/protocol'
 import { AppProvider } from '../../src/app/state'
 import { fakeHost, type FakeHostControls } from '../../src/host/fake'
 import { FakeDraftStore } from '../../src/host/fake-drafts'
+import { receivedFailure } from '../../src/host/tauri'
 import type { CeremonyKind, ConfirmationRequest, HostPort } from '../../src/host/port'
 import { Shell } from '../../src/mobile/entry'
 import { MobileApp, type MobileBuild } from '../../src/mobile/MobileApp'
@@ -695,16 +696,20 @@ describe('what a build must not let happen twice (KR-ACC-012)', () => {
   it('says what to do about a send whose outcome is unknown, in words and never the code (KR-REQ-23.57)', async () => {
     const person = userEvent.setup()
     const { port } = fakeHost()
-    // A failure as native code sends it: the client library's rendering, the code and a colon in
-    // front of the host's words, and the key of the action the code maps to.
+    // A failure as native code sends it (the client library's rendering, the code and a colon in
+    // front of the host's words, and the key of the action the code maps to), as the boundary
+    // makes it the page's.
     const lost = {
       ...port,
       composerSubmit: () =>
-        Promise.reject({
-          code: 'OUTCOME_UNKNOWN',
-          message: 'OUTCOME_UNKNOWN: the connection ended after the request was sent',
-          user_action: 'check_the_outcome'
-        })
+        Promise.reject(
+          receivedFailure({
+            code: 'OUTCOME_UNKNOWN',
+            message: 'OUTCOME_UNKNOWN: the connection ended after the request was sent',
+            user_action: 'check_the_outcome',
+            retry: 'outcome_unknown'
+          })
+        )
     }
     render(
       <AppProvider port={lost}>

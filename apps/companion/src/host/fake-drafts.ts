@@ -29,11 +29,12 @@ import type {
   StoredMark
 } from './port'
 import { fakeRetryOf } from './fake-retry'
+import { receivedFailure } from './tauri'
 
 /** A refusal in the shape native code rejects with. */
 function refuse(code: string, message: string): never {
   // eslint-disable-next-line @typescript-eslint/only-throw-error -- a refusal is data, as native code's is
-  throw { code, message, user_action: 'nothing', retry: fakeRetryOf(code) }
+  throw receivedFailure({ code, message, user_action: 'nothing', retry: fakeRetryOf(code) })
 }
 
 /** What a removal is kept under: a draft's version is a removal of its own. */

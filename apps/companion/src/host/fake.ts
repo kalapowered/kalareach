@@ -125,6 +125,7 @@ import { codeComplete } from '../pairing/words'
 import { openedMode } from '../theme-init'
 import { scriptedHostDrafts, type BindParams, type FakeHostDrafts } from './fake-host-drafts'
 import { fakeRetryOf } from './fake-retry'
+import { receivedFailure } from './tauri'
 import { AGENT_DRAFT_ADD_ATTACHMENT_PARAMS, DRAFT_CREATE_PARAMS, decodeParams } from './fake-decode'
 import { FakeDraftStore } from './fake-drafts'
 import { ScriptedLaunching, type InstalledLaunch, type LaunchScenario } from './fake-launch'
@@ -147,7 +148,10 @@ export const FAKE_NOW_MS = 1_763_000_000_000
 /** What native code says when this host cannot be reached, unless a test gives other words. */
 const UNREACHABLE = 'this host cannot be contacted right now'
 
-/** A failure shaped the way a command's failure arrives. */
+/**
+ * A failure shaped the way a command's failure arrives: native code's, which this stand-in plays,
+ * handed through the conversion the real commands go through.
+ */
 export class FakeHostError extends Error {
   constructor(
     readonly code: string,
@@ -160,12 +164,12 @@ export class FakeHostError extends Error {
 
   /** The object a rejected command actually carries, which is data rather than an Error. */
   toPayload(): HostError {
-    return {
+    return receivedFailure({
       code: this.code,
       message: this.message,
       user_action: this.user_action,
       retry: fakeRetryOf(this.code)
-    }
+    })
   }
 }
 
@@ -2786,13 +2790,13 @@ export function fakeHost(
         return Promise.resolve({
           closed_locally: true,
           fence: null,
-          host_failure: {
+          host_failure: receivedFailure({
             code: 'RESOURCE_UNAVAILABLE',
             message:
               'RESOURCE_UNAVAILABLE: The host has not said whether it made the call. This device is still asking it, and ends the call if it did.',
             user_action: 'wait',
             retry: 'transient'
-          },
+          }),
           not_held: false
         })
       }
@@ -2811,13 +2815,13 @@ export function fakeHost(
         return Promise.resolve({
           closed_locally: running !== null,
           fence: null,
-          host_failure: {
+          host_failure: receivedFailure({
             code: 'RESOURCE_UNAVAILABLE',
             // Native code sends a host's refusal as its code, a colon and the host's words.
             message: 'RESOURCE_UNAVAILABLE: This host cannot be contacted right now.',
             user_action: 'wait',
             retry: 'transient'
-          },
+          }),
           not_held: false
         })
       }

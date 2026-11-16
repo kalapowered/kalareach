@@ -16,6 +16,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { AppProvider } from '../src/app/state'
 import { fakeHost } from '../src/host/fake'
+import { receivedFailure } from '../src/host/tauri'
 import type {
   RevocationDevice,
   RevocationFeed,
@@ -241,12 +242,14 @@ describe('revoking a device', () => {
     async (_kind, sent) => {
       const person = userEvent.setup()
       const { port } = screenOf(view([host()]))
-      vi.spyOn(port, 'revocationRevoke').mockRejectedValue({
-        code: sent.code,
-        message: sent.message,
-        user_action: sent.user_action,
-        retry: 'transient'
-      })
+      vi.spyOn(port, 'revocationRevoke').mockRejectedValue(
+        receivedFailure({
+          code: sent.code,
+          message: sent.message,
+          user_action: sent.user_action,
+          retry: 'transient'
+        })
+      )
       const row = await rowOf('the-phone')
       await person.click(within(row).getByRole('button', { name: /^Revoke with Touch ID/ }))
       await waitFor(() => {
