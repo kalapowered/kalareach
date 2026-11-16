@@ -193,9 +193,12 @@ impl Ask {
         bound: true,
     };
 
-    /// A kept answer: the original deadline is not asked, since a receipt outlives it.
+    /// A kept answer: the original deadline is not asked, since a receipt outlives it, and no
+    /// bound. A caller whose kept answer is also held to the local owner's lease asks it with
+    /// [`Self::and_the_lease`].
     pub(crate) const KEPT_ANSWER: Self = Self {
         deadline: false,
+        bound: false,
         ..Self::MUTATION
     };
 
@@ -675,10 +678,16 @@ mod tests {
     fn a_bound_whose_cell_ends_alone_refuses_the_variants_that_hold_the_lease() {
         let rig = rig();
         rig.cell.end();
-        for ask in [Ask::MUTATION, Ask::KEPT_ANSWER, Ask::READ, Ask::SIGN_IN] {
+        for ask in [
+            Ask::MUTATION,
+            Ask::KEPT_ANSWER.and_the_lease(),
+            Ask::READ,
+            Ask::SIGN_IN,
+        ] {
             assert_eq!(rig.footing.ask(ask), refused(Lapse::LeaseEnded), "{ask:?}");
         }
-        for ask in [Ask::LOCAL_CLOSE, Ask::NETWORK_CLOSE_CLAIM] {
+        // A kept answer reads no bound unless its caller asks the lease with it.
+        for ask in [Ask::KEPT_ANSWER, Ask::LOCAL_CLOSE, Ask::NETWORK_CLOSE_CLAIM] {
             assert_eq!(rig.footing.ask(ask), Ok(()), "{ask:?}");
         }
     }
@@ -690,13 +699,19 @@ mod tests {
         rig.cell.end();
         rig.cell
             .publish(BoundIdentity::Unbounded, None, None, false, false);
-        for ask in [Ask::MUTATION, Ask::KEPT_ANSWER, Ask::READ, Ask::SIGN_IN] {
+        for ask in [
+            Ask::MUTATION,
+            Ask::KEPT_ANSWER.and_the_lease(),
+            Ask::READ,
+            Ask::SIGN_IN,
+        ] {
             assert_eq!(
                 rig.footing.ask(ask),
                 Err(LeasedLapse::BoundMoved),
                 "{ask:?}"
             );
         }
+        assert_eq!(rig.footing.ask(Ask::KEPT_ANSWER), Ok(()));
         assert_eq!(rig.footing.ask(Ask::LOCAL_CLOSE), Ok(()));
     }
 
