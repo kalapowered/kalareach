@@ -440,14 +440,20 @@ fn ended_by_inactivity(connection: &iroh::endpoint::Connection) -> bool {
     matches!(connection.close_reason(), Some(ConnectionError::TimedOut))
 }
 
+/// Whether `error` says only that a stream failed, and carries nothing the host sent: a refusal, a
+/// frame, a selection or any other answer is the host's word, and is not this.
+fn nothing_received(error: &TransportError) -> bool {
+    matches!(error, TransportError::Stream(_))
+}
+
 /// Opens the unpaired surface and asks for the challenge, on a new connection each time the
-/// transport ends one by inactivity before the host has answered. The host keeps nothing of a
-/// candidate that has not sent its proof, so asking again changes nothing it holds.
+/// transport ends one by inactivity with nothing received from the host on it. The host keeps
+/// nothing of a candidate that has not sent its proof, so asking again changes nothing it holds.
 ///
 /// # Panics
 ///
-/// Panics when a step fails for any other reason, or after [`REDIALS`] connections that the
-/// transport ended by inactivity.
+/// Panics when a step fails for any other reason, when the host answered with anything (a refusal
+/// included), or after [`REDIALS`] connections that the transport ended by inactivity.
 async fn until_challenged(
     device: &Candidate<'_>,
     payload: &DirectQrPayload,
@@ -477,6 +483,9 @@ async fn until_challenged(
         .await;
         match asked {
             Ok((candidate, challenge)) => return (connection, candidate, challenge),
+            // What the host said is rejected first: the connection may report a time-out after
+            // the answer was read, and a refusal that was received is never asked again.
+            Err((step, error)) if !nothing_received(&error) => panic!("{step}: {error:?}"),
             Err(_) if redials < REDIALS && ended_by_inactivity(&connection) => redials += 1,
             Err((step, error)) => panic!("{step}: {error:?}"),
         }
