@@ -245,7 +245,7 @@ crates/kr-controller/src/service/inhibition.rs | Controller::review_power | toki
 crates/kr-controller/src/service/inhibition.rs | Controller::review_power_soon | tokio::spawn | async{.power_state} | 1 | supervised-later | 36 | one power evaluation, on a task of its own so that the answer that scheduled it does not wait; it ends after the evaluation, a few seconds at most (the demand scan of two seconds plus lock waits), and nothing joins it
 crates/kr-controller/src/service/local.rs | Controller::perform_at | tokio::spawn | async{.wait} | 1 | supervised-later | 36 | the effect of one mutation on the local connection, on a task meant to outlive the await of its connection (the serving loop's end cancels the awaiting task, and dropping the handle does not stop the effect); it lives until its one mutation route returns, as long as the slowest write takes, with no clock in this function, and it keeps the daemon alive meanwhile
 crates/kr-controller/src/service/local.rs | Controller::serve_clients | serve_each | closure{.client} | 1 | joined | - | awaited where it stands: the loop serves this listener until it ends; each connection's task is the row of serve_each
-crates/kr-controller/src/service/local.rs | serve_each | .spawn | task | 1 | request | 35 | bound(owned-set at crates/kr-controller/src/service/local.rs:128); serve_each's join set holds the connection tasks and dropping it aborts them
+crates/kr-controller/src/service/local.rs | serve_each | .spawn | task | 1 | request | 35 | bound(owned-set at crates/kr-controller/src/service/local.rs:127); serve_each's join set holds the connection tasks and dropping it aborts them
 crates/kr-controller/src/service/local_access.rs | Controller::start_local_access_publisher | tokio::spawn | async{.tell_workers} | 1 | supervised-later | 6 | local access publisher
 crates/kr-controller/src/service/machine_group.rs | Controller::machine_perform | tokio::task::spawn_blocking | closure{.swap} | 1 | joined | - | awaited where it stands
 crates/kr-controller/src/service/machine_group.rs | Controller::machine_step | tokio::spawn | async{.machine_step_serially} | 1 | joined | - | awaited where it stands
@@ -405,6 +405,7 @@ crates/kr-worker/src/runtime.rs | SessionRuntime::start_and_say_if_the_shell_end
 crates/kr-worker/src/runtime.rs | SessionRuntime::start_and_say_if_the_shell_ended | tokio::task::spawn_blocking | closure{.acquisition} | 1 | joined | - | awaited where it stands
 crates/kr-worker/src/runtime.rs | SessionRuntime::start_and_say_if_the_shell_ended | tokio::task::spawn_blocking | closure{.in_observation} | 1 | joined | - | awaited where it stands
 crates/kr-worker/src/runtime.rs | SessionRuntime::start_and_say_if_the_shell_ended | tokio::task::spawn_blocking | closure{Instant::now} | 1 | other_crate | - | worker program: linked; the worker runs it
+crates/kr-worker/src/service.rs | UpstreamHandoff::carry_with | submit_within | .rechecked_before_submit | 2 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/service.rs | WorkerService::desktop_checks | tokio::task::spawn_blocking | closure{crate::desktop::context} | 1 | joined | - | awaited where it stands
 crates/kr-worker/src/service.rs | WorkerService::install_command_backends | tokio::spawn | crate::broker::adoption::watch | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/service.rs | WorkerService::new | .spawn | crate::application::follow_evidence | 1 | other_crate | - | worker program: linked; the worker runs it
@@ -424,6 +425,7 @@ crates/kr-worker/src/service.rs | WorkerService::serve | .spawn | async{.run_con
 crates/kr-worker/src/service.rs | WorkerService::serve | .spawn | crate::plugin_runtime::link | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/service.rs | WorkerService::state_fence | .spawn | async{write_within} | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/service.rs | WorkerService::watch_late | tokio::spawn | async{off_the_executor} | 1 | other_crate | - | worker program: linked; the worker runs it
+crates/kr-worker/src/service.rs | answer_within | submit_within | rechecked | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/service.rs | submit_within | tokio::task::spawn_blocking | closure{recheck} | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/service/overtake.rs | Overtaking::open | tokio::spawn | run | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/testing.rs | keep_one_shell_running | std::thread::spawn | closure{.read_line} | 1 | other_crate | - | the worker crate's test support, compiled on Windows only: `posix_shell` starts this thread, once for each process, and only the tests' code calls `posix_shell`; the worker's own program does not run it

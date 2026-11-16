@@ -102,7 +102,7 @@ pub use capabilities::{CAPABILITY_REVISION_FILE, DESKTOP_REREAD_INTERVAL};
 pub use close::{CLOSE_EXCHANGE, CLOSURE_WATCH_TIMEOUT};
 pub use create::{CREATE_WAIT, RENDEZVOUS_TIMEOUT};
 pub use footing::LeaseAsked;
-pub(crate) use footing::{Ask, Footing, Lapse, LeasedFooting, LeasedLapse};
+pub(crate) use footing::{Ask, Footing, Lapse, LeasedLapse};
 pub(crate) use identifiers::SpendFailed;
 pub use inhibition::{DEMAND_BUDGET, DEMAND_PATIENCE, POWER_REVIEW_INTERVAL};
 pub(crate) use local::serve_each;
