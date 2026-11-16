@@ -168,8 +168,8 @@ impl Typing {
     /// # Errors
     ///
     /// Returns what happened, in words, when the lane opened, when the open ran out of time (the
-    /// client's own deadline, or an end later than [`OPEN_REFUSED_WITHIN`]), or when it failed in
-    /// any other way.
+    /// client's own deadline, or an end more than eight seconds after the open began), or when it
+    /// failed in any other way.
     pub async fn refused_open(
         session: &Session,
         environment_id: EnvironmentId,
