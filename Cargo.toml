@@ -345,6 +345,18 @@ noq-udp = { git = "https://github.com/n0-computer/noq", rev = "04807b674cff617cb
 # cargo writes when it takes the registry crate instead, and when the lock holds a second package
 # of a patched crate or takes it from a source other than its entry's.
 noq-proto = { git = "https://github.com/kalapowered/noq", rev = "d8d5e9153f22f521bc5768c83fc4a50963d02bf3" }
+# `simple-dns` 0.12.0, a library that parses and writes DNS packets, has two fixes that upstream
+# holds in its 0.13.1 release: "limit items vec capacity when parsing packets" and "Return write
+# errors when DNS output buffers fill". This source is the 0.12.0 release with those two upstream
+# commits picked onto it as they are; nothing of 0.13.0 is in it. An update cannot bring the
+# fixes: `iroh`, `iroh-dns` and `n0-dns-resolver`, three registry packages in the lock, require
+# the crate's `0.12` line. Remove this entry, and the git source it gives `simple-dns` in the
+# lock, when the lock can take released dependents that require a version of the crate which
+# holds both fixes. The `patched_crates` test in `tests/conformance` fails when the lock records
+# the entry as unused, which is what cargo writes when it takes the registry crate instead. For
+# the same reason as `noq-udp`, `cargo audit` does not check `simple-dns` while the entry stands,
+# and no workflow or script in this repository reads advisories against the upstream repository.
+simple-dns = { git = "https://github.com/kalapowered/simple-dns", rev = "c94a367cb3f6c81dba995de875647137b62d164e" }
 
 [workspace.lints.rust]
 missing_docs = "warn"
