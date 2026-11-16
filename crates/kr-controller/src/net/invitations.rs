@@ -694,12 +694,16 @@ impl InvitationRows {
     /// first: that is the challenge this action is owed, and the one just made is not issued.
     ///
     /// The record is written in one transaction, in this order: the lookup of the action; the
-    /// authority feed's refusal, asked where it takes its locks; the copy of the bound of the
-    /// local owner's lease that `caller` was decided under; the footing's question, with the copied
-    /// bound; where that bound ended or moved, the subject decided again under the scope a caller
-    /// is limited to once no lease serves it; the feed's refusal asked again with no lock; and the
-    /// write. The question reads atomics and clocks alone, and the write follows it with nothing
-    /// allocated or awaited between them: what the write needs is prepared before the transaction.
+    /// authority feed's refusal, asked where it takes its locks; the caller's own owner check,
+    /// read after that ask; the copy of the bound of the local owner's lease that `caller` was
+    /// decided under; the footing's question, with the copied bound; where that bound ended or
+    /// moved, the subject decided again under the scope a caller is limited to once no lease
+    /// serves it; the feed's refusal asked again with no lock; the write; and the last ask,
+    /// immediately before the commit, which takes a new copy of the bound and makes the question
+    /// and the feed's ask again, so that a refusal there rolls the transaction back and nothing is
+    /// recorded. The question reads atomics and clocks alone, and the write follows it with
+    /// nothing allocated or awaited between them: what the write needs is prepared before the
+    /// transaction.
     ///
     /// # Errors
     ///
@@ -748,6 +752,9 @@ impl InvitationRows {
             }
             landing.feed_still_clear(&kept)?;
             insert_action(transaction, action, challenge.as_deref())?;
+            #[cfg(feature = "testing")]
+            landing.waits_after_the_first_write();
+            landing.asks_before_the_commit(&kept, scope, display)?;
             Ok(None)
         })
     }
@@ -764,14 +771,18 @@ impl InvitationRows {
     /// Returns when the proof was accepted, as the acceptance record holds it.
     ///
     /// The record is written in one transaction, in this order: the lookup of the action; the
-    /// signer's standing, read from the rows of this transaction (`terminal` is what the terminal
-    /// is accepted under), and `verified`, which verifies the confirmation again; the authority
-    /// feed's refusal, asked where it takes its locks; the copy of the bound of the local owner's
-    /// lease that `caller` was decided under; the footing's question, with the copied bound; where
-    /// that bound ended or moved, the challenge's `display` decided again under the scope that no
-    /// lease serves; the feed's refusal asked again with no lock; and the write. The question reads
-    /// atomics and clocks alone, and the write follows it with nothing allocated or awaited between
-    /// them: what the write needs is prepared before the transaction.
+    /// authority feed's refusal, asked where it takes its locks; the signer's standing, read from
+    /// the rows of this transaction (`terminal` is what the terminal is accepted under, and the
+    /// host's exclusive flag is read from the stored policy on the transaction's connection), and
+    /// `verified`, which verifies the confirmation again; the copy of the bound of the local
+    /// owner's lease that `caller` was decided under; the footing's question, with the copied
+    /// bound; where that bound ended or moved, the challenge's `display` decided again under the
+    /// scope that no lease serves; the feed's refusal asked again with no lock; the writes; and the
+    /// last ask, immediately before the commit, which takes a new copy of the bound and makes the
+    /// question and the feed's ask again, so that a refusal there rolls the transaction back and
+    /// nothing is recorded. The question reads atomics and clocks alone, and the first write
+    /// follows it with nothing allocated or awaited between them: what the writes need is prepared
+    /// before the transaction.
     ///
     /// # Errors
     ///
@@ -825,6 +836,8 @@ impl InvitationRows {
             if recorded.is_none() {
                 insert_action(transaction, action, challenge.as_deref())?;
             }
+            #[cfg(feature = "testing")]
+            landing.waits_after_the_first_write();
             transaction
                 .execute(
                     "INSERT INTO owner_confirmations (
@@ -852,6 +865,7 @@ impl InvitationRows {
                     |row| row.get::<_, i64>(0),
                 )
                 .map_err(ControllerError::registry)?;
+            landing.asks_before_the_commit(&kept, scope, display)?;
             Ok(TimestampMs::new(from_sql(answered_at_ms)))
         })
     }

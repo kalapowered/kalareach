@@ -830,6 +830,16 @@ pub struct Controller {
     /// grant's own end can come after the last wait. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     after_the_record_asks_the_feed: ThreadPause,
+    /// Where this host's own tests stop the record of an owner's request or of its answer once its
+    /// first write has been made, before its last ask, so that a lapse that comes while that write
+    /// stands is seen refused at the commit. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    after_the_first_write: ThreadPause,
+    /// Where this host's own tests stop a local connection's writer once the socket has room again
+    /// after a wait for it, before the footing's question that precedes the next transport write.
+    /// Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    after_a_wait_for_room: ThreadPause,
     /// Where this host's own tests stop the record of an owner's request or of its answer just
     /// before its transaction begins, which stands for the wait for the pairing records' write
     /// lock, so that a policy commit, which needs that lock, can land in it. Compiled away in

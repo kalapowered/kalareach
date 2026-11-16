@@ -47,6 +47,9 @@ enum Ends {
     TheLeasesTime,
     /// The lease is presented again, which publishes another lineage in the bound's cell.
     TheLeaseIsPresentedAgain,
+    /// The lease's time and the connection's registration: the caller is withdrawn.
+    #[cfg(unix)]
+    TheLeaseAndTheRegistrationEnd,
 }
 
 fn resolved(display: ConfirmationDisplay) -> Resolved {
@@ -73,11 +76,27 @@ fn told(list: &[PendingConfirmation]) -> ControlFrame {
     })
 }
 
-/// What the writer put on the connection when `ends` came after the daemon's read of the list and
-/// before the writer's question, and the two lists that could have been written: the one the caller
-/// was decided for and the one that no lease serves.
-async fn written_when(ends: Ends) -> (ControlFrame, ControlFrame, ControlFrame) {
-    let (temp, controller, continuous, presenter, mut writer, mut reader) =
+/// Everything a case holds once the daemon has read the list and the door has made the footing: the
+/// connection's two ends, the answer and the standing the writer is handed, and the two lists that
+/// could be written.
+struct Staged {
+    _temp: kr_ipc::testing::TempHost,
+    controller: Arc<crate::service::Controller>,
+    continuous: kr_transport::clock::ManualClock,
+    presenter: super::a_result_the_lease_ended_over::Presenter,
+    writer: kr_ipc::framed::FrameWriter,
+    reader: kr_ipc::framed::FrameReader,
+    #[cfg(unix)]
+    connection_id: kr_protocol::ids::ConnectionId,
+    answer: ControlFrame,
+    under: WrittenUnder,
+    full: ControlFrame,
+    closed: ControlFrame,
+}
+
+/// Reads the list through the door and makes the standing the writer is handed.
+async fn staged() -> Staged {
+    let (temp, controller, continuous, presenter, writer, reader) =
         connected_under_a_lease_that_can_be_presented_again().await;
     let door = Door::open(&temp, &controller).await;
     let revision = controller.admitted_revision(door.connection_id()).ok();
@@ -131,10 +150,47 @@ async fn written_when(ends: Ends) -> (ControlFrame, ControlFrame, ControlFrame) 
     let (answer, instead) = controller.local_read(door.actor_id(), &request).await;
     let under = WrittenUnder::of_a_read(controller.footing_of_a_request(door.connection_id()))
         .listing(instead);
+    Staged {
+        _temp: temp,
+        controller,
+        continuous,
+        presenter,
+        writer,
+        reader,
+        #[cfg(unix)]
+        connection_id: door.connection_id(),
+        answer,
+        under,
+        full,
+        closed,
+    }
+}
+
+/// What the writer put on the connection when `ends` came after the daemon's read of the list and
+/// before the writer's question, and the two lists that could have been written: the one the caller
+/// was decided for and the one that no lease serves.
+async fn written_when(ends: Ends) -> (ControlFrame, ControlFrame, ControlFrame) {
+    let Staged {
+        _temp,
+        controller,
+        continuous,
+        presenter,
+        mut writer,
+        mut reader,
+        answer,
+        under,
+        full,
+        closed,
+        ..
+    } = staged().await;
     match ends {
         Ends::Nothing => {}
         Ends::TheLeasesTime => continuous.advance(Duration::from_secs(16 * 60)),
         Ends::TheLeaseIsPresentedAgain => presenter.present(&[ActionRight::FilesRead]),
+        #[cfg(unix)]
+        Ends::TheLeaseAndTheRegistrationEnd => {
+            unreachable!("the wait for room is where the registration ends")
+        }
     }
     let writing = {
         let controller = Arc::clone(&controller);
@@ -191,4 +247,227 @@ async fn a_list_whose_bound_moves_before_the_question_is_written_under_the_close
     let (read, full, closed) = written_when(Ends::TheLeaseIsPresentedAgain).await;
     assert_ne!(full, closed, "the two lists differ");
     assert_eq!(read, closed);
+}
+
+/// KR-REQ-17.54: the local door decodes the list's parameters as the device's door does: a request
+/// that names a member the parameters do not have is refused with the refusal that decoding gives,
+/// whole, and no list is read. The control: the same request with no member is answered with the
+/// list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_list_asked_for_with_an_unknown_member_is_refused_as_the_devices_door_refuses_it() {
+    #[derive(serde::Serialize)]
+    struct Unknown {
+        zz_unknown: u8,
+    }
+    let (temp, controller, _continuous, _presenter, _writer, _reader) =
+        connected_under_a_lease_that_can_be_presented_again().await;
+    let door = Door::open(&temp, &controller).await;
+    let asked = |params: ParamsValue| Request {
+        request_id: REQUEST,
+        method: Method::OwnerConfirmationPending.into(),
+        method_version: MethodVersion::V1,
+        params,
+    };
+    let unknown =
+        ParamsValue::from_typed(&Unknown { zz_unknown: 1 }).expect("the parameters encode");
+    let error = crate::service::net::methods::decode_pending_params(&unknown)
+        .expect_err("the parameters name a member that they do not have");
+    let (answer, _) = controller
+        .local_read(door.actor_id(), &asked(unknown))
+        .await;
+    assert_eq!(answer, crate::service::respond(REQUEST, Err(error)));
+    let none = ParamsValue::from_typed(&OwnerConfirmationPendingParams {}).expect("encodes");
+    let (answer, _) = controller.local_read(door.actor_id(), &asked(none)).await;
+    assert_eq!(
+        answer,
+        told(&[]),
+        "the control: no challenge is outstanding"
+    );
+}
+
+/// Reads one filler frame, and fails the case when none comes within thirty seconds.
+#[cfg(unix)]
+async fn filler(reader: &mut kr_ipc::framed::FrameReader) {
+    tokio::time::timeout(Duration::from_secs(30), reader.read_payload())
+        .await
+        .expect("a filler frame comes")
+        .expect("a filler frame");
+}
+
+/// Fills the connection's socket to the byte with whole filler frames, so that the next frame the
+/// writer is handed meets a socket that takes none of it, and returns the number of filler frames
+/// the peer has yet to read. The case owns both ends: it writes small frames one byte at a time
+/// until a one-byte write is refused (a one-byte write goes whole or not at all, so the refused one
+/// is taken back), and where that stopped inside a filler frame it reads two frames, finishes that
+/// frame and writes one frame of exactly the room that is left.
+#[cfg(unix)]
+async fn filled(
+    writer: &mut kr_ipc::framed::FrameWriter,
+    reader: &mut kr_ipc::framed::FrameReader,
+) -> usize {
+    use kr_ipc::framed::Wrote;
+    let codec = kr_protocol::frame::FrameCodec::new(StreamKind::Control);
+    let small = codec.encode(&[7]).expect("a frame");
+    let (mut whole, mut dangling) = (0_usize, 0_usize);
+    loop {
+        match writer
+            .begin_frame(&small[dangling..=dangling])
+            .expect("the peer is there")
+        {
+            Wrote::Complete => {
+                dangling += 1;
+                if dangling == small.len() {
+                    dangling = 0;
+                    whole += 1;
+                }
+            }
+            Wrote::Blocked => {
+                assert!(
+                    writer.withdraw_unstarted(),
+                    "a byte goes whole or not at all"
+                );
+                break;
+            }
+        }
+    }
+    if dangling != 0 {
+        for _ in 0..2 {
+            filler(reader).await;
+        }
+        for byte in &small[dangling..] {
+            assert_eq!(
+                writer.begin_frame(&[*byte]).expect("the peer is there"),
+                Wrote::Complete
+            );
+        }
+        let last = codec
+            .encode(&vec![8; dangling + 1])
+            .expect("a frame of the room that is left");
+        for byte in &last {
+            assert_eq!(
+                writer.begin_frame(&[*byte]).expect("the peer is there"),
+                Wrote::Complete
+            );
+        }
+    }
+    assert_eq!(
+        writer.begin_frame(&[0]).expect("the peer is there"),
+        Wrote::Blocked,
+        "the socket takes no byte more"
+    );
+    assert!(writer.withdraw_unstarted());
+    whole
+}
+
+/// What the writer put on the connection when the socket had no room for the list and `ends` came
+/// in that wait: the frames are read once the writer has gone on.
+#[cfg(unix)]
+async fn written_after_a_wait_for_room(ends: Ends) -> (ControlFrame, ControlFrame, ControlFrame) {
+    let Staged {
+        _temp,
+        controller,
+        continuous,
+        presenter,
+        mut writer,
+        mut reader,
+        answer,
+        under,
+        full,
+        closed,
+        connection_id,
+        ..
+    } = staged().await;
+    let fillers = filled(&mut writer, &mut reader).await;
+    let (arrived, go) = controller.pause_after_a_wait_for_room();
+    let writing = {
+        let controller = Arc::clone(&controller);
+        tokio::spawn(async move {
+            let stood = controller
+                .write_answer(
+                    &mut writer,
+                    StreamKind::Control,
+                    &answer,
+                    Some(Method::OwnerConfirmationPending),
+                    REQUEST,
+                    &under,
+                )
+                .await;
+            drop(writer);
+            stood
+        })
+    };
+    // The writer is waiting for room once its wait has been counted.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while controller.local_writes_blocked() < 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the writer waits for room");
+    filler(&mut reader).await;
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30)))
+        .await
+        .expect("the wait ends")
+        .expect("the writer reaches the end of its wait");
+    match ends {
+        Ends::Nothing => {}
+        Ends::TheLeasesTime => continuous.advance(Duration::from_secs(16 * 60)),
+        Ends::TheLeaseIsPresentedAgain => presenter.present(&[ActionRight::FilesRead]),
+        Ends::TheLeaseAndTheRegistrationEnd => {
+            continuous.advance(Duration::from_secs(16 * 60));
+            controller.deregister(connection_id);
+        }
+    }
+    go.send(()).expect("the writer goes on");
+    for _ in 1..fillers {
+        filler(&mut reader).await;
+    }
+    let read = tokio::time::timeout(Duration::from_secs(30), reader.read_message())
+        .await
+        .expect("the daemon wrote or ended the connection")
+        .expect("the list reads");
+    assert!(
+        writing.await.expect("the write ends"),
+        "the connection goes on"
+    );
+    (read, full, closed)
+}
+
+/// KR-REQ-17.54: where the socket has no room for the list and the bound stands when the wait for
+/// room ends, the question after that wait lets the list through, whole.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_list_that_waited_for_room_with_its_bound_standing_is_written_whole() {
+    let (read, full, closed) = written_after_a_wait_for_room(Ends::Nothing).await;
+    assert_ne!(full, closed, "the two lists differ");
+    assert_eq!(read, full);
+}
+
+/// KR-REQ-17.54: a lease that ends in the wait for room is found by the question that follows the
+/// wait: the list under the scope that no lease serves is written, whole, and not the list that
+/// was decided under the lease.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_list_whose_bound_ends_in_the_wait_for_room_is_written_under_the_closed_scope() {
+    let (read, full, closed) = written_after_a_wait_for_room(Ends::TheLeasesTime).await;
+    assert_ne!(full, closed, "the two lists differ");
+    assert_eq!(read, closed);
+}
+
+/// KR-REQ-17.54: a caller whose registration ends in the wait for room, with its lease, is told the
+/// refusal of the registration, whole, and no byte of either list is written: the question after
+/// the wait reads the registration before the lease's bound, so the list under the scope that no
+/// lease serves is not chosen for a caller that has been withdrawn.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_caller_whose_registration_ends_in_the_wait_for_room_is_refused_and_no_list_is_written() {
+    let (read, full, closed) =
+        written_after_a_wait_for_room(Ends::TheLeaseAndTheRegistrationEnd).await;
+    assert_ne!(read, full);
+    assert_ne!(read, closed);
+    let refusal = crate::service::Lapse::Withdrawn.refusal();
+    assert_eq!(
+        read,
+        crate::service::error_reply(REQUEST, refusal.code(), refusal.to_string())
+    );
 }
