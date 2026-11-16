@@ -664,7 +664,13 @@ impl Standalone {
     /// `kr` from the installation, against this tree and nothing else, with nothing of this test's
     /// own environment but the temporary directory.
     fn kr(&self, arguments: &[&str]) -> Command {
-        let mut command = Command::new(installation().join("kr"));
+        self.kr_at(&installation().join("kr"), arguments)
+    }
+
+    /// The `kr` at `program`, which is a copy of the installation's own or one of this test's, against
+    /// this tree and nothing else.
+    fn kr_at(&self, program: &Path, arguments: &[&str]) -> Command {
+        let mut command = Command::new(program);
         command
             .args(arguments)
             .env_clear()
@@ -5864,6 +5870,79 @@ fn kr_host_restart_refuses_before_it_stops_where_no_start_is_chosen() {
     assert!(attempts(&host).is_empty(), "no record was made");
     let stopped = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
     assert!(stopped.status.success(), "the stop still works");
+}
+
+/// KR-REQ-07.12 (a start that cannot be made, found before the stop): the daemon program that the
+/// standalone start would run is there and this user cannot run it, as a file with no execute
+/// permission is. The command refuses with exit 3 and says that nothing was stopped; the daemon
+/// stays and answers, nothing is recorded, and a command with a program that can be run still
+/// stops it.
+#[test]
+fn kr_host_restart_refuses_before_it_stops_where_the_daemon_program_cannot_be_run() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (host, _session_id, _created, daemon) = a_host_with_a_session();
+    let directory = host
+        .tree
+        .root()
+        .join("installation-with-a-daemon-that-cannot-run");
+    std::fs::create_dir(&directory).expect("a directory for the installation");
+    let kr = directory.join("kr");
+    kr_ipc::testing::place_program(Path::new(env!("CARGO_BIN_EXE_kr")), &kr);
+    let program = directory.join("kr-controller");
+    std::fs::write(&program, "#!/bin/sh\n").expect("writes a daemon program");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o600))
+        .expect("takes the execute permission away");
+    let output = start(host.kr_at(&kr, &["--json", "host", "restart"])).finish("kr host restart");
+    let refused = failure_of(&output, "kr host restart");
+    assert_eq!(output.status.code(), Some(3), "{refused}");
+    assert_eq!(refused["code"], "HOST_NOT_CONFIGURED", "{refused}");
+    assert_eq!(stop_of(&refused), "not_asked", "{refused}");
+    assert_eq!(refused["started"], Value::Null, "{refused}");
+    let message = refused["message"].as_str().expect("a message");
+    assert!(message.contains("cannot be run by this user"), "{message}");
+    assert!(message.contains("Nothing was stopped."), "{message}");
+    assert_eq!(host.running(), vec![daemon], "the same daemon runs");
+    assert!(host.answers(), "the same daemon answers");
+    assert!(attempts(&host).is_empty(), "no record was made");
+    let stopped = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
+    let stopped = document(&stopped, "kr host stop");
+    assert_eq!(
+        stop_of(&stopped),
+        "ended",
+        "the stop still ends it: {stopped}"
+    );
+}
+
+/// KR-REQ-07.12 (a start that cannot be made, found before the stop): the log that the start opens
+/// for the daemon is not a file that only this user can read and write. The command refuses with
+/// exit 3 and says that nothing was stopped; the daemon stays and answers and nothing is recorded.
+#[test]
+fn kr_host_restart_refuses_before_it_stops_where_the_log_cannot_be_used() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (host, _session_id, _created, daemon) = a_host_with_a_session();
+    let log = host
+        .tree
+        .environment()
+        .state_dir()
+        .join(kr_cli::startup::LOG_FILE);
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644))
+        .expect("lets others read the log");
+    let output = start(host.kr(&["--json", "host", "restart"])).finish("kr host restart");
+    let refused = failure_of(&output, "kr host restart");
+    assert_eq!(output.status.code(), Some(3), "{refused}");
+    assert_eq!(refused["code"], "HOST_NOT_CONFIGURED", "{refused}");
+    assert_eq!(stop_of(&refused), "not_asked", "{refused}");
+    let message = refused["message"].as_str().expect("a message");
+    assert!(
+        message.contains("is not a file of this user's that only this user can read and write"),
+        "{message}"
+    );
+    assert!(message.contains("Nothing was stopped."), "{message}");
+    assert_eq!(host.running(), vec![daemon], "the same daemon runs");
+    assert!(host.answers(), "the same daemon answers");
+    assert!(attempts(&host).is_empty(), "no record was made");
 }
 
 /// KR-REQ-07.12 (a launch that differs): a daemon started with `--secret-store file`, which this

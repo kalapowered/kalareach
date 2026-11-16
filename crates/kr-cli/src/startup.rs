@@ -661,7 +661,7 @@ pub(crate) async fn preflight(
     environment: &KnownEnvironment,
 ) -> std::result::Result<ControllerStartup, Unstartable> {
     let chosen = Chosen::read(&environment.paths);
-    let program_missing = |error: CliError| Unstartable {
+    let unusable = |error: CliError| Unstartable {
         why: kr_client::shown::Said::said(&error),
         remedy: None,
         not_set_up: true,
@@ -673,15 +673,85 @@ pub(crate) async fn preflight(
             not_set_up: true,
         }),
         Some(ControllerStartup::Standalone) => {
-            // Held only for the look: the start itself takes its own hold.
-            standalone_program().map_err(program_missing)?;
+            standalone_can_be_started(&environment.paths)
+                .await
+                .map_err(unusable)?;
+            can_write_where_a_start_writes(&environment.paths).map_err(unusable)?;
             Ok(ControllerStartup::Standalone)
         }
         Some(ControllerStartup::Service) => {
             service_is_set_up(&environment.paths).await?;
+            service_program_can_be_run().map_err(unusable)?;
+            can_write_where_a_start_writes(&environment.paths).map_err(unusable)?;
             Ok(ControllerStartup::Service)
         }
     }
+}
+
+/// The directories and the log that every start makes and opens before it starts anything, as a
+/// start does it but without emptying a log that has grown too large: a start finds them unusable
+/// only after the stop.
+fn can_write_where_a_start_writes(environment: &EnvironmentPaths) -> Result<()> {
+    environment.create()?;
+    Log::check(&environment.state_dir().join(LOG_FILE))
+}
+
+/// This user can run the program at `program`, which a start finds out only when it starts it.
+#[cfg(unix)]
+fn can_be_run(program: &std::path::Path) -> Result<()> {
+    rustix::fs::access(program, rustix::fs::Access::EXEC_OK).map_err(|errno| {
+        CliError::HostUnavailable(shown!(
+            "the control daemon at {} cannot be run by this user: {}",
+            Shown::root(program),
+            Shown::io(&std::io::Error::from(errno))
+        ))
+    })
+}
+
+/// The standalone start has its program, and this user can run it. Held only for the look: the
+/// start itself takes its own hold.
+#[cfg(unix)]
+async fn standalone_can_be_started(_environment: &EnvironmentPaths) -> Result<()> {
+    let (program, _held) = standalone_program()?;
+    can_be_run(&program)
+}
+
+/// The service start's program is there, and this user can run it: the manager runs the program
+/// the definition names, which is the one this installation writes now.
+#[cfg(unix)]
+fn service_program_can_be_run() -> Result<()> {
+    let program = daemon_program()?;
+    if !program.is_file() {
+        return Err(CliError::HostUnavailable(shown!(
+            "the service start runs the control daemon at {}, and there is none there",
+            Shown::root(&program)
+        )));
+    }
+    can_be_run(&program)
+}
+
+/// The service start does not exist on this platform, so there is no program for it to run.
+#[cfg(not(unix))]
+fn service_program_can_be_run() -> Result<()> {
+    Ok(())
+}
+
+/// The standalone start's program is there and this user's scheduled task is the one this
+/// installation registers: the checks that the start makes after the stop otherwise. There is no
+/// mode bit to check on this platform. The task's definition is read as the start reads it, under
+/// the environment's service lock, which is given up at once.
+#[cfg(windows)]
+async fn standalone_can_be_started(environment: &EnvironmentPaths) -> Result<()> {
+    let program = standalone_program()?;
+    let checking = environment.clone();
+    tokio::task::spawn_blocking(move || windows::check_the_task(&checking, &program))
+        .await
+        .map_err(|error| {
+            CliError::Other(shown!(
+                "checking this user's scheduled task failed: {}",
+                Shown::task(&error)
+            ))
+        })?
 }
 
 /// The service definition is the one kr wrote, and the manager holds nothing else under its label.
@@ -1431,16 +1501,25 @@ impl Log {
     /// a regular file whose list grants no account this host does not trust: the checks the
     /// starter makes when it opens the log for the daemon to append to.
     fn open(path: &std::path::Path) -> Result<Self> {
-        let file = kr_ipc::starter::open_log(path, kr_ipc::starter::LogAccess::ReadAndTruncate)
-            .map_err(|error| match error {
+        let file = Self::opened(path, kr_ipc::starter::LogAccess::ReadAndTruncate)?;
+        Self::from_file(file, path)
+    }
+
+    /// Whether the log can be opened as the start opens it for the daemon to append to, which
+    /// empties nothing and leaves nothing open.
+    fn check(path: &std::path::Path) -> Result<()> {
+        Self::opened(path, kr_ipc::starter::LogAccess::Append).map(drop)
+    }
+
+    fn opened(path: &std::path::Path, access: kr_ipc::starter::LogAccess) -> Result<std::fs::File> {
+        kr_ipc::starter::open_log(path, access).map_err(|error| match error {
             kr_ipc::IpcError::UntrustedFile { .. } => CliError::HostUnavailable(shown!(
                 "{} is not a file of this user's that only this user can read and write, so the \
-                 control daemon's output is not written to it; remove it and run kr new again",
+                 control daemon's output is not written to it; remove it and run the command again",
                 Shown::root(path)
             )),
             other => CliError::Ipc(other),
-        })?;
-        Self::from_file(file, path)
+        })
     }
 }
 
@@ -1453,6 +1532,16 @@ impl Log {
     /// FIFO left where the log belongs would hold the start open before its bound began. So what
     /// was opened is checked, rather than what the name was expected to be.
     fn open(path: &std::path::Path) -> Result<Self> {
+        Self::from_file(Self::opened(path)?, path)
+    }
+
+    /// Whether the log can be opened as the start opens it, which empties nothing and leaves
+    /// nothing open.
+    fn check(path: &std::path::Path) -> Result<()> {
+        Self::opened(path).map(drop)
+    }
+
+    fn opened(path: &std::path::Path) -> Result<std::fs::File> {
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
         let failed = |error| CliError::Ipc(kr_ipc::IpcError::io("open", path, error));
@@ -1471,11 +1560,11 @@ impl Log {
         {
             return Err(CliError::HostUnavailable(shown!(
                 "{} is not a file of this user's that only this user can read and write, so the \
-                 control daemon's output is not written to it; remove it and run kr new again",
+                 control daemon's output is not written to it; remove it and run the command again",
                 Shown::root(path)
             )));
         }
-        Self::from_file(file, path)
+        Ok(file)
     }
 
     /// A handle a daemon writes its output through: the same open file, appended to.
@@ -2139,24 +2228,13 @@ mod windows {
         }
     }
 
-    /// Checks the environment's task, leaves a request to start the daemon for its starter, and
-    /// runs it, all under the environment's lock, which is let go before the command waits.
-    ///
-    /// The request lapses at `deadline`, when the command stops waiting: a starter that looks at
-    /// it later starts nothing for it. A run the Task Scheduler does not confirm has the request
-    /// withdrawn at once; when a starter took it first, or the withdrawal fails, the command waits
-    /// as for a run that was confirmed, and says afterwards that this one was not.
-    pub fn ask(
-        environment: &EnvironmentPaths,
-        program: &Path,
-        deadline: std::time::Instant,
-        bound: Duration,
-    ) -> Result<Asked> {
-        let definition = definition(environment, program)?;
+    /// Whether the environment's task is registered, is this environment's own and is the one this
+    /// installation registers, which is what the start needs of it. The caller holds the
+    /// environment's service lock.
+    fn check_standing(environment: &EnvironmentPaths, definition: &TaskDefinition) -> Result<()> {
         let environment_id = environment.environment_id();
         let name = task::name(environment_id);
-        let held = crate::service_manager::lock(environment)?;
-        match supervision::windows::standing(&definition) {
+        match supervision::windows::standing(definition) {
             Ok(Standing::Owned(differences)) if differences.is_empty() => {}
             Ok(Standing::Owned(differences)) => {
                 return Err(CliError::HostUnavailable(shown!(
@@ -2193,6 +2271,37 @@ mod windows {
                 )));
             }
         }
+        Ok(())
+    }
+
+    /// The check that the start makes of the task, made by `kr host restart` before it stops
+    /// anything: the environment's service lock is held for the check and given up at once.
+    pub fn check_the_task(environment: &EnvironmentPaths, program: &Path) -> Result<()> {
+        let definition = definition(environment, program)?;
+        let held = crate::service_manager::lock(environment)?;
+        let checked = check_standing(environment, &definition);
+        drop(held);
+        checked
+    }
+
+    /// Checks the environment's task, leaves a request to start the daemon for its starter, and
+    /// runs it, all under the environment's lock, which is let go before the command waits.
+    ///
+    /// The request lapses at `deadline`, when the command stops waiting: a starter that looks at
+    /// it later starts nothing for it. A run the Task Scheduler does not confirm has the request
+    /// withdrawn at once; when a starter took it first, or the withdrawal fails, the command waits
+    /// as for a run that was confirmed, and says afterwards that this one was not.
+    pub fn ask(
+        environment: &EnvironmentPaths,
+        program: &Path,
+        deadline: std::time::Instant,
+        bound: Duration,
+    ) -> Result<Asked> {
+        let definition = definition(environment, program)?;
+        let environment_id = environment.environment_id();
+        let name = task::name(environment_id);
+        let held = crate::service_manager::lock(environment)?;
+        check_standing(environment, &definition)?;
         let boot = kr_ipc::identity::boot_identity().map_err(CliError::Ipc)?;
         let request = kr_ipc::new_uuid();
         // The continuous clock is read before what is left of the wait is measured, so the time
