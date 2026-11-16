@@ -5215,7 +5215,7 @@ async fn a_new_stream_in_the_same_epoch_starts_with_an_empty_record(serial: bool
     let reached = send_after(&rig, Dependent::Launch, rig.epoch, 4).await;
     assert!(
         !reached.refused_here,
-        "the limit of the record: one acceptance on the new stream is a count of one on its record, so the device's own numbering is the only thing that makes four: {:?}",
+        "the limit of the record: one acceptance on the new stream, at the device's sequence 3, gives its record an effective count of four, because the record counts the sequence and not the frames that the stream took: {:?}",
         reached.answer
     );
     assert_eq!(forwarded(&sent), vec![Method::ShellLaunch]);
