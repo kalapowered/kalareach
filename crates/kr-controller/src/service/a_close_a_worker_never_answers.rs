@@ -853,6 +853,88 @@ async fn a_close_whose_read_stands_is_answered_with_an_account_that_arrived_mean
     serving.abort();
 }
 
+/// A close of a session that this daemon holds no worker for reads the registry, and the read can
+/// find no record while a record is kept: another close had a worker's answer for the session
+/// while the read stood, and the registry refuses the write of it. The close is answered with what
+/// this daemon knows now, and not with the words that the session is unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_whose_read_found_no_record_is_answered_with_an_account_kept_meanwhile() {
+    let Silent {
+        _temp,
+        controller,
+        environment_id,
+        session_id,
+        actor,
+        accepted,
+        serving,
+        ..
+    } = silent_worker().await;
+    acknowledged(&controller, session_id);
+    let carried = admission(&controller, accepted).await;
+    controller.directory.lock().await.remove(session_id);
+    let account = kr_protocol::session::ClosureRecord {
+        durability: kr_protocol::session::Durability::Volatile,
+        ..super::a_migration_and_a_recovery_of_one_session::closure_of(session_id)
+    };
+    // The registry refuses every closure, so that the account that is kept stays the only record.
+    rusqlite::Connection::open(controller.paths.registry_database())
+        .expect("the registry opens beside the daemon's own handle")
+        .execute_batch(
+            "CREATE TRIGGER the_closure_is_not_kept BEFORE INSERT ON tombstones
+             BEGIN SELECT RAISE(ABORT, 'the registry keeps no closure'); END;",
+        )
+        .expect("the registry is made to refuse the write that records a closure");
+
+    let (arrived, release) = controller
+        .registry
+        .lock()
+        .await
+        .stall_the_next_closure_read();
+    let close = {
+        let controller = Arc::clone(&controller);
+        let request = close_request(environment_id, session_id);
+        tokio::spawn(async move {
+            controller
+                .session_close(&request, &actor, Some(accepted), carried)
+                .await
+                .into_answer_for_test()
+        })
+    };
+    // The close knows no closure and its read stands inside the registry. A worker's answer for
+    // the session is then settled, and the read goes on: it finds nothing.
+    let reached =
+        tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30))).await;
+    controller
+        .settle_close_answer(
+            session_id,
+            &kr_protocol::session::SessionCloseResult {
+                session_id,
+                state: kr_protocol::session::SessionState::Closed,
+                durability: account.durability,
+                closure: Nullable::some(account.clone()),
+                session: None,
+            },
+        )
+        .await;
+    let _ = release.send(());
+    let answered = tokio::time::timeout(CLOSE_EXCHANGE + Duration::from_secs(3), close).await;
+    reached
+        .expect("the wait for the read ends")
+        .expect("the read of the registry was the one that stood");
+    let answered = answered
+        .expect("the close is answered")
+        .expect("the close's task ends")
+        .expect("a close is answered with the account kept while its read stood");
+    let result: kr_protocol::session::SessionCloseResult =
+        answered.to_typed().expect("the answer decodes");
+    assert_eq!(
+        result.closure.as_ref(),
+        Some(&account),
+        "the answer is the account the worker gave: {result:?}"
+    );
+    serving.abort();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_client_is_retired_rather_than_held_for_the_next_caller() {
     let Silent {
