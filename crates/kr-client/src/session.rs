@@ -1573,11 +1573,18 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// As [`Session::send`], for everything that happens before the frame is written: the call
-    /// refuses a mutation composed on another connection, one over the bound of outstanding
-    /// mutations ([`ClientError::TooManyOutstandingMutations`]) or of unresolved actions
-    /// ([`ClientError::TooManyUnresolvedActions`]), and an action that this client is still
-    /// accounting for ([`ClientError::StillAccounting`]), each before a byte is written.
+    /// As [`Session::send`], for everything that happens before the frame is written. The call
+    /// refuses, each time before a byte is written and with nothing sent:
+    /// - a mutation composed on another connection ([`ClientError::Misdirected`]);
+    /// - a method that this build does not have ([`ClientError::Cbor`]);
+    /// - one over the bound of outstanding mutations
+    ///   ([`ClientError::TooManyOutstandingMutations`]);
+    /// - a connection that has ended or that the host refused, with the host's refusal when it
+    ///   gave one ([`ClientError::ConnectionEnded`] or the refusal), as the registration of the
+    ///   request refuses it;
+    /// - a frame over the negotiated bound ([`ClientError::Cbor`]);
+    /// - an action that this client is still accounting for ([`ClientError::StillAccounting`]);
+    /// - one over the bound of unresolved actions ([`ClientError::TooManyUnresolvedActions`]).
     pub async fn send_whole(&self, composed: &ComposedMutation) -> Result<Answering> {
         if composed.composed_on != Some(self.id) {
             return Err(ClientError::Misdirected { repeating: false });
