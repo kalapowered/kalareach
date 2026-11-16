@@ -5839,6 +5839,11 @@ async fn an_unreached_launch_is_not_sent_and_the_typing_behind_it_goes_in_order(
         "terminal_view_launch",
         json!({ "view": view, "press": the_press() }),
     );
+    assert!(
+        link.quiet_for(QUIET).await,
+        "the launch stands behind the typing: nothing of it is on the wire"
+    );
+    // Typed after the press has taken its barrier, so the lane holds it behind the launch.
     page.text(&view, 1, "z").expect("the key is taken");
     let told = tokio::time::timeout(AFTER_BARRIER, &mut pressing)
         .await
