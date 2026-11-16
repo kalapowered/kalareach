@@ -648,6 +648,21 @@ fn silent(environment: &KnownEnvironment, none: &Facts, json: bool, bound: Durat
     }
 }
 
+/// The connect found nothing listening and the end was not shown in the bound: no connection was
+/// accepted, so the silence sentence ("accepted the connection and did not answer") is not said.
+/// Where the lock is held, a daemon holds the environment and does not answer, which is true; where
+/// it is not, the request could not be made.
+fn unaccepted(
+    environment: &KnownEnvironment,
+    none: &Facts,
+    json: bool,
+) -> std::result::Result<Completion, Unmade> {
+    match lock_held(&environment.paths) {
+        Ok(true) => Ok(holds_and_is_silent(environment, none, json)),
+        _ => Err(Unmade::NothingListening),
+    }
+}
+
 /// A daemon holds the environment and does not answer, so it may be starting or stopping.
 fn holds_and_is_silent(environment: &KnownEnvironment, none: &Facts, json: bool) -> Completion {
     let id = environment.environment_id;
@@ -1108,9 +1123,10 @@ fn not_shown(id: EnvironmentId, not_known: Option<&Shown>) -> Shown {
 }
 
 /// Ends the command where its request could not be made, by what the failure came to: with the
-/// daemon's end, with silence (exit 1) where the end is not shown in the bound, and with the
-/// unmade request's failure (exit 3) only where a daemon answered. The read of `host.info` and the
-/// compose of the stop request end here.
+/// daemon's end, with silence (exit 1) where the end is not shown in the bound after a connection
+/// was accepted, and with the unmade request's failure (exit 3) where a daemon answered, where the
+/// failure is this side's own, and where the connect found nothing listening and no lock is held.
+/// The read of `host.info` and the compose of the stop request end here.
 fn unmade_ended(
     before: Before,
     error: &kr_ipc::IpcError,
@@ -1206,8 +1222,9 @@ enum Before {
     /// The daemon had ended: what the command says, and the process that it names.
     Ended { said: Shown, pid: Option<u64> },
     /// A daemon's end can have caused the failure, and no end was shown within the bound, with no
-    /// daemon answering the last look.
-    Silent,
+    /// daemon answering the last look. `accepted` is whether a connection was accepted before the
+    /// failure: a connect that found nothing listening accepted none.
+    Silent { accepted: bool },
     /// A daemon answered, by a look or by a reply of its own: the failure keeps its own words,
     /// with exit 3. It holds the answer.
     Answers(Answered),
@@ -1216,13 +1233,16 @@ enum Before {
     OwnFault,
 }
 
-/// What makes a failure that ends with exit 3 true: a daemon's answer, or this side's own fault.
+/// What makes a failure that ends with exit 3 true: a daemon's answer, this side's own fault, or a
+/// connect that found nothing listening where the end was not shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Unmade {
     /// A daemon answered.
     Answered(Answered),
     /// This side's own fault.
     OwnFault,
+    /// The connect found nothing listening, and no end was shown within the bound.
+    NothingListening,
 }
 
 /// Decides what a failure of the connection before the command's request was made came to, as the
@@ -1262,7 +1282,9 @@ async fn failed_before_the_request(
                 pid,
             }
         }
-        Decided::NotShown => Before::Silent,
+        Decided::NotShown => Before::Silent {
+            accepted: !startup::nothing_listening(error),
+        },
         Decided::Answers(answered) => Before::Answers(answered),
     }
 }
@@ -1313,7 +1335,8 @@ fn ended_by(
             };
             Ok(done(&said, &facts, json, earlier))
         }
-        Before::Silent => Ok(silent(environment, none, json, END_BOUND)),
+        Before::Silent { accepted: true } => Ok(silent(environment, none, json, END_BOUND)),
+        Before::Silent { accepted: false } => unaccepted(environment, none, json),
         Before::Answers(answered) => Err(Unmade::Answered(answered)),
         Before::OwnFault => Err(Unmade::OwnFault),
     }
@@ -2840,7 +2863,8 @@ mod tests {
     fn before_said(before: &Before) -> String {
         match before {
             Before::Ended { said, pid } => format!("ended ({pid:?}): {said}"),
-            Before::Silent => "silent".to_owned(),
+            Before::Silent { accepted: true } => "silent".to_owned(),
+            Before::Silent { accepted: false } => "silent, nothing accepted".to_owned(),
             Before::Answers(_) => "answers".to_owned(),
             Before::OwnFault => "own fault".to_owned(),
         }
@@ -3209,7 +3233,13 @@ mod tests {
         };
         let earlier = Earlier::read(&environment.paths);
         let none = Facts::none(Vec::new());
-        match ended_by(Before::Silent, &environment, &none, true, &earlier) {
+        match ended_by(
+            Before::Silent { accepted: true },
+            &environment,
+            &none,
+            true,
+            &earlier,
+        ) {
             Ok(Completion::Reported(error)) => {
                 assert_eq!(error.exit_code(), 1);
                 let said = error.to_string();
@@ -4160,5 +4190,166 @@ mod tests {
                 "an end that was seen is a result, with exit 0"
             );
         }
+    }
+
+    /// A lock that was free in an earlier round is no sign of life at a bound where the last
+    /// round read it as held, and the other way round: the marks are the last round's. With no
+    /// identity, a lock that is free in the first round and held in every later one is a held lock
+    /// to the bound, which is running, and not a free lock with a look that showed nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_lock_that_was_free_in_an_earlier_round_is_read_as_the_last_round_reads_it() {
+        let supplied = Supplied::new()
+            .held(vec![at_once(Ok(false)), at_once(Ok(true))])
+            .look(vec![at_once(Endpoint::Unclear)]);
+        let ended = wait_for_the_end(&supplied, None, END_BOUND).await;
+        assert_eq!(said(&ended), "not ended, running");
+        let supplied = Supplied::new()
+            .held(vec![at_once(Ok(true)), at_once(Ok(false))])
+            .look(vec![at_once(Endpoint::Unclear)]);
+        let ended = wait_for_the_end(&supplied, None, END_BOUND).await;
+        assert_eq!(said(&ended), "not ended, not shown");
+    }
+
+    /// The words of a daemon that has not ended, for the request that was told and the one whose
+    /// outcome is not known, with exit 1. What follows (the process to end) depends on the platform.
+    #[test]
+    fn a_daemon_that_has_not_ended_says_so_for_a_stop_that_was_told_and_one_not_known() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let paths = temp.environment();
+        let id = paths.environment_id();
+        let failure = Shown::said("the connection was lost");
+        for (not_known, expected) in [
+            (
+                None,
+                format!(
+                    "The control daemon for environment {id} was told to stop and has not ended \
+                     after 30 seconds. It may be finishing a write."
+                ),
+            ),
+            (
+                Some(&failure),
+                format!(
+                    "The control daemon for environment {id} did not show whether it took the \
+                     stop (the connection was lost), and it has not ended after 30 seconds. It \
+                     may be finishing a write."
+                ),
+            ),
+        ] {
+            for why in [Why::Running, Why::Answers(an_answer())] {
+                let error = CliError::Unfinished {
+                    code: ErrorCode::EnvironmentUnavailable,
+                    message: not_ended_said(why, not_known, &paths, id, None),
+                };
+                assert_eq!(error.exit_code(), 1);
+                assert!(error.to_string().starts_with(&expected), "{error}");
+            }
+        }
+    }
+
+    /// A connect that found nothing listening accepted no connection: where the end is not shown
+    /// in the bound, the silence sentence ("accepted the connection and did not answer") is not
+    /// said. A held lock keeps the sentence that a daemon holds the environment and does not
+    /// answer; otherwise the request could not be made, with exit 3 and the connect's failure.
+    /// A connection that was accepted and then closed keeps the silence sentence.
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_that_found_nothing_listening_is_no_connection_that_did_not_answer() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let paths = temp.environment();
+        let id = paths.environment_id();
+        let environment = KnownEnvironment {
+            environment_id: id,
+            paths,
+        };
+        let earlier = Earlier::read(&environment.paths);
+        let none = Facts::none(Vec::new());
+        let reported = |before: Before, error: &kr_ipc::IpcError| match unmade_ended(
+            before,
+            error,
+            id,
+            &environment,
+            &none,
+            true,
+            &earlier,
+        ) {
+            Completion::Reported(error) => error,
+            _ => panic!("a failure that the command has reported"),
+        };
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::ConnectionRefused,
+        ] {
+            let nothing = kr_ipc::IpcError::socket("connect", std::io::Error::from(kind));
+            let supplied = Supplied::new();
+            let before = host_info_failed(
+                &supplied,
+                supplied.connection(),
+                &nothing,
+                None,
+                id,
+                the_deadline(),
+            )
+            .await;
+            assert_eq!(before_said(&before), "silent, nothing accepted", "{kind:?}");
+            let error = reported(before, &nothing);
+            assert_eq!(error.exit_code(), 3);
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "kr host stop could not make its request for the control daemon of \
+                     environment {id}: {}. Nothing was sent, and nothing was stopped.",
+                    Shown::ipc(&nothing)
+                )
+            );
+        }
+        // A connection that was accepted and then closed: the silence sentence.
+        let closed = kr_ipc::IpcError::PeerClosed;
+        let supplied = Supplied::new();
+        let before = host_info_failed(
+            &supplied,
+            supplied.connection(),
+            &closed,
+            None,
+            id,
+            the_deadline(),
+        )
+        .await;
+        assert_eq!(before_said(&before), "silent");
+        let error = reported(before, &closed);
+        assert_eq!(error.exit_code(), 1);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "the control daemon listening for environment {id} accepted the connection and \
+                 did not answer within 30 seconds. No stop was requested. Run kr host stop again \
+                 in a moment."
+            )
+        );
+        // A held lock: a daemon holds the environment and does not answer, whatever failed.
+        let held =
+            SingletonLock::hold(&environment.paths.singleton_lock(), id).expect("takes the lock");
+        let nothing = kr_ipc::IpcError::socket(
+            "connect",
+            std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+        );
+        let supplied = Supplied::new().held(vec![at_once(Ok(true))]);
+        let before = host_info_failed(
+            &supplied,
+            supplied.connection(),
+            &nothing,
+            None,
+            id,
+            the_deadline(),
+        )
+        .await;
+        assert_eq!(before_said(&before), "silent, nothing accepted");
+        let error = reported(before, &nothing);
+        assert_eq!(error.exit_code(), 1);
+        assert!(
+            error
+                .to_string()
+                .contains("does not answer, so it may be starting or stopping"),
+            "{error}"
+        );
+        drop(held);
     }
 }
