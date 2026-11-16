@@ -1283,7 +1283,7 @@ function lookDisagrees(made: { clicks: Clicked[]; opened: string[]; lit: (string
   if (pressNamed.startsWith('text') && atPress !== null) problems.push(`lit ${atPress} at a press that names plain text`)
   if (pressNamed.startsWith('control') && atPress !== null) problems.push(`lit ${atPress} at a press that names ${pressNamed}`)
   if (pressNamed.startsWith('link ')) {
-    if (atPress !== null && pressNamed !== `link ${atPress}`) problems.push(`lit ${atPress} at a press that names ${pressNamed}`)
+    if (pressNamed !== `link ${String(atPress)}`) problems.push(`lit ${String(atPress)} at a press that names ${pressNamed}`)
     if (named !== pressNamed) problems.push(`STOP: the pointer down named ${pressNamed} and the click named ${named}`)
   }
   return problems.length === 0 ? null : problems.join('; ')
