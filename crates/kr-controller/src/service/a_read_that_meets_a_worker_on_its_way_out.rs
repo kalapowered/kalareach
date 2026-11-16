@@ -1336,13 +1336,23 @@ pub(super) async fn list(world: &Silent, include_closed: bool) -> Vec<(SessionId
 
 /// Closes the session through the daemon, and returns what the worker accepted it with.
 async fn close(world: &Silent) -> SessionCloseResult {
+    let carried = fake::admission(&world.controller, world.accepted).await;
+    close_admitted(world, carried).await
+}
+
+/// [`close`] for a caller that took its admission before, which a case needs when the registry
+/// is stopped: the admission reads it.
+async fn close_admitted(
+    world: &Silent,
+    carried: crate::authority::AdmittedMutation,
+) -> SessionCloseResult {
     world
         .controller
         .session_close(
             &fake::close_request(world.environment_id, world.session_id),
             &world.actor,
             Some(world.accepted),
-            fake::admission(&world.controller, world.accepted).await,
+            carried,
         )
         .await
         .into_answer_for_test()
@@ -1417,6 +1427,8 @@ async fn a_close_that_meets_the_daemons_own_record_before_its_commit_is_not_told
         accepted.closure.0.is_none(),
         "the worker only accepted: {accepted:?}"
     );
+    // The admission of the next close reads the registry, which the stalled write holds.
+    let carried = fake::admission(&world.controller, world.accepted).await;
     let (arrived, release) = world.controller.stall_the_next_closure_write();
     let writing = {
         let controller = Arc::clone(&world.controller);
@@ -1438,9 +1450,12 @@ async fn a_close_that_meets_the_daemons_own_record_before_its_commit_is_not_told
         .await
         .expect("the wait for the write ends")
         .expect("the daemon's own record reaches the registry's write");
-    let repeated = tokio::time::timeout(std::time::Duration::from_secs(10), close(&world))
-        .await
-        .expect("a close is answered while the write of the daemon's own record stands");
+    let repeated = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        close_admitted(&world, carried),
+    )
+    .await
+    .expect("a close is answered while the write of the daemon's own record stands");
     assert_ne!(repeated.durability, Durability::Durable, "{repeated:?}");
     assert_eq!(
         repeated.closure.as_ref().map(|record| record.durability),
