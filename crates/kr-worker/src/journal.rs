@@ -2069,12 +2069,15 @@ impl Journal {
         if state == ReceiptState::Dispatching {
             self.marker_read_stall.stand();
         }
-        // The last ask, after every read this step makes and before its first write.
-        still()?;
+        // The writer's lock is taken first, by an immediate transaction that waits for another
+        // connection's, and the last ask stands after it: a deadline that passes while this step
+        // waits for the lock is asked after the wait, and nothing but the writes and the commit
+        // stands between the ask and the marker.
         let transaction = self
             .connection
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| faulted(&self.health, error))?;
+        still()?;
         write_state(&self.health, &transaction, &receipt)?;
         // A rejection is a settlement: what the caller sent is committed with the receipt only
         // where privacy mode does not withhold it. Read once the write lock is held.
@@ -3535,6 +3538,15 @@ impl Journal {
         std::sync::mpsc::Sender<()>,
     ) {
         self.marker_stall.arm_blocking()
+    }
+
+    /// Says, for this host's own tests, when the next write of this journal begins to wait for
+    /// another connection's lock: the end that carries the signal. The wait goes on until the lock
+    /// is let go.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn signal_next_writer_lock_wait(&mut self) -> tokio::sync::oneshot::Receiver<()> {
+        crate::testing::signal_next_lock_wait(&mut self.connection)
     }
 
     /// Stops the next dispatch marker between its read of the receipt and its first write, for

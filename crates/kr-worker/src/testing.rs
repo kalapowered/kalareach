@@ -644,3 +644,28 @@ impl Drop for ClosedOnDrop {
         }
     }
 }
+
+/// Installs on `connection` a handler for the time it waits on another connection's lock: it says
+/// once that the wait has begun, then waits on. Returns the end that carries the signal.
+///
+/// A step that waits for the writer's lock has asked everything it asks before the lock and has
+/// asked nothing after it, so a test that holds the lock from a second connection learns from the
+/// signal that the step stands exactly there. The handler replaces the connection's own busy
+/// timeout, for the one test that arms it. Compiled away in every shipped build.
+#[cfg(feature = "testing")]
+pub fn signal_next_lock_wait(
+    connection: &mut rusqlite::Connection,
+) -> tokio::sync::oneshot::Receiver<()> {
+    let (waiting, signal) = tokio::sync::oneshot::channel();
+    let mut waiting = Some(waiting);
+    connection
+        .busy_handler(Some(move |attempt: i32| {
+            if let Some(waiting) = waiting.take() {
+                let _ = waiting.send(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            attempt < 120_000
+        }))
+        .expect("a busy handler is set");
+    signal
+}
