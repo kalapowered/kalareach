@@ -492,18 +492,21 @@ async fn a_conflict_the_local_door_told_is_written_as_the_checks_refusal_when_a_
             "the connection goes on"
         );
         controller.hold_fence(false);
-        let read = tokio::time::timeout(std::time::Duration::from_secs(30), reader.read_message())
-            .await
-            .expect("the daemon wrote an answer")
-            .expect("the answer reads");
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            reader.read_message::<ControlFrame>(),
+        )
+        .await
+        .expect("the daemon wrote an answer")
+        .expect("the answer reads");
         if owed {
-            let ControlFrame::Response(response) = read else {
-                panic!("a response");
-            };
-            let Outcome::Error(told) = response.outcome else {
-                panic!("the stored conflict reached the caller");
-            };
-            assert_eq!(told.code, ErrorCode::PermissionDenied, "{told:?}");
+            // The whole frame, in the words of the fence: another member's words are no answer.
+            let refusal = crate::service::Lapse::FenceOwed.refusal();
+            assert_eq!(
+                read,
+                super::error_reply(REQUEST, refusal.code(), refusal.to_string()),
+                "the refusal of the fence"
+            );
         } else {
             assert_eq!(read, conflict, "the control");
         }

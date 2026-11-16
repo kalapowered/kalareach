@@ -299,14 +299,13 @@ async fn a_reply_read_from_a_record_is_replaced_by_the_reply_of_the_member_that_
                 &frame,
                 Method::PrivacySet,
                 WrittenUnder::for_a_record_case(footing, conflict),
-                vec![change, fence(&controller, false)],
+                // The second ask stands at the pause that follows, and the member that refused at
+                // the first refuses at it too: the fence stays owed through it.
+                vec![change, fence(&controller, lapse == Lapse::FenceOwed)],
             )
             .await;
-            // The second ask stands at the pause that follows; the frame is withheld at it again
-            // unless the change was the fence, which the second change gave back.
-            let expected = if lapse == Lapse::FenceOwed {
-                frame
-            } else if conflict {
+            controller.hold_fence(false);
+            let expected = if conflict {
                 refused_for(lapse)
             } else {
                 not_shown()
