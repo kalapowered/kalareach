@@ -705,7 +705,9 @@ impl OutputHistory {
 
     /// Waits until the write [`Self::append_deferred`] owed has been made, if one is in flight.
     ///
-    /// The write needs nothing of the session, so this may be waited for with the session held.
+    /// Only the appender waits, at the head of an append, for the write it owed before. A discard
+    /// does not: it leaves the window and the spool where they are while a write is in flight and
+    /// is made again when that write ends.
     fn wait_for_owed_write(&self) {
         if let Some(spool) = self.spool.as_ref() {
             spool.owed.wait_idle();
@@ -941,6 +943,11 @@ impl OutputHistory {
     ///
     /// This is logical cleanup. The files are unlinked and the window is dropped; nothing here
     /// claims the bytes are unrecoverable from the device they were on.
+    ///
+    /// It never waits. While a write to the spool is in flight the window and the spool are left
+    /// where they are, and the answer says that some of the output is still there; the time index
+    /// does not depend on that write and is removed at once. The caller asks again once the write
+    /// has ended.
     pub fn discard_retained(&mut self) -> Discarded {
         let mut discarded = self.discard_window_and_spool();
         self.discard_times(&mut discarded);
@@ -949,9 +956,24 @@ impl OutputHistory {
 
     /// Removes the resident window and the spool's segments, and says what went and what could not.
     fn discard_window_and_spool(&mut self) -> Discarded {
-        // A write that is owed is made before anything is taken away, so that what the index
-        // counts is in the file when a removal that fails leaves it where it was.
-        self.wait_for_owed_write();
+        // A write in flight is not waited for, and nothing is taken away under it: the bytes it
+        // lays down would land in a segment this removal had just counted. The window and the
+        // spool stay as they are, the answer says so, and the discard is made again when that
+        // write ends. The mark is set with the look, so a write that ends right after it is seen.
+        if let Some(spool) = self.spool.as_ref()
+            && spool.owed.defer_discard_if_in_flight()
+        {
+            return Discarded {
+                bytes: 0,
+                segments: 0,
+                left_behind: Some(WRITE_IN_FLIGHT.to_owned()),
+            };
+        }
+        if let Some(spool) = self.spool.as_ref() {
+            spool.owed.clear_discard_deferred();
+        }
+        // What a write that failed left is settled before anything is taken away, so that what
+        // the index counts is in the file when a removal that fails leaves it where it was.
         self.settle_spool_write();
         let resident = self.resident.len() as u64;
         self.resident.clear();
@@ -1685,6 +1707,10 @@ const BOUNDARY_FILE: &str = "boundary";
 const BOUNDARY_UNWRITTEN: &str =
     "this session's spool boundary could not be written, so nothing it supports was removed";
 
+/// What a discard says when a write of this session's output to its spool is still in flight, and
+/// so it removed nothing yet.
+const WRITE_IN_FLIGHT: &str = "this session's retained output is still being written to its spool, so it was left where it was";
+
 /// Fixed-size segment files holding output older than the resident window.
 #[derive(Debug)]
 struct Spool {
@@ -1868,6 +1894,12 @@ struct OwedState {
     /// The segment's file and the handle a write opened it with, for the spool to keep writing
     /// through.
     reopened: Option<(PathBuf, Arc<std::fs::File>)>,
+    /// Whether a discard of the retained output met a write in flight and left the window and the
+    /// spool where they were, so that whoever sees that write end owes the discard.
+    ///
+    /// It is set under the same lock that says whether a write is in flight, so a write that ends
+    /// just after a discard looked at it is never missed. A discard that is made clears it.
+    discard_deferred: bool,
 }
 
 impl OwedWrite {
@@ -1897,8 +1929,33 @@ impl OwedWrite {
         state.in_flight.is_none() && state.failed.is_none()
     }
 
-    /// Waits until no write is in flight. The write needs nothing of the session to finish, so
-    /// this may be waited for with the session held.
+    /// Says that a discard of the retained output is owed, when a write is in flight.
+    ///
+    /// The look and the mark are one step under the lock the write ends under, so a write either
+    /// is in flight and is marked, or has ended and the caller may discard.
+    fn defer_discard_if_in_flight(&self) -> bool {
+        let mut state = self.lock();
+        if state.in_flight.is_some() {
+            state.discard_deferred = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether a discard met a write in flight and has not been made since.
+    fn discard_deferred(&self) -> bool {
+        self.lock().discard_deferred
+    }
+
+    /// Notes that the discard is being made now.
+    fn clear_discard_deferred(&self) {
+        self.lock().discard_deferred = false;
+    }
+
+    /// Waits until no write is in flight. This is the one wait of the output path: the appender
+    /// makes it at the head of an append, where the write it waits for is its own earlier one and
+    /// none is in flight. Nothing that reads, discards or collects waits here.
     fn wait_idle(&self) {
         let mut state = self.lock();
         while state.in_flight.is_some() {
@@ -4143,27 +4200,95 @@ mod tests {
         std::fs::remove_dir_all(&directory).ok();
     }
 
+    /// Plans a write of `cd` after `ab`, and arranges for another thread to make it once told to.
+    ///
+    /// The thread says whether it was told before it made the write, and makes it anyway after ten
+    /// seconds, so that a discard that waited for it ends the case with a failed assertion and not
+    /// with a hang.
+    fn write_made_when_told(
+        history: &mut OutputHistory,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<bool>) {
+        history.append(b"ab");
+        let (_, owed) = history.append_deferred(b"cd");
+        let write = owed.expect("the write is owed");
+        let (tell, told) = std::sync::mpsc::channel();
+        let making = std::thread::spawn(move || {
+            let was_told = told
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_ok();
+            assert!(write.perform(b"cd"));
+            was_told
+        });
+        (tell, making)
+    }
+
     #[test]
-    fn discarding_waits_for_the_write_in_flight_so_a_removal_that_fails_leaves_it_readable() {
-        // A discard whose removal fails leaves the index where it was, and the output it counts is
-        // read from the file. The discard makes the owed write land first, so that what the index
-        // counts is in the file when it stops.
+    fn a_discard_does_not_wait_for_the_write_in_flight_and_removes_nothing_under_it() {
         let directory = spool_directory("owed-write-discard");
         let mut history =
             OutputHistory::with_spool(64, directory.clone(), SpoolLayout::new(64, 1 << 20))
                 .expect("a spool");
-        history.append(b"ab");
-        let (_, owed) = history.append_deferred(b"cd");
-        let write = owed.expect("the write is owed");
-        history.spool.as_mut().expect("a spool").refuse_remove = true;
-        let making = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            assert!(write.perform(b"cd"));
-        });
+        let (tell, making) = write_made_when_told(&mut history);
         let discarded = history.discard_retained();
+        tell.send(()).expect("the write is waiting to be told");
         assert!(
-            discarded.left_behind.is_some(),
-            "the removal was refused: {discarded:?}"
+            making.join().expect("the write is made"),
+            "the discard returned before the write was made"
+        );
+        assert_eq!(
+            discarded,
+            Discarded {
+                bytes: 0,
+                segments: 0,
+                left_behind: Some(WRITE_IN_FLIGHT.to_owned()),
+            },
+            "nothing was removed under the write in flight"
+        );
+        assert_eq!(
+            history.page(0, 64).expect("a page").bytes.as_slice(),
+            b"abcd",
+            "the window and the spool were left where they were"
+        );
+        assert!(
+            history
+                .spool
+                .as_ref()
+                .expect("a spool")
+                .owed
+                .discard_deferred(),
+            "the write that ended owes the discard"
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_discard_made_after_the_write_ended_removes_it_and_a_removal_that_fails_leaves_it_readable()
+    {
+        // A discard whose removal fails leaves the index where it was, and the output it counts is
+        // read from the file, so the write that was in flight has to have landed there.
+        let directory = spool_directory("owed-write-discard-after");
+        let mut history =
+            OutputHistory::with_spool(64, directory.clone(), SpoolLayout::new(64, 1 << 20))
+                .expect("a spool");
+        let (tell, making) = write_made_when_told(&mut history);
+        let deferred = history.discard_retained();
+        assert!(deferred.left_behind.is_some(), "{deferred:?}");
+        tell.send(()).expect("the write is waiting to be told");
+        making.join().expect("the write is made");
+        history.spool.as_mut().expect("a spool").refuse_remove = true;
+        let refused = history.discard_retained();
+        assert!(
+            refused.left_behind.is_some(),
+            "the removal was refused: {refused:?}"
+        );
+        assert!(
+            !history
+                .spool
+                .as_ref()
+                .expect("a spool")
+                .owed
+                .discard_deferred(),
+            "a discard that was made is not owed because of the write"
         );
         let page = history.page(2, 64).expect("a page");
         assert!(page.gap.0.is_none(), "{:?}", page.gap.0);
@@ -4172,7 +4297,10 @@ mod tests {
             b"cd",
             "the output the index counts is there"
         );
-        making.join().expect("the write is made");
+        history.spool.as_mut().expect("a spool").refuse_remove = false;
+        let done = history.discard_retained();
+        assert_eq!(done.left_behind, None, "{done:?}");
+        assert_eq!(done.bytes, 4, "every byte went once: {done:?}");
         std::fs::remove_dir_all(&directory).ok();
     }
 
