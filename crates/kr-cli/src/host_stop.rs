@@ -1875,4 +1875,636 @@ mod tests {
             "{without}"
         );
     }
+
+    // The cases below run the decision of the command, the look for a daemon's end after a request
+    // that could not be made and the wait for the end, on operations that each case supplies, with
+    // the runtime's clock paused: an operation spends the time the case says by advancing it, so a
+    // case counts the time of every call, and none waits for real time or meets a socket.
+
+    /// A call that the decision made on its operations.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Call {
+        ConnectionLetGo,
+        Held(Duration),
+        ProcessState,
+        Look(Duration),
+        NamedDaemon,
+        Pause(Duration),
+    }
+
+    /// What one call gives, and the time it takes on the paused clock: the whole of the bound it
+    /// was given where `takes` is none.
+    #[derive(Clone)]
+    struct Step<T> {
+        takes: Option<Duration>,
+        gives: T,
+    }
+
+    fn at_once<T>(gives: T) -> Step<T> {
+        Step {
+            takes: Some(Duration::ZERO),
+            gives,
+        }
+    }
+
+    fn after<T>(takes: Duration, gives: T) -> Step<T> {
+        Step {
+            takes: Some(takes),
+            gives,
+        }
+    }
+
+    fn whole<T>(gives: T) -> Step<T> {
+        Step { takes: None, gives }
+    }
+
+    fn seconds(count: u64) -> Duration {
+        Duration::from_secs(count)
+    }
+
+    fn millis(count: u64) -> Duration {
+        Duration::from_millis(count)
+    }
+
+    /// The steps of one operation: its n-th call takes the n-th step, and the last step repeats.
+    struct Script<T>(Mutex<(usize, Vec<Step<T>>)>);
+
+    impl<T: Clone> Script<T> {
+        fn of(steps: Vec<Step<T>>) -> Self {
+            assert!(!steps.is_empty(), "a script has a step");
+            Self(Mutex::new((0, steps)))
+        }
+
+        fn next(&self) -> Step<T> {
+            let mut script = self.0.lock().expect("the script");
+            let step = script.1[script.0.min(script.1.len() - 1)].clone();
+            script.0 += 1;
+            step
+        }
+    }
+
+    type Calls = std::sync::Arc<Mutex<Vec<(Duration, Call)>>>;
+
+    /// The connection of the command to the daemon, as the arm is given it: letting it go is a call
+    /// like the others, so the case sees whether it comes before the first look or the wait.
+    struct Connection {
+        start: tokio::time::Instant,
+        calls: Calls,
+    }
+
+    impl Drop for Connection {
+        fn drop(&mut self) {
+            self.calls
+                .lock()
+                .expect("the calls")
+                .push((self.start.elapsed(), Call::ConnectionLetGo));
+        }
+    }
+
+    /// Operations that a case supplies. Each call is recorded with the time at which it began,
+    /// counted from the start of the case on the paused clock, and spends the time of its step.
+    struct Supplied {
+        start: tokio::time::Instant,
+        calls: Calls,
+        held: Script<std::result::Result<bool, Shown>>,
+        process: Script<ProcessState>,
+        look: Script<Endpoint>,
+        named: Script<Option<u64>>,
+    }
+
+    impl Supplied {
+        /// A lock that is free, a process that runs, a listener that does not answer and a lock
+        /// file that names nobody, each at once.
+        fn new() -> Self {
+            Self {
+                start: tokio::time::Instant::now(),
+                calls: Calls::default(),
+                held: Script::of(vec![at_once(Ok(false))]),
+                process: Script::of(vec![at_once(ProcessState::Running)]),
+                look: Script::of(vec![at_once(Endpoint::Unclear)]),
+                named: Script::of(vec![at_once(None)]),
+            }
+        }
+
+        fn held(mut self, steps: Vec<Step<std::result::Result<bool, Shown>>>) -> Self {
+            self.held = Script::of(steps);
+            self
+        }
+
+        fn process(mut self, steps: Vec<Step<ProcessState>>) -> Self {
+            self.process = Script::of(steps);
+            self
+        }
+
+        fn look(mut self, steps: Vec<Step<Endpoint>>) -> Self {
+            self.look = Script::of(steps);
+            self
+        }
+
+        fn named(mut self, steps: Vec<Step<Option<u64>>>) -> Self {
+            self.named = Script::of(steps);
+            self
+        }
+
+        fn record(&self, call: Call) {
+            self.calls
+                .lock()
+                .expect("the calls")
+                .push((self.start.elapsed(), call));
+        }
+
+        fn connection(&self) -> Connection {
+            Connection {
+                start: self.start,
+                calls: self.calls.clone(),
+            }
+        }
+
+        fn calls(&self) -> Vec<(Duration, Call)> {
+            self.calls.lock().expect("the calls").clone()
+        }
+
+        /// How many looks were made.
+        fn looks(&self) -> usize {
+            self.calls()
+                .iter()
+                .filter(|(_, call)| matches!(call, Call::Look(_)))
+                .count()
+        }
+    }
+
+    impl Operations for Supplied {
+        async fn held(&self, within: Duration) -> std::result::Result<bool, Shown> {
+            self.record(Call::Held(within));
+            let step = self.held.next();
+            tokio::time::advance(step.takes.unwrap_or(within)).await;
+            step.gives
+        }
+
+        fn process_state(&self, _old: &ProcessStartIdentity) -> ProcessState {
+            self.record(Call::ProcessState);
+            self.process.next().gives
+        }
+
+        async fn look(&self, within: Duration) -> Endpoint {
+            self.record(Call::Look(within));
+            let step = self.look.next();
+            tokio::time::advance(step.takes.unwrap_or(within)).await;
+            step.gives
+        }
+
+        fn named_daemon(&self) -> Option<u64> {
+            self.record(Call::NamedDaemon);
+            self.named.next().gives
+        }
+
+        async fn pause(&self, time: Duration) {
+            self.record(Call::Pause(time));
+            tokio::time::advance(time).await;
+        }
+    }
+
+    /// The process of the daemon that was asked, as the cases name it.
+    fn asked_process() -> ProcessStartIdentity {
+        identity::ended_process_identity(4000)
+    }
+
+    /// How a wait came out, in words a failed assertion shows.
+    fn said(end: &End) -> String {
+        match end {
+            End::Gone => "gone".to_owned(),
+            End::Successor(named) => format!("successor {named:?}"),
+            End::NotEnded(Why::Running) => "not ended, running".to_owned(),
+            End::NotEnded(Why::Held) => "not ended, held".to_owned(),
+            End::NotEnded(Why::Unlooked(_)) => "not ended, not looked at".to_owned(),
+        }
+    }
+
+    /// How the arm for a request that could not be made came out.
+    fn arm_said(ended: Option<&End>) -> String {
+        ended.map_or_else(|| "the request's failure".to_owned(), said)
+    }
+
+    /// Runs the arm on `supplied` with its deadline counted from now, as the command counts it.
+    async fn arm(
+        supplied: &Supplied,
+        old: Option<&ProcessStartIdentity>,
+        closed: bool,
+    ) -> Option<End> {
+        let deadline = tokio::time::Instant::now() + END_BOUND;
+        ended_before_the_request(supplied, supplied.connection(), old, closed, deadline).await
+    }
+
+    /// Where the connection was not closed and a daemon of the same start answers at the first
+    /// look, the request's failure is the result at once: one look, no wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_daemon_of_the_same_start_at_the_first_look_gives_the_failure_at_once() {
+        let process = asked_process();
+        for old in [None, Some(&process)] {
+            let supplied = Supplied::new().look(vec![at_once(Endpoint::Same)]);
+            let ended = arm(&supplied, old, false).await;
+            assert_eq!(arm_said(ended.as_ref()), "the request's failure", "{old:?}");
+            assert_eq!(
+                supplied.calls(),
+                vec![
+                    (Duration::ZERO, Call::ConnectionLetGo),
+                    (Duration::ZERO, Call::Look(startup::ANSWER_BOUND)),
+                ],
+                "one look and nothing else, {old:?}"
+            );
+        }
+    }
+
+    /// Where the daemon closed the connection no first look is made, and the daemon is waited for
+    /// to the end of the one deadline where it still answers, and found ended where it has gone.
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_connection_is_waited_for_with_no_look_before_the_wait() {
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same)]);
+        let ended = arm(&supplied, None, true).await;
+        assert_eq!(arm_said(ended.as_ref()), "the request's failure");
+        let calls = supplied.calls();
+        assert_eq!(
+            calls[..3],
+            [
+                (Duration::ZERO, Call::ConnectionLetGo),
+                (Duration::ZERO, Call::Held(END_BOUND)),
+                (Duration::ZERO, Call::Look(END_BOUND)),
+            ],
+            "the wait follows the let-go connection, with no look between"
+        );
+        assert!(supplied.looks() > 1, "the wait looks again and again");
+        assert_eq!(
+            supplied.start.elapsed(),
+            END_BOUND,
+            "it waits to the deadline"
+        );
+
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Nobody)]);
+        let ended = arm(&supplied, None, true).await;
+        assert_eq!(arm_said(ended.as_ref()), "gone");
+        assert_eq!(
+            supplied.calls(),
+            vec![
+                (Duration::ZERO, Call::ConnectionLetGo),
+                (Duration::ZERO, Call::Held(END_BOUND)),
+                (Duration::ZERO, Call::Look(END_BOUND)),
+            ]
+        );
+    }
+
+    /// The command's connection is let go before the first look where it makes one, and before the
+    /// wait where it does not.
+    #[tokio::test(start_paused = true)]
+    async fn the_connection_is_let_go_before_the_first_look_and_before_the_wait() {
+        for (closed, next) in [
+            (false, Call::Look(startup::ANSWER_BOUND)),
+            (true, Call::Held(END_BOUND)),
+        ] {
+            let supplied = Supplied::new().look(vec![at_once(Endpoint::Nobody)]);
+            let _ = arm(&supplied, None, closed).await;
+            let calls = supplied.calls();
+            assert_eq!(
+                calls[0].1,
+                Call::ConnectionLetGo,
+                "the first call, closed {closed}"
+            );
+            assert_eq!(
+                calls[1].1, next,
+                "then the look or the wait, closed {closed}"
+            );
+        }
+    }
+
+    /// A daemon that has ended where no daemon answered the one look is the end: with no identity
+    /// where nobody answers at the endpoint and the lock is free, and with one where the process
+    /// has gone and the lock is free; and a successor where the lock is held by another daemon.
+    #[tokio::test(start_paused = true)]
+    async fn a_daemon_that_ended_is_found_to_have_ended_after_the_one_look() {
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Nobody)]);
+        let ended = arm(&supplied, None, false).await;
+        assert_eq!(arm_said(ended.as_ref()), "gone");
+        assert_eq!(
+            supplied.calls(),
+            vec![
+                (Duration::ZERO, Call::ConnectionLetGo),
+                (Duration::ZERO, Call::Look(startup::ANSWER_BOUND)),
+                (Duration::ZERO, Call::Held(END_BOUND)),
+                (Duration::ZERO, Call::Look(END_BOUND)),
+            ],
+            "the first look finds nobody, and the wait looks again"
+        );
+
+        let process = asked_process();
+        let supplied = Supplied::new()
+            .look(vec![at_once(Endpoint::Unclear)])
+            .process(vec![at_once(ProcessState::Ended)]);
+        let ended = arm(&supplied, Some(&process), false).await;
+        assert_eq!(
+            arm_said(ended.as_ref()),
+            "gone",
+            "a process that has gone, a free lock"
+        );
+
+        let supplied = Supplied::new()
+            .held(vec![at_once(Ok(true))])
+            .process(vec![at_once(ProcessState::Ended)])
+            .named(vec![at_once(Some(5000))]);
+        let ended = arm(&supplied, Some(&process), true).await;
+        assert_eq!(arm_said(ended.as_ref()), "successor Some(5000)");
+    }
+
+    /// One deadline counts from the failure: the look for the end takes its time from it, the wait
+    /// has what is left, and each wait after another, the lock's, the look and the pause between
+    /// rounds, is given what is left of the deadline when it starts.
+    #[tokio::test(start_paused = true)]
+    async fn one_deadline_counts_from_the_failure_and_each_wait_has_what_is_left() {
+        let supplied = Supplied::new()
+            .held(vec![
+                after(seconds(4), Ok(false)),
+                after(seconds(2), Ok(false)),
+            ])
+            .look(vec![
+                after(seconds(1), Endpoint::Unclear),
+                after(seconds(3), Endpoint::Unclear),
+                after(seconds(1), Endpoint::Nobody),
+            ]);
+        let ended = arm(&supplied, None, false).await;
+        assert_eq!(arm_said(ended.as_ref()), "gone");
+        assert_eq!(
+            supplied.calls(),
+            vec![
+                (seconds(0), Call::ConnectionLetGo),
+                (seconds(0), Call::Look(startup::ANSWER_BOUND)),
+                // The wait has what the one look left of the 30 seconds.
+                (seconds(1), Call::Held(seconds(29))),
+                (seconds(5), Call::Look(seconds(25))),
+                (seconds(8), Call::Pause(millis(50))),
+                (millis(8050), Call::Held(millis(21950))),
+                (millis(10050), Call::Look(millis(19950))),
+            ]
+        );
+    }
+
+    /// A pause is never longer than what is left of the deadline, and the wait ends at the
+    /// deadline with the daemon not ended: no wait runs past it.
+    #[tokio::test(start_paused = true)]
+    async fn the_pause_does_not_run_past_the_deadline() {
+        let supplied =
+            Supplied::new().held(vec![after(millis(29_990), Ok(false)), at_once(Ok(false))]);
+        let ended = wait_for_the_end(&supplied, None, END_BOUND).await;
+        assert_eq!(said(&ended), "not ended, running");
+        let calls = supplied.calls();
+        assert_eq!(
+            calls,
+            vec![
+                (seconds(0), Call::Held(END_BOUND)),
+                (millis(29_990), Call::Look(millis(10))),
+                (millis(29_990), Call::Pause(millis(10))),
+                (seconds(30), Call::Held(Duration::ZERO)),
+                (seconds(30), Call::Look(Duration::ZERO)),
+            ]
+        );
+        assert_eq!(supplied.start.elapsed(), END_BOUND);
+    }
+
+    /// Operations that use their whole bound end the wait at its deadline: each is given what is
+    /// left when it starts, so a wait after one that used its whole bound has none.
+    #[tokio::test(start_paused = true)]
+    async fn operations_that_use_their_whole_bound_end_the_wait_at_its_deadline() {
+        let supplied = Supplied::new()
+            .held(vec![whole(Ok(false))])
+            .look(vec![whole(Endpoint::Unclear)]);
+        let ended = wait_for_the_end(&supplied, None, END_BOUND).await;
+        assert_eq!(said(&ended), "not ended, running");
+        assert_eq!(
+            supplied.calls(),
+            vec![
+                (seconds(0), Call::Held(END_BOUND)),
+                (seconds(30), Call::Look(Duration::ZERO)),
+            ],
+            "a look after a wait that used the whole bound has none left"
+        );
+        assert_eq!(
+            supplied.start.elapsed(),
+            END_BOUND,
+            "and the wait ends at its deadline"
+        );
+    }
+
+    /// The real wait loop, against a daemon that still answers every time: a daemon of the same
+    /// start is not an end, with or without an identity for its process, and the wait gives up at
+    /// its deadline as not ended and running. A supplied end could not show this.
+    #[tokio::test(start_paused = true)]
+    async fn a_daemon_that_still_answers_in_every_round_is_not_ended_at_the_deadline() {
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same)]);
+        let ended = wait_for_the_end(&supplied, None, END_BOUND).await;
+        assert_eq!(said(&ended), "not ended, running");
+        assert!(supplied.looks() > 100, "the wait looked round after round");
+        assert_eq!(supplied.start.elapsed(), END_BOUND);
+
+        // With an identity the process is read in every round, and a process that runs is the
+        // daemon that has not ended, whatever answers at the endpoint.
+        let process = asked_process();
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same)]);
+        let ended = wait_for_the_end(&supplied, Some(&process), END_BOUND).await;
+        assert_eq!(said(&ended), "not ended, running");
+        assert_eq!(supplied.looks(), 0, "a process that runs needs no look");
+        assert_eq!(supplied.start.elapsed(), END_BOUND);
+    }
+
+    /// With the process's identity known, the daemon has ended only where its process has: running
+    /// or unknown is not an end whatever the lock says; ended with a free lock is the end; ended
+    /// with a held lock is a successor only on evidence, which is a live kr-controller that is not
+    /// the old one, or a daemon of another generation that answers.
+    #[tokio::test(start_paused = true)]
+    async fn with_an_identity_the_end_is_the_process_gone_and_the_lock_free_or_a_successor() {
+        let process = asked_process();
+        for (state, held, expected) in [
+            (ProcessState::Running, Ok(false), "not ended, running"),
+            (
+                ProcessState::Unknown {
+                    detail: "denied".to_owned(),
+                },
+                Ok(false),
+                "not ended, running",
+            ),
+            (ProcessState::Running, Ok(true), "not ended, running"),
+            (ProcessState::Ended, Ok(false), "gone"),
+            (ProcessState::Ended, Ok(true), "not ended, held"),
+            (
+                ProcessState::Ended,
+                Err(Shown::said("the lock could not be taken")),
+                "not ended, not looked at",
+            ),
+            (
+                ProcessState::Running,
+                Err(Shown::said("the lock could not be taken")),
+                "not ended, running",
+            ),
+        ] {
+            let supplied = Supplied::new()
+                .held(vec![at_once(held)])
+                .process(vec![at_once(state.clone())])
+                .look(vec![at_once(Endpoint::Same)]);
+            let ended = wait_for_the_end(&supplied, Some(&process), END_BOUND).await;
+            assert_eq!(said(&ended), expected, "{state:?}");
+        }
+
+        // A successor: another process that the lock file names, with no look made for it; and
+        // where it names none or the old one, a daemon of another generation at the endpoint.
+        let held_ended = || {
+            Supplied::new()
+                .held(vec![at_once(Ok(true))])
+                .process(vec![at_once(ProcessState::Ended)])
+        };
+        let supplied = held_ended().named(vec![at_once(Some(5000))]);
+        let ended = wait_for_the_end(&supplied, Some(&process), END_BOUND).await;
+        assert_eq!(said(&ended), "successor Some(5000)");
+        assert_eq!(supplied.looks(), 0, "the lock file's word is evidence");
+        let supplied = held_ended()
+            .named(vec![at_once(Some(4000))])
+            .look(vec![at_once(Endpoint::Another)]);
+        let ended = wait_for_the_end(&supplied, Some(&process), END_BOUND).await;
+        assert_eq!(said(&ended), "successor Some(4000)", "the endpoint's word");
+        let supplied = held_ended()
+            .named(vec![at_once(None)])
+            .look(vec![at_once(Endpoint::Another)]);
+        let ended = wait_for_the_end(&supplied, Some(&process), END_BOUND).await;
+        assert_eq!(said(&ended), "successor None");
+        let supplied = held_ended().look(vec![at_once(Endpoint::Same)]);
+        let ended = wait_for_the_end(&supplied, Some(&process), END_BOUND).await;
+        assert_eq!(
+            said(&ended),
+            "not ended, held",
+            "a daemon of the same start is no successor"
+        );
+    }
+
+    /// With no process identity, which is what Windows always has, the daemon has ended where the
+    /// lock is free and nobody answers at its endpoint, is replaced where a daemon of another
+    /// generation answers, and is not ended where it answers or cannot be seen; no process is
+    /// read, and the lock that cannot be looked at is said as that.
+    #[tokio::test(start_paused = true)]
+    async fn with_no_identity_the_end_is_a_free_lock_and_an_endpoint_nobody_answers() {
+        for (held, look, expected) in [
+            (Ok(false), Endpoint::Nobody, "gone"),
+            (Ok(false), Endpoint::Another, "successor None"),
+            (Ok(false), Endpoint::Same, "not ended, running"),
+            (Ok(false), Endpoint::Unclear, "not ended, running"),
+            (Ok(true), Endpoint::Another, "successor None"),
+            (Ok(true), Endpoint::Nobody, "not ended, running"),
+            (Ok(true), Endpoint::Same, "not ended, running"),
+            (
+                Err(Shown::said("the lock could not be taken")),
+                Endpoint::Nobody,
+                "not ended, not looked at",
+            ),
+        ] {
+            let supplied = Supplied::new()
+                .held(vec![at_once(held.clone())])
+                .look(vec![at_once(look)]);
+            let ended = wait_for_the_end(&supplied, None, END_BOUND).await;
+            assert_eq!(said(&ended), expected, "{held:?} {look:?}");
+            assert!(
+                !supplied
+                    .calls()
+                    .iter()
+                    .any(|(_, call)| *call == Call::ProcessState),
+                "with no identity no process is read"
+            );
+        }
+    }
+
+    /// What `ask` makes of a request it cannot compose on a connection whose daemon says its hello
+    /// and then closes the connection, with a frame that cannot be read before the close where
+    /// `bad_frame`: the `closed` that it gives, from the real failure of the real client.
+    async fn closed_after_the_hello(bad_frame: bool) -> bool {
+        use kr_ipc::client::LocalClient;
+        use kr_protocol::local::LocalClientKind;
+        use kr_protocol::scalars::CanonicalSet;
+
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = temp.environment();
+        let id = environment.environment_id();
+        let endpoint = environment.controller_endpoint().expect("an endpoint");
+        let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
+        let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+        let boot_epoch = kr_ipc::identity::boot_epoch(&boot).expect("a boot epoch");
+        let daemon = tokio::spawn(async move {
+            let (connection, peer) = listener.accept().await.expect("a connection");
+            let (mut reader, mut writer) =
+                kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+            let connection_id = kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid());
+            let hello = reader
+                .read_message::<ControlFrame>()
+                .await
+                .expect("a hello");
+            assert!(
+                matches!(hello, ControlFrame::Hello(_)),
+                "the client says hello"
+            );
+            let ack = kr_protocol::local::LocalHelloAck {
+                selected_version: kr_protocol::hello::PROTOCOL_VERSION,
+                role: kr_protocol::local::LocalRole::Controller,
+                connection_id,
+                environment_id: id,
+                boot_identity: boot,
+                peer: peer.to_wire(),
+                action_window: kr_protocol::hello::ActionWindow {
+                    action_window_id: kr_protocol::ids::ActionWindowId::new("test-daemon")
+                        .expect("a window identifier"),
+                    connection_id,
+                    boot_epoch,
+                    issued_at_ms: kr_protocol::scalars::TimestampMs::new(0),
+                    valid_for_ms: kr_protocol::scalars::DurationMs::new(600_000),
+                },
+                capabilities: CanonicalSet::new(),
+                max_receive: kr_protocol::hello::ReceiveLimits::default(),
+                build: Some(kr_protocol::local::LocalBuild {
+                    build_id: crate::build_id(),
+                    protocol_version: kr_protocol::hello::PACKAGE_VERSION,
+                }),
+            };
+            writer
+                .write_message(&ControlFrame::HelloAck(Box::new(ack)))
+                .await
+                .expect("the ack");
+            if bad_frame {
+                let codec =
+                    kr_protocol::frame::FrameCodec::new(kr_protocol::frame::StreamKind::Control);
+                let bytes = codec.encode(&[0xff, 0xff]).expect("frames");
+                writer.write_frame(&bytes).await.expect("the bad frame");
+            }
+            // The connection closes here, with the answer and the frame already written.
+        });
+        let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, crate::build_id())
+            .await
+            .expect("connects");
+        daemon.await.expect("the daemon has closed the connection");
+        let progress = Progress {
+            stage: AtomicU8::new(Stage::BeforeAsking as u8),
+            marker: Mutex::new(None),
+            environment_id: id,
+            earlier: Mutex::new(Vec::new()),
+        };
+        match ask(&mut client, id, true, &progress).await {
+            Asked::NotComposed { closed, .. } => closed,
+            _ => panic!("the request could be composed"),
+        }
+    }
+
+    /// A connection that the daemon closed is a closed connection, as the command reads the failure
+    /// of the real client's compose.
+    #[tokio::test]
+    async fn the_failure_of_a_closed_peer_is_a_closed_connection() {
+        assert!(closed_after_the_hello(false).await);
+        assert!(closed_by_the_daemon(&kr_ipc::IpcError::PeerClosed));
+    }
+
+    /// A frame that cannot be read is not a close: the command takes the daemon for one that
+    /// stays and looks at its endpoint.
+    #[tokio::test]
+    async fn the_failure_of_a_bad_frame_is_not_a_closed_connection() {
+        assert!(!closed_after_the_hello(true).await);
+    }
 }
