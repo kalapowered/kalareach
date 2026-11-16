@@ -181,7 +181,7 @@ async fn nothing_ends_and_the_answer_is_written_whole(record: Record) {
     assert!(found.stood, "the connection stands");
     assert_eq!(
         found.frames,
-        [found.answer.clone()],
+        std::slice::from_ref(&found.answer),
         "{record:?} was written"
     );
 }
