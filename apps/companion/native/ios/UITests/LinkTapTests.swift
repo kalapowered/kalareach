@@ -17,13 +17,13 @@
 
 import XCTest
 
-final class LinkTapTests: HarnessTestCase {
-    private static let largest = "UICTContentSizeCategoryAccessibilityXXXL"
+// BEGIN RULES
+// What a link tap must do, as plain functions of the page's record. They use no UIKit and no XCTest, so the lines of a session can be
+// held to them on a Mac with no simulator: everything between BEGIN RULES and END RULES compiles alone with Foundation.
 
-    // MARK: What the page records
-
+enum LinkTapRules {
     /// One event the page saw, in the order it saw it.
-    private struct Seen {
+    struct Seen {
         let order: Int
         let type: String
         let target: String
@@ -34,21 +34,267 @@ final class LinkTapTests: HarnessTestCase {
         let kind: String
         let pointer: String
         let pointerType: String
-        /// At a pointer down and at a click: the name of the link that the page's press handling had lit by then, or nil.
-        /// The click's is the look at the click, which plain text gets only there; a press on plain text lights nothing.
+        /// At a pointer down, a pointer up and a click: every link that had the look by then, by name, joined with commas, or nil
+        /// where none had. A press on plain text lights nothing, and the look at a click is the one link that opens.
         let lit: String?
         /// The page's clock when the record read the event, in milliseconds: the clock of the page's own press handling.
         let at: Double?
+        /// The page's clock when the event itself was made, in milliseconds: a click's own time, which no load on the page delays.
+        let born: Double?
     }
 
     /// One change of the pressed look that the page saw: a link got it (`on`) or lost it, after the event with the
     /// number `after`, at `at` milliseconds on the page's clock.
-    private struct Look: Hashable {
+    struct Look: Hashable {
         let after: Int
         let on: Bool
         let name: String
         let at: Double
     }
+
+    /// What one tap did, as the page saw it, and the links that were lit when it began.
+    struct Tap {
+        let label: String
+        let events: [Seen]
+        let looks: [Look]
+        let opened: [String]
+        let focus: String
+        let litBefore: [String]
+    }
+
+    private static func time(_ field: Substring, _ prefix: String) -> Double? {
+        field.hasPrefix(prefix) ? Double(field.dropFirst(prefix.count)) : nil
+    }
+
+    /// The text of the page's `TAPLOG` line without its label: its events and the changes of the look, oldest first.
+    static func parse(_ text: String) -> (events: [Seen], looks: [Look]) {
+        var events: [Seen] = []
+        var looks: [Look] = []
+        for part in text.components(separatedBy: " ; ") {
+            let fields = part.split(separator: " ")
+            if fields.count == 5, fields[0] == "V", let after = Int(fields[1]), let at = time(fields[4], "t=") {
+                looks.append(Look(after: after, on: fields[2] == "on", name: String(fields[3]), at: at))
+                continue
+            }
+            guard fields.count >= 11, fields[0] == "E", let order = Int(fields[1]), let detail = Int(fields[5]),
+                let x = Double(fields[6]), let y = Double(fields[7])
+            else { continue }
+            let lit = fields.count > 11 && fields[11].hasPrefix("lit=") ? String(fields[11].dropFirst(4)) : "-"
+            events.append(Seen(
+                order: order, type: String(fields[2]), target: String(fields[3]), trusted: fields[4] == "1", detail: detail,
+                point: CGPoint(x: x, y: y), kind: String(fields[8]), pointer: String(fields[9]), pointerType: String(fields[10]),
+                lit: lit == "-" ? nil : lit,
+                at: fields.count > 12 ? time(fields[12], "t=") : nil,
+                born: fields.count > 13 ? time(fields[13], "e=") : nil
+            ))
+        }
+        return (events, looks)
+    }
+
+    /// The text of a `TAPLIT` line without its label: the links that are lit, by name; none for `-`.
+    static func parseLit(_ text: String) -> [String] {
+        let names = text.trimmingCharacters(in: .whitespaces)
+        return names.isEmpty || names == "-" ? [] : names.split(separator: ",").map(String.init)
+    }
+
+    /// The name that an element's description carries between its parentheses, the link's own name: every element in a link has it.
+    static func linkName(of target: String) -> String? {
+        guard let open = target.lastIndex(of: "("), target.hasSuffix(")") else { return nil }
+        return String(target[target.index(after: open)..<target.index(before: target.endIndex)])
+    }
+
+    /// The link's name at the end of an address the host opened.
+    static func name(ofAddress address: String) -> String {
+        String(address.split(separator: "/").last ?? "")
+    }
+
+    static func pressOf(_ tap: Tap) -> Seen? { tap.events.first { $0.type == "pointerdown" } }
+    static func releaseOf(_ tap: Tap) -> Seen? { tap.events.first { $0.type == "pointerup" } }
+    static func clickOf(_ tap: Tap) -> Seen? { tap.events.first { $0.type == "click" && $0.trusted } }
+
+    /// What the system's click named: `none`, `link` (a link's own element), `control` (another button), `composer` (the text
+    /// field) or `plain text` (the pane, a message or anything else, where only the page decides).
+    static func clickKind(_ tap: Tap) -> String {
+        guard let click = clickOf(tap) else { return "none" }
+        if linkName(of: click.target) != nil { return "link" }
+        if click.target.hasPrefix("button") { return "control" }
+        return click.target.hasPrefix("textarea") ? "composer" : "plain text"
+    }
+
+    /// The links that have the look at a time on the page's clock: those lit when the tap began, then every change that the
+    /// record's look lines made up to that time.
+    static func lit(_ tap: Tap, at time: Double) -> Set<String> {
+        var set = Set(tap.litBefore)
+        for look in tap.looks where look.at <= time {
+            if look.on { set.insert(look.name) } else { set.remove(look.name) }
+        }
+        return set
+    }
+
+    /// The least slack, in milliseconds, between the page's clock at an event's own time and at the record's read of a look change:
+    /// the two clocks are read apart and the engine rounds both, so a look that is `on` within this of a click's time came with the click.
+    static let clockSlack = 2.0
+
+    /// The look against what the tap did, or nil where they agree. The four rules, at every tap and for the WHOLE press:
+    /// (0) No link is lit when a tap starts.
+    /// (1) AT THE CLICK the lit link is the link that opens, with no exception: where the system's click names a link's
+    /// element, that link, and the record's list of the links opened is exactly that link; where it names plain text, the one link
+    /// the page opens from it, or none; where it names a control, none, and nothing opens. A click line has its times.
+    /// (2) AT THE PRESS AND UNTIL THE CLICK (or, where no click comes, until the tap's end) nothing is lit after a press on plain text
+    /// or on a control, and after a press on a link's own element only that link is lit.
+    /// (3) Where the press lit another link than the click opens, that first link's look is OFF at the click: never two links lit,
+    /// never the first left lit, read from the record's look lines and from the lines' `lit=` lists.
+    /// (4) No link opens that is not lit at its click, and where no click comes nothing opens.
+    /// A tap that gets no trusted click fails unless `clickExpected` is false; a tap whose pointer the page never saw fails unless
+    /// `pointerExpected` is false.
+    static func disagreement(_ tap: Tap, clickExpected: Bool = true, pointerExpected: Bool = true) -> String? {
+        if !tap.litBefore.isEmpty { return "lit before the tap began: \(tap.litBefore.joined(separator: ","))" }
+        let down = pressOf(tap)
+        if down == nil, pointerExpected { return "the page saw no pointer down: \(tap.events.map(\.type))" }
+        let clicked = clickOf(tap)
+        if let clicked, clicked.at == nil || clicked.born == nil { return "the click's line has no time (t= and e=): \(clicked.target)" }
+        let own = down.flatMap { linkName(of: $0.target) }
+        let pressedOn = down?.target ?? "no pointer down"
+        // (2) The press and the release: the links lit then are none, or the link whose own element the pointer named.
+        for event in [down, releaseOf(tap)].compactMap({ $0 }) {
+            if let lit = event.lit, lit != own { return "\(lit) lit at the \(event.type == "pointerdown" ? "press" : "release") on \(pressedOn)" }
+        }
+        // (2) The whole press: no look comes on before the click (or at all where no click comes), but the own link's.
+        let until = clicked?.born.map { $0 - clockSlack } ?? .infinity
+        for look in tap.looks where look.on && look.at < until {
+            if look.name != own {
+                return "\(look.name) lit at \(look.at) ms, \(clicked == nil ? "in a tap that got no click" : "before the click"), after a press on \(pressedOn)"
+            }
+        }
+        guard let click = clicked, let at = click.at else {
+            if !tap.opened.isEmpty { return "\(tap.opened) opened and no trusted click came" }
+            return clickExpected ? "no trusted click arrived" : nil
+        }
+        // (1) What the click opens, and the record's list of the links opened.
+        let opens: String?
+        if let named = linkName(of: click.target) {
+            guard tap.opened.count == 1, name(ofAddress: tap.opened[0]) == named else {
+                return "the click named \(click.target), the links that opened: \(tap.opened)"
+            }
+            opens = named
+        } else if click.target.hasPrefix("button") {
+            guard tap.opened.isEmpty else { return "the click named the control \(click.target), the links that opened: \(tap.opened)" }
+            opens = nil
+        } else {
+            guard tap.opened.count <= 1 else { return "the click named plain text \(click.target), the links that opened: \(tap.opened)" }
+            opens = tap.opened.last.map(name(ofAddress:))
+        }
+        if click.lit != opens { return "the click named \(click.target), lit \(click.lit ?? "nothing") at the click, the link that opens is \(opens ?? "none")" }
+        // (3) and (4) The links lit at the click, from the record's look lines.
+        let set = lit(tap, at: at)
+        if set != Set(opens.map { [$0] } ?? []) { return "the links lit at the click: \(set.sorted()), the link that opens: \(opens ?? "none")" }
+        for address in tap.opened where !set.contains(name(ofAddress: address)) { return "\(address) opened and was not lit at the click" }
+        return nil
+    }
+
+    /// A press in the gap below the pane. The page's rule reads the press's point, so a press there lights nothing and opens nothing,
+    /// whether the engine gives no click or moves a click onto plain text or the composer inside the pane. A click that the
+    /// engine moves onto the last link's own element opens it once; `disagreement` holds that only it is lit.
+    static func gapDisagreement(_ tap: Tap, paneBottom: CGFloat) -> String? {
+        guard let down = pressOf(tap) else { return "the page saw no pointer down: \(tap.events.map(\.type))" }
+        if down.point.y <= paneBottom { return "the press was at y \(down.point.y), not below the pane's edge at \(paneBottom)" }
+        if linkName(of: down.target) != nil { return "the press named a link's element \(down.target)" }
+        let clicked = clickOf(tap)
+        if let clicked, let named = linkName(of: clicked.target) {
+            guard tap.opened.count == 1, name(ofAddress: tap.opened[0]) == named else {
+                return "the click named \(clicked.target) and the links that opened are \(tap.opened)"
+            }
+            return nil
+        }
+        if let look = tap.looks.first(where: \.on) { return "\(look.name) was lit by a press in the gap (the click named \(clicked?.target ?? "none"))" }
+        if !tap.opened.isEmpty { return "\(tap.opened) opened by a press in the gap (the click named \(clicked?.target ?? "none"))" }
+        return nil
+    }
+
+    /// The least time, in milliseconds, that the look stays after a click: the hold is 150 ms from the click, and the clock is
+    /// read to a millisecond.
+    static let leastHold = 149.0
+
+    /// A tap on plain text that opens a link: the look is not on before the release, and it ends at least `leastHold` after the click's
+    /// own time (not the record's read of the click, which a loaded page delays).
+    static func releaseDisagreement(_ tap: Tap, _ name: String) -> String? {
+        guard let down = pressOf(tap), let up = releaseOf(tap)?.at, let born = clickOf(tap)?.born else {
+            return "the record has no press, release or click with a time"
+        }
+        guard let on = tap.looks.first(where: { $0.on && $0.name == name }) else { return "the look never went on for \(name): \(tap.looks)" }
+        if linkName(of: down.target) == nil, on.at < up { return "the look went on at \(on.at) ms, before the release at \(up) ms, after a press on plain text" }
+        guard let off = tap.looks.first(where: { !$0.on && $0.name == name && $0.at > born }) else {
+            return "the look did not end after the click: \(tap.looks)"
+        }
+        if off.at - born < leastHold { return "the look ended \(off.at - born) ms after the click's own time" }
+        return nil
+    }
+
+    // MARK: The band between two stacked links
+
+    /// One tap of the walk across the border of two links: the touch row the page saw the pointer in (the simulator puts a touch on the
+    /// pixel grid, a third of a point), the link whose element the pointer-down named and the link the click named.
+    struct BandStep: Equatable {
+        let row: Int
+        let down: String?
+        let click: String?
+    }
+
+    /// The touch row of a page coordinate.
+    static func row(of y: CGFloat) -> Int { Int((Double(y) * 3).rounded()) }
+
+    /// A tap as a step of the walk, or nil where the page saw no pointer down.
+    static func bandStep(of tap: Tap) -> BandStep? {
+        guard let down = pressOf(tap) else { return nil }
+        return BandStep(row: row(of: down.point.y), down: linkName(of: down.target), click: clickOf(tap).flatMap { linkName(of: $0.target) })
+    }
+
+    /// Whether the pointer-down and the click named different links.
+    static func differs(_ step: BandStep) -> Bool {
+        guard let down = step.down, let click = step.click else { return false }
+        return down != click
+    }
+
+    /// Where the opened link changes in a sweep: the first two neighbouring rows that opened two different links, as the points
+    /// that bound the change and the link before it; nil where the sweep shows no change.
+    static func firstChange(_ owners: [(y: CGFloat, name: String)]) -> (low: CGFloat, high: CGFloat, before: String)? {
+        for (before, after) in zip(owners, owners.dropFirst()) where before.name != after.name {
+            return (before.y, after.y, before.name)
+        }
+        return nil
+    }
+
+    /// Whether a walk away from the border has gone past the band: its last two steps lie on two touch rows and have the pointer-down
+    /// and the click both on `far`, the link at that end of the walk.
+    static func pastTheBand(_ steps: [BandStep], far: String) -> Bool {
+        let tail = steps.suffix(2)
+        guard tail.count == 2, Set(tail.map(\.row)).count == 2 else { return false }
+        return tail.allSatisfy { $0.down == far && $0.click == far }
+    }
+
+    /// The touch rows at which the pointer-down and the click named different links, in the steps of both walks.
+    static func bandRows(_ steps: [BandStep]) -> [Int] {
+        Array(Set(steps.filter(differs).map(\.row))).sorted()
+    }
+
+    /// The band must be narrower than two touch rows: at most one row of the walk has the pointer-down and the click on different
+    /// links, and the rows past it on both sides agree (`pastTheBand`, which the walk checks).
+    static func bandDisagreement(_ steps: [BandStep]) -> String? {
+        let rows = bandRows(steps)
+        if rows.count > 1 { return "the pointer-down and the click named different links on \(rows.count) touch rows \(rows) (a row is a third of a point): not narrower than two rows" }
+        return nil
+    }
+}
+// END RULES
+
+final class LinkTapTests: HarnessTestCase {
+    private static let largest = "UICTContentSizeCategoryAccessibilityXXXL"
+
+    // MARK: What the page records
+
+    private typealias Seen = LinkTapRules.Seen
+    private typealias Look = LinkTapRules.Look
+    private typealias Result = LinkTapRules.Tap
 
     /// One link of the conversation as the page lays it out now: its box, the rectangles of its words and its view,
     /// the part of the page that every box clipping the link leaves of it.
@@ -70,31 +316,14 @@ final class LinkTapTests: HarnessTestCase {
         tokens.compactMap { Double($0) }.map { CGFloat($0) }
     }
 
-    private func time(_ field: Substring) -> Double? {
-        field.hasPrefix("t=") ? Double(field.dropFirst(2)) : nil
-    }
-
     /// The page's tap record: its events and the changes of the look, oldest first.
     private func record() -> (events: [Seen], looks: [Look]) {
-        var events: [Seen] = []
-        var looks: [Look] = []
-        for part in recordText("TAPLOG").dropFirst("TAPLOG".count).components(separatedBy: " ; ") {
-            let fields = part.split(separator: " ")
-            if fields.count == 5, fields[0] == "V", let after = Int(fields[1]), let at = time(fields[4]) {
-                looks.append(Look(after: after, on: fields[2] == "on", name: String(fields[3]), at: at))
-                continue
-            }
-            guard fields.count >= 11, fields[0] == "E", let order = Int(fields[1]), let detail = Int(fields[5]),
-                let x = Double(fields[6]), let y = Double(fields[7])
-            else { continue }
-            let lit = fields.count > 11 && fields[11].hasPrefix("lit=") ? String(fields[11].dropFirst(4)) : "-"
-            events.append(Seen(
-                order: order, type: String(fields[2]), target: String(fields[3]), trusted: fields[4] == "1", detail: detail,
-                point: CGPoint(x: x, y: y), kind: String(fields[8]), pointer: String(fields[9]), pointerType: String(fields[10]),
-                lit: lit == "-" ? nil : lit, at: fields.count > 12 ? time(fields[12]) : nil
-            ))
-        }
-        return (events, looks)
+        LinkTapRules.parse(String(recordText("TAPLOG").dropFirst("TAPLOG".count)))
+    }
+
+    /// The links that are lit now.
+    private func litNow() -> [String] {
+        LinkTapRules.parseLit(String(recordText("TAPLIT").dropFirst("TAPLIT".count)))
     }
 
     /// The links of the conversation, in the page's own units: a point of the page is a point of the screen.
@@ -171,15 +400,6 @@ final class LinkTapTests: HarnessTestCase {
 
     // MARK: Taps
 
-    /// What one tap did, as the page saw it.
-    private struct Result {
-        let label: String
-        let events: [Seen]
-        let looks: [Look]
-        let opened: [String]
-        let focus: String
-    }
-
     /// What every tap's release-to-click time was, on the page's clock, for the summary at the run's end.
     private var clickDelays: [(label: String, delay: Double)] = []
 
@@ -188,16 +408,19 @@ final class LinkTapTests: HarnessTestCase {
     }
 
     /// Taps a point of the page, or holds a finger on it for `hold` seconds, and reports what happened after the last
-    /// event the record had before.
+    /// event the record had before. Every tap is held to the four rules of `LinkTapRules.disagreement`, the whole press and
+    /// the click, and begins with no link lit.
     ///
     /// `within` holds the page's own pointer point to the requested point: the tap fails where the page saw the pointer farther
     /// from the point than that on either axis, so a calibration that is wrong fails the tap and does not move the samples.
     /// `clickExpected` is false for a press that the platform may leave without a click (a long press).
-    private func tap(_ label: String, at point: CGPoint, shift: CGVector, hold: TimeInterval = 0, clickExpected: Bool = true, within tolerance: CGFloat? = nil) -> Result {
+    /// `pointerExpected` is false for a step that expects the page to see no press at all.
+    private func tap(_ label: String, at point: CGPoint, shift: CGVector, hold: TimeInterval = 0, clickExpected: Bool = true, pointerExpected: Bool = true, within tolerance: CGFloat? = nil) -> Result {
         let first = record()
         let before = first.events.last?.order ?? 0
         let looksBefore = Set(first.looks)
         let openedBefore = opened().count
+        let litBefore = litNow()
         if hold > 0 {
             screenPoint(point, shift).press(forDuration: hold)
         } else {
@@ -207,17 +430,13 @@ final class LinkTapTests: HarnessTestCase {
         let last = record()
         let seen = last.events.filter { $0.order > before }
         let now = opened()
-        let result = Result(label: label, events: seen, looks: last.looks.filter { !looksBefore.contains($0) }, opened: Array(now.dropFirst(openedBefore)), focus: recordText("TAPFOCUS"))
+        let result = Result(label: label, events: seen, looks: last.looks.filter { !looksBefore.contains($0) }, opened: Array(now.dropFirst(openedBefore)), focus: recordText("TAPFOCUS"), litBefore: litBefore)
         report(result, at: point)
-        if let tolerance {
-            if let down = seen.first(where: { $0.type == "pointerdown" }) {
-                XCTAssertLessThanOrEqual(abs(down.point.x - point.x), tolerance, "\(label): the page saw the pointer at x \(down.point.x), the requested point is x \(point.x)")
-                XCTAssertLessThanOrEqual(abs(down.point.y - point.y), tolerance, "\(label): the page saw the pointer at y \(down.point.y), the requested point is y \(point.y)")
-            } else {
-                XCTFail("\(label): the page saw no pointer down")
-            }
+        if let tolerance, let down = seen.first(where: { $0.type == "pointerdown" }) {
+            XCTAssertLessThanOrEqual(abs(down.point.x - point.x), tolerance, "\(label): the page saw the pointer at x \(down.point.x), the requested point is x \(point.x)")
+            XCTAssertLessThanOrEqual(abs(down.point.y - point.y), tolerance, "\(label): the page saw the pointer at y \(down.point.y), the requested point is y \(point.y)")
         }
-        if let disagreement = lookDisagreement(result, clickExpected: clickExpected) { XCTFail("\(label): the pressed look and the click disagree: \(disagreement)") }
+        if let disagreement = LinkTapRules.disagreement(result, clickExpected: clickExpected, pointerExpected: pointerExpected) { XCTFail("\(label): the pressed look and the click disagree: \(disagreement)") }
         return result
     }
 
@@ -232,6 +451,7 @@ final class LinkTapTests: HarnessTestCase {
         let before = first.events.last?.order ?? 0
         let looksBefore = Set(first.looks)
         let openedBefore = opened().count
+        let litBefore = litNow()
         let start = screenPoint(point, shift)
         let end = screenPoint(CGPoint(x: point.x + distance.dx, y: point.y + distance.dy), shift)
         // A swipe at the system's own speed, which the page takes for a scroll.
@@ -239,8 +459,9 @@ final class LinkTapTests: HarnessTestCase {
         Thread.sleep(forTimeInterval: 1.2)
         let last = record()
         let seen = last.events.filter { $0.order > before }
-        let result = Result(label: label, events: seen, looks: last.looks.filter { !looksBefore.contains($0) }, opened: Array(opened().dropFirst(openedBefore)), focus: "\(recordText("TAPFOCUS")) scrolled \(Int(pane().top))")
+        let result = Result(label: label, events: seen, looks: last.looks.filter { !looksBefore.contains($0) }, opened: Array(opened().dropFirst(openedBefore)), focus: "\(recordText("TAPFOCUS")) scrolled \(Int(pane().top))", litBefore: litBefore)
         report(result, at: point)
+        XCTAssertTrue(litBefore.isEmpty, "\(label): lit before the drag began: \(litBefore)")
         return result
     }
 
@@ -250,14 +471,15 @@ final class LinkTapTests: HarnessTestCase {
         let list = result.events.map {
             "\($0.type)(\($0.target),\($0.trusted ? "trusted" : "synthetic"),detail \($0.detail),\($0.kind) pointer \($0.pointer) \($0.pointerType),at \(String(format: "%.1f %.1f", $0.point.x, $0.point.y)))"
         }.joined(separator: " ")
-        say("LINKTAP \(result.label) at (\(Int(point.x)), \(Int(point.y))): \(list.isEmpty ? "no events" : list) | the click named: \(named(result)) | lit at the press: \(pressLook(result) ?? "nothing") | lit at the click: \(clickLook(result) ?? "nothing") | press-to-click(\(clickKind(result))): \(away(result).map { String(format: "%.1f", $0) } ?? "no click") | \(timing(result)) | pointer point off by \(pointerOff(result, at: point)) | opened: \(result.opened.isEmpty ? "nothing" : result.opened.joined(separator: " ")) | \(result.focus)")
+        say("LINKTAP \(result.label) at (\(Int(point.x)), \(Int(point.y))): \(list.isEmpty ? "no events" : list) | the click named: \(named(result)) | lit before the tap: \(result.litBefore.isEmpty ? "nothing" : result.litBefore.joined(separator: ",")) | lit at the press: \(pressLook(result) ?? "nothing") | lit at the click: \(clickLook(result) ?? "nothing") | press-to-click(\(clickKind(result))): \(away(result).map { String(format: "%.1f", $0) } ?? "no click") | \(timing(result)) | pointer point off by \(pointerOff(result, at: point)) | opened: \(result.opened.isEmpty ? "nothing" : result.opened.joined(separator: " ")) | \(result.focus)")
     }
 
     /// How long after the pointer's release the system's click came, in milliseconds on the page's clock, or nil where
     /// no click came. A click later than the look's hold (150 ms) after the release finds the look gone and lights it again.
     private func releaseToClick(_ result: Result) -> Double? {
         guard let up = result.events.first(where: { $0.type == "pointerup" })?.at,
-            let click = result.events.first(where: { $0.type == "click" && $0.trusted })?.at
+            let clicked = result.events.first(where: { $0.type == "click" && $0.trusted }),
+            let click = clicked.born ?? clicked.at
         else { return nil }
         return click - up
     }
@@ -284,12 +506,8 @@ final class LinkTapTests: HarnessTestCase {
         say("LINKTAP \(named): release-to-click on the page's clock: \(clickDelays.count) taps got a click, largest \(largest) ms, later than 150 ms: \(late.count) \(detail)")
     }
 
-    /// What the system's click landed on, for the two distances that are logged apart: `element` (a link's button or another
-    /// control, where the platform's adjustment or the tap itself chose it) and `plain text` (where only the page decides).
-    private func clickKind(_ result: Result) -> String {
-        guard let click = result.events.first(where: { $0.type == "click" && $0.trusted }) else { return "none" }
-        return click.target.contains("md-link") || click.target.hasPrefix("button") ? "element" : "plain text"
-    }
+    /// What the system's click landed on: a link's own element, a control, the composer or plain text, where only the page decides.
+    private func clickKind(_ result: Result) -> String { LinkTapRules.clickKind(result) }
 
     /// How far the page's own pointer point lay from the point that was requested, as two signed numbers.
     private func pointerOff(_ result: Result, at point: CGPoint) -> String {
@@ -304,10 +522,7 @@ final class LinkTapTests: HarnessTestCase {
     }
 
     /// The name that an element's description carries between its parentheses, the link's own name.
-    private func linkName(of target: String) -> String? {
-        guard let open = target.lastIndex(of: "("), target.hasSuffix(")") else { return nil }
-        return String(target[target.index(after: open)..<target.index(before: target.endIndex)])
-    }
+    private func linkName(of target: String) -> String? { LinkTapRules.linkName(of: target) }
 
     /// The look the page had lit at the pointer's press, or nil.
     private func pressLook(_ result: Result) -> String? {
@@ -317,70 +532,6 @@ final class LinkTapTests: HarnessTestCase {
     /// The look the page had lit at the system's trusted click, or nil.
     private func clickLook(_ result: Result) -> String? {
         result.events.first(where: { $0.type == "click" && $0.trusted })?.lit
-    }
-
-    /// Whether an event's target is neither a link's own element nor a control: plain text, the pane or its message.
-    private func isPlainText(_ target: String) -> Bool {
-        !target.contains("md-link") && !target.hasPrefix("button")
-    }
-
-    /// The links that have the look at a time on the page's clock, from the changes of the look that this tap made (the tap
-    /// begins with none lit: the earlier tap's look ended during its own wait).
-    private func lit(_ result: Result, at time: Double) -> Set<String> {
-        var set = Set<String>()
-        for look in result.looks where look.at <= time {
-            if look.on { set.insert(look.name) } else { set.remove(look.name) }
-        }
-        return set
-    }
-
-    /// The look against what the tap did, or nil where they agree. A tap with no trusted click of the system's does not agree
-    /// (unless `clickExpected` is false). The rule:
-    /// (1) AT THE CLICK the lit link is the link that opens, at every step, with no exception: the link the system's click names,
-    /// or, where it names plain text, the link the page opens from it; a control's click and a click that opens nothing have none.
-    /// (2) AT THE PRESS the look is none, or the link that the click opens, or the link whose OWN element the pointer-down named;
-    /// a press on plain text, or on a control, stays none.
-    /// (3) Where the press lit another link than the click opens, that first link's look is OFF at the click: never two links
-    /// lit, never the first left lit. This is read from the record's look lines, not only from the one name the click's line gives.
-    /// (4) No link opens that is not lit at its click.
-    private func lookDisagreement(_ result: Result, clickExpected: Bool = true) -> String? {
-        // Without the system's click there is nothing to hold the look to: a tap that gets none fails, since the look
-        // would then pass whatever it lit.
-        guard let click = result.events.first(where: { $0.type == "click" && $0.trusted }) else { return clickExpected ? "no trusted click arrived" : nil }
-        let press = pressLook(result)
-        let atClick = click.lit
-        let pressTarget = result.events.first(where: { $0.type == "pointerdown" })?.target
-        // What the click opens: the link whose button it names, or the link the page opened from plain text.
-        let opens: String?
-        if click.target.contains("md-link") {
-            opens = linkName(of: click.target)
-        } else if click.target.hasPrefix("button") {
-            opens = nil
-        } else {
-            opens = result.opened.last.map { String($0.split(separator: "/").last ?? "") }
-        }
-        // (1) The click's own line.
-        if atClick != opens {
-            return "the click named \(click.target), lit \(atClick ?? "nothing") at the click, the link that opens is \(opens ?? "none")"
-        }
-        // (2) The press.
-        if let press {
-            let own = pressTarget.flatMap { $0.contains("md-link") ? linkName(of: $0) : nil }
-            if own == nil || (press != own && press != opens) {
-                return "lit \(press) at the press on \(pressTarget ?? "no press"), the click opens \(opens ?? "none")"
-            }
-        }
-        // (3) and (4) The links lit at the click, from the record's look lines.
-        if let time = click.at {
-            let set = lit(result, at: time)
-            let expected: Set<String> = opens.map { [$0] } ?? []
-            if set != expected { return "the links lit at the click: \(set.sorted()), the link that opens: \(opens ?? "none")" }
-        }
-        for address in result.opened {
-            let name = String(address.split(separator: "/").last ?? "")
-            if let time = click.at, !lit(result, at: time).contains(name) { return "\(name) opened and was not lit at the click" }
-        }
-        return nil
     }
 
     /// What the system's click named, and whether the page added a click of its own: `button` (the link's own, by the
@@ -437,26 +588,32 @@ final class LinkTapTests: HarnessTestCase {
         )
     }
 
-    /// Scrolls the conversation until a link's words lie near the middle of the screen, and reads the link again.
-    private func scroll(to name: String, attempts: Int = 10) -> Link {
-        for attempt in 0..<attempts {
+    /// Scrolls the conversation until a link's words lie near the middle of the screen, and reads the link again. It fails where the
+    /// words are not near after `attempts` drags: a tap on a link that is off the screen reaches nothing, and no step may go on as if it had.
+    private func scroll(to name: String, attempts: Int = 40) -> Link {
+        func measure() -> (link: Link, shift: CGVector, room: CGRect, distance: CGFloat) {
             let current = link(name)
             let shift = offset(of: current)
             let room = pane().room
             let screenY = (current.words.first?.midY ?? 0) + shift.dy
             // The middle of the pane as it is now, which the keyboard can have made short.
-            let distance = screenY - (room.midY + shift.dy)
-            if abs(distance) < 60 { return current }
+            return (current, shift, room, screenY - (room.midY + shift.dy))
+        }
+        for attempt in 0..<attempts {
+            let now = measure()
+            if abs(now.distance) < 60 { return now.link }
             // A drag from the middle of the pane moves the content with the finger; a drag that starts on a link scrolls too.
             // The frame that the system gives a button far off the screen can be wrong: after eight drags that have not brought the
             // link near, the drag starts at the middle of the screen, where the pane lies at both text sizes.
-            if attempt == 8 { say("LINKLOOK scroll to \(name): not near after 8 drags: its first line is \(current.words.first ?? .zero), the pane \(room), the button's offset \(shift)") }
-            let start = attempt < 8 ? screenPoint(CGPoint(x: room.midX, y: room.midY), shift) : app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
-            let end = start.withOffset(CGVector(dx: 0, dy: -max(min(distance, 300), -300)))
+            if attempt == 8 { say("LINKLOOK scroll to \(name): not near after 8 drags: its first line is \(now.link.words.first ?? .zero), the pane \(now.room), the button's offset \(now.shift)") }
+            let start = attempt < 8 ? screenPoint(CGPoint(x: now.room.midX, y: now.room.midY), now.shift) : app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            let end = start.withOffset(CGVector(dx: 0, dy: -max(min(now.distance, 300), -300)))
             start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.3)
             Thread.sleep(forTimeInterval: 1.0)
         }
-        return link(name)
+        let last = measure()
+        XCTAssertLessThan(abs(last.distance), 60, "scroll to \(name): the link's words are \(last.distance) points from the middle of the pane after \(attempts) drags (first line \(last.link.words.first ?? .zero), the pane \(last.room))")
+        return last.link
     }
 
     // MARK: The taps
@@ -537,29 +694,27 @@ final class LinkTapTests: HarnessTestCase {
         return CGRect(x: across.0, y: down.0, width: across.1 - across.0, height: down.1 - down.0)
     }
 
-    /// A tap outside the area that lands on the link's own button: the system's click names the button, the page adds
-    /// no click, the look at the press is none or that link, as for any press on a link's own element, and the look
-    /// at the click is that link.
+    /// A tap outside the area that lands on the link's own button: the system's click names the button, the page adds no
+    /// click, and the link opens once and has the look at the click (the tap's own check holds the look and the opening).
     private func expectOnTheLinksButton(_ result: Result, _ name: String, file: StaticString = #filePath, line: UInt = #line) {
         XCTAssertFalse(result.events.contains { $0.type == "click" && !$0.trusted }, "\(result.label): the page added a click on the link's own button", file: file, line: line)
-        if let disagreement = lookDisagreement(result) { XCTFail("\(result.label): \(disagreement)", file: file, line: line) }
         XCTAssertEqual(result.opened.count, 1, "\(result.label): the links that opened: \(result.opened), expected \(name) once", file: file, line: line)
         XCTAssertTrue(result.opened.allSatisfy { $0.hasSuffix(name) }, "\(result.label): opened \(result.opened), expected only \(name)", file: file, line: line)
     }
 
-    /// A tap outside the area: the page adds no click and lights nothing at the press, and nothing at the click unless the
-    /// platform's own adjustment opens the link there: then the system's click names the link's button and that link has
-    /// the look at the click.
+    /// A tap outside the area: the page adds no click and lights nothing at the press, and nothing opens unless the platform's own
+    /// adjustment moves the click onto the link's button: then the system's click names that link, which opens once and has the
+    /// look at the click. A click on plain text opens nothing here.
     private func expectNotOpenedByThePage(_ result: Result, _ name: String, file: StaticString = #filePath, line: UInt = #line) {
         XCTAssertFalse(result.events.contains { $0.type == "click" && !$0.trusted }, "\(result.label): the page added a click outside the area", file: file, line: line)
         XCTAssertNil(pressLook(result), "\(result.label): the look lit at the press outside the area", file: file, line: line)
         let click = result.events.first { $0.type == "click" && $0.trusted }
-        let named = click.flatMap { $0.target.contains("md-link") ? linkName(of: $0.target) : nil }
+        let named = click.flatMap { linkName(of: $0.target) }
         XCTAssertEqual(clickLook(result), named, "\(result.label): the look at the click outside the area, the click named \(click?.target ?? "none")", file: file, line: line)
-        if !result.opened.isEmpty {
-            XCTAssertTrue(click?.target.contains("md-link") ?? false, "\(result.label): opened \(result.opened) with a click that named \(click?.target ?? "none")", file: file, line: line)
-            XCTAssertEqual(result.opened.count, 1, "\(result.label): the links that opened: \(result.opened), expected \(name) once", file: file, line: line)
-            XCTAssertTrue(result.opened.allSatisfy { $0.hasSuffix(name) }, "\(result.label): opened \(result.opened), expected only \(name)", file: file, line: line)
+        if let named {
+            XCTAssertEqual(result.opened.map(LinkTapRules.name(ofAddress:)), [name], "\(result.label): the click named \(named), the links that opened: \(result.opened), expected \(name) once", file: file, line: line)
+        } else {
+            XCTAssertTrue(result.opened.isEmpty, "\(result.label): opened \(result.opened) with a click that named \(click?.target ?? "none")", file: file, line: line)
         }
     }
 
@@ -616,6 +771,20 @@ final class LinkTapTests: HarnessTestCase {
     }
 
 
+    /// A point of the conversation a line away from every link: 40 points beside a link's box and a line and 40 points above or below
+    /// it, on the pane's middle column; nil where there is none.
+    private func awayFromLinks() -> CGPoint? {
+        let all = links()
+        let room = pane().room
+        var y = room.minY + 12
+        while y < room.maxY - 12 {
+            let candidate = CGPoint(x: room.midX, y: y)
+            if all.allSatisfy({ !$0.box.insetBy(dx: -40, dy: -(40 + $0.line)).contains(candidate) }) { return candidate }
+            y += 6
+        }
+        return nil
+    }
+
     /// The taps at one text size. Each is made with the finger on the glass; the page reports what it saw.
     private func runTaps(size: String?, named: String) {
         continueAfterFailure = true
@@ -663,21 +832,12 @@ final class LinkTapTests: HarnessTestCase {
         }
 
         // One line away from every link, beyond the reach: nothing opens.
-        let all = links()
-        let room = pane().room
         let shiftNow = offset(of: link("docs"))
-        var away: CGPoint?
-        var y = room.minY + 12
-        while y < room.maxY - 12, away == nil {
-            let candidate = CGPoint(x: room.midX, y: y)
-            if all.allSatisfy({ !$0.box.insetBy(dx: -40, dy: -(40 + $0.line)).contains(candidate) }) { away = candidate }
-            y += 6
-        }
-        if let away {
+        if let away = awayFromLinks() {
             let result = tap("\(named): one line away from every link", at: away, shift: shiftNow)
             XCTAssertTrue(result.opened.isEmpty, "\(result.label): opened \(result.opened)")
         } else {
-            XCTFail("no point of the conversation lies a line away from every link: \(room)")
+            XCTFail("no point of the conversation lies a line away from every link: \(pane().room)")
         }
 
         // A paragraph with a link on the next line: the upper link's words, and the lower part of them, are the upper link's.
@@ -823,28 +983,10 @@ final class LinkTapTests: HarnessTestCase {
         return all.min { gap($0) < gap($1) }?.name
     }
 
-    /// A tap on plain text that opens a link: no look before the release, and the look stays at least 150 ms from the click
-    /// (the page's clock; the look's end is the first change after the click).
+    /// A tap on plain text that opens a link: no look before the release, and the look stays at least 150 ms from the click's own
+    /// time (the page's clock; the look's end is the first change after the click).
     private func expectTheLookAtTheRelease(_ result: Result, _ name: String, file: StaticString = #filePath, line: UInt = #line) {
-        guard let down = result.events.first(where: { $0.type == "pointerdown" }),
-            let up = result.events.first(where: { $0.type == "pointerup" })?.at,
-            let click = result.events.first(where: { $0.type == "click" && $0.trusted })?.at
-        else {
-            XCTFail("\(result.label): the record has no press, release or click with a time", file: file, line: line)
-            return
-        }
-        guard let firstOn = result.looks.first(where: { $0.on && $0.name == name }) else {
-            XCTFail("\(result.label): the look never went on for \(name): \(result.looks)", file: file, line: line)
-            return
-        }
-        if isPlainText(down.target) {
-            XCTAssertGreaterThanOrEqual(firstOn.at, up, "\(result.label): the look went on before the release of a press on plain text", file: file, line: line)
-        }
-        if let off = result.looks.first(where: { !$0.on && $0.name == name && $0.at > click }) {
-            XCTAssertGreaterThanOrEqual(off.at - click, 140, "\(result.label): the look ended \(off.at - click) ms after the click", file: file, line: line)
-        } else {
-            XCTFail("\(result.label): the look did not end after the click: \(result.looks)", file: file, line: line)
-        }
+        if let disagreement = LinkTapRules.releaseDisagreement(result, name) { XCTFail("\(result.label): \(disagreement)", file: file, line: line) }
     }
 
     /// A press held on plain text: no look at touch-down, none at the end of the hold, none turned on between.
