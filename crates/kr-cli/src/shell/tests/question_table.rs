@@ -127,7 +127,7 @@ const NOT_MADE: &[(&str, &str)] = &[
     (
         "timed_out (this host could not wait for the program)",
         "no stand-in makes a failed wait on a child that this host started; the question ends as a time-out does, \
-         the program is ended and reaped, and both sections of the last read found \"did not answer in time\" true of it",
+         the program is ended and reaped, so \"did not answer in time\" is true of it",
     ),
 ];
 
