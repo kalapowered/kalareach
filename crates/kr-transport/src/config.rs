@@ -121,8 +121,17 @@ impl DiscoveryConfig {
 /// Everything an endpoint is built from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EndpointConfig {
-    /// The selected relay map. An empty map disables relaying.
+    /// The selected relay map. An empty map disables relaying, unless
+    /// [`relays_added_on_dial`](Self::relays_added_on_dial) is on.
     pub relay_urls: Vec<RelayUrl>,
+    /// Whether this endpoint starts with an empty relay map that relays are added to later.
+    ///
+    /// Off is the ordinary case: the relays named here are the whole map, and an empty list means
+    /// no relaying at all. On, an empty list gives an endpoint that relays but holds no relay yet,
+    /// and [`crate::dialler::DeviceEndpoint`] puts a host's relays into the map when the device
+    /// first dials that host. It is this device's own choice, like local discovery and the proxy,
+    /// so a pairing invitation or a host bundle never sets it.
+    pub relays_added_on_dial: bool,
     /// The selected discovery services.
     pub discovery: DiscoveryConfig,
     /// Direct-address hints for peers this endpoint dials.
@@ -309,10 +318,10 @@ impl EndpointConfig {
         RelayMap::from_iter(self.relay_urls.iter().cloned())
     }
 
-    /// Returns true when no relay is selected.
+    /// Returns true when no relay is selected and none will be added.
     #[must_use]
     pub fn relays_disabled(&self) -> bool {
-        self.relay_urls.is_empty()
+        self.relay_urls.is_empty() && !self.relays_added_on_dial
     }
 
     /// Reads the configuration a pairing invitation or host bundle carried.
@@ -344,6 +353,7 @@ impl EndpointConfig {
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             relay_urls,
+            relays_added_on_dial: false,
             discovery: DiscoveryConfig {
                 pkarr_publisher_url: optional_hint(&config.pkarr_publisher_url)
                     .map(|hint| parse_http_url(hint, "Pkarr publisher URL"))
@@ -476,6 +486,7 @@ mod tests {
     fn sample() -> EndpointConfig {
         EndpointConfig {
             relay_urls: vec!["https://relay.kala.to".parse().expect("a relay URL")],
+            relays_added_on_dial: false,
             discovery: DiscoveryConfig {
                 pkarr_publisher_url: Some(
                     Url::parse("https://discovery.kala.to/pkarr").expect("a URL"),
