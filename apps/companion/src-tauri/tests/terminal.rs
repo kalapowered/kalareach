@@ -5866,3 +5866,95 @@ async fn an_unreached_launch_is_not_sent_and_the_typing_behind_it_goes_in_order(
         "no launch is on the wire"
     );
 }
+
+/// A launch whose barrier the host reached, with typing behind it that the lane holds: the press has
+/// taken its barrier once its call is on the control stream, so the key typed then is held behind it.
+async fn launched_with_typing_behind_it(
+    page: &Page,
+    view: &str,
+    host: &ScriptedHost,
+    link: &mut Link,
+) -> (
+    tokio::task::JoinHandle<Result<Value, Value>>,
+    scripted_worker::Call,
+) {
+    three_keys_the_host_has_read(page, view, host).await;
+    host.script.accept(1, 2);
+    let pressing = page.invoke_later(
+        "terminal_view_launch",
+        json!({ "view": view, "press": the_press() }),
+    );
+    let launch = link.expect(Method::ShellLaunch).await;
+    page.text(view, 1, "z").expect("the key is taken");
+    (pressing, launch)
+}
+
+/// Whether the host reads a fourth frame within the quiet that a view that sends nothing is watched
+/// for: false is what a held key does.
+async fn fourth_frame_within_the_quiet(host: &ScriptedHost) -> bool {
+    tokio::time::timeout(
+        QUIET,
+        host.script
+            .until("a fourth frame", |seen| seen.frames.len() >= 4),
+    )
+    .await
+    .is_ok()
+}
+
+/// A launch whose outcome the host does not know keeps the typing behind it held: the launch may
+/// still be before its reservation. The page is told the outcome is unknown, and the marker, when it
+/// comes, releases the key in order.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_launch_outcome_keeps_the_typing_behind_it_held_until_the_marker() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    let (pressing, launch) = launched_with_typing_behind_it(&page, &view, &host, &mut link).await;
+    link.refuse_with(&launch, ErrorCode::OutcomeUnknown, "the host does not know")
+        .await;
+    let told = tokio::time::timeout(AFTER_BARRIER, pressing)
+        .await
+        .expect("the page was told within the bound")
+        .expect("joins")
+        .expect_err("the outcome is unknown");
+    assert_eq!(code(&told), "OUTCOME_UNKNOWN");
+    assert!(
+        !fourth_frame_within_the_quiet(&host).await,
+        "the key behind an unknown launch is still held"
+    );
+    host.script.marker(1);
+    host.script
+        .until_soon("the key behind the launch", |seen| seen.frames.len() == 4)
+        .await;
+    assert_eq!(read_by(&host).last(), Some(&(1, 3, "z".to_owned())));
+}
+
+/// A launch that the host answers definitely, here by a refusal that is not the library's unknown,
+/// releases the typing behind it in order, with no marker.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_definite_launch_answer_releases_the_typing_behind_it_in_order() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    let (pressing, launch) = launched_with_typing_behind_it(&page, &view, &host, &mut link).await;
+    link.refuse_with(
+        &launch,
+        ErrorCode::DraftConflict,
+        "the editor has typing before the launch",
+    )
+    .await;
+    let told = tokio::time::timeout(AFTER_BARRIER, pressing)
+        .await
+        .expect("the page was told within the bound")
+        .expect("joins")
+        .expect_err("the launch was refused");
+    assert_eq!(code(&told), "DRAFT_CONFLICT");
+    host.script
+        .until_soon("the key behind the launch", |seen| seen.frames.len() == 4)
+        .await;
+    assert_eq!(read_by(&host).last(), Some(&(1, 3, "z".to_owned())));
+}
