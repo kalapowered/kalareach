@@ -6,6 +6,7 @@
  * each failure it answers with, and the page says that action beside the host's own words.
  */
 
+import ts from 'typescript'
 import { describe, expect, it } from 'vitest'
 
 import { failureMessage, USER_ACTIONS } from '../src/host/port'
@@ -131,44 +132,85 @@ describe('a refusal that says its own wait', () => {
     eager: true
   })
 
-  /** The ways a source reads the action of a failure or the words for it, counted in code and not in comments. */
-  const READS = {
-    property: /\.user_action\b/g,
-    bracket: /\[\s*['"`]user_action['"`]\s*\]/g,
-    destructuring: /\{[^{}]*\buser_action\b[^{}]*\}\s*=/g,
-    table: /\bUSER_ACTIONS\b/g
-  }
-  const withoutComments = (text: string) => text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
-  const readsOf = (text: string) =>
-    Object.fromEntries(
-      Object.entries(READS).map(([how, pattern]) => [how, withoutComments(text).match(pattern)?.length ?? 0])
+  /**
+   * The ways a source reads the action of a failure, counted in its syntax tree and not in its text:
+   * a property read, an element read, a binding of the member (a declaration, a parameter or an
+   * assignment pattern) and a use of the table the key is looked up in. A comment and a string are
+   * no reader.
+   */
+  const readsOf = (text: string, fileName = 'source.ts') => {
+    const source = ts.createSourceFile(
+      fileName,
+      text,
+      ts.ScriptTarget.Latest,
+      true,
+      fileName.endsWith('x') ? ts.ScriptKind.TSX : ts.ScriptKind.TS
     )
+    const reads = { property: 0, element: 0, binding: 0, table: 0 }
+    const named = (name: ts.Node | undefined) =>
+      name !== undefined && (ts.isIdentifier(name) || ts.isStringLiteralLike(name)) && name.text === 'user_action'
+    const visit = (node: ts.Node): void => {
+      if (ts.isPropertyAccessExpression(node) && node.name.text === 'user_action') reads.property += 1
+      else if (ts.isElementAccessExpression(node) && named(node.argumentExpression)) reads.element += 1
+      else if (ts.isBindingElement(node) && ts.isObjectBindingPattern(node.parent) && named(node.propertyName ?? node.name))
+        reads.binding += 1
+      else if (
+        (ts.isShorthandPropertyAssignment(node) || ts.isPropertyAssignment(node)) &&
+        named(node.name) &&
+        ts.isBinaryExpression(node.parent.parent) &&
+        node.parent.parent.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+        node.parent.parent.left === node.parent
+      )
+        reads.binding += 1
+      else if (ts.isIdentifier(node) && node.text === 'USER_ACTIONS') reads.table += 1
+      ts.forEachChild(node, visit)
+    }
+    visit(source)
+    return reads
+  }
 
   it('meets one reader of the action, counted by its reads, so that no second reader adds a line after the first', () => {
     const readers = Object.entries(files)
       .filter(([path]) => !/\/src\/host\/fake[^/]*\.ts$/.test(path))
-      .map(([path, text]) => [path, readsOf(text)] as const)
+      .map(([path, text]) => [path, readsOf(text, path)] as const)
       .filter(([, reads]) => Object.values(reads).some((count) => count > 0))
     // `failureMessage` reads the key once and looks it up in the table: one property read, and the
     // table's own declaration, its membership test and its lookup.
-    expect(readers).toEqual([['../src/host/port.ts', { property: 1, bracket: 0, destructuring: 0, table: 3 }]])
+    expect(readers).toEqual([['../src/host/port.ts', { property: 1, element: 0, binding: 0, table: 3 }]])
   })
 
-  it('counts a second reader of the action, whether by a property, a bracket or a destructuring', () => {
-    for (const second of [
-      'const key = failure.user_action',
-      "const key = failure['user_action']",
-      'const { user_action } = failure',
-      'const { code, user_action: key } = failure'
-    ]) {
+  it('counts a second reader of the action in each form it can take', () => {
+    const forms: readonly (readonly [keyof ReturnType<typeof readsOf>, string])[] = [
+      ['property', 'const key = failure.user_action'],
+      ['property', 'const key = failure?.user_action'],
+      ['element', "const key = failure['user_action']"],
+      ['element', 'const key = failure[`user_action`]'],
+      ['binding', 'const { user_action } = failure'],
+      ['binding', 'const { code, user_action: key } = failure'],
+      ['binding', "const { 'user_action': key } = failure"],
+      ['binding', 'const { user_action }: HostError = failure'],
+      ['binding', 'function show({ user_action }: HostError) { return user_action }'],
+      ['binding', 'const show = ({ code, user_action: key }: HostError) => key'],
+      ['binding', 'let key; ({ user_action: key } = failure)'],
+      ['table', 'const line = USER_ACTIONS.wait']
+    ]
+    for (const [how, second] of forms) {
       const reads = readsOf(second)
+      expect(reads[how], second).toBe(1)
       expect(Object.values(reads).reduce((total, count) => total + count, 0), second).toBe(1)
     }
-    expect(readsOf('// failure.user_action\n/* USER_ACTIONS */')).toEqual({
-      property: 0,
-      bracket: 0,
-      destructuring: 0,
-      table: 0
-    })
+  })
+
+  it('counts neither a comment nor a string as a reader of the action', () => {
+    const none = [
+      '// failure.user_action',
+      '/* const { user_action } = failure; USER_ACTIONS */',
+      "const words = 'failure.user_action'",
+      'const text = `{ user_action } = failure`',
+      'const valid = true // failure.user_action',
+      'const made = { user_action: "wait" }',
+      'interface HostError { readonly user_action: string }'
+    ].join('\n')
+    expect(readsOf(none)).toEqual({ property: 0, element: 0, binding: 0, table: 0 })
   })
 })
