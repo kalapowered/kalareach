@@ -181,6 +181,10 @@ pub struct Producer {
     rounds: std::sync::atomic::AtomicUsize,
     #[cfg(feature = "testing")]
     waits: std::sync::atomic::AtomicUsize,
+    /// How many reads of the question ledger by the ledger's reader have failed, counted once the
+    /// reader has dealt with the failure, for this host's own tests.
+    #[cfg(feature = "testing")]
+    ledger_failures: std::sync::atomic::AtomicUsize,
     #[cfg(feature = "testing")]
     before_the_send: crate::testing::Stall,
     /// How many helper threads of this producer are alive: its publisher, and the reader of the
@@ -275,6 +279,8 @@ impl Producer {
                 rounds: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(feature = "testing")]
                 waits: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(feature = "testing")]
+                ledger_failures: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(feature = "testing")]
                 before_the_send: crate::testing::Stall::default(),
                 #[cfg(feature = "testing")]
@@ -462,6 +468,16 @@ impl Producer {
         )
     }
 
+    /// Returns how many reads of the question ledger by the ledger's reader have failed, for this
+    /// host's own tests. A read is counted after the reader has dealt with its failure, so whatever
+    /// the reader records for a failed read is recorded when the count has risen.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn failed_ledger_reads(&self) -> usize {
+        self.ledger_failures
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Stops the next publication after the publisher has taken the session and before it reads the
     /// facts, for this host's own tests. Returns the end that says the publisher has arrived there
     /// and the end that lets it go on; the stop fires once. Facts that join while it stands there
@@ -640,12 +656,21 @@ fn read_the_ledger_apart(
                 };
                 // A ledger that cannot be read says nothing, so the fact keeps its last value: an
                 // error is not "no question".
-                if let Ok(open) = questions.any_open(now) {
+                let read = questions.any_open(now);
+                #[cfg(feature = "testing")]
+                let failed = read.is_err();
+                if let Ok(open) = read {
                     #[cfg(feature = "testing")]
                     producer.before_the_fact.stand();
                     if producer.observe_questions(open) {
                         moved.notify_waiters();
                     }
+                }
+                #[cfg(feature = "testing")]
+                if failed {
+                    producer
+                        .ledger_failures
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
             }
         })

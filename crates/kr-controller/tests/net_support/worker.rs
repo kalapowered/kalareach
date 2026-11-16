@@ -284,6 +284,28 @@ impl Worker {
         .await
     }
 
+    /// As [`Self::start_reserved`], for a worker whose runtime reads the continuous clock that the
+    /// case moves by hand. A question's deadline on that clock passes when the case moves it, and
+    /// not before.
+    pub async fn start_reserved_on_a_shared_clock(
+        tree: &kr_ipc::testing::TempHost,
+        display: u64,
+        shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
+    ) -> Self {
+        Self::start_with_reader(
+            tree,
+            display,
+            true,
+            "exec cat",
+            TimeSources::system(),
+            Dimensions::new(80, 24),
+            None,
+            None,
+            shared_clock,
+        )
+        .await
+    }
+
     /// `window` is the size of a session that keeps no spool; `None` is the session every other
     /// constructor starts, with its spool and its 64 KiB window.
     async fn start_with(
@@ -296,7 +318,15 @@ impl Worker {
         window: Option<usize>,
     ) -> Self {
         Self::start_with_reader(
-            tree, display, reserved, script, time, dimensions, window, None,
+            tree,
+            display,
+            reserved,
+            script,
+            time,
+            dimensions,
+            window,
+            None,
+            Arc::new(kr_ipc::clock::SystemSharedClock),
         )
         .await
     }
@@ -319,6 +349,7 @@ impl Worker {
             Dimensions::new(80, 24),
             None,
             Some(MANAGED_NUMBERS),
+            Arc::new(kr_ipc::clock::SystemSharedClock),
         )
         .await
     }
@@ -343,6 +374,8 @@ impl Worker {
             .await
     }
 
+    /// As [`Self::start_with`], for a session whose shell is managed when `managed` is given, and
+    /// on the continuous clock `shared_clock`, which the session's runtime reads.
     #[allow(clippy::too_many_arguments)]
     async fn start_with_reader(
         tree: &kr_ipc::testing::TempHost,
@@ -353,6 +386,7 @@ impl Worker {
         dimensions: Dimensions,
         window: Option<usize>,
         managed: Option<ReaderNumbers>,
+        shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
     ) -> Self {
         let environment = tree.environment();
         let environment_id = tree.environment_id();
@@ -453,10 +487,8 @@ impl Worker {
                 Arc::new(kr_transport::clock::ManualClock::new()),
             ));
         }
-        let runtime = Arc::new(
-            SessionRuntime::start(session, Arc::new(kr_ipc::clock::SystemSharedClock))
-                .expect("starts the runtime"),
-        );
+        let runtime =
+            Arc::new(SessionRuntime::start(session, shared_clock).expect("starts the runtime"));
         let (reader, bridge_task) = match (managed, host_endpoint) {
             (Some(numbers), Some(host_endpoint)) => {
                 let (reader, task) =
@@ -1157,19 +1189,19 @@ impl Adopted {
     /// workers on the tree, each reserved and open in the registry as every session a daemon
     /// creates is, and starts the daemon again, which adopts them.
     pub async fn start(sessions: u64) -> Self {
-        Self::start_on(sessions, None, Clocks::system(), None, false).await
+        Self::start_on(sessions, None, Clocks::system(), None, false, None).await
     }
 
     /// As [`Self::start`], for one session whose application is `script`, a POSIX shell script.
     pub async fn start_running(script: &str) -> Self {
-        Self::start_on(1, None, Clocks::system(), Some(script), false).await
+        Self::start_on(1, None, Clocks::system(), Some(script), false, None).await
     }
 
     /// As [`Self::start`], for one session whose shell is managed and whose reader is the
     /// reference reader ([`Worker::start_managed`]): its application is `exec cat`, and no prompt
     /// has been entered.
     pub async fn start_managed() -> Self {
-        Self::start_on(1, None, Clocks::system(), None, true).await
+        Self::start_on(1, None, Clocks::system(), None, true, None).await
     }
 
     /// As [`Self::start`], for a host whose configuration is `document`.
@@ -1177,12 +1209,38 @@ impl Adopted {
         sessions: u64,
         document: &kr_protocol::hostinfo::configuration::ConfigurationDocument,
     ) -> Self {
-        Self::start_on(sessions, Some(document), Clocks::system(), None, false).await
+        Self::start_on(
+            sessions,
+            Some(document),
+            Clocks::system(),
+            None,
+            false,
+            None,
+        )
+        .await
+    }
+
+    /// As [`Self::start_with_document`], for workers whose runtimes read the continuous clock
+    /// `shared_clock`, which the case moves by hand.
+    pub async fn start_with_document_on_a_shared_clock(
+        sessions: u64,
+        document: &kr_protocol::hostinfo::configuration::ConfigurationDocument,
+        shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
+    ) -> Self {
+        Self::start_on(
+            sessions,
+            Some(document),
+            Clocks::system(),
+            None,
+            false,
+            Some(shared_clock),
+        )
+        .await
     }
 
     /// As [`Self::start`], on the clocks a suite moves by hand.
     pub async fn start_on_clocks(sessions: u64, clocks: Clocks) -> Self {
-        Self::start_on(sessions, None, clocks, None, false).await
+        Self::start_on(sessions, None, clocks, None, false, None).await
     }
 
     async fn start_on(
@@ -1191,6 +1249,7 @@ impl Adopted {
         clocks: Clocks,
         script: Option<&str>,
         managed: bool,
+        shared_clock: Option<Arc<dyn kr_ipc::clock::SharedClock>>,
     ) -> Self {
         let owner = DeviceKeys::generate().expect("owner keys");
         let host = match document {
@@ -1200,10 +1259,18 @@ impl Adopted {
         let stopped = host.shut_down().await;
         let mut workers = Vec::new();
         for display in 1..=sessions {
-            workers.push(match script {
+            workers.push(match (script, &shared_clock) {
                 _ if managed => Worker::start_managed(stopped.tree(), display, "exec cat").await,
-                Some(script) => Worker::start_running(stopped.tree(), display, script).await,
-                None => Worker::start_reserved(stopped.tree(), display).await,
+                (Some(script), _) => Worker::start_running(stopped.tree(), display, script).await,
+                (None, Some(clock)) => {
+                    Worker::start_reserved_on_a_shared_clock(
+                        stopped.tree(),
+                        display,
+                        Arc::clone(clock),
+                    )
+                    .await
+                }
+                (None, None) => Worker::start_reserved(stopped.tree(), display).await,
             });
         }
         let settings = stopped.settings().clone();
