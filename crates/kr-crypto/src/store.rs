@@ -1144,6 +1144,19 @@ const STORE_KIND_MARKER: &str = ".store-kind";
 /// The longest a valid marker is. Anything larger is a damaged or foreign file.
 const MAX_MARKER_LEN: u64 = 64;
 
+/// Which store `directory`'s record names, for a reader that must not choose, create or write
+/// anything: the same read [`open_store`] makes of it, and nothing else.
+///
+/// `None` means this host has not chosen yet.
+///
+/// # Errors
+///
+/// Returns [`CryptoError::SecretStore`] for a record that cannot be read, is too large or names an
+/// unknown backend.
+pub fn recorded_store_kind(directory: &Path) -> Result<Option<StoreKind>> {
+    read_recorded_kind(directory)
+}
+
 /// Reads the recorded choice.
 ///
 /// `None` means this host has not chosen yet. A marker that cannot be read, is too large or holds
@@ -2317,6 +2330,32 @@ mod tests {
                 .expect("a value")
                 .expose(),
             b"seed"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A reader that must not choose names what the record names, none where there is no record,
+    /// and makes nothing: a directory that is not there stays not there.
+    #[test]
+    fn the_recorded_store_kind_is_read_and_nothing_is_made() {
+        let base = scratch_directory("recorded-kind");
+        assert_eq!(recorded_store_kind(&base).expect("no record"), None);
+        assert!(!base.exists(), "the read made the directory");
+        std::fs::create_dir_all(&base).expect("a directory");
+        std::fs::write(base.join(STORE_KIND_MARKER), "platform\n").expect("a record");
+        assert_eq!(
+            recorded_store_kind(&base).expect("a record"),
+            Some(StoreKind::Platform)
+        );
+        std::fs::write(base.join(STORE_KIND_MARKER), "file\n").expect("a record");
+        assert_eq!(
+            recorded_store_kind(&base).expect("a record"),
+            Some(StoreKind::FileFallback)
+        );
+        std::fs::write(base.join(STORE_KIND_MARKER), "nonsense").expect("a damaged record");
+        assert!(
+            recorded_store_kind(&base).is_err(),
+            "a damaged record is an error"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
