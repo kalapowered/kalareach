@@ -100,6 +100,14 @@ const STILL_OPENING: &str = "This view is still opening.";
 const LAUNCH_UNANSWERED: &str =
     "This view ended before the session said whether the launch was installed.";
 
+/// What a launch is told when the lane did not take all the typing before it: nothing of it was sent.
+const LAUNCH_NOT_STARTED: &str =
+    "The launch was not started: the session had not accepted all the typing before it.";
+
+/// What a launch is told when an earlier launch's hold, or a release that waits, stands in the lane:
+/// nothing of it was sent.
+const LAUNCH_BEHIND_ANOTHER: &str = "The launch was not started: an earlier launch or release of this view is still waiting for the session.";
+
 /// How many recoveries in a row may pass without a complete screen before the view ends.
 ///
 /// A recovery asks the session for a fresh screen. A host whose screens never decode would have the
@@ -274,6 +282,7 @@ pub(super) async fn run(
         lane_epoch: None,
         requests: FuturesUnordered::new(),
         keys: BTreeMap::new(),
+        proven: Proven::default(),
         endings: Vec::new(),
         holds: BTreeMap::new(),
         next_launch: 0,
@@ -795,8 +804,35 @@ type Done = (RequestId, Completed);
 struct Barred {
     tag: RequestId,
     barrier: InputBarrier,
-    /// The ending's call, which names the barrier and has not been polled.
-    call: link::Call,
+    /// Makes the ending's call for the barrier it names: the one it took where the lane reached it,
+    /// and where the host did not take the typing before it, what the host did take.
+    call: Box<dyn FnOnce(InputBarrier) -> link::Call + Send>,
+}
+
+/// What an ending came to when it was asked to start.
+enum Started {
+    /// Its call is under the view's number.
+    Sent(RequestId),
+    /// A launch that was not sent, and what the page is told.
+    NotStarted(&'static str),
+}
+
+/// How many frames of each epoch the host has accepted, as the lane's words told, by the epoch's
+/// number: the typing that an ending can name when the host did not take all that was admitted.
+#[derive(Default)]
+struct Proven(BTreeMap<u64, u64>);
+
+impl Proven {
+    /// The host accepted the frames of `epoch` up to the sequence `through`.
+    fn accepted(&mut self, epoch: u64, through: u64) {
+        let count = self.0.entry(epoch).or_default();
+        *count = (*count).max(through.saturating_add(1));
+    }
+
+    /// The most frames of `epoch` the host accepted, none where it said nothing.
+    fn prefix(&self, epoch: u64) -> u64 {
+        self.0.get(&epoch).copied().unwrap_or(0)
+    }
 }
 
 /// One open, attached view.
@@ -825,6 +861,8 @@ struct View {
     /// value is the view's number for the key, which the lease knows it by, until the lease was
     /// told that the key's epoch is over.
     keys: BTreeMap<(u64, u64), Option<RequestId>>,
+    /// What the host accepted of each epoch.
+    proven: Proven,
     /// The endings that wait for the host to have the typing before them.
     endings: Vec<Barred>,
     /// The launches whose later typing the lane holds, by the view's number for the launch, and the
@@ -943,18 +981,32 @@ async fn settle_when_definite(
 }
 
 /// Waits until the lane says the host has the typing before `barrier`, or will not have it, or the
-/// lane ended.
-async fn barrier_passed(events: &mut InputEvents, barrier: &InputBarrier) {
+/// lane ended, and says whether the host has it. What the host accepts meanwhile is counted in
+/// `proven`.
+async fn barrier_passed(
+    events: &mut InputEvents,
+    barrier: &InputBarrier,
+    proven: &mut Proven,
+) -> bool {
     while let Some(event) = events.recv().await {
         match event {
-            InputEvent::Reached(reached) if &reached == barrier => return,
+            InputEvent::Accepted { epoch, through, .. } => {
+                proven.accepted(epoch.get(), through.get());
+            }
+            InputEvent::Refused {
+                epoch,
+                accepted_through: Some(through),
+                ..
+            } => proven.accepted(epoch.get(), through.get()),
+            InputEvent::Reached(reached) if &reached == barrier => return true,
             InputEvent::NotReached {
                 barrier: missed, ..
-            } if &missed == barrier => return,
-            InputEvent::Ended { .. } => return,
+            } if &missed == barrier => return false,
+            InputEvent::Ended { .. } => return false,
             _ => {}
         }
     }
+    false
 }
 
 impl View {
@@ -1345,10 +1397,23 @@ impl View {
                         )
                         .await;
                     match ended {
-                        Ok(request_id) => request_id,
+                        Ok(Started::Sent(request_id)) => request_id,
+                        Ok(Started::NotStarted(_)) => continue,
                         Err(ended) => return Some(ended),
                     }
                 }
+                // The session had not taken all the typing before the release: it goes once more,
+                // naming no position, which the session cannot refuse for the typing.
+                Owed::ReleaseAgain(epoch) => self.mutation(
+                    Method::InputRelease,
+                    InputReleaseParams {
+                        session_id: self.session_id,
+                        attachment_id: self.attachment.attachment_id,
+                        epoch,
+                        after_input: None,
+                        fenced_report: false,
+                    },
+                ),
             };
             self.lease.sent(owed, sent);
         }
@@ -1696,22 +1761,24 @@ impl View {
             InputEvent::Refused {
                 epoch,
                 sequence,
+                accepted_through,
                 error,
                 ..
             } => {
+                if let Some(through) = accepted_through {
+                    self.proven.accepted(epoch.get(), through.get());
+                }
                 if self.refused(epoch, sequence, error) {
                     self.control_changed();
                 }
                 None
             }
             InputEvent::Reached(barrier) => {
-                self.send_barred(&barrier);
+                self.send_barred(&barrier, true);
                 None
             }
             InputEvent::NotReached { barrier, .. } => {
-                // The host did not take the typing before the ending in time: the ending still
-                // goes, naming what it waited for, and the host answers for it.
-                self.send_barred(&barrier);
+                self.send_barred(&barrier, false);
                 None
             }
             InputEvent::EpochEnded { .. } | InputEvent::LaunchReserved { .. } => None,
@@ -1736,6 +1803,7 @@ impl View {
     /// the accepted one, in this epoch or an older one, is in flight any more: they are settled
     /// with it.
     fn accepted(&mut self, epoch: InputLeaseEpoch, through: kr_protocol::ids::InputSequence) {
+        self.proven.accepted(epoch.get(), through.get());
         let accepted: Vec<(u64, u64)> = self
             .keys
             .range(..=(epoch.get(), through.get()))
@@ -1781,8 +1849,11 @@ impl View {
         ended
     }
 
-    /// Sends the ending that waited for `barrier`.
-    fn send_barred(&mut self, barrier: &InputBarrier) {
+    /// Starts the ending that waited for `barrier`, which the host has the typing before, or has
+    /// not: the host did not take it in time, or the epoch or the stream ended first. An ending
+    /// goes either way, and names what the host did accept where it did not take it all; the host
+    /// answers for it.
+    fn send_barred(&mut self, barrier: &InputBarrier, reached: bool) {
         let Some(at) = self
             .endings
             .iter()
@@ -1790,7 +1861,35 @@ impl View {
         else {
             return;
         };
-        let Barred { tag, call, .. } = self.endings.remove(at);
+        let Barred {
+            tag,
+            barrier: taken,
+            call,
+        } = self.endings.remove(at);
+        if !reached && let Some(reply) = self.launches.remove(&tag) {
+            // A launch is sent only where the host has the typing before it: nothing of it was
+            // sent, so the page is told at once that it was not started, in the shape of every
+            // launch the view did not send. What the lane holds behind it is released once, for
+            // whichever reason the barrier was not reached: the lane releases it in order after a
+            // time-out and has already ended it after the others.
+            let _ = reply.send(Err(CommandError::stated(
+                ErrorCode::TerminalUnavailable,
+                LAUNCH_NOT_STARTED,
+            )));
+            if let Some(launch) = self.holds.remove(&tag)
+                && let Some(lane) = &self.lane
+            {
+                lane.release_hold(launch);
+            }
+            return;
+        }
+        let named = if reached {
+            taken
+        } else {
+            let count = U64::new(self.proven.prefix(taken.epoch.get()));
+            InputBarrier { count, ..taken }
+        };
+        let call = call(named);
         self.start(tag, call);
     }
 
@@ -1886,10 +1985,17 @@ impl View {
             )
             .await;
         match ended {
-            Ok(request_id) => {
+            Ok(Started::Sent(request_id)) => {
                 // Kept before the call is polled: a call that failed may have left in part, and the
                 // launch is then not known to have failed.
                 self.launches.insert(request_id, reply);
+                None
+            }
+            Ok(Started::NotStarted(words)) => {
+                let _ = reply.send(Err(CommandError::stated(
+                    ErrorCode::TerminalUnavailable,
+                    words,
+                )));
                 None
             }
             Err(ended) => Some(ended),
@@ -1969,8 +2075,8 @@ impl View {
         method: Method,
         epoch: Option<InputLeaseEpoch>,
         launch: Option<u32>,
-        params: impl FnOnce(Option<InputBarrier>) -> P,
-    ) -> Result<RequestId, Ending>
+        params: impl FnOnce(Option<InputBarrier>) -> P + Send + 'static,
+    ) -> Result<Started, Ending>
     where
         P: serde::Serialize + Send + Sync + 'static,
     {
@@ -1979,22 +2085,32 @@ impl View {
         let Some(lane) = self.lane.as_ref().filter(|_| placed) else {
             let call = self.link.mutate(method, self.target.clone(), params(None));
             self.start(tag, call);
-            return Ok(tag);
+            return Ok(Started::Sent(tag));
         };
         if self.networked {
-            let Ok(barrier) = lane.mark(launch) else {
-                let call = self.link.mutate(method, self.target.clone(), params(None));
-                self.start(tag, call);
-                return Ok(tag);
+            let barrier = match lane.mark(launch) {
+                Ok(barrier) => barrier,
+                // A launch goes only where the lane has the typing before it counted: another
+                // launch's hold stands, or a release waits, and the launch is not sent. What stands
+                // is kept.
+                Err(InputRefusal::LaunchWaiting | InputRefusal::Ending) if launch.is_some() => {
+                    return Ok(Started::NotStarted(LAUNCH_BEHIND_ANOTHER));
+                }
+                Err(_) => {
+                    let call = self.link.mutate(method, self.target.clone(), params(None));
+                    self.start(tag, call);
+                    return Ok(Started::Sent(tag));
+                }
             };
             if launch.is_some() {
                 self.holds.insert(tag, launch.unwrap_or_default());
             }
-            let call = self
-                .link
-                .mutate(method, self.target.clone(), params(Some(barrier.clone())));
+            let (link, target) = (self.link.clone(), self.target.clone());
+            let call = Box::new(move |named: InputBarrier| {
+                link.mutate(method, target, params(Some(named)))
+            });
             self.endings.push(Barred { tag, barrier, call });
-            return Ok(tag);
+            return Ok(Started::Sent(tag));
         }
         let params = params(None);
         let composed = self
@@ -2023,7 +2139,7 @@ impl View {
             Err(_) => self.link.mutate(method, self.target.clone(), params),
         };
         self.start(tag, call);
-        Ok(tag)
+        Ok(Started::Sent(tag))
     }
 
     /// The call that failed took the link with it, or the link failed under it: reads on to the
@@ -2077,9 +2193,13 @@ impl View {
                 InputEvent::Refused {
                     epoch,
                     sequence,
+                    accepted_through,
                     error,
                     ..
                 } => {
+                    if let Some(through) = accepted_through {
+                        self.proven.accepted(epoch.get(), through.get());
+                    }
                     let _ = self.refused(epoch, sequence, error);
                 }
                 _ => {}
@@ -2114,11 +2234,26 @@ impl View {
         if self.networked && placed {
             let barrier = self.lane.as_ref().and_then(|lane| lane.mark(None).ok());
             if let Some(barrier) = barrier {
-                if let Some(lane_events) = self.lane_events.as_mut() {
-                    self.events
-                        .dropping_during(barrier_passed(lane_events, &barrier))
-                        .await;
-                }
+                // The detach names the barrier where the host has the typing before it, and where it
+                // does not, the typing it did accept, counting what it accepts while the close waits.
+                let reached = match self.lane_events.as_mut() {
+                    Some(lane_events) => {
+                        self.events
+                            .dropping_during(barrier_passed(
+                                lane_events,
+                                &barrier,
+                                &mut self.proven,
+                            ))
+                            .await
+                    }
+                    None => false,
+                };
+                let barrier = if reached {
+                    barrier
+                } else {
+                    let count = U64::new(self.proven.prefix(barrier.epoch.get()));
+                    InputBarrier { count, ..barrier }
+                };
                 let Ok(composed) = self
                     .link
                     .compose(
