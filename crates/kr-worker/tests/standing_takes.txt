@@ -1,0 +1,58 @@
+# The takes of a lock inside the standing function.
+#
+# Held in both directions by the scan of the same name. The scope is the four pieces of the
+# function, the checks they call directly, the pure readers of the clocks and the gate, and the
+# broker's checks. A function that a scoped one calls and that is not listed is not read.
+#
+# scope <file> <function>
+# site <file> <function> <callee> <how many calls>
+# outside <file> <function>
+
+scope crates/kr-worker/src/service/standing.rs authority
+scope crates/kr-worker/src/service/standing.rs envelope
+scope crates/kr-worker/src/service/standing.rs limits
+scope crates/kr-worker/src/service/standing.rs subject
+scope crates/kr-worker/src/service/standing.rs dispatch
+scope crates/kr-worker/src/service/standing.rs standing_pass
+scope crates/kr-worker/src/service.rs check_authority
+scope crates/kr-worker/src/service.rs check_validated_revision
+scope crates/kr-worker/src/service.rs check_local_standing
+scope crates/kr-worker/src/service.rs check_restrictions
+scope crates/kr-worker/src/service.rs check_envelope
+scope crates/kr-worker/src/service.rs check_admission_limits
+scope crates/kr-worker/src/service.rs uncertain_outcome_in_the_way
+scope crates/kr-worker/src/service.rs uncertain_with_identity
+scope crates/kr-worker/src/service.rs validate
+scope crates/kr-worker/src/service.rs sweep_questions
+scope crates/kr-worker/src/service.rs check_preconditions
+scope crates/kr-worker/src/service.rs check_dispatch_lease
+scope crates/kr-worker/src/service.rs check_accepted_deadline
+scope crates/kr-worker/src/local_gate.rs check_bound
+scope crates/kr-worker/src/action/time.rs pure_wall_ms
+scope crates/kr-worker/src/action/time.rs pure_proven_ms
+scope crates/kr-worker/src/action/time.rs utc_deadline_standing
+scope crates/kr-worker/src/action/time.rs utc_end_reached
+scope crates/kr-worker/src/broker/methods.rs checks
+scope crates/kr-worker/src/broker/mod.rs check_responsible
+scope crates/kr-worker/src/broker/mod.rs recheck_answer_trust
+outside crates/kr-worker/src/service.rs decidable
+
+# The takes. Each is a lock of one domain, or the session's guard.
+# The time contract's state lock: the proven reading's mark is read under it, and nothing else.
+site crates/kr-worker/src/action/time.rs pure_proven_ms lock 1
+# The gate's own lock: the bound is copied out and the lock is let go before any clock is read.
+site crates/kr-worker/src/local_gate.rs check_bound lock 1
+# The authority state.
+site crates/kr-worker/src/service.rs check_authority lock 1
+# The input domain's lock, for the revision the request was validated under.
+site crates/kr-worker/src/service.rs check_validated_revision lock 1
+# The authority state and the input domain's lock, each taken for one read.
+site crates/kr-worker/src/service.rs check_dispatch_lease lock 2
+# The session, for the id and the epoch the target is compared with, let go before the next check.
+site crates/kr-worker/src/service.rs check_envelope session 1
+# The session, for the journal's two reads (taken here only when no pass holds it), and the lock of
+# the record of what a person was shown, which is read once and let go.
+site crates/kr-worker/src/service.rs check_admission_limits session 1
+site crates/kr-worker/src/service.rs check_admission_limits lock 1
+# `Session::state()` is a read of the session the caller holds, not a take.
+site crates/kr-worker/src/service.rs check_preconditions state 2
