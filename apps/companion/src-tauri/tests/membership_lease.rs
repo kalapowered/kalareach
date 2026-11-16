@@ -1990,7 +1990,12 @@ async fn each_stop_of_the_lease_is_sent_to_the_inbox_as_its_own_words_and_its_ow
         rig.control.fail_presentation(None);
         let desk = Arc::new(InboxDesk::default());
         let first = rig.inbox_of(&desk).await;
-        assert_eq!(first.state, HostInboxState::Read, "{key}: {:?}", first.refusal);
+        assert_eq!(
+            first.state,
+            HostInboxState::Read,
+            "{key}: {:?}",
+            first.refusal
+        );
         rig.control.fail_presentation(Some(stop));
         let kept = rig.inbox_of(&desk).await;
         assert_eq!(kept.state, HostInboxState::Refused, "{key}: {kept:?}");

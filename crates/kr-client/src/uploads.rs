@@ -717,7 +717,9 @@ pub async fn send(
         Err(ClientError::ConnectionEnded) => Err(session
             .transport()
             .ended_by_this_device()
-            .map_or(ClientError::ConnectionEnded, |end| ClientError::Host(end.error))),
+            .map_or(ClientError::ConnectionEnded, |end| {
+                ClientError::Host(end.error)
+            })),
         done => done,
     }
 }
