@@ -164,7 +164,6 @@ describe('pairing with a host', () => {
       'no_host_answered',
       'not_authenticated',
       'host_tries_used',
-      'expired',
       'timed_out',
       'declined',
       'approval_unknown'
@@ -185,6 +184,35 @@ describe('pairing with a host', () => {
     attempt(controls, ended('declined', null))
     expect((await screen.findByTestId('failure-sentence')).textContent).toBe(
       'The owner declined this device on the host.'
+    )
+  })
+
+  // The tries line counts tries of the code that was charged. After an ending that starts again the
+  // code can no longer be used, so no line says how many tries are left on it.
+  it.each<[string, PairingFailure]>([
+    ['an invitation the host consumed as expired', { kind: 'expired', tries_left: 3 }],
+    ['a host that restarted', { kind: 'host_restarted', tries_left: 3 }],
+    [
+      'a dial lost after the host locked the invitation',
+      { kind: 'host_unreachable', tries_left: 4, invitation_spent: true }
+    ]
+  ])('has no tries line after %s, which starts again', async (_name, failure) => {
+    const { controls } = start()
+    await screen.findByLabelText('Pairing code')
+    attempt(controls, { state: 'ended', failure, mode: 'code', service: null })
+    const sentence = await screen.findByTestId('failure-sentence')
+    expect(screen.getByTestId('failure-action').textContent).toBe('Start again')
+    expect(sentence.textContent).not.toMatch(/tr(y|ies) left/)
+    expect(sentence.textContent).toBe(failureWords(failure, 'reach.kala.to').sentence)
+  })
+
+  it('keeps the tries line after an ending that does not start again', async () => {
+    const { controls } = start()
+    await screen.findByLabelText('Pairing code')
+    attempt(controls, ended('timed_out', 3))
+    expect(screen.getByTestId('failure-action').textContent).toBe('Try again')
+    expect((await screen.findByTestId('failure-sentence')).textContent).toBe(
+      `${failureWords({ kind: 'timed_out' }, 'reach.kala.to').sentence} 3 tries left on this device.`
     )
   })
 

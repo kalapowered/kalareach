@@ -282,15 +282,19 @@ export function failureAlternatives(
   return failure.kind === 'relay_capacity' ? (failure.alternatives ?? []) : []
 }
 
-/** The whole sentence for a failure, with the tries line whenever the attempt was charged. */
+/**
+ * The whole sentence for a failure, with the tries line whenever the attempt was charged, except
+ * after an ending that starts again: the tries are those of a code that can no longer be used, so
+ * the line would count what the person cannot spend.
+ */
 export function failureSentence(
   failure: PairingFailure,
   service: string,
   mode: AttemptMode = 'code',
   reading: Reading = 'pasteboard'
 ): string {
-  const { sentence } = failureWords(failure, service, mode, reading)
-  if (failure.tries_left === null) return sentence
+  const { sentence, action } = failureWords(failure, service, mode, reading)
+  if (failure.tries_left === null || action === 'start_again') return sentence
   const tries = failure.tries_left === 1 ? '1 try' : `${failure.tries_left} tries`
   return `${sentence} ${tries} left on this device.`
 }
