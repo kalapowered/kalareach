@@ -14,16 +14,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use kr_client::retry::UserAction;
 use kr_client::services::admission::RelayAdmissionIssueBody;
 use kr_client::services::{
-    AdmissionAnswer, AdmissionClock, AdmissionRequest, LeaseRequest, ManagedPairingAdmission,
-    ManagedRelayLeaseService, PairingAdmissionService, PairingAdmissions, RelayDirection,
-    RelayLeaseService, RelayRefusal, ServiceFuture, ServiceHttp, ServiceHttpAnswer, ServiceSigner,
+    AdmissionAnswer, AdmissionClock, AdmissionRequest, Alternatives, LeaseRequest,
+    ManagedPairingAdmission, ManagedRelayLeaseService, PairingAdmissionService, PairingAdmissions,
+    RelayDirection, RelayLeaseService, RelayRefusal, ServiceFuture, ServiceHttp, ServiceHttpAnswer,
+    ServiceSigner,
 };
 use kr_client::{ClientError as Error, Result};
 use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::sign::{SigningTranscript, sign};
-use kr_protocol::error::ErrorCode;
+use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::pairing::{NetworkConfig, NetworkHint};
 use kr_protocol::scalars::{AuthorisationKey, EndpointKey, Nullable, Signature64};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
@@ -46,6 +48,18 @@ fn no_answer() -> Result<AdmissionAnswer> {
     ))
 }
 
+/// A request that got no answer, and was refused with a delay to wait before the same request is
+/// sent again, as a service's refusal says when it names one.
+fn no_answer_for(delay: u64) -> Result<AdmissionAnswer> {
+    Err(Error::Refused {
+        error: ProtocolError::new(ErrorCode::ResourceUnavailable, "no answer".to_owned()),
+        retry_after_seconds: Some(delay),
+        action: UserAction::Wait,
+        service_code: None,
+        alternatives: Alternatives::default(),
+    })
+}
+
 /// What [`waits_at`] finds at each of `probes` for a service that gives `script`, the last of which
 /// repeats.
 async fn waits_for(
@@ -59,13 +73,14 @@ async fn waits_for(
 }
 
 /// KR-REQ-17.48: a request that fails lifts the time the answer is kept to the time the device asks
-/// again, so that no failed dial between them is told nothing. The answer names 50 seconds and is
-/// kept to 60; the request at 50 fails, and the device asks again at 70.
+/// again, so that no failed dial between them is told nothing, and the answer stops at that time and
+/// not after it. The answer names 50 seconds and is kept to 60; the request at 50 fails, and the
+/// device asks again at 70, where the answer has stopped and the third request is made.
 #[tokio::test]
 async fn kr_req_17_48_a_failed_request_keeps_the_answer_until_the_device_asks_again() {
     let seen = waits_for(
         vec![unable(Some(50)), no_answer()],
-        &[0, 50, 59, 60, 65, 69],
+        &[0, 50, 59, 60, 65, 69, 70],
     )
     .await;
     assert_eq!(
@@ -77,6 +92,34 @@ async fn kr_req_17_48_a_failed_request_keeps_the_answer_until_the_device_asks_ag
             (60, 2, Some(10)),
             (65, 2, Some(5)),
             (69, 2, Some(1)),
+            (70, 3, None),
+        ]
+    );
+}
+
+/// KR-REQ-17.48: a failure that names a delay above the ten minutes after the third request keeps
+/// the answer that stood until the device asks again, and not until the ten minutes are over. The
+/// answers come at 0 and 21 seconds and are kept to 81; the third request, at 61, fails and names
+/// 900 seconds, so the device asks again at 961 and a failed dial before then is told what is left.
+#[tokio::test]
+async fn kr_req_17_48_a_failure_that_names_more_than_ten_minutes_keeps_the_answer_that_stood() {
+    let seen = waits_for(
+        vec![unable(None), unable(None), no_answer_for(900), no_answer()],
+        &[0, 21, 26, 61, 66, 640, 700, 960, 961],
+    )
+    .await;
+    assert_eq!(
+        seen,
+        [
+            (0, 1, Some(20)),
+            (21, 2, Some(20)),
+            (26, 2, Some(15)),
+            (61, 3, Some(900)),
+            (66, 3, Some(895)),
+            (640, 3, Some(321)),
+            (700, 3, Some(261)),
+            (960, 3, Some(1)),
+            (961, 4, None),
         ]
     );
 }
