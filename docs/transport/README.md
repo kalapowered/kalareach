@@ -66,7 +66,8 @@ used:
 
 | Field | What it selects |
 | --- | --- |
-| `relay_urls` | The relay map. Empty disables relaying; it does not fall back to a public map. |
+| `relay_urls` | The relay map. Empty disables relaying unless `relays_added_on_dial` is on; it does not fall back to a public map. |
+| `relays_added_on_dial` | The relay map starts empty and relaying stays on, so a host's relays can be added when the device first dials that host. Only the device's own endpoint sets it; an invitation or a host bundle never does. |
 | `discovery.pkarr_publisher_url` | Where this endpoint publishes its signed record. |
 | `discovery.pkarr_resolver_url` | Where this endpoint resolves other endpoints over HTTPS. |
 | `discovery.dns_origin` | The DNS origin this endpoint resolves from. |
@@ -78,6 +79,14 @@ used:
 | `relay_ca_roots` | Extra trust anchors for a relay whose certificate comes from a private authority. |
 | `bind_addr` | The local socket. |
 | `proxy_url` | The HTTP proxy the endpoint reaches its relays and Pkarr servers through: the relay connection, the relay latency probe and captive-portal check, and the Pkarr publisher and resolver. A `ProxyUrl` is an `http` or `https` origin and never names a credential. |
+
+### The device's one endpoint
+
+An endpoint reaches exactly the services its configuration names. The device's one endpoint is built with none and takes them one host at a time: a host's relays and address lookups are added when the device first dials that host, and a lookup is asked only about the identity of the host that owns it. The device contacts a relay only on account of a host that it has dialled: one that the host's configuration names, which enters the relay map, or one that the host's own record names, where the device opens a client for that host.
+
+`DeviceEndpoint` (`dialler.rs`) binds that endpoint with `relays_added_on_dial` on, an empty relay map and one address lookup, a dispatcher that holds nothing until a host is introduced. `introduce` registers a host's Pkarr resolver and DNS origin under the host's endpoint identity and, for a paired host, puts the host's relays into the map. An invited host's relays stay out of the map until the pairing completes, and a dial reaches the relay its address names without them. `forget` takes a host's lookups out, and each relay that no other host names. The dispatcher answers for an identity that a host owns and for no other, publishes nothing and sends no relay token. A request for one host never refuses, closes or restarts the connection of another.
+
+A relay in the device's relay map can receive the net report's probes: an HTTPS request, which carries no endpoint identity, and a QUIC address probe, which goes to at most five of the relays in the map. The report runs when the map changes, about every 20 to 26 seconds, and at least every five minutes in a report that plans an HTTPS probe for every relay in the map. The relay that the report prefers as home relay also keeps the device's endpoint identity registered while the endpoint is open, and a relay used for a connection keeps it until the device has written no datagram to it for 60 seconds.
 
 Publication rules, which are the defaults of `PublisherPolicy`:
 
