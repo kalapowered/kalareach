@@ -3201,7 +3201,18 @@ mod tests {
     /// and `a_connect_that_found_nothing_listening_is_no_connection_that_did_not_answer`).
     #[tokio::test(start_paused = true)]
     async fn nothing_listening_with_the_lock_held_past_the_bound_is_silence() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let paths = temp.environment();
+        let id = paths.environment_id();
+        let environment = KnownEnvironment {
+            environment_id: id,
+            paths,
+        };
+        let earlier = Earlier::read(&environment.paths);
+        let none = Facts::none(Vec::new());
         let process = asked_process();
+        let held =
+            SingletonLock::hold(&environment.paths.singleton_lock(), id).expect("takes the lock");
         for kind in [
             std::io::ErrorKind::NotFound,
             std::io::ErrorKind::ConnectionRefused,
@@ -3213,13 +3224,31 @@ mod tests {
                 supplied.connection(),
                 &gone,
                 Some(&process),
-                an_environment(),
+                id,
                 the_deadline(),
             )
             .await;
             assert_eq!(before_said(&before), "silent, nothing accepted", "{kind:?}");
             assert_eq!(supplied.start.elapsed(), END_BOUND, "{kind:?}");
+            // The lock is held at the end: a daemon holds the environment and does not answer.
+            match unmade_ended(before, &gone, id, &environment, &none, true, &earlier) {
+                Completion::Reported(error) => {
+                    assert_eq!(error.exit_code(), 1, "{kind:?}");
+                    assert_eq!(
+                        error.to_string(),
+                        format!(
+                            "A control daemon holds environment {id} and does not answer, so it \
+                             may be starting or stopping. No stop was requested. Run kr host stop \
+                             again in a moment. {}",
+                            how_to_end_the_holder(&environment.paths)
+                        ),
+                        "{kind:?}"
+                    );
+                }
+                _ => panic!("a silent end is a failure that the command has reported"),
+            }
         }
+        drop(held);
     }
 
     /// A silent end is exit 1 with the silence sentence for a lock that is held, and no word that
