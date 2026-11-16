@@ -12,8 +12,12 @@
 //! after that read; the case ends what it ends, in a step of its own, with nothing running beside
 //! it; the writer is then called, and its question stands after that step. The writer's own waits
 //! are the lease's reading, which a method held to the lease takes and this method does not, and
-//! the wait for room on a full socket, which a case cannot stage with the frame unstarted. The
-//! replies are read whole.
+//! the wait for room on a full socket. A case stages that wait with the socket filled to the byte
+//! before the writer starts: the writer's wait is counted, the case reads filler frames one at a
+//! time, under a bound, until the writer confirms that it has reached the end of its wait (how
+//! many reads the kernel needs before a socket is writable again is its own, and a case does not
+//! rest on one), the case ends what it ends there, and the fillers that remain are read after the
+//! writer goes on. The replies are read whole.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -307,10 +311,10 @@ async fn filler(reader: &mut kr_ipc::framed::FrameReader) {
 
 /// Reads filler frames, one at a time, until the writer says it has reached the end of its wait for
 /// room, and returns how many were read. How many frames the socket must lose before it is
-/// writable again is the kernel's to say (Linux reports room once a quarter of the bytes it
-/// accounts for are free, and a read of one frame frees one frame's share), so the case reads until
-/// the writer arrives and does not assume that one read is enough. Where every filler has been read
-/// the socket is empty, and the writer is waited for under the same bound.
+/// writable again is the kernel's to say (Linux reports a Unix socket writable only when what is
+/// queued on it has fallen to a fraction of its send buffer, which one frame's read need not do), so
+/// the case reads until the writer arrives and does not assume that one read is enough. Where every
+/// filler has been read the socket is empty, and the writer is waited for under the same bound.
 #[cfg(unix)]
 async fn drained_until_the_writer_arrives(
     reader: &mut kr_ipc::framed::FrameReader,

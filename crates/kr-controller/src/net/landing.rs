@@ -13,12 +13,13 @@
 //! word it sets stands inside the transaction, where the second ask reads it. Three raisers do not
 //! wait for the lock: the feed's removal (`refuse_the_grants_that_rest_on_the_feed`), the personal
 //! grants' mirror and the raise at start. A fourth, `refuse_for_an_unverified_withdrawal`, leaves
-//! the wait to its caller and reads the device directory first, which an open record holds, so it
-//! cannot raise during a record's transaction. A word one of the three sets after the second ask
-//! is met by the last ask, immediately before the commit ([`Landing::asks_before_the_commit`]),
-//! which asks the subject's own checks again first, then the footing's question and the feed, and
-//! rolls the transaction back on a refusal; what stands outside it is the commit's own call, the
-//! rule's stated limit.
+//! the wait to its caller and reads the device directory first, but that read ends before the raise
+//! and the waits that precede it, so a record's transaction can begin between them: it can raise
+//! during a record's transaction too, and its caller's wait for the writes under way comes after
+//! the raise. A word one of the four sets after the second ask is met by the last ask, immediately
+//! before the commit ([`Landing::asks_before_the_commit`]), which asks the subject's own checks
+//! again first, then the footing's question and the feed, and rolls the transaction back on a
+//! refusal; what stands outside it is the commit's own call, the rule's stated limit.
 //!
 //! A [`Landing`] is what a door gives the caller of such a mutation: the feed's ask, the footing
 //! made once at the door, and the held bound of the local owner's lease. The same parts give the
