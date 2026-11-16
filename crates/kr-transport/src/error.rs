@@ -1,5 +1,6 @@
 //! What can go wrong on a KalaReach connection.
 
+use iroh::endpoint::{ConnectionError, ReadError, ReadExactError, ResetError};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::frame::FrameError;
 
@@ -39,6 +40,10 @@ pub enum TransportError {
     /// A stream could not be opened or accepted.
     #[error("the stream failed: {0}")]
     Stream(String),
+    /// A stream's read failed because its connection ended, and the connection's cause is carried
+    /// as the read returned it. The words are those of every other stream failure.
+    #[error("the stream failed: connection lost")]
+    StreamLost(ConnectionEnd),
     /// The peer closed the connection.
     #[error("the peer closed the connection: {0}")]
     Closed(String),
@@ -92,7 +97,74 @@ pub enum TransportError {
     Deadline(crate::deadlines::DeadlineKind),
 }
 
+/// Why the connection that a stream's read waited on ended, as the read returned it.
+///
+/// The cause is the connection's record at the moment the read was woken with it, so it is exactly
+/// what that read saw: a later close of either side changes the record and not this value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionEnd {
+    /// This application closed the connection.
+    ClosedBySelf,
+    /// The peer closed the connection: an application close, or its stack's close. The text says
+    /// which.
+    ClosedByPeer(String),
+    /// The connection was lost any other way (reset by the peer, timed out, a protocol violation,
+    /// a version or connection identifier failure), with the library's text.
+    Lost(String),
+}
+
+impl ConnectionEnd {
+    /// Gives the library's cause of a lost connection its place.
+    ///
+    /// One match, with no catch-all arm: the library's cause type is not marked non-exhaustive
+    /// (`noq-proto` `connection/mod.rs`, `pub enum ConnectionError`), so a variant that a later
+    /// version adds fails this build here and is decided here, and does not pass for a cause that
+    /// this side closed.
+    fn of(cause: &ConnectionError) -> Self {
+        match cause {
+            ConnectionError::LocallyClosed => Self::ClosedBySelf,
+            ConnectionError::ApplicationClosed(_) | ConnectionError::ConnectionClosed(_) => {
+                Self::ClosedByPeer(cause.to_string())
+            }
+            ConnectionError::VersionMismatch
+            | ConnectionError::TransportError(_)
+            | ConnectionError::Reset
+            | ConnectionError::TimedOut
+            | ConnectionError::CidsExhausted => Self::Lost(cause.to_string()),
+        }
+    }
+}
+
 impl TransportError {
+    /// The failure of a stream's read. A read that fails because its connection ended carries the
+    /// connection's cause ([`ConnectionEnd`]); the stream's own failures (a reset, a closed stream,
+    /// a rejected early-data read) stay [`Self::Stream`] with the library's text.
+    pub(crate) fn of_read(error: &ReadError) -> Self {
+        match error {
+            ReadError::ConnectionLost(cause) => Self::StreamLost(ConnectionEnd::of(cause)),
+            ReadError::Reset(_) | ReadError::ClosedStream | ReadError::ZeroRttRejected => {
+                Self::Stream(error.to_string())
+            }
+        }
+    }
+
+    /// The failure of an exact read: as [`Self::of_read`], and a stream that finished early stays
+    /// [`Self::Stream`] with the library's text.
+    pub(crate) fn of_exact_read(error: &ReadExactError) -> Self {
+        match error {
+            ReadExactError::ReadError(error) => Self::of_read(error),
+            ReadExactError::FinishedEarly(_) => Self::Stream(error.to_string()),
+        }
+    }
+
+    /// The failure of a wait for a stream's reset.
+    pub(crate) fn of_reset_wait(error: &ResetError) -> Self {
+        match error {
+            ResetError::ConnectionLost(cause) => Self::StreamLost(ConnectionEnd::of(cause)),
+            ResetError::ZeroRttRejected => Self::Stream(error.to_string()),
+        }
+    }
+
     /// Builds the handshake failure a peer is told about.
     #[must_use]
     pub fn handshake(code: ErrorCode, message: impl Into<String>) -> Self {
@@ -113,6 +185,7 @@ impl TransportError {
             Self::Connect(_)
             | Self::Closed(_)
             | Self::Stream(_)
+            | Self::StreamLost(_)
             | Self::ControlLost
             | Self::Deadline(_) => {
                 ProtocolError::new(ErrorCode::ResourceUnavailable, "the connection ended")
@@ -499,5 +572,47 @@ mod tests {
              authenticated update, local network discovery the person selects or another \
              configured relay"
         );
+    }
+
+    /// A stream read that fails because its connection ended carries the connection's cause, and
+    /// the stream's own failures stay failures with the library's text. The words of every one are
+    /// those of a stream that failed, as before the cause was carried.
+    #[test]
+    fn a_failed_read_carries_the_cause_of_the_lost_connection() {
+        use iroh::endpoint::{ConnectionError, ReadError, VarInt};
+
+        let lost = |cause| TransportError::of_read(&ReadError::ConnectionLost(cause));
+        assert!(matches!(
+            lost(ConnectionError::LocallyClosed),
+            TransportError::StreamLost(ConnectionEnd::ClosedBySelf)
+        ));
+        for cause in [
+            ConnectionError::TimedOut,
+            ConnectionError::Reset,
+            ConnectionError::VersionMismatch,
+            ConnectionError::CidsExhausted,
+        ] {
+            assert!(matches!(
+                lost(cause),
+                TransportError::StreamLost(ConnectionEnd::Lost(_))
+            ));
+        }
+        assert_eq!(
+            lost(ConnectionError::LocallyClosed).to_string(),
+            "the stream failed: connection lost"
+        );
+        // The stream's own failures keep the existing variant and text.
+        match TransportError::of_read(&ReadError::Reset(VarInt::from(77_u32))) {
+            TransportError::Stream(words) => assert_eq!(words, "stream reset by peer: error 77"),
+            other => panic!("a reset stream was not a stream failure: {other:?}"),
+        }
+        assert!(matches!(
+            TransportError::of_read(&ReadError::ClosedStream),
+            TransportError::Stream(_)
+        ));
+        assert!(matches!(
+            TransportError::of_read(&ReadError::ZeroRttRejected),
+            TransportError::Stream(_)
+        ));
     }
 }

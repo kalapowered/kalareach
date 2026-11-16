@@ -410,7 +410,9 @@ impl Shown {
                 }
                 Self::decided(said)
             }
-            TransportError::Stream(_) => Self::said("the stream failed"),
+            TransportError::Stream(_) | TransportError::StreamLost(_) => {
+                Self::said("the stream failed")
+            }
             TransportError::Closed(_) => Self::said("the peer closed the connection"),
             TransportError::Frame(error) => {
                 crate::shown!("the frame was refused: {}", Self::frame(error))

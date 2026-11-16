@@ -597,6 +597,37 @@ async fn one_connection_carries_one_session() {
     serving.abort();
 }
 
+/// An endpoint that is closed under a live connection (this device's pool does it when nothing holds
+/// the endpoint) ends a session that reads the connection as a failure: the connection's cause then
+/// is "closed by this side", but the wrapper's own close was not called, so it is no clean end, and
+/// no close of the owner is involved.
+#[tokio::test]
+async fn an_endpoint_closed_under_a_live_session_ends_it_as_a_failure() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let serving = spawn_host(&host, client.record, Arc::new(HostScript::default()), None);
+
+    let transport: Arc<dyn kr_client::transport::ControlTransport> =
+        Arc::new(dial(&client, &host).await);
+    let (session, mut events) =
+        Session::start_ordered(Arc::clone(&transport), 4).expect("an ordered session");
+    client.endpoint.close().await;
+    let ended = tokio::time::timeout(Duration::from_secs(30), events.recv())
+        .await
+        .expect("the endpoint's close ends the session");
+    assert!(
+        matches!(
+            ended,
+            Some(kr_client::ordered::Ordered::Ended(
+                kr_client::ordered::Ended::Failed(_)
+            ))
+        ),
+        "an endpoint closed under a live session did not end it as a failure"
+    );
+    drop(session);
+    serving.abort();
+}
+
 /// This side's own close ends a read of the paired transport that waits, and the read returns the
 /// clean end and no error: the transport says so by what its connection recorded as the cause of
 /// its end, so a session that reads the end need not guess it from a flag raised afterwards. A
@@ -652,12 +683,33 @@ async fn a_connection_that_the_host_closed_is_not_one_that_this_side_closed() {
     .await
     .expect("the host's close reaches the client");
     assert!(
-        read_to_the_end.is_err(),
-        "the connection was lost under the control stream: {read_to_the_end:?}"
+        matches!(
+            &read_to_the_end,
+            Err(ClientError::Transport(
+                kr_transport::TransportError::StreamLost(
+                    kr_transport::ConnectionEnd::ClosedByPeer(_)
+                )
+            ))
+        ),
+        "the connection was lost under the control stream, closed by the host: {read_to_the_end:?}"
     );
     assert!(
         !kr_client::transport::ControlTransport::is_closed(&closed_by_the_host),
         "the host closed the connection and this side did not"
+    );
+    // This side's close that follows changes what the read returned, and the read's end is
+    // classified by what it returned: the cause stays the host's.
+    kr_client::transport::ControlTransport::close(&closed_by_the_host);
+    assert!(
+        matches!(
+            &read_to_the_end,
+            Err(ClientError::Transport(
+                kr_transport::TransportError::StreamLost(
+                    kr_transport::ConnectionEnd::ClosedByPeer(_)
+                )
+            ))
+        ),
+        "a close of this side after the read returned its error took the host's cause away"
     );
     assert!(
         !kr_client::transport::ControlTransport::can_send(&closed_by_the_host),
