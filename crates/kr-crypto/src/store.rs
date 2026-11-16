@@ -2686,6 +2686,49 @@ mod tests {
         );
     }
 
+    /// KR-REQ-10.47: a host whose record names the platform store is not started with the
+    /// directory store: the keys are not in the directory, so it would make a new set. The start
+    /// is refused before any key is made, and a record that names the directory, or none, is
+    /// served by the directory as before.
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+    ))]
+    #[test]
+    fn the_directory_store_is_refused_over_a_record_that_names_the_platform_store() {
+        let name = SecretName::new("host/x").expect("a name");
+        let base = scratch_directory("selection-file-over-platform");
+        record_kind(&base, StoreKind::Platform).expect("a record");
+
+        let refusal = StoreSelection::File
+            .open(SELECTION_SERVICE, &base)
+            .expect_err("the directory is not this host's store")
+            .to_string();
+        assert!(refusal.contains("No key was made or changed"), "{refusal}");
+        assert!(
+            !fallback_holds_secrets(&base).expect("a read"),
+            "no key is made"
+        );
+        assert_eq!(
+            read_recorded_kind(&base).expect("a record"),
+            Some(StoreKind::Platform),
+            "the record is as it was"
+        );
+
+        for record in [Some(StoreKind::FileFallback), None] {
+            let base = scratch_directory("selection-file-served");
+            if let Some(kind) = record {
+                record_kind(&base, kind).expect("a record");
+            }
+            let opened = StoreSelection::File
+                .open(SELECTION_SERVICE, &base)
+                .expect("the directory serves a named run");
+            opened.store.set(&name, b"seed").expect("a write");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// KR-REQ-10.47: a host with no record, whose platform store does not open and whose directory
     /// cannot be used, has nowhere to keep its keys: the start is refused, the directory and the
     /// store's reason are named, and nothing is made.
