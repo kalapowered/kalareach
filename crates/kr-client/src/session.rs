@@ -2136,7 +2136,7 @@ fn refused_or_unknown(
 fn word_of(response: &Response) -> HostWord {
     match &response.outcome {
         Outcome::Ok(_) => HostWord::Definite,
-        Outcome::Error(error) => HostWord::of(error.code),
+        Outcome::Error(error) => HostWord::of_refusal(error),
     }
 }
 
@@ -2151,7 +2151,7 @@ fn suggests_withdrawal(response: &Response) -> bool {
         Outcome::Ok(_) => false,
         Outcome::Error(error) => {
             error.code == kr_protocol::error::ErrorCode::PermissionDenied
-                || HostWord::of(error.code) == HostWord::Unknown
+                || HostWord::of_refusal(error) == HostWord::Unknown
         }
     }
 }

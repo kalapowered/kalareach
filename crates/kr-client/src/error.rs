@@ -386,6 +386,13 @@ impl HostWord {
         }
     }
 
+    /// What a host's `refusal` says: the one rule that the session applies to an answer it reads
+    /// off the connection, offered to a caller that holds the refusal and not the answer.
+    #[must_use]
+    pub const fn of_refusal(refusal: &ProtocolError) -> Self {
+        Self::of(refusal.code)
+    }
+
     /// Whether this is the host's definite word that the action did not happen.
     #[must_use]
     pub const fn is_definite(self) -> bool {
@@ -435,6 +442,11 @@ mod tests {
                 _ => assert_eq!(word, HostWord::Definite, "{code:?}"),
             }
             assert_eq!(is_definite(*code), word == HostWord::Definite, "{code:?}");
+            assert_eq!(
+                HostWord::of_refusal(&ProtocolError::new(*code, "refused")),
+                word,
+                "{code:?}"
+            );
         }
     }
 
