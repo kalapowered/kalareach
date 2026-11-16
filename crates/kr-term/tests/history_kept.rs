@@ -59,6 +59,16 @@ fn retained(engine: &Engine) -> Vec<String> {
     text_of(&grid.history_rows(oldest, count))
 }
 
+/// Every row of text that the engine holds or shows on the primary screen, oldest first, without the
+/// empty rows: what a person scrolling back from the bottom would read.
+fn text_rows(engine: &Engine) -> Vec<String> {
+    retained(engine)
+        .into_iter()
+        .chain(text_of(&engine.grid().visible_rows()))
+        .filter(|row| !row.is_empty())
+        .collect()
+}
+
 /// How many rows the primary buffer holds above its screen, whichever buffer shows.
 fn held_above_primary(engine: &Engine) -> usize {
     let grid = engine.grid();
@@ -345,6 +355,40 @@ fn rows_are_kept_through_a_height_only_resize_that_gives_up_nothing_of_its_own()
 
 #[test]
 fn rows_are_kept_through_a_resize_to_the_same_size_and_a_width_only_resize() {
+    // While an old row of the interval and fresh rows share the screen: the screen of six rows holds
+    // `while 18` and `while 19`, `after 0` (printed onto a row that was on the screen at the
+    // disabling) and the fresh rows `after 1` and `after 2`. A resize that gave up what is above the
+    // screen, or marked the rows on it, would lose `after 1` and `after 2` here.
+    for (note, columns) in [
+        ("without a resize", None),
+        ("a resize to the size it has", Some(20)),
+        ("a wider screen", Some(21)),
+        ("a narrower screen that splits no row", Some(12)),
+    ] {
+        let mut engine = engine(20, 6);
+        engine.set_history_kept(false);
+        feed(&mut engine, &printed("while", 0, 20));
+        engine.set_history_kept(true);
+        feed(&mut engine, &printed("after", 0, 3));
+        assert_eq!(
+            text_of(&engine.grid().visible_rows()),
+            vec!["while 18", "while 19", "after 0", "after 1", "after 2", ""]
+        );
+        if let Some(columns) = columns {
+            engine
+                .resize(GridSize::new(columns, 6), 0)
+                .expect("resizes");
+        }
+        feed(&mut engine, &format!("\r\n{}", printed("later", 0, 12)));
+
+        assert_eq!(
+            text_rows(&engine),
+            [numbered("after", 1, 3), numbered("later", 0, 12)].concat(),
+            "{note}: the complete list of rows kept"
+        );
+    }
+
+    // After every row of the interval has left the screen.
     let mut engine = after_a_private_interval();
     feed(&mut engine, &printed("after", 0, 12));
     // The screen holds `after 9` to `after 11` and the row the cursor is on; `after 0` was
@@ -362,27 +406,87 @@ fn rows_are_kept_through_a_resize_to_the_same_size_and_a_width_only_resize() {
 
     // A narrower screen that splits no row. The library moves the row above the screen onto it when
     // the empty row under the cursor goes, so the rows held and the rows shown are read together.
-    let everything = |engine: &Engine| -> Vec<String> {
-        retained(engine)
-            .into_iter()
-            .chain(
-                text_of(&engine.grid().visible_rows())
-                    .into_iter()
-                    .filter(|row| !row.is_empty()),
-            )
-            .collect()
-    };
     engine.resize(GridSize::new(12, 4), 0).expect("narrower");
     assert_eq!(
-        everything(&engine),
+        text_rows(&engine),
         numbered("after", 1, 12),
         "after a narrower screen: none of the rows is joined, cut or given up"
     );
     feed(&mut engine, &format!("\r\n{}", printed("later", 0, 4)));
     assert_eq!(
-        everything(&engine),
+        text_rows(&engine),
         [numbered("after", 1, 12), numbered("later", 0, 4)].concat(),
         "and the rows that come after are kept"
+    );
+}
+
+#[test]
+fn a_resize_that_joins_the_parts_of_a_wrapped_line_gives_up_the_first_part_when_the_rest_is_given_up()
+ {
+    // The rest of the line is marked and the first part is a fresh row. Without a resize the first
+    // part is kept; a resize that joins them gives up the whole line, and the fresh rows that leave
+    // while it stays on the screen below them.
+    let kept = |resize: bool| -> Vec<String> {
+        let mut engine = engine(20, 4);
+        engine.set_history_kept(false);
+        feed(&mut engine, "a\r\nb\r\nc\r\nd");
+        engine.set_history_kept(true);
+        // A fresh row at the top, and twenty-five characters from its start: twenty fill it and five
+        // wrap onto the row of the interval that stands under it.
+        feed(&mut engine, "\x1b[H\x1bM0123456789ABCDEFGHIJKLMNO");
+        if resize {
+            engine.resize(GridSize::new(30, 4), 0).expect("wider");
+        }
+        // Three fresh rows at the top push the rows of the interval off the bottom, then three rows
+        // are printed on them and scrolled away.
+        feed(&mut engine, "\x1b[H\x1bM\x1bM\x1bM");
+        feed(&mut engine, "g3\r\ng2\r\ng1");
+        feed(&mut engine, "\x1b[4;1H\n\n\n\n\n\n");
+        retained(&engine)
+    };
+
+    assert_eq!(
+        kept(false),
+        ["g3", "g2", "g1", "0123456789ABCDEFGHIJ", "", ""],
+        "without a resize the first part and the rows after it are kept"
+    );
+    assert_eq!(
+        kept(true),
+        ["", ""],
+        "after the join the whole line is a row of the interval, and none of them is kept"
+    );
+}
+
+#[test]
+fn a_scroll_inside_margins_carries_the_rule_to_the_line_that_receives_the_cells() {
+    // A clear at the disabling, four rows printed onto the cleared lines, and a run of rows after
+    // them from the bottom of the screen.
+    let kept = |scroll_in_margins: bool| -> Vec<String> {
+        let mut engine = after_a_private_interval();
+        feed(&mut engine, "\x1b[2J\x1b[H");
+        feed(&mut engine, &printed("after", 0, 4));
+        if scroll_in_margins {
+            // One reverse index inside columns 1 to 10: the fresh row at the bottom receives the cells
+            // of the marked row above it.
+            feed(
+                &mut engine,
+                "\x1b[?69h\x1b[1;10s\x1b[H\x1bM\x1b[1;20s\x1b[?69l",
+            );
+        }
+        feed(&mut engine, "\x1b[4;1H");
+        feed(&mut engine, &printed("later", 0, 12));
+        retained(&engine)
+    };
+
+    assert_eq!(
+        kept(false),
+        numbered("later", 0, 9),
+        "four rows are given up: `after 0` to `after 3`"
+    );
+    assert_eq!(
+        kept(true),
+        numbered("later", 1, 9),
+        "five are: the fresh row that received the cells took the rule with them"
     );
 }
 
@@ -560,9 +664,16 @@ fn the_newest_marked_row_joined_to_a_row_of_the_interval_is_given_up_whole() {
     // wrap from the fresh row onto it make the two one logical line.
     feed(&mut engine, "\n\n\n\x1b[H\x1bMABCDEFGHIJKLMNOPQRSTUVW");
     engine.resize(GridSize::new(30, 4), 0).expect("wider");
+    // The cursor goes to the bottom row, off the joined line, so that nothing printed afterwards
+    // overwrites the cells that the list below is read for.
+    feed(&mut engine, "\x1b[4;1H");
     feed(&mut engine, &printed("after", 0, 30));
 
-    assert_none_of(&retained(&engine), &["le 20", "while"]);
+    assert_eq!(
+        retained(&engine),
+        [vec![String::new(); 2], numbered("after", 0, 27)].concat(),
+        "the joined line is not kept, whole or in part, and nothing else is lost"
+    );
 }
 
 #[test]
@@ -570,9 +681,11 @@ fn a_blank_row_that_holds_a_link_is_given_up_when_a_narrower_screen_rebuilds_it(
     let mut engine = engine(20, 4);
     engine.set_history_kept(false);
     feed(&mut engine, &printed("while", 0, 20));
+    // The link covers twelve columns, more than the ten of the narrower screen, so the row is wider
+    // than the screen it is handed back to and the grid rebuilds it.
     feed(
         &mut engine,
-        "\x1b]8;;https://link.example/\x1b\\     \x1b]8;;\x1b\\",
+        "\x1b]8;;https://link.example/\x1b\\            \x1b]8;;\x1b\\\r\n",
     );
     engine.set_history_kept(true);
 
