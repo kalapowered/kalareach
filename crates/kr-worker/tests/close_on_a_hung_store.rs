@@ -764,14 +764,14 @@ async fn read_within_its_bound(client: &mut LocalClient, host: &Host, what: &str
 }
 
 /// Reads the receipt of `action_id` on `client`, waited for no longer than [`READ_BOUND`], and
-/// returns the host's answer, an error code when it refused.
+/// returns the host's answer, the host's error when it refused.
 async fn receipt_within_its_bound(
     client: &mut LocalClient,
     action_id: ActionId,
     what: &str,
 ) -> (
     Duration,
-    Result<kr_protocol::receipt::ActionReadResult, kr_protocol::error::ErrorCode>,
+    Result<kr_protocol::receipt::ActionReadResult, kr_protocol::error::ProtocolError>,
 ) {
     let sent = Instant::now();
     let outcome = tokio::time::timeout(
@@ -791,12 +791,12 @@ async fn receipt_within_its_bound(
         Ok(Ok(value)) => Ok(value
             .to_typed()
             .unwrap_or_else(|error| panic!("{what}: the answer could not be read: {error}"))),
-        Ok(Err(error)) => Err(error.code),
+        Ok(Err(error)) => Err(error),
         Err(error) => panic!("{what}: the read failed: {error}"),
     };
     eprintln!(
         "RESULT {what}: receipt read answered after {answered:.2?}: {:?}",
-        result.as_ref().map(|_| ())
+        result.as_ref().map(|_| ()).map_err(|error| error.code)
     );
     (answered, result)
 }
@@ -1081,7 +1081,7 @@ async fn a_read_of_a_receipt_while_the_session_is_held_is_answered_within_its_bo
         "the receipt read was answered after {answered:?}, past {READ_BOUND:?}"
     );
     assert_eq!(
-        held.map(|_| ()),
+        held.map(|_| ()).map_err(|error| error.code),
         Err(kr_protocol::error::ErrorCode::StorageUnavailable),
         "a receipt that cannot be read now is said to be unreachable"
     );
@@ -1095,6 +1095,78 @@ async fn a_read_of_a_receipt_while_the_session_is_held_is_answered_within_its_bo
         assert!(
             began.elapsed() < AFTER_LET_GO,
             "the receipt was not readable {AFTER_LET_GO:?} after the stall was let go"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The session is taken and the store does not answer the read of the receipt: the read answers
+/// within its bound that the receipt could not be read, and the thread that stands in the store
+/// keeps the session, so a read of the session is answered from the published summary until the
+/// store answers. Let go, the same read gives the receipt again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_read_of_a_receipt_that_the_store_does_not_answer_is_answered_within_its_bound() {
+    let host = host().await;
+    let (mut owner, mut reader, mut other) = (
+        host.client().await,
+        host.client().await,
+        host.client().await,
+    );
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let attached = owner
+        .mutate(
+            Method::SessionAttach,
+            action_id,
+            host.target(),
+            &attach_params(host.session_id),
+        )
+        .await
+        .expect("the attach reached the worker");
+    assert!(attached.is_ok(), "the attach was accepted: {attached:?}");
+    let (_, control) = receipt_within_its_bound(&mut reader, action_id, "control receipt").await;
+    assert!(control.is_ok(), "a receipt is read when the store answers");
+    let (arrived, release) = {
+        let mut session = host.runtime.session();
+        session
+            .journal_mut()
+            .expect("this session keeps a journal")
+            .stall_next_result_read_blocking()
+    };
+    let (answered, stalled) =
+        receipt_within_its_bound(&mut reader, action_id, "stalled receipt").await;
+    // The read had taken the session and stood in the store when it was refused.
+    reached(arrived, "the receipt read").await;
+    assert!(
+        answered <= READ_BOUND,
+        "the receipt read was answered after {answered:?}, past {READ_BOUND:?}"
+    );
+    assert_eq!(
+        stalled.map(|_| ()).map_err(|error| error.code),
+        Err(kr_protocol::error::ErrorCode::StorageUnavailable),
+        "a receipt that the store did not answer is said to be unreachable"
+    );
+    // What the stalled read still holds: the session, until the store answers.
+    let (answered, held) =
+        read_within_its_bound(&mut other, &host, "held by the receipt read").await;
+    assert!(
+        answered <= READ_BOUND,
+        "the read of a held session was answered after {answered:?}, past {READ_BOUND:?}"
+    );
+    assert!(
+        held.launch_profile.0.is_none(),
+        "the read was answered while the stalled receipt read held the session"
+    );
+    let _ = release.send(());
+    // The store answered, so the same read gives the receipt again.
+    let began = Instant::now();
+    loop {
+        let (_, again) = receipt_within_its_bound(&mut reader, action_id, "after the let-go").await;
+        if again.is_ok() {
+            break;
+        }
+        assert!(
+            began.elapsed() < AFTER_LET_GO,
+            "the receipt was not readable {AFTER_LET_GO:?} after the store answered"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

@@ -22,6 +22,10 @@ use crate::input_domain::InputShared;
 /// How long a read waits to take the session before it answers from the published summary.
 pub const TAKE_BOUND: Duration = Duration::from_millis(250);
 
+/// How long a read that holds the session waits for the store to answer it before it stops
+/// waiting. The read itself goes on, with the session, until the store answers.
+pub const STORE_BOUND: Duration = TAKE_BOUND;
+
 /// How long a bounded take waits between two tries.
 pub(crate) const TAKE_STEP: Duration = Duration::from_millis(10);
 
