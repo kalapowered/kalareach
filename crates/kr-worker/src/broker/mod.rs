@@ -2708,7 +2708,12 @@ impl Broker {
         // admission was checked against, and the two deadlines on clocks read here, not on the
         // reading the caller took before it waited for this lock. Nothing but the event's
         // construction stands between them and the write.
-        state.checks(against, request, self.deadline_now())?;
+        state.checks(
+            against,
+            request,
+            self.deadline_now(),
+            crate::broker::methods::Ask::Again,
+        )?;
         // The resource's own state does not change here: it was claimed and stays claimed. What
         // changes is the marker, and that is a durable change like any other, so the event that
         // announces it is written in the same transaction and published with it.
@@ -5267,17 +5272,23 @@ impl BrokerState {
             turn_id,
             body,
         };
-        // The suspension, the binding revision, the turn (read here rather than before the lock:
-        // a turn that ended between the two would otherwise be steered), the component answerable
-        // for the dispatch and the capability: the checks that every later ask of this admission
-        // makes again.
+        // The suspension, the binding revision and the turn (read here rather than before the
+        // lock: a turn that ended between the two would otherwise be steered) are the checks that
+        // every later ask of this admission makes again. The component answerable for the
+        // dispatch and the capability are the first admission's alone.
         let against = crate::broker::methods::AdmittedAgainst::new(
             application_instance_id,
             target.binding_revision,
-            responsible,
-            capability.clone(),
         );
-        self.checks(&against, &request, now)?;
+        self.checks(
+            &against,
+            &request,
+            now,
+            crate::broker::methods::Ask::First {
+                responsible,
+                capability: capability.as_ref(),
+            },
+        )?;
         Ok(crate::broker::methods::MutationAdmission::new(
             request,
             dispatch,
