@@ -915,6 +915,12 @@ async fn a_later_look_gives_a_reason_that_rests_on_a_fact_the_first_look_could_n
             false,
             ClosureReason::DesktopLost,
         ),
+        (
+            ClosureReason::DesktopLost,
+            ClosureReason::HostShutdown,
+            true,
+            ClosureReason::HostShutdown,
+        ),
     ] {
         let temp = TempHost::create();
         let controller = daemon(&temp).await;
