@@ -72,18 +72,43 @@ pub const CLOSE_EXCHANGE: std::time::Duration = std::time::Duration::from_millis
 /// A closure this daemon has been told of, and what it holds of it until its registry does.
 ///
 /// The registry is this daemon's disk, and a write to it that does not return must not hold a
-/// close that already has its answer. The answer is kept here before the registry is written, and
+/// close that already has its answer. The record is kept here before the registry is written, and
 /// a close of the session is answered from it.
 #[derive(Debug)]
 pub(super) struct KnownClosure {
-    /// The close result a close of the session is answered with.
-    answer: SessionCloseResult,
+    /// The record as the registry is written with it.
+    record: ClosureRecord,
+    /// Whose account the record is.
+    whose: Whose,
     /// Whether the record is a worker's volatile one, which its durable record may still replace.
     /// A provisional record is held and never written: the registry's first record of a closure
     /// is the one it keeps, so writing a volatile one would hide the durable one that follows.
     provisional: bool,
     /// Whether a task of this daemon is writing the record to the registry now.
     writing: bool,
+}
+
+impl KnownClosure {
+    /// The close result that a close of the session is answered with while the registry has not
+    /// the record.
+    fn said(&self) -> SessionCloseResult {
+        let mut said = self.record.clone();
+        if self.whose == Whose::Daemon {
+            said.durability = Durability::Volatile;
+        }
+        answer_of_record(&said)
+    }
+}
+
+/// Whose account of a closure this daemon keeps until its registry has it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Whose {
+    /// The worker's own account, as it gave it. A durable one is also in the worker's journal.
+    Worker,
+    /// This daemon's own account of a worker that ended and left none. Nothing but the registry
+    /// holds it, so until the registry has committed it a close is told that the closure is not
+    /// recorded durably.
+    Daemon,
 }
 
 /// The close result that a closure record answers a close with.
@@ -502,7 +527,7 @@ impl Controller {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&session_id)
-            .map(|known| known.answer.clone())
+            .map(KnownClosure::said)
     }
 
     /// Whether this daemon knows how `session_id` ended, finally: a closure that is not a worker's
@@ -530,23 +555,25 @@ impl Controller {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&session_id)
             .filter(|known| known.provisional)
-            .and_then(|known| known.answer.closure.0.clone())
+            .map(|known| known.record.clone())
     }
 
     /// Keeps `record` as what a close of its session is answered with. A final record is not
     /// replaced by a provisional one.
-    fn keep_known_closure(&self, record: &ClosureRecord, provisional: bool) {
+    fn keep_known_closure(&self, record: &ClosureRecord, provisional: bool, whose: Whose) {
         let mut known = self
             .known_closures
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = known.entry(record.session_id).or_insert(KnownClosure {
-            answer: answer_of_record(record),
+            record: record.clone(),
+            whose,
             provisional,
             writing: false,
         });
         if entry.provisional || !provisional {
-            entry.answer = answer_of_record(record);
+            entry.record = record.clone();
+            entry.whose = whose;
             entry.provisional = provisional;
         }
     }
@@ -563,7 +590,7 @@ impl Controller {
     /// task of its own is writing it. A write that fails is tried again by the next close of the
     /// session, and by the watch over the worker's end.
     fn record_known_closure_soon(self: &Arc<Self>, session_id: SessionId) {
-        let record = {
+        let (record, whose) = {
             let mut known = self
                 .known_closures
                 .lock()
@@ -574,15 +601,12 @@ impl Controller {
             if entry.provisional || entry.writing {
                 return;
             }
-            let Some(record) = entry.answer.closure.0.clone() else {
-                return;
-            };
             entry.writing = true;
-            record
+            (entry.record.clone(), entry.whose)
         };
         let me = Arc::clone(self);
         tokio::spawn(async move {
-            let written = me.retire(&record).await;
+            let written = me.retire_as(&record, whose).await;
             if let Some(entry) = me
                 .known_closures
                 .lock()
@@ -643,12 +667,12 @@ impl Controller {
     ) {
         match answer.closure.as_ref() {
             Some(record) if record.durability == Durability::Volatile => {
-                self.keep_known_closure(record, true);
+                self.keep_known_closure(record, true, Whose::Worker);
                 self.close_accepted(session_id, answer.session.as_ref())
                     .await;
             }
             Some(record) => {
-                self.keep_known_closure(record, false);
+                self.keep_known_closure(record, false, Whose::Worker);
                 self.record_known_closure_soon(session_id);
             }
             None => {
@@ -1105,7 +1129,7 @@ impl Controller {
         if death == Death::Confirmed
             && let Some(recovered) = self.recovered_closure(session_id)
         {
-            self.write_closure(&recovered).await?;
+            self.write_closure(&recovered, Whose::Worker).await?;
             return Ok(recovered);
         }
         // The worker ended with no durable record of its own. What it said of its closure before
@@ -1113,7 +1137,7 @@ impl Controller {
         if death == Death::Confirmed
             && let Some(provisional) = self.provisional_closure(session_id)
         {
-            self.write_closure(&provisional).await?;
+            self.write_closure(&provisional, Whose::Worker).await?;
             return Ok(provisional);
         }
         // Nothing authoritative survived. What is written instead says so: the coverage is
@@ -1175,7 +1199,7 @@ impl Controller {
             durability: kr_protocol::session::Durability::Durable,
             closed_at_ms: kr_ipc::now_ms(),
         };
-        self.write_closure(&record).await?;
+        self.write_closure(&record, Whose::Daemon).await?;
         Ok(record)
     }
 
@@ -1193,6 +1217,11 @@ impl Controller {
     ///
     /// Returns an error when the registry cannot be read or written.
     pub async fn retire(self: &Arc<Self>, record: &ClosureRecord) -> Result<()> {
+        self.retire_as(record, Whose::Worker).await
+    }
+
+    /// [`Self::retire`] for a record that is `whose`.
+    async fn retire_as(self: &Arc<Self>, record: &ClosureRecord, whose: Whose) -> Result<()> {
         let written = {
             let _finalising = self.finalising.lock().await;
             if self
@@ -1207,7 +1236,7 @@ impl Controller {
                 self.forget_known_closure(record.session_id);
                 Ok(())
             } else {
-                self.write_closure(record).await
+                self.write_closure(record, whose).await
             }
         };
         // Outside the lock, and before the result is returned: the registry row is written before
@@ -1232,10 +1261,11 @@ impl Controller {
     /// # Errors
     ///
     /// Returns an error when the registry cannot be written.
-    pub(super) async fn write_closure(&self, record: &ClosureRecord) -> Result<()> {
+    pub(super) async fn write_closure(&self, record: &ClosureRecord, whose: Whose) -> Result<()> {
         // Known before the registry is written: a close of this session is answered from what is
-        // kept here while the write stands, and the registry answers once it has the record.
-        self.keep_known_closure(record, false);
+        // kept here while the write stands, and the registry answers once it has the record. A
+        // record that only this daemon holds is not said to be durable until it is.
+        self.keep_known_closure(record, false, whose);
         let mut registry = self.registry.lock().await;
         #[cfg(feature = "testing")]
         self.registry_write_stall.0.wait();
