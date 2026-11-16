@@ -217,15 +217,22 @@ describe('a pairing that the managed relay could not take', () => {
       await act(async () => {
         for (let turn = 0; turn < 10; turn++) await Promise.resolve()
       })
-      attempt(
-        controls,
-        failing({ kind: 'relay_capacity', tries_left: null, retry_after_seconds: 20, alternatives: PATHS })
-      )
+      const ended = failing({
+        kind: 'relay_capacity',
+        tries_left: null,
+        retry_after_seconds: 20,
+        alternatives: PATHS
+      })
+      attempt(controls, ended)
       const said = screen.getByTestId('failure-sentence').textContent
       expect(said).toBe(capacity('20 seconds'))
       act(() => {
         vi.advanceTimersByTime(10 * 60_000)
       })
+      expect(screen.getByTestId('failure-sentence').textContent).toBe(said)
+      // The same view published again is drawn again, after the clock has moved: a sentence made
+      // from the clock at the moment of drawing would say something else now.
+      attempt(controls, ended)
       expect(screen.getByTestId('failure-sentence').textContent).toBe(said)
       expect((document.body.textContent ?? '').split('Try again in about')).toHaveLength(2)
       expect(listed()?.paths).toEqual(PATHS)
