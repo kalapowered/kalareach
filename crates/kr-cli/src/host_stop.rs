@@ -5117,6 +5117,22 @@ mod tests {
         gave
     }
 
+    /// A look takes no longer than one second, however much of the deadline is left: a daemon
+    /// that says nothing to the hello is waited for until that second has gone, not until the
+    /// deadline, and the look then shows nothing in time.
+    #[tokio::test(start_paused = true)]
+    async fn a_look_takes_no_longer_than_one_second_however_much_of_the_deadline_is_left() {
+        let (_temp, environment, _within, daemon) = a_stand_in_for(Peer::SaysNothingToTheHello);
+        let started = tokio::time::Instant::now();
+        let gave = the_look_gave(&environment, seconds(30)).await;
+        let taken = tokio::time::Instant::now() - started;
+        if let Some(daemon) = daemon {
+            daemon.abort();
+        }
+        assert!(matches!(gave, Gave::NothingInTime), "{gave:?}");
+        assert_eq!(taken, seconds(1));
+    }
+
     /// What a look at `peer` says answers at the endpoint, where the generation asked is `asked`.
     async fn look_at(peer: Peer, asked: Option<ControllerGeneration>) -> Endpoint {
         let (_temp, environment, within, daemon) = a_stand_in_for(peer);
