@@ -1197,16 +1197,7 @@ impl Host {
             NetworkSetup {
                 settings: settings.clone(),
                 secrets: if waits.timer.is_some() {
-                    Arc::from(
-                        controller
-                            .secret_store()
-                            .open(
-                                kr_ipc::verify::CONTROLLER_SECRET_SERVICE,
-                                &environment.secrets_dir(),
-                            )
-                            .expect("the daemon's own key store")
-                            .store,
-                    )
+                    Arc::clone(controller.secret_store())
                 } else {
                     Arc::clone(&secrets) as Arc<dyn kr_crypto::store::SecretStore>
                 },
