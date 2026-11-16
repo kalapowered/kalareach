@@ -1884,15 +1884,18 @@ impl Session {
         }
     }
 
-    /// Sets what the session's application is doing, and returns whether that changed anything.
+    /// Sets what the session's application is doing, publishes the summary when that changed, and
+    /// returns whether it did.
     ///
     /// A session that no longer accepts input has no application to describe: closing clears the
-    /// state, and nothing sets it again afterwards.
+    /// state, and nothing sets it again afterwards. The state is published on its own, not only
+    /// with the name of the application, because the sleep demand of a held session reads it.
     pub(crate) fn set_application_state(&mut self, state: Option<ApplicationState>) -> bool {
         if !self.state().accepts_input() || self.application_state == state {
             return false;
         }
         self.application_state = state;
+        self.publish_summary();
         true
     }
 
