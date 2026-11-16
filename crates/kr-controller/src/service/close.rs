@@ -165,8 +165,10 @@ pub(crate) fn read_close_answer(
 /// not. The host's restart is the most: the worker's own record of its processes names an earlier
 /// boot, which a look reads only where it can read that record. The platform's word that the
 /// worker's desktop has gone is next: it is given only where the platform answers
-/// (`Controller::why_a_worker_is_gone`). Every other reason is the look's default, a worker that
-/// ended without its closure.
+/// (`Controller::why_a_worker_is_gone`), so the rule holds where the earlier look did not get the
+/// platform's answer. Every other reason is a default: the look's own, a worker that ended without
+/// its closure, or the watch's, the close that a worker accepted. Two defaults have the same rank,
+/// and the first look decides between them.
 const fn reason_rests_on_a_fact(reason: ClosureReason) -> u8 {
     match reason {
         ClosureReason::HostShutdown => 2,
@@ -1200,7 +1202,9 @@ impl Controller {
         //    that does not stay is a reason that this look's own pass establishes from a fact
         //    that the earlier look could not have ([`reason_rests_on_a_fact`]): the worker's own
         //    record names an earlier boot, or the platform now says that the worker's desktop has
-        //    gone. That reason is given first, then the kept record's, then this look's default.
+        //    gone. That reason is given first, unless the kept record's reason rests on a fact of
+        //    a higher rank (the host's restart outranks the lost desktop), which then comes before
+        //    it; then the kept record's reason; then this look's default.
         // 4. A new record, built from this look's own pass, below.
         let kept = self.known_record(session_id);
         if let Some((account, Whose::Worker)) = &kept {
