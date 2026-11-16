@@ -2569,7 +2569,7 @@ mod tests {
         match before {
             Before::Ended { said, pid } => format!("ended ({pid:?}): {said}"),
             Before::Silent => "silent".to_owned(),
-            Before::Stays => "stays".to_owned(),
+            Before::Stays => "answers".to_owned(),
         }
     }
 
@@ -2633,20 +2633,54 @@ mod tests {
         }
     }
 
-    /// A greeting that fails some other way than a closed peer (a rejection, a mismatch, a fault)
-    /// says nothing of an end: nothing is looked at, and the failure keeps its words.
+    /// A greeting that fails on the socket and is no closure is judged as any failure before the
+    /// request is: by one look first. A daemon that answers it stays the answer of the failure, and a
+    /// daemon that has gone is the end.
     #[tokio::test(start_paused = true)]
-    async fn a_greeting_that_fails_other_than_by_a_closed_peer_is_not_judged() {
-        let supplied = Supplied::new().look(vec![at_once(Endpoint::Nobody)]);
+    async fn a_greeting_that_fails_on_the_socket_is_judged_by_one_look() {
+        let id = an_environment();
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same)]);
         let before = greeting_failed(
             &supplied,
             &a_fault_of_the_socket(),
+            None,
+            id,
+            the_deadline(),
+        )
+        .await;
+        assert_eq!(before_said(&before), "answers");
+        assert_eq!(
+            supplied.calls(),
+            vec![(Duration::ZERO, Call::Look(startup::ANSWER_BOUND))]
+        );
+
+        let process = asked_process();
+        let fault = a_fault_of_the_socket();
+        let supplied = Supplied::new()
+            .process(vec![at_once(ProcessState::Ended)])
+            .look(vec![at_once(Endpoint::Nobody)]);
+        let before = greeting_failed(&supplied, &fault, Some(&process), id, the_deadline()).await;
+        assert_eq!(
+            before_said(&before),
+            the_end_said_for(id, Some(4000), &fault)
+        );
+    }
+
+    /// A greeting that a daemon answers with something that cannot be used (a frame that cannot be
+    /// read, a message of another kind, a rejection) is a daemon's answer: nothing is looked at, and
+    /// the failure keeps its words.
+    #[tokio::test(start_paused = true)]
+    async fn a_greeting_that_a_daemon_answers_with_something_unusable_is_an_answer() {
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Nobody)]);
+        let before = greeting_failed(
+            &supplied,
+            &kr_ipc::IpcError::UnexpectedMessage("a frame of another kind"),
             None,
             an_environment(),
             the_deadline(),
         )
         .await;
-        assert_eq!(before_said(&before), "stays");
+        assert_eq!(before_said(&before), "answers");
         assert!(supplied.calls().is_empty(), "{:?}", supplied.calls());
     }
 
@@ -2717,7 +2751,7 @@ mod tests {
             the_deadline(),
         )
         .await;
-        assert_eq!(before_said(&before), "stays");
+        assert_eq!(before_said(&before), "answers");
         assert_eq!(
             supplied.calls(),
             vec![
@@ -2855,6 +2889,111 @@ mod tests {
         )
         .await;
         assert_eq!(before_said(&before), the_end_said_for(id, Some(4000), &cut));
+    }
+
+    /// Where the retry's connection finds nothing listening and the lock is held past the bound, no
+    /// daemon has answered anything: the command's result is its silence (exit 1), after the whole
+    /// bound, and never the failure of an answered request.
+    #[tokio::test(start_paused = true)]
+    async fn nothing_listening_with_the_lock_held_past_the_bound_is_silence() {
+        let process = asked_process();
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::ConnectionRefused,
+        ] {
+            let supplied = Supplied::new().look(vec![at_once(Endpoint::Nobody)]);
+            let gone = kr_ipc::IpcError::socket("connect", std::io::Error::from(kind));
+            let before = host_info_failed(
+                &supplied,
+                supplied.connection(),
+                &gone,
+                Some(&process),
+                an_environment(),
+                the_deadline(),
+            )
+            .await;
+            assert_eq!(before_said(&before), "silent", "{kind:?}");
+            assert_eq!(supplied.start.elapsed(), END_BOUND, "{kind:?}");
+        }
+    }
+
+    /// A silent end is exit 1 with the silence sentence for a lock that is held, and no word that
+    /// no host runs.
+    #[test]
+    fn a_silent_end_is_exit_1_with_the_silence_sentence_and_no_word_that_no_host_runs() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let paths = temp.environment();
+        let id = paths.environment_id();
+        let _held = SingletonLock::hold(&paths.singleton_lock(), id).expect("takes the lock");
+        let environment = KnownEnvironment {
+            environment_id: id,
+            paths,
+        };
+        let earlier = Earlier::read(&environment.paths);
+        let none = Facts::none(Vec::new());
+        match ended_by(Before::Silent, &environment, &none, true, &earlier) {
+            Some(Completion::Reported(error)) => {
+                assert_eq!(error.exit_code(), 1);
+                let said = error.to_string();
+                assert!(
+                    said.contains("does not answer, so it may be starting or stopping")
+                        && said.contains("No stop was requested"),
+                    "{said}"
+                );
+                assert!(!said.contains("no KalaReach host"), "{said}");
+            }
+            _ => panic!("a silent end is a failure that the command has reported"),
+        }
+    }
+
+    /// The first look takes what is left of the deadline where that is less than its own bound.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_look_takes_what_is_left_of_the_deadline() {
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same)]);
+        let before = host_info_failed(
+            &supplied,
+            supplied.connection(),
+            &a_fault_of_the_socket(),
+            None,
+            an_environment(),
+            tokio::time::Instant::now() + seconds(3),
+        )
+        .await;
+        assert_eq!(before_said(&before), "answers");
+        assert_eq!(
+            supplied.calls(),
+            vec![
+                (Duration::ZERO, Call::ConnectionLetGo),
+                (Duration::ZERO, Call::Look(seconds(3))),
+            ]
+        );
+    }
+
+    /// Where a daemon answers a look after a fault that is no closure, exit 3 stays, with the words
+    /// of an unmade request.
+    #[tokio::test(start_paused = true)]
+    async fn a_daemon_that_answers_a_look_keeps_exit_3_and_the_unmade_requests_words() {
+        let id = an_environment();
+        let fault = a_fault_of_the_socket();
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same)]);
+        let before = host_info_failed(
+            &supplied,
+            supplied.connection(),
+            &fault,
+            None,
+            id,
+            the_deadline(),
+        )
+        .await;
+        assert_eq!(before_said(&before), "answers");
+        let error = unmade_request(id, &Shown::ipc(&fault));
+        assert_eq!(error.exit_code(), 3);
+        assert!(
+            error
+                .to_string()
+                .contains("could not make its request for the control daemon"),
+            "{error}"
+        );
     }
 
     fn a_refusal() -> ProtocolError {
