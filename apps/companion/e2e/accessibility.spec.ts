@@ -1139,6 +1139,141 @@ test.describe('a tap on the plain text near a link of a message', () => {
   }
 })
 
+/** A second link for the cases that need two: a short paragraph with plain words after it. */
+const OTHER = 'https://example.org/other'
+const TWO_LINKS = [...TEXT_AFTER_LINK, '[other](https://example.org/other) and more words follow the other link, which ends its paragraph.']
+
+/** Where a pointer down is made: on a link's own element, or on the page's body, outside the pane. */
+type DownOn = { readonly href: string } | 'outside'
+
+/**
+ * A pointer down that the page's own script makes on a link's element or on the body: the handler reads no
+ * trust from a pointer down, and neither engine can drive a second finger or a pen's barrel the same way
+ * (WebKit has no tool for a touch that is held or for a second one).
+ */
+async function pointerDownOn(page: Page, aim: DownOn, over: Record<string, unknown> = {}): Promise<void> {
+  await page.evaluate(
+    ({ where, init }) => {
+      const link = where === 'outside' ? null : document.querySelector<HTMLElement>(`.m-node .md-link[title="${where.href}"]`)
+      if (where !== 'outside' && link === null) throw new Error(`the page shows no link ${where.href}`)
+      const target = link ?? document.body
+      const box = target.getBoundingClientRect()
+      const at = link === null ? { x: 5, y: 5 } : { x: box.left + box.width / 2, y: box.top + box.height / 2 }
+      target.dispatchEvent(
+        new PointerEvent('pointerdown', { bubbles: true, cancelable: true, composed: true, clientX: at.x, clientY: at.y, pointerId: 1, pointerType: 'touch', isPrimary: true, button: 0, buttons: 1, ...init })
+      )
+    },
+    { where: aim, init: over }
+  )
+}
+
+/** The pointer downs that begin no press: a second finger, and a mouse's or a pen's other button. */
+const BEGIN_NONE: readonly (readonly [string, Record<string, unknown>])[] = [
+  ['a second finger', { pointerId: 2, isPrimary: false }],
+  ['a mouse’s right button', { pointerId: 2, pointerType: 'mouse', button: 2 }],
+  ['a pen’s barrel', { pointerId: 2, pointerType: 'pen', button: 2 }]
+]
+
+// KR-REQ-13.19: every pointer down ends the press that is going on, and only a primary pointer's main button
+// begins one. The presses that the synthetic cases hold are made by the page's script, which the handler takes
+// as it takes any other; the cases with a second finger, a mouse and a pen use the engine's own input where
+// Chromium's protocol gives it.
+test.describe('the end of a press at every pointer down', () => {
+  test.use({ hasTouch: true })
+  for (const surface of SURFACES) {
+    test(`puts out the look of a press on a link's own words at a pointer down that begins no press, on another link and outside the pane, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface, { only: TWO_LINKS })
+      for (const [where, aim] of [
+        ['on another link', { href: OTHER }],
+        ['outside the pane', 'outside']
+      ] as const) {
+        for (const [what, over] of BEGIN_NONE) {
+          await pointerDownOn(page, { href: DOCS })
+          expect(await pressedLooks(page), `the pressed look of a touch press, before ${what} ${where}`).toBe(1)
+          await pointerDownOn(page, aim, over)
+          expect(await pressedLooks(page), `the pressed look after ${what} ${where}`).toBe(0)
+        }
+      }
+      await page.waitForTimeout(400)
+      expect(await openedLinks(page), 'links opened by presses that were ended').toEqual([])
+    })
+
+    test(`gives no look to a second finger, a mouse's right button or a pen's barrel on a link's own words, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface, { only: TWO_LINKS })
+      for (const [what, over] of BEGIN_NONE) {
+        await pointerDownOn(page, { href: DOCS }, over)
+        expect(await pressedLooks(page), `the pressed look of ${what}`).toBe(0)
+      }
+      await pointerDownOn(page, { href: DOCS })
+      expect(await pressedLooks(page), 'the pressed look of a primary touch press, as the control').toBe(1)
+    })
+
+    test(`gives no look to a mouse's right button on a link's own words, and a left button does, with the engine's own input, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface, { only: TWO_LINKS })
+      const words = await pointOnWords(page, DOCS)
+      await page.mouse.move(words.x, words.y)
+      await page.mouse.down({ button: 'right' })
+      expect(await pressedLooks(page), 'the pressed look of a mouse press with the right button').toBe(0)
+      await page.mouse.up({ button: 'right' })
+      await page.mouse.down()
+      expect(await pressedLooks(page), 'the pressed look of a mouse press with the left button, as the control').toBe(1)
+      await page.mouse.up()
+      expect(await pressedLooks(page), 'the pressed look after the release').toBe(0)
+    })
+
+    test(`puts out the look of a held touch at a second finger, and nothing opens, on ${surface}`, async ({ page, browserName }) => {
+      test.skip(browserName !== 'chromium', 'two touches are held through the Chromium protocol: WebKit has no tool for a second touch')
+      await pressPage(page, surface, { only: TWO_LINKS })
+      const first = await pointOnWords(page, DOCS)
+      const second = await pointOnWords(page, OTHER)
+      const { session } = await touchSession(page)
+      const points = (count: number): { x: number; y: number; id: number }[] =>
+        [
+          { x: first.x, y: first.y, id: 0 },
+          { x: second.x, y: second.y, id: 1 }
+        ].slice(0, count)
+      await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: points(1) })
+      expect(await pressedLooks(page), 'the pressed look of the first finger').toBe(1)
+      await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: points(2) })
+      await expect.poll(() => pressedLooks(page), 'the pressed look after the second finger went down').toBe(0)
+      await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
+      await page.waitForTimeout(400)
+      expect(await pressedLooks(page), 'the pressed look after both fingers were lifted').toBe(0)
+      expect(await openedLinks(page), 'links opened by two fingers').toEqual([])
+      expect(handlers(await clicksSeen(page)), 'clicks that the page added for two fingers').toEqual([])
+    })
+
+    test(`puts out the look of a held touch at the right button of a mouse and at a pen's barrel, on ${surface}`, async ({ page, browserName }) => {
+      test.skip(browserName !== 'chromium', 'the touch and the pen are held through the Chromium protocol: WebKit has no tool for them')
+      await pressPage(page, surface, { only: TWO_LINKS })
+      const words = await pointOnWords(page, DOCS)
+      const away = await pointOnWords(page, OTHER)
+      const { session } = await touchSession(page)
+      const touch = (type: 'touchStart' | 'touchEnd'): Promise<unknown> =>
+        session.send('Input.dispatchTouchEvent', { type, touchPoints: type === 'touchStart' ? [{ x: words.x, y: words.y }] : [] })
+      const barrel = (type: 'mousePressed' | 'mouseReleased'): Promise<unknown> =>
+        session.send('Input.dispatchMouseEvent', { type, x: away.x, y: away.y, button: 'right', buttons: type === 'mouseReleased' ? 0 : 2, clickCount: 1, pointerType: 'pen' })
+      await touch('touchStart')
+      expect(await pressedLooks(page), 'the pressed look of a held touch, before the mouse’s right button').toBe(1)
+      await page.mouse.move(away.x, away.y)
+      await page.mouse.down({ button: 'right' })
+      await expect.poll(() => pressedLooks(page), 'the pressed look after the mouse’s right button went down').toBe(0)
+      await page.mouse.up({ button: 'right' })
+      await touch('touchEnd')
+      await touch('touchStart')
+      expect(await pressedLooks(page), 'the pressed look of a second held touch, before the pen’s barrel').toBe(1)
+      await barrel('mousePressed')
+      await expect.poll(() => pressedLooks(page), 'the pressed look after the pen’s barrel went down').toBe(0)
+      await barrel('mouseReleased')
+      await touch('touchEnd')
+      await page.waitForTimeout(400)
+      // The touch is on the link's own words and is lifted in place: the browser's click opens the link, as it does for
+      // any such tap, and the handler adds no click of its own.
+      expect(handlers(await clicksSeen(page)), 'clicks that the page added for a touch that a mouse button or a pen ended').toEqual([])
+    })
+  }
+})
+
 // KR-REQ-13.19, the pane as it ships (with its own `tabindex`): the words of a link open it, and a
 // tap on the text after it does.
 test.describe('a tap on the pane as it ships', () => {
