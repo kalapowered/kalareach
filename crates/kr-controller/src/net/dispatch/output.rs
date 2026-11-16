@@ -787,7 +787,7 @@ impl RemoteOutput {
             // bytes are handed over. The copies and the grants are kept until the attempt has
             // handed its bytes over.
             let mut copied = None;
-            let mut grants = None;
+            let grants;
             let admitted = self.fence()
                 && {
                     let (taken, refuses) = feed_taken();
