@@ -97,8 +97,9 @@ struct Rig {
     host_stream: OutputStream,
     device: AttachmentId,
     device_stream: OutputStream,
-    temp: kr_ipc::testing::TempHost,
     session_id: SessionId,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    temp: kr_ipc::testing::TempHost,
 }
 
 impl Rig {
