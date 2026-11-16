@@ -75,6 +75,9 @@ struct Scripted {
     freed: Notify,
     closed: AtomicBool,
     claimed: AtomicBool,
+    /// What runs once, inside the read that returns the next scripted failure, just before that
+    /// read returns: the owner's close that follows a failure the read already has.
+    after_a_failed_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl std::fmt::Debug for Scripted {
@@ -98,7 +101,13 @@ impl Scripted {
             freed: Notify::new(),
             closed: AtomicBool::new(false),
             claimed: AtomicBool::new(false),
+            after_a_failed_read: Mutex::new(None),
         })
+    }
+
+    /// Runs `hook` inside the read that returns the next scripted failure, right before it returns.
+    fn after_a_failed_read(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.after_a_failed_read.lock().expect("hook") = Some(Box::new(hook));
     }
 
     fn feed(&self, frame: ControlFrame) {
@@ -230,7 +239,13 @@ impl ControlTransport for Scripted {
                     self.read.fetch_add(1, Ordering::AcqRel);
                     Ok(Some(frame))
                 }
-                Some(Incoming::Fail(error)) => Err(error),
+                Some(Incoming::Fail(error)) => {
+                    let hook = self.after_a_failed_read.lock().expect("hook").take();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                    Err(error)
+                }
                 Some(Incoming::End) | None => Ok(None),
             }
         })
@@ -697,6 +712,45 @@ async fn a_close_after_a_failed_read_keeps_the_failures_end() {
 #[tokio::test]
 async fn a_close_with_nothing_read_ends_the_session_and_the_channel_at_once() {
     let (_transport, session, mut events) = ordered(4);
+    session.close();
+    assert!(matches!(next_end(&mut events).await, Ended::Finished));
+    the_channel_ends(&mut events).await;
+}
+
+/// A read's end is what the transport returned. A failure that the read has already returned is a
+/// cause that the owner's close, which comes right after it, does not take away: the close raises
+/// the stop before the reader looks at the result.
+#[tokio::test]
+async fn a_failure_the_read_returned_keeps_its_cause_when_the_owner_closes_right_after_it() {
+    let (transport, session, mut events) = ordered(4);
+    transport.after_a_failed_read({
+        let session = Arc::clone(&session);
+        move || session.close()
+    });
+    transport.fail(ClientError::Host(ProtocolError::new(
+        ErrorCode::ResourceUnavailable,
+        "the stream was reset by the peer",
+    )));
+    match next_end(&mut events).await {
+        Ended::Failed(ClientError::Host(error)) => {
+            assert_eq!(error.message, "the stream was reset by the peer");
+        }
+        Ended::Finished => {
+            panic!("a close right after a failed read replaced the failure with the clean end")
+        }
+        _ => panic!("the end did not carry the failure that was read"),
+    }
+    the_channel_ends(&mut events).await;
+}
+
+/// The other order: the owner closes, and the read that the close ends is the clean end, since a
+/// transport returns the clean end for this side's own close.
+#[tokio::test]
+async fn a_close_while_the_reader_waits_for_a_frame_ends_cleanly() {
+    let (transport, session, mut events) = ordered(4);
+    transport.feed(notice("session.output", 0));
+    assert_eq!(next_notice(&mut events).await.1, 0);
+    // The reader has taken the frame and now waits for the next one.
     session.close();
     assert!(matches!(next_end(&mut events).await, Ended::Finished));
     the_channel_ends(&mut events).await;
