@@ -374,9 +374,10 @@ enum Held {
     /// An admission is installed until then.
     Admitted { until: Instant },
     /// The service is unable, or failed on its side. `kept_until` is how long the answer explains
-    /// a failed dial, and `retry_at` is when a dial asks again. `alternatives` is what the service
-    /// named, with no entry for a fault; `retry_after_seconds` is the delay it named, as it named it,
-    /// and `answered_at` is when the answer was read.
+    /// a failed dial, and `retry_at` is when a dial asks again; a request that fails moves `retry_at`
+    /// later and lifts `kept_until` to it. `alternatives` is what the service named, with no entry
+    /// for a fault; `retry_after_seconds` is the delay it named, as it named it, and `answered_at`
+    /// is when the answer was read.
     Unavailable {
         kept_until: Instant,
         retry_at: Instant,
@@ -424,7 +425,8 @@ impl Entry {
     /// Whether the entry holds an answer that the service is unable and that still explains a
     /// failed dial: for as long as it is kept, and for as long as the cache will not ask again
     /// (three requests with no connection, until the ten minutes after the last), because nothing
-    /// renews it while no request is made.
+    /// renews it while no request is made. A request that is made while the answer has stopped drops
+    /// it, so the count of asks only keeps an answer that stood when the last request was made.
     fn answer_stands(&self, now: Instant) -> bool {
         match self.held {
             Held::Unavailable { kept_until, .. } => {
@@ -589,6 +591,12 @@ impl PairingAdmissions {
                 let entry = state.entries.entry(key.clone()).or_insert_with(Entry::new);
                 let ask = !suspended && entry.asks_again(now);
                 if ask {
+                    // Only a word that stands as this request is made may outlive its failure. One
+                    // that has stopped is dropped now, so that neither the count of asks nor the time
+                    // the request is on its way brings it back.
+                    if matches!(entry.held, Held::Unavailable { .. }) && !entry.answer_stands(now) {
+                        entry.held = Held::Nothing;
+                    }
                     if entry.window_passed(now) {
                         entry.asks = 0;
                     }
@@ -682,14 +690,18 @@ impl PairingAdmissions {
             },
             Err(error) => {
                 let retry = now + retry_delay(&error);
-                // A request that failed says nothing about what the service last said, so an answer
-                // that still stands is kept as it is, and only the time a dial asks again moves.
-                // That time moves later: a request is made only once the answer's own retry time
-                // has come.
-                if entry.answer_stands(now)
-                    && let Held::Unavailable { retry_at, .. } = &mut entry.held
+                // A request that failed says nothing about what the service last said. A word that
+                // is still held stood as the request was made (one that had stopped was dropped
+                // then), so it is kept as it is until a dial asks again, and only that time moves.
+                // It moves later: a request is made only once the word's own retry time has come.
+                if let Held::Unavailable {
+                    kept_until,
+                    retry_at,
+                    ..
+                } = &mut entry.held
                 {
                     *retry_at = retry;
+                    *kept_until = (*kept_until).max(retry);
                     return;
                 }
                 Held::Failed { retry_at: retry }
