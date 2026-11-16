@@ -175,6 +175,61 @@ async fn a_start_where_the_platform_store_does_not_open_is_refused_and_makes_no_
     );
 }
 
+/// KR-REQ-10.47: a host whose keys are in the platform store is not started with the file store:
+/// the start is refused, no key is made in files or in the platform's store, and the host has its
+/// identity at the next start that does not name the file store.
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_with_the_file_store_over_a_platform_record_is_refused_and_makes_no_key() {
+    let switch = stand_in::Switch::take(CONTROLLER_SECRET_SERVICE);
+    let host = kr_ipc::testing::TempHost::create();
+    let environment = host.environment();
+    put_on_the_network(&environment);
+
+    let platform = switch.opens();
+    let first = start(
+        &environment,
+        host.environment_id(),
+        StoreSelection::Platform,
+    )
+    .await
+    .expect("the daemon starts where the platform store opens");
+    let before = identity_of(&first);
+    drop(first);
+
+    let refused = start(&environment, host.environment_id(), StoreSelection::File).await;
+    assert!(
+        refused.is_err(),
+        "the file store is not the store of a host whose keys are in the platform's"
+    );
+    assert!(
+        kept_in_files(&environment).is_empty(),
+        "the refused start made no key in files"
+    );
+    let kept = device_keys_in(&*platform, host.environment_id());
+    assert_eq!(
+        kept.public_keys(),
+        before.keys,
+        "the platform's keys are as they were"
+    );
+
+    let again = start(
+        &environment,
+        host.environment_id(),
+        StoreSelection::Platform,
+    )
+    .await
+    .expect("the daemon starts where the platform store opens");
+    assert_eq!(
+        identity_of(&again),
+        before,
+        "the host has the identity it had"
+    );
+}
+
 /// Writes the document that puts the host on the network, on loopback alone.
 fn put_on_the_network(environment: &kr_ipc::paths::EnvironmentPaths) {
     let mut document = ConfigurationDocument::empty();
