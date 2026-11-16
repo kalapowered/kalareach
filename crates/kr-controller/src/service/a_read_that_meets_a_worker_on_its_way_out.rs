@@ -1446,23 +1446,29 @@ async fn a_close_that_meets_the_daemons_own_record_before_its_commit_is_not_told
                 .await
         })
     };
-    tokio::task::spawn_blocking(move || arrived.recv_timeout(std::time::Duration::from_secs(30)))
-        .await
-        .expect("the wait for the write ends")
-        .expect("the daemon's own record reaches the registry's write");
+    let reached = tokio::task::spawn_blocking(move || {
+        arrived.recv_timeout(std::time::Duration::from_secs(30))
+    })
+    .await;
     let repeated = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         close_admitted(&world, carried),
     )
-    .await
-    .expect("a close is answered while the write of the daemon's own record stands");
+    .await;
+    // Let go before any assertion, so that a close that was not answered does not hold the program
+    // with the write that stands.
+    let _ = release.send(());
+    reached
+        .expect("the wait for the write ends")
+        .expect("the daemon's own record reaches the registry's write");
+    let repeated =
+        repeated.expect("a close is answered while the write of the daemon's own record stands");
     assert_ne!(repeated.durability, Durability::Durable, "{repeated:?}");
     assert_eq!(
         repeated.closure.as_ref().map(|record| record.durability),
         Some(Durability::Volatile),
         "the record it carries is not said to be durable either: {repeated:?}"
     );
-    release.send(()).expect("the write is let go");
     let record = writing
         .await
         .expect("the record's task ends")

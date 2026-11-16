@@ -734,26 +734,31 @@ async fn a_close_whose_read_of_the_registry_does_not_return_is_answered_within_i
         .await
         .stall_the_next_closure_read();
     let started = tokio::time::Instant::now();
-    let answered = tokio::time::timeout(
-        CLOSE_EXCHANGE + Duration::from_secs(3),
-        controller.session_close(
-            &close_request(environment_id, session_id),
-            &actor,
-            Some(accepted),
-            carried,
-        ),
-    )
-    .await;
+    // The close runs on a task of its own, so that a read that stops it does not stop the case's
+    // timer with it.
+    let close = {
+        let controller = Arc::clone(&controller);
+        let request = close_request(environment_id, session_id);
+        tokio::spawn(async move {
+            controller
+                .session_close(&request, &actor, Some(accepted), carried)
+                .await
+                .into_answer_for_test()
+        })
+    };
+    let answered = tokio::time::timeout(CLOSE_EXCHANGE + Duration::from_secs(3), close).await;
     let waited = started.elapsed();
     let reached = arrived.try_recv().is_ok();
     // The runtime still has threads for other work while the read stands.
     let ticked = tokio::time::timeout(Duration::from_secs(2), tokio::task::yield_now())
         .await
         .is_ok();
-    release.send(()).expect("the read is let go");
+    // Let go before any assertion, so that a close that was not answered in its budget does not
+    // hold the program.
+    let _ = release.send(());
     let refused = answered
         .unwrap_or_else(|_| panic!("the close was still waiting for the read after {waited:?}"))
-        .into_answer_for_test()
+        .expect("the close's task ends")
         .expect_err("a read that does not return gives no closure");
     assert!(reached, "the read of the registry was the one that stood");
     assert!(ticked, "the runtime is not held by the read");
