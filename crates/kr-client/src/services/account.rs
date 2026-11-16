@@ -2024,14 +2024,18 @@ pub struct SignOut {
 /// error is the one the revocation returned.
 #[derive(Debug)]
 pub enum Unrevoked {
-    /// The queue took the token, the send that followed failed in the store, and the service did
-    /// not take a send of its own: the queue holds the token, and the next send sends it.
+    /// The queue took the token, the send that followed failed, and a send of the token alone was
+    /// not acknowledged. The service may have taken the token, and the queue may still hold its
+    /// entry, which the next send sends: a clean-up that failed may have removed it first.
     Queued(ClientError),
     /// The service took the token by a send of its own, so it is ended, and the queue or the send
     /// of the queue failed.
     Ended(ClientError),
-    /// The queue could not take the token and the service did not: this process holds it in memory
-    /// for the next send, and loses it if the process stops before one runs.
+    /// Queuing the token failed and a send of the token alone was not acknowledged: this process
+    /// holds the token in memory for the next send, and loses it if the process stops before one
+    /// runs. The failure can be the account's lock or the queue's read, where no write began, or
+    /// the queue's write, which can have left its entry in place. The service may have taken the
+    /// token.
     Held(ClientError),
 }
 
