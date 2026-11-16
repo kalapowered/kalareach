@@ -883,8 +883,8 @@ mod tests {
 
     #[cfg(unix)]
     const PROFILES_NOT_UNDERSTOOD: &str = "PowerShell's answer about where its profiles are was \
-        not understood: it ended without an answer or said something other than two paths, so \
-        nothing was written for PowerShell";
+        not understood: it ended without an answer or said something other than two full paths, \
+        so nothing was written for PowerShell";
     #[cfg(unix)]
     const PROFILES_UNANSWERED: &str = "PowerShell did not say where its profiles are: it did not \
         answer in time, could not start or ended with an error, so nothing was written for \
