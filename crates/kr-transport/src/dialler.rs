@@ -494,17 +494,44 @@ pub struct ReconcileHold {
     ended: tokio::sync::oneshot::Receiver<()>,
 }
 
+/// How long a wait on a hold may take before it is a failure. The held task has the shared lock and
+/// one change of the map to make, on this machine, so this is a bound on a fault and not a time
+/// that anything is expected to take.
+#[cfg(feature = "testing")]
+const HOLD_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[cfg(feature = "testing")]
 impl ReconcileHold {
     /// Waits until a task is held at the gate, before it has taken its turn or read the table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no task reaches the gate within the bound, and when the gate dropped this hold,
+    /// which a second hold armed over it does.
     pub async fn reached(&mut self) {
-        let _ = (&mut self.reached).await;
+        match tokio::time::timeout(HOLD_PATIENCE, &mut self.reached).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => panic!("the gate dropped the hold before a task reached it"),
+            Err(_) => panic!("no task reached the hold within {HOLD_PATIENCE:?}"),
+        }
     }
 
     /// Lets the held task go on, and waits until it has changed the map and ended.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the gate dropped this hold, when the held task ends without saying so, and when
+    /// the task does not end within the bound.
     pub async fn release(self) {
-        let _ = self.release.send(());
-        let _ = self.ended.await;
+        assert!(
+            self.release.send(()).is_ok(),
+            "the gate dropped the hold before it was released"
+        );
+        match tokio::time::timeout(HOLD_PATIENCE, self.ended).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => panic!("the held task ended without finishing its change of the map"),
+            Err(_) => panic!("the held task did not end within {HOLD_PATIENCE:?}"),
+        }
     }
 }
 
