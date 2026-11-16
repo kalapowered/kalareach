@@ -10,6 +10,13 @@
 use kr_protocol::error::ErrorCode;
 use kr_protocol::pairing::PairingConsumedReason;
 
+/// What the text of [`PairingError::RendezvousUnavailable`] begins with. The text of a failure of
+/// the rendezvous service always begins with it, and the text of a refusal for want of capacity,
+/// which begins with the service's own words, never does by this build's composing, so the
+/// command that tells a person what a refusal says tells the two apart by this prefix and by
+/// nothing inside a service's words. Both the failure's text and that test read this constant.
+pub const RENDEZVOUS_UNAVAILABLE_PREFIX: &str = "the rendezvous service is unavailable: ";
+
 /// The result of a pairing step.
 pub type Result<T> = core::result::Result<T, PairingError>;
 
@@ -127,7 +134,7 @@ pub enum PairingError {
     /// This is a transport failure, never an authentication result. Section 10 keeps them apart:
     /// a local configuration or transport failure consumes admission budget but not the host's
     /// failed-confirmation allowance.
-    #[error("the rendezvous service is unavailable: {reason}")]
+    #[error("{}{reason}", RENDEZVOUS_UNAVAILABLE_PREFIX)]
     RendezvousUnavailable {
         /// What the transport reported.
         reason: String,

@@ -126,9 +126,10 @@ impl From<kr_client::ClientError> for CommandError {
     /// that carries the service's own words carries those alternatives after them: "Until then:"
     /// and each one as the service wrote it, and no delay of their own.
     ///
-    /// A text that says when to try again, or what to do meanwhile, is not followed by a second
-    /// instruction that the code chooses: the failure then asks for nothing more, and the page adds
-    /// no line to it.
+    /// A refusal that carries a delay or a list says when to try again, or what to do meanwhile,
+    /// in the text composed from them, so no second instruction that the code chooses follows it:
+    /// the failure then asks for nothing more, and the page adds no line to it. The fields decide,
+    /// never the words.
     fn from(error: kr_client::ClientError) -> Self {
         let code = error.code();
         let mut message = error.to_string();
@@ -136,7 +137,7 @@ impl From<kr_client::ClientError> for CommandError {
             message.push(' ');
             message.push_str(told.as_str());
         }
-        let action = if kr_client::services::says_its_own_next_step(&message) {
+        let action = if error.says_its_own_next_step() {
             kr_client::retry::UserAction::Nothing
         } else {
             error.user_action()
@@ -285,6 +286,19 @@ mod tests {
             refusal(None, &[], UserAction::Wait).message,
             "SERVICE_CAPACITY: There is no room for new feeds right now."
         );
+        // What a service's words hold is data: words with a delay and a list inside them, and no
+        // field of the refusal that says so, keep the action.
+        let quoted = CommandError::from(ClientError::Refused {
+            error: kr_protocol::error::ProtocolError::new(
+                ErrorCode::ServiceCapacity,
+                "Cannot open /data/(retry after 5s)/state. Until then: A path.",
+            ),
+            retry_after_seconds: None,
+            action: UserAction::Wait,
+            service_code: None,
+            alternatives: Alternatives::for_test(&[]),
+        });
+        assert_eq!(quoted.user_action, "wait", "{quoted}");
     }
 
     /// The scripted hosts the page is tested against give every code the retry category the

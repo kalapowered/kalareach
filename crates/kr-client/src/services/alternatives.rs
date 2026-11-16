@@ -21,7 +21,7 @@ use std::fmt;
 use crate::shown::{ServiceMessage, Shown};
 
 /// The words that lead the list of alternatives in a text told to a person. What composes such a
-/// text ([`Alternatives::until_then`]) and what recognises one ([`says_its_own_next_step`]) both read this
+/// text ([`Alternatives::until_then`]) and the tests that read one both read this
 /// one constant, so that neither can say it differently.
 const UNTIL_THEN: &str = "Until then:";
 
@@ -296,38 +296,6 @@ pub fn told_capacity(
     Some(Shown::joined(parts, " ").into_string())
 }
 
-/// Whether `text`, as a person reads it, already says when to try again or what to do meanwhile:
-/// it holds the list of alternatives after the service's words (the lead-in and at least one
-/// alternative after it, as [`told_capacity`] and [`Alternatives::until_then`] compose it), the
-/// delay a refusal's text ends with (`(retry after 600s)`), or the sentence of a command that
-/// waited out what a service asked for (`wait about 30 more seconds`).
-///
-/// This is the one rule that every line which would add an instruction of its own after a service's
-/// refusal asks first, such as "Wait a moment and try again.": where it is true the line is left
-/// out, because two instructions one after the other are one too many and the service's own words
-/// are the better of the two. The test is positive on purpose: a text that holds none of the three
-/// says nothing of when or of what else, so the line stays.
-#[must_use]
-pub fn says_its_own_next_step(text: &str) -> bool {
-    lists_alternatives(text)
-        || states_a_number_between(text, "(retry after ", "s)")
-        || states_a_number_between(text, "wait about ", " more seconds")
-}
-
-/// Whether `text` holds words, then the lead-in of a list, then something after it.
-fn lists_alternatives(text: &str) -> bool {
-    text.split_once(&format!(" {UNTIL_THEN} "))
-        .is_some_and(|(words, list)| !words.trim().is_empty() && !list.trim().is_empty())
-}
-
-/// Whether `text` holds `open`, one or more digits and then `close`, in that order.
-fn states_a_number_between(text: &str, open: &str, close: &str) -> bool {
-    text.split(open).skip(1).any(|after| {
-        let tail = after.trim_start_matches(|letter: char| letter.is_ascii_digit());
-        tail.len() < after.len() && tail.starts_with(close)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,12 +505,11 @@ mod tests {
         assert!(told_capacity("  \n", None, &list).is_none());
     }
 
-    /// KR-REQ-17.48: what composes a capacity text and what recognises one agree: every text made
-    /// from an answer with a list is recognised, whatever the wait and however many alternatives it
-    /// names, and a text that was not made from one is not. An answer whose list has no entry with
-    /// text is not told at all. The lead-in is one constant.
+    /// KR-REQ-17.48: every text made from an answer with a list holds the lead-in with the list
+    /// after it, whatever the wait and however many alternatives it names. An answer whose list has
+    /// no entry with text is not told at all. The lead-in is one constant.
     #[test]
-    fn kr_req_17_48_every_capacity_text_that_is_composed_is_recognised_and_no_other_text_is() {
+    fn kr_req_17_48_every_capacity_text_that_is_composed_holds_the_lead_in_and_the_list() {
         let one = Alternatives::from_member(Some(serde_json::json!([DIRECT_INVITATION])));
         let several = Alternatives::from_member(Some(serde_json::json!([
             "First.",
@@ -562,12 +529,10 @@ mod tests {
             (&several, Some(200_000)),
         ] {
             let told = told_capacity(WORDS, wait, alternatives).expect("told");
-            assert!(says_its_own_next_step(&told), "{told}");
             assert!(told.contains(&format!(" {UNTIL_THEN} ")), "{told}");
         }
         // The words of the service may be anything, a sentence of several lines included.
-        let told = told_capacity("Two\nlines.", None, &one).expect("told");
-        assert!(says_its_own_next_step(&told), "{told}");
+        assert!(told_capacity("Two\nlines.", None, &one).is_some());
         // A list in which no entry has text names nothing a person can do, so the answer is not
         // told as a capacity answer, whatever the wait; one entry with text is enough.
         for no_text in [
@@ -586,81 +551,10 @@ mod tests {
         ] {
             let mixed = Alternatives::from_member(Some(mixed));
             let told = told_capacity(WORDS, Some(3600), &mixed).expect("told");
-            assert!(says_its_own_next_step(&told), "{told}");
-        }
-
-        for not_composed in [
-            "",
-            WORDS,
-            "the rendezvous service is unavailable: https://rendezvous.example/api/pair/locator/reserve answered RATE_LIMITED",
-            "the rendezvous service is unavailable: the connection could not be established",
-            "Until then: A path.",
-            " Until then: A path.",
-            "Words. Until then:",
-            "Words. Until then: ",
-            "Words. Until then:   ",
-            "Words. until then: A path.",
-            "Words. Until then A path.",
-            "Words.Until then: A path.",
-            "   Until then: A path.",
-        ] {
-            assert!(!says_its_own_next_step(not_composed), "{not_composed:?}");
-        }
-    }
-
-    /// A refusal as the client renders it, with the delay the service named when it named one.
-    fn refusal_text(delay: Option<u64>) -> String {
-        crate::error::ClientError::Refused {
-            error: crate::error::refusal(
-                kr_protocol::error::ErrorCode::RateLimited,
-                Shown::said("The service is busy."),
-            ),
-            retry_after_seconds: delay,
-            action: crate::retry::UserAction::Wait,
-            service_code: None,
-            alternatives: Alternatives::none(),
-        }
-        .to_string()
-    }
-
-    /// KR-REQ-17.48: a text says its own next step when it holds the delay that a refusal's
-    /// rendering ends with, the list after the service's words, or the sentence of a command that
-    /// waited out a service's delay, and every other text, a refusal that named no delay included,
-    /// does not. The texts that say it are made by the code that composes them, not typed here.
-    #[test]
-    fn kr_req_17_48_a_text_says_its_own_next_step_by_its_delay_its_list_or_its_wait() {
-        let list = Alternatives::named(vec!["A path.".to_owned(), "Another path.".to_owned()])
-            .until_then()
-            .expect("a list")
-            .into_string();
-        let delayed = refusal_text(Some(600));
-        assert!(delayed.ends_with("(retry after 600s)"), "{delayed}");
-        for says in [
-            delayed.clone(),
-            format!("{delayed} {list}"),
-            format!("{} {list}", refusal_text(None)),
-            "the storage service still asks this host to wait about 12 more seconds after 5 \
-             waits; try again after that, and nothing was kept"
-                .to_owned(),
-            "to wait about 1 more seconds".to_owned(),
-            "Words (retry after 0s)".to_owned(),
-        ] {
-            assert!(says_its_own_next_step(&says), "{says}");
-        }
-        for silent in [
-            refusal_text(None),
-            "Words (retry after)".to_owned(),
-            "Words (retry after s)".to_owned(),
-            "Words (retry after 5)".to_owned(),
-            "Words (retry after 5 s)".to_owned(),
-            "Words (retry after 5m)".to_owned(),
-            "Words (retry after -5s)".to_owned(),
-            "to wait about some more seconds".to_owned(),
-            "to wait about 5 minutes".to_owned(),
-            "Wait about 5 more seconds".to_owned(),
-            "the service will retry after 600s".to_owned(),
-        ] {
-            assert!(!says_its_own_next_step(&silent), "{silent}");
+            assert!(
+                told.contains(UNTIL_THEN) && told.contains("A path."),
+                "{told}"
+            );
         }
     }
 }

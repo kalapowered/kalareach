@@ -20,4 +20,4 @@ pub mod spake;
 pub mod transcript;
 pub mod vectors;
 
-pub use crate::error::{PairingError, Result};
+pub use crate::error::{PairingError, RENDEZVOUS_UNAVAILABLE_PREFIX, Result};

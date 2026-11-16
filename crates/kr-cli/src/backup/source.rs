@@ -19,7 +19,10 @@ use kr_client::recovery::{
     BundleWrite, BundleWriter, BundleWritten, RestoreSource, SignInCause, SourceService,
     SourceSignIn,
 };
-use kr_client::services::{ServiceFuture, SyncFetched, SyncPosition, SyncRecoveryId, SyncRevision};
+use kr_client::retry::UserAction;
+use kr_client::services::{
+    Alternatives, ServiceFuture, SyncFetched, SyncPosition, SyncRecoveryId, SyncRevision,
+};
 use kr_client::shown;
 use kr_client::shown::{Said as _, Shown};
 use kr_protocol::archive::{ArchiveCheckpoint, BackupGenerationPublication};
@@ -84,15 +87,23 @@ impl DaemonSource {
             };
             let seconds = retry_after_seconds.get();
             if waited == MAX_WAITS {
-                return Err(ClientError::Host(kr_client::error::refusal(
-                    ErrorCode::RateLimited,
-                    shown!(
-                        "the storage service still asks this host to wait about {} more seconds \
-                         after {} waits; try again after that, and nothing was kept",
-                        seconds,
-                        MAX_WAITS
+                // The sentence says when to try again, so the refusal says that it asks a person
+                // for nothing more, and no line chosen by its code follows it.
+                return Err(ClientError::Refused {
+                    error: kr_client::error::refusal(
+                        ErrorCode::RateLimited,
+                        shown!(
+                            "the storage service still asks this host to wait about {} more \
+                             seconds after {} waits; try again after that, and nothing was kept",
+                            seconds,
+                            MAX_WAITS
+                        ),
                     ),
-                )));
+                    retry_after_seconds: Some(seconds),
+                    action: UserAction::Nothing,
+                    service_code: None,
+                    alternatives: Alternatives::default(),
+                });
             }
             waited += 1;
             crate::report::say(&shown!(

@@ -938,6 +938,11 @@ async fn explain<P: Privacy>(
                 None => CliError::Refused(refusal),
             }
         }
+        // The sentence a source made for a service that still asks to wait says when to try again
+        // itself, so it is said alone.
+        RestoreError::Read(ClientError::Refused { error, action, .. }) => {
+            CliError::ServiceRefused { error, action }
+        }
         RestoreError::Read(ClientError::Host(refusal)) => CliError::Refused(refusal),
         RestoreError::Read(ClientError::Ipc(failure)) => CliError::Ipc(failure),
         other => CliError::Other(shown!("{}", other)),
