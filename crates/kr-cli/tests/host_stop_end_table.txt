@@ -852,3 +852,54 @@ start=silent lock=unreadable -> silent exit=1 code=ENVIRONMENT_UNAVAILABLE stop=
 start=nothing_listening lock=free -> no_daemon exit=0 code=- stop=not_asked
 start=nothing_listening lock=held -> holds_and_is_silent exit=1 code=ENVIRONMENT_UNAVAILABLE stop=not_asked
 start=nothing_listening lock=unreadable -> lock_unreadable exit=1 code=RESOURCE_UNAVAILABLE stop=not_asked
+
+## the lock's reading, as the wait reads it
+reading=not_held -> lock=free
+reading=held -> lock=held
+reading=failed -> lock=unreadable
+
+## the process's reading, as the wait reads it
+reading=no_identity -> process=no_identity
+reading=running -> process=running
+reading=ended -> process=ended
+reading=unknown -> process=unreadable
+
+## the process that the lock file names: the process it names, the identity of the asked process
+named=none identity=none -> holder=nobody
+named=none identity=asked -> holder=nobody
+named=asked identity=none -> holder=other
+named=asked identity=asked -> holder=asked
+named=other identity=none -> holder=other
+named=other identity=asked -> holder=other
+
+## a request that could not be made: where a failure goes, by its source
+source=reply -> reply: an answer, nothing is looked at
+source=closure -> the_end: the daemon's end is looked for
+source=own_fault -> own_fault: nothing is looked at
+
+## a request that could not be made: what a failure that the daemon's end can cause came to, by what the wait decided
+accepted=yes decided=ended -> before=ended pid=4000
+accepted=yes decided=ended_by_a_successor(5000) -> before=ended pid=4000
+accepted=yes decided=ended_by_a_successor(-) -> before=ended pid=4000
+accepted=yes decided=not_shown -> before=silent_accepted
+accepted=yes decided=answers -> before=answers
+accepted=no decided=ended -> before=ended pid=4000
+accepted=no decided=ended_by_a_successor(5000) -> before=ended pid=4000
+accepted=no decided=ended_by_a_successor(-) -> before=ended pid=4000
+accepted=no decided=not_shown -> before=silent_nothing_accepted
+accepted=no decided=answers -> before=answers
+
+## the process that the end of a stop is waited for by: the process that the lock file named, the process that the answer named
+named=none answer=none -> waits_for=- json_pid=-
+named=none answer=4000 -> waits_for=- json_pid=4000
+named=none answer=4001 -> waits_for=- json_pid=4001
+named=4000 answer=none -> waits_for=4000 json_pid=4000
+named=4000 answer=4000 -> waits_for=4000 json_pid=4000
+named=4000 answer=4001 -> waits_for=- json_pid=4001
+
+## the stop: where a refusal goes, by the retry category of its code (every code's category)
+category=configuration_change -> refused: nothing was taken, no wait
+category=no_retry -> refused: nothing was taken, no wait
+category=outcome_unknown -> maybe_asked: the daemon is waited for as one that took the stop
+category=resync -> refused: nothing was taken, no wait
+category=transient -> maybe_asked: the daemon is waited for as one that took the stop
