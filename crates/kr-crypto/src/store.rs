@@ -194,6 +194,9 @@ pub trait SecretStore: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct PlatformStore {
     service: String,
+    /// The store a case put in the platform's place, where one did.
+    #[cfg(any(test, feature = "testing"))]
+    stand_in: Option<std::sync::Arc<MemoryStore>>,
 }
 
 impl PlatformStore {
@@ -204,13 +207,31 @@ impl PlatformStore {
     /// Returns [`CryptoError::SecretStore`] when the platform has no usable credential store, so
     /// the caller can fall back deliberately rather than discovering it at the first write.
     pub fn open(service: impl Into<String>) -> Result<Self> {
+        let service: String = service.into();
+        #[cfg(any(test, feature = "testing"))]
+        match stand_in::standing_for(&service) {
+            stand_in::State::Unset => {}
+            stand_in::State::Closed => {
+                return Err(CryptoError::SecretStore {
+                    message: "no platform credential store: the stand-in is closed".to_owned(),
+                });
+            }
+            stand_in::State::Open(store) => {
+                return Ok(Self {
+                    service,
+                    stand_in: Some(store),
+                });
+            }
+        }
         keyring::Entry::store_status()
             .as_ref()
             .map_err(|error| CryptoError::SecretStore {
                 message: format!("no platform credential store: {error}"),
             })?;
         Ok(Self {
-            service: service.into(),
+            service,
+            #[cfg(any(test, feature = "testing"))]
+            stand_in: None,
         })
     }
 
@@ -225,6 +246,10 @@ impl PlatformStore {
 
 impl SecretStore for PlatformStore {
     fn set(&self, name: &SecretName, secret: &[u8]) -> Result<()> {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(stand_in) = &self.stand_in {
+            return stand_in.set(name, secret);
+        }
         self.entry(name)?
             .set_secret(secret)
             .map_err(|error| CryptoError::SecretStore {
@@ -233,6 +258,10 @@ impl SecretStore for PlatformStore {
     }
 
     fn get(&self, name: &SecretName) -> Result<Option<SecretVec>> {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(stand_in) = &self.stand_in {
+            return stand_in.get(name);
+        }
         match self.entry(name)?.get_secret() {
             Ok(secret) => Ok(Some(SecretVec::new(secret))),
             Err(keyring::Error::NoEntry) => Ok(None),
@@ -243,6 +272,10 @@ impl SecretStore for PlatformStore {
     }
 
     fn delete(&self, name: &SecretName) -> Result<()> {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(stand_in) = &self.stand_in {
+            return stand_in.delete(name);
+        }
         match self.entry(name)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(error) => Err(CryptoError::SecretStore {
@@ -256,6 +289,92 @@ impl SecretStore for PlatformStore {
             "the platform credential store for service {:?}",
             self.service
         )
+    }
+}
+
+/// A store a case puts in the platform credential store's place.
+///
+/// A case says whether the platform store opens and, where it does, which in-memory store it is, so
+/// that the selection's choices can be shown without a Secret Service, a Keychain or a Credential
+/// Manager and without reaching the one this machine has. It speaks for one service name only: a
+/// case that opens the platform store under another name gets the platform's own answer. The switch
+/// is process-wide, so [`Switch`] serialises the cases that hold it, and puts the platform's own
+/// answer back when it is dropped.
+#[cfg(any(test, feature = "testing"))]
+pub mod stand_in {
+    use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+    use super::MemoryStore;
+
+    /// What the platform store answers while a case holds the switch.
+    #[derive(Clone)]
+    pub(super) enum State {
+        /// No case speaks for this service: the platform's own answer stands.
+        Unset,
+        /// The platform store does not open.
+        Closed,
+        /// The platform store opens, and is this store.
+        Open(Arc<MemoryStore>),
+    }
+
+    static STANDING: Mutex<Option<(String, State)>> = Mutex::new(None);
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    pub(super) fn standing_for(service: &str) -> State {
+        match &*STANDING.lock().unwrap_or_else(PoisonError::into_inner) {
+            Some((named, state)) if named == service => state.clone(),
+            _ => State::Unset,
+        }
+    }
+
+    /// The right to say what the platform store answers for one service.
+    ///
+    /// Only one case holds it at a time. It starts as the platform's own answer, and a case makes
+    /// the store open or not open with [`Switch::opens`], [`Switch::opens_with`] and
+    /// [`Switch::closes`], as often as the case's starts need.
+    pub struct Switch {
+        service: String,
+        _serial: MutexGuard<'static, ()>,
+    }
+
+    impl Switch {
+        /// Waits for the switch and takes it for `service`.
+        #[must_use]
+        pub fn take(service: &str) -> Self {
+            let serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+            Self {
+                service: service.to_owned(),
+                _serial: serial,
+            }
+        }
+
+        /// Makes the platform store open as a new empty store, which is returned.
+        pub fn opens(&self) -> Arc<MemoryStore> {
+            let store = Arc::new(MemoryStore::new());
+            self.opens_with(&store);
+            store
+        }
+
+        /// Makes the platform store open as `store`.
+        pub fn opens_with(&self, store: &Arc<MemoryStore>) {
+            self.stand_for(State::Open(Arc::clone(store)));
+        }
+
+        /// Makes the platform store not open.
+        pub fn closes(&self) {
+            self.stand_for(State::Closed);
+        }
+
+        fn stand_for(&self, state: State) {
+            *STANDING.lock().unwrap_or_else(PoisonError::into_inner) =
+                Some((self.service.clone(), state));
+        }
+    }
+
+    impl Drop for Switch {
+        fn drop(&mut self) {
+            *STANDING.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        }
     }
 }
 
@@ -945,6 +1064,13 @@ impl MemoryStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether the store holds no item.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.items.lock().is_ok_and(|items| items.is_empty())
     }
 }
 
@@ -2363,5 +2489,151 @@ mod tests {
         store.delete(&name).expect("a delete");
         assert!(store.get(&name).expect("a read").is_none());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The service name the selection's cases open the stand-in under, which nothing else uses.
+    const SELECTION_SERVICE: &str = "kalareach-selection-cases";
+
+    /// KR-REQ-10.47: each state of a host's directory and each environment has one store for the
+    /// host's keys. The record and the files already in the directory decide it before what opens
+    /// does, a record that names the platform store is never given up for another one, and the
+    /// first start is the only choice that follows what opens.
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+    ))]
+    #[test]
+    fn the_selection_gives_each_state_and_environment_its_store() {
+        use StoreKind::{FileFallback, Platform};
+
+        let switch = stand_in::Switch::take(SELECTION_SERVICE);
+        let name = SecretName::new("host/x").expect("a name");
+        // The state: a record, files already in the directory; the environment: whether the
+        // platform store opens; the answer: the store, or a refusal.
+        let rows: [(&str, Option<StoreKind>, bool, bool, Option<StoreKind>); 8] = [
+            ("no record, empty, opens", None, false, true, Some(Platform)),
+            (
+                "no record, empty, closed",
+                None,
+                false,
+                false,
+                Some(FileFallback),
+            ),
+            (
+                "no record, files, opens",
+                None,
+                true,
+                true,
+                Some(FileFallback),
+            ),
+            (
+                "no record, files, closed",
+                None,
+                true,
+                false,
+                Some(FileFallback),
+            ),
+            (
+                "record platform, opens",
+                Some(Platform),
+                false,
+                true,
+                Some(Platform),
+            ),
+            (
+                "record platform, closed",
+                Some(Platform),
+                false,
+                false,
+                None,
+            ),
+            (
+                "record file, opens",
+                Some(FileFallback),
+                false,
+                true,
+                Some(FileFallback),
+            ),
+            (
+                "record file, closed",
+                Some(FileFallback),
+                false,
+                false,
+                Some(FileFallback),
+            ),
+        ];
+        for (row, record, files, opens, answer) in rows {
+            let base = scratch_directory("selection-row");
+            if files {
+                open_store_in(&base)
+                    .expect("a store")
+                    .store
+                    .set(&name, b"seed")
+                    .expect("a write");
+            }
+            if let Some(kind) = record {
+                record_kind(&base, kind).expect("a record");
+            }
+            let platform = if opens {
+                switch.opens()
+            } else {
+                switch.closes();
+                std::sync::Arc::new(MemoryStore::new())
+            };
+            let opened = StoreSelection::Platform.open(SELECTION_SERVICE, &base);
+            match answer {
+                Some(kind) => {
+                    let opened = opened.unwrap_or_else(|error| panic!("{row}: {error}"));
+                    assert_eq!(opened.kind, kind, "{row}");
+                    assert_eq!(
+                        read_recorded_kind(&base).expect("a record"),
+                        Some(kind),
+                        "{row}: the store is recorded"
+                    );
+                    assert_eq!(
+                        opened.store.get(&name).expect("a read").is_some(),
+                        files && kind == FileFallback,
+                        "{row}: the files in the directory are the store's"
+                    );
+                }
+                None => {
+                    assert!(opened.is_err(), "{row}: the start is refused");
+                    assert!(!fallback_holds_secrets(&base).expect("a read"), "{row}");
+                }
+            }
+            assert!(
+                platform.is_empty(),
+                "{row}: opening the store makes no item in the platform's store"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// KR-REQ-10.47: where section 10 offers no fallback, the platform store is the only store: it
+    /// is the one the stand-in opens, and a start where it does not open is refused with nothing
+    /// made on disk.
+    #[cfg(not(all(
+        unix,
+        not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+    )))]
+    #[test]
+    fn the_platform_store_is_the_only_store_where_there_is_no_fallback() {
+        let switch = stand_in::Switch::take(SELECTION_SERVICE);
+        let base = scratch_directory("selection-only");
+        let store = switch.opens();
+        let opened = StoreSelection::Platform
+            .open(SELECTION_SERVICE, &base)
+            .expect("the platform store");
+        assert_eq!(opened.kind, StoreKind::Platform);
+        opened
+            .store
+            .set(&SecretName::new("host/x").expect("a name"), b"seed")
+            .expect("a write");
+        assert!(!store.is_empty(), "the item is in the platform's store");
+
+        switch.closes();
+        let refused = StoreSelection::Platform.open(SELECTION_SERVICE, &base);
+        assert!(refused.is_err(), "no other store is taken");
+        assert!(!base.exists(), "nothing is made on disk");
     }
 }
