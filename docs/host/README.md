@@ -6074,10 +6074,11 @@ what it removes is exactly the thing a person cannot check for themselves.
   the screen when the mode goes off is given up in the same way when it leaves the screen. After
   that the grid keeps rows again. It still gives up two kinds of row that it could keep: a row
   printed after the mode went off onto a line that was on the screen while the mode was on (after a
-  clear or a full reset that is every row, for at most one screen of rows), and a row that leaves
-  the screen while an older row from that time is still on the screen below it, as when a program
-  scrolls a region above a status line. A resize gives up nothing more, except the rest of a wrapped
-  line whose first part is given up.
+  clear or a full reset that is every row), and a row that leaves the screen while an older row
+  from that time is still on the screen below it, as when a program scrolls a region above a status
+  line. A resize can join the parts of a wrapped line: when one part is given up, the whole line is,
+  and it then counts as a row from that time while it stays on the screen. A scroll inside left and
+  right margins carries the same rule to the line that receives the cells.
 * **Application notices keep their content.** A notification's title and body are written to the
   host-event store, and privacy cleanup removes neither the rows already there nor later ones.
 * **An invitation keeps what its issuer was shown.** `grant.create` stores the visible lines of a
