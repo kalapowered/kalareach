@@ -433,6 +433,9 @@ pub struct WorkerService {
     expired_receiver: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<(AttachmentId, u64)>>>,
     /// How many connections this session is serving.
     connections: Arc<std::sync::atomic::AtomicUsize>,
+    /// What the clean-ups of connections whose peers went owe to the session and to the authority
+    /// record, which two tasks of [`Self::serve`] do.
+    clean_up_owed: CleanUpOwed,
     /// Every connection this worker has admitted, and how to withdraw it.
     ///
     /// The transport's contract names this as the host's to keep: the final validation of the
@@ -746,6 +749,93 @@ impl Drop for DispatchGuard<'_> {
         drop(self.guard.take());
         self.released.notify_waiters();
     }
+}
+
+/// What clean-ups of connections whose peers have gone could not do without waiting for a lock,
+/// owed to the service.
+///
+/// A connection whose peer has gone does what it can at once and gives its place in the worker's
+/// count back. What needs a lock that somebody else holds is entered here, and the service's own
+/// tasks do it when the lock comes free. The two kinds are kept apart by the lock each waits for,
+/// so that a long hold of one never delays the other. Each kind is a set, so an entry owed twice is
+/// done once, and each has a wake that keeps its permit, so an entry made while a pass runs is
+/// not left until some other entry is made. A pass is one thread of the blocking pool, and the
+/// next pass begins when it ends: a kind waits with one thread at most, whatever the number of
+/// entries. Entries are in this service's memory, so they end with it, and a session that starts
+/// again has none: a restart rejects what it finds accepted by itself.
+#[derive(Debug, Default)]
+struct CleanUpOwed {
+    /// What waits for the session.
+    session: OwedSet<SessionWork>,
+    /// What waits for the authority lock and then for the attention fence's own: the connections
+    /// to remove from what the accepted generation speaks through.
+    authority: OwedSet<ConnectionId>,
+}
+
+/// One kind of owed work, each entry once.
+#[derive(Debug)]
+struct OwedSet<K> {
+    entries: Mutex<std::collections::BTreeSet<K>>,
+    wake: tokio::sync::Notify,
+}
+
+impl<K> Default for OwedSet<K> {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::new(std::collections::BTreeSet::new()),
+            wake: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+impl<K: Ord> OwedSet<K> {
+    /// Owes every entry of `keys` and wakes the task that does them. The wake keeps a permit, so a
+    /// task that is between two passes finds it.
+    fn owe_all(&self, keys: impl IntoIterator<Item = K>) {
+        self.entries
+            .lock()
+            .expect("the owed work is not poisoned")
+            .extend(keys);
+        self.wake.notify_one();
+    }
+
+    /// Owes one entry.
+    fn owe(&self, key: K) {
+        self.owe_all(std::iter::once(key));
+    }
+
+    /// Takes everything that is owed, and leaves nothing behind.
+    fn take(&self) -> Vec<K> {
+        std::mem::take(&mut *self.entries.lock().expect("the owed work is not poisoned"))
+            .into_iter()
+            .collect()
+    }
+
+    /// Waits until something is owed, and takes all of it.
+    async fn next(&self) -> Vec<K> {
+        loop {
+            let owed = self.take();
+            if !owed.is_empty() {
+                return owed;
+            }
+            self.wake.notified().await;
+        }
+    }
+}
+
+/// Work on the session that a clean-up owes.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SessionWork {
+    /// Rejects an accepted action whose connection ended before it was dispatched, when its receipt
+    /// is still the accepted one at `revision`: a receipt that has moved since, or that a later
+    /// request made new under the same identity, is not this action's.
+    Reject {
+        actor_id: ActorId,
+        action_id: kr_protocol::ids::ActionId,
+        revision: u64,
+    },
+    /// Detaches an attachment the connection kept.
+    Detach(AttachmentId),
 }
 
 /// What one try of a request that waits for the dispatch boundary came to.
@@ -1082,6 +1172,7 @@ impl WorkerService {
             expired: expired.0,
             expired_receiver: Mutex::new(Some(expired.1)),
             connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            clean_up_owed: CleanUpOwed::default(),
             admitted: Mutex::new(std::collections::BTreeMap::new()),
             questions,
             journal_path: binding.journal_path,
@@ -2391,6 +2482,11 @@ impl WorkerService {
         {
             tasks.spawn(Arc::clone(&self).release_expired_grants(expired));
         }
+        // What the clean-ups of connections whose peers went owe, each kind by its own task, so a
+        // hold of the session never delays an unbind and a hold of the authority lock never delays
+        // a rejection. Both end with this call.
+        tasks.spawn(Arc::clone(&self).settle_what_is_owed_to_the_session());
+        tasks.spawn(Arc::clone(&self).settle_what_is_owed_to_the_authority());
         // The components of this session's bindings are registered with the plugin runtime from
         // here. Nothing is asked of anybody until a binding wants one.
         if let Some(request) = self.plugin_runtime.clone() {
@@ -2425,6 +2521,53 @@ impl WorkerService {
                 let _ = service.run_connection(connection, peer).await;
                 held.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             });
+        }
+    }
+
+    /// Does what clean-ups owe to the session, one pass after another.
+    ///
+    /// A pass takes everything that is owed and waits for the session on one thread of the blocking
+    /// pool; what is owed meanwhile is the next pass's. A connection never waits for it.
+    async fn settle_what_is_owed_to_the_session(self: Arc<Self>) {
+        loop {
+            let owed = self.clean_up_owed.session.next().await;
+            let service = Arc::clone(&self);
+            let _ = tokio::task::spawn_blocking(move || service.settle_session_work(owed)).await;
+        }
+    }
+
+    /// Does what clean-ups owe to the authority record and the attention fence, one pass after
+    /// another, on one thread of the blocking pool at a time.
+    async fn settle_what_is_owed_to_the_authority(self: Arc<Self>) {
+        loop {
+            let owed = self.clean_up_owed.authority.next().await;
+            let service = Arc::clone(&self);
+            let _ = tokio::task::spawn_blocking(move || {
+                for connection_id in owed {
+                    service.unbind(connection_id);
+                }
+            })
+            .await;
+        }
+    }
+
+    /// Does the work on the session that clean-ups owed, waiting for the session for each entry.
+    fn settle_session_work(&self, owed: Vec<SessionWork>) {
+        for work in owed {
+            let mut session = self.runtime.session();
+            match work {
+                SessionWork::Reject {
+                    actor_id,
+                    action_id,
+                    revision,
+                } => Self::reject_abandoned(&mut session, actor_id, action_id, Some(revision)),
+                SessionWork::Detach(attachment_id) => {
+                    let _ = session.detach(attachment_id);
+                    // The fence this detach moved, and any terminator it produced, reach the
+                    // writer here.
+                    self.runtime.flush_input();
+                }
+            }
         }
     }
 
@@ -3653,12 +3796,7 @@ impl WorkerService {
         if let Some(task) = state.page_task.take() {
             task.abort();
         }
-        for attachment_id in state.facts.take_attachments() {
-            let mut session = self.runtime.session();
-            let _ = session.detach(attachment_id);
-            // The fence this detach moved, and any terminator it produced, reach the writer here.
-            self.runtime.flush_input();
-        }
+        self.detach_or_owe(state.facts.take_attachments());
         // A window that outlived its connection could first-admit a request through a connection
         // that no longer exists, so the connection's windows go when it does, and so does its
         // registration.
@@ -5727,30 +5865,77 @@ impl WorkerService {
         self.recoveries.forget(connection_id);
     }
 
-    /// Removes one connection from whatever the accepted generation speaks through.
+    /// Removes one connection from whatever the accepted generation speaks through, waiting for
+    /// the authority lock and for the privacy fence's own.
     fn unbind(&self, connection_id: ConnectionId) {
         {
             let mut authority = self
                 .authority
                 .lock()
                 .expect("the authority lock is not poisoned");
-            if authority.bound_connection == Some(connection_id) {
-                authority.bound_connection = None;
-            }
-            authority.proxy_connections.remove(&connection_id);
-            if authority.attention_connection == Some(connection_id) {
-                authority.attention_connection = None;
-            }
-            if authority.descriptions_connection == Some(connection_id) {
-                authority.descriptions_connection = None;
-            }
-            if authority.checks_connection == Some(connection_id) {
-                authority.checks_connection = None;
-            }
+            Self::unbind_entries(&mut authority, connection_id);
         }
         // And from the privacy fence, when it was the connection the fence speaks through: an
         // acknowledgement or a named generation from it no longer counts.
         self.attention_fence.ended(connection_id);
+    }
+
+    /// Removes one connection from the authority record and from the privacy fence when neither
+    /// lock is held, and says whether all of it was done. It never waits.
+    ///
+    /// A false answer may follow a removal from the authority record that was made: the fence's
+    /// own lock was held then. What is owed afterwards is all of [`Self::unbind`], which finds
+    /// nothing to remove in what was done and does the rest.
+    fn try_unbind(&self, connection_id: ConnectionId) -> bool {
+        {
+            let mut authority = match self.authority.try_lock() {
+                Ok(authority) => authority,
+                Err(std::sync::TryLockError::WouldBlock) => return false,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    panic!("the authority lock is not poisoned")
+                }
+            };
+            Self::unbind_entries(&mut authority, connection_id);
+        }
+        self.attention_fence.try_ended(connection_id)
+    }
+
+    /// Takes the connection out of every place the authority record names it.
+    fn unbind_entries(authority: &mut Authority, connection_id: ConnectionId) {
+        if authority.bound_connection == Some(connection_id) {
+            authority.bound_connection = None;
+        }
+        authority.proxy_connections.remove(&connection_id);
+        if authority.attention_connection == Some(connection_id) {
+            authority.attention_connection = None;
+        }
+        if authority.descriptions_connection == Some(connection_id) {
+            authority.descriptions_connection = None;
+        }
+        if authority.checks_connection == Some(connection_id) {
+            authority.checks_connection = None;
+        }
+    }
+
+    /// Detaches the attachments a connection kept, each when the session is free, and owes the
+    /// rest to the service at the first that finds it held. An identifier that another connection
+    /// has detached already is detached again to no effect, and is owed like the others, since
+    /// finding that out needs the session too.
+    fn detach_or_owe(&self, attachments: Vec<AttachmentId>) {
+        let mut rest = attachments.into_iter();
+        while let Some(attachment_id) = rest.next() {
+            let Some(mut session) = self.runtime.try_session() else {
+                self.clean_up_owed.session.owe_all(
+                    std::iter::once(attachment_id)
+                        .chain(rest)
+                        .map(SessionWork::Detach),
+                );
+                return;
+            };
+            let _ = session.detach(attachment_id);
+            // The fence this detach moved, and any terminator it produced, reach the writer here.
+            self.runtime.flush_input();
+        }
     }
 
     /// Removes a connection that has ended of its own accord.
@@ -5761,8 +5946,11 @@ impl WorkerService {
     /// ended because its peer went would otherwise keep its place in the count of connections
     /// until that read was done.
     fn deregister(&self, connection_id: ConnectionId, presented: bool) {
-        if presented {
-            self.unbind(connection_id);
+        // Never waited for: a holder of the authority lock or of the fence's own keeps this
+        // connection's place in the count while it works, and what is owed is done by the service
+        // when the lock comes free.
+        if presented && !self.try_unbind(connection_id) {
+            self.clean_up_owed.authority.owe(connection_id);
         }
         let held = self
             .admitted
@@ -6470,6 +6658,7 @@ impl WorkerService {
             caller,
             pending.deadline,
             true,
+            None,
             false,
             Some(preparation),
         )
@@ -6480,17 +6669,64 @@ impl WorkerService {
         self.abandon_pending(&ready.pending);
     }
 
-    /// Rejects an accepted action nothing is left to dispatch.
+    /// Rejects an accepted action nothing is left to dispatch, and never waits for the session.
+    ///
+    /// Every end of a connection that held an accepted action comes here: the loop's look at a
+    /// peer that has gone, a preparation whose connection ended, and the clean-up. When a holder
+    /// has the session, the rejection is owed to the service, which makes it when the session
+    /// comes free; the receipt stays `accepted` until then, and counts as outstanding for its
+    /// actor. A client that stays is answered with its rejection by [`Self::reject_accepted`],
+    /// which waits.
     fn abandon_pending(&self, pending: &PendingPreparation) {
-        let _ = self.reject_accepted(
-            &pending.caller,
-            &pending.mutation,
-            kr_protocol::receipt::RejectionReason::AdmissionFailed,
-            WorkerError::PreconditionFailed {
-                detail: "the connection this action was accepted on ended before it was dispatched"
-                    .to_owned(),
-            },
-        );
+        let actor_id = pending.caller.actor_id.clone();
+        let action_id = pending.mutation.action_id;
+        let Some(mut session) = self.runtime.try_session() else {
+            self.clean_up_owed.session.owe(SessionWork::Reject {
+                actor_id,
+                action_id,
+                revision: pending.revision,
+            });
+            return;
+        };
+        Self::reject_abandoned(&mut session, actor_id, action_id, Some(pending.revision));
+    }
+
+    /// Rejects an action whose connection ended before it was dispatched, under the session the
+    /// caller holds. A receipt that is no longer `accepted` is left as it is, and so is one whose
+    /// revision is not `revision`, which is a receipt of another action that took the identity.
+    fn reject_abandoned(
+        session: &mut Session,
+        actor_id: ActorId,
+        action_id: kr_protocol::ids::ActionId,
+        revision: Option<u64>,
+    ) {
+        let Some(journal) = session.journal_mut() else {
+            return;
+        };
+        let this_one = journal
+            .read(actor_id.clone(), action_id)
+            .ok()
+            .flatten()
+            .is_some_and(|receipt| {
+                receipt.state == kr_protocol::receipt::ReceiptState::Accepted
+                    && revision.is_none_or(|revision| receipt.revision.get() == revision)
+            });
+        if this_one {
+            let _ = journal.reject(
+                actor_id,
+                action_id,
+                kr_protocol::receipt::RejectionReason::AdmissionFailed,
+                Some(
+                    WorkerError::PreconditionFailed {
+                        detail: "the connection this action was accepted on ended before it was \
+                                 dispatched"
+                            .to_owned(),
+                    }
+                    .to_protocol_error(),
+                ),
+                kr_ipc::now_ms(),
+            );
+        }
     }
 
     /// Rejects an action whose intent is committed and which will not be dispatched, and returns
@@ -7231,16 +7467,16 @@ impl WorkerService {
         // and failing* is the same condition as one that is absent — a full disk refusing a write
         // is exactly when a person most needs to be able to stop a session — so the exception
         // covers the write failing as well as the journal being missing.
-        let admitted = match session.journal_mut() {
+        let (admitted, accepted_revision) = match session.journal_mut() {
             Some(journal) => match journal.accept(submission) {
-                Ok(_) => true,
+                Ok(admission) => (true, Some(admission.receipt.revision.get())),
                 Err(error) if volatile_permitted && is_storage_failure(&error) => {
                     session.note_journal_failure(error.to_string());
-                    false
+                    (false, None)
                 }
                 Err(error) => return Err(error),
             },
-            None if volatile_permitted => false,
+            None if volatile_permitted => (false, None),
             None => {
                 return Err(WorkerError::JournalUnavailable {
                     detail:
@@ -7259,6 +7495,7 @@ impl WorkerService {
             caller,
             deadline,
             admitted,
+            accepted_revision,
             volatile_permitted,
             None,
         )
@@ -7282,6 +7519,7 @@ impl WorkerService {
         caller: &Caller,
         deadline: ContinuousInstant,
         admitted: bool,
+        accepted_revision: Option<u64>,
         volatile_permitted: bool,
         preparation: Option<Made>,
     ) -> Result<Answered> {
@@ -7359,6 +7597,8 @@ impl WorkerService {
                     caller: caller.clone(),
                     deadline,
                     forwarded: false,
+                    revision: accepted_revision
+                        .expect("a first pass keeps the revision of the receipt it accepted"),
                 })))
             } else {
                 // The receipt is where a prepared action is remembered, and this session keeps
@@ -12651,6 +12891,9 @@ pub struct PendingPreparation {
     deadline: ContinuousInstant,
     /// Whether the answer goes to a proxy rather than to the actor whose action it is.
     forwarded: bool,
+    /// The revision of the `accepted` receipt this action was admitted under. A rejection owed for
+    /// the action names it, so that it can only reject that receipt.
+    revision: u64,
 }
 
 /// What an attachment's offer came to, from what its action came to.
