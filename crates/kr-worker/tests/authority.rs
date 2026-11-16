@@ -277,12 +277,14 @@ async fn a_replaced_controller_connection_stops_being_served() {
 const WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// KR-REQ-02.05: a connection whose presentation reaches the worker after a newer connection's
-/// does not take the authority from it, even when the daemon gave up on the older one before the
-/// newer one was opened.
+/// does not take the authority from it, even when the older connection's daemon is still there to
+/// be answered and the newer one was opened after it.
 ///
-/// The older presentation is held where it waits for the dispatch boundary, and its client task is
-/// ended. The newer connection is opened, presents, and is served. The older presentation is then
-/// let go and its decision awaited, and the newer connection is served again.
+/// The older presentation is held where it waits for the dispatch boundary, and its client stays
+/// connected: a presentation whose peer has gone is not decided at all, so the order of the two
+/// connections is only what keeps a living one from fencing the other. The newer connection is
+/// opened, presents, and is served. The older presentation is then let go and refused for its
+/// order, and the newer connection is served again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_abandoned_presentation_that_is_decided_late_does_not_fence_a_newer_connection() {
     let host = host(1).await;
@@ -301,14 +303,6 @@ async fn an_abandoned_presentation_that_is_decided_late_does_not_fence_a_newer_c
         .await
         .expect("the wait ends")
         .expect("the older presentation reaches the worker's pause");
-    presenting.abort();
-    assert!(
-        presenting
-            .await
-            .expect_err("the task did not finish")
-            .is_cancelled(),
-        "the older connection's client is gone"
-    );
 
     let mut newer = controller_client(&host, 1).await;
     read_session(&mut newer, host.session_id)
@@ -320,6 +314,12 @@ async fn an_abandoned_presentation_that_is_decided_late_does_not_fence_a_newer_c
         .await
         .expect("the wait ends")
         .expect("the older presentation is decided");
+    assert_refused_for_order(
+        tokio::time::timeout(WAIT, presenting)
+            .await
+            .expect("the older client is answered")
+            .expect("the older client's task ends"),
+    );
     read_session(&mut newer, host.session_id)
         .await
         .expect("the newer connection is still served once the older presentation is decided");
