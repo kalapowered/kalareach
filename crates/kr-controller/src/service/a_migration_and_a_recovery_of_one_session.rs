@@ -323,3 +323,191 @@ async fn a_closure_is_not_recorded_from_under_a_recovery() {
         "the closure is the one the worker wrote for itself"
     );
 }
+
+/// A worker that ended after the account it gave when it was asked to close, with a registry that
+/// refused the write that records it.
+struct AccountThatWasRefused {
+    _temp: TempHost,
+    controller: std::sync::Arc<Controller>,
+    session_id: SessionId,
+    display: DisplayNumber,
+    /// What the worker said of its closure: volatile, and not what this daemon would write of a
+    /// worker that left nothing.
+    account: ClosureRecord,
+}
+
+impl AccountThatWasRefused {
+    async fn made() -> Self {
+        let temp = TempHost::create();
+        let controller = daemon(&temp).await;
+        let session_id = recorded_ended_worker(&controller, &temp).await;
+        let display = controller
+            .registry
+            .lock()
+            .await
+            .workers()
+            .expect("the registry answers")
+            .into_iter()
+            .find(|row| row.session_id == session_id)
+            .expect("the worker is recorded")
+            .display_number;
+        let account = ClosureRecord {
+            durability: Durability::Volatile,
+            ..closure_of(session_id)
+        };
+        rusqlite::Connection::open(controller.paths.registry_database())
+            .expect("the registry opens beside the daemon's own handle")
+            .execute_batch(
+                "CREATE TRIGGER the_closure_is_not_kept BEFORE INSERT ON tombstones
+                 BEGIN SELECT RAISE(ABORT, 'the registry keeps no closure'); END;",
+            )
+            .expect("the registry is made to refuse the write that records a closure");
+        controller
+            .settle_close_answer(
+                session_id,
+                &kr_protocol::session::SessionCloseResult {
+                    session_id,
+                    state: SessionState::Closed,
+                    durability: account.durability,
+                    closure: Nullable::some(account.clone()),
+                    session: None,
+                },
+            )
+            .await;
+        Self {
+            _temp: temp,
+            controller,
+            session_id,
+            display,
+            account,
+        }
+    }
+
+    /// The look of a recovery at the worker that ended, as the closure watcher makes it.
+    async fn recovery_looks(&self) -> crate::error::Result<Option<ClosureRecord>> {
+        self.controller
+            .crash_flight(
+                self.session_id,
+                self.display,
+                &kr_ipc::identity::ended_process_identity(4_000_003),
+                ClosureReason::WorkerCrash,
+            )
+            .await
+    }
+
+    fn the_registry_takes_closures_again(&self) {
+        rusqlite::Connection::open(self.controller.paths.registry_database())
+            .expect("the registry opens beside the daemon's own handle")
+            .execute_batch("DROP TRIGGER the_closure_is_not_kept;")
+            .expect("the registry takes a closure again");
+    }
+
+    /// What the registry holds once a recovery has recorded the closure.
+    async fn recorded(&self) -> ClosureRecord {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                if let Some(closure) = self
+                    .controller
+                    .registry
+                    .lock()
+                    .await
+                    .closure(self.session_id)
+                    .expect("the registry answers")
+                {
+                    return closure;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the closure is recorded")
+    }
+}
+
+/// The closure the worker gave when it was asked to close is its own account of how its session
+/// ended. When the worker ends after a write of that account failed, a recovery that finds its
+/// endpoint cannot be removed records the account, and not the daemon's own record of a worker
+/// that left none.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_endpoint_that_cannot_be_removed_does_not_replace_the_account_a_worker_gave() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// Puts the directory back as it was, whatever the case ends with.
+    struct Writable(std::path::PathBuf);
+    impl Drop for Writable {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    let world = AccountThatWasRefused::made().await;
+    drop(
+        world
+            .controller
+            .archive()
+            .own_closed(world.session_id, || Ok(false))
+            .expect("the session's lock is made"),
+    );
+    let endpoint = world
+        .controller
+        .paths
+        .worker_endpoint(world.display)
+        .expect("an endpoint");
+    let directory = endpoint
+        .as_path()
+        .parent()
+        .expect("a directory")
+        .to_path_buf();
+    std::fs::create_dir_all(&directory).expect("the directory");
+    std::fs::write(endpoint.as_path(), b"a socket").expect("publishes the endpoint");
+    let _writable = Writable(directory.clone());
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500))
+        .expect("makes the directory unwritable");
+
+    world.the_registry_takes_closures_again();
+    let found = world
+        .recovery_looks()
+        .await
+        .expect("the registry answers")
+        .expect("the worker that ended is closed");
+    assert_eq!(found, world.account, "the account the worker gave stands");
+    assert_eq!(
+        world.recorded().await,
+        world.account,
+        "and it is the one recorded: a record of a crash is not written over it"
+    );
+}
+
+/// When the first write of the account a worker gave fails at the worker's end, the account is
+/// still known, and the next look records it and not the daemon's own record of a worker that left
+/// none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_write_at_the_end_of_a_worker_keeps_the_account_it_gave() {
+    let world = AccountThatWasRefused::made().await;
+    let refused = world.recovery_looks().await;
+    assert!(
+        refused.is_err(),
+        "the write at the worker's end fails with the registry: {refused:?}"
+    );
+    assert!(
+        world
+            .controller
+            .registry
+            .lock()
+            .await
+            .closure(world.session_id)
+            .expect("the registry answers")
+            .is_none(),
+        "and nothing is recorded"
+    );
+
+    world.the_registry_takes_closures_again();
+    let found = world
+        .recovery_looks()
+        .await
+        .expect("the registry answers")
+        .expect("the worker that ended is closed");
+    assert_eq!(found, world.account, "the account the worker gave stands");
+    assert_eq!(world.recorded().await, world.account);
+}
