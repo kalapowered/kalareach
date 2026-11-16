@@ -2357,9 +2357,11 @@ impl Controller {
         let params: kr_protocol::session::SessionCloseParams =
             crate::service::parse(&mutation.params)?;
         let session_id = params.session_id;
-        if self.directory.lock().await.get(session_id).is_none()
-            || self.knows_how_it_ended(session_id)
-        {
+        // Asked first, whatever the directory holds: a closure this daemon knows and its registry
+        // has not yet recorded is written again when it is asked about, and a worker that is
+        // still in the directory is not asked to close twice.
+        let knows_how_it_ended = self.knows_how_it_ended(session_id);
+        if knows_how_it_ended || self.directory.lock().await.get(session_id).is_none() {
             // Nothing is running under that identity, or this daemon knows how it ended. Either
             // it has already closed, and the record is the answer, or it never existed here.
             //
