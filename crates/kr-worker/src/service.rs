@@ -565,6 +565,11 @@ pub struct WorkerService {
     /// for this host's own tests. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     subscriptions_held: std::sync::atomic::AtomicUsize,
+    /// How many threads of receipt reads this service has alive at this moment, for this host's
+    /// own tests: a thread's own entry and exit move the count. It is compiled away in every
+    /// shipped build.
+    #[cfg(feature = "testing")]
+    receipt_threads: Arc<std::sync::atomic::AtomicUsize>,
     /// How many description facts requests this service is holding at this moment, waiting for a
     /// fact to change, for this host's own tests. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -1272,6 +1277,8 @@ impl WorkerService {
             maintenance_gate: Mutex::new(()),
             #[cfg(feature = "testing")]
             subscriptions_held: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "testing")]
+            receipt_threads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(feature = "testing")]
             facts_held: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "testing")]
@@ -2095,6 +2102,16 @@ impl WorkerService {
     #[must_use]
     pub fn subscriptions_held(&self) -> usize {
         self.subscriptions_held
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Returns how many threads of receipt reads this service has alive at this moment, for this
+    /// host's own tests. A thread is counted from the moment a read starts it until it returns,
+    /// whatever it is waiting for.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn receipt_threads_alive(&self) -> usize {
+        self.receipt_threads
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -10422,7 +10439,11 @@ impl WorkerService {
         let (read_sender, read) = std::sync::mpsc::channel();
         let runtime = Arc::clone(&self.runtime);
         let (actor_id, action_id, named) = (actor_id.clone(), params.action_id, params.session_id);
+        #[cfg(feature = "testing")]
+        let counted = ReceiptThread::count(&self.receipt_threads);
         std::thread::spawn(move || {
+            #[cfg(feature = "testing")]
+            let _counted = counted;
             let left = take_until.saturating_duration_since(std::time::Instant::now());
             let Some(mut session) = runtime.session_within(left) else {
                 let _ = took_sender.send(false);
@@ -12427,6 +12448,26 @@ impl<'a> SubscriptionHeld<'a> {
 
 #[cfg(feature = "testing")]
 impl Drop for SubscriptionHeld<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// One thread of a receipt read, counted in [`WorkerService::receipt_threads_alive`] for as long as
+/// it stands, for this host's own tests.
+#[cfg(feature = "testing")]
+struct ReceiptThread(Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(feature = "testing")]
+impl ReceiptThread {
+    fn count(alive: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        alive.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(Arc::clone(alive))
+    }
+}
+
+#[cfg(feature = "testing")]
+impl Drop for ReceiptThread {
     fn drop(&mut self) {
         self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
