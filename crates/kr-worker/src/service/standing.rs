@@ -43,7 +43,7 @@ pub(super) enum Mode {
 
 impl Mode {
     /// Whether this pass runs the expiry sweep of the questions inside its check of the subject.
-    const fn sweep(self) -> Sweep {
+    const fn question_sweep(self) -> Sweep {
         match self {
             Self::First => Sweep::Run,
             Self::Again => Sweep::Never,
@@ -162,8 +162,14 @@ impl StandingPass<'_> {
         method: Method,
         caller: &Caller,
     ) -> Result<()> {
-        self.service
-            .validate(session, state, mutation, method, caller, self.mode.sweep())?;
+        self.service.validate(
+            session,
+            state,
+            mutation,
+            method,
+            caller,
+            self.mode.question_sweep(),
+        )?;
         WorkerService::check_preconditions(session, mutation)
     }
 
