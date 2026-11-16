@@ -5175,3 +5175,121 @@ async fn a_key_answered_before_the_view_read_its_acceptance_does_not_stop_the_de
         methods(&sent)
     );
 }
+
+/// How a scripted worker answers a launch.
+enum Launched {
+    Installed,
+    Refused(ErrorCode),
+}
+
+/// Presses a launch on `view` and answers it as `launched` says; returns what the page was told.
+/// Fails when the page was told before the launch reached the wire.
+async fn launch_answered(
+    page: &Page,
+    view: &str,
+    link: &mut Link,
+    launched: &Launched,
+    round: usize,
+) -> Result<Value, Value> {
+    let mut pressing = page.invoke_later(
+        "terminal_view_launch",
+        json!({ "view": view, "press": the_press() }),
+    );
+    let launch = tokio::select! {
+        launch = link.expect(Method::ShellLaunch) => launch,
+        told = &mut pressing => {
+            panic!("launch {round} was answered to the page before it reached the wire: {told:?}")
+        }
+    };
+    match launched {
+        Launched::Installed => {
+            let asked: kr_protocol::root::ShellLaunchParams = launch.params();
+            let installed = kr_protocol::root::ShellLaunchResult {
+                fence_id: kr_protocol::root::FenceId::new(kr_ipc::new_uuid()),
+                prompt_generation: asked.expected_prompt_generation,
+                buffer_revision: kr_protocol::root::EditorBufferRevision::new(4),
+            };
+            link.answer(&launch, &installed).await;
+        }
+        Launched::Refused(refusal) => link.refuse_with(&launch, *refusal, "scripted").await,
+    }
+    pressing.await.expect("joins")
+}
+
+/// Launches whose results are definite, more of them than the session keeps unresolved actions
+/// for, are settled by the view as they are answered: the session's book does not grow with the
+/// view's life, and a release and a detach after them still go.
+#[tokio::test(flavor = "multi_thread")]
+async fn definite_results_of_launches_do_not_fill_the_sessions_unresolved_actions() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let mut lease = WorkerLease::at(4);
+    let (view, mut link) =
+        controlling(&page, &mut worker, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    for round in 0..kr_client::session::MAX_UNRESOLVED_ACTIONS + 8 {
+        if round % 2 == 0 {
+            let told = launch_answered(&page, &view, &mut link, &Launched::Installed, round).await;
+            assert!(told.is_ok(), "launch {round} was installed: {told:?}");
+        } else {
+            let told = launch_answered(
+                &page,
+                &view,
+                &mut link,
+                &Launched::Refused(ErrorCode::DraftConflict),
+                round,
+            )
+            .await
+            .expect_err("the host refused the launch");
+            assert_eq!(code(&told), "DRAFT_CONFLICT", "launch {round}");
+        }
+    }
+    page.release(&view, 2);
+    let release = link.expect(Method::InputRelease).await;
+    lease.answer(&mut link, &release).await;
+    page.newest(3, |state| control(state) == (2, "watching".to_owned()))
+        .await;
+    assert!(
+        ended_within_the_close_bound(&page, &view).await,
+        "the view ended within the close bound"
+    );
+    let sent = link.closed().await;
+    assert_eq!(
+        methods(&sent),
+        vec!["session.detach"],
+        "the detach still went after the launches"
+    );
+}
+
+/// A result that is not definite is left as the session's rule has it: a launch answered as of
+/// unknown outcome, or refused for now, stays an unresolved action, so that the session can ask
+/// after it. At the bound the next launch is refused by the session before any byte goes.
+#[tokio::test(flavor = "multi_thread")]
+async fn launches_whose_result_is_not_definite_stay_unresolved_at_the_session() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let mut lease = WorkerLease::at(4);
+    let (view, mut link) =
+        controlling(&page, &mut worker, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    for round in 0..kr_client::session::MAX_UNRESOLVED_ACTIONS {
+        let (refusal, said) = if round % 4 == 3 {
+            (ErrorCode::RendezvousUnavailable, "RENDEZVOUS_UNAVAILABLE")
+        } else {
+            (ErrorCode::OutcomeUnknown, "OUTCOME_UNKNOWN")
+        };
+        let told = launch_answered(&page, &view, &mut link, &Launched::Refused(refusal), round)
+            .await
+            .expect_err("the host did not decide");
+        assert_eq!(code(&told), said, "launch {round}");
+    }
+    let mut pressing = page.invoke_later(
+        "terminal_view_launch",
+        json!({ "view": view, "press": the_press() }),
+    );
+    let told = tokio::select! {
+        launch = link.expect(Method::ShellLaunch) => {
+            panic!("the launch reached the wire with the session at its bound: {:?}", launch.method)
+        }
+        told = &mut pressing => told.expect("joins").expect_err("the session refuses it"),
+    };
+    assert_eq!(code(&told), "RESOURCE_UNAVAILABLE");
+}
