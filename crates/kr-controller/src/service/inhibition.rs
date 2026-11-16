@@ -538,6 +538,21 @@ mod tests {
         );
     }
 
+    /// The order busy, a request, busy again inside ONE hold: both counts stay, whatever the
+    /// answer after them says.
+    #[test]
+    fn busy_then_a_request_then_busy_within_one_hold_keeps_both_counted() {
+        let busy = answer(Some(AgentBusy), Some(0), false);
+        let held_asking = answer(Some(AwaitingApproval), Some(0), true);
+        let held_busy = answer(Some(AgentBusy), Some(0), true);
+        assert_eq!(counted_after(&[&busy, &held_asking, &held_busy]), (1, 1));
+        let held_idle = answer(Some(ShellReady), Some(0), true);
+        assert_eq!(
+            counted_after(&[&busy, &held_asking, &held_busy, &held_idle]),
+            (1, 1)
+        );
+    }
+
     /// A session that the scan hears for the first time in a hold counts what the answer says:
     /// there is nothing to floor it with, and main counts nothing for a session whose read does
     /// not return.
