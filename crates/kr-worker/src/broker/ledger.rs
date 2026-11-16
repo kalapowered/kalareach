@@ -1469,19 +1469,28 @@ impl Ledger {
     /// `claimed`; the native client's own answer is marked from whatever state it beat, which is
     /// `pending` when nothing was encoding and `claimed` when something was.
     ///
+    /// `still` is the last ask, made once the writer's lock is held and before anything is written;
+    /// what it refuses is returned, and nothing is written.
+    ///
     /// # Errors
     ///
     /// Returns [`BrokerError::LedgerUnavailable`] when the write fails or the row is not in that
-    /// state with its marker unset.
+    /// state with its marker unset, and what `still` refuses.
     pub fn mark_dispatched(
         &self,
         resource: &PendingResource,
         event: &TransitionEvent,
+        still: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
-        let transaction = self
-            .connection
-            .unchecked_transaction()
-            .map_err(|error| self.fault(error))?;
+        // The writer's lock is taken first, by an immediate transaction that waits for another
+        // connection's, and the last ask stands after it: a deadline that passes while this write
+        // waits for the lock is asked after the wait.
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|error| self.fault(error))?;
+        still()?;
         let updated = transaction
             .execute(
                 "UPDATE broker_pending SET dispatched = 1
@@ -1542,6 +1551,15 @@ impl Ledger {
             }
         }
         Ok(owed)
+    }
+
+    /// Says, for this host's own tests, when the next write of this ledger begins to wait for
+    /// another connection's lock: the end that carries the signal. The wait goes on until the lock
+    /// is let go.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn signal_next_writer_lock_wait(&mut self) -> tokio::sync::oneshot::Receiver<()> {
+        crate::testing::signal_next_lock_wait(&mut self.connection)
     }
 
     /// Commits an evidence gap and everything that happened inside it, in one transaction.
@@ -2968,7 +2986,7 @@ mod tests {
                 "a claim on its own is not an answer that went"
             );
             ledger
-                .mark_dispatched(&claimed, &event(93, &claimed))
+                .mark_dispatched(&claimed, &event(93, &claimed), || Ok(()))
                 .expect("the marker is committed");
         }
         let reopened =

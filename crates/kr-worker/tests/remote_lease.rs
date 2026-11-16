@@ -54,6 +54,7 @@ struct Host {
     controller: Arc<ControllerIdentity>,
     boot: kr_protocol::identity::BootIdentity,
     environment_id: kr_protocol::ids::EnvironmentId,
+    journal_path: std::path::PathBuf,
     // Declared last: the directory is removed after every field above has let go of its files.
     _temp: kr_ipc::testing::TempHost,
 }
@@ -140,6 +141,7 @@ async fn host_on(clock: Option<Arc<dyn ContinuousClock>>) -> Host {
     let service = Arc::new(service);
     tokio::spawn(Arc::clone(&service).serve(listener));
     Host {
+        journal_path: environment.journal_database(session_id),
         _temp: temp,
         service,
         session_id,
@@ -771,14 +773,31 @@ async fn a_local_forwarded_action_and_a_devices_stop_need_no_lease() {
 async fn attach_while_the_clock_moves(
     moved: Duration,
 ) -> (Host, MutationRequest, Outcome, BoundLink) {
+    attach_in_the_markers_step(moved, false).await
+}
+
+/// What a local `session.attach` comes to when the worker's clock moves by `moved` while the
+/// marker's step waits for the journal's writer lock, which another connection holds: the step has
+/// read the receipt and asked nothing since.
+async fn attach_while_the_writer_lock_is_held(
+    moved: Duration,
+) -> (Host, MutationRequest, Outcome, BoundLink) {
+    attach_in_the_markers_step(moved, true).await
+}
+
+async fn attach_in_the_markers_step(
+    moved: Duration,
+    holds_the_lock: bool,
+) -> (Host, MutationRequest, Outcome, BoundLink) {
     let clock = ManualClock::new();
     let host = host_on(Some(Arc::new(clock.clone()))).await;
     let mut sender = link(&host, 1, None).await;
     let mutation = attach(&host);
-    let (reached, release) = {
+    let (reached, release, waiting) = {
         let mut session = host.service.runtime().session();
         let journal = session.journal_mut().expect("this session keeps a journal");
-        journal.stall_next_marker_before_its_write()
+        let (reached, release) = journal.stall_next_marker_before_its_write();
+        (reached, release, journal.signal_next_writer_lock_wait())
     };
     let frame = forwarded(&mutation, ActorIngress::LocalIpc, 1, 0, None);
     let answering = tokio::spawn(async move {
@@ -789,8 +808,26 @@ async fn attach_while_the_clock_moves(
         .await
         .expect("the dispatch reaches the stop in time")
         .expect("the stop is armed");
-    clock.advance(moved);
-    release.send(()).expect("the dispatch is waiting to go on");
+    if holds_the_lock {
+        // Another connection takes the writer's lock while the marker's step stands before its
+        // first write, and the step's own signal says that it now waits for it.
+        let holder = rusqlite::Connection::open(&host.journal_path).expect("opens the journal");
+        holder
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("takes the writer's lock");
+        release.send(()).expect("the dispatch is waiting to go on");
+        tokio::time::timeout(WAIT, waiting)
+            .await
+            .expect("the marker's step waits for the lock in time")
+            .expect("the wait is signalled");
+        clock.advance(moved);
+        holder
+            .execute_batch("COMMIT")
+            .expect("lets the writer's lock go");
+    } else {
+        clock.advance(moved);
+        release.send(()).expect("the dispatch is waiting to go on");
+    }
     let (sender, outcome) = answering.await.expect("the dispatch ends");
     // The link stays open while the case looks at the session.
     (host, mutation, outcome, sender)
@@ -852,6 +889,40 @@ async fn an_accepted_deadline_that_passes_in_the_markers_step_leaves_no_marker_a
 
     let (host, mutation, outcome, _link) =
         attach_while_the_clock_moves(Duration::from_secs(1)).await;
+    assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
+    assert_eq!(
+        receipt_for(&host, local_actor(), &mutation).state,
+        ReceiptState::Applied
+    );
+    assert_eq!(attachments(&host), 1, "the control attaches once");
+}
+
+/// KR-REQ-09.16: the accepted deadline is asked after the marker's step holds the journal's writer
+/// lock, not before it. Another connection holds the lock while the deadline passes; when the step
+/// has the lock it asks again, writes no marker and rejects the action as expired, and no
+/// attachment is made. The control, the same wait with the clock where it was, writes the marker
+/// and attaches once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_accepted_deadline_that_passes_while_the_marker_waits_for_the_writer_lock_leaves_no_marker()
+ {
+    let (host, mutation, outcome, _link) =
+        attach_while_the_writer_lock_is_held(Duration::from_secs(121)).await;
+    // What landed is read before what was answered.
+    assert!(
+        !marker_event_written(&host, local_actor(), &mutation),
+        "the marker was written after the deadline passed in the wait for the writer's lock"
+    );
+    let receipt = receipt_for(&host, local_actor(), &mutation);
+    assert_eq!(receipt.state, ReceiptState::Rejected, "{receipt:?}");
+    assert_eq!(receipt.reason.as_ref(), Some(&RejectionReason::Expired));
+    assert_eq!(attachments(&host), 0, "the effect was made");
+    let Outcome::Error(error) = &outcome else {
+        panic!("a deadline that passed in the wait for the lock did not refuse: {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+
+    let (host, mutation, outcome, _link) =
+        attach_while_the_writer_lock_is_held(Duration::from_secs(1)).await;
     assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
     assert_eq!(
         receipt_for(&host, local_actor(), &mutation).state,
