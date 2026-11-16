@@ -321,6 +321,31 @@ impl Scene {
         .unwrap_or_else(|_| panic!("the call never showed {what}: {}", self.state()))
     }
 
+    /// Reads the call's state again and again until it shows the end `cause`, and returns it. At
+    /// every read that shows an end, the entry of `kind` that the end owes is in the same state,
+    /// once: a person, the page and the file never meet an end without what it owes.
+    async fn end_with_what_it_owes(&self, cause: &str, kind: &str) -> serde_json::Value {
+        tokio::time::timeout(WATCHDOG, async {
+            loop {
+                let state = self.state();
+                if state["ended"].is_object() {
+                    let entries = state["owed"].as_array().map_or(0, |owed| {
+                        owed.iter().filter(|each| each["kind"] == kind).count()
+                    });
+                    assert_eq!(
+                        entries, 1,
+                        "the end is shown with {entries} entries of {kind} owed: {state}"
+                    );
+                    assert_eq!(state["ended"]["cause"], cause, "{state}");
+                    return state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the call never showed the end {cause}: {}", self.state()))
+    }
+
     /// Asks for a start the way the page does, after reading what a call would be.
     fn start_request(&self, prepared: &serde_json::Value) -> serde_json::Value {
         json!({
@@ -2984,6 +3009,64 @@ async fn forgetting_the_host_ends_the_call_and_owes_the_revocation() {
     assert!(commands_sent(&scene).contains(&"close".to_owned()));
 }
 
+/// The end that the person's forgetting of the host causes is shown with the revocation it owes in
+/// the same state, at every read, however soon the screen reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_end_a_forgotten_host_causes_is_never_shown_without_the_revocation_it_owes() {
+    let timings = Timings {
+        host_within: Duration::from_secs(3),
+        ..quick()
+    };
+    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    scene.start().await;
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    let reference = scene
+        .call("pairing_view", json!({}))
+        .expect("the pairing screen")["hosts"][0]["reference"]
+        .clone();
+    scene.stop_host().await;
+    scene
+        .state_where("a host that is lost", |state| state["host"] == "lost")
+        .await;
+
+    scene
+        .call("hosts_forget", json!({ "reference": reference }))
+        .expect("the host is forgotten");
+
+    scene
+        .end_with_what_it_owes("host_forgotten", "revocation")
+        .await;
+}
+
+/// The end of a start the host never answers is shown with the start it owes in the same state, at
+/// every read, however soon the screen reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_end_of_a_start_the_host_never_answers_is_never_shown_without_the_start_it_owes() {
+    let timings = Timings {
+        host_within: Duration::from_millis(300),
+        ..asking_again()
+    };
+    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    scene.stand_in.hold_creations();
+    let prepared = scene.prepared().await;
+    let starting = scene
+        .phone
+        .companion
+        .start_call("voice_start", scene.start_request(&prepared));
+
+    scene
+        .end_with_what_it_owes("start_unknown", "start_unknown")
+        .await;
+
+    let _ = starting.await;
+    scene.stand_in.release_creations();
+    scene.stop_host().await;
+}
+
 /// The host created the call, and cannot be told it is over: it is gone before the device finishes
 /// setting the call up. The call is ended all the same, the revocation is owed, and the voice
 /// service is told over its own route, with the account's token, because nothing else can: no
@@ -3654,12 +3737,9 @@ async fn an_owner_that_fails_while_asking_what_became_of_a_start_leaves_the_star
         .await;
 
     assert!(refused.is_err(), "the owner failed before it could answer");
-    // The supervisor shows the end, and then records what it owes: the state is read once both
-    // are in it.
+    // The supervisor's end is never shown without the start it owes.
     let ended = scene
-        .state_where("the owner's failure with the start owed", |state| {
-            state["ended"]["cause"] == "owner_failed" && state["owed"][0]["kind"] == "start_unknown"
-        })
+        .end_with_what_it_owes("owner_failed", "start_unknown")
         .await;
     assert!(scene.platform.count("stop") >= 1, "the media is stopped");
     // The host was not heard to answer, so it is not a host that was never asked, and the service
