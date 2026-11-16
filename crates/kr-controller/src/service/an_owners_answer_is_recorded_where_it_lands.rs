@@ -30,6 +30,7 @@ use super::a_result_the_lease_ended_over::{
     Presenter, connected_under_a_lease_that_can_be_presented_again,
 };
 use super::an_owner_establishes_the_clock::{Door, paired, registry};
+use super::an_owners_request_is_recorded_where_it_lands::present_and_hold;
 use crate::error::ControllerError;
 use crate::service::Controller;
 use crate::service::net::owner::{Caller, Resolved};
@@ -50,10 +51,16 @@ enum Ends {
     Nothing,
     /// The lease's time passes in the last wait, inside the transaction.
     TheLeasesTime,
+    /// The mutation's deadline passes in the last wait, and the lease's end with it.
+    TheDeadlinePasses,
     /// The lease is presented again in the wait for the write lock, before the transaction.
     TheLeaseIsPresentedAgain,
     /// An owner is established in the wait for the write lock, which ends the terminal's standing.
     AnOwnerIsEstablished,
+    /// The lease is presented again and its presentation is held at its publishing stop after its
+    /// write has committed, in the wait for the write lock; it swaps the bound's cell inside the
+    /// transaction, at the end of the feed's locked ask.
+    TheBoundMovesInside,
     /// The challenge's time passes in the last wait, inside the transaction: the pairing clock's
     /// wall reading moves past its expiry.
     TheChallengeExpires,
@@ -74,11 +81,16 @@ fn making_exclusive() -> ConfirmationDisplay {
     }
 }
 
-fn closed_refusal() -> String {
+fn closed_refusal() -> ControllerError {
     Caller::local(ActorId::new("local:test").expect("a principal"))
         .confirming_recovery_only(true)
         .refusal_to_confirm()
-        .to_string()
+}
+
+/// `refusal` is the one a caller no lease serves is told, whole: its words and its code.
+fn is_the_closed_refusal(refusal: &ControllerError) -> bool {
+    let closed = closed_refusal();
+    refusal.to_string() == closed.to_string() && refusal.code() == closed.code()
 }
 
 struct Parts {
@@ -129,7 +141,7 @@ async fn answered_with(
     display: ConfirmationDisplay,
     landed: bool,
 ) -> Found {
-    let parts = parts(world).await;
+    let mut parts = parts(world).await;
     let controller = &parts.controller;
     let door = Door::open(&parts.temp, controller).await;
     let revision = controller.admitted_revision(door.connection_id()).ok();
@@ -188,13 +200,17 @@ async fn answered_with(
         caller
     };
     let (arrived, go) = match ends {
-        Ends::Nothing | Ends::TheLeasesTime | Ends::TheChallengeExpires => {
-            controller.pause_after_the_record_asks_the_feed()
-        }
-        Ends::TheLeaseIsPresentedAgain | Ends::AnOwnerIsEstablished => {
+        Ends::Nothing
+        | Ends::TheLeasesTime
+        | Ends::TheDeadlinePasses
+        | Ends::TheChallengeExpires => controller.pause_after_the_record_asks_the_feed(),
+        Ends::TheLeaseIsPresentedAgain | Ends::TheBoundMovesInside | Ends::AnOwnerIsEstablished => {
             controller.pause_before_the_record_begins()
         }
     };
+    // The end of the feed's locked ask, where a bound that moves inside the transaction is stopped.
+    let inside = matches!(ends, Ends::TheBoundMovesInside)
+        .then(|| controller.pause_after_the_record_asks_the_feed());
     let answering = tokio::task::spawn_blocking({
         let owner = Arc::clone(&owner);
         move || {
@@ -203,6 +219,7 @@ async fn answered_with(
             (answered, copied.load(Ordering::Acquire))
         }
     });
+    let mut held = None;
     if landed {
         tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(30)))
             .await
@@ -211,6 +228,10 @@ async fn answered_with(
         match ends {
             Ends::Nothing => {}
             Ends::TheLeasesTime => parts.continuous.advance(Duration::from_secs(16 * 60)),
+            Ends::TheDeadlinePasses => parts.continuous.advance(Duration::from_secs(61 * 60)),
+            Ends::TheBoundMovesInside => {
+                held = Some(present_and_hold(parts.presenter.take().expect("a leased host")).await);
+            }
             Ends::TheChallengeExpires => controller
                 .owner_authority()
                 .pass_the_wall(Duration::from_secs(3 * 60)),
@@ -229,6 +250,14 @@ async fn answered_with(
             }
         }
         go.send(()).expect("the record goes on");
+        if let (Some((reached, go_on)), Some(held)) = (inside, held) {
+            tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(30)))
+                .await
+                .expect("the wait ends")
+                .expect("the record reaches the end of the feed's ask");
+            held.swap().await;
+            go_on.send(()).expect("the record goes on");
+        }
     }
     let (answered, copied) = answering.await.expect("the answer ends");
     Found {
@@ -283,7 +312,7 @@ async fn an_answer_whose_lease_ends_in_the_last_wait_is_decided_again_under_the_
     let establishing = ConfirmationDisplay::EstablishClock;
     recorded(&answered_with(World::Leased, Ends::TheLeasesTime, establishing, true).await);
     let found = answered_with(World::Leased, Ends::TheLeasesTime, making_exclusive(), true).await;
-    assert_eq!(refused(&found).to_string(), closed_refusal());
+    assert!(is_the_closed_refusal(refused(&found)));
 }
 
 /// KR-REQ-17.54: a lease presented again in the wait for the write lock moves the bound to another
@@ -308,7 +337,7 @@ async fn an_answer_whose_bound_moves_before_its_transaction_is_decided_again_und
         true,
     )
     .await;
-    assert_eq!(refused(&found).to_string(), closed_refusal());
+    assert!(is_the_closed_refusal(refused(&found)));
 }
 
 /// KR-REQ-10.05: a terminal whose standing ends before the transaction reads the owner's rows,
@@ -529,4 +558,36 @@ async fn an_answer_with_an_owner_devices_proof_meets_a_feed_refusal_raised_in_th
         "this host's authority feed shows a revocation by an owner this host does not know, so it \
          refuses remote access until the owner at this machine has revoked what it names"
     );
+}
+
+/// KR-REQ-17.54: a lease presented again whose bound moves inside the record's transaction, after
+/// the feed's locked ask and before the bound is copied, is found by the question: the challenge's
+/// display is decided again under the scope that no lease serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_whose_bound_moves_inside_its_transaction_is_decided_again_under_the_closed_scope()
+ {
+    let establishing = ConfirmationDisplay::EstablishClock;
+    recorded(&answered_with(World::Leased, Ends::TheBoundMovesInside, establishing, true).await);
+    let found = answered_with(
+        World::Leased,
+        Ends::TheBoundMovesInside,
+        making_exclusive(),
+        true,
+    )
+    .await;
+    assert!(is_the_closed_refusal(refused(&found)));
+}
+
+/// KR-REQ-17.54: an answer whose deadline passes in the last wait is refused in the words of the
+/// deadline, whole, whatever the challenge asks and whatever the scope that no lease serves holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_whose_deadline_passes_in_the_last_wait_is_refused_in_the_deadlines_words() {
+    for display in [ConfirmationDisplay::EstablishClock, making_exclusive()] {
+        let found = answered_with(World::Leased, Ends::TheDeadlinePasses, display, true).await;
+        let refusal = refused(&found);
+        let expired =
+            crate::service::Lapse::Admission(crate::authority::AdmissionLapse::Expired).refusal();
+        assert_eq!(refusal.to_string(), expired.to_string());
+        assert_eq!(refusal.code(), expired.code());
+    }
 }
