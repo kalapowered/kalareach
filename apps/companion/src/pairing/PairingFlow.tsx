@@ -696,7 +696,10 @@ function Ended({
       </p>
       {alternatives.length > 0 ? (
         <div className="pairing-alternatives" data-testid="failure-alternatives">
-          <p id="pairing-until-then">{UNTIL_THEN}</p>
+          {/* The list is named by these words, so a screen reader says them once, as its name. */}
+          <p id="pairing-until-then" aria-hidden="true">
+            {UNTIL_THEN}
+          </p>
           <ul aria-labelledby="pairing-until-then">
             {alternatives.map((path, at) => (
               <li key={at}>{path}</li>
