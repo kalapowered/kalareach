@@ -1902,6 +1902,36 @@ mod tests {
         }
     }
 
+    /// A package's launch sets none of the variables that give this host's own question its folders
+    /// or turn off the shell's report of a start: they belong to the question's shell alone, and a
+    /// session is started with what the launch sets over the person's own environment.
+    #[cfg(unix)]
+    #[test]
+    fn a_packages_launch_sets_nothing_that_a_question_of_the_hosts_own_sets() {
+        let host_directory = tempfile::tempdir().expect("a directory");
+        let host = a_host(host_directory.path());
+        let root = tempfile::tempdir().expect("a directory");
+        publish(root.path(), &host_record(root.path(), &host));
+        let set = PackageSet::discover(root.path()).expect("reads the packages");
+        let package = set.select(Some("pwsh")).expect("qualified");
+        let names = [
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
+            "TMPDIR",
+            "XDG_RUNTIME_DIR",
+            "POWERSHELL_TELEMETRY_OPTOUT",
+        ];
+        let persons: Vec<(String, String)> = names
+            .iter()
+            .map(|name| ((*name).to_owned(), "/persons".to_owned()))
+            .collect();
+        for base in [Vec::new(), persons] {
+            for (name, _) in package.launch_environment(&base, false) {
+                assert!(!names.contains(&name.as_str()), "the launch sets {name}");
+            }
+        }
+    }
+
     /// The package's directory goes first on the list of module directories, once,
     /// and everything else on the list keeps its order, wherever the package's directory was.
     #[cfg(unix)]
