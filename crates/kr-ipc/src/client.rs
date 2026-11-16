@@ -832,10 +832,19 @@ impl<C: Codec> Client<C> {
         self.await_response(request_id).await
     }
 
-    /// Calls a mutation.
+    /// Calls a mutation, and waits on this connection for the answer.
     ///
     /// The action identifier is the durable operation identity. Retrying the same identifier with
     /// the same payload returns the same result rather than performing the operation twice.
+    ///
+    /// A worker whose dispatch boundary or session is held deals with a mutation only when the hold
+    /// ends, which can take long, and while it waits it asks the operating system, at short
+    /// intervals, whether this connection's peer has gone. A mutation for a peer that has gone is
+    /// not carried out, and nothing is made for it: the worker ends the connection. The one
+    /// exception is the cancellation of an action, which is carried out because it only ends an
+    /// action. A client that wants its answer therefore keeps this connection open until the
+    /// worker has answered. It ends the connection when it no longer wants the answer, and not
+    /// before.
     ///
     /// # Errors
     ///
