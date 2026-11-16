@@ -37,7 +37,7 @@ const run = (tool, args, env = {}) => {
  * Strings that only the test harness's tap record writes (its element ids and the labels of its lines). The record exists to let a
  * test read the events the platform sends, so it must be in the harness bundle and in no bundle that ships.
  */
-const TAP_RECORD_MARKERS = ['kr-taps-log', 'kr-taps-lit', 'TAPLOG', 'TAPLINKS', 'TAPLIT']
+const TAP_RECORD_MARKERS = ['kr-taps-log', 'kr-taps-lit', 'kr-taps-selection', 'TAPLOG', 'TAPLINKS', 'TAPLIT', 'TAPSEL']
 
 /** The files under a directory, with their folders. */
 const filesUnder = (directory) =>

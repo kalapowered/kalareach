@@ -23,7 +23,9 @@
  * its element carries `data-pressed`, so the record compares the links that carry it with the links it
  * has said are lit after every change of the page's elements: a link that loses the look by losing its
  * element is logged as off, and no other element's pressed state is recorded. `TAPLIT` names the links
- * that are lit now.
+ * that are lit now. `TAPSEL` is the page's text selection now. A line of its own says which pointer went
+ * down and whether it was the primary one, and a line of its own says where the selection becomes a range
+ * or stops being one, with the links that are lit once the page's own listeners have run on the change.
  */
 
 import { useEffect, type ReactNode } from 'react'
@@ -127,7 +129,15 @@ export function TapRecord({ controls }: { readonly controls: FakeHostControls })
     const opened = document.getElementById('kr-taps-opened')
     const focus = document.getElementById('kr-taps-focus')
     const lit = document.getElementById('kr-taps-lit')
-    if (!log || !places || !opened || !focus || !lit) return undefined
+    const chosen = document.getElementById('kr-taps-selection')
+    if (!log || !places || !opened || !focus || !lit || !chosen) return undefined
+    /** The page's own text selection now: its type, how many characters it holds and the element it starts in; `none` where it has no range. */
+    const selectionNow = (): string => {
+      const now = document.getSelection()
+      if (!now || now.rangeCount === 0) return 'none'
+      const start = now.anchorNode instanceof Element ? now.anchorNode : (now.anchorNode?.parentElement ?? null)
+      return `${now.type} ${String(now.toString().length)} ${describe(start)}`
+    }
     /** The names of the links that carry the pressed look now: the message links' own elements alone. */
     const litNow = (): string[] => Array.from(document.querySelectorAll<HTMLElement>('.md-link[data-pressed]'), (link) => nameOf(link.title)).sort()
     const keep = (line: string): void => {
@@ -161,7 +171,8 @@ export function TapRecord({ controls }: { readonly controls: FakeHostControls })
         [places, `TAPLINKS ${[pane, where, ...rectangles].join(' ; ')}`],
         [opened, `TAPOPENED ${String(controls.openedLinks.length)} ${controls.openedLinks.join(' ')}`],
         [focus, `TAPFOCUS active=${describe(document.activeElement)}`],
-        [lit, `TAPLIT ${litNow().join(',') || '-'}`]
+        [lit, `TAPLIT ${litNow().join(',') || '-'}`],
+        [chosen, `TAPSEL ${selectionNow()}`]
       ]
       for (const [element, text] of texts) if (element.textContent !== text) element.textContent = text
     }
@@ -207,6 +218,38 @@ export function TapRecord({ controls }: { readonly controls: FakeHostControls })
     for (const type of types) document.addEventListener(type, note, true)
     document.addEventListener('pointerdown', note)
     document.addEventListener('click', note)
+    // Which pointer a pointer down came from, and whether it was the primary one: `C <events so far> pointerdown id=<pointer> primary=<1|0>
+    // button=<button> type=<type> t=<ms>`. It is read in the capture phase, before any listener of the page's own has run.
+    const pointed = (event: Event): void => {
+      const pointer = event as PointerEvent
+      keep(
+        `C ${String(order)} pointerdown id=${String(pointer.pointerId)} primary=${pointer.isPrimary ? '1' : '0'} button=${String(pointer.button)} type=${pointer.pointerType} t=${round(performance.now())}`
+      )
+    }
+    document.addEventListener('pointerdown', pointed, true)
+    // Where the page's selection becomes a range and where it stops being one, with the links that have the look once the page's own listeners
+    // have run on the change: `S <events so far> range|collapsed <type> <length> n=<selection changes so far> lit=<links> t=<ms>`. The selection's
+    // own line is kept fresh at every change.
+    let ranged = false
+    let changes = 0
+    const selected = (): void => {
+      changes += 1
+      const now = document.getSelection()
+      const type = now?.type ?? 'none'
+      const length = now?.toString().length ?? 0
+      chosen.textContent = `TAPSEL ${selectionNow()}`
+      const range = type === 'Range' && length > 0
+      if (range === ranged) return
+      ranged = range
+      const stamp = round(performance.now())
+      const after = order
+      const count = changes
+      window.setTimeout(() => {
+        keep(`S ${String(after)} ${range ? 'range' : 'collapsed'} ${type} ${String(length)} n=${String(count)} lit=${litNow().join(',') || '-'} t=${stamp}`)
+        show()
+      }, 0)
+    }
+    document.addEventListener('selectionchange', selected)
     const timer = window.setInterval(show, 400)
     show()
     return () => {
@@ -214,6 +257,8 @@ export function TapRecord({ controls }: { readonly controls: FakeHostControls })
       for (const type of types) document.removeEventListener(type, note, true)
       document.removeEventListener('pointerdown', note)
       document.removeEventListener('click', note)
+      document.removeEventListener('pointerdown', pointed, true)
+      document.removeEventListener('selectionchange', selected)
       window.clearInterval(timer)
     }
   }, [controls])
@@ -238,6 +283,7 @@ export function TapRecord({ controls }: { readonly controls: FakeHostControls })
       <div id="kr-taps-opened" />
       <div id="kr-taps-focus" />
       <div id="kr-taps-lit" />
+      <div id="kr-taps-selection" />
     </div>
   )
 }
