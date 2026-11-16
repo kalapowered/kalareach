@@ -610,6 +610,34 @@ impl FrameWriter {
         }
     }
 
+    /// Asks the operating system whether the connection has been hung up, reading nothing and
+    /// waiting for nothing.
+    ///
+    /// A peer that has closed is reported hung up whether or not it left bytes unread, which is what
+    /// [`Self::peer_state`] cannot say: it reports the end only behind the bytes. A peer that only
+    /// ended what it sends is hung up on macOS and not on Linux, where the end shows behind the
+    /// bytes it sent. A refused question, and a descriptor the system calls invalid, are taken as a
+    /// peer that is still there; a writer with no descriptor of its own can write nothing, so its
+    /// peer is gone.
+    #[cfg(unix)]
+    fn hung_up(&self) -> bool {
+        use rustix::event::{PollFd, PollFlags, poll};
+        let Some(descriptor) = self.descriptor.as_ref() else {
+            return true;
+        };
+        let mut look = [PollFd::new(descriptor, PollFlags::IN)];
+        let at_once = rustix::time::Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        match poll(&mut look, Some(&at_once)) {
+            Ok(_) => look[0]
+                .revents()
+                .intersects(PollFlags::HUP | PollFlags::ERR),
+            Err(_) => false,
+        }
+    }
+
     /// Asks the operating system what has become of the peer, reading nothing and waiting for
     /// nothing.
     ///
@@ -623,6 +651,24 @@ impl FrameWriter {
     #[must_use]
     pub fn peer_state(&self) -> PeerState {
         pipe_probe::peer_state(self.probe)
+    }
+
+    /// Whether the system says now that the peer has gone, reading nothing and waiting for
+    /// nothing.
+    ///
+    /// On Unix that is [`PeerState::Gone`], or a hang-up, which a peer that closed shows beside the
+    /// bytes it left unread. On Windows it is [`PeerState::Gone`] alone, so a peer that closed with
+    /// bytes waiting in the pipe is taken as there until they are read.
+    #[must_use]
+    pub fn has_gone(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.peer_state() == PeerState::Gone || self.hung_up()
+        }
+        #[cfg(windows)]
+        {
+            self.peer_state() == PeerState::Gone
+        }
     }
 
     /// Takes back a frame none of whose bytes the peer has taken, and answers whether it did.
