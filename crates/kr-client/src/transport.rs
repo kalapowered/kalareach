@@ -228,6 +228,9 @@ pub struct NetworkTransport {
     /// end for this side's close only when the read's own cause says that this side closed the
     /// connection and this mark says that the close was made while the connection stood.
     own_close: OwnCloseMark,
+    /// The place where a case holds a read between its return and its classification.
+    #[cfg(feature = "testing")]
+    seam: ReadSeam,
     streams: Arc<StreamRegistry>,
     opener: Arc<NetworkStreams>,
     reach: Reach,
@@ -280,6 +283,8 @@ impl NetworkTransport {
             reader: Mutex::new(Some(authorised.control_reader)),
             claimed: std::sync::atomic::AtomicBool::new(false),
             own_close: OwnCloseMark::new(),
+            #[cfg(feature = "testing")]
+            seam: ReadSeam::default(),
             streams,
             opener,
             reach: Reach {
@@ -306,6 +311,21 @@ impl NetworkTransport {
     #[must_use]
     pub fn close_reason(&self) -> Option<iroh::endpoint::ConnectionError> {
         self.connection.close_reason()
+    }
+
+    /// Waits until the connection has ended, whichever side ended it, and returns the cause that
+    /// the library recorded when it did.
+    #[cfg(feature = "testing")]
+    pub async fn closed(&self) -> iroh::endpoint::ConnectionError {
+        self.connection.closed().await
+    }
+
+    /// The place between a read's return from the connection and its classification, where a case
+    /// holds a read to put another step between the two.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub const fn read_seam(&self) -> &ReadSeam {
+        &self.seam
     }
 
     /// Resets the control stream's sending half while the connection stands.
@@ -441,7 +461,10 @@ impl ControlTransport for NetworkTransport {
             // and says whether the connection had already ended at that close, so a close that
             // follows the read's return cannot change what it says about an end that came first.
             // The connection's record is read nowhere here.
-            let frame = match reader.read_message::<ControlFrame>().await {
+            let read = reader.read_message::<ControlFrame>().await;
+            #[cfg(feature = "testing")]
+            self.seam.after_a_read(read.is_err()).await;
+            let frame = match read {
                 Ok(frame) => frame,
                 Err(error) => end_of_a_failed_read(error, self.own_close.get())?,
             };
@@ -498,6 +521,57 @@ impl ControlTransport for NetworkTransport {
     /// connection open, so this does not answer for that.
     fn can_send(&self) -> bool {
         self.connection.close_reason().is_none()
+    }
+}
+
+/// Where a case holds a network read between the return of the connection's read and the
+/// classification of its end, and how many reads have touched the connection.
+#[cfg(feature = "testing")]
+#[derive(Debug, Default)]
+pub struct ReadSeam {
+    returned: std::sync::atomic::AtomicUsize,
+    hold_next_failure: std::sync::atomic::AtomicBool,
+    held: tokio::sync::Notify,
+    resumed: tokio::sync::Notify,
+}
+
+#[cfg(feature = "testing")]
+impl ReadSeam {
+    /// Holds the next read that fails, after the connection's read returned its error and before
+    /// the error is classified, until [`ReadSeam::resume`].
+    pub fn hold_next_failure(&self) {
+        self.hold_next_failure
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Waits until a read is held.
+    pub async fn held(&self) {
+        self.held.notified().await;
+    }
+
+    /// Lets the held read go on to its classification.
+    pub fn resume(&self) {
+        self.resumed.notify_one();
+    }
+
+    /// How many reads have returned from the connection: a read that ended before it touched the
+    /// connection is not one of them.
+    #[must_use]
+    pub fn returned(&self) -> usize {
+        self.returned.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    async fn after_a_read(&self, failed: bool) {
+        self.returned
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if failed
+            && self
+                .hold_next_failure
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.held.notify_one();
+            self.resumed.notified().await;
+        }
     }
 }
 
