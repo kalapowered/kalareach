@@ -617,10 +617,11 @@ pub struct WorkerService {
     /// held, which this host's own tests arm. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     announcements_before_a_held_boundary: Mutex<Option<usize>>,
-    /// How many presentations of a generation are waiting for the dispatch boundary now, which
-    /// this host's own tests read. It is compiled away in every shipped build.
+    /// How many presentations of a generation are waiting for the dispatch boundary now, for each
+    /// role a connection declared (in the order of `presentation_role_slot`), which this host's own
+    /// tests read. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
-    presentations_waiting: std::sync::atomic::AtomicUsize,
+    presentations_waiting: [std::sync::atomic::AtomicUsize; PRESENTATION_ROLE_SLOTS],
     /// How many times a presentation has found the dispatch boundary held, which this host's own
     /// tests read. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -1139,7 +1140,7 @@ impl WorkerService {
             #[cfg(feature = "testing")]
             announcements_before_a_held_boundary: Mutex::new(None),
             #[cfg(feature = "testing")]
-            presentations_waiting: std::sync::atomic::AtomicUsize::new(0),
+            presentations_waiting: std::array::from_fn(|_| std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(feature = "testing")]
             presentation_tries: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "testing")]
@@ -1631,12 +1632,28 @@ impl WorkerService {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// How many presentations of a generation are waiting for the dispatch boundary now, for this
-    /// host's own tests: each is a link whose opener has not been answered.
+    /// How many presentations of a generation are waiting for the dispatch boundary now, of every
+    /// role, for this host's own tests: each is a link whose opener has not been answered. A case
+    /// that has more than one role presenting at a worker reads the count of one role instead.
     #[cfg(feature = "testing")]
     #[must_use]
     pub fn presentations_waiting_for_tests(&self) -> usize {
         self.presentations_waiting
+            .iter()
+            .map(|count| count.load(std::sync::atomic::Ordering::SeqCst))
+            .sum()
+    }
+
+    /// How many presentations of a generation are waiting for the dispatch boundary now on
+    /// connections that declared `role`, for this host's own tests: a presentation of another role
+    /// is not in it.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn presentations_waiting_for_role_for_tests(
+        &self,
+        role: ControllerConnectionRole,
+    ) -> usize {
+        self.presentations_waiting[presentation_role_slot(role)]
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -4679,7 +4696,9 @@ impl WorkerService {
         #[cfg(feature = "testing")]
         let _decided = off_the_executor(|| self.wait_before_presentation());
         #[cfg(feature = "testing")]
-        let waiting = PresentationWaiting::begin(&self.presentations_waiting);
+        let waiting = PresentationWaiting::begin(
+            &self.presentations_waiting[presentation_role_slot(state.facts.controller_role)],
+        );
         let mut pause = PRESENTATION_FIRST_RETRY;
         let decided = loop {
             // Created before the try, so that a release between the try and the wait wakes it.
