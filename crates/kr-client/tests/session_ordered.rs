@@ -480,6 +480,80 @@ async fn a_slow_owner_loses_nothing_and_the_reader_waits_for_room() {
     assert_eq!(listing, SessionList { count: 2 });
 }
 
+/// An owner that drops its end is not waited for, not even by a reader that is already waiting
+/// for room in its channel: the reader goes on, answers still arrive, and the session ends.
+#[tokio::test]
+async fn an_owner_that_drops_its_end_does_not_stop_the_reader() {
+    const CAPACITY: usize = 2;
+    const NOTICES: u64 = 5;
+    let (transport, session, events) = ordered(CAPACITY);
+    let call = ask_for_the_list(&session);
+    let request_id = transport.written_at_least(1).await;
+    for sequence in 0..NOTICES {
+        transport.feed(notice("session.output", sequence));
+    }
+    transport.feed(answer(request_id, Ok(typed(&SessionList { count: 5 }))));
+
+    // The reader is held by the full channel: it holds the channel's items and one more.
+    within(async {
+        while transport.read_count() < CAPACITY + 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    tokio::time::sleep(STILL).await;
+    assert_eq!(
+        transport.read_count(),
+        CAPACITY + 1,
+        "the reader was not held by the full channel, which this case needs"
+    );
+
+    // The owner goes away while the reader waits for room.
+    drop(events);
+    let every_frame = usize::try_from(NOTICES).expect("a small count") + 1;
+    let went_on = tokio::time::timeout(LIVENESS, async {
+        while transport.read_count() < every_frame {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        went_on.is_ok(),
+        "the reader stopped at {} of {every_frame} frames when the owner dropped its end",
+        transport.read_count()
+    );
+    let answered = tokio::time::timeout(LIVENESS, call.0).await;
+    assert!(
+        answered.is_ok(),
+        "a request got no answer after the owner dropped its end"
+    );
+
+    // Later frames are read and answered as well, and the end of the connection ends the session.
+    let second = ask_for_the_list(&session);
+    let second_id = transport.written_at_least(2).await;
+    transport.feed(notice("session.output", NOTICES));
+    transport.feed(answer(second_id, Ok(typed(&SessionList { count: 6 }))));
+    let answered = tokio::time::timeout(LIVENESS, second.0).await;
+    assert!(
+        answered.is_ok(),
+        "a later request got no answer after the owner dropped its end"
+    );
+    assert_eq!(
+        answered
+            .ok()
+            .expect("an answer")
+            .expect("the call ran")
+            .expect("a listing"),
+        SessionList { count: 6 }
+    );
+    transport.finish();
+    let closed = tokio::time::timeout(LIVENESS, session.closed()).await;
+    assert!(
+        closed.is_ok(),
+        "the session did not end when the connection did"
+    );
+}
+
 #[tokio::test]
 async fn the_end_of_a_connection_the_host_finished_comes_after_every_earlier_notification() {
     let (transport, _session, mut events) = ordered(8);
