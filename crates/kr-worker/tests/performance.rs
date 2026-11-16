@@ -64,19 +64,51 @@ const ATTACHED_VIEWS: usize = 32;
 /// is never below it.
 const RESIDENT_BOUND_KIB: u64 = 500 * 1024;
 
-/// Where the sum of the resident sizes stood when the memory the group holds was last read on a
-/// 64-processor Linux host, in kibibytes: the mean of four runs of one build (515,387 KiB, rounded
-/// down), which spread 2,560 KiB. The sum counts a page of the worker program once for each of the
-/// twenty workers, so it shows a growth of that program twenty times enlarged. It is recorded, and
-/// it is no reading of the requirement: see [`SUM_ALARM_STEP_KIB`].
-const SUM_RECORDED_KIB: u64 = 515_000;
+/// Where the memory the twenty session workers hold stood on a 64-processor Linux host, in
+/// kibibytes: the first figure of the session workers on the `by class` line, each resident page
+/// counted once for the class. Read on 2026-11-16 at commit 3ace455c69 in 13 valid readings of that
+/// one commit, each of which said `1 passed` or `1 failed` by an alarm alone: 110,816 to 111,892 KiB,
+/// a spread of 1,076 KiB and a mean of 111,386 KiB. A reading is low when the memory the group holds
+/// is under 168,000 KiB, which is where mapped pages were taken back (the file pages of the worker
+/// program and of the test program read lower in the same readings); none of the 13 was low, and a
+/// low reading stays out of every mean. Across the 25 normal readings (those 13, and 12 rows from the
+/// verifications of 11 earlier commits made from 2026-11-12 to 2026-11-15; two further commits read
+/// low and are kept out) the figure spans 1,284 KiB, where the sum spans 13,932 KiB over 21 of them.
+/// A growth of private memory in a worker shows in it once for each of the twenty workers. See
+/// [`WORKERS_HELD_ALARM_STEP_KIB`].
+const WORKERS_HELD_RECORDED_KIB: u64 = 111_386;
 
-/// How far the sum of the resident sizes may rise above [`SUM_RECORDED_KIB`] before the idle
-/// measurement fails, so that a ruling is asked for. The failure is an alarm that what the workers
-/// map or hold has grown, and not a finding about the requirement, which the figure that counts each
-/// resident page once holds. A sum that reads low, as the kernel's reclaim of mapped pages makes it,
-/// is no alarm: only a rise is.
-const SUM_ALARM_STEP_KIB: u64 = 10 * 1024;
+/// How far the session workers' held figure may rise above [`WORKERS_HELD_RECORDED_KIB`] before the
+/// idle measurement fails, so that a ruling is asked for. The step is 4,096 KiB: 205 KiB of private
+/// memory in each of the twenty workers, and more than three times the 1,284 KiB spread of the 25
+/// normal readings. The failure is an alarm that what the workers hold has grown, and no reading of
+/// the requirement, which the figure that counts each resident page once for the group holds. A low
+/// reading is no alarm: only a rise is. This figure and the program's size are chosen because they
+/// point at the place of a growth; a newly set margin of 10,240 KiB on the sum would also have
+/// passed the 25 normal readings.
+const WORKERS_HELD_ALARM_STEP_KIB: u64 = 4 * 1024;
+
+/// The size on disk of the worker program, in kibibytes: the length of the file the daemon starts
+/// each worker from, divided by 1,024 and rounded down, as `scripts/worker-size.sh` prints a size.
+/// Read on the build box on 2026-11-16: 35,328 KiB (36,176,328 bytes, one file) in the 8 of the 13
+/// valid readings of commit 3ace455c69 whose runs recorded the file's hash, and in 4 runs of commit
+/// 2bc513d435, which differs from it in this test file alone: a spread of 0 KiB and a mean of
+/// 35,328 KiB. A size has no low reading, because no reclaim of mapped pages moves it. The `worker
+/// size` line that `scripts/performance.sh` prints before the case is read from the program that
+/// `cargo build --workspace` leaves, which is another build of the same sources: 35,101 KiB at
+/// commit 3ace455c69, 227 KiB less than this file. Its sections show where the workspace build
+/// grew, and not this file's; the `worker file` line prints the figure the alarm reads. See
+/// [`WORKER_SIZE_ALARM_STEP_KIB`].
+const WORKER_SIZE_RECORDED_KIB: u64 = 35_328;
+
+/// How far the worker program's size may rise above [`WORKER_SIZE_RECORDED_KIB`] before the idle
+/// measurement fails, so that a ruling is asked for. The step is 512 KiB, more than twice the 236
+/// KiB by which the workspace build's size on disk rose from the earliest of the 12 verification
+/// rows (34,865 KiB, 2026-11-12) to commit 3ace455c69 (35,101 KiB). Ordinary growth reaches the step
+/// in time, on purpose: it is the place where someone looks at what the program gained, in the
+/// sections of the `worker size` line, and moves the recorded level by a ruling. The failure is no
+/// reading of the requirement. A smaller program is no alarm: only a rise is.
+const WORKER_SIZE_ALARM_STEP_KIB: u64 = 512;
 
 /// The processor bound the requirement names: a fraction of one core, averaged.
 const IDLE_CORE_FRACTION: f64 = 0.01;
@@ -676,16 +708,32 @@ fn total<T: std::iter::Sum>(
         .sum()
 }
 
+/// The two figures that each have an alarm on a rise.
+struct Growth {
+    /// What the session workers hold, in kibibytes: the first figure of the session workers on the
+    /// `by class` line.
+    workers_held_kib: u64,
+    /// The size on disk of the worker program, in kibibytes.
+    worker_size_kib: u64,
+}
+
 /// What the idle measurement established, and what its host was short of the reference host.
 struct Idle {
     cores: f64,
     /// The sum of the processes' resident sizes, in kibibytes: a page that several processes map
-    /// is counted for each of them.
+    /// is counted for each of them. It is recorded and has no alarm, because it counts each
+    /// worker's mapped pages of one program once for each worker. Over the 21 normal readings of
+    /// builds whose worker program was nearly the same size it spread 13,932 KiB, more than the old
+    /// step of 10,240 KiB, and the old line fired in 4 of 8 runs of one build and in 8 of 13 readings
+    /// of commit 3ace455c69.
     sum: u64,
     /// What the group holds, in kibibytes, where this host can read it (Linux): each resident page
     /// counted once for the group, each page in swap, and what the reader's scan may have missed.
     /// Where it is read it is the figure the memory bound is held to.
     combined: Option<u64>,
+    /// The figures the alarms watch, where this host can read them (Linux, where the memory the
+    /// group holds is read by class). Elsewhere there is no alarm.
+    growth: Option<Growth>,
     /// Each condition of the reference host this host can be shown not to meet. The processor
     /// figure is a claim about a reference host, so it is asserted only while this is empty; the
     /// memory bound is a size and is asserted on every host.
@@ -698,8 +746,15 @@ impl Idle {
             cores,
             sum,
             combined,
+            growth: None,
             shortfalls: conditions.shortfalls(),
         }
+    }
+
+    /// This measurement with the figures its alarms watch.
+    fn watching(mut self, growth: Growth) -> Self {
+        self.growth = Some(growth);
+        self
     }
 
     /// The figure the memory bound is held to: what the group holds where that can be read, and
@@ -723,24 +778,43 @@ impl Idle {
         })
     }
 
-    /// Whether the sum of the resident sizes has risen past its alarm, which is watched only where
-    /// the requirement is held to the figure that counts each resident page once.
-    fn sum_alarm_fired(&self) -> bool {
-        self.combined.is_some() && self.sum > SUM_RECORDED_KIB + SUM_ALARM_STEP_KIB
+    /// What each alarm that has fired says. An alarm is a rise of a figure past its recorded level
+    /// by more than its step; a figure that reads low is none.
+    fn alarms(&self) -> Vec<String> {
+        let Some(growth) = &self.growth else {
+            return Vec::new();
+        };
+        let mut said = Vec::new();
+        if growth.workers_held_kib > WORKERS_HELD_RECORDED_KIB + WORKERS_HELD_ALARM_STEP_KIB {
+            said.push(format!(
+                "the memory the session workers hold is {} KiB, more than \
+                 {WORKERS_HELD_ALARM_STEP_KIB} KiB above its recorded level of \
+                 {WORKERS_HELD_RECORDED_KIB} KiB: a ruling is needed on whether what the workers \
+                 hold has grown or the recorded level moves",
+                growth.workers_held_kib
+            ));
+        }
+        if growth.worker_size_kib > WORKER_SIZE_RECORDED_KIB + WORKER_SIZE_ALARM_STEP_KIB {
+            said.push(format!(
+                "the worker program is {} KiB on disk, more than {WORKER_SIZE_ALARM_STEP_KIB} KiB \
+                 above its recorded level of {WORKER_SIZE_RECORDED_KIB} KiB: a ruling is needed on \
+                 what the program gained and whether the recorded level moves",
+                growth.worker_size_kib
+            ));
+        }
+        said
     }
 
     /// The lines that say what the figures came to against the target, and what stood in the way
-    /// of asserting it where something did, and a line that says so when the sum's alarm fired.
+    /// of asserting it where something did, and a line for each alarm that fired.
     fn verdict(&self) -> Vec<String> {
         let mut lines = self.target_verdict();
-        if self.sum_alarm_fired() {
-            lines.push(format!(
-                "  alarm             the sum of the resident sizes, {} KiB, is more than \
-                 {SUM_ALARM_STEP_KIB} KiB above its recorded level of {SUM_RECORDED_KIB} KiB, so \
-                 the measurement fails and a ruling is needed; the alarm is not the requirement",
-                self.sum
-            ));
-        }
+        lines.extend(self.alarms().into_iter().map(|alarm| {
+            format!(
+                "  alarm             {alarm}; the measurement fails, the alarm is not the requirement, \
+                 and the `by class` and `worker size` lines show where a growth is"
+            )
+        }));
         lines
     }
 
@@ -803,19 +877,17 @@ impl Idle {
                 self.memory()
             ));
         }
-        // The sum counts the worker program once for each worker, so it shows twenty times what
-        // the program grows by. Where the requirement is held to the figure that counts it once,
-        // the sum is watched here and its rise is put to a ruling.
-        if self.sum_alarm_fired() {
+        // The sum is no alarm: it counts the worker program once for each worker. What the session
+        // workers hold and the size of the worker program move far less than the sum, so their rise
+        // is put to a ruling here.
+        let alarms = self.alarms();
+        if !alarms.is_empty() {
             return Err(format!(
-                "the sum of the processes' resident sizes is {} KiB, more than {SUM_ALARM_STEP_KIB} \
-                 KiB above its recorded level of {SUM_RECORDED_KIB} KiB: a ruling is needed on \
-                 whether the memory the workers map or hold has grown or the recorded level moves \
-                 (the `by class`, `worker program` and `largest files` lines of the record say \
-                 where). This is an alarm and not the requirement, which is held to the memory the \
+                "{}. This is an alarm and not the requirement, which is held to the memory the \
                  group holds with each resident page counted once: {} KiB against \
-                 {RESIDENT_BOUND_KIB} KiB",
-                self.sum,
+                 {RESIDENT_BOUND_KIB} KiB. The `by class` and `worker size` lines of the record \
+                 show where a growth is",
+                alarms.join("; and "),
                 self.memory()
             ));
         }
@@ -1038,17 +1110,30 @@ fn memory_held_includes_what_the_scan_was_accepted_short_by() {
     );
 }
 
-/// The sum is watched, not held to the requirement: a rise of it above its recorded level by more
-/// than the step stops the measurement with the words that a ruling is needed.
+/// KR-PERF-003, in the specification's table of section 27: "combined controller and 20 idle workers
+/// below 500 MiB RSS including allocated grids, caches and idle shared services but excluding the
+/// disk spool and the separately reported model". The figure is held here by name only; this holds
+/// the name to the requirement's number, so that the bound cannot move without a failing case.
 #[test]
-fn a_sum_that_rises_past_its_recorded_level_fails_with_the_words_that_a_ruling_is_needed() {
-    let reference = record::Conditions::supplied(4, 8 * 1024, Some(0.0));
-    let at_the_step = Idle::new(
-        0.0075,
-        SUM_RECORDED_KIB + SUM_ALARM_STEP_KIB,
-        Some(151_496),
-        &reference,
+fn the_memory_bound_is_the_500_mib_of_the_requirement() {
+    assert_eq!(
+        RESIDENT_BOUND_KIB, 512_000,
+        "KR-PERF-003 names 500 MiB, which is 512,000 KiB"
     );
+}
+
+/// What the session workers hold is watched, not held to the requirement: a rise of it above its
+/// recorded level by more than the step stops the measurement with the words that a ruling is needed.
+#[test]
+fn a_workers_held_figure_past_its_recorded_level_fails_asking_for_a_ruling() {
+    let reference = record::Conditions::supplied(4, 8 * 1024, Some(0.0));
+    let watched = |workers_held_kib: u64| {
+        Idle::new(0.0075, 524_000, Some(173_000), &reference).watching(Growth {
+            workers_held_kib,
+            worker_size_kib: WORKER_SIZE_RECORDED_KIB,
+        })
+    };
+    let at_the_step = watched(WORKERS_HELD_RECORDED_KIB + WORKERS_HELD_ALARM_STEP_KIB);
     assert_eq!(at_the_step.check(), Ok(()), "the step itself is allowed");
     assert!(
         at_the_step
@@ -1059,16 +1144,15 @@ fn a_sum_that_rises_past_its_recorded_level_fails_with_the_words_that_a_ruling_i
         at_the_step.verdict()
     );
 
-    let past = Idle::new(
-        0.0075,
-        SUM_RECORDED_KIB + SUM_ALARM_STEP_KIB + 1,
-        Some(151_496),
-        &reference,
-    );
-    let failure = past.check().expect_err("a sum past its alarm");
+    let past = watched(WORKERS_HELD_RECORDED_KIB + WORKERS_HELD_ALARM_STEP_KIB + 1);
+    let failure = past.check().expect_err("a held figure past its alarm");
     assert!(
-        failure.contains("a ruling is needed") && failure.contains("not the requirement"),
-        "the alarm says what it is: {failure}"
+        failure.contains("session workers hold")
+            && failure.contains("a ruling is needed")
+            && failure.contains("not the requirement")
+            && failure.contains("`by class`")
+            && failure.contains("`worker size`"),
+        "the alarm says what it is and where to look: {failure}"
     );
     assert!(
         past.verdict()
@@ -1078,23 +1162,72 @@ fn a_sum_that_rises_past_its_recorded_level_fails_with_the_words_that_a_ruling_i
         past.verdict()
     );
 
-    // A low reading, which the kernel's reclaim of mapped pages gives (the sum read 440,048 KiB at one
-    // commit while it read 513,960 to 516,520 KiB at four other runs of it), is no alarm: the sum is
-    // watched for a rise only.
-    let low = Idle::new(0.0075, 440_048, Some(90_432), &reference);
-    assert_eq!(low.check(), Ok(()), "a low reading does not fail");
-
-    // Where the sum is the held figure, it has no alarm of its own: the bound decides.
-    let sum_only = Idle::new(
-        0.0075,
-        SUM_RECORDED_KIB + SUM_ALARM_STEP_KIB + 1,
-        None,
-        &reference,
+    // A low reading, which the kernel's reclaim of mapped pages gives (the session workers held
+    // 109,624 KiB at the lowest reading, where they held 110,816 to 112,100 KiB at the normal ones),
+    // is no alarm: the figure is watched for a rise only.
+    assert_eq!(
+        watched(109_624).check(),
+        Ok(()),
+        "a low reading does not fail"
     );
-    let failure = sum_only.check().expect_err("a sum over the bound");
+}
+
+/// The worker program's size on disk is watched the same way: a rise past its recorded level by more
+/// than the step fails the measurement with the words that a ruling is needed, and a smaller
+/// program does not.
+#[test]
+fn a_worker_program_past_its_recorded_size_fails_asking_for_a_ruling() {
+    let reference = record::Conditions::supplied(4, 8 * 1024, Some(0.0));
+    let watched = |worker_size_kib: u64| {
+        Idle::new(0.0075, 524_000, Some(173_000), &reference).watching(Growth {
+            workers_held_kib: WORKERS_HELD_RECORDED_KIB,
+            worker_size_kib,
+        })
+    };
+    let at_the_step = watched(WORKER_SIZE_RECORDED_KIB + WORKER_SIZE_ALARM_STEP_KIB);
+    assert_eq!(at_the_step.check(), Ok(()), "the step itself is allowed");
     assert!(
-        failure.contains("idle resident memory") && !failure.contains("a ruling is needed"),
-        "it fails as the bound and not as the alarm: {failure}"
+        at_the_step
+            .verdict()
+            .iter()
+            .all(|line| !line.starts_with("  alarm ")),
+        "and the record has no alarm line: {:?}",
+        at_the_step.verdict()
+    );
+
+    let past = watched(WORKER_SIZE_RECORDED_KIB + WORKER_SIZE_ALARM_STEP_KIB + 1);
+    let failure = past.check().expect_err("a size past its alarm");
+    assert!(
+        failure.contains("worker program")
+            && failure.contains("a ruling is needed")
+            && failure.contains("not the requirement")
+            && failure.contains("`by class`")
+            && failure.contains("`worker size`"),
+        "the alarm says what it is and where to look: {failure}"
+    );
+    assert!(
+        past.verdict()
+            .iter()
+            .any(|line| line.starts_with("  alarm ") && line.contains("a ruling is needed")),
+        "and the record says that it fired: {:?}",
+        past.verdict()
+    );
+
+    assert_eq!(
+        watched(WORKER_SIZE_RECORDED_KIB - 1_000).check(),
+        Ok(()),
+        "a smaller program does not fail"
+    );
+
+    // Both alarms fire together and say so in one failure.
+    let both = Idle::new(0.0075, 524_000, Some(173_000), &reference).watching(Growth {
+        workers_held_kib: WORKERS_HELD_RECORDED_KIB + WORKERS_HELD_ALARM_STEP_KIB + 1,
+        worker_size_kib: WORKER_SIZE_RECORDED_KIB + WORKER_SIZE_ALARM_STEP_KIB + 1,
+    });
+    let failure = both.check().expect_err("both alarms fired");
+    assert!(
+        failure.contains("session workers hold") && failure.contains("worker program"),
+        "one failure names both: {failure}"
     );
 }
 
@@ -1137,7 +1270,7 @@ async fn held_memory(
     shells: &[u32],
     daemon: u32,
     sum: u64,
-) -> Result<(Option<u64>, Vec<String>), String> {
+) -> Result<(Option<u64>, Option<u64>, Vec<String>), String> {
     let hosts: Vec<u32> = workers
         .iter()
         .copied()
@@ -1241,7 +1374,8 @@ async fn held_memory(
             .collect::<Vec<_>>()
             .join(", ")
     ));
-    Ok((Some(reading.held_kib()), lines))
+    let workers_held = class("session_workers").0;
+    Ok((Some(reading.held_kib()), Some(workers_held), lines))
 }
 
 /// Where the memory the group holds cannot be read, the memory bound is held to the sum.
@@ -1255,8 +1389,9 @@ async fn held_memory(
     _shells: &[u32],
     _daemon: u32,
     _sum: u64,
-) -> Result<(Option<u64>, Vec<String>), String> {
+) -> Result<(Option<u64>, Option<u64>, Vec<String>), String> {
     Ok((
+        None,
         None,
         vec![
             "  resident set      not read on this host: no reader of what the group holds, with each \
@@ -1424,14 +1559,52 @@ async fn idle(host: &Host, owned: &mut Owned) -> Result<Idle, String> {
     let held = held_memory(&workers, &shells, daemon, sum).await;
     // A reading that cannot be taken fails the measurement, after the record has kept the rest of
     // what this run found: the processor figure, the sum and the conditions.
-    let (combined, held_lines, refusal) = match held {
-        Ok((combined, lines)) => (combined, lines, None),
+    let (combined, workers_held, mut held_lines, mut refusal) = match held {
+        Ok((combined, workers_held, lines)) => (combined, workers_held, lines, None),
         Err(reason) => (
+            None,
             None,
             vec![format!("  resident set      not read: {reason}")],
             Some(reason),
         ),
     };
+    // The worker program's size is read from the file the daemon starts each worker from, where the
+    // session workers' held figure is read, so that the two figures the alarms watch come together.
+    let growth = match workers_held {
+        Some(workers_held_kib) => match std::fs::metadata(&host.worker) {
+            Ok(file) => Some(Growth {
+                workers_held_kib,
+                worker_size_kib: file.len() / 1024,
+            }),
+            Err(error) => {
+                let reason = format!(
+                    "the size of the worker program at {} could not be read: {error}",
+                    host.worker.display()
+                );
+                held_lines.push(format!("  worker file       not read: {reason}"));
+                refusal = refusal.or(Some(reason));
+                None
+            }
+        },
+        None => None,
+    };
+    if let Some(growth) = &growth {
+        held_lines.push(format!(
+            "  worker file       {} KiB on disk, the program the daemon starts each worker from; the \
+             `worker size` line that the script prints before this case is read from the workspace \
+             build's program, another build of the same sources (227 KiB smaller at commit \
+             3ace455c69), so its sections are that build's and not this program's",
+            growth.worker_size_kib
+        ));
+        held_lines.push(format!(
+            "  growth watch      the session workers hold {} KiB against a recorded level of \
+             {WORKERS_HELD_RECORDED_KIB} KiB, with an alarm {WORKERS_HELD_ALARM_STEP_KIB} KiB above it; \
+             the worker program is {} KiB on disk against {WORKER_SIZE_RECORDED_KIB} KiB, with an \
+             alarm {WORKER_SIZE_ALARM_STEP_KIB} KiB above it; neither is the requirement, and a low \
+             reading is no alarm",
+            growth.workers_held_kib, growth.worker_size_kib
+        ));
+    }
 
     let grid = kr_protocol::session::INVISIBLE_DEFAULT_DIMENSIONS;
     let mut lines = conditions.lines();
@@ -1466,12 +1639,9 @@ async fn idle(host: &Host, owned: &mut Owned) -> Result<Idle, String> {
          shell) and the daemon{}",
         workers.len(),
         if cfg!(target_os = "linux") {
-            format!(
-                ", the sum of their resident sizes, which counts a page that several of them map \
-                 for each: recorded on this host, with an alarm {} KiB above its recorded level \
-                 of {SUM_RECORDED_KIB} KiB, and not the requirement",
-                SUM_ALARM_STEP_KIB
-            )
+            ", the sum of their resident sizes, which counts a page that several of them map for \
+             each: recorded on this host, with no alarm, and not the requirement"
+                .to_owned()
         } else {
             format!(", against {RESIDENT_BOUND_KIB} KiB")
         }
@@ -1484,15 +1654,18 @@ async fn idle(host: &Host, owned: &mut Owned) -> Result<Idle, String> {
     );
     if let Some(reason) = refusal {
         lines.push(
-            "  verdict           the memory the group holds could not be read, so the measurement \
-             fails with the reason on the `resident set` line"
+            "  verdict           a reading the measurement needs could not be taken, so it fails \
+             with the reason on the `resident set` or `worker file` line"
                 .to_owned(),
         );
         record::report(RECORD, "KR-PERF-003 idle local terminal resources", &lines);
         drop(views);
         return Err(reason);
     }
-    let idle = Idle::new(cores, sum, combined, &conditions);
+    let mut idle = Idle::new(cores, sum, combined, &conditions);
+    if let Some(growth) = growth {
+        idle = idle.watching(growth);
+    }
     lines.extend(idle.verdict());
     // Before anything is asserted, so a run whose target failed keeps the figure.
     record::report(RECORD, "KR-PERF-003 idle local terminal resources", &lines);

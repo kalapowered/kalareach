@@ -8,8 +8,10 @@
 # sessions hold: each resident page counted once for the group, each page in swap, and what the
 # reader's scan may have missed, read from the kernel's page map at the end of the window. The sum
 # of the processes' resident sizes, which counts the worker program once for each worker, is
-# printed beside it with an alarm that asks for a ruling when it rises; it is not the requirement. On Linux a reading that cannot be taken fails the measurement, with the
-# process and the reason named. macOS has no page map that a process of the same user can read, so
+# printed beside it with no alarm; it is not the requirement. Two figures that move far less than the
+# sum carry alarms that ask for a ruling when they rise: what the session workers hold, and the size
+# on disk of the worker program the case starts. On Linux a reading that cannot be taken fails the
+# measurement, with the process and the reason named. macOS has no page map that a process of the same user can read, so
 # there the bound is held to the sum, which is never below what the group holds.
 #
 # Every step is checked. A build that fails, a measurement that produces no samples, or a
