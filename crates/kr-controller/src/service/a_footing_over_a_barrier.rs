@@ -56,8 +56,11 @@ async fn a_fence_held_by_the_test_seam_sets_the_flag_and_letting_it_go_clears_it
 /// A change publishes its debts and the flag is set; its barrier then withdraws the registration
 /// and raises the revision, and clears the flag last. Stopped between the withdrawal and the
 /// issuer's adoption of the revision, the registration's latch is set, the stored revision has
-/// moved, the revision in memory has not, and the flag is still set: a reader finds the members in
-/// the order that the barrier makes true.
+/// moved, the revision in memory has not, and the flag is still set. Let on while the case holds
+/// the debts' lock, the barrier raises the revision in memory and then waits for that lock, which
+/// it needs to clear the flag: the revision is raised while the flag is still set. A barrier that
+/// cleared the flag first would leave a reader a clear flag and a revision not yet raised, which
+/// passes work that a narrower barrier restamped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_barrier_sets_the_latch_and_raises_the_revision_before_it_clears_the_flag() {
     let (_temp, controller, _clock) = daemon_on_clocks().await;
@@ -98,7 +101,37 @@ async fn a_barrier_sets_the_latch_and_raises_the_revision_before_it_clears_the_f
     );
     assert_eq!(footing.ask(Ask::MUTATION), Err(Lapse::FenceOwed));
 
+    // The case holds the debts' lock on a blocking thread, so that the barrier cannot clear the
+    // flag, and lets the barrier go on. A dropped sender ends the hold too, so that a failing case
+    // does not leave the lock held.
+    let (holds, held) = std::sync::mpsc::channel();
+    let (lets_go, let_go) = std::sync::mpsc::channel::<()>();
+    let holding = tokio::task::spawn_blocking({
+        let controller = std::sync::Arc::clone(&controller);
+        move || {
+            let debts = controller.debts();
+            holds.send(()).expect("the case waits for the lock");
+            let _ = let_go.recv_timeout(Duration::from_secs(30));
+            drop(debts);
+        }
+    });
+    tokio::task::spawn_blocking(move || held.recv_timeout(Duration::from_secs(30)))
+        .await
+        .expect("the waiting thread finishes")
+        .expect("the case holds the debts' lock");
     release.send(()).expect("the barrier goes on");
+    until(
+        "the barrier raising the revision in memory while it waits for the debts' lock",
+        async || controller.copies.revision() == before + 1,
+    )
+    .await;
+    assert!(
+        controller.copies.fence_is_owed(),
+        "the flag is cleared after the revision is raised, never before"
+    );
+    assert_eq!(footing.ask(Ask::MUTATION), Err(Lapse::FenceOwed));
+    lets_go.send(()).expect("the hold waits for the case");
+    holding.await.expect("the hold ends");
     raising
         .await
         .expect("the barrier ends")
