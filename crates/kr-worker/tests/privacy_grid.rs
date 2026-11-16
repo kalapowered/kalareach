@@ -1,0 +1,513 @@
+//! Privacy mode and the rows of the canonical grid above the live screen.
+//!
+//! The host's own terminal scrolls above the live page and is served those rows from the grid. Under
+//! privacy mode the grid holds none of them: it gives up what it held when privacy mode went on,
+//! keeps none while it is on, and starts empty when it goes off. The live screen is left alone, and
+//! a paired device, which is shown the live screen and nothing above it, is told the same before and
+//! after.
+//!
+//! Every case runs a session of this process with a shell that only waits, so the output is what a
+//! case gives it and no step waits for anything: a scroll is answered when it is asked for.
+
+use kr_protocol::attachment::{
+    AttachMode, AttachmentCapability, SessionAttachParams, ViewportPosition,
+};
+use kr_protocol::error::ErrorCode;
+use kr_protocol::identity::{DesktopBinding, WorkerProfile};
+use kr_protocol::ids::{AttachmentId, SessionEpoch, SessionId};
+use kr_protocol::projection::{ProjectedBuffer, ProjectionEvent};
+use kr_protocol::scalars::{CanonicalSet, Nullable, U64};
+use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
+use kr_worker::output::{OutputDelivery, OutputStream};
+use kr_worker::privacy::PrivacyGeneration;
+use kr_worker::pty::ShellCommand;
+use kr_worker::session::{Session, SessionConfig};
+
+/// The lines a run prints, and the rows of the screen they scroll over.
+const LINES: usize = 60;
+const ROWS: u64 = 24;
+
+/// The first line of a run that is still on the live screen when the run has ended: the screen
+/// holds the last lines and the blank row the cursor is on.
+const ON_SCREEN: usize = LINES - (ROWS as usize - 1);
+
+const ENTER_ALTERNATE: &str = "\x1b[?1049h";
+const LEAVE_ALTERNATE: &str = "\x1b[?1049l";
+
+/// The session's own size.
+fn dimensions() -> Dimensions {
+    Dimensions::new(80, ROWS)
+}
+
+/// The window both terminals look through: a projection of the bottom of the live screen, which
+/// moves above the live page when it is asked to.
+const WINDOW_ROWS: u64 = 10;
+
+fn window() -> Dimensions {
+    Dimensions::new(40, WINDOW_ROWS)
+}
+
+/// The window that shows the last rows of the live screen.
+fn bottom() -> Option<ViewportPosition> {
+    Some(ViewportPosition::Line(U64::new(ROWS - WINDOW_ROWS)))
+}
+
+fn config(temp: &kr_ipc::testing::TempHost, session_id: SessionId) -> SessionConfig {
+    let environment = temp.environment();
+    let journal = environment.journal_database(session_id);
+    std::fs::create_dir_all(journal.parent().expect("a parent")).expect("the journal directory");
+    SessionConfig {
+        session_id,
+        session_epoch: SessionEpoch::V1,
+        environment_id: environment.environment_id(),
+        display_number: DisplayNumber::new(1),
+        shell: ShellCommand {
+            program: "/bin/sh".to_owned(),
+            arguments: vec!["-c".to_owned(), "sleep 30".to_owned()],
+            cwd: "/".to_owned(),
+            environment: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
+        },
+        shell_mode: ShellMode::NativeCompat,
+        worker_profile: WorkerProfile::HeadlessUser,
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
+        worker_endpoint: None,
+        desktop: DesktopBinding::none(),
+        dimensions: dimensions(),
+        journal_path: Some(journal),
+        spool_directory: Some(environment.session_spool(session_id)),
+        send_queue_bytes: 1024 * 1024,
+        resident_bytes: 64 * 1024,
+        time: kr_worker::action::time::TimeSources::system(),
+    }
+}
+
+/// The lines `word 0` to `word 59`, each ended as a terminal ends it.
+fn run(word: &str) -> String {
+    (0..LINES)
+        .map(|line| format!("{word} {line}\r\n"))
+        .collect()
+}
+
+/// A session, the host's own terminal and a paired device beside it.
+///
+/// The device is shown the live screen and nothing above it, as a forwarded caller is.
+struct Rig {
+    session: Session,
+    host: AttachmentId,
+    host_stream: OutputStream,
+    device: AttachmentId,
+    device_stream: OutputStream,
+    temp: kr_ipc::testing::TempHost,
+    session_id: SessionId,
+}
+
+impl Rig {
+    fn open() -> Self {
+        let temp = kr_ipc::testing::TempHost::create();
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let session = Session::open(config(&temp, session_id)).expect("opens the session");
+        Self::around(temp, session_id, session)
+    }
+
+    /// The same session, opened again over the stores it left.
+    fn reopened(self) -> Self {
+        let Self {
+            session,
+            temp,
+            session_id,
+            ..
+        } = self;
+        drop(session);
+        let session = Session::open(config(&temp, session_id)).expect("opens the session again");
+        Self::around(temp, session_id, session)
+    }
+
+    fn around(
+        temp: kr_ipc::testing::TempHost,
+        session_id: SessionId,
+        mut session: Session,
+    ) -> Self {
+        let (host, mut host_stream) = attach(&mut session, session_id);
+        let (device, mut device_stream) = attach(&mut session, session_id);
+        session.narrow_content(device, kr_worker::render::Scope::LiveScreen);
+        // Both start at the bottom of the live screen, so that a window that is put on the top of
+        // it is a window that moved and is installed.
+        for (attachment, stream) in [(host, &mut host_stream), (device, &mut device_stream)] {
+            session
+                .viewport(attachment, window(), bottom(), 0)
+                .expect("the bottom of the live screen");
+            drain(stream);
+        }
+        Self {
+            session,
+            host,
+            host_stream,
+            device,
+            device_stream,
+            temp,
+            session_id,
+        }
+    }
+
+    fn print(&mut self, bytes: &str) {
+        let _ = self.session.ingest_output(bytes.as_bytes());
+    }
+
+    fn enable(&mut self) {
+        self.session
+            .enable_privacy(PrivacyGeneration::new(1), &mut [])
+            .expect("privacy mode goes on");
+        assert!(self.session.privacy().is_enabled());
+    }
+
+    fn disable(&mut self) {
+        self.session
+            .disable_privacy(PrivacyGeneration::new(2))
+            .expect("privacy mode goes off")
+            .expect("it was on");
+        assert!(!self.session.privacy().is_enabled());
+    }
+
+    /// What the host's own terminal is shown when it scrolls `rows` above the live page, and is
+    /// then back on the bottom of the live screen. The device is refused the same scroll.
+    fn scrolled(&mut self, rows: u64) -> Vec<String> {
+        drain(&mut self.host_stream);
+        self.session
+            .viewport(
+                self.host,
+                window(),
+                Some(ViewportPosition::Above(U64::new(rows))),
+                0,
+            )
+            .expect("the host's terminal may look above the live page");
+        let installed = installed_rows(drain(&mut self.host_stream));
+        self.session
+            .viewport(self.host, window(), bottom(), 0)
+            .expect("and may come back");
+        drain(&mut self.host_stream);
+
+        let refused = self
+            .session
+            .viewportable(
+                self.device,
+                window(),
+                Some(ViewportPosition::Above(U64::new(rows))),
+            )
+            .expect_err("a device shown the live screen cannot look above it");
+        assert_eq!(refused.code(), ErrorCode::UnsupportedCapability);
+        installed
+    }
+
+    /// What the host's terminal and the device are each drawn of the bottom of the live screen.
+    fn live_screens(&mut self) -> (Vec<String>, Vec<String>) {
+        let mut seen = Vec::new();
+        for (attachment, stream) in [
+            (self.host, &mut self.host_stream),
+            (self.device, &mut self.device_stream),
+        ] {
+            self.session
+                .viewport(attachment, window(), bottom(), 0)
+                .expect("the bottom of the live screen");
+            drain(stream);
+            self.session
+                .install_projection(attachment)
+                .expect("the screen is installed");
+            let rows = installed_rows(drain(stream));
+            assert!(!rows.is_empty(), "the live screen is drawn");
+            seen.push(rows);
+        }
+        let device = seen.pop().expect("the device's rows");
+        let host = seen.pop().expect("the host's rows");
+        (host, device)
+    }
+}
+
+fn attach(session: &mut Session, session_id: SessionId) -> (AttachmentId, OutputStream) {
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    let params = SessionAttachParams {
+        session_id,
+        mode: AttachMode::Terminal,
+        claim_geometry: false,
+        dimensions: Nullable::some(window()),
+        terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+        requested,
+    };
+    let id = AttachmentId::new(kr_ipc::new_uuid());
+    session
+        .attach(&params, params.requested.clone(), id)
+        .expect("attaches");
+    session.join(id).expect("joins");
+    let stream = session.subscribe(id).expect("subscribes");
+    session.install_projection(id).expect("installs");
+    (id, stream)
+}
+
+/// Everything queued on a stream, as the events of a projection and nothing else.
+fn drain(stream: &mut OutputStream) -> Vec<ProjectionEvent> {
+    let mut events = Vec::new();
+    while let Some(delivery) = stream.try_recv() {
+        stream.written(delivery.len());
+        if let OutputDelivery::Projection { event, .. } = delivery {
+            events.push(*event);
+        }
+    }
+    events
+}
+
+/// The text of every primary-buffer row of the last screen the events installed, oldest first.
+fn installed_rows(events: Vec<ProjectionEvent>) -> Vec<String> {
+    let mut rows: Vec<(u64, String)> = Vec::new();
+    for event in events {
+        match event {
+            ProjectionEvent::Snapshot(_) | ProjectionEvent::Reset(_) => rows.clear(),
+            ProjectionEvent::Rows(page) if page.buffer == ProjectedBuffer::Primary => {
+                for row in page.rows {
+                    let text = row.runs.iter().map(|run| run.text.as_str()).collect();
+                    rows.push((row.row.get(), text));
+                }
+            }
+            _ => {}
+        }
+    }
+    rows.sort_by_key(|(id, _)| *id);
+    rows.dedup_by_key(|(id, _)| *id);
+    rows.into_iter().map(|(_, text)| text).collect()
+}
+
+/// The numbers of the rows that read `word <number>`.
+fn numbers(rows: &[String], word: &str) -> Vec<usize> {
+    rows.iter()
+        .filter_map(|row| row.trim().strip_prefix(word)?.trim().parse().ok())
+        .collect()
+}
+
+/// Whether a scroll shows nothing of `word` but rows that were on the live screen when the run
+/// ended, which privacy mode leaves where they are.
+fn shows_only_the_screen(rows: &[String], word: &str) -> bool {
+    numbers(rows, word)
+        .iter()
+        .all(|number| *number >= ON_SCREEN)
+}
+
+/// The control of every case: without privacy mode the same scroll reaches the first row.
+fn reaches_the_first_row(rows: &[String], word: &str) -> bool {
+    numbers(rows, word).contains(&0)
+}
+
+#[test]
+fn rows_printed_before_privacy_mode_are_not_scrolled_to_after_it_goes_on() {
+    let mut rig = Rig::open();
+    rig.print(&run("before"));
+    let live = rig.live_screens();
+    assert!(
+        reaches_the_first_row(&rig.scrolled(1000), "before"),
+        "without privacy mode a scroll reaches the oldest row"
+    );
+
+    rig.enable();
+
+    let scrolled = rig.scrolled(1000);
+    assert!(
+        !numbers(&scrolled, "before").is_empty(),
+        "the live screen is still there to be scrolled over"
+    );
+    assert!(
+        shows_only_the_screen(&scrolled, "before"),
+        "a scroll shows no row from above the live page: {scrolled:?}"
+    );
+    assert_eq!(
+        rig.live_screens(),
+        live,
+        "the host's screen and the device's are drawn by the same bytes as before"
+    );
+}
+
+#[test]
+fn rows_printed_while_privacy_mode_is_on_are_not_scrolled_to() {
+    let mut rig = Rig::open();
+    rig.print(&run("before"));
+    rig.enable();
+    rig.print(&run("while"));
+
+    let scrolled = rig.scrolled(1000);
+    assert!(
+        !numbers(&scrolled, "while").is_empty(),
+        "the scroll is answered with the live screen"
+    );
+    assert!(
+        numbers(&scrolled, "before").is_empty(),
+        "the rows that were on the screen have left it and are not kept: {scrolled:?}"
+    );
+    assert!(
+        shows_only_the_screen(&scrolled, "while"),
+        "no row printed while privacy mode is on is above the live page: {scrolled:?}"
+    );
+    assert_eq!(rig.session.retained_output_bytes(), 0);
+}
+
+#[test]
+fn nothing_comes_back_when_privacy_mode_goes_off_and_new_rows_are_kept() {
+    let mut rig = Rig::open();
+    rig.print(&run("before"));
+    rig.enable();
+    rig.print(&run("while"));
+    rig.disable();
+
+    let scrolled = rig.scrolled(1000);
+    assert!(!numbers(&scrolled, "while").is_empty(), "{scrolled:?}");
+    assert!(numbers(&scrolled, "before").is_empty(), "{scrolled:?}");
+    assert!(shows_only_the_screen(&scrolled, "while"), "{scrolled:?}");
+
+    rig.print(&run("after"));
+    let scrolled = rig.scrolled(30);
+    assert!(
+        numbers(&scrolled, "after")
+            .iter()
+            .any(|number| *number < ON_SCREEN),
+        "rows printed afterwards are kept and can be scrolled to: {scrolled:?}"
+    );
+    let scrolled = rig.scrolled(1000);
+    assert!(numbers(&scrolled, "before").is_empty(), "{scrolled:?}");
+    assert!(shows_only_the_screen(&scrolled, "while"), "{scrolled:?}");
+}
+
+#[test]
+fn a_session_opened_under_privacy_mode_keeps_no_rows() {
+    let mut rig = Rig::open();
+    rig.enable();
+    let mut rig = rig.reopened();
+    assert!(rig.session.privacy().is_enabled());
+
+    rig.print(&run("while"));
+
+    let scrolled = rig.scrolled(1000);
+    assert!(!numbers(&scrolled, "while").is_empty());
+    assert!(shows_only_the_screen(&scrolled, "while"), "{scrolled:?}");
+}
+
+#[test]
+fn a_session_that_cannot_read_its_state_keeps_no_rows_until_it_reads_off() {
+    let rig = Rig::open();
+    let (temp, session_id) = (rig.temp, rig.session_id);
+    drop(rig.session);
+    let journal = temp.environment().journal_database(session_id);
+    rusqlite::Connection::open(&journal)
+        .expect("the journal")
+        .execute(
+            "UPDATE privacy SET generation = 'unreadable' WHERE id = 1",
+            [],
+        )
+        .expect("the record is made unreadable");
+    let session = Session::open(config(&temp, session_id)).expect("opens again");
+    let mut rig = Rig::around(temp, session_id, session);
+
+    rig.print(&run("unknown"));
+    let scrolled = rig.scrolled(1000);
+    assert!(!numbers(&scrolled, "unknown").is_empty());
+    assert!(
+        shows_only_the_screen(&scrolled, "unknown"),
+        "a session that cannot say keeps none: {scrolled:?}"
+    );
+
+    // The record is put right and reads as off: rows are kept again from that moment.
+    rusqlite::Connection::open(&journal)
+        .expect("the journal")
+        .execute(
+            "UPDATE privacy SET generation = 0, enabled = 0 WHERE id = 1",
+            [],
+        )
+        .expect("the record is put right");
+    rig.session.collect_expired();
+    rig.print(&run("known"));
+    let scrolled = rig.scrolled(30);
+    assert!(
+        numbers(&scrolled, "known")
+            .iter()
+            .any(|number| *number < ON_SCREEN),
+        "rows printed after it reads off are kept: {scrolled:?}"
+    );
+}
+
+#[test]
+fn rows_owed_while_a_full_screen_program_runs_are_gone_when_it_leaves() {
+    let mut rig = Rig::open();
+    rig.print(&run("before"));
+    rig.print(ENTER_ALTERNATE);
+    rig.enable();
+    rig.print(&format!("{LEAVE_ALTERNATE}{}", run("while")));
+
+    let scrolled = rig.scrolled(1000);
+    assert!(
+        !numbers(&scrolled, "while").is_empty(),
+        "the scroll is answered with the live screen"
+    );
+    assert!(
+        numbers(&scrolled, "before").is_empty(),
+        "no row from before privacy mode went on is above the live page: {scrolled:?}"
+    );
+    assert!(shows_only_the_screen(&scrolled, "while"), "{scrolled:?}");
+}
+
+#[test]
+fn rows_owed_stay_owed_when_privacy_mode_goes_off_before_the_program_leaves() {
+    let mut rig = Rig::open();
+    rig.print(&run("before"));
+    rig.print(ENTER_ALTERNATE);
+    rig.enable();
+    rig.disable();
+    rig.print(&format!("{LEAVE_ALTERNATE}{}", run("after")));
+
+    let scrolled = rig.scrolled(1000);
+    assert!(
+        shows_only_the_screen(&scrolled, "before"),
+        "no row from before comes back: {scrolled:?}"
+    );
+    assert!(!numbers(&scrolled, "after").is_empty(), "{scrolled:?}");
+    let scrolled = rig.scrolled(30);
+    assert!(
+        numbers(&scrolled, "after")
+            .iter()
+            .any(|number| *number < ON_SCREEN),
+        "rows printed afterwards are kept: {scrolled:?}"
+    );
+}
+
+#[test]
+fn a_window_above_the_live_page_when_privacy_mode_goes_on_is_installed_again() {
+    let mut rig = Rig::open();
+    rig.print(&run("before"));
+    drain(&mut rig.host_stream);
+    rig.session
+        .viewport(
+            rig.host,
+            window(),
+            Some(ViewportPosition::Above(U64::new(30))),
+            0,
+        )
+        .expect("the host's terminal looks above the live page");
+    let held = installed_rows(drain(&mut rig.host_stream));
+    assert!(
+        numbers(&held, "before")
+            .iter()
+            .any(|number| *number < ON_SCREEN),
+        "the window is above the live page: {held:?}"
+    );
+
+    rig.enable();
+    rig.print("next\r\n");
+
+    let events = drain(&mut rig.host_stream);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, ProjectionEvent::Snapshot(_))),
+        "the window is installed again"
+    );
+    let installed = installed_rows(events);
+    assert!(!numbers(&installed, "before").is_empty(), "{installed:?}");
+    assert!(
+        shows_only_the_screen(&installed, "before"),
+        "and what it holds is the live screen: {installed:?}"
+    );
+}

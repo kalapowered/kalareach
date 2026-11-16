@@ -546,7 +546,7 @@ impl Session {
         // them at once instead of one refusal at a time.
         crate::attachments::admit(config.dimensions)?;
         let pty = Pty::open(config.dimensions)?;
-        let engine = crate::projection::TerminalEngine::for_backend(
+        let mut engine = crate::projection::TerminalEngine::for_backend(
             config.dimensions,
             Arc::clone(&config.time.continuous),
             backend,
@@ -701,9 +701,14 @@ impl Session {
         // their content has run, or the state is read as off, no reader is told of a settled
         // receipt's result or envelope. The journal is still this function's own here, so the
         // fence is up before any reader can reach it.
+        //
+        // The canonical grid follows the history: a session that opens under privacy mode, or that
+        // cannot say, keeps none of the rows that leave its screen. It holds none yet, so nothing
+        // is removed here.
         if privacy.is_enabled() || unresolved {
             history.stop_retaining();
             history.set_discard_owed(true);
+            engine.set_history_kept(false);
         }
         if let Some(journal) = journal.as_mut() {
             journal.set_content_owed(privacy.is_enabled() || unresolved);
@@ -4584,7 +4589,8 @@ impl Session {
         // pending questions and approvals comes from the caller with its own subsystems. What is
         // reported here is what this session can see, which is none of them.
         let pending = 0;
-        let mut history = crate::privacy::RetainedHistory::over(&mut self.history);
+        let mut history =
+            crate::privacy::RetainedHistory::over(&mut self.history, &mut self.engine);
         let mut receipts = crate::privacy::ReceiptMetadata::over(self.journal.as_mut(), pending);
         let mut facts =
             crate::description_facts::DescriptionFactsPrivacy::over(self.description_facts.clone());
@@ -4738,7 +4744,7 @@ impl Session {
             journal.record_privacy(generation.get(), false, now)?;
         }
         self.privacy = privacy;
-        self.history.resume_retaining();
+        self.resume_retaining();
         // Capture starts again from this moment, into a record of its own: nothing from before is
         // brought back.
         self.description_facts.release(generation);
@@ -4804,7 +4810,7 @@ impl Session {
                         self.privacy_cleanup.history = None;
                         self.privacy_cleanup.receipts = None;
                         self.description_facts.release(self.privacy.generation());
-                        self.history.resume_retaining();
+                        self.resume_retaining();
                         self.history.set_discard_owed(false);
                         self.settle_receipt_fence();
                         return;
@@ -4830,6 +4836,13 @@ impl Session {
             }
             self.settle_receipt_fence();
         }
+    }
+
+    /// Starts retaining output again from this moment: the history, and the rows the canonical
+    /// grid keeps above the live screen. Neither brings back what it did not keep.
+    fn resume_retaining(&mut self) {
+        self.history.resume_retaining();
+        self.engine.set_history_kept(true);
     }
 
     /// Raises the fence on settled receipts' content while this session owes its removal or cannot
