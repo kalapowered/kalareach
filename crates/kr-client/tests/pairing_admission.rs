@@ -1127,7 +1127,7 @@ fn words_of(alternatives: &kr_client::services::Alternatives) -> Vec<String> {
 }
 
 /// KR-REQ-17.48: an answer that the service is unable, with a list that has an entry, is kept with
-/// that list and the delay it named, as it wrote them, for as long as it explains a failed dial, and
+/// that list, as it wrote it, and the device's wait, for as long as it explains a failed dial, and
 /// is asked again at the moments it always was. A service that is not updated, whose list has the
 /// old second item or any other, reads the same way.
 #[tokio::test]
@@ -1166,8 +1166,8 @@ async fn kr_req_17_48_a_kept_answer_holds_the_list_and_the_delay_it_named() {
 }
 
 /// KR-REQ-17.48: an answer that the service is unable, whose list has no entry, is a fault of the
-/// service and never exhausted capacity, with the delay it named when it named one, and is kept and
-/// asked again at the same moments as one with entries.
+/// service and never exhausted capacity, with the device's own wait, and is kept and asked again at
+/// the same moments as one with entries.
 #[tokio::test]
 async fn kr_req_17_48_an_unavailable_answer_with_no_entry_is_a_fault_and_never_capacity() {
     const FAULT: &str = "The managed relay service could not admit this pairing now.";
@@ -1195,8 +1195,8 @@ async fn kr_req_17_48_an_unavailable_answer_with_no_entry_is_a_fault_and_never_c
 }
 
 /// KR-REQ-17.48: a refusal in the service's envelope under a status of the 5xx class is a fault of
-/// the service, explained for as long as an answer that it is unable is, with the delay the envelope
-/// named, and is asked again at the moments a refusal always was.
+/// the service, explained for as long as an answer that it is unable is, with the device's own wait
+/// that the delay the envelope named sets, and is asked again at the moments a refusal always was.
 #[tokio::test]
 async fn kr_req_17_48_a_refusal_of_the_5xx_class_in_the_envelope_is_a_fault() {
     const SHORT: &str = "Managed capacity for new pairing invitations is not available now.";
@@ -1298,7 +1298,7 @@ fn handed_on(refusal: &Option<RelayRefusal>) -> Option<u64> {
 /// KR-REQ-17.48: what a failed dial hands on as the wait is the seconds from now until this device
 /// asks the service again, and never less than what is left of the delay the service named: not the
 /// delay as it was named when the answer was read, which is kept past itself while no request is
-/// made. Rounded up, and none where the service named none.
+/// made. Rounded up, and twenty seconds at least where the service named none.
 #[tokio::test]
 async fn kr_req_17_48_the_wait_handed_on_is_the_wait_until_the_device_asks_again() {
     const SHORT: &str = "Managed capacity for new pairing invitations is not available now.";
