@@ -2472,6 +2472,215 @@ async fn a_mutation_whose_client_goes_before_the_look_is_dropped_and_after_it_is
     assert!(written, "a client that went after the look has its receipt");
 }
 
+/// How a client's end comes behind the request it wrote.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Goes {
+    /// It ends what it sends and stays to read the answer. Unix only: a Windows pipe has no half
+    /// close, and the case does not use this way there.
+    ShutsItsSendingSide,
+    /// Its socket is shut down, where the platform can, and dropped.
+    Closes,
+}
+
+/// A local client that composes one request, writes it, waits for the case's word, ends as `goes`
+/// says, and reads what the worker answers if it stays to read. The task ends with the answer, or
+/// with none when the worker ended the connection first. The whole task is bounded.
+fn writing_then_going<T: serde::Serialize + Send + Sync + 'static>(
+    host: &Host,
+    method: Method,
+    action_id: kr_protocol::ids::ActionId,
+    params: T,
+    goes: Goes,
+    go: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<Option<kr_protocol::envelope::Outcome>> {
+    let endpoint = host.endpoint.clone();
+    let (environment_id, session_id) = (host.environment_id, host.session_id);
+    tokio::spawn(async move {
+        let mut go = go;
+        tokio::time::timeout(WAIT, async move {
+            let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+                .await
+                .expect("connects");
+            let request = client
+                .compose(
+                    method,
+                    action_id,
+                    target(environment_id, session_id),
+                    &params,
+                )
+                .await
+                .expect("composes");
+            client
+                .send(&ControlFrame::Mutation(Box::new(request)))
+                .await
+                .expect("writes the request");
+            go.wait_for(|gone| *gone)
+                .await
+                .expect("the case lets the client go");
+            if goes == Goes::Closes {
+                #[cfg(unix)]
+                client
+                    .writer()
+                    .shut_down(std::net::Shutdown::Both)
+                    .expect("shuts the client's socket down");
+                return None;
+            }
+            #[cfg(unix)]
+            client
+                .writer()
+                .shut_down(std::net::Shutdown::Write)
+                .expect("ends what the client sends");
+            while let Ok(frame) = client.recv().await {
+                if let ControlFrame::Response(response) = frame {
+                    return Some(response.outcome);
+                }
+            }
+            None
+        })
+        .await
+        .unwrap_or_default()
+    })
+}
+
+/// A cancellation whose client has gone is carried out, and a mutation that starts work whose
+/// client has gone is dropped.
+///
+/// Accepted receipts are made, one for each way a client can go, and the boundary is held. For each
+/// way, two clients write behind the boundary and then go: one cancels a receipt, and one attaches.
+/// The ways are a client that ends what it sends and stays to read (Unix) and one that closes its
+/// socket. The attaches leave the wait at once and nothing is made for them. The cancellations keep
+/// their places for as long as the boundary is held, and no longer: at the release each cancels its
+/// receipt, the client that stayed is answered, and every connection is given back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancellation_whose_client_has_gone_is_carried_out_and_a_starting_mutation_is_dropped() {
+    let host = host_ready_apart(false).await;
+    let service = &host.service;
+    let user = kr_protocol::ids::ActorId::new(format!("local:{}", kr_ipc::paths::current_uid()))
+        .expect("a principal");
+    let ways: &[Goes] = if cfg!(unix) {
+        &[Goes::ShutsItsSendingSide, Goes::Closes]
+    } else {
+        &[Goes::Closes]
+    };
+    let offered: Vec<_> = ways
+        .iter()
+        .map(|_| kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()))
+        .collect();
+    {
+        let mut session = service.runtime().session();
+        let journal = session.journal_mut().expect("a journal");
+        for action_id in &offered {
+            let now_ms = kr_ipc::now_ms();
+            journal
+                .accept(&kr_worker::journal::Submission {
+                    actor_id: user.clone(),
+                    action_id: *action_id,
+                    method: Method::SessionAttach.into(),
+                    method_version: kr_protocol::method::MethodVersion::V1,
+                    payload_digest: kr_protocol::scalars::Digest256::from_bytes([7; 32]),
+                    subject_digest: kr_protocol::scalars::Digest256::from_bytes([8; 32]),
+                    intent: vec![0xa0],
+                    accepted_deadline_ms: Some(kr_protocol::scalars::TimestampMs::new(
+                        now_ms.get() + 120_000,
+                    )),
+                    now_ms,
+                })
+                .expect("accepts the offer");
+        }
+    }
+    let start = service.connections_held_for_tests();
+    let boundary = Held::boundary(&host).await;
+    let (go, goes) = tokio::sync::watch::channel(false);
+    let new_id = || kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+    let mut cancelling = Vec::new();
+    let mut attaching = Vec::new();
+    let mut attached = Vec::new();
+    for (way, offer) in ways.iter().zip(&offered) {
+        cancelling.push((
+            *way,
+            writing_then_going(
+                &host,
+                Method::ActionCancel,
+                new_id(),
+                kr_protocol::receipt::ActionCancelParams { action_id: *offer },
+                *way,
+                goes.clone(),
+            ),
+        ));
+        let action_id = new_id();
+        attached.push(action_id);
+        attaching.push(writing_then_going(
+            &host,
+            Method::SessionAttach,
+            action_id,
+            attach_params(host.session_id),
+            *way,
+            goes.clone(),
+        ));
+    }
+    let clients = ways.len();
+    // Each client has written its request and waits for the word to go: all of them wait at the
+    // held boundary with their peers there.
+    assert!(
+        settle(|| service.mutations_waiting_for_tests() == 2 * clients).await,
+        "the requests wait at the held boundary"
+    );
+    go.send(true).expect("lets the clients go");
+    assert!(
+        settle(|| {
+            service.mutations_waiting_for_tests() == clients
+                && service.connections_held_for_tests() == start + clients
+        })
+        .await,
+        "the attaches leave the wait and give back their connections, and the cancellations keep \
+         theirs: {} waiting, {} held",
+        service.mutations_waiting_for_tests(),
+        service.connections_held_for_tests()
+    );
+    boundary.release();
+    for (way, client) in cancelling {
+        let answered = tokio::time::timeout(SETTLE, client)
+            .await
+            .expect("the client's task ends once the cancellation is carried out")
+            .expect("the client's task finishes");
+        if way == Goes::ShutsItsSendingSide {
+            assert!(
+                matches!(answered, Some(kr_protocol::envelope::Outcome::Ok(_))),
+                "the cancellation was carried out and answered: {answered:?}"
+            );
+        }
+    }
+    for (which, action_id) in offered.iter().enumerate() {
+        let cancelled = settle(|| {
+            let session = service.runtime().session();
+            session
+                .journal()
+                .expect("a journal")
+                .read(user.clone(), *action_id)
+                .expect("reads the journal")
+                .is_some_and(|receipt| {
+                    receipt.reason.as_ref()
+                        == Some(&kr_protocol::receipt::RejectionReason::Cancelled)
+                })
+        })
+        .await;
+        assert!(cancelled, "offer {which} says cancelled");
+    }
+    for client in attaching {
+        let _ = client.await;
+    }
+    assert!(
+        settle(|| service.connections_held_for_tests() == start).await,
+        "every connection is given back"
+    );
+    for action_id in attached {
+        assert!(
+            !receipt_exists(&host, action_id).await,
+            "a receipt was written for a starting mutation whose client was not there"
+        );
+    }
+}
+
 /// What the requests wait with is a pause that doubles to a quarter of a second and no more.
 ///
 /// A living mutation waits at the held boundary. The case reads the longest pause the wait asked
