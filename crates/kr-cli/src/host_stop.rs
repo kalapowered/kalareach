@@ -407,6 +407,7 @@ fn done(said: &Shown, result: &Facts, json: bool, earlier: &Earlier) -> Completi
 
 /// What a stop's request came to, where it was written.
 #[derive(Clone, Debug)]
+#[cfg_attr(test, derive(strum::EnumCount))]
 enum Request {
     /// The daemon took the stop and answered.
     Told,
@@ -599,6 +600,7 @@ fn said_before_the_request(
 
 /// What the first reach of the endpoint showed, where it ends the command with no wait.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(strum::EnumCount))]
 enum Start {
     /// A daemon answers and states another public major than this command.
     OtherMajor,
@@ -1518,6 +1520,7 @@ fn decided_by_the_wait(end: End) -> Decided {
 
 /// How the failure of the command's connection to the daemon came out, where it failed before the
 /// command could make its request.
+#[cfg_attr(test, derive(strum::EnumCount))]
 enum Before {
     /// The daemon had ended, or another holds the environment now: what the command says, and the
     /// process that it names.
@@ -2013,6 +2016,7 @@ async fn host_info(
 
 /// What the environment's lock showed in a round.
 #[derive(Clone, Debug)]
+#[cfg_attr(test, derive(strum::EnumCount))]
 enum Lock {
     /// No process holds the environment's lock.
     Free,
@@ -2035,6 +2039,7 @@ impl Lock {
 
 /// What the system said in a round of the process of the daemon that was asked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(strum::EnumCount))]
 enum Process {
     /// The command has no identity of the process (always so on Windows), so none was read.
     NoIdentity,
@@ -2059,6 +2064,7 @@ impl Process {
 
 /// The process that the lock file names as a control daemon, in a round that read it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(strum::EnumCount))]
 enum Holder {
     /// The round did not read it.
     NotRead,
@@ -2341,6 +2347,7 @@ use answered::Answered;
 
 /// What answers at the environment's endpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(strum::EnumCount))]
 enum Endpoint {
     /// Nothing listens there.
     Nobody,
@@ -2372,6 +2379,7 @@ fn by_generation(asked: Option<ControllerGeneration>, reported: ControllerGenera
 /// What the exchange of a look gave: one value for each way it can end, from the address of the
 /// endpoint to the answer of `host.info`. [`label_of`] takes each to what answers at the endpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(strum::EnumCount))]
 enum Gave {
     /// The address of the endpoint could not be made, so nothing was tried.
     NoAddress,
@@ -5704,8 +5712,12 @@ mod tests {
     // request came to, walked, written into one file that the repository holds, and read by the
     // properties of the cases after it.
 
-    /// A set whose every value is listed by a chain: `after` has an arm for each value, so that a
-    /// value added to the set stops the build here until the walk takes it.
+    /// A set whose every value is listed by a chain: `after` has an arm for each value in turn.
+    /// For the eight sets of the product that the tables walk (`Lock`, `Process`, `Holder`,
+    /// `Endpoint`, `Request`, `Start`, `Before` and `Gave`), the case
+    /// `each_walk_sees_every_variant_of_its_set` compares the variants that a chain gives with
+    /// the compiler's count of them, so that a variant added to one of them fails that case until
+    /// the walk takes it.
     trait Every: Sized {
         fn first() -> Self;
         fn after(&self) -> Option<Self>;
@@ -6967,6 +6979,56 @@ mod tests {
             .collect();
         assert_eq!(made.iter().map(readings).collect::<Vec<_>>(), kept);
         assert!(made.len() < all.len());
+    }
+
+    /// The number of distinct variants that the walk of `T` gives, by `variant`.
+    fn variants_walked<T: Every, V: std::hash::Hash + Eq>(variant: impl Fn(&T) -> V) -> usize {
+        every::<T>()
+            .iter()
+            .map(variant)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    }
+
+    /// Each walk of a set of the product sees every variant of it: the number of distinct variants
+    /// that its chain gives is the compiler's count of the variants of the set. The look is none or
+    /// an endpoint.
+    #[test]
+    fn each_walk_sees_every_variant_of_its_set() {
+        use strum::EnumCount;
+
+        assert_eq!(variants_walked(std::mem::discriminant::<Lock>), Lock::COUNT);
+        assert_eq!(
+            variants_walked(std::mem::discriminant::<Process>),
+            Process::COUNT
+        );
+        assert_eq!(
+            variants_walked(std::mem::discriminant::<Holder>),
+            Holder::COUNT
+        );
+        assert_eq!(
+            variants_walked(std::mem::discriminant::<Request>),
+            Request::COUNT
+        );
+        assert_eq!(
+            variants_walked(std::mem::discriminant::<Start>),
+            Start::COUNT
+        );
+        assert_eq!(
+            variants_walked(std::mem::discriminant::<Before>),
+            Before::COUNT
+        );
+        assert_eq!(variants_walked(std::mem::discriminant::<Gave>), Gave::COUNT);
+        assert!(every::<Look>().iter().any(Option::is_none));
+        assert_eq!(
+            every::<Look>()
+                .iter()
+                .flatten()
+                .map(std::mem::discriminant)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            Endpoint::COUNT
+        );
     }
 
     // The properties of the end's decision, asserted over every row of the table. They are written
