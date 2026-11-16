@@ -691,8 +691,14 @@ impl Session {
         };
         // The fence is part of the state, not something the enabling leaves behind in memory: a
         // session reopened with privacy mode on must not start retaining again.
+        //
+        // The same reading raises the readers' fence: the output the spool still holds is owed a
+        // removal that the first maintenance pass makes, and until it has, or until a session that
+        // cannot read its state reads that privacy mode is off, no reader is told of a byte of it.
+        // To hide for a while a history that may not be private is the lesser harm.
         if privacy.is_enabled() || unresolved {
             history.stop_retaining();
+            history.set_discard_owed(true);
         }
         // The same reading decides whether facts are captured: a session that cannot say privacy
         // mode is off captures none.
@@ -4593,6 +4599,11 @@ impl Session {
             history: owed("history"),
             receipts: owed("receipts"),
         };
+        // The fence stands for as long as the removal is owed: a discard that met a write in
+        // flight, or left a segment it could not unlink, leaves the output where it was, and no
+        // reader is told of it.
+        self.history
+            .set_discard_owed(self.privacy_cleanup.history.is_some());
         Ok(enabling)
     }
 
@@ -4767,6 +4778,17 @@ impl Session {
                     if let Some(lane) = self.observation.as_ref() {
                         lane.set_private(self.privacy.is_enabled());
                     }
+                    if !self.privacy.is_enabled() {
+                        // The state reads as off: privacy mode was never on here, or its removal
+                        // finished before it was turned off, so what this session holds was never
+                        // private. The history and the receipts stay whole, retention starts again
+                        // as it does when privacy mode is turned off, and the fence falls.
+                        self.privacy_cleanup.history = None;
+                        self.privacy_cleanup.receipts = None;
+                        self.history.resume_retaining();
+                        self.history.set_discard_owed(false);
+                        return;
+                    }
                 }
                 // Still unreadable, or still no journal to read. Nothing below runs.
                 Some(Err(_)) | None => return,
@@ -4775,6 +4797,8 @@ impl Session {
         if self.privacy_cleanup.history.is_some() {
             let discarded = self.history.discard_retained();
             self.privacy_cleanup.history = discarded.left_behind;
+            self.history
+                .set_discard_owed(self.privacy_cleanup.history.is_some());
         }
         if self.privacy_cleanup.receipts.is_some() {
             match self
