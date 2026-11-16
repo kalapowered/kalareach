@@ -328,7 +328,12 @@ impl HomeLayout {
 
 /// The question that names the two profiles: each path as base64 of its UTF-8 bytes on a line of
 /// its own. Only classes that the older Windows edition has as well are used.
-const PROFILES_QUESTION: &str = "$utf8 = New-Object System.Text.UTF8Encoding $false; \
+///
+/// The encoder throws on a string that is not text (an unpaired surrogate in a Windows path would
+/// otherwise become a replacement character, and the install would write a profile that no shell
+/// reads), and the first error ends the question, which is then a question that did not answer.
+const PROFILES_QUESTION: &str = "$ErrorActionPreference = 'Stop'; \
+     $utf8 = New-Object System.Text.UTF8Encoding $false, $true; \
      foreach ($path in @($PROFILE.CurrentUserAllHosts, $PROFILE.CurrentUserCurrentHost)) { \
          [Console]::Out.WriteLine([Convert]::ToBase64String($utf8.GetBytes([string]$path))) }";
 
