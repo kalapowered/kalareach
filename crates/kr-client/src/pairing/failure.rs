@@ -146,6 +146,13 @@ pub struct PairingFailure {
     /// caps what it says all the same and never makes a timer from it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_after_seconds: Option<u64>,
+    /// Whether the attempt failed after the host had locked its invitation to it, so that the
+    /// invitation can no longer be used and the same code or text, brought in again, is refused. Only
+    /// an attempt that was under way through a rendezvous service, and failed on the way to the host,
+    /// says so: an attempt that never reached the host, a direct invitation whose dial was lost, and
+    /// one that was resumed after a restart do not. Sent only when it is true.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub invitation_spent: bool,
     /// What happened, for a log.
     #[serde(skip)]
     pub detail: Shown,
@@ -169,6 +176,7 @@ impl PairingFailure {
             tries_left: None,
             alternatives: Alternatives::none(),
             retry_after_seconds: None,
+            invitation_spent: false,
             detail: detail.into(),
         }
     }
@@ -200,6 +208,14 @@ impl PairingFailure {
                 )
             },
         }
+    }
+
+    /// The same failure, marked as one that came after the host had locked the invitation to the
+    /// attempt.
+    #[must_use]
+    pub const fn with_invitation_spent(mut self) -> Self {
+        self.invitation_spent = true;
+        self
     }
 
     /// The same failure, with the tries this device has left.
@@ -365,6 +381,26 @@ mod tests {
                 "kind": "relay_fault",
                 "tries_left": null,
                 "retry_after_seconds": 30,
+            })
+        );
+    }
+
+    /// KR-REQ-10.19: a failure says that its invitation is spent only when it is, and sends nothing
+    /// otherwise.
+    #[test]
+    fn a_failure_says_its_invitation_is_spent_only_when_it_is() {
+        let sent = |failure: PairingFailure| serde_json::to_value(failure).expect("ok");
+        let unreachable = || PairingFailure::new(FailureKind::HostUnreachable, "the dial was lost");
+        assert_eq!(
+            sent(unreachable()),
+            serde_json::json!({"kind": "host_unreachable", "tries_left": null})
+        );
+        assert_eq!(
+            sent(unreachable().with_invitation_spent()),
+            serde_json::json!({
+                "kind": "host_unreachable",
+                "tries_left": null,
+                "invitation_spent": true
             })
         );
     }

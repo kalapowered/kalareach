@@ -485,8 +485,17 @@ impl Pairing {
         // Nothing this device does for another host may close the endpoint the attempt uses.
         let _held = match within(WAIT_STEP, self.link.hold(&pending.network_config)).await {
             Ok(held) => held,
+            // The attempt was waiting for the owner, and this device cannot reach the host to ask
+            // whether the owner decided: what it knows is that it does not know.
             Err(error) => {
-                let failure = link_failed(&error, pending.tries_left);
+                let failure = PairingFailure::new(
+                    FailureKind::ApprovalUnknown,
+                    crate::shown!(
+                        "the host could not be reached to ask whether its owner approved this device: {}",
+                        error.said()
+                    ),
+                )
+                .with_tries(pending.tries_left);
                 return Some(ended(progress, Err(failure), mode, None));
             }
         };
@@ -670,17 +679,19 @@ impl Pairing {
         });
         let _held = within(WAIT_STEP, self.link.hold(&bundle.network_config))
             .await
-            .map_err(|error| link_failed(&error, tries))?;
+            .map_err(|error| link_failed(&error, tries).with_invitation_spent())?;
         let connection = within(
             WAIT_STEP,
             self.link.dial(&bundle.network_config, &bundle.endpoint_id),
         )
         .await
         .map_err(|error| {
-            match self.relay_failure(&error, &bundle.network_config, &bundle.endpoint_id) {
-                Some(failure) => failure.with_tries(tries),
-                None => link_failed(&error, tries),
-            }
+            let failure =
+                match self.relay_failure(&error, &bundle.network_config, &bundle.endpoint_id) {
+                    Some(failure) => failure.with_tries(tries),
+                    None => link_failed(&error, tries),
+                };
+            failure.with_invitation_spent()
         })?;
         // The live peer is the connection's own. kr-pairing refuses one that is not the bundle's
         // endpoint before this device offers anything on the connection.
@@ -700,7 +711,7 @@ impl Pairing {
                 .open_unpaired(&connection, &self.candidate.unpaired()),
         )
         .await
-        .map_err(|error| link_failed(&error, tries))?;
+        .map_err(|error| link_failed(&error, tries).with_invitation_spent())?;
         let selection = preauth.selection();
         // The transport has refused a selection that names another endpoint than the one that
         // answered, and kr-pairing refused a connection that is not the bundle's endpoint above.
