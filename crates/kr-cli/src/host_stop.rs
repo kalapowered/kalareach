@@ -405,6 +405,240 @@ fn done(said: &Shown, result: &Facts, json: bool, earlier: &Earlier) -> Completi
     Completion::Done
 }
 
+/// What a stop's request came to, where it was written.
+#[derive(Clone, Debug)]
+enum Request {
+    /// The daemon took the stop and answered.
+    Told,
+    /// The outcome is not known; the failure says why (its words).
+    MaybeAsked(Shown),
+}
+
+impl Request {
+    /// What the command knows of the request, for `--json`.
+    const fn knows(&self) -> Knows {
+        match self {
+            Self::Told => Knows::Told,
+            Self::MaybeAsked(_) => Knows::MaybeAsked,
+        }
+    }
+
+    /// What the request's failure said where whether the daemon took the stop is not known.
+    const fn not_known(&self) -> Option<&Shown> {
+        match self {
+            Self::Told => None,
+            Self::MaybeAsked(failure) => Some(failure),
+        }
+    }
+}
+
+/// How a result ends the command: its exit code, and so the failure that reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Exit {
+    /// Exit 0: the result is a success.
+    Done,
+    /// Exit 1: the command could not show that the environment is as it should be, and says what it
+    /// knows (the host is unavailable for now; a person runs the command again).
+    Unfinished,
+    /// Exit 1: a failure of the command's own, said in its words.
+    Failed,
+    /// Exit 3: the request could not be made, and the failure keeps its own words.
+    Unavailable,
+}
+
+impl Exit {
+    /// The failure that ends the command with this exit, with `message` as its words; none for a
+    /// success.
+    fn failure(self, message: Shown) -> Option<CliError> {
+        match self {
+            Self::Done => None,
+            Self::Unfinished => Some(CliError::Unfinished {
+                code: ErrorCode::EnvironmentUnavailable,
+                message,
+            }),
+            Self::Failed => Some(CliError::Other(message)),
+            Self::Unavailable => Some(CliError::HostUnavailable(message)),
+        }
+    }
+}
+
+/// What the command ends with in one place: the kind of sentence, the exit, and the `stop` member
+/// that `--json` carries. Each place has its own kinds, decided by one pure function of the
+/// readings that reach it.
+#[derive(Clone, Debug)]
+struct Said<Sentence> {
+    sentence: Sentence,
+    exit: Exit,
+    stop: Knows,
+}
+
+impl<Sentence> Said<Sentence> {
+    const fn new(sentence: Sentence, exit: Exit, stop: Knows) -> Self {
+        Self {
+            sentence,
+            exit,
+            stop,
+        }
+    }
+}
+
+/// Reports `message` with `exit`: a success where the exit is 0, and otherwise the failure that has
+/// that exit.
+fn conclude(
+    exit: Exit,
+    message: Shown,
+    result: &Facts,
+    json: bool,
+    earlier: &Earlier,
+) -> Completion {
+    match exit.failure(message.clone()) {
+        None => done(&message, result, json, earlier),
+        Some(error) => failed(error, result, json),
+    }
+}
+
+/// The kinds of sentence after a request that was written. A told stop and one whose outcome was
+/// not shown differ in the words ([`Request`]), not in the kind.
+#[derive(Clone, Debug)]
+enum AfterRequest {
+    /// The daemon ended and the environment is free: "Stopped ..." for a told stop, and what the
+    /// command knows for the other.
+    Stopped,
+    /// The daemon ended and another holds the environment (the process the lock file names, where
+    /// it names one).
+    Successor(Option<u64>),
+    /// The daemon has not ended: its process runs, or the daemon of the generation asked answers.
+    NotEnded,
+    /// The lock was free and the last look showed neither that the daemon runs nor that it had gone.
+    NotShown,
+    /// The process has gone and something that is not shown to be a daemon holds the environment.
+    StillHeld,
+    /// The lock could not be read: why.
+    Unlooked(Shown),
+}
+
+/// What the command ends with where the end is decided after a request that was written: `end` is
+/// what the last round showed. The exit is 0 only where the end is shown, and the `stop` member
+/// says `ended` only there.
+fn said_after_the_request(end: End, request: &Request) -> Said<AfterRequest> {
+    let asked = request.knows();
+    match end {
+        End::Gone => Said::new(AfterRequest::Stopped, Exit::Done, Knows::Ended),
+        End::Successor(successor) => {
+            Said::new(AfterRequest::Successor(successor), Exit::Done, Knows::Ended)
+        }
+        End::NotEnded(why, _answered) => match why {
+            Why::Running | Why::Answers => {
+                Said::new(AfterRequest::NotEnded, Exit::Unfinished, asked)
+            }
+            Why::NotShown => Said::new(AfterRequest::NotShown, Exit::Unfinished, asked),
+            Why::Held => Said::new(AfterRequest::StillHeld, Exit::Unfinished, asked),
+            Why::Unlooked(why) => Said::new(AfterRequest::Unlooked(why), Exit::Unfinished, asked),
+        },
+    }
+}
+
+/// The kinds of sentence where the request could not be made.
+#[derive(Clone, Debug)]
+enum BeforeRequest {
+    /// The daemon had ended (or another holds the environment now): the words are made already.
+    Ended { words: Shown, pid: Option<u64> },
+    /// A daemon holds the environment and does not answer.
+    HoldsAndSilent,
+    /// A connection was accepted and nothing answered within the bound.
+    Silent,
+    /// The failure keeps its own words: what makes that true.
+    Unmade(Unmade),
+}
+
+/// What the command ends with where the request could not be made: `lock_again` is the lock read
+/// once more, which only a failure with no end shown within the bound asks for.
+fn said_before_the_request(
+    before: Before,
+    lock_again: impl FnOnce() -> Lock,
+) -> Said<BeforeRequest> {
+    match before {
+        Before::Ended { said, pid } => Said::new(
+            BeforeRequest::Ended { words: said, pid },
+            Exit::Done,
+            Knows::Ended,
+        ),
+        Before::Silent { accepted } => match lock_again() {
+            Lock::Held => Said::new(
+                BeforeRequest::HoldsAndSilent,
+                Exit::Unfinished,
+                Knows::NotAsked,
+            ),
+            Lock::Free | Lock::Unreadable(_) => {
+                if accepted {
+                    Said::new(BeforeRequest::Silent, Exit::Unfinished, Knows::NotAsked)
+                } else {
+                    Said::new(
+                        BeforeRequest::Unmade(Unmade::NothingListening),
+                        Exit::Unavailable,
+                        Knows::NotAsked,
+                    )
+                }
+            }
+        },
+        Before::Answers(answered) => Said::new(
+            BeforeRequest::Unmade(Unmade::Answered(answered)),
+            Exit::Unavailable,
+            Knows::NotAsked,
+        ),
+        Before::OwnFault => Said::new(
+            BeforeRequest::Unmade(Unmade::OwnFault),
+            Exit::Unavailable,
+            Knows::NotAsked,
+        ),
+    }
+}
+
+/// What the first reach of the endpoint showed, where it ends the command with no wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Start {
+    /// A daemon answers and states another public major than this command.
+    OtherMajor,
+    /// Something accepted the connection and did not answer.
+    Silent,
+    /// Nothing listens at the endpoint.
+    NothingListening,
+}
+
+/// The kinds of sentence at the start.
+#[derive(Clone, Debug)]
+enum AtStart {
+    OtherMajor,
+    /// Nothing listens and the lock is free: no daemon runs.
+    NoDaemon,
+    /// A daemon holds the environment and does not answer.
+    HoldsAndSilent,
+    Silent,
+    /// The lock could not be read: why.
+    LockUnreadable(Shown),
+}
+
+/// What the command ends with at its start: `lock` is the environment's lock, read only where the
+/// decision needs it.
+fn said_at_the_start(start: &Start, lock: impl FnOnce() -> Lock) -> Said<AtStart> {
+    match start {
+        Start::OtherMajor => Said::new(AtStart::OtherMajor, Exit::Failed, Knows::NotAsked),
+        Start::Silent => match lock() {
+            Lock::Held => Said::new(AtStart::HoldsAndSilent, Exit::Unfinished, Knows::NotAsked),
+            Lock::Free | Lock::Unreadable(_) => {
+                Said::new(AtStart::Silent, Exit::Unfinished, Knows::NotAsked)
+            }
+        },
+        Start::NothingListening => match lock() {
+            Lock::Free => Said::new(AtStart::NoDaemon, Exit::Done, Knows::NotAsked),
+            Lock::Held => Said::new(AtStart::HoldsAndSilent, Exit::Unfinished, Knows::NotAsked),
+            Lock::Unreadable(why) => {
+                Said::new(AtStart::LockUnreadable(why), Exit::Failed, Knows::NotAsked)
+            }
+        },
+    }
+}
+
 /// The command, from the guard to the daemon's end.
 async fn stop(
     host: &HostPaths,
@@ -439,22 +673,33 @@ async fn stop(
     match startup::reach(&endpoint, startup::ANSWER_BOUND, &[]).await {
         Reached::Answered(listed) => {
             let Listed::Ours(client) = *listed else {
-                return Ok(failed(
-                    CliError::Other(shown!(
-                        "the control daemon for environment {} states another public major than \
-                         this command does. No stop was requested.",
-                        id
-                    )),
+                return Ok(at_the_start(
+                    &Start::OtherMajor,
+                    environment,
                     &none,
                     json,
+                    &earlier,
+                    startup::ANSWER_BOUND,
                 ));
             };
             Ok(stop_the_daemon(host, environment, *client, json, progress, &earlier).await)
         }
-        Reached::Silent => Ok(silent(environment, &none, json, startup::ANSWER_BOUND)),
-        Reached::Refused(error) if startup::nothing_listening(&error) => {
-            Ok(vacant(environment, &none, json, &earlier))
-        }
+        Reached::Silent => Ok(at_the_start(
+            &Start::Silent,
+            environment,
+            &none,
+            json,
+            &earlier,
+            startup::ANSWER_BOUND,
+        )),
+        Reached::Refused(error) if startup::nothing_listening(&error) => Ok(at_the_start(
+            &Start::NothingListening,
+            environment,
+            &none,
+            json,
+            &earlier,
+            startup::ANSWER_BOUND,
+        )),
         Reached::Refused(error) => {
             let operations = Real::of(host, &environment.paths, None);
             let before = greeting_failed(
@@ -581,105 +826,87 @@ pub fn records_said(environment: &EnvironmentPaths) -> Shown {
     }
 }
 
-/// Nothing listens at the endpoint: no daemon runs, or one holds the environment and has not begun
-/// to listen or has stopped listening.
-fn vacant(
+/// The words where nothing listens at the endpoint and the lock is free: no daemon runs. The
+/// records of earlier attempts that are still under way follow.
+fn no_daemon_said(environment: &KnownEnvironment) -> Shown {
+    let id = environment.environment_id;
+    let under_way: Vec<Shown> = attempt::recorded(&environment.paths)
+        .iter()
+        .filter(|recorded| recorded.standing() == Standing::UnderWay)
+        .map(|recorded| record_said(recorded, id))
+        .collect();
+    let tail = if under_way.is_empty() {
+        Shown::said("")
+    } else {
+        shown!(" {}", Shown::joined(under_way, " "))
+    };
+    shown!(
+        "No control daemon runs for environment {}. Nothing was stopped.{}",
+        id,
+        tail
+    )
+}
+
+/// The words where something accepted the connection and did not answer within `bound`.
+fn silent_said(id: EnvironmentId, bound: Duration) -> Shown {
+    shown!(
+        "the control daemon listening for environment {} accepted the connection and did not answer \
+         within {} seconds. No stop was requested. Run kr host stop again in a moment.",
+        id,
+        bound.as_secs()
+    )
+}
+
+/// The words where a daemon holds the environment and does not answer, so it may be starting or
+/// stopping.
+fn holds_and_is_silent_said(environment: &KnownEnvironment) -> Shown {
+    shown!(
+        "A control daemon holds environment {} and does not answer, so it may be starting or \
+         stopping. No stop was requested. Run kr host stop again in a moment. {}",
+        environment.environment_id,
+        how_to_end_the_holder(&environment.paths)
+    )
+}
+
+/// The words where the environment's lock could not be read at the start.
+fn lock_unreadable_said(id: EnvironmentId, why: &Shown) -> Shown {
+    shown!(
+        "whether a control daemon holds environment {} could not be read: {}. No stop was \
+         requested.",
+        id,
+        *why
+    )
+}
+
+/// The words where the daemon at the endpoint states another public major than this command.
+fn other_major_said(id: EnvironmentId) -> Shown {
+    shown!(
+        "the control daemon for environment {} states another public major than this command does. \
+         No stop was requested.",
+        id
+    )
+}
+
+/// Ends the command at its start, where the first reach of the endpoint shows what it does, by
+/// the decision of [`said_at_the_start`]. The lock is read only where the decision needs it.
+fn at_the_start(
+    start: &Start,
     environment: &KnownEnvironment,
     none: &Facts,
     json: bool,
     earlier: &Earlier,
+    bound: Duration,
 ) -> Completion {
     let id = environment.environment_id;
-    match lock_held(&environment.paths) {
-        Ok(false) => {
-            let under_way: Vec<Shown> = attempt::recorded(&environment.paths)
-                .iter()
-                .filter(|recorded| recorded.standing() == Standing::UnderWay)
-                .map(|recorded| record_said(recorded, id))
-                .collect();
-            let tail = if under_way.is_empty() {
-                Shown::said("")
-            } else {
-                shown!(" {}", Shown::joined(under_way, " "))
-            };
-            done(
-                &shown!(
-                    "No control daemon runs for environment {}. Nothing was stopped.{}",
-                    id,
-                    tail
-                ),
-                none,
-                json,
-                earlier,
-            )
-        }
-        Ok(true) => holds_and_is_silent(environment, none, json),
-        Err(error) => failed(
-            CliError::Other(shown!(
-                "whether a control daemon holds environment {} could not be read: {}. No stop \
-                 was requested.",
-                id,
-                error
-            )),
-            none,
-            json,
-        ),
-    }
-}
-
-/// Something accepted the connection and did not answer within `bound`.
-fn silent(environment: &KnownEnvironment, none: &Facts, json: bool, bound: Duration) -> Completion {
-    match lock_held(&environment.paths) {
-        Ok(true) => holds_and_is_silent(environment, none, json),
-        _ => failed(
-            CliError::Unfinished {
-                code: ErrorCode::EnvironmentUnavailable,
-                message: shown!(
-                    "the control daemon listening for environment {} accepted the connection and \
-                     did not answer within {} seconds. No stop was requested. Run kr host stop \
-                     again in a moment.",
-                    environment.environment_id,
-                    bound.as_secs()
-                ),
-            },
-            none,
-            json,
-        ),
-    }
-}
-
-/// The connect found nothing listening and the end was not shown in the bound: no connection was
-/// accepted, so the silence sentence ("accepted the connection and did not answer") is not said.
-/// Where the lock is held, a daemon holds the environment and does not answer, which is true; where
-/// it is not, the request could not be made.
-fn unaccepted(
-    environment: &KnownEnvironment,
-    none: &Facts,
-    json: bool,
-) -> std::result::Result<Completion, Unmade> {
-    match lock_held(&environment.paths) {
-        Ok(true) => Ok(holds_and_is_silent(environment, none, json)),
-        _ => Err(Unmade::NothingListening),
-    }
-}
-
-/// A daemon holds the environment and does not answer, so it may be starting or stopping.
-fn holds_and_is_silent(environment: &KnownEnvironment, none: &Facts, json: bool) -> Completion {
-    let id = environment.environment_id;
-    let ending = how_to_end_the_holder(&environment.paths);
-    failed(
-        CliError::Unfinished {
-            code: ErrorCode::EnvironmentUnavailable,
-            message: shown!(
-                "A control daemon holds environment {} and does not answer, so it may be starting \
-                 or stopping. No stop was requested. Run kr host stop again in a moment. {}",
-                id,
-                ending
-            ),
-        },
-        none,
-        json,
-    )
+    let said = said_at_the_start(start, || Lock::of(lock_held(&environment.paths)));
+    let message = match said.sentence {
+        AtStart::OtherMajor => other_major_said(id),
+        AtStart::NoDaemon => no_daemon_said(environment),
+        AtStart::HoldsAndSilent => holds_and_is_silent_said(environment),
+        AtStart::Silent => silent_said(id, bound),
+        AtStart::LockUnreadable(why) => lock_unreadable_said(id, &why),
+    };
+    conclude(said.exit, message, none, json, earlier)
 }
 
 /// What a person does if the process that holds the environment stays: the process the lock file
@@ -906,7 +1133,16 @@ async fn stop_the_daemon(
             return unmade_ended(before, &error, id, environment, &none, json, earlier);
         }
         Ok(Err(error)) => return failed(error, &none, json),
-        Err(_) => return silent(environment, &none, json, startup::ANSWER_BOUND),
+        Err(_) => {
+            return at_the_start(
+                &Start::Silent,
+                environment,
+                &none,
+                json,
+                earlier,
+                startup::ANSWER_BOUND,
+            );
+        }
     };
     // Who holds the environment, and which process that is, before anything is asked: a process
     // that has ended and not been collected is read as gone, and its number may be reused.
@@ -929,20 +1165,19 @@ async fn stop_the_daemon(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(marker);
 
-    let (knows, pid, unsettled, unknown) = match ask(&mut client, id, json, progress).await {
+    let (request, pid, unsettled) = match ask(&mut client, id, json, progress).await {
         Asked::Taken(result) => {
             progress.enter(Stage::Told);
             (
-                Knows::Told,
+                Request::Told,
                 Some(result.pid.get()),
                 Some(result.unsettled.get()),
-                None,
             )
         }
         Asked::Unknown(said) => {
             // The request may have left; the daemon is waited for as one that took it.
             progress.enter(Stage::Asked);
-            (Knows::MaybeAsked, None, None, Some(said))
+            (Request::MaybeAsked(said), None, None)
         }
         Asked::NotComposed { error } => {
             // The request was never made (it could not be composed, or the level's check refused
@@ -976,7 +1211,7 @@ async fn stop_the_daemon(
             return refused(&mut client, id, &info, error, &refusal, json).await;
         }
     };
-    if knows == Knows::Told {
+    if matches!(request, Request::Told) {
         let _ = progress.with_marker(|marker| marker.told());
     }
     drop(client);
@@ -987,53 +1222,30 @@ async fn stop_the_daemon(
     let old = holder
         .as_ref()
         .filter(|holder| pid.is_none_or(|answered| answered == holder.pid.get()));
-    let named = old.map(|old| old.pid.get());
     // For `--json`: the process the answer gave, and otherwise the one the lock file named.
     let pid = pid.or_else(|| holder.as_ref().map(|holder| holder.pid.get()));
     let operations = Real::of(host, &environment.paths, Some(info.generation));
     let ended = wait_for_the_end(&operations, old, END_BOUND).await;
-    let result = |knows| Facts {
-        knows,
+    let said = said_after_the_request(ended, &request);
+    let message = words_after_the_request(
+        &said.sentence,
+        &request,
+        &environment.paths,
+        id,
+        old,
+        unsettled,
+    );
+    // The record of the attempt is removed where the end is shown.
+    if said.exit == Exit::Done {
+        progress.remove_marker();
+    }
+    let facts = Facts {
+        knows: said.stop,
         pid,
         unsettled,
         records: none.records.clone(),
     };
-    // What the request came to: its failure where whether the daemon took it is not known.
-    let not_known = match (knows, unknown.as_ref()) {
-        (Knows::MaybeAsked, Some(failure)) => Some(failure),
-        _ => None,
-    };
-    match ended {
-        End::Gone => {
-            progress.remove_marker();
-            done(
-                &gone_said(id, named, not_known, unsettled),
-                &result(Knows::Ended),
-                json,
-                earlier,
-            )
-        }
-        End::Successor(successor) => {
-            progress.remove_marker();
-            done(
-                &successor_said(id, named, successor, unsettled),
-                &result(Knows::Ended),
-                json,
-                earlier,
-            )
-        }
-        End::NotEnded(why, _) => {
-            let message = not_ended_said(why, not_known, &environment.paths, id, old);
-            failed(
-                CliError::Unfinished {
-                    code: ErrorCode::EnvironmentUnavailable,
-                    message,
-                },
-                &result(knows),
-                json,
-            )
-        }
-    }
+    conclude(said.exit, message, &facts, json, earlier)
 }
 
 /// What the command says where it saw the daemon end after the request was written and no other
@@ -1071,21 +1283,23 @@ fn gone_said(
     )
 }
 
-/// What the command says where the wait for the end gave up at its bound with the request written:
-/// that the daemon has not ended only where the last round shows a sign of life, and otherwise what
-/// it knows.
-fn not_ended_said(
-    why: Why,
-    not_known: Option<&Shown>,
+/// What the command says after a request that was written, by the kind of sentence that
+/// [`said_after_the_request`] decided. The process of the daemon that was asked is named where it
+/// is known (`old`).
+fn words_after_the_request(
+    sentence: &AfterRequest,
+    request: &Request,
     environment: &EnvironmentPaths,
     id: EnvironmentId,
     old: Option<&ProcessStartIdentity>,
+    unsettled: Option<u64>,
 ) -> Shown {
-    match why {
-        Why::Held => still_held(environment, id),
-        Why::Unlooked(why) => unlooked(id, not_known, &why),
-        Why::NotShown => not_shown(id, not_known),
-        Why::Running | Why::Answers => {
+    let not_known = request.not_known();
+    let named = old.map(|old| old.pid.get());
+    match sentence {
+        AfterRequest::Stopped => gone_said(id, named, not_known, unsettled),
+        AfterRequest::Successor(successor) => successor_said(id, named, *successor, unsettled),
+        AfterRequest::NotEnded => {
             let what = match not_known {
                 Some(failure) => shown!(
                     "did not show whether it took the stop ({}), and it has not ended",
@@ -1095,6 +1309,9 @@ fn not_ended_said(
             };
             not_ended(environment, id, &what, old)
         }
+        AfterRequest::NotShown => not_shown(id, not_known),
+        AfterRequest::StillHeld => still_held(environment, id),
+        AfterRequest::Unlooked(why) => unlooked(id, not_known, why),
     }
 }
 
@@ -1221,7 +1438,8 @@ async fn ended_before_the_request(
 /// How the failure of the command's connection to the daemon came out, where it failed before the
 /// command could make its request.
 enum Before {
-    /// The daemon had ended: what the command says, and the process that it names.
+    /// The daemon had ended, or another holds the environment now: what the command says, and the
+    /// process that it names.
     Ended { said: Shown, pid: Option<u64> },
     /// A daemon's end can have caused the failure, and no end was shown within the bound, with no
     /// daemon answering the last look. `accepted` is whether a connection was accepted before the
@@ -1280,7 +1498,7 @@ async fn failed_before_the_request(
         Decided::Ended(ended) => {
             let pid = holder.map(|holder| holder.pid.get());
             Before::Ended {
-                said: ended_before_the_request_said(id, pid, ended, &Shown::ipc(error)),
+                said: ended_before_the_request_said(id, pid, &ended, &Shown::ipc(error)),
                 pid,
             }
         }
@@ -1316,10 +1534,11 @@ async fn host_info_failed(
     failed_before_the_request(operations, connection, holder, error, id, deadline).await
 }
 
-/// Ends the command by what a failed connection came to: with the daemon's end where it had
-/// ended, and as for a daemon that does not answer where no end was shown within the bound and no
-/// daemon answered the last look. It gives the answer where a daemon answered: the failure keeps its own
-/// words, and only an answer in hand builds those.
+/// Ends the command by what a failed connection came to, by the decision of
+/// [`said_before_the_request`]: with the daemon's end where it had ended, and as for a daemon that
+/// does not answer where no end was shown within the bound and no daemon answered the last look.
+/// It gives the cause where the failure keeps its own words (exit 3): a daemon answered, the
+/// failure is this side's own, or the connect found nothing listening and no lock is held.
 fn ended_by(
     before: Before,
     environment: &KnownEnvironment,
@@ -1327,20 +1546,33 @@ fn ended_by(
     json: bool,
     earlier: &Earlier,
 ) -> std::result::Result<Completion, Unmade> {
-    match before {
-        Before::Ended { said, pid } => {
+    let id = environment.environment_id;
+    let said = said_before_the_request(before, || Lock::of(lock_held(&environment.paths)));
+    match said.sentence {
+        BeforeRequest::Ended { words, pid } => {
             let facts = Facts {
-                knows: Knows::Ended,
+                knows: said.stop,
                 pid,
                 unsettled: None,
                 records: none.records.clone(),
             };
-            Ok(done(&said, &facts, json, earlier))
+            Ok(conclude(said.exit, words, &facts, json, earlier))
         }
-        Before::Silent { accepted: true } => Ok(silent(environment, none, json, END_BOUND)),
-        Before::Silent { accepted: false } => unaccepted(environment, none, json),
-        Before::Answers(answered) => Err(Unmade::Answered(answered)),
-        Before::OwnFault => Err(Unmade::OwnFault),
+        BeforeRequest::HoldsAndSilent => Ok(conclude(
+            said.exit,
+            holds_and_is_silent_said(environment),
+            none,
+            json,
+            earlier,
+        )),
+        BeforeRequest::Silent => Ok(conclude(
+            said.exit,
+            silent_said(id, END_BOUND),
+            none,
+            json,
+            earlier,
+        )),
+        BeforeRequest::Unmade(cause) => Err(cause),
     }
 }
 
@@ -1351,12 +1583,12 @@ fn ended_by(
 fn ended_before_the_request_said(
     id: EnvironmentId,
     old: Option<u64>,
-    ended: End,
+    ended: &End,
     why: &Shown,
 ) -> Shown {
     match ended {
-        End::Successor(successor) => successor_said(id, old, successor, None),
-        _ => {
+        End::Successor(successor) => successor_said(id, old, *successor, None),
+        End::Gone | End::NotEnded(..) => {
             let process = old.map_or_else(|| Shown::said(""), |pid| shown!(" (process {})", pid));
             shown!(
                 "The control daemon for environment {}{} ended, and this command could not make \
@@ -1629,6 +1861,201 @@ async fn host_info(
     }
 }
 
+/// What the environment's lock showed in a round.
+#[derive(Clone, Debug)]
+enum Lock {
+    /// No process holds the environment's lock.
+    Free,
+    /// A process holds the environment's lock. The reading does not say which, and not whether it
+    /// is a control daemon.
+    Held,
+    /// The lock could not be read: why, in this command's words.
+    Unreadable(Shown),
+}
+
+impl Lock {
+    fn of(read: std::result::Result<bool, Shown>) -> Self {
+        match read {
+            Ok(false) => Self::Free,
+            Ok(true) => Self::Held,
+            Err(why) => Self::Unreadable(why),
+        }
+    }
+}
+
+/// What the system said in a round of the process of the daemon that was asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Process {
+    /// The command has no identity of the process (always so on Windows), so none was read.
+    NoIdentity,
+    /// The process runs and its start identity matches.
+    Running,
+    /// The process has gone, or its number belongs to another process now.
+    Ended,
+    /// The system did not say whether the process runs: neither answer is established.
+    Unreadable,
+}
+
+impl Process {
+    fn of(state: Option<ProcessState>) -> Self {
+        match state {
+            None => Self::NoIdentity,
+            Some(ProcessState::Running) => Self::Running,
+            Some(ProcessState::Ended) => Self::Ended,
+            Some(ProcessState::Unknown { .. }) => Self::Unreadable,
+        }
+    }
+}
+
+/// The process that the lock file names as a control daemon, in a round that read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Holder {
+    /// The round did not read it.
+    NotRead,
+    /// It names none, or the process that it names is no process named kr-controller.
+    Nobody,
+    /// It names the process that was asked itself.
+    Asked,
+    /// It names another process (its number), named kr-controller.
+    Other(u64),
+}
+
+impl Holder {
+    fn of(named: Option<u64>, old: Option<&ProcessStartIdentity>) -> Self {
+        match named {
+            None => Self::Nobody,
+            Some(pid) if old.is_some_and(|old| old.pid.get() == pid) => Self::Asked,
+            Some(pid) => Self::Other(pid),
+        }
+    }
+}
+
+/// What one round of the wait read. The decision of what the round shows is one function of this
+/// value ([`what_the_round_shows`]), and which rounds make a look is another ([`look_wanted`]).
+#[derive(Clone, Debug)]
+struct Round {
+    lock: Lock,
+    process: Process,
+    holder: Holder,
+    /// What the look showed; none where the round made none.
+    look: Option<Endpoint>,
+    /// The process that the lock file named after a look that showed a daemon of another
+    /// generation, where it named one.
+    successor: Option<u64>,
+}
+
+/// Whether a round reads the process that the lock file names: where the lock is held and the
+/// process is gone or was not read, which is where a named process other than the asked one is a
+/// successor.
+fn holder_wanted(lock: &Lock, process: Process) -> bool {
+    match lock {
+        Lock::Held => match process {
+            Process::Ended | Process::NoIdentity => true,
+            Process::Running | Process::Unreadable => false,
+        },
+        Lock::Free | Lock::Unreadable(_) => false,
+    }
+}
+
+/// Whether a round makes a look at the endpoint. A look is made where the lock and the process
+/// leave the end undecided and a look can decide it: with the lock free and no usable reading of
+/// the process, and with the lock held and the process gone or not read, unless the lock file
+/// names another process that is a daemon (which is evidence of a successor with no look).
+fn look_wanted(lock: &Lock, process: Process, holder: Holder) -> bool {
+    match lock {
+        Lock::Free => match process {
+            Process::Ended | Process::Running => false,
+            Process::NoIdentity | Process::Unreadable => true,
+        },
+        Lock::Held => match process {
+            Process::Ended => match holder {
+                Holder::Other(_) => false,
+                Holder::NotRead | Holder::Nobody | Holder::Asked => true,
+            },
+            Process::NoIdentity => true,
+            Process::Running | Process::Unreadable => false,
+        },
+        Lock::Unreadable(_) => false,
+    }
+}
+
+/// What a round shows: the end (`End::Gone`, or `End::Successor`), nothing yet (none: the wait
+/// goes on) or, where the bound is reached, why the end is not shown. Every combination of what a
+/// round reads is an arm, with no catch-all arm over any of the readings, so that a new value of
+/// one is a compile error here until it is decided.
+///
+/// The principle is that the command says only what the round's own readings show:
+///
+/// - The end is shown by the process gone with the lock free; by the lock free and nobody
+///   listening where no usable reading of the process exists; and by a successor: another process
+///   that the lock file names as a daemon, or a daemon of another generation at the endpoint.
+/// - At the bound, a daemon of the generation asked answering the look is a sign that it has not
+///   ended and wins over every other reading. An answer with no proved generation is no such
+///   sign: it is kept as an answer at the endpoint (the second member of `End::NotEnded`) and the
+///   other readings decide why.
+fn what_the_round_shows(round: &Round, at_bound: bool) -> Option<End> {
+    match &round.lock {
+        Lock::Free => match round.process {
+            Process::Ended => Some(End::Gone),
+            Process::Running => bound_shows(round, at_bound, Why::Running),
+            Process::NoIdentity | Process::Unreadable => the_endpoint_decides(round, at_bound),
+        },
+        Lock::Held => match round.process {
+            Process::Ended => match round.holder {
+                Holder::Other(pid) => Some(End::Successor(Some(pid))),
+                Holder::NotRead | Holder::Nobody | Holder::Asked => {
+                    a_successor_by_the_endpoint(round, at_bound, Why::Held)
+                }
+            },
+            Process::Running | Process::Unreadable => bound_shows(round, at_bound, Why::Running),
+            Process::NoIdentity => a_successor_by_the_endpoint(round, at_bound, Why::Running),
+        },
+        Lock::Unreadable(why) => match round.process {
+            Process::NoIdentity | Process::Unreadable | Process::Ended => {
+                bound_shows(round, at_bound, Why::Unlooked(why.clone()))
+            }
+            Process::Running => bound_shows(round, at_bound, Why::Running),
+        },
+    }
+}
+
+/// With the lock free and no usable reading of the process, the look decides: nobody listening is
+/// the end, another generation is a successor, and anything else shows no end.
+fn the_endpoint_decides(round: &Round, at_bound: bool) -> Option<End> {
+    match round.look {
+        Some(Endpoint::Nobody) => Some(End::Gone),
+        Some(Endpoint::Another) => Some(End::Successor(round.successor)),
+        Some(Endpoint::Same(_) | Endpoint::Unproved(_) | Endpoint::Unclear) | None => {
+            bound_shows(round, at_bound, Why::NotShown)
+        }
+    }
+}
+
+/// With the lock held, a daemon of another generation at the endpoint is a successor, and
+/// anything else shows no end.
+fn a_successor_by_the_endpoint(round: &Round, at_bound: bool, why: Why) -> Option<End> {
+    match round.look {
+        Some(Endpoint::Another) => Some(End::Successor(round.successor)),
+        Some(Endpoint::Nobody | Endpoint::Same(_) | Endpoint::Unproved(_) | Endpoint::Unclear)
+        | None => bound_shows(round, at_bound, why),
+    }
+}
+
+/// What a round that shows no end shows at the bound, and nothing before it: `why` from the lock
+/// and the process, except where the look showed the daemon of the generation asked answering.
+fn bound_shows(round: &Round, at_bound: bool, why: Why) -> Option<End> {
+    if !at_bound {
+        return None;
+    }
+    Some(match round.look {
+        Some(Endpoint::Same(answered)) => End::NotEnded(Why::Answers, Some(answered)),
+        Some(Endpoint::Unproved(answered)) => End::NotEnded(why, Some(answered)),
+        Some(Endpoint::Nobody | Endpoint::Another | Endpoint::Unclear) | None => {
+            End::NotEnded(why, None)
+        }
+    })
+}
+
 /// Waits up to `bound` for the daemon that was asked to stop to end.
 ///
 /// Where the daemon's process identity is known (`old`) it has ended only when that process has
@@ -1644,11 +2071,8 @@ async fn host_info(
 /// before it: the install lock's wait, a look at the endpoint and the pause between two rounds. A
 /// look that cannot be made leaves the daemon as not ended.
 ///
-/// At the bound the command says what its LAST round read: the daemon of the generation asked
-/// answering the round's look is [`Why::Answers`], whatever else the round read (an answer with no
-/// proved generation is no such sign, and is kept as the answer of the last look); otherwise a held lock or a running process is
-/// [`Why::Running`]; and with no usable reading of the process a free lock and a last look that
-/// showed nothing is [`Why::NotShown`], and an unreadable lock is [`Why::Unlooked`].
+/// Each round reads the lock, the process, where it matters the process that the lock file names,
+/// and, where [`look_wanted`] says so, the endpoint; [`what_the_round_shows`] says what that is.
 async fn wait_for_the_end(
     operations: &impl Operations,
     old: Option<&ProcessStartIdentity>,
@@ -1657,89 +2081,36 @@ async fn wait_for_the_end(
     let deadline = tokio::time::Instant::now() + bound;
     let left = || deadline.saturating_duration_since(tokio::time::Instant::now());
     loop {
-        let held = operations.held(left()).await;
-        let unlooked = held.as_ref().err().cloned();
-        let process = old.map(|old| operations.process_state(old));
-        let old_gone = matches!(process, Some(ProcessState::Ended));
-        // No usable reading of the process: none was possible, or the system did not say.
-        let no_reading = old.is_none() || matches!(process, Some(ProcessState::Unknown { .. }));
-        // What this round shows of the daemon: the lock's reading and the look are this round's.
-        let lock_free = matches!(held, Ok(false));
-        let mut last_look = None;
-        let seen = match (held, process) {
-            (Ok(false), Some(ProcessState::Ended)) => Some(End::Gone),
-            (Ok(true), Some(ProcessState::Ended)) => {
-                let (successor, look) = successor_of(operations, old, left()).await;
-                last_look = look;
-                successor.map(End::Successor)
-            }
-            // The process runs, or the system did not say and the lock is held or unreadable: the
-            // daemon has not ended.
-            (_, Some(ProcessState::Running))
-            | (Ok(true) | Err(_), Some(ProcessState::Unknown { .. })) => None,
-            // No usable reading of the process, and the lock is free: the endpoint decides.
-            (Ok(false), None | Some(ProcessState::Unknown { .. })) => {
-                let look = operations.look(left()).await;
-                last_look = Some(look);
-                match look {
-                    Endpoint::Nobody => Some(End::Gone),
-                    Endpoint::Another => Some(End::Successor(operations.named_daemon())),
-                    Endpoint::Same(_) | Endpoint::Unproved(_) | Endpoint::Unclear => None,
-                }
-            }
-            (Ok(true), None) => {
-                let (successor, look) = successor_of(operations, None, left()).await;
-                last_look = look;
-                successor.map(End::Successor)
-            }
-            (Err(_), _) => None,
+        let lock = Lock::of(operations.held(left()).await);
+        let process = Process::of(old.map(|old| operations.process_state(old)));
+        let holder = if holder_wanted(&lock, process) {
+            Holder::of(operations.named_daemon(), old)
+        } else {
+            Holder::NotRead
         };
-        if let Some(seen) = seen {
-            return seen;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            // Something answered the last look, with a proved generation or without one.
-            let answered = match last_look {
-                Some(Endpoint::Same(answered) | Endpoint::Unproved(answered)) => Some(answered),
-                Some(Endpoint::Nobody | Endpoint::Another | Endpoint::Unclear) | None => None,
-            };
-            let why = match (unlooked, old_gone, last_look) {
-                // The last look showed a daemon of the generation asked answering.
-                (_, _, Some(Endpoint::Same(_))) => Why::Answers,
-                // The lock could not be read, and no process is shown to run: there is no usable
-                // reading of the process, or it has gone.
-                (Some(why), _, _) if no_reading || old_gone => Why::Unlooked(why),
-                (None, true, _) => Why::Held,
-                // The lock is free and the last look did not show the daemon: no sign of life.
-                _ if no_reading && lock_free => Why::NotShown,
-                _ => Why::Running,
-            };
-            return End::NotEnded(why, answered);
+        let look = if look_wanted(&lock, process, holder) {
+            Some(operations.look(left()).await)
+        } else {
+            None
+        };
+        let successor = if matches!(look, Some(Endpoint::Another)) {
+            operations.named_daemon()
+        } else {
+            None
+        };
+        let round = Round {
+            lock,
+            process,
+            holder,
+            look,
+            successor,
+        };
+        let at_bound = tokio::time::Instant::now() >= deadline;
+        if let Some(end) = what_the_round_shows(&round, at_bound) {
+            return end;
         }
         operations.pause(LOOK_EVERY.min(left())).await;
     }
-}
-
-/// Whether the environment is held by a daemon that is not the one that was asked, and the number
-/// of the process the lock file names as that daemon where it names one: a live process named
-/// kr-controller other than `old`, or a daemon of another generation that answers. Nothing else
-/// proves a successor. With it, the look that it made, where it made one: the round keeps it.
-async fn successor_of(
-    operations: &impl Operations,
-    old: Option<&ProcessStartIdentity>,
-    within: Duration,
-) -> (Option<Option<u64>>, Option<Endpoint>) {
-    let named = operations
-        .named_daemon()
-        .filter(|named| old.is_none_or(|old| *named != old.pid.get()));
-    if named.is_some() && old.is_some() {
-        return (Some(named), None);
-    }
-    let look = operations.look(within).await;
-    (
-        (look == Endpoint::Another).then(|| operations.named_daemon()),
-        Some(look),
-    )
 }
 
 /// The evidence that a daemon answered.
@@ -2489,6 +2860,22 @@ mod tests {
     /// The process of the daemon that was asked, as the cases name it.
     fn asked_process() -> ProcessStartIdentity {
         identity::ended_process_identity(4000)
+    }
+
+    /// What the command says where the wait ended at its bound as `why`, after a request that was
+    /// told (`not_known` is none) or whose outcome was not shown (`not_known` is its failure).
+    fn not_ended_said(
+        why: Why,
+        not_known: Option<&Shown>,
+        environment: &EnvironmentPaths,
+        id: EnvironmentId,
+        old: Option<&ProcessStartIdentity>,
+    ) -> Shown {
+        let request = not_known.map_or(Request::Told, |failure| {
+            Request::MaybeAsked(failure.clone())
+        });
+        let said = said_after_the_request(End::NotEnded(why, None), &request);
+        words_after_the_request(&said.sentence, &request, environment, id, old, None)
     }
 
     /// How a wait came out, in words a failed assertion shows.
@@ -3797,6 +4184,108 @@ mod tests {
             let ended = arm(&supplied, old, true).await;
             assert_eq!(arm_said(ended.as_ref()), "the request's failure", "{old:?}");
         }
+    }
+
+    /// The text of the function `name` in `source`, from its `fn` to the brace that closes it, with
+    /// comments blanked.
+    fn function_text(source: &str, name: &str) -> String {
+        let at = source
+            .find(&format!("fn {name}("))
+            .or_else(|| source.find(&format!("fn {name}<")))
+            .unwrap_or_else(|| panic!("no function {name}"));
+        let rest = &source[at..];
+        let open = rest.find('{').expect("a body");
+        let mut depth = 0usize;
+        let mut end = rest.len();
+        for (index, byte) in rest.bytes().enumerate().skip(open) {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = index + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        rest[..end]
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The places in `text` where a lone `_` stands that is not the placeholder for the payload of
+    /// a variant of this command's own sets (`Variant(_)`): a catch-all arm, a wildcard in a tuple,
+    /// or a placeholder inside `Some`, `Ok` or `Err`, which would hide a set behind it.
+    fn catch_alls(text: &str) -> Vec<String> {
+        let bytes = text.as_bytes();
+        let word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+        let mut found = Vec::new();
+        for (at, byte) in bytes.iter().enumerate() {
+            if *byte != b'_'
+                || (at > 0 && word(bytes[at - 1]))
+                || word(*bytes.get(at + 1).unwrap_or(&b' '))
+            {
+                continue;
+            }
+            let inside_a_variant =
+                at > 1 && bytes[at - 1] == b'(' && bytes.get(at + 1) == Some(&b')') && {
+                    let name_end = at - 1;
+                    let name_start = text[..name_end]
+                        .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .map_or(0, |index| index + 1);
+                    let name = &text[name_start..name_end];
+                    name.chars().next().is_some_and(char::is_uppercase)
+                        && !["Some", "Ok", "Err"].contains(&name)
+                };
+            if !inside_a_variant {
+                let from = text[..at].rfind('\n').map_or(0, |index| index + 1);
+                let to = text[at..].find('\n').map_or(text.len(), |index| at + index);
+                found.push(text[from..to].trim().to_owned());
+            }
+        }
+        found
+    }
+
+    /// The functions that decide what a round shows, which rounds look, and what is said where the
+    /// end is decided hold no catch-all arm over any reading's set, so that a value added to a set
+    /// stops the build here until it is decided.
+    const TOTAL_FUNCTIONS: [&str; 9] = [
+        "what_the_round_shows",
+        "the_endpoint_decides",
+        "a_successor_by_the_endpoint",
+        "bound_shows",
+        "look_wanted",
+        "holder_wanted",
+        "said_after_the_request",
+        "said_before_the_request",
+        "said_at_the_start",
+    ];
+
+    #[test]
+    fn the_decisions_hold_no_catch_all_arm() {
+        let source = include_str!("host_stop.rs");
+        for name in TOTAL_FUNCTIONS {
+            let text = function_text(source, name);
+            assert!(text.lines().count() > 3, "{name} was read whole");
+            assert_eq!(catch_alls(&text), Vec::<String>::new(), "{name}");
+        }
+        // The scan refuses a catch-all arm, a wildcard in a tuple and a placeholder inside `Some`,
+        // and lets the payload of a variant of the sets stand.
+        for refused in [
+            "match look { Endpoint::Nobody => 1, _ => 2 }",
+            "match (lock, process) { (Lock::Free, _) => 1, (Lock::Held, Process::Ended) => 2 }",
+            "match look { Some(_) => 1, None => 2 }",
+            "match look { Endpoint::Same(_) => 1, other => 2 } if x { _ }",
+        ] {
+            assert!(!catch_alls(refused).is_empty(), "{refused}");
+        }
+        assert!(
+            catch_alls("match look { Endpoint::Same(_) | Endpoint::Unproved(_) => 1 }").is_empty()
+        );
     }
 
     /// A lock that is held and a process that cannot be read (no identity, as on Windows) is a
