@@ -463,19 +463,10 @@ async fn stop(
                 tokio::time::Instant::now() + END_BOUND,
             )
             .await;
-            let ended = ended_by(before, environment, &none, json, &earlier);
-            Ok(ended.unwrap_or_else(|| {
-                failed(
-                    CliError::HostUnavailable(shown!(
-                        "the control daemon for environment {} could not be reached: {}. No stop \
-                         was requested.",
-                        id,
-                        Shown::ipc(&error)
-                    )),
-                    &none,
-                    json,
-                )
-            }))
+            Ok(match ended_by(before, environment, &none, json, &earlier) {
+                Ok(completion) => completion,
+                Err(answered) => failed(unreached(id, &error, answered), &none, json),
+            })
         }
     }
 }
@@ -746,9 +737,8 @@ enum Asked {
     Unknown(Shown),
     /// The daemon refused, and its word is that nothing was done.
     Refused(ProtocolError),
-    /// The request could not be made: nothing was sent. `closed` is whether the daemon closed the
-    /// connection, which a daemon does when it goes.
-    NotComposed { why: Shown, closed: bool },
+    /// The request could not be made: nothing was sent. `error` is the failure of composing it.
+    NotComposed { error: kr_ipc::IpcError },
 }
 
 /// Whether a failure of the connection is the daemon's close of it, which a daemon does when it
@@ -783,10 +773,7 @@ async fn ask(
     let mutation = match composed {
         Ok(mutation) => mutation,
         Err(error) => {
-            return Asked::NotComposed {
-                closed: closed_by_the_daemon(&error),
-                why: Shown::ipc(&error),
-            };
+            return Asked::NotComposed { error };
         }
     };
     // Set before the request is written: an interrupt from here on may find it taken.
@@ -876,9 +863,14 @@ async fn stop_the_daemon(
                 tokio::time::Instant::now() + END_BOUND,
             )
             .await;
-            let ended = ended_by(before, environment, &none, json, earlier);
-            return ended
-                .unwrap_or_else(|| failed(unmade_request(id, &Shown::ipc(&error)), &none, json));
+            return match ended_by(before, environment, &none, json, earlier) {
+                Ok(completion) => completion,
+                Err(answered) => failed(
+                    unmade_request(id, &Shown::ipc(&error), answered),
+                    &none,
+                    json,
+                ),
+            };
         }
         Ok(Err(error)) => return failed(error, &none, json),
         Err(_) => return silent(environment, &none, json, startup::ANSWER_BOUND),
@@ -919,33 +911,32 @@ async fn stop_the_daemon(
             progress.enter(Stage::Asked);
             (Knows::MaybeAsked, None, None, Some(said))
         }
-        Asked::NotComposed { why, closed } => {
+        Asked::NotComposed { error } => {
             // The request was never made, so nothing left and there is no stop to wait for. The
             // daemon may have gone meanwhile, as it does when another command's stop has taken
-            // effect: its end is looked for once, within the one deadline. A daemon that stays is
-            // the unmade request's failure. The deadline counts from the failure.
+            // effect: its end is decided as for any failure before the request, within the one
+            // deadline, which counts from the failure. A daemon that answered a look is the unmade
+            // request's failure; where none answered, the end is proved or it is not shown.
             let deadline = tokio::time::Instant::now() + END_BOUND;
             progress.remove_marker();
-            let named = holder.as_ref().map(|holder| holder.pid.get());
             let operations = Real::of(host, &environment.paths, Some(info.generation));
-            if let Some(ended) =
-                ended_before_the_request(&operations, client, holder.as_ref(), closed, deadline)
-                    .await
-            {
-                let facts = Facts {
-                    knows: Knows::Ended,
-                    pid: named,
-                    unsettled: None,
-                    records: none.records.clone(),
-                };
-                return done(
-                    &ended_before_the_request_said(id, named, ended, &why),
-                    &facts,
+            let before = failed_before_the_request(
+                &operations,
+                client,
+                holder.as_ref(),
+                &error,
+                id,
+                deadline,
+            )
+            .await;
+            return match ended_by(before, environment, &none, json, earlier) {
+                Ok(completion) => completion,
+                Err(answered) => failed(
+                    unmade_request(id, &Shown::ipc(&error), answered),
+                    &none,
                     json,
-                    earlier,
-                );
-            }
-            return failed(unmade_request(id, &why), &none, json);
+                ),
+            };
         }
         Asked::Refused(error) => {
             // Nothing was taken, so an interrupt from here on has nothing to say but that.
@@ -1040,9 +1031,20 @@ async fn stop_the_daemon(
     }
 }
 
-/// The failure of a request that could not be made while the daemon stays: what was not made and
-/// that the stop was not asked.
-fn unmade_request(id: EnvironmentId, why: &Shown) -> CliError {
+/// The failure of a greeting that a daemon answers with a failure: that the daemon could not be
+/// reached and that no stop was requested. A daemon's answer is the proof, as for an unmade request.
+fn unreached(id: EnvironmentId, error: &kr_ipc::IpcError, _answered: Answered) -> CliError {
+    CliError::HostUnavailable(shown!(
+        "the control daemon for environment {} could not be reached: {}. No stop was requested.",
+        id,
+        Shown::ipc(error)
+    ))
+}
+
+/// The failure of a request that could not be made while a daemon answers: what was not made and
+/// that the stop was not asked. A daemon's answer is the proof that it stays, and nothing builds
+/// this failure without one.
+fn unmade_request(id: EnvironmentId, why: &Shown, _answered: Answered) -> CliError {
     CliError::HostUnavailable(shown!(
         "kr host stop could not make its request for the control daemon of environment {}: {}. \
          Nothing was sent, and nothing was stopped.",
@@ -1051,12 +1053,23 @@ fn unmade_request(id: EnvironmentId, why: &Shown) -> CliError {
     ))
 }
 
-/// Where the request could not be made, whether the daemon had ended when it could not be: the end,
-/// where the daemon's process has gone and the environment's lock is free or another control
-/// daemon holds it. A daemon that closed the connection is going, and a listener that is gone is
-/// waited for to its end within the one deadline, once. A daemon that did not close it and still
-/// answers at its endpoint stays, and nothing is waited for. A daemon that has not ended by the
-/// deadline is the failure's, and so is one whose end cannot be looked at. The deadline is the
+/// What the end's decision came to where a request could not be made.
+enum Decided {
+    /// The daemon had ended: its process has gone and the environment's lock is free or another
+    /// control daemon holds it.
+    Ended(End),
+    /// The end is not shown within the bound, and no daemon answered.
+    NotShown,
+    /// A daemon answered a look. This is the only result that leads to exit 3, and it holds the
+    /// answer.
+    Answers(Answered),
+}
+
+/// Decides, where the request could not be made, whether the daemon had ended when it could not be.
+/// A daemon that closed the connection is going and is waited for to its end within the one
+/// deadline, once. A daemon that did not close it is looked at once first, for as long as the
+/// deadline leaves, and one that answers stays: nothing is waited for. Where no daemon answered, the
+/// end is proved or it is not shown in the bound; there is no other result. The deadline is the
 /// caller's, set before the look, so that the look and the wait together stay inside it.
 ///
 /// `connection` is the command's connection to the daemon, which is let go before anything is
@@ -1067,19 +1080,24 @@ async fn ended_before_the_request(
     old: Option<&ProcessStartIdentity>,
     closed: bool,
     deadline: tokio::time::Instant,
-) -> Option<End> {
+) -> Decided {
     // Where the platform keeps a pipe instance for as long as a handle to it is open, a daemon
     // that has gone stays at its endpoint for a command that holds its end: every new connection
     // finds the pipe busy, so no look sees the end, and a new daemon cannot create the pipe's
     // first instance.
     drop(connection);
-    if !closed && operations.look(startup::ANSWER_BOUND).await == Endpoint::Same {
-        return None;
+    let left = || deadline.saturating_duration_since(tokio::time::Instant::now());
+    let first = if closed {
+        Endpoint::Unclear
+    } else {
+        operations.look(startup::ANSWER_BOUND.min(left())).await
+    };
+    if let Endpoint::Same(answered) = first {
+        return Decided::Answers(answered);
     }
-    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-    match wait_for_the_end(operations, old, left).await {
-        End::NotEnded(_) => None,
-        ended => Some(ended),
+    match wait_for_the_end(operations, old, left()).await {
+        End::NotEnded(_) => Decided::NotShown,
+        ended => Decided::Ended(ended),
     }
 }
 
@@ -1090,15 +1108,17 @@ enum Before {
     Ended { said: Shown, pid: Option<u64> },
     /// The daemon closed the connection and was not shown to have ended within the bound.
     Silent,
-    /// The connection failed some other way, or the daemon still answers: the failure keeps its
-    /// own words.
-    Stays,
+    /// A daemon answered, by a look or by a reply that cannot be used: the failure keeps its own
+    /// words, with exit 3. It holds the answer.
+    Answers(Answered),
 }
 
 /// Decides what a failure of the connection before the command's request was made came to, as the
 /// arm for a request that could not be made decides it: by the daemon's end, looked for within
-/// `deadline`. A daemon that closed the connection is going and is waited for; any other failure
-/// is looked at once, and the daemon that still answers leaves the failure its own words.
+/// `deadline`. A daemon's own reply that cannot be used is an answer. Otherwise a daemon that closed
+/// the connection, or a frame that the close cut, is waited for; any other failure is looked at
+/// once first. A daemon that answers a look leaves the failure its own words; where none answered,
+/// the end is proved or it is not shown in the bound.
 async fn failed_before_the_request(
     operations: &impl Operations,
     connection: impl Sized,
@@ -1107,23 +1127,25 @@ async fn failed_before_the_request(
     id: EnvironmentId,
     deadline: tokio::time::Instant,
 ) -> Before {
+    if let Some(answered) = Answered::of_reply(error) {
+        drop(connection);
+        return Before::Answers(answered);
+    }
     let closed = closed_by_the_daemon(error);
     match ended_before_the_request(operations, connection, holder, closed, deadline).await {
-        Some(ended) => {
+        Decided::Ended(ended) => {
             let pid = holder.map(|holder| holder.pid.get());
             Before::Ended {
                 said: ended_before_the_request_said(id, pid, ended, &Shown::ipc(error)),
                 pid,
             }
         }
-        None if closed => Before::Silent,
-        None => Before::Stays,
+        Decided::NotShown => Before::Silent,
+        Decided::Answers(answered) => Before::Answers(answered),
     }
 }
 
-/// The command's greeting of the daemon failed with `error`: what the failure came to. Only a
-/// closed peer, or a frame that the close cut, says that a daemon is ending; a rejection, a
-/// mismatch or a fault of another kind keeps its words and nothing is looked at.
+/// The command's greeting of the daemon failed with `error`: what the failure came to.
 async fn greeting_failed(
     operations: &impl Operations,
     error: &kr_ipc::IpcError,
@@ -1131,9 +1153,6 @@ async fn greeting_failed(
     id: EnvironmentId,
     deadline: tokio::time::Instant,
 ) -> Before {
-    if !closed_by_the_daemon(error) {
-        return Before::Stays;
-    }
     failed_before_the_request(operations, (), holder, error, id, deadline).await
 }
 
@@ -1153,14 +1172,15 @@ async fn host_info_failed(
 
 /// Ends the command by what a failed connection came to: with the daemon's end where it had
 /// ended, and as for a daemon that does not answer where it closed the connection and was not
-/// shown to have ended. It gives none where the failure keeps its own words.
+/// shown to have ended. It gives the answer where a daemon answered: the failure keeps its own
+/// words, and only an answer in hand builds those.
 fn ended_by(
     before: Before,
     environment: &KnownEnvironment,
     none: &Facts,
     json: bool,
     earlier: &Earlier,
-) -> Option<Completion> {
+) -> std::result::Result<Completion, Answered> {
     match before {
         Before::Ended { said, pid } => {
             let facts = Facts {
@@ -1169,10 +1189,10 @@ fn ended_by(
                 unsettled: None,
                 records: none.records.clone(),
             };
-            Some(done(&said, &facts, json, earlier))
+            Ok(done(&said, &facts, json, earlier))
         }
-        Before::Silent => Some(silent(environment, none, json, END_BOUND)),
-        Before::Stays => None,
+        Before::Silent => Ok(silent(environment, none, json, END_BOUND)),
+        Before::Answers(answered) => Err(answered),
     }
 }
 
@@ -1488,7 +1508,7 @@ async fn wait_for_the_end(
             (Ok(false), None) => match operations.look(left()).await {
                 Endpoint::Nobody => Some(End::Gone),
                 Endpoint::Another => Some(End::Successor(operations.named_daemon())),
-                Endpoint::Same | Endpoint::Unclear => None,
+                Endpoint::Same(_) | Endpoint::Unclear => None,
             },
             (Ok(true), None) => successor_of(operations, None, left())
                 .await
@@ -1527,13 +1547,56 @@ async fn successor_of(
     (operations.look(within).await == Endpoint::Another).then(|| operations.named_daemon())
 }
 
+/// The evidence that a daemon answered.
+mod answered {
+    use kr_ipc::IpcError;
+    use kr_protocol::ids::ControllerGeneration;
+
+    /// What shows that a daemon answered: its answer to a look (the generation that it reported),
+    /// or its reply to the greeting that cannot be used. Nothing else builds one, so no result that
+    /// says "a host still answers" can be made without an answer in hand.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) struct Answered {
+        /// The generation that the answering daemon reported; none for an unusable reply.
+        generation: Option<ControllerGeneration>,
+    }
+
+    impl Answered {
+        /// The answer of a look: a daemon reported `generation`.
+        pub(super) const fn of_look(generation: ControllerGeneration) -> Self {
+            Self {
+                generation: Some(generation),
+            }
+        }
+
+        /// The daemon's own reply, where `error` is one: a frame that cannot be read, a message of
+        /// another kind, a version that does not fit, or a rejection. A closure or a fault of the
+        /// socket is no reply.
+        pub(super) fn of_reply(error: &IpcError) -> Option<Self> {
+            matches!(
+                error,
+                IpcError::Frame(_)
+                    | IpcError::UnexpectedMessage(_)
+                    | IpcError::VersionMismatch { .. }
+                    | IpcError::PeerRejected { .. }
+                    | IpcError::PeerUnknown { .. }
+                    | IpcError::PeerAccountRejected { .. }
+            )
+            .then_some(Self { generation: None })
+        }
+    }
+}
+
+use answered::Answered;
+
 /// What answers at the environment's endpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Endpoint {
     /// Nothing listens there.
     Nobody,
-    /// A daemon of the generation that was asked answers.
-    Same,
+    /// A daemon of the generation that was asked answers, or one answers where the generation is
+    /// not known.
+    Same(Answered),
     /// A daemon of another generation answers.
     Another,
     /// Something listens and does not answer, or the look could not be made.
@@ -1562,7 +1625,7 @@ async fn endpoint_look(
                         Ok(now) if generation.is_some_and(|asked| now.generation != asked) => {
                             Endpoint::Another
                         }
-                        Ok(_) => Endpoint::Same,
+                        Ok(now) => Endpoint::Same(Answered::of_look(now.generation)),
                         Err(_) => Endpoint::Unclear,
                     },
                     _ => Endpoint::Unclear,
@@ -2238,7 +2301,11 @@ mod tests {
         closed: bool,
     ) -> Option<End> {
         let deadline = tokio::time::Instant::now() + END_BOUND;
-        ended_before_the_request(supplied, supplied.connection(), old, closed, deadline).await
+        match ended_before_the_request(supplied, supplied.connection(), old, closed, deadline).await
+        {
+            Decided::Ended(end) => Some(end),
+            Decided::NotShown | Decided::Answers(_) => None,
+        }
     }
 
     /// Where the connection was not closed and a daemon of the same start answers at the first
@@ -2247,7 +2314,7 @@ mod tests {
     async fn a_daemon_of_the_same_start_at_the_first_look_gives_the_failure_at_once() {
         let process = asked_process();
         for old in [None, Some(&process)] {
-            let supplied = Supplied::new().look(vec![at_once(Endpoint::Same)]);
+            let supplied = Supplied::new().look(vec![at_once(Endpoint::Same(an_answer()))]);
             let ended = arm(&supplied, old, false).await;
             assert_eq!(arm_said(ended.as_ref()), "the request's failure", "{old:?}");
             assert_eq!(
@@ -2265,7 +2332,7 @@ mod tests {
     /// to the end of the one deadline where it still answers, and found ended where it has gone.
     #[tokio::test(start_paused = true)]
     async fn a_closed_connection_is_waited_for_with_no_look_before_the_wait() {
-        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same)]);
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same(an_answer()))]);
         let ended = arm(&supplied, None, true).await;
         assert_eq!(arm_said(ended.as_ref()), "the request's failure");
         let calls = supplied.calls();
@@ -2442,7 +2509,7 @@ mod tests {
     /// its deadline as not ended and running. A supplied end could not show this.
     #[tokio::test(start_paused = true)]
     async fn a_daemon_that_still_answers_in_every_round_is_not_ended_at_the_deadline() {
-        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same)]);
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same(an_answer()))]);
         let ended = wait_for_the_end(&supplied, None, END_BOUND).await;
         assert_eq!(said(&ended), "not ended, running");
         assert!(supplied.looks() > 100, "the wait looked round after round");
@@ -2451,7 +2518,7 @@ mod tests {
         // With an identity the process is read in every round, and a process that runs is the
         // daemon that has not ended, whatever answers at the endpoint.
         let process = asked_process();
-        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same)]);
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same(an_answer()))]);
         let ended = wait_for_the_end(&supplied, Some(&process), END_BOUND).await;
         assert_eq!(said(&ended), "not ended, running");
         assert_eq!(supplied.looks(), 0, "a process that runs needs no look");
@@ -2491,7 +2558,7 @@ mod tests {
             let supplied = Supplied::new()
                 .held(vec![at_once(held)])
                 .process(vec![at_once(state.clone())])
-                .look(vec![at_once(Endpoint::Same)]);
+                .look(vec![at_once(Endpoint::Same(an_answer()))]);
             let ended = wait_for_the_end(&supplied, Some(&process), END_BOUND).await;
             assert_eq!(said(&ended), expected, "{state:?}");
         }
@@ -2517,7 +2584,7 @@ mod tests {
             .look(vec![at_once(Endpoint::Another)]);
         let ended = wait_for_the_end(&supplied, Some(&process), END_BOUND).await;
         assert_eq!(said(&ended), "successor None");
-        let supplied = held_ended().look(vec![at_once(Endpoint::Same)]);
+        let supplied = held_ended().look(vec![at_once(Endpoint::Same(an_answer()))]);
         let ended = wait_for_the_end(&supplied, Some(&process), END_BOUND).await;
         assert_eq!(
             said(&ended),
@@ -2535,11 +2602,11 @@ mod tests {
         for (held, look, expected) in [
             (Ok(false), Endpoint::Nobody, "gone"),
             (Ok(false), Endpoint::Another, "successor None"),
-            (Ok(false), Endpoint::Same, "not ended, running"),
+            (Ok(false), Endpoint::Same(an_answer()), "not ended, running"),
             (Ok(false), Endpoint::Unclear, "not ended, running"),
             (Ok(true), Endpoint::Another, "successor None"),
             (Ok(true), Endpoint::Nobody, "not ended, running"),
-            (Ok(true), Endpoint::Same, "not ended, running"),
+            (Ok(true), Endpoint::Same(an_answer()), "not ended, running"),
             (
                 Err(Shown::said("the lock could not be taken")),
                 Endpoint::Nobody,
@@ -2569,7 +2636,7 @@ mod tests {
         match before {
             Before::Ended { said, pid } => format!("ended ({pid:?}): {said}"),
             Before::Silent => "silent".to_owned(),
-            Before::Stays => "answers".to_owned(),
+            Before::Answers(_) => "answers".to_owned(),
         }
     }
 
@@ -2586,6 +2653,11 @@ mod tests {
              command could not make its request for it: {}. This command sent nothing.",
             Shown::ipc(error)
         )
+    }
+
+    /// The answer of a daemon of the first generation to a look.
+    fn an_answer() -> Answered {
+        Answered::of_look(ControllerGeneration::new(1))
     }
 
     /// A frame that the daemon's end cut: the end of the stream, or a reset, inside a frame.
@@ -2639,7 +2711,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_greeting_that_fails_on_the_socket_is_judged_by_one_look() {
         let id = an_environment();
-        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same)]);
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same(an_answer()))]);
         let before = greeting_failed(
             &supplied,
             &a_fault_of_the_socket(),
@@ -2689,7 +2761,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_greeting_closed_by_a_daemon_that_does_not_end_is_silence_at_the_deadline() {
         let process = asked_process();
-        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same)]);
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same(an_answer()))]);
         let before = greeting_failed(
             &supplied,
             &kr_ipc::IpcError::PeerClosed,
@@ -2741,7 +2813,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_host_info_that_fails_on_the_socket_is_judged_by_one_look() {
         let id = an_environment();
-        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same)]);
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same(an_answer()))]);
         let before = host_info_failed(
             &supplied,
             supplied.connection(),
@@ -2782,7 +2854,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_host_info_closed_by_a_daemon_that_does_not_end_is_silence_at_the_deadline() {
         let process = asked_process();
-        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same)]);
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same(an_answer()))]);
         let before = host_info_failed(
             &supplied,
             supplied.connection(),
@@ -2826,7 +2898,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_greeting_cut_inside_a_frame_by_a_daemon_that_does_not_end_is_silence() {
         let process = asked_process();
-        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same)]);
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same(an_answer()))]);
         let before = greeting_failed(
             &supplied,
             &a_frame_cut_by_the_end(),
@@ -2848,7 +2920,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_host_info_cut_inside_a_frame_is_waited_for_as_a_closed_peer_is() {
         let process = asked_process();
-        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same)]);
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same(an_answer()))]);
         let before = host_info_failed(
             &supplied,
             supplied.connection(),
@@ -2932,7 +3004,7 @@ mod tests {
         let earlier = Earlier::read(&environment.paths);
         let none = Facts::none(Vec::new());
         match ended_by(Before::Silent, &environment, &none, true, &earlier) {
-            Some(Completion::Reported(error)) => {
+            Ok(Completion::Reported(error)) => {
                 assert_eq!(error.exit_code(), 1);
                 let said = error.to_string();
                 assert!(
@@ -2949,7 +3021,7 @@ mod tests {
     /// The first look takes what is left of the deadline where that is less than its own bound.
     #[tokio::test(start_paused = true)]
     async fn the_first_look_takes_what_is_left_of_the_deadline() {
-        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same)]);
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same(an_answer()))]);
         let before = host_info_failed(
             &supplied,
             supplied.connection(),
@@ -2975,7 +3047,7 @@ mod tests {
     async fn a_daemon_that_answers_a_look_keeps_exit_3_and_the_unmade_requests_words() {
         let id = an_environment();
         let fault = a_fault_of_the_socket();
-        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same)]);
+        let supplied = Supplied::new().look(vec![at_once(Endpoint::Same(an_answer()))]);
         let before = host_info_failed(
             &supplied,
             supplied.connection(),
@@ -2986,7 +3058,7 @@ mod tests {
         )
         .await;
         assert_eq!(before_said(&before), "answers");
-        let error = unmade_request(id, &Shown::ipc(&fault));
+        let error = unmade_request(id, &Shown::ipc(&fault), an_answer());
         assert_eq!(error.exit_code(), 3);
         assert!(
             error
@@ -3148,7 +3220,7 @@ mod tests {
             earlier: Mutex::new(Vec::new()),
         };
         match ask(&mut client, id, true, &progress).await {
-            Asked::NotComposed { closed, .. } => closed,
+            Asked::NotComposed { error } => closed_by_the_daemon(&error),
             _ => panic!("the request could be composed"),
         }
     }
