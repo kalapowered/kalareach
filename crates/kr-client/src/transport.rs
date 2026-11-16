@@ -162,7 +162,10 @@ pub trait ControlTransport: Send + Sync + std::fmt::Debug {
     /// Returns [`ClientError::ConnectionEnded`] when the receive side is already claimed.
     fn claim_receiver(&self) -> Result<()>;
 
-    /// Reads the next control frame, or `None` when the peer ended the stream.
+    /// Reads the next control frame, or `None` when the stream ended without a failure: the peer
+    /// finished it at a frame's boundary on a network connection, or this side closed the
+    /// connection. A stream that fails is an error that carries what the transport said, and the
+    /// local link reports the peer's end at a frame's boundary as such an error too.
     ///
     /// Only the holder of the claim calls this.
     fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>>;
