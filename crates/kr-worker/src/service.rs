@@ -5363,6 +5363,28 @@ impl WorkerService {
                 reach: owed.reach.then(owed.revision, &notice.reach),
             }),
         };
+        drop(authority);
+        // A fence that installed the revision between the read above and the record above has
+        // already run the step that follows a fence and clears what it covers, and found nothing
+        // to clear. Read again, with the authority state let go, and clear here what the installed
+        // revision covers, by the same rule that step uses. A fence that installs after this read
+        // clears it itself, because the record is already made.
+        let installed = self.runtime.input().lock().revision();
+        if let Some(installed) = installed
+            && installed.get() >= notice.revision.get()
+        {
+            let mut authority = self
+                .authority
+                .lock()
+                .expect("the authority lock is not poisoned");
+            if authority
+                .owed
+                .as_ref()
+                .is_some_and(|owed| owed.revision.get() <= installed.get())
+            {
+                authority.owed = None;
+            }
+        }
         Ok(())
     }
 
