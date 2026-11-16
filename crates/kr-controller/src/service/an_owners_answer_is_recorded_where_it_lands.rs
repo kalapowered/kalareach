@@ -24,7 +24,7 @@ use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ActionId, ActorId};
 use kr_protocol::pairing::{ConfirmationChannel, SensitiveAction};
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable};
+use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable, TimestampMs};
 
 use super::a_result_the_lease_ended_over::{
     Presenter, connected_under_a_lease_that_can_be_presented_again,
@@ -72,6 +72,11 @@ struct Found {
     copied: bool,
     answers: i64,
     actions: i64,
+    /// The answer's time as its row holds it, where the row exists.
+    row_answered_at_ms: Option<i64>,
+    /// The wall readings before the answer began and after it ended: the time it records lies
+    /// between them.
+    window: (u64, u64),
 }
 
 fn making_exclusive() -> ConfirmationDisplay {
@@ -211,6 +216,7 @@ async fn answered_with(
     // The end of the feed's locked ask, where a bound that moves inside the transaction is stopped.
     let inside = matches!(ends, Ends::TheBoundMovesInside)
         .then(|| controller.pause_after_the_record_asks_the_feed());
+    let before = kr_ipc::now_ms().get();
     let answering = tokio::task::spawn_blocking({
         let owner = Arc::clone(&owner);
         move || {
@@ -260,6 +266,7 @@ async fn answered_with(
         }
     }
     let (answered, copied) = answering.await.expect("the answer ends");
+    let after = kr_ipc::now_ms().get();
     Found {
         answered,
         confirmation,
@@ -274,15 +281,55 @@ async fn answered_with(
             "SELECT COUNT(*) FROM pairing_actions WHERE action_id = ?1",
             action.0.get().as_bytes().as_slice(),
         ),
+        row_answered_at_ms: row_time(&parts.temp, confirmation),
+        window: (before, after),
     }
 }
 
+/// The time the acceptance's row holds, where the row exists.
+fn row_time(
+    temp: &kr_ipc::testing::TempHost,
+    confirmation: kr_protocol::ids::ConfirmationId,
+) -> Option<i64> {
+    match registry(temp).query_row(
+        "SELECT answered_at_ms FROM owner_confirmations WHERE confirmation_id = ?1",
+        [confirmation.get().as_bytes().as_slice()],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(at) => Some(at),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(error) => panic!("the acceptance's time is read: {error}"),
+    }
+}
+
+/// The reply of an accepted answer, compared whole: the challenge's identity, the channel the
+/// proof arrived through, and the time the row of the acceptance holds. That time is the wall
+/// reading of the moment the host recorded the answer, so it is also found between the readings
+/// taken before the answer began and after it ended.
 fn recorded(found: &Found) {
+    recorded_through(found, ConfirmationChannel::LocalBootstrapTerminal);
+}
+
+/// [`recorded`] for an answer whose proof arrived through `channel`.
+fn recorded_through(found: &Found, channel: ConfirmationChannel) {
     let answered = found.answered.as_ref().expect("the answer is accepted");
-    assert_eq!(answered.confirmation_id, found.confirmation);
+    let at = found
+        .row_answered_at_ms
+        .expect("the acceptance's row holds a time");
+    let at = u64::try_from(at).expect("a time after the epoch");
+    assert!(
+        (found.window.0..=found.window.1).contains(&at),
+        "the recorded time {at} lies between {} and {}",
+        found.window.0,
+        found.window.1
+    );
     assert_eq!(
-        answered.channel,
-        ConfirmationChannel::LocalBootstrapTerminal
+        answered,
+        &OwnerConfirmationCompleteResult {
+            confirmation_id: found.confirmation,
+            channel,
+            answered_at_ms: TimestampMs::new(at),
+        }
     );
     assert!(!found.copied, "the answer was recorded here, not copied");
     assert_eq!(found.answers, 1, "the acceptance is recorded once");
@@ -478,6 +525,7 @@ async fn answered_by_an_owner_device(raised: bool) -> Found {
     );
     let caller = controller.local_caller(door.actor_id()).landed(landing());
     let (arrived, go) = controller.pause_after_the_record_asks_the_feed();
+    let before = kr_ipc::now_ms().get();
     let answering = tokio::task::spawn_blocking({
         let owner = Arc::clone(&owner);
         move || {
@@ -517,6 +565,7 @@ async fn answered_by_an_owner_device(raised: bool) -> Found {
     }
     go.send(()).expect("the record goes on");
     let (answered, copied) = answering.await.expect("the answer ends");
+    let after = kr_ipc::now_ms().get();
     if let Some(raising) = raising {
         raising.await.expect("the raise ends once the record has");
     }
@@ -534,6 +583,8 @@ async fn answered_by_an_owner_device(raised: bool) -> Found {
             "SELECT COUNT(*) FROM pairing_actions WHERE action_id = ?1",
             action.0.get().as_bytes().as_slice(),
         ),
+        row_answered_at_ms: row_time(&parts.temp, confirmation),
+        window: (before, after),
     }
 }
 
@@ -545,10 +596,7 @@ async fn answered_by_an_owner_device(raised: bool) -> Found {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_answer_with_an_owner_devices_proof_meets_a_feed_refusal_raised_in_the_last_wait() {
     let control = answered_by_an_owner_device(false).await;
-    let answered = control.answered.as_ref().expect("the answer is accepted");
-    assert_eq!(answered.confirmation_id, control.confirmation);
-    assert_eq!(answered.channel, ConfirmationChannel::OwnerDevicePresence);
-    assert_eq!(control.answers, 1, "the acceptance is recorded once");
+    recorded_through(&control, ConfirmationChannel::OwnerDevicePresence);
     let found = answered_by_an_owner_device(true).await;
     let ControllerError::PermissionDenied { detail } = refused(&found) else {
         panic!("the answer is refused as the feed refuses the device's standing");
