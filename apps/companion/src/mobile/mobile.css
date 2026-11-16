@@ -696,9 +696,11 @@
 }
 
 /*
- * The pressed look: on the words of the link that a press starts on or near, from the press's start
- * to its end. The link's box and the lines around it are the page's own, so nothing moves. Which
- * link a tap on plain text near its words opens is decided by `useLinkPress`, not here.
+ * The pressed look: on the words of the link that a touch or a pen opens. It starts at the press where
+ * the press is on the link's own element, and at the click where the press is on the text near the
+ * link; it ends a moment after the click. The link's box and the lines around it are the page's own,
+ * so nothing moves. Which link a tap on plain text near its words opens is decided by `useLinkPress`,
+ * not here.
  */
 .m-node .md-link[data-pressed] .md-link-label {
   border-radius: 2px;

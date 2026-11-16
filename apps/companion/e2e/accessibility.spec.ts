@@ -953,7 +953,7 @@ test.describe('a tap on the plain text near a link of a message', () => {
       await expect.poll(() => pressedLooks(page), 'the pressed look after a pointer cancel with no move').toBe(0)
       expect(await held(), 'the pointer ended by a cancel after no move').toEqual({ moves: 0, ends: ['pointercancel'] })
 
-      // A held touch and a scroll: 3 px keep the look (the link still wins the press's point), 300 px take it off.
+      // A held touch on the link's own words and a scroll: 3 px keep the look (the link still wins the press's point), 300 px take it off.
       await touch('touchStart')
       expect(await pressedLooks(page), 'the pressed look of a second held touch').toBe(1)
       await scrollBy(3)
@@ -1257,8 +1257,8 @@ function expectReach(area: Area, words: Words, pane: { left: number; right: numb
  *   page opened, and none where it opened none.
  * - The look at the press is none where the pointer down names plain text, and the named link where it names
  *   a link (the browser's own element, retargeted or not); a control lights nothing.
- * - A pointer down on a link whose click names another link or a control is reported as a stop: the plan
- *   rules that no such tap exists, and the build says so where it finds one.
+ * - A pointer down on a link whose click names another link or a control is reported as a stop: no such
+ *   tap is expected, and the case says so where it finds one.
  */
 function lookDisagrees(made: { clicks: Clicked[]; opened: string[]; lit: (string | null)[]; litAtClick: (string | null)[]; presses: Look[] }): string | null {
   const problems: string[] = []
@@ -1306,7 +1306,7 @@ interface Area {
   readonly taps: number
   /** Cross taps that opened another link, or the link more than once. */
   readonly different: string[]
-  /** Cross taps whose click named plain text, so the page's handler decided, at which the look at the press and the open at the release differed. */
+  /** Cross taps whose click named plain text, so the page's handler decided, at which the look at the click and the page's open differed. */
   readonly unlike: string[]
   /** Cross taps whose click the browser sent to an element, at which the look lit another link than that one. */
   readonly conflicts: string[]
@@ -1350,8 +1350,8 @@ const extentsOf = (area: Area): string => `row ${String(area.width)} px, column 
  * says for each side whether it did or whether the pane limited it (no step beyond the last lattice line fits
  * in the pane, so no unlit outer line was measured there): a lit point on the lattice's own boundary with room
  * for a step beyond it fails the case. At a point where the click names
- * plain text the page's handler decides, and the look at the press is the open at the release; where the
- * click names an element the browser decides, and the look lit nothing or that same link.
+ * plain text the page's handler decides, and the look at the click is the link that it opens; where the
+ * click names an element the browser decides, and the look at the click is that link or none.
  */
 async function areaOf(page: Page, href: string, words: Words, size: number): Promise<Area> {
   const pane = await paneBox(page)

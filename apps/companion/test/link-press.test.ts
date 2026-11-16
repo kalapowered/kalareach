@@ -1156,7 +1156,7 @@ describe('a scroll under a held press', () => {
       expect(lives(), 'the press where the button lies under the first point and not under the finger').toBe(false)
     })
 
-    it('keeps the look and the press where the lit link’s own element comes under the point, and the engine’s click on the element opens it once', () => {
+    it('keeps the press where the link’s own element comes under the point, and lights the link at the click that names it, which the engine opens once', () => {
       const { pane, text, links } = between(words)
       start(pane)
       clock(100)
