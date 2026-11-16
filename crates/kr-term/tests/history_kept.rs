@@ -681,19 +681,21 @@ fn a_blank_row_that_holds_a_link_is_given_up_when_a_narrower_screen_rebuilds_it(
     let mut engine = engine(20, 4);
     engine.set_history_kept(false);
     feed(&mut engine, &printed("while", 0, 20));
-    // The link covers all twenty columns, so the row the narrower screen is handed back is as wide as
-    // the screen was and wider than the screen is now, and the grid rebuilds it.
+    // The link covers all twenty columns of the bottom row, so the row the narrower screen is handed
+    // back is as wide as the screen was and wider than the screen is now, and the grid rebuilds it.
+    // It is the newest row on the screen, so no younger marked row stands below it to give it up
+    // when it leaves: only the rebuilt row's own mark does.
     feed(
         &mut engine,
         &format!(
-            "\x1b]8;;https://link.example/\x1b\\{}\x1b]8;;\x1b\\\r\n",
+            "\x1b]8;;https://link.example/\x1b\\{}\x1b]8;;\x1b\\",
             " ".repeat(20)
         ),
     );
     engine.set_history_kept(true);
 
     engine.resize(GridSize::new(10, 4), 0).expect("narrower");
-    feed(&mut engine, &printed("after", 0, 30));
+    feed(&mut engine, &format!("\r\n{}", printed("after", 0, 30)));
 
     assert!(
         engine.grid().link_census().links.is_empty(),
