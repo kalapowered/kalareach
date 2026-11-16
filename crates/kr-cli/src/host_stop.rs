@@ -269,6 +269,14 @@ impl Which {
         }
     }
 
+    /// The command as the record of an attempt names it.
+    pub(crate) const fn attempt(self) -> attempt::Command {
+        match self {
+            Self::Stop => attempt::Command::Stop,
+            Self::Restart => attempt::Command::Restart,
+        }
+    }
+
     /// What a refusal of the guard says of the sessions meanwhile.
     const fn sessions(self) -> &'static str {
         match self {
@@ -1054,35 +1062,56 @@ pub(crate) async fn ask(
     }
 }
 
-/// A daemon answered the hello: asks it to stop, and waits for it to end.
-async fn stop_the_daemon(
+/// What a stop came to once the daemon was seen to end. `kr host stop` says it, and `kr host
+/// restart` goes on to the start.
+pub(crate) struct Stopped {
+    /// `None` where the environment is free, and the process the lock file names as the control
+    /// daemon that holds it where another has taken it.
+    pub(crate) successor: Option<Option<u64>>,
+    /// The process that was waited for, where it was named.
+    pub(crate) named: Option<u64>,
+    /// For `--json`: the process of the answer, and otherwise the one the lock file named.
+    pub(crate) pid: Option<u64>,
+    /// The creates that did not settle, where the answer arrived.
+    pub(crate) unsettled: Option<u64>,
+    /// Where the request could not be made and the daemon had ended all the same: why it could
+    /// not be made.
+    pub(crate) unmade: Option<Shown>,
+    /// The generation of the daemon that ended.
+    pub(crate) generation: ControllerGeneration,
+}
+
+/// A daemon answered the hello: asks it to stop, and waits for it to end. Everything that is not
+/// the end of the daemon is the command's own result, said here; the end is returned.
+pub(crate) async fn ask_to_stop(
+    which: Which,
     host: &HostPaths,
     environment: &KnownEnvironment,
     daemon: Daemon,
     json: bool,
     progress: &Progress,
     begun: &Begun,
-) -> Completion {
-    let which = Which::Stop;
+) -> std::result::Result<Stopped, Completion> {
     let id = environment.environment_id;
     let none = begun.none.clone();
-    let earlier = &begun.earlier;
     let Daemon {
         mut client,
         info,
         holder,
     } = daemon;
-    let marker = match Marker::begin(&environment.paths, attempt::Command::Stop, holder.clone()) {
+    let marker = match Marker::begin(&environment.paths, which.attempt(), holder.clone()) {
         Ok(marker) => marker,
         Err(error) => {
-            return failed(
+            return Err(failed(
                 CliError::Other(shown!(
-                    "kr host stop could not record its attempt: {}. No stop was requested.",
-                    Shown::ipc(&error)
+                    "{} could not record its attempt: {}. {}",
+                    which.command(),
+                    Shown::ipc(&error),
+                    which.nothing_asked()
                 )),
                 &none,
                 json,
-            );
+            ));
         }
     };
     *progress
@@ -1128,30 +1157,29 @@ async fn stop_the_daemon(
             )
             .await
             {
-                let facts = Facts {
-                    knows: Knows::Ended,
+                return Ok(Stopped {
+                    successor: match ended {
+                        End::Successor(successor) => Some(successor),
+                        _ => None,
+                    },
+                    named,
                     pid: named,
                     unsettled: None,
-                    records: none.records.clone(),
-                    started: None,
-                };
-                return done(
-                    &ended_before_the_request_said(id, named, ended, &why),
-                    &facts,
-                    json,
-                    earlier,
-                );
+                    unmade: Some(why),
+                    generation: info.generation,
+                });
             }
-            return failed(
+            return Err(failed(
                 CliError::HostUnavailable(shown!(
-                    "kr host stop could not make its request for the control daemon of \
-                     environment {}: {}. Nothing was sent, and nothing was stopped.",
+                    "{} could not make its request for the control daemon of environment {}: {}. \
+                     Nothing was sent, and nothing was stopped.",
+                    which.command(),
                     id,
                     why
                 )),
                 &none,
                 json,
-            );
+            ));
         }
         Asked::Refused(error) => {
             // Nothing was taken, so an interrupt from here on has nothing to say but that.
@@ -1161,7 +1189,7 @@ async fn stop_the_daemon(
                 knows: Knows::Refused,
                 ..none
             };
-            return refused(&mut client, id, &info, error, &refusal, json).await;
+            return Err(refused(&mut client, id, &info, error, &refusal, json).await);
         }
     };
     if knows == Knows::Told {
@@ -1184,37 +1212,20 @@ async fn stop_the_daemon(
         pid,
         unsettled,
         records: none.records.clone(),
-        started: None,
+        started: none.started,
     };
     match ended {
-        End::Gone => {
-            progress.remove_marker();
-            let cut = creates_under_way(unsettled);
-            let process = named.map_or_else(|| Shown::said(""), |pid| shown!(" (process {})", pid));
-            done(
-                &shown!(
-                    "Stopped the control daemon for environment {}{}. No session was stopped: its \
-                     workers keep running, a local attach keeps working, and the next daemon finds \
-                     the sessions again. Paired devices' connections close until a daemon runs.{} Run \
-                     kr host restart to start one where a start is chosen.",
-                    id,
-                    process,
-                    cut
-                ),
-                &result(Knows::Ended),
-                json,
-                earlier,
-            )
-        }
-        End::Successor(successor) => {
-            progress.remove_marker();
-            done(
-                &successor_said(id, named, successor, unsettled),
-                &result(Knows::Ended),
-                json,
-                earlier,
-            )
-        }
+        End::Gone | End::Successor(_) => Ok(Stopped {
+            successor: match ended {
+                End::Successor(successor) => Some(successor),
+                _ => None,
+            },
+            named,
+            pid,
+            unsettled,
+            unmade: None,
+            generation: info.generation,
+        }),
         End::NotEnded(why) => {
             // What the request came to: its failure where whether the daemon took it is not known.
             let not_known = match (knows, unknown.as_ref()) {
@@ -1235,16 +1246,81 @@ async fn stop_the_daemon(
                     not_ended(which, &environment.paths, id, &what, old)
                 }
             };
-            failed(
+            Err(failed(
                 CliError::Unfinished {
                     code: ErrorCode::EnvironmentUnavailable,
                     message,
                 },
                 &result(knows),
                 json,
-            )
+            ))
         }
     }
+}
+
+/// `kr host stop`, from the answering daemon to the end: asks, waits, and says the end.
+async fn stop_the_daemon(
+    host: &HostPaths,
+    environment: &KnownEnvironment,
+    daemon: Daemon,
+    json: bool,
+    progress: &Progress,
+    begun: &Begun,
+) -> Completion {
+    let id = environment.environment_id;
+    let stopped = match ask_to_stop(
+        Which::Stop,
+        host,
+        environment,
+        daemon,
+        json,
+        progress,
+        begun,
+    )
+    .await
+    {
+        Ok(stopped) => stopped,
+        Err(reported) => return reported,
+    };
+    progress.remove_marker();
+    let Stopped {
+        successor,
+        named,
+        pid,
+        unsettled,
+        unmade,
+        ..
+    } = stopped;
+    let said = match (unmade, successor) {
+        (Some(why), successor) => ended_before_the_request_said(id, named, successor, &why),
+        (None, Some(successor)) => successor_said(id, named, successor, unsettled),
+        (None, None) => shown!(
+            "Stopped the control daemon for environment {}{}. No session was stopped: its \
+             workers keep running, a local attach keeps working, and the next daemon finds the \
+             sessions again. Paired devices' connections close until a daemon runs.{} Run kr host \
+             restart to start one where a start is chosen.",
+            id,
+            process_said(named),
+            creates_under_way(unsettled)
+        ),
+    };
+    done(
+        &said,
+        &Facts {
+            knows: Knows::Ended,
+            pid,
+            unsettled,
+            records: begun.none.records.clone(),
+            started: None,
+        },
+        json,
+        &begun.earlier,
+    )
+}
+
+/// ` (process N)` where the process is known, and nothing otherwise.
+pub(crate) fn process_said(pid: Option<u64>) -> Shown {
+    pid.map_or_else(|| Shown::said(""), |pid| shown!(" (process {})", pid))
 }
 
 /// Where the request could not be made, whether the daemon had ended when it could not be: the end,
@@ -1281,27 +1357,24 @@ async fn ended_before_the_request(
 fn ended_before_the_request_said(
     id: EnvironmentId,
     old: Option<u64>,
-    ended: End,
+    successor: Option<Option<u64>>,
     why: &Shown,
 ) -> Shown {
-    match ended {
-        End::Successor(successor) => successor_said(id, old, successor, None),
-        _ => {
-            let process = old.map_or_else(|| Shown::said(""), |pid| shown!(" (process {})", pid));
-            shown!(
-                "The control daemon for environment {}{} ended, and this command could not make \
-                 its request for it: {}. This command sent nothing.",
-                id,
-                process,
-                *why
-            )
-        }
+    match successor {
+        Some(successor) => successor_said(id, old, successor, None),
+        None => shown!(
+            "The control daemon for environment {}{} ended, and this command could not make its \
+             request for it: {}. This command sent nothing.",
+            id,
+            process_said(old),
+            *why
+        ),
     }
 }
 
 /// What the creates that the daemon's stop went on without add to a result that saw it end: a
 /// space and the sentence where the answer gave a count above zero, and nothing otherwise.
-fn creates_under_way(unsettled: Option<u64>) -> Shown {
+pub(crate) fn creates_under_way(unsettled: Option<u64>) -> Shown {
     match unsettled {
         Some(count) if count > 0 => shown!(
             " {} session creates were still under way after {} seconds, when the daemon went on \

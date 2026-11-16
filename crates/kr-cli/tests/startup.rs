@@ -117,6 +117,16 @@ const BARRIER: &str = "daemon-barrier";
 /// daemon, which is what a daemon slow to come up looks like from outside.
 const DELAY: &str = "daemon-delay";
 
+/// A file in the tree whose presence makes a supervisor become the daemon: it records itself as
+/// the launched process and then runs the daemon in its own place, so that the process `kr`
+/// started is the daemon, as in a real standalone start. Nothing watches the lifeline then, and
+/// the tree's end signals the daemon instead.
+const EXEC: &str = "daemon-exec";
+
+/// A file in the tree that holds a number of starts: a supervisor that is started after that many
+/// have been started before it starts no daemon and ends, so a start fails.
+const FAIL_FROM: &str = "daemon-fail-from";
+
 /// The tools a service, lingering or a privilege would be obtained through.
 const RECORDING_TOOLS: [&str; 8] = [
     "systemctl",
@@ -278,6 +288,30 @@ fn supervise(daemon: &Path) {
     if closed(&lifeline) {
         return;
     }
+    if let Ok(from) = std::fs::read_to_string(tree.join(FAIL_FROM)) {
+        let from: usize = from.trim().parse().expect("a number of starts");
+        if std::fs::read_to_string(tree.join(STARTS))
+            .unwrap_or_default()
+            .lines()
+            .count()
+            > from
+        {
+            return;
+        }
+    }
+    if tree.join(EXEC).exists() {
+        use std::os::unix::process::CommandExt as _;
+
+        record(LAUNCHED, std::process::id());
+        let error = Command::new(daemon)
+            .arg("--secret-store")
+            .arg("file")
+            .args(&arguments)
+            .env_remove(SUPERVISE)
+            .env_remove(SUPERVISED_ARGUMENTS)
+            .exec();
+        panic!("the daemon could not be run in the supervisor's place: {error}");
+    }
     // Held from the moment it starts, so it is ended and collected however this supervisor's run
     // ends, a failure to record it included.
     let daemon = Supervised(
@@ -375,6 +409,22 @@ impl Standalone {
         drop(self.lifeline.take());
         let (mut identities, mut unresolved) = self.identities(STARTS);
         let (launched, unreadable) = self.identities(LAUNCHED);
+        // A daemon that is the process `kr` started watches no lifeline, so it is told to end.
+        if self.tree.root().join(EXEC).exists() {
+            for identity in &launched {
+                if matches!(
+                    kr_ipc::identity::process_state(identity),
+                    ProcessState::Running
+                ) {
+                    let _ = spawning(|| {
+                        Command::new("/bin/kill")
+                            .arg("-TERM")
+                            .arg(identity.pid.get().to_string())
+                            .status()
+                    });
+                }
+            }
+        }
         identities.extend(launched);
         unresolved.extend(unreadable);
         let begun = Instant::now();
@@ -459,6 +509,19 @@ impl Standalone {
             home,
             lifeline: Some(lifeline),
         }
+    }
+
+    /// Has every daemon this tree starts be the process `kr` started, as a real standalone start
+    /// has it, and not a child of a supervisor.
+    fn run_the_daemon_as_the_started_process(&self) {
+        std::fs::write(self.tree.root().join(EXEC), "").expect("writes the mode");
+    }
+
+    /// Has a start after the first `from` starts of this tree end without a daemon.
+    #[cfg(not(target_os = "macos"))]
+    fn fail_the_starts_after(&self, from: usize) {
+        std::fs::write(self.tree.root().join(FAIL_FROM), from.to_string())
+            .expect("writes the number");
     }
 
     /// Selects the standalone start as `kr host startup --set standalone` records it: the first
@@ -5585,12 +5648,34 @@ fn failure_of(output: &Output, what: &str) -> Value {
     said
 }
 
+/// A host whose daemon is the process `kr` started, as a real standalone start has it, with one live
+/// session: the host, the session and the daemon's process. The cases that use it run where a
+/// daemon started with `--secret-store file` is no launch difference, which the Mac is not: its
+/// platform store is the only store, so a truthful comparison refuses the harness's daemons there.
+#[cfg(not(target_os = "macos"))]
+fn a_host_with_a_session_run_as_started() -> (Standalone, SessionId, u32) {
+    let host = Standalone::create();
+    host.run_the_daemon_as_the_started_process();
+    host.select_standalone();
+    let output = start(host.new_session()).finish("kr new");
+    let created = document(&output, "kr new");
+    assert!(output.status.success(), "{created}");
+    let session_id: SessionId = created["session_id"]
+        .as_str()
+        .expect("a session identifier")
+        .parse()
+        .expect("parses");
+    let daemon = host.one_daemon();
+    (host, session_id, daemon)
+}
+
 /// KR-REQ-07.12 (a restart where no daemon runs): it starts one under the chosen start and says
 /// which, and the daemon that answers is the one it started. Nothing was asked of a daemon, and the
 /// command's record is gone.
 #[test]
 fn kr_host_restart_starts_a_daemon_where_none_runs_and_says_which() {
     let host = Standalone::create();
+    host.run_the_daemon_as_the_started_process();
     host.select_standalone();
     let output = start(host.kr(&["--json", "host", "restart"])).finish("kr host restart");
     let said = document(&output, "kr host restart");
@@ -5598,10 +5683,156 @@ fn kr_host_restart_starts_a_daemon_where_none_runs_and_says_which() {
     assert_eq!(said["ok"], true, "{said}");
     assert_eq!(stop_of(&said), "not_asked", "{said}");
     assert_eq!(said["started"]["start"], "standalone", "{said}");
-    assert!(said["started"]["pid"].is_u64(), "{said}");
+    assert_eq!(
+        said["started"]["pid"].as_u64(),
+        Some(u64::from(host.one_daemon())),
+        "the process this command started is the daemon that answers: {said}"
+    );
     assert!(host.answers(), "a daemon answers");
     assert_eq!(host.running().len(), 1, "one daemon runs");
     assert!(attempts(&host).is_empty(), "the command removed its record");
+}
+
+/// KR-REQ-07.12, KR-REQ-02.03, KR-REQ-05.01 (a restart): the old daemon's process has gone, the
+/// daemon that answers is the one this command started, the session is listed and a terminal
+/// attached before it goes on, and the command's own record is gone. A restart is done when the new
+/// daemon answers, not when the old one ends.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn kr_host_restart_replaces_the_daemon_and_the_new_one_is_the_one_it_started() {
+    let (host, session_id, old) = a_host_with_a_session_run_as_started();
+    let runtime = runtime();
+    let mut before = runtime.block_on(async {
+        let mut terminal = Typing::attach(&host, session_id, true).await;
+        terminal
+            .type_line("KR_RESTART_KEPT=kept; echo first-$KR_RESTART_KEPT")
+            .await;
+        terminal.shown("first-kept").await;
+        terminal
+    });
+    let output = start(host.kr(&["--json", "host", "restart"])).finish("kr host restart");
+    let said = document(&output, "kr host restart");
+    assert!(output.status.success(), "{said}");
+    assert_eq!(said["ok"], true, "{said}");
+    assert_eq!(stop_of(&said), "ended", "{said}");
+    assert_eq!(said["pid"].as_u64(), Some(u64::from(old)), "{said}");
+    assert_eq!(said["started"]["start"], "standalone", "{said}");
+    let new = host.one_daemon();
+    assert_ne!(new, old, "a new daemon");
+    assert_eq!(
+        said["started"]["pid"].as_u64(),
+        Some(u64::from(new)),
+        "{said}"
+    );
+    assert_eq!(host.running(), vec![new], "the old process has gone");
+    assert!(host.answers(), "the new daemon answers");
+    assert!(attempts(&host).is_empty(), "the command removed its record");
+
+    let status = start(host.kr(&["--json", "status"])).finish("kr status");
+    assert!(status.status.success());
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains(&session_id.to_string()),
+        "the new daemon lists the session"
+    );
+    runtime.block_on(async {
+        before.type_line("echo second-$KR_RESTART_KEPT").await;
+        before.shown("second-kept").await;
+    });
+    drop(before);
+}
+
+/// KR-REQ-07.12 (two restarts at once): both end with exit 0, one daemon runs and it is a new one,
+/// and each says what is true of it: the command that started it names it, and the other says
+/// that a control daemon already serves the environment, or names it too where it started it.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn two_kr_host_restarts_at_once_converge_on_one_daemon_and_neither_fails() {
+    let (host, _session_id, old) = a_host_with_a_session_run_as_started();
+    let first = start(host.kr(&["--json", "host", "restart"]));
+    let second = start(host.kr(&["--json", "host", "restart"]));
+    let outputs = [
+        first.finish("kr host restart"),
+        second.finish("kr host restart"),
+    ];
+    let said: Vec<Value> = outputs
+        .iter()
+        .map(|output| document(output, "kr host restart"))
+        .collect();
+    for (output, said) in outputs.iter().zip(&said) {
+        assert!(output.status.success(), "{said}");
+        assert_eq!(said["ok"], true, "{said}");
+    }
+    let running = host.running();
+    assert_eq!(running.len(), 1, "one daemon runs: {running:?}");
+    assert_ne!(running[0], old, "and it is a new one");
+    let started: Vec<_> = said
+        .iter()
+        .filter(|said| !said["started"].is_null())
+        .collect();
+    assert!(!started.is_empty(), "one of them started it: {said:?}");
+    for said in &started {
+        assert_eq!(
+            said["started"]["pid"].as_u64(),
+            Some(u64::from(running[0])),
+            "a command that says it started a daemon started this one: {said}"
+        );
+    }
+    assert!(host.answers());
+}
+
+/// KR-REQ-07.12 (a start that fails after the stop): the text says that the daemon was stopped and
+/// that the start failed, and that no session was stopped; the record reads as a failed start, and
+/// the next command says so; the session is alive and a terminal attaches to it with no daemon.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_restart_whose_start_fails_after_the_stop_says_so_and_leaves_the_sessions_alive() {
+    let (host, session_id, old) = a_host_with_a_session_run_as_started();
+    host.fail_the_starts_after(1);
+    let output = start(host.kr(&["--json", "host", "restart"])).finish("kr host restart");
+    let failed = failure_of(&output, "kr host restart");
+    assert_eq!(output.status.code(), Some(1), "{failed}");
+    assert_eq!(stop_of(&failed), "ended", "{failed}");
+    assert_eq!(failed["pid"].as_u64(), Some(u64::from(old)), "{failed}");
+    assert_eq!(failed["started"], Value::Null, "{failed}");
+    let message = failed["message"].as_str().expect("a message");
+    assert!(
+        message.contains("was stopped and the start failed"),
+        "{message}"
+    );
+    assert!(
+        message.contains("The requested daemon may still start."),
+        "{message}"
+    );
+    assert!(message.contains("No session was stopped"), "{message}");
+    assert!(
+        message.ends_with("Fix the cause and run kr host restart again."),
+        "{message}"
+    );
+    assert!(host.running().is_empty(), "no daemon runs");
+    assert!(!host.answers());
+    let records = attempts(&host);
+    assert_eq!(records.len(), 1, "the failed start is recorded");
+    assert_eq!(
+        records[0].attempt.phase,
+        kr_controller::attempt::Phase::StartFailed
+    );
+    assert_eq!(
+        records[0].attempt.command,
+        kr_controller::attempt::Command::Restart
+    );
+    runtime().block_on(async {
+        let mut terminal = Typing::attach(&host, session_id, false).await;
+        terminal.type_line("echo alive-$((40 + 2))").await;
+        terminal.shown("alive-42").await;
+    });
+    let next = start(host.kr(&["host", "stop"])).finish("kr host stop");
+    assert!(next.status.success());
+    let said = String::from_utf8_lossy(&next.stderr);
+    assert!(
+        said.contains("its start of a control daemon for environment")
+            && said.contains("had failed"),
+        "the next command says that the start failed: {said}"
+    );
 }
 
 /// KR-REQ-07.12 (a restart refuses before it stops): where no start is chosen for this

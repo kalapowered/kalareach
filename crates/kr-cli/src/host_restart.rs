@@ -101,10 +101,10 @@ fn not_startable(id: EnvironmentId, unstartable: Unstartable) -> CliError {
     }
 }
 
-/// A control daemon answers: asks how it was started, and refuses before it stops anything where
-/// the start would not give what it has.
+/// A control daemon answers: asks how it was started, refuses before it stops anything where the
+/// start would not give what it has, stops the daemon, and then starts one and proves it.
 async fn restart_the_daemon(
-    _host: &HostPaths,
+    host: &HostPaths,
     environment: &KnownEnvironment,
     start: ControllerStartup,
     daemon: Daemon,
@@ -114,7 +114,9 @@ async fn restart_the_daemon(
 ) -> Completion {
     let id = environment.environment_id;
     let Daemon {
-        mut client, info, ..
+        mut client,
+        info,
+        holder,
     } = daemon;
     // How it was started, before anything is stopped. The request for it stops nothing. A daemon of
     // another build that lists no such request refuses it, and says so as `kr host stop` does.
@@ -142,11 +144,129 @@ async fn restart_the_daemon(
             );
         }
     }
-    host_stop::failed(
-        CliError::Other(Shown::said("kr host restart has no stop to make yet")),
-        &begun.none,
+    let old = holder.clone();
+    let daemon = Daemon {
+        client,
+        info,
+        holder,
+    };
+    let stopped = match host_stop::ask_to_stop(
+        Which::Restart,
+        host,
+        environment,
+        daemon,
         json,
+        progress,
+        begun,
     )
+    .await
+    {
+        Ok(stopped) => stopped,
+        Err(reported) => return reported,
+    };
+    progress.enter(Stage::Ended);
+    // The record is the command's own until a daemon that it started answers. A request that could
+    // not be made let it go, and the start needs it again.
+    if progress.with_marker(|_| ()).is_none() {
+        let _ = begin_the_record(environment, old, progress);
+    }
+    let facts = Facts {
+        knows: Knows::Ended,
+        pid: stopped.pid,
+        unsettled: stopped.unsettled,
+        ..begun.none.clone()
+    };
+    let proved = match stopped.successor {
+        // Another daemon holds the environment: nothing is started beside it.
+        Some(successor) => match wait_for_the_successor(environment, successor).await {
+            Ok(proved) => Ok(proved),
+            Err(error) => return host_stop::failed(error, &facts, json),
+        },
+        None => start_and_prove(host, environment, Some(stopped.generation), progress).await,
+    };
+    let creates = host_stop::creates_under_way(stopped.unsettled);
+    match proved {
+        Ok(Proved::Ours(started)) => {
+            progress.remove_marker();
+            let processes = match (stopped.named, started.pid) {
+                (Some(old), Some(new)) => {
+                    shown!(" (process {} ended, process {} started)", old, new)
+                }
+                (Some(old), None) => shown!(" (process {} ended)", old),
+                (None, Some(new)) => shown!(" (process {} started)", new),
+                (None, None) => Shown::said(""),
+            };
+            host_stop::done(
+                &shown!(
+                    "Restarted the control daemon for environment {}{} under the {} start. No \
+                     session was stopped.{}",
+                    id,
+                    processes,
+                    start_said(&started),
+                    creates
+                ),
+                &Facts {
+                    started: Some(Some(started_fact(&started))),
+                    ..facts
+                },
+                json,
+                &begun.earlier,
+            )
+        }
+        Ok(Proved::Another(serving)) => {
+            progress.remove_marker();
+            host_stop::done(
+                &shown!(
+                    "Stopped the control daemon for environment {}{}; a control daemon already \
+                     serves it{}. No session was stopped.{}",
+                    id,
+                    host_stop::process_said(stopped.named),
+                    host_stop::process_said(serving),
+                    creates
+                ),
+                &facts,
+                json,
+                &begun.earlier,
+            )
+        }
+        Err(failed) => {
+            failed
+                .reported(
+                    environment,
+                    Had::Daemon(stopped.named),
+                    json,
+                    progress,
+                    &facts,
+                )
+                .await
+        }
+    }
+}
+
+/// Another daemon holds the environment after the one that was stopped ended: waits for it to
+/// answer, and starts nothing beside it.
+async fn wait_for_the_successor(
+    environment: &KnownEnvironment,
+    successor: Option<u64>,
+) -> std::result::Result<Proved, CliError> {
+    let id = environment.environment_id;
+    let endpoint = environment.paths.controller_endpoint()?;
+    let deadline = tokio::time::Instant::now() + startup::START_BOUND;
+    match startup::answered_by(&endpoint, deadline, &[], || {}).await {
+        Ok(_) => Ok(Proved::Another(successor)),
+        Err(last) => Err(CliError::Unfinished {
+            code: ErrorCode::EnvironmentUnavailable,
+            message: shown!(
+                "A control daemon{} holds environment {} since the daemon that was stopped ended, \
+                 and it did not answer within {} seconds: {}. No new daemon was started. Run kr \
+                 host restart again once it answers.",
+                host_stop::process_said(successor),
+                id,
+                startup::START_BOUND.as_secs(),
+                last
+            ),
+        }),
+    }
 }
 
 /// No control daemon runs: the start is made, and the daemon that answers is proved to be the one
@@ -174,7 +294,7 @@ async fn start_where_none_ran(
     match result {
         Ok(Proved::Ours(started)) => {
             progress.remove_marker();
-            let process = process_of(started.pid.map(u64::from));
+            let process = host_stop::process_said(started.pid.map(u64::from));
             let under_way = host_stop::under_way_said(environment);
             host_stop::done(
                 &shown!(
@@ -200,7 +320,7 @@ async fn start_where_none_ran(
                     "No control daemon was running for environment {}, and one serves it now{}. \
                      This command started none.{}",
                     id,
-                    process_of(serving),
+                    host_stop::process_said(serving),
                     host_stop::under_way_said(environment)
                 ),
                 &none,
@@ -208,7 +328,11 @@ async fn start_where_none_ran(
                 &begun.earlier,
             )
         }
-        Err(failed) => failed.reported(environment, Stopped::Nothing, json, progress, &none),
+        Err(failed) => {
+            failed
+                .reported(environment, Had::NoDaemon, json, progress, &none)
+                .await
+        }
     }
 }
 
@@ -225,9 +349,11 @@ pub(crate) enum Proved {
 
 /// What the restart had stopped when its start failed.
 #[derive(Clone, Copy)]
-pub(crate) enum Stopped {
+pub(crate) enum Had {
     /// No daemon ran, and nothing was stopped.
-    Nothing,
+    NoDaemon,
+    /// The daemon ended, and the process that it was, where the command read it.
+    Daemon(Option<u64>),
 }
 
 /// A start that did not give a daemon that answers.
@@ -243,21 +369,36 @@ impl StartFailed {
     /// Reports the failure: the start's own words, that nothing of the sessions was stopped, and
     /// the record as a failed start. A daemon that answers once the record is written makes the
     /// failure moot, and the record goes.
-    fn reported(
+    async fn reported(
         self,
         environment: &KnownEnvironment,
-        stopped: Stopped,
+        had: Had,
         json: bool,
         progress: &Progress,
         facts: &Facts,
     ) -> Completion {
         let id = environment.environment_id;
         let _ = progress.with_marker(|marker| marker.start_failed());
+        // A daemon that answers now, started by something else meanwhile, leaves the record
+        // nothing to say: it is removed, and the failure is still said as it was.
+        if let Ok(endpoint) = environment.paths.controller_endpoint()
+            && matches!(
+                startup::reach(&endpoint, startup::ANSWER_BOUND, &[]).await,
+                startup::Reached::Answered(_)
+            )
+        {
+            progress.remove_marker();
+        }
         let own = self.error.said();
-        let stop = match stopped {
-            Stopped::Nothing => shown!(
+        let stop = match had {
+            Had::NoDaemon => shown!(
                 "No control daemon was running for environment {} and the start failed",
                 id
+            ),
+            Had::Daemon(pid) => shown!(
+                "The control daemon for environment {}{} was stopped and the start failed",
+                id,
+                host_stop::process_said(pid)
             ),
         };
         let still = if self.launched {
@@ -265,8 +406,11 @@ impl StartFailed {
         } else {
             Shown::said("")
         };
-        let sessions = match stopped {
-            Stopped::Nothing => Shown::said("Nothing was stopped."),
+        let sessions = match had {
+            Had::NoDaemon => Shown::said("Nothing was stopped."),
+            Had::Daemon(_) => Shown::said(
+                "No session was stopped: its workers keep running and a local attach still works.",
+            ),
         };
         let message = shown!(
             "{}: {}.{} {} Fix the cause and run kr host restart again.",
@@ -354,17 +498,14 @@ pub(crate) async fn start_and_prove(
             )));
         }
     };
-    let holding = host_stop::lock_holder(&environment.paths);
-    let holder = holding.as_ref().map(|holder| holder.pid.get());
+    let holder = host_stop::lock_holder(&environment.paths).map(|holder| holder.pid.get());
     let Some(started) = started else {
         // The look found a daemon: another restart's, or a manager's.
         return Ok(Proved::Another(holder));
     };
     let newer = stopped.is_none_or(|old| info.generation > old);
     match (started.pid, holder) {
-        (Some(pid), Some(_)) if newer && holds_the_environment(holding.as_ref(), pid) => {
-            Ok(Proved::Ours(started))
-        }
+        (Some(pid), Some(held)) if newer && held == u64::from(pid) => Ok(Proved::Ours(started)),
         // The child that was started lost the environment to another daemon, which answers.
         (Some(_), _) if newer => Ok(Proved::Another(holder)),
         (None, _) if newer => Ok(Proved::Ours(started)),
@@ -372,29 +513,6 @@ pub(crate) async fn start_and_prove(
             "the control daemon that answers is of the generation that was told to stop",
         ))),
     }
-}
-
-/// Whether the process that holds the environment is the one that was started, or a child of it:
-/// the daemon is the started process itself, except where the program that was started runs the
-/// daemon as its own child.
-fn holds_the_environment(
-    holder: Option<&kr_protocol::identity::ProcessStartIdentity>,
-    started: u32,
-) -> bool {
-    let Some(holder) = holder else {
-        return false;
-    };
-    holder.pid.get() == u64::from(started)
-        || matches!(
-            kr_ipc::identity::read_process(holder),
-            kr_ipc::identity::ProcessReading::Running(facts)
-                if facts.parent.as_ref().is_some_and(|parent| parent.pid.get() == u64::from(started))
-        )
-}
-
-/// ` (process N)` where the process is known, and nothing otherwise.
-fn process_of(pid: Option<u64>) -> Shown {
-    pid.map_or_else(|| Shown::said(""), |pid| shown!(" (process {})", pid))
 }
 
 /// The start as a person names it.
