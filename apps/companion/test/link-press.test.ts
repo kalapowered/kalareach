@@ -420,7 +420,7 @@ describe('where the handler’s listeners stand', () => {
     expect([...listening.keys()]).toEqual([])
   })
 
-  it('takes the scroll, viewport, capture, visibility and blur listeners off when the press ends: at the release, at a cancel, at a move past the slop, at a lost capture, at a blur and at a hidden page', () => {
+  it('takes the scroll, viewport, capture, visibility and blur listeners off when the press ends: at the release, at a cancel, at a move past the slop, at a lost capture, at a blur, at a pointer down that is not primary and at a hidden page', () => {
     viewportOf({ left: 0, top: 0, right: 390, bottom: 844 })
     const { pane } = between({ left: 0, top: 0, right: 8, bottom: 17 })
     start(pane)
@@ -448,6 +448,10 @@ describe('where the handler’s listeners stand', () => {
     fire('window blur', {} as Event)
     expect(standing(), 'listeners after a blur').toEqual([])
     expect([...listening.keys()], 'visibility listener after a blur').not.toContain('visibilitychange')
+    fire('pointerdown', pointer(pane, { clientX: 4, clientY: 25 }))
+    fire('pointerdown', pointer(pane, { pointerId: 2, isPrimary: false, clientX: 4, clientY: 25 }))
+    expect(standing(), 'listeners after a pointer down that is not primary').toEqual([])
+    expect([...listening.keys()], 'visibility listener after a pointer down that is not primary').not.toContain('visibilitychange')
     fire('pointerdown', pointer(pane, { clientX: 4, clientY: 25 }))
     vi.spyOn(document, 'hidden', 'get').mockReturnValue(true)
     fire('visibilitychange', {} as Event)
@@ -837,6 +841,107 @@ describe('a press for a pointer that can open, and the look it gives', () => {
     fire('click', click(texts[3], { clientY: y - 11 }))
     expect(opened, 'links opened by the click after the press ended').toEqual([])
     expect(isLit(links[3]?.[0]), 'the look at that click').toBe(false)
+  })
+})
+
+describe('the end of a press at every pointer down', () => {
+  // The first link of message 3 has its words at x 10 to 26 and y 320 to 337; the tap is 6 px before it.
+  const y = 328
+  // The pointer downs that begin no press: a second finger, and a mouse's or a pen's other button.
+  const beginNone: [string, Record<string, unknown>][] = [
+    ['a second finger', { isPrimary: false }],
+    ['a mouse’s right button', { pointerType: 'mouse', button: 2 }],
+    ['a mouse’s middle button', { pointerType: 'mouse', button: 1 }],
+    ['a pen’s barrel', { pointerType: 'pen', button: 2 }],
+    ['a pen’s eraser', { pointerType: 'pen', button: 5 }]
+  ]
+
+  it('puts out the look of a press on a link’s own element at a second finger on another link, ends the press and lights no link', () => {
+    const { pane, links } = conversation(6, 3)
+    start(pane)
+    clock(100)
+    fire('pointerdown', pointer(links[3]?.[0], { clientX: 18, clientY: y }))
+    expect(isLit(links[3]?.[0]), 'the look of the first finger').toBe(true)
+    expect(lives(), 'the press of the first finger').toBe(true)
+    fire('pointerdown', pointer(links[3]?.[1], { pointerId: 2, isPrimary: false, clientX: 36, clientY: y }))
+    expect(isLit(links[3]?.[0]), 'the look of the first finger after the second went down').toBe(false)
+    expect(isLit(links[3]?.[1]), 'the look for the second finger').toBe(false)
+    expect(lives(), 'the press after the second finger went down').toBe(false)
+    expect([...listening.keys()].sort(), 'listeners after the second finger went down').toEqual(['click', 'pointerdown'])
+  })
+
+  it('puts out the look of a press on a link’s own element at a pointer down of another button or of the pen’s barrel, and lights no other link', () => {
+    const { pane, links } = conversation(6, 3)
+    start(pane)
+    clock(100)
+    for (const [what, over] of beginNone) {
+      fire('pointerdown', pointer(links[3]?.[0], { clientX: 18, clientY: y }))
+      expect(isLit(links[3]?.[0]), `the look of the press before ${what}`).toBe(true)
+      fire('pointerdown', pointer(links[3]?.[1], { pointerId: 2, clientX: 36, clientY: y, ...over }))
+      expect(isLit(links[3]?.[0]), `the look of the press after ${what}`).toBe(false)
+      expect(isLit(links[3]?.[1]), `the look for ${what}`).toBe(false)
+      expect(lives(), `the press after ${what}`).toBe(false)
+    }
+  })
+
+  it('ends a press that keeps a record at a pointer down that begins none, so that the old pointer’s release and click open nothing', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100, 130)
+    for (const [what, over] of beginNone) {
+      fire('pointerdown', pointer(texts[3], { clientY: y }))
+      expect(lives(), `the press on plain text before ${what}`).toBe(true)
+      fire('pointerdown', pointer(links[2]?.[0], { pointerId: 2, clientX: 18, clientY: 228, ...over }))
+      expect(lives(), `the press after ${what}`).toBe(false)
+      release(texts[3], { clientY: y })
+      expect(opened, `links opened by the old pointer’s click after ${what}`).toEqual([])
+      expect(links.flat().some(isLit), `a look at the old pointer’s click after ${what}`).toBe(false)
+    }
+  })
+
+  it('ends the press at a pointer down outside the pane, for a pointer that is not primary and for another button', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100, 130)
+    for (const [what, over] of beginNone) {
+      fire('pointerdown', pointer(links[3]?.[0], { clientX: 18, clientY: y }))
+      fire('pointerdown', pointer(document.body, { pointerId: 2, clientX: 5, clientY: 5, ...over }))
+      expect(isLit(links[3]?.[0]), `the look after ${what} outside the pane`).toBe(false)
+      expect(lives(), `the press after ${what} outside the pane`).toBe(false)
+      fire('pointerdown', pointer(texts[3], { clientY: y }))
+      fire('pointerdown', pointer(document.body, { pointerId: 2, clientX: 5, clientY: 5, ...over }))
+      expect(lives(), `the press on plain text after ${what} outside the pane`).toBe(false)
+      release(texts[3], { clientY: y })
+      expect(opened, `links opened after ${what} outside the pane`).toEqual([])
+    }
+  })
+
+  it('ends the look that a click gave and leaves no timer, in the pane and outside it, where no press is going on', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100, 130)
+    for (const [where, target] of [
+      ['in the pane', texts[1]],
+      ['outside the pane', document.body]
+    ] as const) {
+      fire('pointerdown', pointer(texts[3], { clientY: y }))
+      release(texts[3], { clientY: y })
+      expect(isLit(links[3]?.[0]), `the look at the click, before the pointer down ${where}`).toBe(true)
+      expect(lives(), `a press after its click, before the pointer down ${where}`).toBe(false)
+      fire('pointerdown', pointer(target, { pointerId: 2, isPrimary: false, clientX: 300, clientY: 150 }))
+      expect(isLit(links[3]?.[0]), `the look after a pointer down that is not primary ${where}`).toBe(false)
+      expect(vi.getTimerCount(), `timers standing after a pointer down that is not primary ${where}`).toBe(0)
+    }
+  })
+
+  it('keeps the pointer type of the last primary press: a pointer down of a mouse’s right button does not change what the click reads', () => {
+    const { pane, links, texts } = conversation(6, 3)
+    start(pane)
+    clock(100, 130)
+    fire('pointerdown', pointer(texts[3], { clientY: y }))
+    fire('pointerdown', pointer(links[2]?.[0], { pointerType: 'mouse', pointerId: 2, button: 2, clientX: 18, clientY: 228 }))
+    fire('click', click(links[3]?.[0], { clientX: 18, clientY: y }))
+    expect(isLit(links[3]?.[0]), 'the look at the click that follows a touch press and a mouse’s right button').toBe(true)
   })
 })
 

@@ -7,8 +7,8 @@
  * touch's or a pen's click lands on plain text near a link's words (the line under them, the words
  * after them), the link gets a click of its own. `decide` says when (see `link-target.ts`).
  *
- * - At a primary pointer down the pane writes a record of the press: its pointer type, where it went
- *   down, and the link it names, with what that link opens. A press on a link's own element names that
+ * - At the pointer down of a primary pointer's main button the pane writes a record of the press: its
+ *   pointer type, where it went down, and the link it names, with what that link opens. A press on a link's own element names that
  *   link for every pointer type, whatever the words' rectangles say, since the browser sends its click to
  *   that element, and lights it at once; a press on another control names nothing; a press on plain text
  *   names the link that `linkAt` returns at that point, and only for a pointer that `opensByRule` (a
@@ -19,10 +19,15 @@
  *   0 and adds nothing.
  * - A press is live or dead. It lives from the pointer down to the pointer up, and dies at the first of:
  *   a move past the slop, a pointer cancel, the loss of the pointer's capture, the window's loss of
- *   focus, the page's hiding, the next primary pointer down (in the pane or outside it) and, for a touch
- *   or a pen only, a scroll of any box or of the visual viewport, or a resize of the viewport, after
- *   which a release at the press's point would open nothing (`releaseOpens`). At its death the record
- *   goes and the look ends at once, so a dead press opens nothing. A mouse's or a trackpad's record never
+ *   focus, the page's hiding, the next pointer down of any pointer and any button (in the pane or
+ *   outside it) and, for a touch or a pen only, a scroll of any box or of the visual viewport, or a
+ *   resize of the viewport, after which a release at the press's point would open nothing
+ *   (`releaseOpens`). At its death the record goes and the look ends at once, so a dead press opens
+ *   nothing. Only a primary pointer's main button begins a press: a second finger, a pen's barrel and a
+ *   mouse's other buttons end the press that is going on and begin none. The next pointer down is the
+ *   net for a press whose end never comes: iOS can take a touch for its own text selection and give the
+ *   page that touch's pointer down alone, with no move, release or cancel after it, and WebKit then
+ *   counts the touch as still down, so the next touch is not primary. A mouse's or a trackpad's record never
  *   gives an open (`decide` stands for it), so no scroll ends its press. Its click comes from where the
  *   button is released and goes to the engine's target, so its look follows the pointer, at each move and
  *   at each scroll: lit while the pointer lies in the link's own element, out where it has left it (within
@@ -34,7 +39,7 @@
  *   open goes out. On plain text near a link the look therefore comes at the click, on the link that opens,
  *   and a press on a link's own element keeps the look it got at the pointer down. A touch's or a
  *   pen's look ends `LOOK_HOLD` after the click, or after a release that gets no click, and at once at any
- *   end of the handler and at the next press. It has no motion. The click that this handler makes inside
+ *   end of the handler and at the next pointer down. It has no motion. The click that this handler makes inside
  *   the first one is untrusted and leaves the look as the first one set it.
  * - The open at the click runs the same rule at the press's own point, so for a touch or a pen the link
  *   that a press on plain text names is the link that opens at the click. A layout that moves under a
@@ -141,11 +146,12 @@ export function startLinkPress(element: HTMLElement): () => void {
 
   // A press is live or dead. It lives from a primary pointer down to the pointer's up, and it dies at the
   // first of: a move past the slop, a pointer cancel, the loss of the pointer's capture, the window's loss
-  // of focus, the page's hiding, the next primary pointer down, and a scroll or a resize after which a
-  // release would no longer open the link it names. At its death the look ends at once and the record
-  // goes, so a dead press opens nothing. The listeners below stand only while a press lives. A release can
-  // then never arrive (a lost capture, a window that is no longer in front, a page that is no longer
-  // shown), and the look would stay on the link until some later press.
+  // of focus, the page's hiding, the next pointer down of any pointer and any button, and a scroll or a
+  // resize after which a release would no longer open the link it names. At its death the look ends at
+  // once and the record goes, so a dead press opens nothing. The listeners below stand only while a press
+  // lives. A release can then never arrive (a lost capture, a window that is no longer in front, a page
+  // that is no longer shown, a touch that the system took for its own), and the look would stay on the
+  // link until some later pointer down.
   const die = (): void => {
     press = null
     out()
@@ -219,16 +225,19 @@ export function startLinkPress(element: HTMLElement): () => void {
     die()
   }
   const down = (event: PointerEvent): void => {
-    // A second finger, a pen's barrel and a mouse's other buttons are not the press that is going on.
-    if (!event.isPrimary || event.button !== 0) return
-    // Every primary press ends the one before it, in the pane or outside it.
+    // Every pointer down ends the press that is going on, in the pane or outside it, before the test of
+    // whether it begins one: the next touch after one that the system took is not primary, and a second
+    // finger, a pen's barrel and a mouse's other buttons end a press too.
     die()
+    // Only a primary pointer's main button begins a press, and only it sets the pointer type that the
+    // click reads.
+    if (!event.isPrimary || event.button !== 0) return
     kind = event.pointerType
     if (!here(event.target)) return
     const found = pressedLink(element, event)
     // A press that names no link opens nothing and has no look to keep: it keeps no record and registers
     // no listener, so no end has to reach it (a lost capture, a blur or a hidden page would otherwise
-    // leave its listeners standing until the next press).
+    // leave its listeners standing until the next pointer down).
     if (found === null) return
     press = {
       pointer: event.pointerId,
