@@ -31,7 +31,8 @@ use kr_protocol::envelope::ActionTarget;
 use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::identity::{DesktopBinding, WorkerProfile};
 use kr_protocol::ids::{
-    ActionId, BuildId, ControllerGeneration, EnvironmentId, SessionEpoch, SessionId,
+    ActionId, BuildId, ControllerGeneration, EnvironmentId, InputLeaseEpoch, SessionEpoch,
+    SessionId,
 };
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
@@ -40,6 +41,10 @@ use kr_protocol::session::{
     Dimensions, DisplayNumber, SessionCloseParams, SessionCloseResult, SessionReadParams,
     SessionReadResult, SessionState, ShellMode,
 };
+use kr_shell_integration::contract::fence::LeaseView;
+use kr_shell_integration::contract::requests::LaunchTransactionId;
+use kr_worker::application::{Evidence, Holder, Producer};
+use kr_worker::fence::FenceDriver;
 use kr_worker::published::TAKE_BOUND;
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
@@ -872,6 +877,79 @@ async fn a_read_of_a_held_session_names_the_application_the_session_had() {
         "the read of a held session was answered after {answered:?}, past {READ_BOUND:?}"
     );
     assert_eq!(read.session.application.as_deref(), Some("an editor"));
+}
+
+/// What the application is doing changes without its name changing, and the session counts the
+/// launches that wait for the reader. A read of the held session says both as the session has them:
+/// the summary is published when the state changes, and the count is read from the input domain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_read_of_a_held_session_says_what_the_application_is_doing_and_the_launches_that_wait() {
+    let host = host().await;
+    // A session with a managed root editor counts the launches that wait for its reader.
+    host.runtime.session().install_fence(FenceDriver::new(
+        host.session_id,
+        LeaseView::unheld(InputLeaseEpoch::new(0)),
+        Arc::new(kr_transport::clock::ManualClock::new()),
+    ));
+    let producer = Producer::new(Arc::downgrade(&host.runtime));
+    producer.observe_holder(Holder::Program(Some("an editor".to_owned())));
+    let named = host.runtime.published().latest();
+    assert_eq!(named.application.as_deref(), Some("an editor"));
+    assert_eq!(named.application_state.0, None);
+    // Two launches wait for the reader, and the state changes with the name the same.
+    let waiting: Vec<_> = (0..2)
+        .map(|_| {
+            host.runtime
+                .session()
+                .register_launch(LaunchTransactionId::new(kr_ipc::new_uuid()))
+        })
+        .collect();
+    producer.observe_evidence(Evidence {
+        turn_running: true,
+        ..Evidence::default()
+    });
+    // What the case stands on: the state is published, and the name is the one it was.
+    let changed = host.runtime.published().latest();
+    assert_eq!(changed.application, named.application);
+    assert_eq!(
+        changed.application_state.0,
+        Some(kr_protocol::session::ApplicationState::AgentBusy),
+        "the summary is published when what the application is doing changes"
+    );
+    let mut control = host.client().await;
+    let (_, taken) = read_within_its_bound(&mut control, &host, "control state").await;
+    assert_eq!(
+        taken.outstanding_launches.0.map(|count| count.get()),
+        Some(2)
+    );
+    assert!(
+        taken.launch_profile.0.is_some(),
+        "the control read takes the session"
+    );
+    let (holder, mut reader) = (host.client().await, host.client().await);
+    let standing = stall(&host, Stalled::Prune, holder).await;
+    let (answered, read) = read_within_its_bound(&mut reader, &host, "held state").await;
+    let _ = standing.release.send(());
+    assert!(
+        answered <= READ_BOUND,
+        "the read of a held session was answered after {answered:?}, past {READ_BOUND:?}"
+    );
+    assert!(
+        read.launch_profile.0.is_none(),
+        "the read was answered while the session was held"
+    );
+    assert_eq!(read.session.application.as_deref(), Some("an editor"));
+    assert_eq!(
+        read.session.application_state.0,
+        Some(kr_protocol::session::ApplicationState::AgentBusy),
+        "a held session says what its application is doing"
+    );
+    assert_eq!(
+        read.outstanding_launches.0.map(|count| count.get()),
+        Some(2),
+        "a held session says how many launches wait for the reader"
+    );
+    drop(waiting);
 }
 
 /// A read that names another session is refused whether or not the session is held.

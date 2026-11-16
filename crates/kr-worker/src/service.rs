@@ -8547,21 +8547,22 @@ impl WorkerService {
 
     /// Answers `session.read` for a session that something else holds.
     ///
-    /// The answer is the summary the session published, with the lifecycle state read from the
-    /// input domain and not from the summary: the summary is set a moment after a close is
-    /// admitted, and a read that copied its state could say that a session is live while it is
-    /// closing. It carries no session content, so a caller gets no more than the read that takes
-    /// the session would give it.
+    /// The answer is the summary the session published, with the lifecycle state and the count of
+    /// launches that wait for the reader read from the input domain and not from the summary: the
+    /// summary is set a moment after a close is admitted, and a read that copied its state could
+    /// say that a session is live while it is closing. The count is what the host's sleep demand
+    /// reads, so a held session still shows its demand. The answer carries no session content, so a
+    /// caller gets no more than the read that takes the session would give it.
     fn session_read_while_held(&self, params: &SessionReadParams) -> Result<ParamsValue> {
-        let summary = self.runtime.published().answer(self.runtime.input());
-        Self::check_owned_session(summary.session_id, params.session_id)?;
-        let running = summary.state.is_running();
+        let held = self.runtime.published().answer(self.runtime.input());
+        Self::check_owned_session(held.summary.session_id, params.session_id)?;
+        let running = held.summary.state.is_running();
         encode(&SessionReadResult {
-            session: summary,
+            session: held.summary,
             endpoint: Nullable(running.then(|| self.endpoint.as_text())),
             launch_profile: Nullable::null(),
             last_command_block: Nullable::null(),
-            outstanding_launches: Nullable::null(),
+            outstanding_launches: Nullable(held.outstanding_launches.map(U64::new)),
             metrics: None,
         })
     }
