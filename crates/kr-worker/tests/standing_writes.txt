@@ -37,10 +37,8 @@ scope crates/kr-worker/src/broker/mod.rs check_responsible
 scope crates/kr-worker/src/broker/mod.rs recheck_answer_trust
 outside crates/kr-worker/src/service.rs decidable
 
-# The writes. The pass changes nothing but these two, and each stands behind the mode that is the
-# first admission's.
-# The note of a journal that failed: made in `Mode::First` only, so that a pass that asks again
-# leaves the first admission's note as it is.
-site crates/kr-worker/src/service.rs check_admission_limits note_journal_failure 1
+# The writes. The pass changes nothing but this one, and it stands behind the mode that is the
+# first admission's. The note of a journal that failed is the first admission's own, made by its
+# wrapper from what the limits hand back, and stands outside the scope.
 # The expiry sweep of the questions that are due: run only for `Sweep::Run`, which is `Mode::First`.
 site crates/kr-worker/src/service.rs sweep_questions sweep 1

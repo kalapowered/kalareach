@@ -61,8 +61,8 @@ fn a_take_planted_in_the_pure_wall_reader_is_reported() {
 fn a_take_planted_in_a_piece_of_the_pass_is_reported() {
     let found = planted(
         "crates/kr-worker/src/service/standing.rs",
-        "        self.service.check_envelope(mutation, entry, caller)",
-        "        let _held = self.service.runtime.session();\n        self.service.check_envelope(mutation, entry, caller)",
+        "        self.service\n            .check_envelope(session, mutation, entry, caller)",
+        "        let _held = self.service.runtime.session();\n        self.service\n            .check_envelope(session, mutation, entry, caller)",
     );
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(

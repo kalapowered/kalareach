@@ -48,8 +48,6 @@ site crates/kr-worker/src/service.rs check_authority lock 1
 site crates/kr-worker/src/service.rs check_validated_revision lock 1
 # The authority state and the input domain's lock, each taken for one read.
 site crates/kr-worker/src/service.rs check_dispatch_lease lock 2
-# The session, for the id and the epoch the target is compared with, let go before the next check.
-site crates/kr-worker/src/service.rs check_envelope session 1
 # The session, for the journal's two reads (taken here only when no pass holds it), and the lock of
 # the record of what a person was shown, which is read once and let go.
 site crates/kr-worker/src/service.rs check_admission_limits session 1

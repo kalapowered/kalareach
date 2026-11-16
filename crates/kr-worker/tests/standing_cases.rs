@@ -512,11 +512,11 @@ async fn an_outcome_that_settles_unknown_while_the_admission_waits_refuses_it_be
 // C-K1-S6-volatile: the second look on a journal that fails from the stop on
 // ---------------------------------------------------------------------------------------------
 
-/// KR-REQ-07.57: the authorised stop goes on without its receipt when the journal cannot answer,
-/// and says so. The first look read the journal before the stop; the table goes while the admission
-/// stands, so the second look is the first read that fails, and it must not refuse the stop.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_close_whose_journal_fails_after_the_first_look_goes_on_and_reports_volatile() {
+/// What a local `session.close` comes to when the journal's receipt table is taken away (when
+/// `fails`) while the admission stands after its limits.
+async fn close_while_the_journal_changes(
+    fails: bool,
+) -> (Host, MutationRequest, Outcome, LocalClient) {
     let host = host().await;
     let client = cli(&host).await;
     let mutation = close(&client, &host);
@@ -526,14 +526,32 @@ async fn a_close_whose_journal_fails_after_the_first_look_goes_on_and_reports_vo
         receipt_of(&host, mutation.action_id).is_none(),
         "a receipt was written before the admission's checks ended"
     );
-    {
+    if fails {
         let connection = rusqlite::Connection::open(&host.journal_path).expect("opens the store");
         connection
             .execute_batch("DROP TABLE receipts;")
             .expect("takes the receipt table away");
     }
     release.send(()).expect("the admission is waiting to go on");
-    let (_client, outcome) = answering.await.expect("the admission ends");
+    let (client, outcome) = answering.await.expect("the admission ends");
+    (host, mutation, outcome, client)
+}
+
+/// The close's answer, which a case reads after what landed.
+fn the_close_answered(outcome: Outcome) -> kr_protocol::session::SessionCloseResult {
+    let Outcome::Ok(value) = outcome else {
+        panic!("a close whose journal failed after the first look was refused: {outcome:?}");
+    };
+    value.to_typed().expect("decodes")
+}
+
+/// KR-REQ-07.57: the authorised stop goes on without its receipt when the journal cannot answer,
+/// and says so. The first look read the journal before the stop; the table goes while the admission
+/// stands, so the second look is the first read that fails, and it must not refuse the stop. The
+/// control, the same stop with the table in place, reports durable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_close_whose_journal_fails_after_the_first_look_goes_on_and_reports_volatile() {
+    let (host, mutation, outcome, _client) = close_while_the_journal_changes(true).await;
     // What landed is read before what was answered: the journal cannot answer now, and the close
     // was made without a receipt.
     {
@@ -546,10 +564,7 @@ async fn a_close_whose_journal_fails_after_the_first_look_goes_on_and_reports_vo
             "the journal still answers after its table was taken away"
         );
     }
-    let Outcome::Ok(value) = outcome else {
-        panic!("a close whose journal failed after the first look was refused: {outcome:?}");
-    };
-    let closed: kr_protocol::session::SessionCloseResult = value.to_typed().expect("decodes");
+    let closed = the_close_answered(outcome);
     assert_eq!(
         closed.durability,
         Durability::Volatile,
@@ -563,4 +578,19 @@ async fn a_close_whose_journal_fails_after_the_first_look_goes_on_and_reports_vo
     )
     .await
     .expect("the session's closure finishes");
+
+    let (host, _mutation, outcome, _client) = close_while_the_journal_changes(false).await;
+    let closed = the_close_answered(outcome);
+    assert_eq!(
+        closed.durability,
+        Durability::Durable,
+        "the control's journal answered, so the close claims what it kept"
+    );
+    assert_eq!(closed.session_id, host.session_id);
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        host.service.runtime().wait_closed(),
+    )
+    .await
+    .expect("the control's closure finishes");
 }
