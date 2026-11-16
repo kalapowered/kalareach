@@ -175,6 +175,14 @@ pub enum IpcError {
         /// What the worker said it refused.
         detail: String,
     },
+    /// The host answered the hello with a complete refusal: the host wrote it. A refusal that this
+    /// side's own checks make is not this, and a failure to read an identity is
+    /// [`Self::IdentityUnavailable`].
+    #[error("the host refused the connection: {detail}")]
+    HostRefused {
+        /// The host's refusal, in its own words.
+        detail: String,
+    },
     /// A host identity could not be read from the operating system.
     #[error("{what}: {detail}")]
     IdentityUnavailable {
@@ -183,6 +191,20 @@ pub enum IpcError {
         /// Why it could not be read.
         detail: String,
     },
+}
+
+/// Where a failure of a local connection comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorSource {
+    /// A daemon wrote it: a refusal, a version it does not take, or a message of another kind.
+    Reply,
+    /// A daemon's end can cause it: a closed peer, a stream cut short, a frame that cannot be
+    /// read, or nothing listening.
+    Closure,
+    /// This side's own fault: no daemon wrote it and no daemon's end causes it, such as the check
+    /// of the peer's credentials or of the endpoint's access list, a fault of this side's socket or
+    /// files, and a request that this side cannot encode.
+    OwnFault,
 }
 
 impl IpcError {
@@ -221,9 +243,10 @@ impl IpcError {
             Self::Socket { source, .. } if carries_account_refusal(source) => {
                 ErrorCode::PermissionDenied
             }
-            Self::Io { .. } | Self::Socket { .. } | Self::IdentityUnavailable { .. } => {
-                ErrorCode::ResourceUnavailable
-            }
+            Self::Io { .. }
+            | Self::Socket { .. }
+            | Self::IdentityUnavailable { .. }
+            | Self::HostRefused { .. } => ErrorCode::ResourceUnavailable,
             Self::DirectoryNotOwnerOnly { .. }
             | Self::DirectoryAccessRefused { .. }
             | Self::PeerRejected { .. }
@@ -241,6 +264,47 @@ impl IpcError {
                 ErrorCode::UnsupportedSchema
             }
             Self::NotInLevel(_) => ErrorCode::UnsupportedCapability,
+        }
+    }
+
+    /// Where this failure comes from, which is what a command may say of the daemon from it. The
+    /// match names every variant and has no catch-all arm, so that a new variant does not compile
+    /// until it has a source.
+    #[must_use]
+    pub fn comes_from(&self) -> ErrorSource {
+        match self {
+            Self::UnexpectedMessage(_)
+            | Self::VersionMismatch { .. }
+            | Self::HostRefused { .. } => ErrorSource::Reply,
+            Self::PeerClosed | Self::TruncatedFrame { .. } | Self::Frame(_) => ErrorSource::Closure,
+            Self::Socket { source, .. } => {
+                if carries_account_refusal(source) {
+                    ErrorSource::OwnFault
+                } else if matches!(
+                    source.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) {
+                    // A connect that finds nothing listening: the daemon has gone, or is not there.
+                    ErrorSource::Closure
+                } else {
+                    ErrorSource::OwnFault
+                }
+            }
+            Self::Io { .. }
+            | Self::DirectoryNotOwnerOnly { .. }
+            | Self::DirectoryAccessRefused { .. }
+            | Self::SocketPathTooLong { .. }
+            | Self::PeerRejected { .. }
+            | Self::PeerUnknown { .. }
+            | Self::PeerAccountRejected { .. }
+            | Self::EnvironmentPrefixCollision { .. }
+            | Self::UntrustedFile { .. }
+            | Self::RightNotForwarded(_)
+            | Self::UnretainedLevel { .. }
+            | Self::NotInLevel(_)
+            | Self::OutsideLevel(_)
+            | Self::LinkFenced { .. }
+            | Self::IdentityUnavailable { .. } => ErrorSource::OwnFault,
         }
     }
 
@@ -465,5 +529,77 @@ mod tests {
                 "{other:?} gave {failure:?}"
             );
         }
+    }
+
+    /// Each source has its examples: what a daemon wrote, what a daemon's end can cause, and this
+    /// side's own faults, among them the checks that happen before any hello.
+    #[test]
+    fn every_failure_has_its_source() {
+        let refused = |kind| IpcError::socket("connect", std::io::Error::from(kind));
+        for (error, source) in [
+            (
+                IpcError::UnexpectedMessage("a frame of another kind"),
+                ErrorSource::Reply,
+            ),
+            (
+                IpcError::VersionMismatch {
+                    host: "1".to_owned(),
+                    offered: "2".to_owned(),
+                },
+                ErrorSource::Reply,
+            ),
+            (
+                IpcError::HostRefused {
+                    detail: "no".to_owned(),
+                },
+                ErrorSource::Reply,
+            ),
+            (IpcError::PeerClosed, ErrorSource::Closure),
+            (
+                IpcError::TruncatedFrame {
+                    received: 1,
+                    expected: 4,
+                },
+                ErrorSource::Closure,
+            ),
+            (
+                IpcError::Frame(kr_protocol::frame::FrameError::EmptyPayload),
+                ErrorSource::Closure,
+            ),
+            (refused(std::io::ErrorKind::NotFound), ErrorSource::Closure),
+            (
+                refused(std::io::ErrorKind::ConnectionRefused),
+                ErrorSource::Closure,
+            ),
+            (refused(std::io::ErrorKind::TimedOut), ErrorSource::OwnFault),
+            (
+                IpcError::IdentityUnavailable {
+                    what: "a clock floor identity",
+                    detail: "no".to_owned(),
+                },
+                ErrorSource::OwnFault,
+            ),
+            (
+                IpcError::NotInLevel("a field".to_owned()),
+                ErrorSource::OwnFault,
+            ),
+        ] {
+            assert_eq!(error.comes_from(), source, "{error}");
+        }
+    }
+
+    /// The host's refusal of the hello says the words that it said before it had a variant of its
+    /// own, byte for byte, and keeps its code.
+    #[test]
+    fn the_hosts_refusal_of_the_hello_says_what_it_said_before() {
+        let was = IpcError::IdentityUnavailable {
+            what: "the host refused the connection",
+            detail: "PERMISSION_DENIED: no".to_owned(),
+        };
+        let is = IpcError::HostRefused {
+            detail: "PERMISSION_DENIED: no".to_owned(),
+        };
+        assert_eq!(was.to_string(), is.to_string());
+        assert_eq!(was.code(), is.code());
     }
 }
