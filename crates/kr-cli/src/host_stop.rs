@@ -1995,8 +1995,10 @@ struct Round {
 }
 
 /// Whether a round reads the process that the lock file names: where the lock is held and the
-/// process is gone or was not read, which is where a named process other than the asked one is a
-/// successor.
+/// process is gone or was not read. Where the process is gone, a named process other than the
+/// asked one is a successor. With no identity the named process is read too, but
+/// [`what_the_round_shows`] never takes it for a successor, because the command cannot tell it
+/// from the daemon that was asked: there the read only fills the table's column.
 fn holder_wanted(lock: &Lock, process: Process) -> bool {
     match lock {
         Lock::Held => match process {
