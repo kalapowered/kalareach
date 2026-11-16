@@ -151,16 +151,55 @@ pub fn describe(evidence: Evidence, holder: &Holder) -> Application {
 }
 
 /// One session's application, and the one place it is published from.
+///
+/// The facts are written by the tasks that read them, and none of those tasks waits for the
+/// session: a fact is written where a read of a held session finds it (in `record`), and a
+/// publisher thread of the producer's own makes the publication, which takes the session and may
+/// wait for as long as a storage call holds it.
 pub struct Producer {
     runtime: Weak<SessionRuntime>,
     held: Mutex<Held>,
-    /// Taken for the whole of a publication, so two facts arriving together are published in the
-    /// order they were joined in and the last one wins.
-    publishing: Mutex<()>,
     published: tokio::sync::watch::Sender<Application>,
+    /// Tells the publisher that a publication is owed. It holds one wake, which stands for every
+    /// fact that joined before the publisher reads them, so a fact that joins while the publisher
+    /// waits for the session is published after it.
+    owed: std::sync::mpsc::SyncSender<Wake>,
+    /// How many helper threads of this producer are alive: its publisher, and the reader of the
+    /// question ledger that the evidence loop starts.
+    #[cfg(feature = "testing")]
+    helpers: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-/// The two kinds of fact the producer joins.
+/// One live helper thread of a producer, counted for as long as it stands, for this host's own
+/// tests.
+#[cfg(feature = "testing")]
+struct Counted(Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(feature = "testing")]
+impl Counted {
+    fn new(alive: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        alive.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(Arc::clone(alive))
+    }
+}
+
+#[cfg(feature = "testing")]
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// What the publisher is told.
+enum Wake {
+    /// A publication is owed.
+    Owed,
+    /// Every publication owed before this wake has been made, for this host's own tests.
+    #[cfg(feature = "testing")]
+    Settled(std::sync::mpsc::Sender<()>),
+}
+
+/// The facts the producer joins, each written by the task that reads it.
 #[derive(Debug, Default)]
 struct Held {
     evidence: Evidence,
@@ -177,17 +216,41 @@ impl Producer {
     /// Builds the producer of one session's application.
     ///
     /// It holds the session weakly: a session that has gone is a session with nothing to describe.
+    /// Its publisher is a thread that holds nothing while it waits to be told, and ends with the
+    /// producer.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the publisher's thread cannot be started.
     #[must_use]
     pub fn new(runtime: Weak<SessionRuntime>) -> Arc<Self> {
         // What a live session starts as, which is what launching it made it: the shell, at its
         // prompt.
         let (published, _) =
             tokio::sync::watch::channel(describe(Evidence::default(), &Holder::Unread));
-        Arc::new(Self {
-            runtime,
-            held: Mutex::new(Held::default()),
-            publishing: Mutex::new(()),
-            published,
+        let (owed, wakes) = std::sync::mpsc::sync_channel(1);
+        #[cfg(feature = "testing")]
+        let helpers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        #[cfg(feature = "testing")]
+        let counted = Counted::new(&helpers);
+        Arc::new_cyclic(|this: &Weak<Self>| {
+            let producer = Weak::clone(this);
+            std::thread::Builder::new()
+                .name("kr-application-publisher".to_owned())
+                .spawn(move || {
+                    #[cfg(feature = "testing")]
+                    let _counted = counted;
+                    publish_when_owed(&producer, &wakes);
+                })
+                .expect("a thread for the application's publisher");
+            Self {
+                runtime,
+                held: Mutex::new(Held::default()),
+                published,
+                owed,
+                #[cfg(feature = "testing")]
+                helpers,
+            }
         })
     }
 
@@ -205,52 +268,94 @@ impl Producer {
         self.published.borrow().clone()
     }
 
-    /// Takes the evidence the worker holds now.
-    pub fn observe_evidence(&self, evidence: Evidence) {
-        {
-            let mut held = self
-                .held
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if held.evidence == evidence {
-                return;
-            }
-            held.evidence = evidence;
-            self.record(&held);
-        }
-        self.publish();
+    /// Waits until every publication that was owed when it was called has been made, for this
+    /// host's own tests. A publication waits for the session, so this waits for it too.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the publisher has gone, which it does only with the producer.
+    #[cfg(feature = "testing")]
+    pub fn settle(&self) {
+        let (done, settled) = std::sync::mpsc::channel();
+        self.owed
+            .send(Wake::Settled(done))
+            .expect("the publisher is there while the producer is");
+        settled
+            .recv()
+            .expect("the publisher answers while the producer is there");
+    }
+
+    /// Returns how many helper threads of this producer are alive, for this host's own tests: its
+    /// publisher, and the reader of the question ledger while the evidence loop runs. The count is
+    /// shared, so it can be read after the producer has gone.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn helpers_alive(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::clone(&self.helpers)
+    }
+
+    /// Takes what the broker holds now: whether a request waits for a decision and whether an
+    /// instance runs a turn.
+    pub fn observe_broker(&self, approval_pending: bool, turn_running: bool) {
+        self.join(|held| {
+            let changed = held.evidence.approval_pending != approval_pending
+                || held.evidence.turn_running != turn_running;
+            held.evidence.approval_pending = approval_pending;
+            held.evidence.turn_running = turn_running;
+            changed
+        });
+    }
+
+    /// Takes whether the question ledger holds an open question, and says whether that is a change.
+    fn observe_questions(&self, question_open: bool) -> bool {
+        self.join(|held| {
+            let changed = held.evidence.question_open != question_open;
+            held.evidence.question_open = question_open;
+            changed
+        })
     }
 
     /// Takes what holds the terminal now.
     pub fn observe_holder(&self, holder: Holder) {
-        {
-            let mut held = self
-                .held
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if held.holder == holder {
-                return;
-            }
+        self.join(|held| {
+            let changed = held.holder != holder;
             held.holder = holder;
-            self.record(&held);
-        }
-        self.publish();
+            changed
+        });
     }
 
-    /// Whether the session this describes has finished or gone.
-    fn over(&self) -> bool {
-        self.runtime
-            .upgrade()
-            .is_none_or(|runtime| !runtime.session().state().is_running())
+    /// Whether the last read of the question ledger found a question open.
+    fn question_open(&self) -> bool {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .evidence
+            .question_open
+    }
+
+    /// Joins one fact to the others and records what they come to, and says whether the fact
+    /// changed anything. Nothing here waits for the session.
+    fn join(&self, fact: impl FnOnce(&mut Held) -> bool) -> bool {
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changed = fact(&mut held);
+        if changed {
+            self.record(&held);
+        }
+        changed
     }
 
     /// Writes what the facts held come to into the session's input domain, where a read of a
-    /// session that something holds finds it.
+    /// session that something holds finds it, and tells the publisher when that is not what was
+    /// published.
     ///
-    /// It is made as the fact joins the others, before the session is waited for, and with the
-    /// facts locked, so the writes go in the order the facts were joined in. A turn or a question
-    /// that begins while a storage call holds the session is therefore in the answer of a read
-    /// that cannot take the session. The domain's lock is taken last, for the write alone.
+    /// It is made as the fact joins the others, with the facts locked, so the writes go in the
+    /// order the facts were joined in, and it waits for nothing. A turn that begins while a storage
+    /// call holds the session is therefore in the answer of a read that cannot take the session,
+    /// whatever the task that read it was doing before. A question cannot begin then: it is created
+    /// with the session taken. The domain's lock is taken last, for the write alone.
     fn record(&self, held: &Held) {
         let Some(runtime) = self.runtime.upgrade() else {
             return;
@@ -260,82 +365,108 @@ impl Producer {
             .input()
             .lock()
             .set_application_state(application.state);
+        if *self.published.borrow() != application {
+            // A full channel holds a wake already, and the publisher reads the facts after it.
+            let _ = self.owed.try_send(Wake::Owed);
+        }
     }
 
     /// Publishes what the held facts come to, if that is not what was published.
     ///
-    /// The session takes it first, under its own lock and last of every lock this takes, and a
-    /// receiver is told after; so a receiver that sees a change finds it in the summary.
+    /// Only the publisher calls it. The session takes it first, and the facts are read under the
+    /// session, so what is published is the latest the facts say and not what they said when the
+    /// publisher was told. The name goes into the session before a receiver is told, so a receiver
+    /// that sees a change finds it in the summary.
     fn publish(&self) {
-        let _publishing = self
-            .publishing
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let application = {
-            let held = self
-                .held
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            describe(held.evidence, &held.holder)
-        };
-        if *self.published.borrow() == application {
-            return;
-        }
         let Some(runtime) = self.runtime.upgrade() else {
             return;
         };
-        {
+        let application = {
             let mut session = runtime.session();
             if !session.state().accepts_input() {
                 // A session that is not live has nothing to describe, and closing cleared what it
                 // had. What was held waits for a session that is.
                 return;
             }
+            let application = {
+                let held = self
+                    .held
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                describe(held.evidence, &held.holder)
+            };
+            if *self.published.borrow() == application {
+                return;
+            }
             session.set_application(application.name.clone());
-        }
+            application
+        };
         self.published.send_replace(application);
+    }
+}
+
+/// The publisher: waits to be told that a publication is owed, and makes it. It holds nothing
+/// while it waits, and it ends when the producer has gone.
+fn publish_when_owed(producer: &Weak<Producer>, wakes: &std::sync::mpsc::Receiver<Wake>) {
+    while let Ok(wake) = wakes.recv() {
+        match wake {
+            Wake::Owed => {
+                let Some(producer) = producer.upgrade() else {
+                    return;
+                };
+                producer.publish();
+            }
+            #[cfg(feature = "testing")]
+            Wake::Settled(done) => {
+                let _ = done.send(());
+            }
+        }
     }
 }
 
 /// Reads the evidence each time something that can change it wakes the producer, until the session
 /// is closed.
 ///
-/// What it reads is the broker's two facts and whether the question ledger holds an open question.
-/// Each wake is subscribed to before the read, so a change that lands during the read is not lost.
-/// The reads happen here and never at a look at the terminal, which is what keeps an idle session
-/// at one read of its foreground group for each look.
+/// What it reads is the broker's two facts, and it asks for a read of the question ledger. Each
+/// wake is subscribed to before the read, so a change that lands during the read is not lost. The
+/// reads happen here and never at a look at the terminal, which is what keeps an idle session at
+/// one read of its foreground group for each look.
+///
+/// Between two reads of its stream the loop takes nothing that a held session blocks: not the
+/// session, which it never takes, and not the question ledger's lock, which a question's commit
+/// holds with the session taken. The ledger is read by a thread of its own, and the loop writes
+/// each fact where a read of a held session finds it.
 pub async fn follow_evidence(
     producer: Arc<Producer>,
     runtime: Arc<SessionRuntime>,
     broker: Arc<Broker>,
     questions: Arc<Questions>,
     journal_changes: Option<Arc<tokio::sync::Notify>>,
-    now: impl Fn() -> Now,
+    now: impl Fn() -> Now + Send + 'static,
     deadlines: DeadlineClock,
 ) {
-    let closed = runtime.wait_closed();
-    tokio::pin!(closed);
     let changes = broker.application_changes();
+    let ledger_read = Arc::new(tokio::sync::Notify::new());
+    let ask = read_the_ledger_apart(&producer, &questions, Arc::clone(&ledger_read), now);
     loop {
         let moved_questions = questions.subscribe();
+        let moved_ledger = ledger_read.notified();
         let moved_journal = journal_changes.as_ref().map(|journal| journal.notified());
         let moved_broker = changes.notified();
-        let current = now();
+        let moved_closed = runtime.closure_notified();
         let reading = deadlines.now();
         let facts = broker.application(reading);
-        // A ledger that cannot be read says nothing, so it is taken for no question: a session is
-        // not kept awake by a record that cannot be read.
-        let question_open = questions.any_open(current).unwrap_or(false);
-        producer.observe_evidence(Evidence {
-            approval_pending: facts.approval_pending,
-            question_open,
-            turn_running: facts.turn_running,
-        });
-        if producer.over() {
+        producer.observe_broker(facts.approval_pending, facts.turn_running);
+        // A read that was asked for and not begun is enough for every ask after it.
+        let _ = ask.try_send(());
+        // The lifecycle is the input domain's, which nothing that holds the session holds too.
+        if !runtime.input().lock().state().is_running() {
             return;
         }
+        let question_open = producer.question_open();
         tokio::select! {
             () = moved_questions => {}
+            () = moved_ledger => {}
             () = async {
                 match moved_journal {
                     Some(journal) => journal.await,
@@ -364,9 +495,55 @@ pub async fn follow_evidence(
                     None => std::future::pending::<()>().await,
                 }
             } => {}
-            _ = &mut closed => return,
+            () = moved_closed => {}
         }
     }
+}
+
+/// Starts the thread that reads the question ledger for [`follow_evidence`], and returns the end
+/// that asks it to read.
+///
+/// A read of the ledger takes its store's lock and calls the store. A question's creation, answer
+/// or cancellation holds that lock across its own commit, with the session taken, so a loop that
+/// read the ledger would stand still for as long as that storage call does, and read nothing of
+/// the broker meanwhile. The thread reads when it is asked, writes what it found as the question
+/// fact, and tells the loop only when the fact changed, which is when the loop arms its timer
+/// anew. A ledger that cannot be read says nothing, so it is taken for no question: a session is
+/// not kept awake by a record that cannot be read. The thread ends when the loop does, because the
+/// asking end goes with it.
+///
+/// # Panics
+///
+/// Panics when the thread cannot be started.
+fn read_the_ledger_apart(
+    producer: &Arc<Producer>,
+    questions: &Arc<Questions>,
+    moved: Arc<tokio::sync::Notify>,
+    now: impl Fn() -> Now + Send + 'static,
+) -> std::sync::mpsc::SyncSender<()> {
+    let (ask, asked) = std::sync::mpsc::sync_channel(1);
+    #[cfg(feature = "testing")]
+    let counted = Counted::new(&producer.helpers);
+    let (producer, questions) = (Arc::downgrade(producer), Arc::downgrade(questions));
+    std::thread::Builder::new()
+        .name("kr-question-ledger-reader".to_owned())
+        .spawn(move || {
+            #[cfg(feature = "testing")]
+            let _counted = counted;
+            while asked.recv().is_ok() {
+                // Neither outlives its owner: a producer or a ledger that has gone ends the thread.
+                let (Some(producer), Some(questions)) = (producer.upgrade(), questions.upgrade())
+                else {
+                    return;
+                };
+                let open = questions.any_open(now()).unwrap_or(false);
+                if producer.observe_questions(open) {
+                    moved.notify_waiters();
+                }
+            }
+        })
+        .expect("a thread for the question ledger's reader");
+    ask
 }
 
 /// Turns the adoption watch's looks at the terminal into what holds it.

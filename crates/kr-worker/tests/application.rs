@@ -531,19 +531,13 @@ async fn a_closed_session_describes_nothing() {
     world.shows(None).await;
     world.names(None).await;
 
-    world
-        .service
-        .application()
-        .observe_evidence(kr_worker::application::Evidence {
-            approval_pending: true,
-            ..kr_worker::application::Evidence::default()
-        });
-    world
-        .service
-        .application()
-        .observe_holder(kr_worker::application::Holder::Program(Some(
-            "other".to_owned(),
-        )));
+    let application = world.service.application();
+    application.observe_broker(true, false);
+    application.observe_holder(kr_worker::application::Holder::Program(Some(
+        "other".to_owned(),
+    )));
+    // What the producer was told is published, or refused, before the session is looked at.
+    application.settle();
     assert_eq!(
         world.state(),
         None,

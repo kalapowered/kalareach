@@ -1529,6 +1529,7 @@ async fn the_command_the_integration_answered_for_names_the_program_that_runs_it
         "the script the interpreter was given names it, not the interpreter"
     );
     following.look(None);
+    producer.settle();
     assert_eq!(producer.application().name, None);
     started.end();
 
@@ -1542,6 +1543,7 @@ async fn the_command_the_integration_answered_for_names_the_program_that_runs_it
         "a script given by a relative path is the one that runs"
     );
     following.look(None);
+    producer.settle();
     started.end();
 
     // A program that has the script among its arguments and is another program: `tail` reads the
@@ -1558,6 +1560,7 @@ async fn the_command_the_integration_answered_for_names_the_program_that_runs_it
         "a program that is given the script's path to read is not the script"
     );
     following.look(None);
+    producer.settle();
     started.end();
 
     // The same command, answered for a line whose program has since replaced it: nothing the
