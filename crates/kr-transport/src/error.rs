@@ -99,8 +99,9 @@ pub enum TransportError {
 
 /// Why the connection that a stream's read waited on ended, as the read returned it.
 ///
-/// The cause is the connection's record at the moment the read was woken with it, so it is exactly
-/// what that read saw: a later close of either side changes the record and not this value.
+/// The cause is the connection's record at the moment the read polled it (the library takes it when
+/// it polls the read and finds no data to return), so it is exactly what that read saw: a later
+/// close of either side changes the record and not this value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionEnd {
     /// This application closed the connection.
@@ -597,6 +598,22 @@ mod tests {
                 TransportError::StreamLost(ConnectionEnd::Lost(_))
             ));
         }
+        // The peer's stack closed the connection: the peer's close, whatever this side did.
+        let stack_error = || {
+            iroh::endpoint::TransportError::new(
+                iroh::endpoint::TransportErrorCode::INTERNAL_ERROR,
+                "closed by the peer's stack".into(),
+            )
+        };
+        assert!(matches!(
+            lost(ConnectionError::ConnectionClosed(stack_error().into())),
+            TransportError::StreamLost(ConnectionEnd::ClosedByPeer(_))
+        ));
+        // The library's own transport error is a lost connection, and no close of either side.
+        assert!(matches!(
+            lost(ConnectionError::TransportError(stack_error())),
+            TransportError::StreamLost(ConnectionEnd::Lost(_))
+        ));
         assert_eq!(
             lost(ConnectionError::LocallyClosed).to_string(),
             "the stream failed: connection lost"
