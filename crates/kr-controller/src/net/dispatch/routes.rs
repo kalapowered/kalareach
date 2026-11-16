@@ -726,7 +726,7 @@ impl RemoteConnection {
         // The rights this request was decided with: the grant as this host's policy and its
         // configured ceiling leave it. They are what the worker is told the host checked.
         let decided = match self.ask_mutation(mutation, entry) {
-            Ok(decided) => decided.admitted_under(validated),
+            Ok(decided) => decided.admitted_under(self.footing_of(validated)),
             Err(error) => return Err(error),
         };
         *asked = Some(decided.clone());
@@ -1085,7 +1085,7 @@ impl RemoteConnection {
                         // happened: section 7's stop does not wait on this, and only the answer
                         // does, so a close not shown is not told as one refused.
                         if retained != Retained::Not {
-                            *asked = Some(decided.clone().kept(validated));
+                            *asked = Some(decided.clone().kept(self.footing_of(validated)));
                             if self.admitted_to_answer(validated).is_err() {
                                 return Err(outcome_not_shown());
                             }

@@ -87,14 +87,14 @@ async fn written_with(record: Record, ends: Ends) -> Found {
     let request_id = RequestId::new(91);
     let (asked, answer) = match record {
         Record::KeptAnswer => (
-            decided.kept(admitted),
+            decided.kept(connection.footing_of(admitted)),
             ControlFrame::Response(Response {
                 request_id,
                 outcome: Outcome::Ok(ParamsValue::empty()),
             }),
         ),
         Record::ReusedIdentifier => (
-            decided.admitted_under(admitted),
+            decided.admitted_under(connection.footing_of(admitted)),
             super::failure(
                 request_id,
                 ProtocolError::new(ErrorCode::IdConflict, "the identifier was spent"),
@@ -337,7 +337,7 @@ async fn a_kept_answer_is_not_written_when_the_grant_ends_while_the_feed_waits_f
                 false,
             )
             .expect("the action is decided")
-            .kept(admitted);
+            .kept(connection.footing_of(admitted));
         let answer = ControlFrame::Response(Response {
             request_id: RequestId::new(92),
             outcome: Outcome::Ok(ParamsValue::empty()),

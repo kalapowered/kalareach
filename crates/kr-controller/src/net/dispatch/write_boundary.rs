@@ -150,6 +150,16 @@ fn output_for(
     )
 }
 
+/// An answer kept from an earlier submission, for a case in which it is replaced by a refusal
+/// before it lands, so that the standing it carries is never asked.
+fn a_kept_answer_never_asked(controller: &Arc<Controller>) -> Answers {
+    Answers::Kept(controller.footing_of_a_network_request(
+        ConnectionId::new(kr_ipc::new_uuid()),
+        AuthorityRevision::new(0),
+        &Arc::new(AtomicBool::new(false)),
+    ))
+}
+
 /// The write boundary of a connection registered for a test device, writing to `stream`, to a peer
 /// that said in its hello it can receive no more than `receiving`: as an authorised connection's
 /// is built.
@@ -3700,7 +3710,7 @@ async fn an_answer_the_hosts_edits_make_too_large_for_the_device_is_not_written(
                 &answer,
                 &[],
                 None,
-                Answers::Kept(AuthorityRevision::new(0)),
+                a_kept_answer_never_asked(&controller),
                 None
             )
             .await,
@@ -3734,7 +3744,7 @@ async fn an_answer_the_hosts_edits_make_too_large_for_the_device_is_not_written(
             kr_protocol::error::ErrorCode::InvalidArgument,
         ),
         (
-            Answers::Kept(AuthorityRevision::new(0)),
+            a_kept_answer_never_asked(&controller),
             kr_protocol::error::ErrorCode::OutcomeUnknown,
         ),
     ] {

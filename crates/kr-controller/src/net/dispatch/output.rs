@@ -6,11 +6,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use kr_protocol::envelope::{ControlFrame, Outcome, Response};
 use kr_protocol::error::ProtocolError;
-use kr_protocol::ids::{AuthorityRevision, ConnectionId, DeviceId, RequestId};
+use kr_protocol::ids::{ConnectionId, DeviceId, RequestId};
 use kr_transport::listener::{AuthorisedSession, ControlSender};
 
 use crate::grants::policy::{BoundIdentity, HeldBound, Stands};
-use crate::service::Controller;
+use crate::service::{Ask, Controller, Footing};
 
 /// The QUIC application error code a withdrawn connection is closed with.
 pub const WITHDRAWN: u32 = 4;
@@ -269,7 +269,7 @@ pub(super) struct Relaying<'a> {
 }
 
 /// What a frame written under a decision is the answer to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(super) enum Answers {
     /// Nothing a device asked: a notification, or a batch a subscription carries.
     Nothing,
@@ -281,14 +281,16 @@ pub(super) enum Answers {
     Action,
     /// The answer kept from an earlier submission of an action, which a device is shown only as a
     /// read of the receipt it is. It goes only while the standing it was checked under holds: the
-    /// registration at the revision the request was admitted under, and no fence owed.
-    Kept(AuthorityRevision),
+    /// registration at the revision the request was admitted under, and no fence owed. The footing
+    /// the door made when it admitted the request carries that standing.
+    Kept(Footing),
     /// A refusal that says another request spent the identifier of this one, read from the route's
     /// record, from the door's own stores or from a service. It names no result and had no effect of
     /// its own, but it is read from a record, so it goes only while the standing it was checked
     /// under holds, as a kept answer does; where that fails the device is told the refusal of the
-    /// check that failed.
-    Conflict(AuthorityRevision),
+    /// check that failed. The footing the door made when it admitted the request carries that
+    /// standing.
+    Conflict(Footing),
 }
 
 impl Answers {
@@ -300,11 +302,19 @@ impl Answers {
     /// unknown for an answer that leaves it possible that the action took effect, and for any
     /// answer kept from an earlier submission; a read, or a frame that answers nothing a device
     /// asked, carries out nothing, and is told `refusal`.
-    pub(super) fn refusing(self, answer: &ControlFrame, refusal: ProtocolError) -> ProtocolError {
+    pub(super) fn refusing(&self, answer: &ControlFrame, refusal: ProtocolError) -> ProtocolError {
         match self {
             Self::Action => super::after_the_outcome(answer, refusal),
             Self::Kept(_) => super::outcome_not_shown(),
             Self::Read | Self::Nothing | Self::Conflict(_) => refusal,
+        }
+    }
+
+    /// The standing of the request an answer read from a record is written under.
+    fn standing(&self) -> Option<&Footing> {
+        match self {
+            Self::Kept(standing) | Self::Conflict(standing) => Some(standing),
+            Self::Nothing | Self::Read | Self::Action => None,
         }
     }
 }
@@ -603,12 +613,7 @@ impl RemoteOutput {
         // What a kept answer, or a conflict read from a record, stands on, asked with the other
         // bounds. It is not asked of a refusal written in the answer's place: that frame carries
         // nothing the record held.
-        let mut kept_standing = match answers {
-            Answers::Kept(admitted_revision) | Answers::Conflict(admitted_revision) => {
-                Some(admitted_revision)
-            }
-            Answers::Nothing | Answers::Read | Answers::Action => None,
-        };
+        let mut kept_standing = answers.standing();
         let frame: &ControlFrame = match &shown {
             Cow::Owned(mapped) if !super::super::device_errors::fits(mapped, self.max_payload) => {
                 // The host's edits made the answer larger than the stream carries, and the stream
@@ -649,7 +654,7 @@ impl RemoteOutput {
         // and the connection's shares lock, which a withdrawal or a commit can hold. Nothing that
         // is asked after it takes one.
         let feed_refuses = || {
-            answers != Answers::Nothing
+            !matches!(answers, Answers::Nothing)
                 && self
                     .authority
                     .controller
@@ -660,16 +665,8 @@ impl RemoteOutput {
         // standing a kept answer or a conflict was admitted under (the fence this host owes, the
         // revision in force and the connection's latch), every bound the answer is written under
         // and the decision a relayed batch rides on.
-        let kept = kept_standing.map(|admitted_revision| {
-            self.authority.controller.footing_of_a_network_request(
-                self.authority.connection_id,
-                admitted_revision,
-                &self.authority.latch,
-            )
-        });
         let standing = || {
-            kept.as_ref()
-                .is_none_or(|footing| footing.ask(crate::service::Ask::KEPT_ANSWER).is_ok())
+            kept_standing.is_none_or(|footing| footing.ask(Ask::KEPT_ANSWER).is_ok())
                 && bounds_hold(&self.authority.controller, under, HeldBound::stands_at)
                 && relaying
                     .as_ref()
