@@ -782,31 +782,60 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_question_compares_the_bound_it_took_before_its_first_read() {
+    /// A footing, on a clock that ends its bound at its first reading, that holds a lease bound of
+    /// an hour: with a registration and a deadline a minute away when `admitted`, with neither
+    /// otherwise.
+    fn a_footing_on_a_clock_that_ends_its_bound(admitted: bool) -> LeasedFooting {
         let clock = ManualClock::new();
+        let deadline = clock.now().checked_add(Duration::from_secs(60));
         let cell = BoundCell::new(
             BoundIdentity::Unbounded,
             clock.now().checked_add(Duration::from_secs(3600)),
             None,
             false,
         );
+        let held = HeldBound::load(&cell);
         let copies = Arc::new(Copies::new(
             AuthorityRevision::new(3),
             Arc::new(EndsTheBoundWhenRead {
                 clock,
-                cell: Arc::clone(&cell),
+                cell,
                 ended: AtomicBool::new(false),
             }),
             WallClock::from_fn(|| 1_000),
             Arc::new(UtcFloor::default()),
         ));
-        let footing = Footing::untargeted(copies).holding(HeldBound::load(&cell));
-        // The cell ends while the question reads the clock, after its first read: that question
-        // goes by the bound it took before, and does not load the cell again. The next one finds
-        // the end.
+        if admitted {
+            Footing::admitted(
+                copies,
+                ConnectionId::new(kr_ipc::new_uuid()),
+                AuthorityRevision::new(3),
+                Some(Arc::new(AtomicBool::new(false))),
+                deadline,
+            )
+        } else {
+            Footing::untargeted(copies)
+        }
+        .holding(held)
+    }
+
+    #[test]
+    fn a_question_compares_the_bound_it_took_before_the_bounds_own_clock_read() {
+        let footing = a_footing_on_a_clock_that_ends_its_bound(false);
+        // The cell ends while the question reads the clock for the bound, after its first read:
+        // that question goes by the bound it took before, and does not load the cell again. The
+        // next one finds the end.
         assert_eq!(footing.ask(Ask::SIGN_IN), Ok(()));
         assert_eq!(footing.ask(Ask::SIGN_IN), refused(Lapse::LeaseEnded));
+    }
+
+    #[test]
+    fn a_question_compares_the_bound_it_took_before_the_deadlines_clock_read() {
+        let footing = a_footing_on_a_clock_that_ends_its_bound(true);
+        // The cell ends while the question reads the clock for the deadline, which is read before
+        // the bound is compared.
+        assert_eq!(footing.ask(Ask::MUTATION), Ok(()));
+        assert_eq!(footing.ask(Ask::MUTATION), refused(Lapse::LeaseEnded));
     }
 
     #[test]
