@@ -1932,14 +1932,18 @@ impl DaemonThatEnds {
     }
 }
 
-/// KR-REQ-07.12 (a request that could not be made): a daemon that answers `host.info`, closes the
-/// connection and ends is seen to end by `kr host stop`, which lets go of its own end of the
-/// connection before it looks for the end. Where it kept the connection, the pipe's instance for
-/// it would stay for as long as the command held it, every new connection would meet a busy pipe,
-/// and the command could not see the daemon go. The text is the unmade request's own sentence: it
-/// names why the request could not be made and says that the command sent nothing, and the line
-/// that says a request was asked, which a command that composed its request before it saw the
-/// close prints on the error stream, is not there.
+/// KR-REQ-07.12 (a daemon that closed the connection and ended): a daemon that answers `host.info`,
+/// closes the connection and ends is seen to end by `kr host stop`, which lets go of its own end of
+/// the connection before it looks for the end. Where it kept the connection, the pipe's instance
+/// for it would stay for as long as the command held it, every new connection would meet a busy
+/// pipe, and the command could not see the daemon go. This case does not choose the path to that
+/// end: where the close has reached the command when it composes its request, it makes none and
+/// says so; where it composed first it sent its request into the closed connection and waits for
+/// the daemon as one that may have taken it. The case takes the sentence that its run came to and
+/// holds what is true of that path: the unmade request's own sentence with no line that says a
+/// request was asked, or the end of a daemon that was asked. It can miss a fault of the
+/// closed-connection branch on a run that composed first, which the unit cases of the stop's
+/// decision hold.
 #[test]
 fn kr_host_stop_sees_a_daemon_end_that_closed_the_connection_the_command_held() {
     let host = Host::create();
@@ -1947,23 +1951,24 @@ fn kr_host_stop_sees_a_daemon_end_that_closed_the_connection_the_command_held() 
     let output = host.kr(&["host", "stop"]);
     daemon.finish();
     let out = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "{out} {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        out.starts_with("The control daemon for environment "),
-        "{out}"
-    );
-    assert!(
-        out.contains(" ended, and this command could not make its request for it: "),
-        "{out}"
-    );
-    assert!(
-        out.trim_end().ends_with("This command sent nothing."),
-        "{out}"
-    );
     let said = String::from_utf8_lossy(&output.stderr);
-    assert!(!said.contains("Asked the control daemon"), "{said}");
+    assert!(output.status.success(), "{out} {said}");
+    if out.starts_with("The control daemon for environment ") {
+        // The unmade request.
+        assert!(
+            out.contains(" ended, and this command could not make its request for it: "),
+            "{out}"
+        );
+        assert!(
+            out.trim_end().ends_with("This command sent nothing."),
+            "{out}"
+        );
+        assert!(!said.contains("Asked the control daemon"), "{said}");
+    } else {
+        // The request that was made into the closed connection.
+        assert!(
+            out.starts_with("Stopped the control daemon for environment "),
+            "neither path's sentence: {out}"
+        );
+    }
 }
