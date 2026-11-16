@@ -1044,16 +1044,20 @@ final class LinkTapTests: HarnessTestCase {
         } else {
             XCTAssertEqual(pressLook(result), dragged.name, "\(result.label): the hold left no range and the drag's pointer down names \(pressLook(result) ?? "none"), not \(dragged.name)")
         }
-        if let away = awayFromLinks() {
-            let elsewhere = tap("\(named): a tap elsewhere, after the drag that followed a held press", at: away, shift: offset(of: link("table-2")))
-            let elsewherePrimary = LinkTapRules.pressOf(elsewhere).flatMap { isPrimary($0.pointer) }
-            say("LINKTAP \(named): the tap elsewhere: events \(elsewhere.events.map(\.type)), its pointer primary: \(elsewherePrimary.map { $0 ? "yes" : "no" } ?? "unknown"), looks \(elsewhere.looks.map { "\($0.on ? "on" : "off")(\($0.name))" }), opened \(elsewhere.opened), the page's selection after it \(selection().text), lit now \(litNow())")
-            XCTAssertFalse(elsewhere.looks.contains { $0.on }, "\(elsewhere.label): a look came on: \(elsewhere.looks)")
-            XCTAssertTrue(elsewhere.opened.isEmpty, "\(elsewhere.label): opened \(elsewhere.opened)")
-            XCTAssertTrue(litNow().isEmpty, "\(elsewhere.label): lit at its end: \(litNow())")
-        } else {
-            XCTFail("no point of the conversation lies a line away from every link: \(pane().room)")
-        }
+        // The tap elsewhere is made at the screen's left edge, the point that the harness itself taps to put the keyboard away: outside the pane and
+        // the composer, so it cannot hit a link or a text field, and it needs no link's button or place on the page (while a selection stands the
+        // system's tree can hold no button for a link, and a short pane can hold no point a line away from every link). The point is a point of
+        // the screen, so there is no shift.
+        let elsewhere = tap(
+            "\(named): a tap elsewhere, after the drag that followed a held press",
+            at: CGPoint(x: app.frame.width * 0.004, y: app.frame.height * 0.4),
+            shift: .zero
+        )
+        let elsewherePrimary = LinkTapRules.pressOf(elsewhere).flatMap { isPrimary($0.pointer) }
+        say("LINKTAP \(named): the tap elsewhere: events \(elsewhere.events.map(\.type)), its pointer primary: \(elsewherePrimary.map { $0 ? "yes" : "no" } ?? "unknown"), looks \(elsewhere.looks.map { "\($0.on ? "on" : "off")(\($0.name))" }), opened \(elsewhere.opened), the page's selection after it \(selection().text), lit now \(litNow())")
+        XCTAssertFalse(elsewhere.looks.contains { $0.on }, "\(elsewhere.label): a look came on: \(elsewhere.looks)")
+        XCTAssertTrue(elsewhere.opened.isEmpty, "\(elsewhere.label): opened \(elsewhere.opened)")
+        XCTAssertTrue(litNow().isEmpty, "\(elsewhere.label): lit at its end: \(litNow())")
 
         // A link tapped while the composer has focus: the link opens once, and the report says where the focus is
         // and whether the keyboard is still up.
