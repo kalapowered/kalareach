@@ -1834,6 +1834,35 @@ async fn a_sign_in_that_meets_a_fence_before_it_is_shown_as_waiting_is_not_shown
     }
 }
 
+/// What a refusal of a request under a fence this host owes says, whole.
+const FENCE_OWED_REFUSAL: &str = "this host withdrew authority and the fence that withdrawal owes \
+     could not be raised yet, so nothing admitted under it is dispatched; run kr doctor to see what \
+     stopped it";
+
+/// What the browser is shown when the authority a sign-in was started under ended while it waited
+/// and the revocation of what the service issued was queued or sent.
+const AUTHORITY_ENDED_PAGE: &str = "This host's authority for this sign-in ended while the sign-in \
+     waited for you. Nothing was signed in. The host revokes what the account service issued. To \
+     sign in, start again on the host.";
+
+/// What the browser is shown when the same happened and the revocation reached neither the service
+/// nor the queue.
+const AUTHORITY_ENDED_REVOCATION_OWED_PAGE: &str = "This host's authority for this sign-in ended \
+     while the sign-in waited for you. Nothing was signed in. The host could not yet revoke what the \
+     account service issued. The host tries again the next time it uses the account, and what was \
+     issued ends by itself when it expires. To sign in, start again on the host.";
+
+/// The words of the one paragraph in the page the daemon answered a browser with, which is the
+/// whole of what the page tells the person.
+fn page_words(page: &str) -> &str {
+    const OPENS: &str = "padding:0 1rem\">";
+    let (head, body) = page.split_once("\r\n\r\n").expect("a head and a body");
+    assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+    let (_, rest) = body.split_once(OPENS).expect("the page's one paragraph");
+    rest.strip_suffix("</p></html>")
+        .expect("the page ends after its paragraph")
+}
+
 /// KR-REQ-09.09: a sign-in asks whether its request still stands immediately before each try to
 /// bind the address a sign-in comes back to, since the bind takes the address and the request's
 /// authority can end in the waits before it. A fence this host comes to owe after the sign-in's
@@ -1870,7 +1899,7 @@ async fn a_sign_in_that_meets_a_fence_before_it_binds_its_address_binds_none() {
                 kr_protocol::error::ErrorCode::PermissionDenied,
                 "{refused:?}"
             );
-            assert!(refused.message.contains("fence"), "{refused:?}");
+            assert_eq!(refused.message, FENCE_OWED_REFUSAL, "{refused:?}");
             assert_eq!(account.binds_made(), 0, "no address was bound");
             assert_eq!(
                 account_report(&host).await.state,
@@ -1926,12 +1955,18 @@ async fn a_sign_in_that_meets_a_fence_before_its_change_gate_is_raised_raises_no
         host.controller().hold_fence(false);
         let report = settled(&host).await;
         if owed {
-            assert!(
-                page.contains("authority for this sign-in ended"),
-                "the browser is told why: {page}"
+            assert_eq!(
+                page_words(&page),
+                AUTHORITY_ENDED_PAGE,
+                "the browser is told why"
             );
             assert_eq!(account.change_gates_raised(), 0, "no gate was raised");
             assert_eq!(report.state, AccountState::SignedOut, "no grant is kept");
+            assert_eq!(
+                report.last_attempt.as_ref(),
+                Some(&AccountAttempt::NotKept),
+                "the attempt is reported as a grant that was not kept"
+            );
             assert_eq!(
                 broker.revoked(),
                 [broker.refresh(1)],
@@ -1951,6 +1986,86 @@ async fn a_sign_in_that_meets_a_fence_before_its_change_gate_is_raised_raises_no
         }
         host.stop().await;
     }
+}
+
+/// KR-REQ-17.23 and 17.54: a sign-in whose authority ended before its change gate was raised, and
+/// whose revocation reaches neither the queue nor the service, is told to the person as a revocation
+/// that is still owed, as the keep tells it: the queue's place is a directory and the service
+/// refuses revocations, so the token that the exchange brought is held in memory alone. No gate is
+/// raised, the account stays as it was, and the browser is shown the whole of the owed page. The
+/// next send, with the queue and the service back, ends that token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_whose_authority_ended_before_its_change_gate_owes_a_revocation_that_neither_took()
+ {
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+    let broker = Broker::start().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host =
+        net_support::Host::start_with_document(&owner, &document_naming(&broker.origin)).await;
+    listen_for_sign_ins(&host);
+    sign_in_with(&host, broker.issue_grant(600)).await;
+    let (url, address) = start_sign_in(&host).await;
+    broker.expect_sign_in(&url);
+    let kept = account_item_in(&host.tree().environment().secrets_dir(), "session");
+    let queue = kept.with_file_name("revoke");
+    let account = host.controller().host_account();
+    let (arrived, go) = account.pause_before_the_change_gate();
+    let (page, ()) = tokio::join!(browser_answers(&address, &url, "the-code"), async {
+        tokio::time::timeout(WAIT, arrived)
+            .await
+            .expect("the sign-in reaches the place it raises the gate")
+            .expect("the pause is armed");
+        // The exchange and the recovery before it are over: from here the queue cannot be read and
+        // the service refuses what it is sent, and a fence is owed.
+        std::fs::create_dir(&queue).expect("a directory in the queue's place");
+        broker.refuse_revocations(true);
+        host.controller().hold_fence(true);
+        go.send(()).expect("the sign-in goes on");
+    });
+    host.controller().hold_fence(false);
+    let report = settled(&host).await;
+    assert_eq!(
+        page_words(&page),
+        AUTHORITY_ENDED_REVOCATION_OWED_PAGE,
+        "the browser is told that the revocation is owed"
+    );
+    assert_eq!(account.change_gates_raised(), 0, "no gate was raised");
+    assert_eq!(
+        report.last_attempt.as_ref(),
+        Some(&AccountAttempt::NotKept),
+        "the attempt is reported as a grant that was not kept"
+    );
+    assert!(
+        matches!(report.state, AccountState::SignedIn { .. }),
+        "the account is as it was: {report:?}"
+    );
+    assert!(
+        broker.revoked().is_empty(),
+        "the service refused the revocation"
+    );
+    assert!(
+        broker
+            .seen()
+            .iter()
+            .any(|request| request.path == "/auth/oauth2/revoke"
+                && request.body["token"] == broker.refresh(2).as_str()),
+        "the token was sent to the service at once, and refused"
+    );
+
+    // The token is in memory alone: the queue never held it. The next send ends it, with the grant
+    // that sign-out ends.
+    std::fs::remove_dir(&queue).expect("the queue's place is given back");
+    broker.refuse_revocations(false);
+    let _ = sign_out(&host).await;
+    let mut revoked = broker.revoked();
+    revoked.sort();
+    let mut both = vec![broker.refresh(1), broker.refresh(2)];
+    both.sort();
+    assert_eq!(
+        revoked, both,
+        "the next send ended the token that only memory held"
+    );
+    host.stop().await;
 }
 
 /// What a refusal says beside its own words when the request had already ended the sign-in that

@@ -194,6 +194,11 @@ fn a_stop_whose_hold_ends_while_its_admission_is_asked_does_not_stop_the_daemon(
         if ends {
             let refused = stopped.expect_err("a stop after its hold ended is refused");
             assert_eq!(refused.code(), ErrorCode::ResourceUnavailable);
+            assert_eq!(
+                refused.to_string(),
+                "this control daemon was not prepared for this handover, or the preparation \
+                 lapsed, or it is over; prepare it again"
+            );
             assert!(!told, "the daemon was not told to stop");
         } else {
             assert_eq!(stopped.expect("the control stops"), attempt);
