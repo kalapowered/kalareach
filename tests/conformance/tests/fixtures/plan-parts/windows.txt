@@ -45,14 +45,16 @@ the environment's singleton lock :: cargo test --locked -p kr-controller --lib s
 the environment's scheduled task, registered, read back and run :: cargo test --locked -p kr-controller --lib supervision::windows -- --show-output
 a start through the environment's scheduled task :: cargo test --locked -p kr-controller --test task_supervisor -- --show-output
 the plugin host started through the environment's scheduled task :: cargo test --locked -p kr-controller --test plugin_runtime_service -- --show-output
+the plugin host with its epoch held, which the plugin world's programs start :: cargo build --locked -p kr-plugin-host --features testing --bins
+the plugin actions, their decoding, their attachments and the observation of terminals :: cargo test --locked -p kr-controller --test worker_waits_prepared --test plugin_actions --test plugin_decoding --test plugin_insertion --test plugin_observation --test revocation_of_a_held_action -- --show-output
 the plugin host's launcher :: cargo test --locked -p kr-plugin-service --lib launcher:: -- --show-output
 the compile budget's reading of a thread's processor time :: cargo test --locked -p kr-plugin-runtime --test execution kr_req_11_41_the_budget_counts_the_compiling_threads_own_processor_time -- --show-output
 the plugin runtime's library :: cargo test --locked -p kr-plugin-runtime --lib -- --show-output
 the plugin runtime running real components :: cargo test --locked -p kr-plugin-runtime --test execution -- --show-output --skip kr_req_11_41_the_budget_counts_the_compiling_threads_own_processor_time
-the plugin runtime's service over a pipe :: cargo test --locked -p kr-plugin-runtime --test service -- --show-output
 part 2/2
 the control daemon, the worker, the forwarder and the plugin host the suites start, and the release tool whose header a case reads :: cargo build --locked -p kr-controller -p kr-worker -p kr-hook -p kr-plugin-host -p kr-release
 the description process the update suite assembles into releases :: cargo build --locked -p kr-describe-model --bin kr-describe-inference
+the plugin runtime's service over a pipe :: cargo test --locked -p kr-plugin-runtime --test service -- --show-output
 the control daemon started through the environment's scheduled task :: cargo test --locked -p kr-cli --test startup_windows -- --ignored --skip a_task_the_task_scheduler_does_not_start --show-output
 the attention store :: cargo test --locked -p kr-attention -- --show-output
 the client's stores and their directory flush :: cargo test --locked -p kr-client --lib -- --show-output
