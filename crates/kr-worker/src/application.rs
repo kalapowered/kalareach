@@ -479,7 +479,10 @@ fn publish_when_owed(producer: &Weak<Producer>, wakes: &std::sync::mpsc::Receive
 /// Between two reads of its stream the loop takes nothing that a held session blocks: not the
 /// session, which it never takes, and not the question ledger's lock, which a question's commit
 /// holds with the session taken. The ledger is read by a thread of its own, and the loop writes
-/// each fact where a read of a held session finds it.
+/// each fact where a read of a held session finds it. What it still waits for is the broker's
+/// lock, which a broker commit holds across its own write: behind a commit that waits for the
+/// journal's file while a hold keeps it, for at most the store's five seconds, and behind a commit
+/// to a disk that has stopped for as long as the disk does, as the loop did before.
 pub async fn follow_evidence(
     producer: Arc<Producer>,
     runtime: Arc<SessionRuntime>,
