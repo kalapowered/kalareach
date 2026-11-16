@@ -5103,6 +5103,18 @@ impl WorkerService {
         }
     }
 
+    /// Whether a request only ends work that its own connection holds, so that its peer's end does
+    /// not take it back.
+    ///
+    /// A cancellation of an action takes nothing on and starts nothing: it ends what the client
+    /// offered. The client wrote it before it went, and the end behind it is read after it, so the
+    /// cancellation decides the action; dropping it would leave the action to be rejected as one
+    /// whose admission failed. Every other request starts or changes work, and is dropped when its
+    /// peer cannot take the answer.
+    fn only_ends_work(method: Method) -> bool {
+        method == Method::ActionCancel
+    }
+
     /// What a try that found the boundary held comes to: the peer has gone, or it is there and the
     /// request waits.
     fn after_a_failed_try<T>(state: &ConnectionState) -> Tried<T> {
@@ -5146,7 +5158,7 @@ impl WorkerService {
 
     /// One try of a mutation: takes the dispatch boundary when it is free and deals with the
     /// request under it, and otherwise asks whether the peer has gone. It holds nothing when it
-    /// returns.
+    /// returns. A request that only ends work asks nothing of the peer.
     fn receipt_once(
         &self,
         state: &mut ConnectionState,
@@ -5156,8 +5168,15 @@ impl WorkerService {
         caller: &Caller,
         freshness: Freshness,
     ) -> Tried<Result<Answered>> {
+        // A request that only ends work is not dropped for its peer's end: it waits for the
+        // boundary for as long as that takes, and is carried out.
+        let ends_work = Self::only_ends_work(method);
         let Some(_barrier) = self.try_boundary() else {
-            return Self::after_a_failed_try(state);
+            return if ends_work {
+                Tried::Held
+            } else {
+                Self::after_a_failed_try(state)
+            };
         };
         // The wait for the session and the commits are the body's, so only the body leaves the
         // executor.
@@ -5168,7 +5187,7 @@ impl WorkerService {
             // this request: a peer that went since the last try is not answered, and no receipt,
             // effect or answer is made for it. This narrows the window and cannot close it, since
             // a peer can go at any time after the question.
-            if state.peer_has_gone() {
+            if !ends_work && state.peer_has_gone() {
                 return Tried::PeerGone;
             }
             Tried::Done(self.receipted(state, mutation, method, entry, caller, freshness))
@@ -6517,9 +6536,10 @@ impl WorkerService {
             local.hold_request(mutation.request_id);
         }
         // The wait for the dispatch boundary is made of tries, so a request whose peer has gone
-        // leaves it at once. The marker, the effect and the outcome are commits, and the wait for
-        // the session is for whatever else holds it: a thread that is in it is not one the
-        // recogniser's timer, or any other task, can be run on.
+        // leaves it at once, unless it only ends work (see `only_ends_work`). The marker, the
+        // effect and the outcome are commits, and the wait for the session is for whatever else
+        // holds it: a thread that is in it is not one the recogniser's timer, or any other task,
+        // can be run on.
         self.wait_before_the_boundary();
         #[cfg(feature = "testing")]
         let waiting = WaitingCount::begin(&self.boundary_waiting[0]);
