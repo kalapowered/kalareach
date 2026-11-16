@@ -38,7 +38,7 @@ use kr_protocol::scalars::{Nullable, U64};
 use kr_protocol::session::{DisplayNumber, SessionListParams, SessionListResult};
 use serde::Serialize;
 
-use crate::connection::{Asked, Connection, Unopened};
+use crate::connection::{Asked, Connection, Unanswered, Unopened};
 use crate::device::Device;
 use crate::device::hosts::{UNNAMED_HOST, reference_of};
 use crate::error::CommandError;
@@ -468,10 +468,13 @@ async fn read_over(
                 display_number: each.display_number,
             })
             .collect(),
-        // The host refused its session list: its answer, and the rows say "a session".
-        Err(ClientError::Host(_)) => Vec::new(),
-        // Anything else is the connection failing, and the inbox read beside it is not published.
-        Err(other) => return Err(Unopened::lost(other).into()),
+        Err(error) => match Unanswered::of(error) {
+            // The host refused its session list: its answer, and the rows say "a session".
+            Err(_) => Vec::new(),
+            // Anything else is the connection failing, and the inbox read beside it is not
+            // published.
+            Ok(silence) => return Err(Unopened::lost(silence).into()),
+        },
     };
     Ok((result, sessions))
 }
