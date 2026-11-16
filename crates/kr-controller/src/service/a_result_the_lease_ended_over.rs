@@ -572,11 +572,11 @@ async fn a_reply_read_from_a_record_is_not_written_when_the_lease_ends_after_it_
     }
 }
 
-/// KR-REQ-17.54: the ask that stands behind a sign-in reads the owner's lease first and the fence
-/// this host owes after it, and reading the fence takes its lock, so the lease's end that the first
-/// reading returned is compared with the clock again after it. A lease that ends in that wait
-/// stops the sign-in: nothing is kept. The control: where the lease still stands after the wait,
-/// the ask passes.
+/// KR-REQ-17.54: the ask that stands behind a sign-in reads the owner's lease first, and then asks
+/// the footing's one question through its guard, which reads the fence this host owes and compares
+/// the lease's end that the reading returned with the clock again. A lease that ends between the
+/// reading and the question stops the sign-in: nothing is kept. The control: where the lease still
+/// stands at the question, the ask passes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sign_in_ask_whose_lease_ends_while_the_fence_is_read_is_refused() {
     for ends in [false, true] {
@@ -584,13 +584,13 @@ async fn a_sign_in_ask_whose_lease_ends_while_the_fence_is_read_is_refused() {
         let lasting = controller.sign_in_lasting(Method::AccountSignIn);
         let (arrived, go) = controller.pause_before_the_last_fence_read();
         let asking = tokio::task::spawn_blocking(move || lasting());
-        // The lease was read live, and the ask is about to read the fence.
+        // The lease was read live, and the question is about to be asked.
         tokio::task::spawn_blocking(move || {
             arrived.recv_timeout(std::time::Duration::from_secs(30))
         })
         .await
         .expect("the wait ends")
-        .expect("the ask reaches its reading of the fence");
+        .expect("the ask reaches its question");
         if ends {
             continuous.advance(std::time::Duration::from_secs(16 * 60));
         }

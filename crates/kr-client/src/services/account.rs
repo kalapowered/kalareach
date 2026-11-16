@@ -2626,15 +2626,9 @@ impl SignedInAccount {
             };
             if let Some(old) = &replaced {
                 // The queue is prepared first, with every read it makes, and asked for after them
-                // with only its write after the ask. Where the ask says no nothing was queued, so
-                // nothing is put back.
-                let entries = match self.queued(&old.grant_id, old.refresh_token.clone()) {
-                    Ok(entries) => entries,
-                    Err(error) => {
-                        let _ = put_back(&replaced);
-                        return Err(error);
-                    }
-                };
+                // with only its write after the ask. Where a read fails or the ask says no, nothing
+                // was queued, so nothing is put back.
+                let entries = self.queued(&old.grant_id, old.refresh_token.clone())?;
                 let Some(guard) = stands() else {
                     return Ok(Commit::Withheld);
                 };

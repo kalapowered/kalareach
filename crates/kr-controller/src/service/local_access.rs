@@ -26,8 +26,9 @@ use crate::grants::policy::LocalOwnerBound;
 
 /// The refusal of a method the local owner's membership lease holds, when no lease is live.
 ///
-/// Only [`Controller::local_hold`] makes one: it names no record and no effect, and a held method
-/// is refused before anything is looked for. There is no conversion into it from an error.
+/// [`Controller::local_hold`] makes one where no lease is live, and so does
+/// [`super::Lapse::refusal`] for a lease that ended: it names no record and no effect, and a held
+/// method is refused before anything is looked for. There is no conversion into it from an error.
 #[derive(Debug)]
 pub(crate) struct LeaseNotLive {
     error: ControllerError,
