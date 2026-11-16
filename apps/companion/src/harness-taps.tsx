@@ -13,7 +13,12 @@
  * The record listens on the document, as the pane's own tap handling does, so that it adds nothing the
  * platform counts as a click listener on the page's content: in the capture phase, except for the
  * pointer down and the click, which are read in the bubble phase so that the look they log is the one
- * that the pane's handling and the page's own listeners have left.
+ * that the pane's handling and the page's own listeners have left. The pointer up is read in the capture
+ * phase, so that its look is the one that the press had kept until the release.
+ *
+ * Every event line ends with the time that the page read it (`t=`, milliseconds on the page's own
+ * clock, the clock of the pane's handling), and a line of its own says when a link gets and loses the
+ * pressed look, so that a tap's release-to-click time and the length of the look can be read from the log.
  */
 
 import { useEffect, type ReactNode } from 'react'
@@ -63,7 +68,7 @@ export function fillForTaps(controls: FakeHostControls, short = false): void {
 }
 
 /** How many events the record keeps. */
-const KEPT = 24
+const KEPT = 48
 
 /** The last part of an address, which names a link. */
 const nameOf = (address: string): string => address.slice(address.lastIndexOf('/') + 1)
@@ -147,17 +152,31 @@ export function TapRecord({ controls }: { readonly controls: FakeHostControls })
       ]
       for (const [element, text] of texts) if (element.textContent !== text) element.textContent = text
     }
+    const litName = (): string => nameOf(document.querySelector<HTMLElement>('.md-link[data-pressed]')?.title ?? '') || '-'
+    // When a link gets and loses the pressed look, after the event that it follows: `V <the last event's number> on|off <link> t=<ms>`.
+    const looks = new MutationObserver((records) => {
+      for (const record of records) {
+        const link = record.target
+        if (!(link instanceof HTMLElement)) continue
+        const lit = link.hasAttribute('data-pressed')
+        if (lit === (record.oldValue !== null)) continue
+        seen.push(`V ${String(order)} ${lit ? 'on' : 'off'} ${nameOf(link.title)} t=${round(performance.now())}`)
+        if (seen.length > KEPT) seen.shift()
+      }
+      show()
+    })
+    looks.observe(document.body, { attributes: true, attributeFilter: ['data-pressed'], attributeOldValue: true, subtree: true })
     const note = (event: Event): void => {
       const at = event as MouseEvent
       order += 1
       const pointer = event as PointerEvent
       // The event's class, and the pointer's number and type where the event has them: `-` where it has not.
-      // At a pointer down and at a click, the link that the page's press handling lit by then (`-` for none):
-      // these run in the bubble phase, after the handler's own listener on the document and the page's own
-      // have run.
-      const lit = event.type === 'pointerdown' || event.type === 'click' ? nameOf(document.querySelector<HTMLElement>('.md-link[data-pressed]')?.title ?? '') || '-' : '-'
+      // At a pointer down, a pointer up and a click, the link that the page's press handling had lit by then
+      // (`-` for none): the pointer down and the click run in the bubble phase, after the handler's own listener
+      // on the document and the page's own have run, and the pointer up runs before the handler's release.
+      const lit = event.type === 'pointerdown' || event.type === 'pointerup' || event.type === 'click' ? litName() : '-'
       seen.push(
-        `E ${String(order)} ${event.type} ${describe(event.target)} ${event.isTrusted ? '1' : '0'} ${String(at.detail ?? 0)} ${round(at.clientX ?? 0)} ${round(at.clientY ?? 0)} ${event.constructor.name} ${typeof pointer.pointerId === 'number' ? String(pointer.pointerId) : '-'} ${pointer.pointerType || '-'} lit=${lit}`
+        `E ${String(order)} ${event.type} ${describe(event.target)} ${event.isTrusted ? '1' : '0'} ${String(at.detail ?? 0)} ${round(at.clientX ?? 0)} ${round(at.clientY ?? 0)} ${event.constructor.name} ${typeof pointer.pointerId === 'number' ? String(pointer.pointerId) : '-'} ${pointer.pointerType || '-'} lit=${lit} t=${round(performance.now())}`
       )
       if (seen.length > KEPT) seen.shift()
       show()
@@ -169,6 +188,7 @@ export function TapRecord({ controls }: { readonly controls: FakeHostControls })
     const timer = window.setInterval(show, 400)
     show()
     return () => {
+      looks.disconnect()
       for (const type of types) document.removeEventListener(type, note, true)
       document.removeEventListener('pointerdown', note)
       document.removeEventListener('click', note)
