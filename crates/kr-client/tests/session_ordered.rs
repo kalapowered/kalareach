@@ -325,7 +325,9 @@ async fn next_notice(events: &mut OrderedEvents) -> (StreamId, u64) {
 }
 
 async fn next_end(events: &mut OrderedEvents) -> Ended {
-    match within(events.recv()).await {
+    let item = tokio::time::timeout(LIVENESS, events.recv()).await;
+    assert!(item.is_ok(), "the end never came");
+    match item.ok().flatten() {
         Some(Ordered::Ended(ended)) => ended,
         Some(Ordered::Notification(_)) => panic!("a notification came where the end was due"),
         None => panic!("the channel closed where the end was due"),
@@ -561,12 +563,16 @@ async fn an_ordered_session_keeps_the_broadcast_and_the_cursors_as_they_are() {
     for sequence in [0, 1, 1, 5] {
         assert_eq!(next_notice(&mut events).await.1, sequence);
     }
+    // The broadcast's copy is made before the owner's, so it is there once the owner has read.
     let mut seen = Vec::new();
-    for _ in 0..3 {
-        let notification = within(broadcast.recv()).await.expect("an event");
+    while let Ok(notification) = broadcast.try_recv() {
         seen.push(notification.sequence.get());
     }
-    assert_eq!(seen, [0, 1, 5], "the duplicate reached the broadcast");
+    assert_eq!(
+        seen,
+        [0, 1, 5],
+        "the broadcast did not get what the cursors let through, once each"
+    );
 }
 
 /// What a lane stands on: on an ordered session a lane sends, and its event is seen, while the
