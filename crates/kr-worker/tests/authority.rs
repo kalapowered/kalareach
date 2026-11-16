@@ -1544,13 +1544,20 @@ async fn a_presentation_with_a_frame_behind_its_token_is_not_taken_for_gone() {
     assert_eq!(service.presentations_waiting_for_tests(), 1);
     let large =
         kr_protocol::envelope::ParamsValue::from_typed(&"x".repeat(5 * 1024)).expect("encodes");
-    link.send(&ControlFrame::Request(kr_protocol::envelope::Request {
-        request_id: kr_protocol::ids::RequestId::new(7),
-        method: Method::SessionRead.into(),
-        method_version: kr_protocol::method::MethodVersion::V1,
-        params: large,
-    }))
+    // Bounded: a connection whose buffer cannot take the whole frame would stop this send until the
+    // boundary is released, which only this case does, and the suite would hang with correct code.
+    // A send that the connection takes ends in milliseconds.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        link.send(&ControlFrame::Request(kr_protocol::envelope::Request {
+            request_id: kr_protocol::ids::RequestId::new(7),
+            method: Method::SessionRead.into(),
+            method_version: kr_protocol::method::MethodVersion::V1,
+            params: large,
+        })),
+    )
     .await
+    .expect("the send of the 5 KiB frame behind the token did not complete within 10 s")
     .expect("sends a frame behind the token");
 
     let before = service.presentation_tries_for_tests();
