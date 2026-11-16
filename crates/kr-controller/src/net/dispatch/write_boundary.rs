@@ -211,6 +211,15 @@ fn decided_now(controller: &Controller) -> RelayGrant {
     }
 }
 
+/// Fails the test when a write has not ended within [`WAIT_BOUND`]: a check that is gone leaves a
+/// write that waits for a decision to stop holding waiting for ever, and the case then fails
+/// by its own assertion and not by the runner's limit.
+async fn ends(write: impl std::future::Future<Output = Written>) -> Written {
+    tokio::time::timeout(WAIT_BOUND, write)
+        .await
+        .unwrap_or_else(|_| panic!("the write did not end within {WAIT_BOUND:?}"))
+}
+
 fn batch() -> ControlFrame {
     ControlFrame::Event(ControlEvent::Keepalive)
 }
@@ -275,7 +284,7 @@ async fn a_batch_held_at_the_writer_is_not_written_once_the_policy_moves() {
         grant: decided_now(&controller),
         redecide: &redecide,
     };
-    let (written, ()) = tokio::join!(output.write(&frame, &[], Some(relaying)), async {
+    let (written, ()) = tokio::join!(ends(output.write(&frame, &[], Some(relaying))), async {
         stream.waited(1).await;
         lapse_the_offline_bound(&controller);
         stream.writer.add_permits(1);
@@ -308,7 +317,7 @@ async fn a_batch_that_waits_for_the_writer_is_decided_again_by_the_watch() {
         grant: decided_now(&controller),
         redecide: &redecide,
     };
-    let (written, ()) = tokio::join!(output.write(&frame, &[], Some(relaying)), async {
+    let (written, ()) = tokio::join!(ends(output.write(&frame, &[], Some(relaying))), async {
         stream.waited(1).await;
         lapse_the_offline_bound(&controller);
     });
@@ -337,7 +346,7 @@ async fn a_batch_waiting_for_the_peer_is_abandoned_once_the_policy_moves() {
             grant: decided_now(&controller),
             redecide: &redecide,
         };
-        let (written, ()) = tokio::join!(output.write(&frame, &[], Some(relaying)), async {
+        let (written, ()) = tokio::join!(ends(output.write(&frame, &[], Some(relaying))), async {
             // Once for the writer, and once for the peer.
             stream.waited(2).await;
             lapse_the_offline_bound(&controller);
@@ -381,7 +390,7 @@ async fn a_batch_held_past_its_decisions_bound_is_not_written() {
         },
         redecide: &redecide,
     };
-    let (written, ()) = tokio::join!(output.write(&frame, &[], Some(relaying)), async {
+    let (written, ()) = tokio::join!(ends(output.write(&frame, &[], Some(relaying))), async {
         stream.waited(1).await;
         continuous.advance(Duration::from_millis(60));
         stream.writer.add_permits(1);
@@ -408,7 +417,7 @@ async fn a_batch_the_decision_no_longer_allows_is_not_written() {
         grant: decided_now(&controller),
         redecide: &redecide,
     };
-    let (written, ()) = tokio::join!(output.write(&frame, &[], Some(relaying)), async {
+    let (written, ()) = tokio::join!(ends(output.write(&frame, &[], Some(relaying))), async {
         stream.waited(1).await;
         allowed.store(false, Ordering::Release);
     });
@@ -448,7 +457,7 @@ async fn a_batch_is_not_written_once_the_floor_passes_its_decision() {
             },
             redecide: &redecide,
         };
-        let (written, ()) = tokio::join!(output.write(&frame, &[], Some(relaying)), async {
+        let (written, ()) = tokio::join!(ends(output.write(&frame, &[], Some(relaying))), async {
             stream.waited(if peer_stops_reading { 2 } else { 1 }).await;
             // Another request is decided at a reading past the moment, which raises the floor.
             controller
@@ -666,7 +675,7 @@ async fn a_moment_the_boundary_reads_holds_for_every_later_decision() {
         },
         redecide: &redecide,
     };
-    let (written, ()) = tokio::join!(output.write(&frame, &[], Some(relaying)), async {
+    let (written, ()) = tokio::join!(ends(output.write(&frame, &[], Some(relaying))), async {
         stream.waited(1).await;
         // Nothing but the boundary reads the wall clock from here.
         wall.store(lapses_at_ms + 200, Ordering::SeqCst);
@@ -762,7 +771,7 @@ async fn a_bound_the_boundary_finds_run_out_is_written_down_outside_the_poll() {
         },
         redecide: &redecide,
     };
-    let (written, ()) = tokio::join!(output.write(&frame, &[], Some(relaying)), async {
+    let (written, ()) = tokio::join!(ends(output.write(&frame, &[], Some(relaying))), async {
         stream.waited(1).await;
         continuous.advance(Duration::from_millis(400));
         stream.writer.add_permits(1);
@@ -1083,7 +1092,7 @@ async fn a_relayed_batch_is_decided_again_once_its_lease_publishes_anew() {
             },
             redecide: &redecide,
         };
-        let (written, ()) = tokio::join!(output.write(&frame, &[], Some(relaying)), async {
+        let (written, ()) = tokio::join!(ends(output.write(&frame, &[], Some(relaying))), async {
             stream.waited(1).await;
             if published {
                 let held = cell.load();
