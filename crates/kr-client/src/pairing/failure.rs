@@ -18,9 +18,21 @@ use serde::{Serialize, Serializer};
 use crate::services::{Alternatives, RelayRefusal};
 use crate::shown::{Said, Shown};
 
+/// The mark of a kind of the managed relay service that was made with its wait. Only
+/// [`PairingFailure::of_relay`] can make one, so such a kind cannot be built without the figure an
+/// interface says.
+///
+/// ```compile_fail
+/// use kr_client::pairing::failure::{FailureKind, PairingFailure};
+///
+/// // Neither the kind nor its mark can be made outside this module.
+/// let _ = PairingFailure::new(FailureKind::RelayCapacity, "no figure");
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Waited(());
+
 /// Which of the outcomes a person is told apart an attempt ended with.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FailureKind {
     /// The code is not ten characters of the pairing alphabet.
     Malformed,
@@ -54,11 +66,11 @@ pub enum FailureKind {
     HostUnreachable,
     /// The relay this device would reach the host through is the managed service's, and the service
     /// has no free capacity to admit this device through it now: not a failure of the host.
-    RelayCapacity,
+    RelayCapacity(Waited),
     /// The relay this device would reach the host through is the managed service's, and the service
     /// failed on its side when it was asked to admit this device through it: not a failure of the
     /// host, and not a refusal for want of capacity.
-    RelayFault,
+    RelayFault(Waited),
     /// The host did not match its invitation, so nothing was sent to it.
     HostMismatch,
     /// This device is already paired with the host the invitation is for.
@@ -100,8 +112,8 @@ impl Said for FailureKind {
             Self::HostRestarted => "HostRestarted",
             Self::AnotherDeviceWaiting => "AnotherDeviceWaiting",
             Self::HostUnreachable => "HostUnreachable",
-            Self::RelayCapacity => "RelayCapacity",
-            Self::RelayFault => "RelayFault",
+            Self::RelayCapacity(_) => "RelayCapacity",
+            Self::RelayFault(_) => "RelayFault",
             Self::HostMismatch => "HostMismatch",
             Self::AlreadyPaired => "AlreadyPaired",
             Self::NotAnInvitation => "NotAnInvitation",
@@ -113,6 +125,21 @@ impl Said for FailureKind {
             Self::StoreFailed => "StoreFailed",
             Self::ApprovalUnknown => "ApprovalUnknown",
         })
+    }
+}
+
+impl Serialize for FailureKind {
+    /// A kind is sent as the name [`Said::said`] gives it, in snake case: lower case, with an
+    /// underscore before each capital but the first.
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut name = String::new();
+        for (index, letter) in self.said().as_str().chars().enumerate() {
+            if index > 0 && letter.is_ascii_uppercase() {
+                name.push('_');
+            }
+            name.push(letter.to_ascii_lowercase());
+        }
+        serializer.serialize_str(&name)
     }
 }
 
@@ -168,7 +195,8 @@ fn as_received<S: Serializer>(
 }
 
 impl PairingFailure {
-    /// A failure of `kind`, with `detail` for a log.
+    /// A failure of `kind`, with `detail` for a log. The two kinds of the managed relay service
+    /// cannot be given here: [`Self::of_relay`] makes them, with their wait.
     #[must_use]
     pub fn new(kind: FailureKind, detail: impl Into<Shown>) -> Self {
         Self {
@@ -194,7 +222,7 @@ impl PairingFailure {
                 alternatives,
                 retry_after_seconds: Some(retry_after_seconds),
                 ..Self::new(
-                    FailureKind::RelayCapacity,
+                    FailureKind::RelayCapacity(Waited(())),
                     "the managed relay has no free capacity to admit this device now",
                 )
             },
@@ -203,7 +231,7 @@ impl PairingFailure {
             } => Self {
                 retry_after_seconds: Some(retry_after_seconds),
                 ..Self::new(
-                    FailureKind::RelayFault,
+                    FailureKind::RelayFault(Waited(())),
                     "the managed relay service could not admit this device now",
                 )
             },

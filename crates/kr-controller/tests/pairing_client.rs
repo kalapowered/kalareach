@@ -2967,21 +2967,22 @@ async fn a_code_attempt_that_fails_on_the_way_to_the_host_says_its_invitation_is
         retry_after_seconds: 90,
     };
     type Configure = Box<dyn FnOnce(&mut WatchedLink)>;
-    let sites: [(&str, Configure, FailureKind); 5] = [
+    // The kind each site ends as, as it is sent: a relay kind is made only with its figure.
+    let sites: [(&str, Configure, &str); 5] = [
         (
             "hold",
             Box::new(|link: &mut WatchedLink| link.fail_hold = true),
-            FailureKind::HostUnreachable,
+            "host_unreachable",
         ),
         (
             "dial",
             Box::new(|link: &mut WatchedLink| link.severed.store(true, Ordering::SeqCst)),
-            FailureKind::HostUnreachable,
+            "host_unreachable",
         ),
         (
             "open",
             Box::new(|link: &mut WatchedLink| link.fail_open = true),
-            FailureKind::HostUnreachable,
+            "host_unreachable",
         ),
         (
             "relay capacity",
@@ -2989,7 +2990,7 @@ async fn a_code_attempt_that_fails_on_the_way_to_the_host_says_its_invitation_is
                 link.severed.store(true, Ordering::SeqCst);
                 link.relay_refused = Some(refusal());
             }),
-            FailureKind::RelayCapacity,
+            "relay_capacity",
         ),
         (
             "relay fault",
@@ -2999,17 +3000,17 @@ async fn a_code_attempt_that_fails_on_the_way_to_the_host_says_its_invitation_is
                     retry_after_seconds: 600,
                 });
             }),
-            FailureKind::RelayFault,
+            "relay_fault",
         ),
     ];
     for (site, configure, kind) in sites {
         let failure = attempt_through(configure)
             .await
             .expect_err("the host cannot be reached");
-        assert_eq!(failure.kind, kind, "{site}");
         assert!(failure.invitation_spent, "{site}");
         assert_eq!(failure.tries_left, Some(MAX_CLIENT_ATTEMPTS - 1), "{site}");
         let sent = serde_json::to_value(&failure).expect("sent");
+        assert_eq!(sent["kind"], serde_json::json!(kind), "{site}");
         assert_eq!(sent["invitation_spent"], serde_json::json!(true), "{site}");
     }
 }
