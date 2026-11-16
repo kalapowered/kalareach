@@ -421,7 +421,9 @@ enum Kept {
 fn is_the_host_ending_the_connection(error: &kr_client::ClientError) -> bool {
     match error {
         kr_client::ClientError::Transport(
-            kr_transport::TransportError::Stream(_) | kr_transport::TransportError::Closed(_),
+            kr_transport::TransportError::Stream(_)
+            | kr_transport::TransportError::StreamLost(_)
+            | kr_transport::TransportError::Closed(_),
         ) => true,
         kr_client::ClientError::Transport(kr_transport::TransportError::Refused(refusal)) => {
             refusal.code == ErrorCode::PermissionDenied

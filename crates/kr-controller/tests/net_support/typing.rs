@@ -236,7 +236,15 @@ impl Typing {
         let begun = Instant::now();
         match Self::open(session, environment_id, session_id, attachment_id).await {
             Ok(lane) => Ok(Ok(lane)),
-            Err(NotTyped::Opening(ClientError::Transport(TransportError::Stream(why)))) => {
+            Err(NotTyped::Opening(ClientError::Transport(
+                ref error @ (TransportError::Stream(_) | TransportError::StreamLost(_)),
+            ))) => {
+                // The words of a stream that failed under the open: the library's text, which for
+                // a lost connection is the same text as before the cause was typed.
+                let why = match error {
+                    TransportError::Stream(why) => why.as_str(),
+                    _ => "connection lost",
+                };
                 let took = begun.elapsed();
                 if took < OPEN_REFUSED_WITHIN {
                     Ok(Err(format!(

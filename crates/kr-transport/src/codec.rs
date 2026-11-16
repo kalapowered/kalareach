@@ -598,7 +598,7 @@ impl FrameReader {
             match read {
                 Some(Ok(Some(count))) => filled += count,
                 Some(Ok(None)) => return Ok(Filled::Ended(filled)),
-                Some(Err(error)) => return Err(TransportError::Stream(error.to_string())),
+                Some(Err(error)) => return Err(TransportError::of_read(&error)),
                 None => {
                     self.stop();
                     return Err(TransportError::Deadline(kind));
@@ -627,7 +627,7 @@ impl FrameReader {
         self.stream
             .read_exact(&mut prefix)
             .await
-            .map_err(|error| TransportError::Stream(error.to_string()))?;
+            .map_err(|error| TransportError::of_exact_read(&error))?;
         let declared = u32::from_be_bytes(prefix) as usize;
         if declared == 0 {
             return Err(FrameError::EmptyPayload.into());
@@ -646,7 +646,7 @@ impl FrameReader {
         self.stream
             .read_exact(buffer)
             .await
-            .map_err(|error| TransportError::Stream(error.to_string()))
+            .map_err(|error| TransportError::of_exact_read(&error))
     }
 
     /// Completes with the error a read of the stream gives when the peer has reset it, carrying the
@@ -658,7 +658,7 @@ impl FrameReader {
             Ok(Some(code)) => Some(TransportError::Stream(
                 iroh::endpoint::ReadError::Reset(code).to_string(),
             )),
-            Err(error) => Some(TransportError::Stream(error.to_string())),
+            Err(error) => Some(TransportError::of_reset_wait(&error)),
             Ok(None) => None,
         }
     }

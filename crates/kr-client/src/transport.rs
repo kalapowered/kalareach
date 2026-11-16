@@ -216,6 +216,10 @@ pub struct NetworkTransport {
     reader: Mutex<Option<FrameReader>>,
     /// Set once a session has claimed the receive side.
     claimed: std::sync::atomic::AtomicBool,
+    /// Set by this wrapper's own [`ControlTransport::close`], before it touches the connection.
+    /// A read's end is the clean end for this side's close only when the read's own cause says
+    /// the connection was closed by this side and this mark says that this wrapper closed it.
+    closed_here: std::sync::atomic::AtomicBool,
     streams: Arc<StreamRegistry>,
     opener: Arc<NetworkStreams>,
     reach: Reach,
@@ -267,6 +271,7 @@ impl NetworkTransport {
             writer: Arc::new(Mutex::new(authorised.control_writer)),
             reader: Mutex::new(Some(authorised.control_reader)),
             claimed: std::sync::atomic::AtomicBool::new(false),
+            closed_here: std::sync::atomic::AtomicBool::new(false),
             streams,
             opener,
             reach: Reach {
@@ -417,15 +422,14 @@ impl ControlTransport for NetworkTransport {
         Box::pin(async move {
             let mut held = self.reader.lock().await;
             let reader = held.as_mut().ok_or(ClientError::ConnectionEnded)?;
+            // A read's end is classified by what the read itself returned and by this wrapper's
+            // own mark, and never by the connection's record, which a later close overwrites.
             let frame = match reader.read_message::<ControlFrame>().await {
                 Ok(frame) => frame,
-                // A read that fails because this side closed the connection is the clean end,
-                // as on the local link. `is_closed` says it by what the connection recorded as
-                // the cause of its end, which is the first cause: a connection that the host
-                // closed, or that was reset or timed out, before this side closed it is not one
-                // that this side closed, so its read keeps its error.
-                Err(_) if self.is_closed() => None,
-                Err(error) => return Err(error.into()),
+                Err(error) => end_of_a_failed_read(
+                    error,
+                    self.closed_here.load(std::sync::atomic::Ordering::Acquire),
+                )?,
             };
             if frame.is_none() {
                 held.take();
@@ -443,17 +447,22 @@ impl ControlTransport for NetworkTransport {
     }
 
     fn close(&self) {
+        // The mark comes before the close, so that a read that the close ends finds it set.
+        self.closed_here
+            .store(true, std::sync::atomic::Ordering::Release);
         self.streams.revoke_all();
         self.connection
             .close(CLIENT_CLOSED.into(), b"the client closed the connection");
     }
 
-    /// Whether this side closed the connection. The library records `LocallyClosed` when the
-    /// application calls `close`, and for no other reason: a close by the peer (`ApplicationClosed`
-    /// and `ConnectionClosed`), a reset, an idle timeout and a protocol error are the peer's or the
-    /// network's, and the session's read loop ends the session for them after it has read what the
-    /// peer sent first, a refusal included. A send that is cut short resets its stream and leaves
-    /// the connection open, so this does not answer for that.
+    /// Whether the connection's record says that a local close ended it: the library records
+    /// `LocallyClosed` when the application calls `close`. That record is the LAST cause written to
+    /// the connection and not the first: this side's close writes it over a close by the peer, and
+    /// the endpoint's own close (the pool's, under a live connection) writes it too, for a short
+    /// time, before the record becomes the endpoint driver's end. A send that is cut short resets
+    /// its stream and leaves the connection open, so this does not answer for that. It answers
+    /// whether a write may be tried, and no read's end depends on it: a read is classified by the
+    /// cause it returned and by this wrapper's own mark.
     fn is_closed(&self) -> bool {
         matches!(
             self.connection.close_reason(),
@@ -470,6 +479,33 @@ impl ControlTransport for NetworkTransport {
     /// connection open, so this does not answer for that.
     fn can_send(&self) -> bool {
         self.connection.close_reason().is_none()
+    }
+}
+
+/// What the end of a failed read of the control stream is: the one place that gives each cause its
+/// end.
+///
+/// The cause that the read itself returned decides. A connection that this side closed ends the
+/// read as the clean end only when this wrapper's own close was called (`closed_here`): a cause of
+/// "closed by this side" that this wrapper did not make (the endpoint's close under a live
+/// connection) is a failure. A connection closed by the peer, lost for another reason or failed in
+/// its stream keeps its cause as a failure, and keeps it when a close follows, since the cause was
+/// returned before. The inner match names every cause of the transport's type, with no catch-all.
+fn end_of_a_failed_read(
+    error: kr_transport::TransportError,
+    closed_here: bool,
+) -> Result<Option<ControlFrame>> {
+    use kr_transport::{ConnectionEnd, TransportError};
+    match error {
+        TransportError::StreamLost(cause) => match cause {
+            ConnectionEnd::ClosedBySelf if closed_here => Ok(None),
+            ConnectionEnd::ClosedBySelf
+            | ConnectionEnd::ClosedByPeer(_)
+            | ConnectionEnd::Lost(_) => Err(TransportError::StreamLost(cause).into()),
+        },
+        // Every other failure of the stream or the frame, and any variant that the transport adds
+        // later: a failure.
+        other => Err(other.into()),
     }
 }
 
@@ -493,5 +529,55 @@ impl ControlSender {
     pub async fn send(&self, frame: &ControlFrame) -> Result<()> {
         self.writer.lock().await.write_message(frame).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kr_transport::{ConnectionEnd, TransportError};
+
+    fn lost(cause: ConnectionEnd) -> TransportError {
+        TransportError::StreamLost(cause)
+    }
+
+    /// Each cause that a failed read returned has its end, and the end reads nothing but the cause
+    /// and this wrapper's own mark: the host's close that was read before this side's close stays a
+    /// failure with the host's cause, whatever the mark says when the end is classified.
+    #[test]
+    fn each_cause_of_a_failed_read_has_its_end() {
+        // A close by this side, made by this wrapper: the clean end.
+        assert!(matches!(
+            end_of_a_failed_read(lost(ConnectionEnd::ClosedBySelf), true),
+            Ok(None)
+        ));
+        // A close by this side that this wrapper did not make (the endpoint's): a failure.
+        assert!(matches!(
+            end_of_a_failed_read(lost(ConnectionEnd::ClosedBySelf), false),
+            Err(ClientError::Transport(TransportError::StreamLost(
+                ConnectionEnd::ClosedBySelf
+            )))
+        ));
+        // The host closed and the read returned that; this side's close came after it (the mark is
+        // set when the end is classified): the host's cause is kept.
+        for mark in [false, true] {
+            assert!(matches!(
+                end_of_a_failed_read(lost(ConnectionEnd::ClosedByPeer("closed".into())), mark),
+                Err(ClientError::Transport(TransportError::StreamLost(
+                    ConnectionEnd::ClosedByPeer(_)
+                )))
+            ));
+            assert!(matches!(
+                end_of_a_failed_read(lost(ConnectionEnd::Lost("timed out".into())), mark),
+                Err(ClientError::Transport(TransportError::StreamLost(
+                    ConnectionEnd::Lost(_)
+                )))
+            ));
+            // Any other failure of the stream: a failure, a close that follows or not.
+            assert!(matches!(
+                end_of_a_failed_read(TransportError::Stream("reset".into()), mark),
+                Err(ClientError::Transport(TransportError::Stream(_)))
+            ));
+        }
     }
 }

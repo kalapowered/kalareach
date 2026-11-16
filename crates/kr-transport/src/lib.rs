@@ -69,5 +69,5 @@ pub mod scheduler;
 pub mod streams;
 pub mod window;
 
-pub use error::{Result, TransportError};
+pub use error::{ConnectionEnd, Result, TransportError};
 pub use kr_protocol::hello::ALPN;
