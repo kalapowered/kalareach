@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use kr_protocol::confirmation::OwnerConfirmationPendingResult;
 use kr_protocol::envelope::{
     ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
 };
@@ -14,6 +15,7 @@ use kr_protocol::scalars::Nullable;
 use kr_transport::window::AcceptedDeadline;
 
 use crate::error::{ControllerError, Result};
+use crate::given::local_door::Instead;
 use crate::given::{Given, Settled};
 
 use super::writes::LocalWrite;
@@ -247,6 +249,32 @@ impl Controller {
                 request,
             )
             .await
+    }
+
+    /// Serves one read of the local socket: [`Self::read_method`], and for the owner's
+    /// outstanding confirmations also the list that replaces the answer where the local owner's
+    /// lease ends before the answer is written. Both lists are made before anything is asked of the
+    /// lease again, from the same entries ([`net::owner::Listed`]), and the answer is the one
+    /// whose lease the writer asks with the bound the list was decided under.
+    pub(super) async fn local_read(
+        self: &Arc<Self>,
+        actor_id: &ActorId,
+        request: &Request,
+    ) -> (ControlFrame, Option<Instead>) {
+        if request.method.method() != Some(Method::OwnerConfirmationPending) {
+            return (self.read_method(actor_id, request, false).await, None);
+        }
+        let caller = self.local_caller(actor_id);
+        let listed = match self.pairing_pending(caller).await {
+            Ok(listed) => listed,
+            Err(error) => return (respond(request.request_id, Err(error)), None),
+        };
+        let told =
+            |list: &OwnerConfirmationPendingResult| respond(request.request_id, encode(list));
+        let instead = listed
+            .held
+            .map(|bound| Instead::new(told(&listed.closed), bound));
+        (told(&listed.full), instead)
     }
 
     /// Serves one read of the daemon's own.

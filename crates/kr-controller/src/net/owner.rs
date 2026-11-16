@@ -100,6 +100,33 @@ pub struct LocalScope {
     pub held: Option<HeldBound>,
 }
 
+/// The owner's outstanding confirmations as the host lists them: the list the caller was decided
+/// for, the list under the scope that no lease serves, and the bound of the lease the first was
+/// decided under. Both lists are made by `listed` from the same entries, so that they differ by
+/// the scope's filter alone.
+#[derive(Debug)]
+pub struct Listed {
+    /// The list under the scope the caller was decided for.
+    pub full: OwnerConfirmationPendingResult,
+    /// The list under the scope that no lease serves: what a lease that ended before the list was
+    /// written shows.
+    pub closed: OwnerConfirmationPendingResult,
+    /// The bound of the lease that `full` was decided under; none where no lease limits it.
+    pub held: Option<HeldBound>,
+}
+
+/// The challenges `entries` holds, oldest first, that `scope` may be shown: the one function that
+/// makes either list.
+fn listed(entries: &[(u64, PendingConfirmation)], scope: Scope) -> OwnerConfirmationPendingResult {
+    OwnerConfirmationPendingResult {
+        pending: entries
+            .iter()
+            .filter(|(_, entry)| scope.may_confirm_display(&entry.display))
+            .map(|(_, entry)| entry.clone())
+            .collect(),
+    }
+}
+
 /// Reads the host's local owner's lease at this moment.
 #[derive(Clone)]
 struct ScopeNow(std::sync::Arc<dyn Fn() -> LocalScope + Send + Sync>);
@@ -233,15 +260,24 @@ impl Caller {
     /// never inside it.
     #[must_use]
     pub fn decided_now(&self) -> Self {
+        self.decided_holding().0
+    }
+
+    /// [`Self::decided_now`], and the bound of the local owner's lease that the decision was taken
+    /// under, for a reply that is written under it later.
+    #[must_use]
+    pub(crate) fn decided_holding(&self) -> (Self, Option<HeldBound>) {
         let mut now = self.clone();
+        let mut kept = None;
         if let Some(scope_now) = &self.scope_now
             && !self.confirms_recovery_only
         {
             let LocalScope { closed, held } = (scope_now.0)();
             now.confirms_recovery_only = closed;
-            now.landing = now.landing.map(|landing| landing.holding(held));
+            now.landing = now.landing.map(|landing| landing.holding(held.clone()));
+            kept = held;
         }
-        now
+        (now, kept)
     }
 
     /// What this caller is limited to.
@@ -1204,12 +1240,15 @@ impl OwnerAuthority {
         })
     }
 
-    /// Lists the challenges an owner can still answer, oldest first.
+    /// Lists the challenges an owner can still answer, oldest first, as two lists made from the
+    /// same entries before anything is asked of the lease again: the one the caller is decided
+    /// for now, and the one under the scope that no lease serves. The writer of the reply chooses
+    /// between them with the footing's question alone ([`Listed`]).
     ///
     /// # Errors
     ///
     /// Returns `PERMISSION_DENIED` for a caller without owner authority.
-    pub fn pending(&self, caller: &Caller) -> Result<OwnerConfirmationPendingResult> {
+    pub fn pending(&self, caller: &Caller) -> Result<Listed> {
         if !caller.is_owner(self.rows.lifetimes())? {
             return Err(ControllerError::PermissionDenied {
                 detail: "only this host's owner reads its outstanding confirmations".to_owned(),
@@ -1219,22 +1258,28 @@ impl OwnerAuthority {
         self.sweep(&mut state);
         // The scope the door decides now: a lease that ended while the lock was waited for limits
         // what is shown.
-        let caller = caller.decided_now();
-        let mut pending: Vec<&Entry> = state
+        let (caller, held) = caller.decided_holding();
+        let mut entries: Vec<(u64, PendingConfirmation)> = state
             .entries
             .values()
-            .filter(|entry| caller.may_confirm_display(&entry.display))
+            .map(|entry| {
+                (
+                    entry.order,
+                    PendingConfirmation {
+                        request: entry.request.clone(),
+                        display: entry.display.clone(),
+                        answered: entry.answer.is_some(),
+                    },
+                )
+            })
             .collect();
-        pending.sort_by_key(|entry| entry.order);
-        Ok(OwnerConfirmationPendingResult {
-            pending: pending
-                .into_iter()
-                .map(|entry| PendingConfirmation {
-                    request: entry.request.clone(),
-                    display: entry.display.clone(),
-                    answered: entry.answer.is_some(),
-                })
-                .collect(),
+        drop(state);
+        entries.sort_by_key(|(order, _)| *order);
+        let scope = caller.scope();
+        Ok(Listed {
+            full: listed(&entries, scope),
+            closed: listed(&entries, scope.closed()),
+            held,
         })
     }
 
