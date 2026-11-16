@@ -555,7 +555,7 @@ fn ask_with(
     // be writing, and half an answer is worse than none. A successful one is read up to a bound.
     let answer = status
         .filter(std::process::ExitStatus::success)
-        .map(|_| read_answer(&said));
+        .and_then(|_| read_answer(&said));
     let _ = std::fs::remove_dir_all(&directory);
     answer
 }
@@ -565,18 +565,20 @@ fn ask_with(
 const ANSWER_LIMIT: u64 = 64 * 1024;
 
 /// Reads what a shell answered: its text, or that the answer is not read ([`Said::Unreadable`]).
-fn read_answer(path: &Path) -> Said {
+/// Nothing is returned where this host could not read its own answer file: it saw no answer.
+fn read_answer(path: &Path) -> Option<Said> {
     use std::io::Read as _;
 
     let mut bytes = Vec::new();
-    let read = std::fs::File::open(path)
-        .and_then(|file| file.take(ANSWER_LIMIT + 1).read_to_end(&mut bytes));
-    match (read, u64::try_from(bytes.len())) {
-        (Ok(_), Ok(held)) if held <= ANSWER_LIMIT => {
+    std::fs::File::open(path)
+        .and_then(|file| file.take(ANSWER_LIMIT + 1).read_to_end(&mut bytes))
+        .ok()?;
+    Some(match u64::try_from(bytes.len()) {
+        Ok(held) if held <= ANSWER_LIMIT => {
             String::from_utf8(bytes).map_or(Said::Unreadable, Said::Text)
         }
         _ => Said::Unreadable,
-    }
+    })
 }
 
 /// Returns the PowerShell this host would launch, when one is on the path.
@@ -5090,8 +5092,8 @@ mod tests {
     fn an_answer_that_did_not_come_is_a_refused_question_and_no_profile_is_guessed() {
         let root = tempfile::tempdir().expect("a directory");
         let not_understood = "PowerShell's answer about where its profiles are was not understood: it \
-                              ended without an answer or said something other than two full paths, \
-                              so nothing was written for PowerShell";
+                              was too long, or it was not two full paths in the form that this host \
+                              asked for, so nothing was written for PowerShell";
         let asked_in_vain = "PowerShell did not say where its profiles are: it did not answer in \
                              time, could not start or ended with an error, so nothing was written \
                              for PowerShell";
