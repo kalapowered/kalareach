@@ -93,6 +93,7 @@ use kr_worker::history_filter::{HistoryFilter, Surface, ViewerScope};
 use crate::directory::KnownWorker;
 use crate::error::{ControllerError, Result};
 use crate::given::{Given, Recorded};
+use crate::service::LeaseAsked;
 
 mod change_sets;
 
@@ -600,23 +601,6 @@ pub struct LeaseHold<'a> {
     /// left in `asked`, which the writer lets go only after the transport's write.
     pub refused:
         &'a (dyn Fn(&mut LeaseAsked) -> Option<kr_protocol::envelope::ControlFrame> + Sync),
-}
-
-/// What the question of a lease was asked with. The writer of an answer holds it from the question
-/// until the transport has taken what the question let through, so that letting go of it, which
-/// can free memory, never stands between the question and the write.
-#[derive(Default)]
-pub struct LeaseAsked {
-    _leased: Option<crate::service::LeasedFooting>,
-}
-
-impl LeaseAsked {
-    /// What a question was asked with where the lease's bound was read.
-    pub(crate) const fn with(leased: crate::service::LeasedFooting) -> Self {
-        Self {
-            _leased: Some(leased),
-        }
-    }
 }
 
 /// One read of this group's answer, ready to be released to the reader who asked.

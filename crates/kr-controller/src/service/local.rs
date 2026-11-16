@@ -16,7 +16,6 @@ use kr_protocol::method::Method;
 use kr_protocol::scalars::{CanonicalSet, Nullable, U64};
 use kr_transport::window::MAX_WINDOW_VALIDITY;
 
-use crate::attention::LeaseAsked;
 use crate::error::{ControllerError, Result};
 use crate::given::local_door::{
     Declined, DoorReply, ReplySink, Standing, WrittenUnder, declined, told,
@@ -25,7 +24,7 @@ use crate::given::{Given, Recorded, Settled};
 
 use super::identifiers::{Arrival, SpendError};
 use super::local_access::LeaseHeld;
-use super::{Controller, Footing, Lapse, LeasedLapse, error_reply, net, respond};
+use super::{Controller, Footing, Lapse, LeaseAsked, LeasedLapse, error_reply, net, respond};
 
 /// How often the daemon replaces a live connection's action window.
 ///
