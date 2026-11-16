@@ -905,10 +905,11 @@ async fn the_fence_is_owed_while_a_worker_is_pending_and_settled_when_the_pass_h
 /// dispatch boundary, however many passes go by.
 ///
 /// An ask that has no link opens one, and its presentation waits at the boundary for the whole
-/// hold, on one thread of the worker's and with one of its connections. A host that opened another
-/// at each ask would take the worker's connections one after another, the owner's own included.
-/// The real boundary is held for twenty passes with no link in the slot, and the worker's own
-/// count of the presentations waiting is what shows how many the host made.
+/// hold, with one of the worker's connections for as long as the host keeps its link. A host that
+/// opened another at each ask would begin a presentation at each ask. The real boundary is held for
+/// twenty passes with no link in the slot, and the worker's own count of the presentations begun
+/// is what shows how many the host made: the count of those waiting also falls when the host closes
+/// a link, so it cannot tell one opening from a series of them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_worker_whose_boundary_is_held_through_twenty_passes_holds_one_presentation_of_the_host()
 {
@@ -944,6 +945,14 @@ async fn a_worker_whose_boundary_is_held_through_twenty_passes_holds_one_present
         service.presentations_waiting_for_tests(),
         1,
         "the host's presentations waiting at the held boundary after twenty passes"
+    );
+    // A presentation whose daemon has closed its link leaves the count above within a pause, so a
+    // host that closed its waiting opening and began another would still show one waiting: what a
+    // gone peer does not lower is the count of presentations begun.
+    assert_eq!(
+        service.presentations_begun_for_tests(),
+        1,
+        "the presentations the host began at the held boundary in twenty passes"
     );
     tokio::time::timeout(Duration::from_secs(10), worker.client())
         .await
@@ -1575,6 +1584,13 @@ async fn two_openings_waiting_at_held_boundaries_do_not_keep_a_stopped_daemon_al
         },
     )
     .await;
+    for worker in &workers {
+        assert_eq!(
+            worker.service.presentations_begun_for_tests(),
+            1,
+            "the host began one presentation at each held boundary"
+        );
+    }
 
     // The owner lets the daemon go, which is all a stop does, and keeps no handle to it.
     let daemon = Arc::downgrade(host.controller());
@@ -1783,6 +1799,11 @@ async fn the_pass_looks_at_a_worker_whose_presentation_is_waiting_and_asks_it_no
         worker.service.presentations_waiting_for_tests(),
         1,
         "the host's one presentation is still waiting"
+    );
+    assert_eq!(
+        worker.service.presentations_begun_for_tests(),
+        1,
+        "the host began no other presentation while it waited"
     );
     held.release();
     until_nobody_is_pending(

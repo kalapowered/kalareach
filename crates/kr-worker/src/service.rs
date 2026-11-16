@@ -617,6 +617,11 @@ pub struct WorkerService {
     /// tests read. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     presentation_tries: std::sync::atomic::AtomicU64,
+    /// How many presentations of a generation have begun, whatever became of them, which this
+    /// host's own tests read. A presentation whose peer goes leaves the count of those waiting and
+    /// not this one. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    presentations_begun: std::sync::atomic::AtomicU64,
     /// How many maintenance passes have finished, which this host's own tests read. It is compiled
     /// away in every shipped build.
     #[cfg(feature = "testing")]
@@ -1130,6 +1135,8 @@ impl WorkerService {
             presentations_waiting: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "testing")]
             presentation_tries: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "testing")]
+            presentations_begun: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "testing")]
             presentation_boundary_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
@@ -1652,6 +1659,15 @@ impl WorkerService {
     #[must_use]
     pub fn maintenance_passes_for_tests(&self) -> u64 {
         self.maintenance_passes
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many presentations of a generation have begun, for this host's own tests: a count that
+    /// a presentation whose peer has gone does not lower.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn presentations_begun_for_tests(&self) -> u64 {
+        self.presentations_begun
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -4708,6 +4724,9 @@ impl WorkerService {
                 ),
             ));
         };
+        #[cfg(feature = "testing")]
+        self.presentations_begun
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         #[cfg(feature = "testing")]
         let _decided = off_the_executor(|| self.wait_before_presentation());
         #[cfg(feature = "testing")]
