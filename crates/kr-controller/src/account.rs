@@ -1586,7 +1586,8 @@ impl Inner {
                         None => {}
                         Some(Unrevoked::Queued(error)) => eprintln!(
                             "kr-controller: a withheld sign-in's token is in the queue of \
-                             revocations and the service could not be told yet: {error}"
+                             revocations, but the send failed and the service did not take it: \
+                             {error}"
                         ),
                         Some(Unrevoked::Ended(error)) => eprintln!(
                             "kr-controller: a withheld sign-in's token was ended at the service, \
