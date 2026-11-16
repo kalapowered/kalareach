@@ -315,13 +315,32 @@ async fn composed(session: &Session, number: u8) -> ComposedMutation {
 
 /// The next item, which must be a notification: its stream and its sequence.
 async fn next_notice(events: &mut OrderedEvents) -> (StreamId, u64) {
-    match within(events.recv()).await {
+    let item = tokio::time::timeout(LIVENESS, events.recv()).await;
+    assert!(item.is_ok(), "a notification was due and never came");
+    match item.ok().flatten() {
         Some(Ordered::Notification(notification)) => {
             (notification.stream_id, notification.sequence.get())
         }
         Some(Ordered::Ended(_)) => panic!("the session ended where a notification was due"),
         None => panic!("the channel closed where a notification was due"),
     }
+}
+
+/// The channel's end, which comes right after the session's end.
+async fn the_channel_ends(events: &mut OrderedEvents) {
+    let item = tokio::time::timeout(LIVENESS, events.recv()).await;
+    assert!(item.is_ok(), "the channel stayed open after the end");
+    assert!(item.ok().flatten().is_none(), "an item came after the end");
+}
+
+/// Waits until the session's reader has taken `count` frames from the connection.
+async fn reader_has_taken(transport: &Scripted, count: usize) {
+    within(async {
+        while transport.read_count() < count {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
 }
 
 async fn next_end(events: &mut OrderedEvents) -> Ended {
@@ -621,6 +640,110 @@ async fn the_end_waits_behind_notifications_a_slow_owner_has_not_read() {
         assert_eq!(next_notice(&mut events).await.1, sequence);
     }
     assert!(matches!(next_end(&mut events).await, Ended::Finished));
+}
+
+/* ---------------------------------------------------------------------------------------- */
+/* The owner's close                                                                          */
+/* ---------------------------------------------------------------------------------------- */
+
+/// What the reader has taken from the connection is the owner's, whatever the owner does next: the
+/// channel holds the first notification and the reader holds the second, waiting for room, when
+/// the owner closes. Both arrive, in order, then the end, then the channel's end. The third frame
+/// was not read, since the close stopped the reading.
+#[tokio::test]
+async fn a_close_keeps_every_notification_the_reader_had_taken_and_the_end_follows() {
+    let (transport, session, mut events) = ordered(1);
+    for sequence in 0..3 {
+        transport.feed(notice("session.output", sequence));
+    }
+    reader_has_taken(&transport, 2).await;
+    tokio::time::sleep(STILL).await;
+    assert_eq!(
+        transport.read_count(),
+        2,
+        "the reader was not held by the full channel, which this case needs"
+    );
+    session.close();
+    assert_eq!(next_notice(&mut events).await.1, 0);
+    assert_eq!(next_notice(&mut events).await.1, 1);
+    assert!(matches!(next_end(&mut events).await, Ended::Finished));
+    the_channel_ends(&mut events).await;
+}
+
+/// The end of a failed read is as much the reader's as a notification is: a close that comes while
+/// the reader holds it, waiting for room, does not lose it or its text.
+#[tokio::test]
+async fn a_close_after_a_failed_read_keeps_the_failures_end() {
+    let (transport, session, mut events) = ordered(1);
+    transport.feed(notice("session.output", 0));
+    transport.fail(ClientError::Host(ProtocolError::new(
+        ErrorCode::ResourceUnavailable,
+        "the stream was reset by the peer",
+    )));
+    // The session has ended on the failure; the channel is full, so the reader holds the end.
+    within(session.closed()).await;
+    tokio::time::sleep(STILL).await;
+    session.close();
+    assert_eq!(next_notice(&mut events).await.1, 0);
+    match next_end(&mut events).await {
+        Ended::Failed(ClientError::Host(error)) => {
+            assert_eq!(error.message, "the stream was reset by the peer");
+        }
+        _ => panic!("the end after a close did not carry the failure that was read"),
+    }
+    the_channel_ends(&mut events).await;
+}
+
+#[tokio::test]
+async fn a_close_with_nothing_read_ends_the_session_and_the_channel_at_once() {
+    let (_transport, session, mut events) = ordered(4);
+    session.close();
+    assert!(matches!(next_end(&mut events).await, Ended::Finished));
+    the_channel_ends(&mut events).await;
+}
+
+/// A lane holds the session's state for as long as it lives, and the channel's end does not wait
+/// for it: the session is dropped with the lane alive and a notification still held by the reader.
+#[tokio::test]
+async fn a_dropped_session_ends_the_channel_while_a_lane_lives() {
+    let (transport, session, mut events) = ordered(1);
+    let lane =
+        within(session.input_lane(InputTarget::new(environment(), session_id(), attachment())))
+            .await
+            .expect("a lane");
+    transport.feed(notice("session.output", 0));
+    transport.feed(notice("session.output", 1));
+    reader_has_taken(&transport, 2).await;
+    tokio::time::sleep(STILL).await;
+    drop(session);
+    assert_eq!(next_notice(&mut events).await.1, 0);
+    assert_eq!(next_notice(&mut events).await.1, 1);
+    assert!(matches!(next_end(&mut events).await, Ended::Finished));
+    the_channel_ends(&mut events).await;
+    drop(lane);
+}
+
+/// The same for an answer that is still awaited: it holds the session's state, the channel's end
+/// does not wait for it, and the answer itself ends with the session's end and not with silence.
+#[tokio::test]
+async fn a_dropped_session_ends_the_channel_while_an_answer_is_awaited() {
+    let (transport, session, mut events) = ordered(4);
+    let detach = composed(&session, 6).await;
+    let answering = within(session.send_whole(&detach))
+        .await
+        .expect("the frame was written");
+    transport.feed(notice("session.output", 0));
+    reader_has_taken(&transport, 1).await;
+    drop(session);
+    assert_eq!(next_notice(&mut events).await.1, 0);
+    assert!(matches!(next_end(&mut events).await, Ended::Finished));
+    the_channel_ends(&mut events).await;
+    match within(answering).await {
+        Err(ClientError::SubmissionUncertain { action_id }) => {
+            assert_eq!(action_id, ActionId::new(Uuid::from_bytes([6; 16])));
+        }
+        _ => panic!("the written request ended with silence or another word"),
+    }
 }
 
 /// The broadcast and the cursors work on an ordered session as on any other: a holder of
