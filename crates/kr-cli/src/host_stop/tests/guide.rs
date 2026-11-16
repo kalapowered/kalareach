@@ -17,6 +17,8 @@ const GUIDE: &str = include_str!("../../../../../docs/cli/README.md");
 const LIB_CASES: &str = include_str!("../../../src/host_stop.rs");
 /// The source of the startup suite, where a named startup case stands.
 const STARTUP_CASES: &str = include_str!("../../../tests/startup.rs");
+/// The source of the lock that a daemon holds, where its cases for Windows stand.
+const SINGLETON_CASES: &str = include_str!("../../../../kr-controller/src/singleton.rs");
 /// The comment that opens the passage in the guide.
 const PASSAGE_START: &str = "<!-- the end of a stop: start -->";
 /// The comment that closes the passage in the guide.
@@ -175,6 +177,8 @@ struct WordsClaim {
     speaks_of: &'static str,
     about: fn(&Round, &AfterRequest, &Request) -> bool,
     breaks: fn(&Round, &AfterRequest, &Request, &str) -> bool,
+    /// Cases that also hold the claim, where a property of the rows cannot show all of it.
+    holders: &'static [(Where, &'static str)],
     /// Each pair changes the words of the first row that the claim speaks of and that holds the old
     /// text; an empty old text adds the new text at the end of the words.
     doctored: &'static [(&'static str, &'static str)],
@@ -185,6 +189,8 @@ struct WordsClaim {
 enum Where {
     Lib,
     Startup,
+    /// The lib cases of the controller's singleton lock.
+    Controller,
 }
 
 /// A text that no row holds: a named case holds it, or it defines or names what other texts claim.
@@ -528,7 +534,7 @@ fn claims() -> Vec<Claim> {
             ],
         },
         Claim {
-            text: r#"and the command cannot name or wait for that process."#,
+            text: r#"and the command cannot wait for that process."#,
             place: (24, 2),
             speaks_of: "the walk of the process that a stop is waited for by, where the lock file names none",
             about: |r| r.kind == Kind::Waited && r.is("named", "none"),
@@ -539,8 +545,40 @@ fn claims() -> Vec<Claim> {
             )],
         },
         Claim {
+            text: r#"The `--json` member `pid` may still carry the number that the daemon's answer named."#,
+            place: (25, 0),
+            speaks_of: "the walk of the process that a stop is waited for by: the `--json` process is the one that the answer named; where no answer named one, the rows give the process that the lock file named, or none",
+            about: |r| r.kind == Kind::Waited,
+            breaks: |r| {
+                if r.field("answer") == "none" {
+                    r.field("json_pid")
+                        != if r.is("named", "none") {
+                            "-"
+                        } else {
+                            r.field("named")
+                        }
+                } else {
+                    r.field("json_pid") != r.field("answer")
+                }
+            },
+            doctored: &[
+                (
+                    "named=none answer=4000 -> waits_for=- json_pid=4000",
+                    "named=none answer=4000 -> waits_for=- json_pid=-",
+                ),
+                (
+                    "named=4000 answer=4001 -> waits_for=- json_pid=4001",
+                    "named=4000 answer=4001 -> waits_for=- json_pid=4000",
+                ),
+                (
+                    "named=4000 answer=none -> waits_for=4000 json_pid=4000",
+                    "named=4000 answer=none -> waits_for=4000 json_pid=-",
+                ),
+            ],
+        },
+        Claim {
             text: r#"and it counts for neither a sign of life nor an end."#,
-            place: (26, 2),
+            place: (27, 2),
             speaks_of: "the rounds at the bound with a process that cannot be read",
             about: |r| r.at_the_bound() && r.is("process", "unreadable"),
             breaks: |r| {
@@ -554,7 +592,7 @@ fn claims() -> Vec<Claim> {
         },
         Claim {
             text: r#"With the lock free, the endpoint decides as it does where no process could be read: nobody listening is the end, a daemon of another generation is a successor, and anything else shows no end."#,
-            place: (27, 0),
+            place: (28, 0),
             speaks_of: "the rounds at the bound with a free lock and a process that cannot be read",
             about: |r| r.at_the_bound() && r.is("lock", "free") && r.is("process", "unreadable"),
             breaks: |r| match r.look() {
@@ -570,7 +608,7 @@ fn claims() -> Vec<Claim> {
         },
         Claim {
             text: r#"With the lock held, the command reads neither the lock file's process nor the endpoint: it shows no successor and no daemon that answers, and at the bound it says that the environment was still held and that it could not show what holds it (exit 1)."#,
-            place: (28, 0),
+            place: (29, 0),
             speaks_of: "the rounds at the bound with a held lock and a process that cannot be read, and the after rows of the same readings",
             about: |r| {
                 (r.at_the_bound() || r.kind == Kind::After)
@@ -594,7 +632,7 @@ fn claims() -> Vec<Claim> {
         },
         Claim {
             text: r#"A lock that another command's look holds for a moment is waited through."#,
-            place: (29, 0),
+            place: (30, 0),
             speaks_of: "the rounds before the bound that the wait can make",
             about: |r| r.kind == Kind::Round && r.is("bound", "no") && r.is("reachable", "yes"),
             breaks: |r| r.result().starts_with("not_ended"),
@@ -602,7 +640,7 @@ fn claims() -> Vec<Claim> {
         },
         Claim {
             text: r#"Where the old process was read, a lock file that names a live process named `kr-controller` other than the old one shows that something started the daemon again, and so does a daemon of another generation that answers once the old process has gone or was not read."#,
-            place: (30, 0),
+            place: (31, 0),
             speaks_of: "the reachable rounds at the bound that show another daemon: a named other process with the process gone, a look of another generation where the lock and the process leave room",
             about: |r| {
                 r.at_the_bound()
@@ -619,7 +657,7 @@ fn claims() -> Vec<Claim> {
         },
         Claim {
             text: r#"The command says so and exits 0."#,
-            place: (31, 0),
+            place: (32, 0),
             speaks_of: "the after rows of kind successor",
             about: |r| r.kind == Kind::After && r.result() == "successor",
             breaks: |r| r.exit() != 0,
@@ -627,7 +665,7 @@ fn claims() -> Vec<Claim> {
         },
         Claim {
             text: r#"Where the old process has gone and something that is not shown to be a daemon still holds the environment after 30 seconds, the command says that and exits 1, whatever the last look answered without a proved generation;"#,
-            place: (32, 1),
+            place: (33, 1),
             speaks_of: "the after rows with the process gone, the lock held, no named other process and a look that is no proved answer or another generation",
             about: |r| {
                 r.kind == Kind::After
@@ -644,7 +682,7 @@ fn claims() -> Vec<Claim> {
         },
         Claim {
             text: r#"where the lock cannot be looked at and no process is shown to run, it says that instead, with the reason: a start lock of the store that stayed held, or the failure of the look in its own words."#,
-            place: (32, 2),
+            place: (33, 2),
             speaks_of: "the after rows with a lock that cannot be read and no process shown to run",
             about: |r| {
                 r.kind == Kind::After
@@ -656,7 +694,7 @@ fn claims() -> Vec<Claim> {
         },
         Claim {
             text: r#"Where the lock is free, no process could be read and the last look showed nothing, or an answer with no proved generation, the text says that the command could not confirm the end."#,
-            place: (33, 0),
+            place: (34, 0),
             speaks_of: "the after rows with a free lock, no readable process and a look that gave nothing or no proved generation",
             about: |r| {
                 r.kind == Kind::After
@@ -669,7 +707,7 @@ fn claims() -> Vec<Claim> {
         },
         Claim {
             text: r#"Where the lock is held, no process could be read, no look showed a daemon of another generation and no look showed the daemon asked answering, the text says that the environment was still held and that the command could not show what holds it, and that it could not confirm the end (exit 1); the reading is the environment's own lock, and what holds it can be the daemon that was told, a daemon that is starting, or another command's look."#,
-            place: (34, 0),
+            place: (35, 0),
             speaks_of: "the after rows with a held lock, no readable process and no look of another generation or of the daemon asked",
             about: |r| {
                 r.kind == Kind::After
@@ -685,7 +723,7 @@ fn claims() -> Vec<Claim> {
         },
         Claim {
             text: r#"The text says that the daemon has not ended only where the last round of the wait proved that the daemon asked is alive: a look that showed a daemon of its generation answering, or a process that runs."#,
-            place: (35, 0),
+            place: (36, 0),
             speaks_of: "the after rows of kind not_ended",
             about: |r| r.kind == Kind::After && r.result() == "not_ended",
             breaks: |r| !(r.look() == "same" || r.is("process", "running")),
@@ -696,7 +734,7 @@ fn claims() -> Vec<Claim> {
         },
         Claim {
             text: r#"It shows that something answers at the endpoint and nothing of which daemon it is."#,
-            place: (37, 0),
+            place: (38, 0),
             speaks_of: "the rounds at the bound with an answer of no proved generation that end without an end",
             about: |r| {
                 r.at_the_bound() && r.look() == "unproved" && r.result().starts_with("not_ended")
@@ -706,7 +744,7 @@ fn claims() -> Vec<Claim> {
         },
         Claim {
             text: r#"A look that gets nothing within its bound is no answer and shows nothing."#,
-            place: (38, 0),
+            place: (39, 0),
             speaks_of: "the rounds at the bound and the first-look rows with a look that got nothing",
             about: |r| (r.at_the_bound() || r.kind == Kind::First) && r.look() == "unclear",
             breaks: |r| r.is("answered", "yes") || r.result() == "answers",
@@ -720,7 +758,7 @@ fn claims() -> Vec<Claim> {
         },
         Claim {
             text: r#"The exit is 0 for both."#,
-            place: (42, 0),
+            place: (43, 0),
             speaks_of: "the after rows of kind stopped",
             about: |r| r.kind == Kind::After && r.result() == "stopped",
             breaks: |r| r.exit() != 0,
@@ -761,6 +799,7 @@ fn words_claims() -> Vec<WordsClaim> {
         WordsClaim {
             text: r#"The text then names no process of the daemon that was asked, except where it says how to end the lock's holder (below),"#,
             place: (24, 1),
+            holders: &[],
             speaks_of: "the words of every round with no process identity, for each request",
             about: |round, _, _| round.process == Process::NoIdentity,
             breaks: |_, sentence, _, text| {
@@ -771,9 +810,13 @@ fn words_claims() -> Vec<WordsClaim> {
             doctored: &[("", "The control daemon (process 4000) ended.")],
         },
         WordsClaim {
-            text: r#"Where a daemon of another generation answers, the text names the process that the lock file names, where that is a live process named `kr-controller`."#,
-            place: (25, 0),
-            speaks_of: "the words of a successor that a look of another generation showed where the lock file names no other holder",
+            text: r#"Where a daemon of another generation answers, the text names the process that the lock file names, where that is a live process named `kr-controller`; on Windows the lock file cannot be read while a daemon holds the lock, so the text says another control daemon, with no number."#,
+            place: (26, 0),
+            holders: &[(
+                Where::Controller,
+                "on_windows_the_holder_is_unreadable_while_the_daemon_holds_the_lock_and_readable_after",
+            )],
+            speaks_of: "the words of a successor that a look of another generation showed where the lock file names no other holder: with the number where the lock file named a process (5000), and with `another control daemon` and no number where it named none, which is what Windows gives (the rows `another(-)`)",
             about: |round, sentence, _| {
                 matches!(sentence, AfterRequest::Successor(_))
                     && matches!(round.look, Some(Endpoint::Another))
@@ -783,15 +826,18 @@ fn words_claims() -> Vec<WordsClaim> {
             },
             breaks: |round, _, _, text| {
                 (round.successor == Some(5000)) != text.contains("process 5000")
+                    || (round.successor.is_none() && !text.contains("another control daemon"))
             },
             doctored: &[
                 ("process 5000", "another control daemon"),
                 ("another control daemon", "process 5000"),
+                ("another control daemon", "the control daemon"),
             ],
         },
         WordsClaim {
             text: r#"Where it read the process and the system does not say whether it runs, the process is still named in the words that name one,"#,
-            place: (26, 1),
+            place: (27, 1),
+            holders: &[],
             speaks_of: "the words that name a process, where the process cannot be read",
             about: |round, sentence, _| {
                 round.process == Process::Unreadable
@@ -802,7 +848,8 @@ fn words_claims() -> Vec<WordsClaim> {
         },
         WordsClaim {
             text: r#"Where the daemon is seen to end after a stop that it answered, the text says that the command stopped it."#,
-            place: (40, 0),
+            place: (41, 0),
+            holders: &[],
             speaks_of: "the words of a daemon that was seen to end after a request that was told",
             about: |_, sentence, request| {
                 matches!(sentence, AfterRequest::Stopped) && matches!(request, Request::Told)
@@ -815,7 +862,8 @@ fn words_claims() -> Vec<WordsClaim> {
         },
         WordsClaim {
             text: r#"Where the request's outcome is not known (`maybe_asked`), it says that the daemon did not show whether it took the stop, with the reason, and that it has ended."#,
-            place: (41, 0),
+            place: (42, 0),
+            holders: &[],
             speaks_of: "the words of a daemon that was seen to end after a request whose outcome was not shown",
             about: |_, sentence, request| {
                 matches!(sentence, AfterRequest::Stopped)
@@ -894,7 +942,7 @@ fn held() -> Vec<Held> {
         },
         Held {
             text: r#"A look whose link fails is read the same way, also where the greeting was acknowledged before the link failed: it gives no reply that the command could weigh."#,
-            place: (39, 0),
+            place: (40, 0),
             why: "it says how a look whose link fails is read: the look table prints it (`gave=link_failed` is unclear, no answer), and no row of the end table holds a link",
             holders: &[
                 (Where::Lib, "the_table_of_the_look_is_the_file"),
@@ -906,7 +954,7 @@ fn held() -> Vec<Held> {
         },
         Held {
             text: r#"An answer with no proved generation is any answer that came within the look's bound and proves no generation of the daemon asked: a reply that the command cannot use (a refusal of the connection or of the read of `host.info`, a version that does not fit, a message of another kind, a result that does not decode), or an answer where the generation asked is not known."#,
-            place: (36, 0),
+            place: (37, 0),
             why: "it defines a term: which exchanges give a look of no proved generation is the look table's, and the properties hold that no such look reads as proved",
             holders: &[
                 (Where::Lib, "the_table_of_the_look_is_the_file"),
@@ -1117,21 +1165,36 @@ fn the_words_of_a_round_with_no_process_identity_name_the_successor_say_how_to_e
     assert_eq!((successor, how_to_end, none), (6, 6, 26));
 }
 
-/// Each named case of a text that no row holds stands in the source of its file.
+/// Each named case of a text stands in the source of its file.
 #[test]
 fn each_text_that_a_case_holds_names_a_case_that_exists() {
+    let holders: Vec<(&str, &[(Where, &str)])> = held()
+        .iter()
+        .map(|held| (held.text, held.holders))
+        .chain(
+            words_claims()
+                .iter()
+                .map(|claim| (claim.text, claim.holders)),
+        )
+        .collect();
     for held in held() {
-        assert!(!held.holders.is_empty(), "no case holds: {}", held.text);
-        for (place, name) in held.holders {
+        assert!(
+            !held.holders.is_empty(),
+            "no case holds ({}): {}",
+            held.why,
+            held.text
+        );
+    }
+    for (text, cases) in holders {
+        for (place, name) in cases {
             let source = match place {
                 Where::Lib => LIB_CASES,
                 Where::Startup => STARTUP_CASES,
+                Where::Controller => SINGLETON_CASES,
             };
             assert!(
                 source.contains(&format!("fn {name}(")),
-                "no case named {name} holds ({}): {}",
-                held.why,
-                held.text
+                "no case named {name} holds: {text}"
             );
         }
     }
