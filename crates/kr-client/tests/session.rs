@@ -628,6 +628,182 @@ async fn an_endpoint_closed_under_a_live_session_ends_it_as_a_failure() {
     serving.abort();
 }
 
+/// The endpoint's close and then the owner's close, the owner's after the read returned "closed by
+/// this side" and before the read's end was classified. The connection had already ended when the
+/// owner closed it, so the end is a failure and the owner does not lose it. The read is held
+/// between its return and its classification, which holds the order with no wait.
+#[tokio::test]
+async fn an_owner_close_after_the_endpoints_close_and_the_read_returned_is_a_failure() {
+    use kr_client::transport::ControlTransport;
+
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let serving = spawn_host(&host, client.record, Arc::new(HostScript::default()), None);
+
+    let transport = Arc::new(dial(&client, &host).await);
+    transport.read_seam().hold_next_failure();
+    let reading = tokio::spawn({
+        let transport = Arc::clone(&transport);
+        async move { transport.recv().await }
+    });
+    // The endpoint is closed under the live connection, and the owner has closed nothing.
+    let endpoint_close = tokio::spawn({
+        let endpoint = client.endpoint.clone();
+        async move { endpoint.close().await }
+    });
+    tokio::time::timeout(Duration::from_secs(30), transport.read_seam().held())
+        .await
+        .expect("the endpoint's close reached the read");
+    // The read has returned its error and waits before its classification: the owner closes now.
+    transport.close();
+    transport.read_seam().resume();
+    let read = tokio::time::timeout(Duration::from_secs(30), reading)
+        .await
+        .expect("the held read went on")
+        .expect("the read task");
+    assert!(
+        matches!(
+            read,
+            Err(ClientError::Transport(
+                kr_transport::TransportError::StreamLost(kr_transport::ConnectionEnd::ClosedBySelf)
+            ))
+        ),
+        "the owner's close after the endpoint's close made the clean end of a read that returned a \
+         failure: {read:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(30), endpoint_close)
+        .await
+        .expect("the endpoint closed")
+        .expect("the close task");
+    serving.abort();
+}
+
+/// The host's close, read and returned, and then the owner's close, which comes before the read's
+/// end was classified: the end keeps the host's cause. The read is held between its return and its
+/// classification.
+#[tokio::test]
+async fn an_owner_close_after_the_hosts_close_and_the_read_returned_keeps_the_hosts_cause() {
+    use kr_client::transport::ControlTransport;
+
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    script.closes_when_told.store(true, Ordering::Release);
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+
+    let transport = Arc::new(dial(&client, &host).await);
+    transport.read_seam().hold_next_failure();
+    let reading = tokio::spawn({
+        let transport = Arc::clone(&transport);
+        async move {
+            loop {
+                match transport.recv().await {
+                    Ok(Some(_)) => {}
+                    outcome => return outcome,
+                }
+            }
+        }
+    });
+    script.close_now.notify_one();
+    tokio::time::timeout(Duration::from_secs(30), transport.read_seam().held())
+        .await
+        .expect("the host's close reached the read");
+    transport.close();
+    transport.read_seam().resume();
+    let read = tokio::time::timeout(Duration::from_secs(30), reading)
+        .await
+        .expect("the held read went on")
+        .expect("the read task");
+    assert!(
+        matches!(
+            read,
+            Err(ClientError::Transport(
+                kr_transport::TransportError::StreamLost(
+                    kr_transport::ConnectionEnd::ClosedByPeer(_)
+                )
+            ))
+        ),
+        "the owner's close after the host's close took the host's cause from a read that returned \
+         it: {read:?}"
+    );
+    serving.abort();
+}
+
+/// The host's close is on the connection's record, the owner closes after it, and only then does
+/// the read go on, a read that had started and waited: the library has written this side's close
+/// over the host's, so the read returns "closed by this side", and the owner's close came after the
+/// connection's end, so the end is a failure. The case polls the read itself, once before and once
+/// after, which keeps it from returning the host's close before the owner's.
+#[tokio::test]
+async fn an_owner_close_after_the_hosts_close_and_before_the_read_went_on_is_a_failure() {
+    use kr_client::transport::ControlTransport;
+
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    script.closes_when_told.store(true, Ordering::Release);
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+
+    let transport = dial(&client, &host).await;
+    let mut read = transport.recv();
+    let first_poll = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(read.as_mut(), cx))
+    })
+    .await;
+    assert!(
+        first_poll.is_pending(),
+        "the read waits for the control stream"
+    );
+    script.close_now.notify_one();
+    let recorded = tokio::time::timeout(Duration::from_secs(30), transport.closed())
+        .await
+        .expect("the host's close reached the connection");
+    assert!(
+        !matches!(recorded, ConnectionError::LocallyClosed),
+        "the connection's record names the host's close: {recorded:?}"
+    );
+    transport.close();
+    let read = tokio::time::timeout(Duration::from_secs(30), read)
+        .await
+        .expect("the read went on");
+    assert!(
+        matches!(
+            read,
+            Err(ClientError::Transport(
+                kr_transport::TransportError::StreamLost(_)
+            ))
+        ),
+        "the owner's close after the host's close made the clean end of a read: {read:?}"
+    );
+    serving.abort();
+}
+
+/// A read that starts after the owner's close is the clean end at its entry, and it does not touch
+/// the connection: no read has returned from it.
+#[tokio::test]
+async fn a_read_that_starts_after_the_owners_close_is_the_clean_end_and_touches_nothing() {
+    use kr_client::transport::ControlTransport;
+
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let serving = spawn_host(&host, client.record, Arc::new(HostScript::default()), None);
+
+    let transport = dial(&client, &host).await;
+    transport.close();
+    for _ in 0..2 {
+        let read = tokio::time::timeout(Duration::from_secs(30), transport.recv())
+            .await
+            .expect("the read ended at its entry");
+        assert!(matches!(read, Ok(None)), "{read:?}");
+    }
+    assert_eq!(
+        transport.read_seam().returned(),
+        0,
+        "a read that started after the owner's close touched the connection"
+    );
+    serving.abort();
+}
+
 /// This side's own close ends a read of the paired transport that waits, and the read returns the
 /// clean end and no error: the transport says so by what its connection recorded as the cause of
 /// its end, so a session that reads the end need not guess it from a flag raised afterwards. A
