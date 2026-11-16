@@ -273,7 +273,10 @@ async fn the_closure_record_is_given_back_as_a_copy_when_it_answers_a_close_or_n
         .expect("the closure is recorded");
 
     let answer = controller
-        .answer_from_the_closure(world.session_id)
+        .answer_from_the_closure(
+            world.session_id,
+            tokio::time::Instant::now() + crate::service::CLOSE_EXCHANGE,
+        )
         .await
         .copied();
     assert!(answer.is_copied(), "the closure answers a repeated close");

@@ -696,6 +696,79 @@ async fn a_close_that_cannot_read_the_registry_for_a_closure_is_not_told_the_ses
         ErrorCode::OutcomeUnknown,
         "the caller is told the outcome is not known, not that the session is unknown: {refused}"
     );
+    assert!(
+        refused.to_string().contains(
+            "The host could not read its record of this session. This request closed nothing, and whether \
+             an earlier request closed the session is not known."
+        ),
+        "the words say that the record could not be read and what this request did: {refused}"
+    );
+    serving.abort();
+}
+
+/// A close of a session that this daemon holds no worker for, and knows no closure of, reads the
+/// registry on a thread of its own, inside the budget of the exchange. A read that does not return
+/// leaves the close answered when the budget ends, and holds no thread of the runtime: the close
+/// is told that the record could not be read, and the runtime goes on with other work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_close_whose_read_of_the_registry_does_not_return_is_answered_within_its_budget() {
+    let Silent {
+        _temp,
+        controller,
+        environment_id,
+        session_id,
+        actor,
+        accepted,
+        serving,
+        ..
+    } = silent_worker().await;
+    acknowledged(&controller, session_id);
+    let carried = admission(&controller, accepted).await;
+    controller.directory.lock().await.remove(session_id);
+
+    // The read itself stops, as a disk that does not answer stops it, with the registry's lock
+    // taken: the lock is not what is waited for.
+    let (arrived, release) = controller
+        .registry
+        .lock()
+        .await
+        .stall_the_next_closure_read();
+    let started = tokio::time::Instant::now();
+    let answered = tokio::time::timeout(
+        CLOSE_EXCHANGE + Duration::from_secs(3),
+        controller.session_close(
+            &close_request(environment_id, session_id),
+            &actor,
+            Some(accepted),
+            carried,
+        ),
+    )
+    .await;
+    let waited = started.elapsed();
+    let reached = arrived.try_recv().is_ok();
+    // The runtime still has threads for other work while the read stands.
+    let ticked = tokio::time::timeout(Duration::from_secs(2), tokio::task::yield_now())
+        .await
+        .is_ok();
+    release.send(()).expect("the read is let go");
+    let refused = answered
+        .unwrap_or_else(|_| panic!("the close was still waiting for the read after {waited:?}"))
+        .into_answer_for_test()
+        .expect_err("a read that does not return gives no closure");
+    assert!(reached, "the read of the registry was the one that stood");
+    assert!(ticked, "the runtime is not held by the read");
+    assert!(
+        waited >= CLOSE_EXCHANGE - Duration::from_secs(1),
+        "the read was given the time a closure may take: {waited:?}"
+    );
+    assert_eq!(refused.code(), ErrorCode::OutcomeUnknown, "{refused}");
+    assert!(
+        refused.to_string().contains(
+            "The host could not read its record of this session. This request closed nothing, and whether \
+             an earlier request closed the session is not known."
+        ),
+        "{refused}"
+    );
     serving.abort();
 }
 

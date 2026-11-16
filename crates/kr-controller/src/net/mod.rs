@@ -2327,11 +2327,12 @@ impl Controller {
     async fn closure_answer_to_a_close(
         &self,
         session_id: kr_protocol::ids::SessionId,
+        budget: tokio::time::Instant,
         retained: &mut Retained,
     ) -> Result<kr_protocol::envelope::ParamsValue> {
         let answer = crate::given::network_door::kept(
             crate::service::net::AtTheNetworkDoor::here(),
-            self.answer_from_the_closure(session_id).await,
+            self.answer_from_the_closure(session_id, budget).await,
         );
         if answer.is_ok() {
             *retained = Retained::Record;
@@ -2357,6 +2358,8 @@ impl Controller {
         let params: kr_protocol::session::SessionCloseParams =
             crate::service::parse(&mutation.params)?;
         let session_id = params.session_id;
+        // What a close of this session is given to answer from a record that cannot be read.
+        let budget = tokio::time::Instant::now() + crate::service::CLOSE_EXCHANGE;
         // Asked first, whatever the directory holds: a closure this daemon knows and its registry
         // has not yet recorded is written again when it is asked about, and a worker that is
         // still in the directory is not asked to close twice.
@@ -2368,7 +2371,9 @@ impl Controller {
             // Whatever comes back here comes from a record rather than from a close performed now,
             // which is the same read the worker's own journal would have been. The caller decides
             // whether this device may be told it.
-            return self.closure_answer_to_a_close(session_id, retained).await;
+            return self
+                .closure_answer_to_a_close(session_id, budget, retained)
+                .await;
         }
         // The accepted deadline as it stands, and no dispatch lease behind it. Section 9 asks for
         // a live lease before a *remote dispatch*, and it exempts stopping owned execution from
@@ -2410,7 +2415,9 @@ impl Controller {
             // The worker was in the directory when this close read it and is not now: its closure
             // was recorded in between, and the record is the answer.
             Err(ControllerError::UnknownSession { .. }) => {
-                return self.closure_answer_to_a_close(session_id, retained).await;
+                return self
+                    .closure_answer_to_a_close(session_id, budget, retained)
+                    .await;
             }
             Err(error) => return Err(error),
         };
