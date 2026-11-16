@@ -483,6 +483,7 @@ async fn scene_replacing(
         tokens
             .keep(grant, "a-nonce", || Some(()))
             .await
+            .answer
             .expect("the phone signs in");
     }
     let origin = kr_protocol::service::GatewayOrigin::new(stand_in.origin()).expect("an origin");

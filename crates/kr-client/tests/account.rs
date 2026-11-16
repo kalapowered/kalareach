@@ -1767,6 +1767,7 @@ async fn a_commit_whose_standing_ended_writes_nothing_and_a_keep_ends_its_tokens
             || None::<()>,
         )
         .await
+        .answer
         .expect("a keep");
     assert_eq!(withheld, Commit::Withheld);
     assert_eq!(stored_refresh(&store).as_deref(), Some("grant-a"));
@@ -1783,6 +1784,7 @@ async fn a_commit_whose_standing_ended_writes_nothing_and_a_keep_ends_its_tokens
             || Some(()),
         )
         .await
+        .answer
         .expect("a keep");
     assert_eq!(kept, Commit::Kept);
     assert_eq!(stored_refresh(&store).as_deref(), Some("grant-d"));
@@ -1840,6 +1842,7 @@ async fn a_keep_whose_standing_ends_while_the_store_works_writes_no_grant_and_pu
             || standing.load(Ordering::SeqCst).then_some(()),
         )
         .await
+        .answer
         .expect("a keep");
     assert_eq!(withheld, Commit::Withheld);
     assert_eq!(stored_refresh(&store.inner).as_deref(), Some("grant-a"));
@@ -1856,6 +1859,7 @@ async fn a_keep_whose_standing_ends_while_the_store_works_writes_no_grant_and_pu
             || Some(()),
         )
         .await
+        .answer
         .expect("a keep");
     assert_eq!(kept, Commit::Kept);
     assert_eq!(stored_refresh(&store.inner).as_deref(), Some("grant-d"));
@@ -1918,6 +1922,7 @@ async fn a_keep_whose_standing_ends_while_the_queue_is_read_queues_nothing_and_w
                     },
                 )
                 .await
+                .answer
         } else {
             signed_in
                 .commit(
@@ -2026,6 +2031,7 @@ async fn a_keep_whose_standing_ends_while_the_store_works_and_whose_queue_cannot
             || standing.load(Ordering::SeqCst).then_some(()),
         )
         .await
+        .answer
         .expect_err("the queue cannot be put back");
     assert!(
         !standing.load(Ordering::SeqCst),
@@ -2144,14 +2150,11 @@ async fn a_commit_that_cannot_write_the_new_grant_leaves_the_old_one_whole() {
     );
 
     // Ending a token that was never kept sends the queue too. The queue holds nothing of A.
-    assert_eq!(
-        signed_in
-            .revoke_unkept(RefreshToken::new("grant-b").expect("a token"))
-            .await
-            .expect("the token is sent"),
-        0,
-        "nothing is left waiting"
-    );
+    let (commit, unrevoked) = signed_in
+        .end_withheld(RefreshToken::new("grant-b").expect("a token"))
+        .await;
+    assert_eq!(commit, Commit::Withheld, "nothing is left waiting");
+    assert!(unrevoked.is_none(), "the token is sent: {unrevoked:?}");
     assert_eq!(stub.revoked(), ["grant-b"], "A's token was not sent");
     assert_eq!(stored_refresh(&store.inner).as_deref(), Some("grant-a"));
     assert!(matches!(
@@ -2233,10 +2236,10 @@ async fn a_grant_whose_queue_could_not_be_put_back_is_not_ended_while_it_is_held
         )
         .await
         .expect_err("the new grant cannot be written");
-    signed_in
-        .revoke_unkept(RefreshToken::new("grant-b").expect("a token"))
-        .await
-        .expect("the token is sent");
+    let (_, unrevoked) = signed_in
+        .end_withheld(RefreshToken::new("grant-b").expect("a token"))
+        .await;
+    assert!(unrevoked.is_none(), "the token is sent: {unrevoked:?}");
     assert_eq!(stub.revoked(), ["grant-b"], "A is held, so A is not sent");
     assert_eq!(stored_refresh(&store.inner).as_deref(), Some("grant-a"));
 
@@ -2386,6 +2389,7 @@ async fn an_unsettled_sign_in_ends_every_token(write: SessionWrite) {
                 || Some(())
             )
             .await
+            .answer
             .expect("the store could not say, which is not a failure"),
         Commit::Unsettled
     );
@@ -2444,6 +2448,7 @@ async fn an_unsettled_sign_in_the_queue_cannot_take(
             || Some(()),
         )
         .await
+        .answer
         .expect("the store could not say, which is not a failure");
     (stub, store, signed_in, kept)
 }
@@ -2528,6 +2533,7 @@ async fn a_token_kept_in_memory_is_queued_by_the_first_send_that_can_and_survive
                 || Some(())
             )
             .await
+            .answer
             .expect("the store could not say"),
         Commit::Unsettled
     );
@@ -2582,6 +2588,7 @@ async fn a_token_in_the_queue_and_in_memory_is_ended_once() {
                 || Some(())
             )
             .await
+            .answer
             .expect("the store could not say"),
         Commit::Unsettled
     );
@@ -2613,6 +2620,7 @@ async fn a_sign_in_that_is_kept_later_ends_a_token_that_was_only_in_memory() {
                 || Some(())
             )
             .await
+            .answer
             .expect("the store could not say"),
         Commit::Unsettled
     );
@@ -2646,13 +2654,11 @@ async fn a_token_waiting_to_be_ended_is_queued_once() {
     let store = Arc::new(FaultyStore::new());
     let signed_in = account_on(&stub, &store);
     for _ in 0..2 {
-        assert_eq!(
-            signed_in
-                .revoke_unkept(RefreshToken::new("grant-x").expect("a token"))
-                .await
-                .expect("the token is queued"),
-            1
-        );
+        let (commit, unrevoked) = signed_in
+            .end_withheld(RefreshToken::new("grant-x").expect("a token"))
+            .await;
+        assert_eq!(commit, Commit::Withheld, "the queue holds the token");
+        assert!(unrevoked.is_none(), "the token is queued: {unrevoked:?}");
     }
     let queued = queue_text(&store).expect("a queue");
     assert_eq!(queued.matches("grantId").count(), 1, "{queued}");
@@ -2685,6 +2691,7 @@ async fn a_token_only_memory_holds_is_counted_as_waiting() {
                 || Some(())
             )
             .await
+            .answer
             .expect("the store could not say"),
         Commit::Unsettled
     );
@@ -2734,6 +2741,7 @@ async fn a_memory_token_the_service_acknowledged_is_let_go_of() {
                 || Some(())
             )
             .await
+            .answer
             .expect("the store could not say"),
         Commit::Unsettled
     );
@@ -2764,6 +2772,7 @@ async fn a_token_the_queue_took_while_reporting_a_failure_is_sent_once() {
                 || Some(())
             )
             .await
+            .answer
             .expect("the store could not say"),
         Commit::Unsettled
     );
@@ -2803,6 +2812,7 @@ async fn a_failing_queue_clean_up_does_not_keep_a_memory_token_from_the_service(
                 || Some(())
             )
             .await
+            .answer
             .expect("the store could not say"),
         Commit::Unsettled
     );
@@ -2827,7 +2837,7 @@ async fn a_token_neither_the_queue_nor_the_service_took_is_kept_for_the_next_sen
     let signed_in = account_on(&stub, &store);
     store.queue_writes(&[true]);
     let _ = signed_in
-        .revoke_unkept(RefreshToken::new("grant-x").expect("a token"))
+        .end_withheld(RefreshToken::new("grant-x").expect("a token"))
         .await;
     assert!(stub.revoked().is_empty());
     stub.revoke_works.store(true, Ordering::SeqCst);
@@ -2862,6 +2872,7 @@ async fn a_keep_whose_standing_ended_says_when_its_revocation_reached_neither_qu
                 || None::<()>,
             )
             .await
+            .answer
             .expect("a keep");
         assert_eq!(
             outcome, expected,
@@ -3019,6 +3030,124 @@ async fn a_failed_revocation_says_where_the_token_stands_in_the_orders_that_leav
     );
 }
 
+/// Makes one of the three states in which the revocation of a token that was not kept fails: the
+/// queue refuses and the service takes nothing (`Held`), the queue refuses and the service takes
+/// the token by a send of its own (`Ended`), and the queue takes the token, the service takes it in
+/// the send of the queue, the clean-up is refused, and a send of the token alone is not
+/// acknowledged (`Queued`). Returns the service and the store that make it.
+fn revocation_that_fails_as(state: &str) -> (Arc<Stub>, Arc<FaultyStore>) {
+    let stub = Arc::new(Stub::new());
+    let store = Arc::new(FaultyStore::new());
+    match state {
+        "Held" => {
+            stub.revoke_works.store(false, Ordering::SeqCst);
+            store.queue_writes(&[true]);
+        }
+        "Ended" => store.queue_writes(&[true]),
+        "Queued" => {
+            stub.revoke_once.store(true, Ordering::SeqCst);
+            store.queue_writes(&[false, true]);
+        }
+        other => panic!("no state {other}"),
+    }
+    (stub, store)
+}
+
+/// What the variant of a failed revocation is called in `revocation_that_fails_as`.
+fn state_of(unrevoked: &Option<Unrevoked>) -> &'static str {
+    match unrevoked {
+        Some(Unrevoked::Held(_)) => "Held",
+        Some(Unrevoked::Ended(_)) => "Ended",
+        Some(Unrevoked::Queued(_)) => "Queued",
+        None => "none",
+    }
+}
+
+/// A keep whose commit fails ends its token through the one function and answers the commit's own
+/// failure, with how the revocation failed beside it, in each of the three states; where both the
+/// queue and the service refuse, the token is held in memory and the next send ends it.
+#[tokio::test]
+async fn a_keep_whose_commit_fails_answers_its_failure_and_says_where_its_token_stands() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    // The failure a commit gives when the grant's write is refused, taken from a commit alone.
+    let alone = Arc::new(FaultyStore::new());
+    alone.session_next(SessionWrite::Refused);
+    let commit_failure = account_on(&Arc::new(Stub::new()), &alone)
+        .commit(
+            issued_for("account-1", "grant-k", &["openid"]),
+            "k-nonce",
+            || Some(()),
+        )
+        .await
+        .expect_err("the grant's write is refused")
+        .to_string();
+    for (state, queue_holds, taken) in [
+        ("Held", false, &[][..]),
+        ("Ended", false, &["grant-k"][..]),
+        ("Queued", true, &["grant-k"][..]),
+    ] {
+        let (stub, store) = revocation_that_fails_as(state);
+        store.session_next(SessionWrite::Refused);
+        let signed_in = account_on(&stub, &store);
+        let kept = signed_in
+            .keep(
+                issued_for("account-1", "grant-k", &["openid"]),
+                "k-nonce",
+                || Some(()),
+            )
+            .await;
+        assert_eq!(
+            kept.answer.expect_err("the commit's failure").to_string(),
+            commit_failure,
+            "{state}: the answer is the commit's own failure"
+        );
+        assert_eq!(state_of(&kept.unrevoked), state, "{state}");
+        assert_eq!(stub.revoked(), taken, "{state}");
+        assert_eq!(
+            queue_text(&store).is_some_and(|queued| queued.contains("grant-k")),
+            queue_holds,
+            "{state}: what the queue holds"
+        );
+        if state == "Held" {
+            stub.revoke_works.store(true, Ordering::SeqCst);
+            assert_eq!(signed_in.send_pending().await.expect("a send"), 0);
+            assert_eq!(stub.revoked(), ["grant-k"], "the next send ended the token");
+        }
+    }
+}
+
+/// A keep whose caller's standing does not hold ends its token through the one function, with the
+/// outcome and how the revocation failed beside it, in each of the three states.
+#[tokio::test]
+async fn a_keep_that_withholds_says_where_its_token_stands() {
+    let _clock = CLOCK.lock().await;
+    rewind();
+    for (state, expected, queue_holds, taken) in [
+        ("Held", Commit::WithheldOwing, false, &[][..]),
+        ("Ended", Commit::Withheld, false, &["grant-k"][..]),
+        ("Queued", Commit::Withheld, true, &["grant-k"][..]),
+    ] {
+        let (stub, store) = revocation_that_fails_as(state);
+        let signed_in = account_on(&stub, &store);
+        let kept = signed_in
+            .keep(
+                issued_for("account-1", "grant-k", &["openid"]),
+                "k-nonce",
+                || None::<()>,
+            )
+            .await;
+        assert_eq!(kept.answer.expect("an outcome"), expected, "{state}");
+        assert_eq!(state_of(&kept.unrevoked), state, "{state}");
+        assert_eq!(stub.revoked(), taken, "{state}");
+        assert_eq!(
+            queue_text(&store).is_some_and(|queued| queued.contains("grant-k")),
+            queue_holds,
+            "{state}: what the queue holds"
+        );
+    }
+}
+
 /// A token that neither the queue nor the service takes is held in memory once however often it is
 /// refused, so a service that answers later is sent it once, and a service that does not is not
 /// counted as owed it twice.
@@ -3033,7 +3162,7 @@ async fn a_token_refused_twice_is_held_in_memory_once() {
     store.queue_writes(&[true, true, true, true]);
     for _ in 0..2 {
         let _ = signed_in
-            .revoke_unkept(RefreshToken::new("grant-x").expect("a token"))
+            .end_withheld(RefreshToken::new("grant-x").expect("a token"))
             .await;
     }
     assert_eq!(
@@ -3076,6 +3205,7 @@ async fn a_sign_in_the_next_recovery_would_remove_is_not_reported_as_kept() {
                 || Some(())
             )
             .await
+            .answer
             .expect("the store could not say"),
         Commit::Unsettled,
         "the store holds B and the queue names it: not a sign-in that is kept"
@@ -3117,6 +3247,7 @@ async fn a_sign_in_the_store_is_known_not_to_have_kept_ends_its_token_and_leaves
             || Some(()),
         )
         .await
+        .answer
         .expect_err("the store refused the new grant");
     assert_eq!(
         stub.revoked(),

@@ -19,7 +19,7 @@ use kr_client::services::account::{
 use kr_crypto::store::{MemoryStore, SecretName, SecretStore};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 
-use super::failed_revocation_line;
+use super::{REFUSED, REFUSED_EXCHANGE, UNKEPT, WITHHELD, failed_revocation_line};
 
 /// What the store does with the next write of the revocation queue (a set or a delete).
 #[derive(Clone, Copy)]
@@ -184,6 +184,7 @@ enum Queue {
 struct Seen {
     commit: Commit,
     placed: Placed,
+    unrevoked: Option<Unrevoked>,
     /// The whole line the daemon writes, or none where nothing failed.
     line: Option<String>,
     queue: Queue,
@@ -219,7 +220,7 @@ async fn run(order: &Order) -> Seen {
     };
     let line = unrevoked
         .as_ref()
-        .map(|unrevoked| failed_revocation_line("a withheld sign-in's", unrevoked));
+        .map(|unrevoked| failed_revocation_line(WITHHELD, unrevoked));
     let queue = match store
         .inner
         .get(&SecretName::new("account/revoke").expect("a name"))
@@ -237,6 +238,7 @@ async fn run(order: &Order) -> Seen {
     Seen {
         commit,
         placed,
+        unrevoked,
         line,
         queue,
         taken,
@@ -477,4 +479,34 @@ async fn the_service_refuses() {
         &[],
     )
     .await;
+}
+
+/// Each place that ends a token it does not keep begins its line with its own words, and the rest
+/// of the line is the variant's: the line of the order where both the queue and the service fail,
+/// whole, for each place.
+#[tokio::test]
+async fn each_place_that_ends_a_token_words_its_line_with_its_own_first_words() {
+    let order = Order {
+        reads: &[true],
+        writes: &[],
+        service_takes: &[false],
+    };
+    let seen = run(&order).await;
+    let unrevoked = seen.unrevoked.expect("the revocation failed");
+    let rest = format!(
+        "token: queuing the token failed and a send of the token alone was not acknowledged; a \
+         write that had begun may have left its entry in place, and the service may have taken \
+         the token; the token is held in memory for the next send: {READ_ERROR}"
+    );
+    for (whose, first_words) in [
+        (WITHHELD, "kr-controller: a withheld sign-in's"),
+        (REFUSED, "kr-controller: a refused sign-in's"),
+        (UNKEPT, "kr-controller: an unkept sign-in's"),
+        (REFUSED_EXCHANGE, "kr-controller: a refused exchange's"),
+    ] {
+        assert_eq!(
+            failed_revocation_line(whose, &unrevoked),
+            format!("{first_words} {rest}")
+        );
+    }
 }
