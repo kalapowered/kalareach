@@ -3,9 +3,9 @@
 //! Each case makes one order through a store and a service that fail where the case says, on a real
 //! `SignedInAccount`, and asserts what the one function returned (the variant of `Unrevoked`), the
 //! whole line the daemon writes for it, and what the queue holds afterwards. No variant is made by
-//! hand. The account's own lock is not a step the store can fail, so no case makes it fail: the
-//! lines name no step that a variant does not record, which is what lets one line stand for the
-//! orders that reach it.
+//! hand. The account's own lock is not a step the store can fail; its case puts a directory where
+//! the lock's file would be. The lines name no step that a variant does not record, which is what
+//! lets one line stand for the orders that reach it.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -195,6 +195,11 @@ struct Seen {
 const TOKEN: &str = "grant-order";
 
 async fn run(order: &Order) -> Seen {
+    run_under(order, None).await
+}
+
+/// As [`run`], with the account's shared lock on `lock` when one is given.
+async fn run_under(order: &Order, lock: Option<std::path::PathBuf>) -> Seen {
     let service = Arc::new(Service {
         takes: Mutex::new(order.service_takes.iter().copied().collect()),
         taken: Mutex::new(Vec::new()),
@@ -204,11 +209,14 @@ async fn run(order: &Order) -> Seen {
         reads: Mutex::new(order.reads.iter().copied().collect()),
         writes: Mutex::new(order.writes.iter().copied().collect()),
     });
-    let account = SignedInAccount::new(
+    let mut account = SignedInAccount::new(
         Arc::clone(&service) as Arc<dyn AccountService>,
         Arc::clone(&store) as Arc<dyn SecretStore>,
         Client::Desktop,
     );
+    if let Some(lock) = lock {
+        account = account.with_shared_lock(lock);
+    }
     let (commit, unrevoked) = account
         .end_withheld(RefreshToken::new(TOKEN).expect("a token"))
         .await;
@@ -358,6 +366,39 @@ async fn the_queues_write_lands_and_its_flush_fails() {
         &[],
     )
     .await;
+}
+
+/// The account's own lock cannot be taken (a directory stands where its file would be): nothing is
+/// read or written, and the send of the token alone is not taken. Only memory holds the token, and
+/// the queue holds nothing, as the line says of a queuing that failed. The lock's error ends with
+/// words that the operating system gives, so the line is compared with the variant's own error,
+/// whose start is asserted.
+#[tokio::test]
+async fn the_account_lock_cannot_be_taken_and_the_service_takes_nothing() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let order = Order {
+        reads: &[],
+        writes: &[],
+        service_takes: &[false],
+    };
+    let seen = run_under(&order, Some(directory.path().to_owned())).await;
+    let Some(Unrevoked::Held(error)) = &seen.unrevoked else {
+        panic!("the variant is Held: {:?}", seen.unrevoked);
+    };
+    let error = error.to_string();
+    assert!(
+        error.starts_with("STORAGE_UNAVAILABLE: the account lock could not be taken: "),
+        "the lock is the step that failed: {error}"
+    );
+    assert_eq!(seen.commit, Commit::WithheldOwing, "the commit");
+    assert_eq!(seen.placed, Placed::Held, "the variant");
+    assert_eq!(
+        seen.line,
+        Some(format!("{HELD}: {error}")),
+        "the whole line"
+    );
+    assert_eq!(seen.queue, Queue::Empty, "what the queue holds");
+    assert!(seen.taken.is_empty(), "the service took nothing");
 }
 
 /// The send of the queue reaches the service, the clean-up lands and then fails, and the send of
