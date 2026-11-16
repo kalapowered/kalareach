@@ -1459,12 +1459,12 @@ mod a_repeat_the_owner_authority_answers {
 
         let performed = AtomicBool::new(false);
         let first = owner
-            .complete(&caller, &params, action, &|| Ok(()), &performed)
+            .complete(&caller, &params, action, &performed)
             .expect("the proof is accepted");
         assert!(!performed.load(Ordering::Acquire));
         let copied = AtomicBool::new(false);
         let again = owner
-            .complete(&caller, &params, action, &|| Ok(()), &copied)
+            .complete(&caller, &params, action, &copied)
             .expect("the repeat is answered");
         assert_eq!(again, first);
         assert!(
@@ -1476,7 +1476,6 @@ mod a_repeat_the_owner_authority_answers {
             &caller,
             &params,
             (action.0, Digest256::from_bytes([34; 32])),
-            &|| Ok(()),
             &reused,
         );
         assert!(is_id_conflict(&refused), "{refused:?}");
