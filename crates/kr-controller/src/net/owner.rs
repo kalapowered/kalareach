@@ -1233,7 +1233,6 @@ impl OwnerAuthority {
         caller: &Caller,
         params: &OwnerConfirmationCompleteParams,
         action: (ActionId, Digest256),
-        admission: &dyn Fn() -> Result<()>,
         copied: &AtomicBool,
     ) -> Result<OwnerConfirmationCompleteResult> {
         let proof = &params.proof;
@@ -1271,16 +1270,7 @@ impl OwnerAuthority {
         if !caller.may_confirm_display(&entry.display) {
             return Err(caller.refusal_to_confirm());
         }
-        // The caller's scope is read again where the admission is asked: the lease the door found
-        // can end while the challenges' lock and the record's lock are waited for.
         let display = entry.display.clone();
-        let admission = || {
-            let now = caller.decided_now();
-            if !now.may_confirm_display(&display) {
-                return Err(now.refusal_to_confirm());
-            }
-            admission()
-        };
         let signer = self.signer_for(caller, proof, entry, enrolment, params)?;
         verify_confirmation(&self.clock, &entry.request, proof, &signer, enrolment)
             .map_err(refusal)?;
@@ -1290,8 +1280,21 @@ impl OwnerAuthority {
                 "that challenge has already been answered with another proof",
             ));
         }
-        // The admission is asked inside the transaction that records the answer, after every wait
-        // before it.
+        // The caller's scope as the door decides it now, with the bound of the local owner's lease
+        // it was decided under: the lease the door found can end while the challenges' lock and the
+        // record's lock are waited for, and the policy's lock is taken here, outside the
+        // transaction that records the answer. The refusal is the door's own.
+        let now = caller.decided_now();
+        if !now.may_confirm_display(&display) {
+            return Err(now.refusal_to_confirm());
+        }
+        let terminal = self.terminal_standing(enrolment);
+        // The signer's standing is read inside the transaction that records the answer, and the
+        // confirmation is verified again there, after every wait before it.
+        let verified = || {
+            verify_confirmation(&self.clock, &entry.request, proof, &signer, enrolment)
+                .map_err(refusal)
+        };
         let answered_at_ms = self.rows.record_answered(
             proof,
             &PairingAction {
@@ -1301,7 +1304,10 @@ impl OwnerAuthority {
                 subject: ActionSubject::Completed(proof.request.confirmation_id),
             },
             kr_ipc::now_ms(),
-            &admission,
+            &now,
+            &display,
+            terminal,
+            &verified,
         )?;
         if let Some(entry) = state.entries.get_mut(&key) {
             entry.answer = Some(Answer {

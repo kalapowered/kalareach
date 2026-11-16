@@ -303,10 +303,7 @@ impl Controller {
             Method::OwnerConfirmationComplete => {
                 let params: OwnerConfirmationCompleteParams = decode(&mutation.params)?;
                 let owner = Arc::clone(&self.owner);
-                blocking(move || {
-                    owner.complete(&caller, &params, action, admission.as_ref(), &copied)
-                })
-                .await
+                blocking(move || owner.complete(&caller, &params, action, &copied)).await
             }
             Method::OwnerConfirmationRequest => {
                 let params: OwnerConfirmationRequestParams = decode(&mutation.params)?;

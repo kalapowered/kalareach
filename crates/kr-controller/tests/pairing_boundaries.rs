@@ -1465,12 +1465,12 @@ mod a_repeat_the_owner_authority_answers {
 
         let performed = AtomicBool::new(false);
         let first = owner
-            .complete(&caller, &params, action, &|| Ok(()), &performed)
+            .complete(&caller, &params, action, &performed)
             .expect("the proof is accepted");
         assert!(!performed.load(Ordering::Acquire));
         let copied = AtomicBool::new(false);
         let again = owner
-            .complete(&caller, &params, action, &|| Ok(()), &copied)
+            .complete(&caller, &params, action, &copied)
             .expect("the repeat is answered");
         assert_eq!(again, first);
         assert!(
