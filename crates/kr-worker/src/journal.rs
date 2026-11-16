@@ -249,6 +249,10 @@ pub struct Journal {
     /// every shipped build.
     #[cfg(feature = "testing")]
     host_event_stall: crate::testing::Stall,
+    /// Where this host's own tests stop the read of a retained result, as a call that blocks its
+    /// thread. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    result_read_stall: crate::testing::Stall,
     /// How many names one page of a revocation's evidence carries, where a test of this host has
     /// asked for fewer than the protocol allows. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -393,6 +397,8 @@ impl Journal {
             prune_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             host_event_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            result_read_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             evidence_page_names: None,
         };
@@ -3497,6 +3503,22 @@ impl Journal {
         self.host_event_stall.arm_blocking()
     }
 
+    /// Stops the next read of a retained result as a call that blocks its thread, for this host's
+    /// own tests: the thread the read runs on is not handed back to its runtime.
+    ///
+    /// Returns the end that says the read has arrived, and the end that lets it go. The stop
+    /// fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_next_result_read_blocking(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.result_read_stall.arm_blocking()
+    }
+
     /// Makes the next maintenance pass prune, and stops the prune at its commit, for this host's
     /// own tests.
     ///
@@ -3535,6 +3557,8 @@ impl Journal {
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
     pub fn read_result(&self, actor_id: &ActorId, action_id: ActionId) -> Result<Option<Vec<u8>>> {
+        #[cfg(feature = "testing")]
+        self.result_read_stall.stand();
         self.connection
             .query_row(
                 "SELECT result FROM results WHERE actor_id = ?1 AND action_id = ?2",
@@ -3622,6 +3646,8 @@ impl Journal {
             prune_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             host_event_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            result_read_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             evidence_page_names: None,
         };
