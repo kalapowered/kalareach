@@ -11,6 +11,17 @@
 //! therefore be older than the session: a close can be admitted a moment before the copy says so.
 //! What the answer says about the lifecycle, and how many launches wait for the reader, is for that
 //! reason read from the input domain, which holds both as they are, and never from the copy.
+//!
+//! Three things the answer does not follow:
+//!
+//! - A root that exits while a storage call holds the session stays `Live` in the answer. Only the
+//!   supervision sees the exit, and it waits for the session, so the domain still says `Live`, and
+//!   the answer says so with the `root_process` of the root that has ended.
+//! - An answer given between the domain's change to `Closed` and the copy's publication of the
+//!   closure says `Closed` with no closure record, and the application name the copy had.
+//! - A record of what a worker said, kept by a reader that asks again and again, can take an older
+//!   copy of the same stage in the place of a newer one, because two answers of one stage are not
+//!   ordered by anything the answer carries.
 
 use std::sync::Mutex;
 use std::time::Duration;
