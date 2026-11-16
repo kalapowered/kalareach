@@ -622,10 +622,15 @@ impl Controller {
     /// session, and by the watch over the worker's end.
     ///
     /// A worker's account is written as it is. A record of this daemon's own is tried again
-    /// through a look at the worker's end ([`Self::reconcile_session`]), as the watch makes it,
-    /// and not written directly: the look reads the worker's journal first, which an earlier look
-    /// may not have been able to read, and writes the kept record only where the journal gives
-    /// none.
+    /// through a look at the worker's end, [`Self::reconcile_session`], which is the look that a
+    /// list makes (the watch's look is [`Self::watch_closure_once`], and takes the same path
+    /// through [`Self::crash_flight`]), and not written directly. A look that can take the
+    /// session's ownership, which needs the worker's endpoint removed, reads the worker's journal
+    /// before it writes anything of this daemon's own, and gives the kept record's reason alone.
+    /// A look that cannot remove the endpoint reads no journal, and writes the record of this
+    /// daemon's own that its own pass gives. A look that ends with nothing recorded, because
+    /// another recovery holds the session, the kernel does not say that the worker ended, or no
+    /// worker row is left, starts the watch, as a write that failed does.
     fn record_known_closure_soon(self: &Arc<Self>, session_id: SessionId) {
         let (record, whose) = {
             let mut known = self
@@ -643,17 +648,18 @@ impl Controller {
         };
         let me = Arc::clone(self);
         tokio::spawn(async move {
-            let written = match whose {
-                Whose::Worker => me.retire_as(&record, whose).await,
+            let (written, recorded) = match whose {
+                Whose::Worker => (me.retire_as(&record, whose).await, true),
                 Whose::Daemon => {
                     let looked = me.reconcile_session(record.session_id).await;
-                    if matches!(looked, Ok(Some(_))) {
+                    let recorded = matches!(looked, Ok(Some(_)));
+                    if recorded {
                         // A closure is recorded, by this look or by another path first, and
                         // what was kept is no longer what a close is answered from.
                         me.forget_known_closure(record.session_id);
                         me.review_power_soon();
                     }
-                    looked.map(|_| ())
+                    (looked.map(|_| ()), recorded)
                 }
             };
             if let Some(entry) = me
@@ -671,6 +677,9 @@ impl Controller {
                      session is closed again and at the next start",
                     record.session_id
                 );
+                me.watch_closure(record.session_id, record.reason).await;
+            } else if !recorded {
+                // The look ended with nothing recorded: the watch looks again.
                 me.watch_closure(record.session_id, record.reason).await;
             }
         });
