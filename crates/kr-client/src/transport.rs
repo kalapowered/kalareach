@@ -546,13 +546,16 @@ impl ControlTransport for NetworkTransport {
 /// Where a case holds a network read between the return of the connection's read and the
 /// classification of its end, and how many reads have touched the connection.
 #[cfg(feature = "testing")]
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ReadSeam {
     returned: std::sync::atomic::AtomicUsize,
     hold_next_failure: std::sync::atomic::AtomicBool,
     held: tokio::sync::Notify,
     resumed: tokio::sync::Notify,
 }
+
+#[cfg(feature = "testing")]
+crate::debug_as_name!(ReadSeam);
 
 #[cfg(feature = "testing")]
 impl ReadSeam {
