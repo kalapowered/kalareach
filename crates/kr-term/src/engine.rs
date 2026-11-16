@@ -1052,14 +1052,15 @@ impl Engine {
     /// comes next. The grid carries what the retained rows cost, charging each row where it leaves
     /// the screen, so this reads one figure however long the history is.
     fn charge_rows_that_left_the_screen(&mut self, now_ms: u64) {
+        // Also where rows the engine may not keep are given up, in the call that moved them off the
+        // screen, so no reader sees one between the event and its removal. The primary buffer is
+        // reached whichever buffer shows, so nothing is owed while the alternate buffer shows.
+        self.grid.give_up_marked_rows();
         if self.grid.alternate_active() {
             // The alternate buffer keeps no history, and its rows are numbered separately.
+            self.budget.set_row_cache(self.grid.history_bytes());
             return;
         }
-        // Also where rows the engine may not keep are given up, in the call that moved them off the
-        // screen: the event that brought the primary buffer back is followed by this call, inside the
-        // same read, so no reader sees a row between the switch and its removal.
-        self.grid.give_up_unkept_rows();
         if self.budget.set_row_cache(self.grid.history_bytes()) {
             self.evict_history(now_ms);
         }
@@ -1067,26 +1068,22 @@ impl Engine {
 
     /// Sets whether the rows that leave the live screen are kept.
     ///
-    /// Turning it off gives up every row held above the live screen at once and keeps none from
-    /// then on: a row is given up in the call that moved it off the screen, so none is ever held
-    /// between two calls, and the rows on the screen are given up when they leave it. The live
-    /// screen is not changed, and nothing is recorded as truncated, because nothing was cut to fit a
-    /// bound.
+    /// Turning it off gives up every row held above the live screen at once, whichever buffer
+    /// shows, and keeps none from then on: a row is given up in the call that moved it off the
+    /// screen, so none is ever held between two calls. The live screen is not changed, and nothing
+    /// is recorded as truncated, because nothing was cut to fit a bound. The rows on the screen are
+    /// marked, and each is given up when it leaves the screen.
     ///
-    /// Turning it on keeps rows again from the first row that comes onto the screen after the call,
-    /// up to the cache bound as before. Every row the primary buffer holds then, the row the cursor
-    /// is on included, is given up when it leaves the screen, so nothing that was held while rows
-    /// were not kept is kept afterwards.
-    ///
-    /// While the alternate buffer shows, the primary buffer's rows cannot be reached, and they
-    /// cannot be read either. They are given up in the call that makes the primary buffer show
-    /// again.
+    /// Turning it on keeps rows again from the first row that is printed onto a line that was not on
+    /// the screen at that point. Every row that is on the screen then, the row the cursor is on
+    /// included, is given up when it leaves the screen, so nothing that was printed while rows were
+    /// not kept is kept afterwards. A row that leaves the screen while an older row of that kind
+    /// still stays on it is given up too, for as long as the older row stays.
     pub fn set_history_kept(&mut self, kept: bool) {
         if kept {
             self.grid.keep_rows_again();
         } else {
-            self.grid.keep_no_rows();
-            self.grid.give_up_unkept_rows();
+            self.grid.stop_keeping_rows();
             // What the hyperlink objects on the given-up rows cost is read again at the next read.
             self.measure_now = true;
         }
@@ -1099,7 +1096,6 @@ impl Engine {
     /// average of what the rows cost, so what is left after it costs no more than the bound; the
     /// figure afterwards is what those rows cost, not an estimate of it.
     fn evict_history(&mut self, now_ms: u64) {
-        self.grid.give_up_unkept_rows();
         self.budget.set_row_cache(self.grid.history_bytes());
         let limit = self.budget.limits().row_cache_bytes;
         if !self.grid.enforce_row_cache(limit) {
