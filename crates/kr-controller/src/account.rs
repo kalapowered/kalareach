@@ -1011,10 +1011,12 @@ impl HostAccount {
     /// browser's answer and returns when the daemon is ready for it. The address the person opens is in
     /// [`Self::report`].
     ///
-    /// `stands` is asked before the waiting sign-in is ended and again, under the lock this one is
-    /// shown as waiting under and immediately before it is shown, because the waits between them can
-    /// outlast the request's authority. A refusal after
-    /// the waiting sign-in was ended says so (the words of `EARLIER_SIGN_IN_CANCELLED`).
+    /// `stands` is asked before the waiting sign-in is ended, immediately before each try to bind
+    /// the address the person comes back to, and again, under the lock this one is shown as waiting
+    /// under and immediately before it is shown, because the waits between them can outlast the
+    /// request's authority: the end of the waiting sign-in, the pause between two tries to bind and
+    /// the wait for the lock. A refusal after the waiting sign-in was ended says so (the words of
+    /// `EARLIER_SIGN_IN_CANCELLED`).
     ///
     /// # Errors
     ///
