@@ -90,7 +90,9 @@ async fn a_bind_and_a_closure_wait_together(bind_first: bool) -> bool {
     let record = closure_of(world.session_id);
     let registry = world.controller.registry.lock().await;
     let binding = world.controller.bind_worker(world.session_id);
-    let closing = world.controller.write_closure(&record);
+    let closing = world
+        .controller
+        .write_closure(&record, super::close::Whose::Worker);
     tokio::pin!(binding, closing);
     // The lock is fair: they are let in in the order they asked.
     if bind_first {

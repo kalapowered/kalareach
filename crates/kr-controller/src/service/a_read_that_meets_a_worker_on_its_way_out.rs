@@ -1396,6 +1396,70 @@ async fn a_worker_that_ended_after_its_volatile_closure_is_recorded_as_it_said()
     world.serving.abort();
 }
 
+/// The daemon's own record of a worker that ended with no closure in its journal is held by this
+/// daemon alone until the registry has committed it, so a close that meets it before then is not
+/// told that the closure is durable, and the registry holds a durable record once it has it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_that_meets_the_daemons_own_record_before_its_commit_is_not_told_it_is_durable() {
+    let script = Scripted::new();
+    let world = scripted(&script).await;
+    let accepted = close(&world).await;
+    assert!(
+        accepted.closure.0.is_none(),
+        "the worker only accepted: {accepted:?}"
+    );
+    let (arrived, release) = world.controller.stall_the_next_closure_write();
+    let writing = {
+        let controller = Arc::clone(&world.controller);
+        let session_id = world.session_id;
+        let identity = world.worker.descriptor.process_start_identity.clone();
+        tokio::spawn(async move {
+            controller
+                .record_final(
+                    session_id,
+                    ClosureReason::WorkerCrash,
+                    &identity,
+                    &crate::archive::Fenced::nothing(session_id),
+                    super::close::Death::Confirmed,
+                )
+                .await
+        })
+    };
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(std::time::Duration::from_secs(30)))
+        .await
+        .expect("the wait for the write ends")
+        .expect("the daemon's own record reaches the registry's write");
+    let repeated = tokio::time::timeout(std::time::Duration::from_secs(10), close(&world))
+        .await
+        .expect("a close is answered while the write of the daemon's own record stands");
+    assert_ne!(repeated.durability, Durability::Durable, "{repeated:?}");
+    assert_eq!(
+        repeated.closure.as_ref().map(|record| record.durability),
+        Some(Durability::Volatile),
+        "the record it carries is not said to be durable either: {repeated:?}"
+    );
+    release.send(()).expect("the write is let go");
+    let record = writing
+        .await
+        .expect("the record's task ends")
+        .expect("the daemon's own record is written");
+    assert_eq!(record.durability, Durability::Durable, "{record:?}");
+    assert!(
+        recorded(&world).await,
+        "the registry holds the record once the write is let go"
+    );
+    let after = close(&world).await;
+    assert_eq!(
+        (
+            after.durability,
+            after.closure.as_ref().map(|record| record.durability)
+        ),
+        (Durability::Durable, Some(Durability::Durable)),
+        "from the registry's record the answer is durable: {after:?}"
+    );
+    world.serving.abort();
+}
+
 /// Whether the registry has a closure recorded for the session.
 pub(super) async fn recorded(world: &Silent) -> bool {
     world
