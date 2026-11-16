@@ -233,7 +233,7 @@ pub struct Journal {
     /// the one waiting can hold it without holding the journal.
     attention_changes: std::sync::Arc<tokio::sync::Notify>,
     /// Whether the removal of settled receipts' content is owed, or the session that owns this
-    /// journal cannot say whether privacy mode is on ([`Self::withheld_now`]).
+    /// journal cannot say whether privacy mode is on (`withheld_now`).
     ///
     /// The session sets it where it owes that removal and clears it where the removal is done or
     /// the state reads as off, so that a journal a session opens is fenced before any reader can
@@ -1527,7 +1527,7 @@ impl Journal {
     /// Reads the recoverable intent an action was accepted with.
     ///
     /// While the removal of settled content is owed, a receipt that the removal strips has none
-    /// ([`Self::withheld_now`]).
+    /// (`withheld_now`).
     ///
     /// # Errors
     ///
@@ -2871,7 +2871,7 @@ impl Journal {
     /// it is another ask; its envelope may still say so.
     ///
     /// While the removal of settled content is owed, the envelope is offered as it is after the
-    /// removal, which is none ([`Self::withheld_now`]), so every uncertain outcome of the subject
+    /// removal, which is none (`withheld_now`), so every uncertain outcome of the subject
     /// holds the request back.
     ///
     /// # Errors
@@ -3557,7 +3557,7 @@ impl Journal {
     /// Reads the retained result of an action.
     ///
     /// While the removal of settled content is owed, a receipt that the removal strips has none
-    /// ([`Self::withheld_now`]).
+    /// (`withheld_now`).
     ///
     /// # Errors
     ///
