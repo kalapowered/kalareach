@@ -2315,7 +2315,9 @@ impl kr_client::pairing::link::HostLink for ControlledLink {
                 .failing_presentation
                 .clone();
             if let Some(error) = failing {
-                return Err(kr_client::pairing::link::LinkError::Membership(error));
+                return Err(kr_client::pairing::link::LinkError::membership_by_code(
+                    error,
+                ));
             }
             let presented = self
                 .own

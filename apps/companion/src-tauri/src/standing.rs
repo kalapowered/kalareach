@@ -252,7 +252,7 @@ impl Dial {
             // A connection that could not be given the lease the host needs, or whose account left,
             // is waited out: the opening stands and its watch dials again, as for a host that did
             // not answer.
-            error @ LinkError::Membership(_) => Unopened::unreached(error.said().into_string()),
+            error @ LinkError::Membership(..) => Unopened::unreached(error.said().into_string()),
             other => Unopened::of_link(other),
         })
     }

@@ -758,7 +758,7 @@ impl Pairing {
             Err(
                 LinkError::Lost(_)
                 | LinkError::Configuration(_)
-                | LinkError::Membership(_)
+                | LinkError::Membership(..)
                 | LinkError::ConnectionRefused(_)
                 | LinkError::Declined(_)
                 | LinkError::Selection(_),
@@ -936,7 +936,7 @@ impl Pairing {
                         Err(
                             LinkError::Lost(_)
                             | LinkError::Configuration(_)
-                            | LinkError::Membership(_)
+                            | LinkError::Membership(..)
                             | LinkError::ConnectionRefused(_)
                             | LinkError::Declined(_)
                             | LinkError::Selection(_),
@@ -993,7 +993,7 @@ impl Pairing {
                 Err(
                     LinkError::Lost(_)
                     | LinkError::Configuration(_)
-                    | LinkError::Membership(_)
+                    | LinkError::Membership(..)
                     | LinkError::ConnectionRefused(_)
                     | LinkError::Declined(_)
                     | LinkError::Selection(_),
@@ -1703,7 +1703,7 @@ fn link_failed(error: &LinkError, tries: Option<u32>) -> PairingFailure {
     let kind = match error {
         LinkError::Refused(refusal) => refused_by_host(refusal.code, false),
         LinkError::Lost(_)
-        | LinkError::Membership(_)
+        | LinkError::Membership(..)
         | LinkError::ConnectionRefused(_)
         | LinkError::Declined(_) => FailureKind::HostUnreachable,
         // The host answered, and what it answered is not the host the bundle names: a new try gets

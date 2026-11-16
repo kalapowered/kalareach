@@ -183,7 +183,7 @@ impl Pairing {
             Err(
                 LinkError::Lost(_)
                 | LinkError::Configuration(_)
-                | LinkError::Membership(_)
+                | LinkError::Membership(..)
                 | LinkError::ConnectionRefused(_)
                 | LinkError::Declined(_)
                 | LinkError::Selection(_),
@@ -209,7 +209,7 @@ fn reached(error: &LinkError) -> PairingFailure {
     let kind = match error {
         LinkError::Refused(refusal) => refused_by_host(refusal.code, true),
         LinkError::Lost(_)
-        | LinkError::Membership(_)
+        | LinkError::Membership(..)
         | LinkError::ConnectionRefused(_)
         | LinkError::Declined(_) => FailureKind::HostUnreachable,
         // The host answered, and what it answered is not the host the invitation names: a new try

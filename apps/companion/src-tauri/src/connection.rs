@@ -489,8 +489,8 @@ impl Unopened {
             // The host was reachable and was not asked for anything: the device could not give it
             // the lease it needs, or the account it was to be opened under left, and the words say
             // why.
-            LinkError::Membership(refusal) => {
-                Self::Refused(Asked::Connection, CommandError::from(refusal))
+            LinkError::Membership(refusal, action) => {
+                Self::Refused(Asked::Connection, CommandError::asking(refusal, action))
             }
             // The host refused the connection itself while the lease it needs was being
             // presented, and its refusal is what the session kept: the same cause as one that
