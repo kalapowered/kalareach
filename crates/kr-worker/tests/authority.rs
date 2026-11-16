@@ -1312,8 +1312,8 @@ async fn settle(mut settled: impl FnMut() -> bool) -> bool {
     true
 }
 
-/// Holds the worker's dispatch boundary on a thread of its own until it is released, and its
-/// authority record with it when asked: a generation that is being decided holds both.
+/// Holds one of the worker's locks on a thread of its own until it is released: the dispatch
+/// boundary, or the authority record.
 struct Held {
     release: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -1324,24 +1324,26 @@ impl Held {
         Self::take(host, false).await
     }
 
-    async fn boundary_and_authority(host: &Host) -> Self {
+    /// The authority record, which a generation that is being decided holds while it reads the
+    /// journal.
+    async fn authority(host: &Host) -> Self {
         Self::take(host, true).await
     }
 
-    async fn take(host: &Host, with_authority: bool) -> Self {
+    async fn take(host: &Host, authority: bool) -> Self {
         let (release, wait) = std::sync::mpsc::channel::<()>();
         let (held, confirmed) = tokio::sync::oneshot::channel::<()>();
         let service = Arc::clone(&host.service);
         let thread = std::thread::spawn(move || {
-            let _boundary = service.hold_the_dispatch_boundary();
-            let _authority = with_authority.then(|| service.hold_the_authority_for_tests());
+            let _boundary = (!authority).then(|| service.hold_the_dispatch_boundary());
+            let _authority = authority.then(|| service.hold_the_authority_for_tests());
             let _ = held.send(());
             let _ = wait.recv();
         });
         tokio::time::timeout(WAIT, confirmed)
             .await
-            .expect("the boundary is held in time")
-            .expect("the holder ended without holding the boundary");
+            .expect("the lock is held in time")
+            .expect("the holder ended without holding the lock");
         Self {
             release: Some(release),
             thread: Some(thread),
@@ -1408,8 +1410,9 @@ async fn presentations_whose_peers_have_gone_do_not_keep_their_connections_while
     let service = &host.service;
     let boundary = Held::boundary(&host).await;
     let start = service.connections_held_for_tests();
+    let accepted = service.accepted_generation();
     for round in 1..=3 {
-        let peers = presenting_many(&host, 30, 1);
+        let peers = presenting_many(&host, 30, 2);
         settle(|| service.presentations_waiting_for_tests() == 30).await;
         assert_eq!(
             service.presentations_waiting_for_tests(),
@@ -1435,7 +1438,7 @@ async fn presentations_whose_peers_have_gone_do_not_keep_their_connections_while
     }
     assert_eq!(
         service.accepted_generation(),
-        None,
+        accepted,
         "nothing was decided for a peer that was not there"
     );
     boundary.release();
@@ -1451,8 +1454,9 @@ async fn a_living_presentation_waits_through_a_long_hold_and_is_answered() {
     let service = &host.service;
     let boundary = Held::boundary(&host).await;
     let start = service.connections_held_for_tests();
-    let living = presenting(&host, 1);
-    let dead = presenting_many(&host, 8, 1);
+    let accepted = service.accepted_generation();
+    let living = presenting(&host, 2);
+    let dead = presenting_many(&host, 8, 2);
     settle(|| service.presentations_waiting_for_tests() == 9).await;
     assert_eq!(service.presentations_waiting_for_tests(), 9);
     peers_go(dead).await;
@@ -1480,7 +1484,7 @@ async fn a_living_presentation_waits_through_a_long_hold_and_is_answered() {
         "the living presentation found the boundary held again and again"
     );
     assert!(!living.is_finished(), "it waits for the hold");
-    assert_eq!(service.accepted_generation(), None);
+    assert_eq!(service.accepted_generation(), accepted);
 
     boundary.release();
     let (mut link, answer) = tokio::time::timeout(WAIT, living)
@@ -1490,7 +1494,7 @@ async fn a_living_presentation_waits_through_a_long_hold_and_is_answered() {
     answer.expect("the living presentation is accepted");
     assert_eq!(
         service.accepted_generation(),
-        Some(ControllerGeneration::new(1))
+        Some(ControllerGeneration::new(2))
     );
     read_session(&mut link, host.session_id)
         .await
@@ -1610,8 +1614,9 @@ async fn a_presentation_whose_peer_goes_as_the_hold_ends_has_no_effect() {
     let host = host(1).await;
     let service = &host.service;
     let boundary = Held::boundary(&host).await;
+    let accepted = service.accepted_generation();
     let (arrived, go) = service.pause_inside_presentation();
-    let peer = presenting(&host, 1);
+    let peer = presenting(&host, 2);
     settle(|| service.presentations_waiting_for_tests() == 1).await;
     assert_eq!(service.presentations_waiting_for_tests(), 1);
 
@@ -1630,11 +1635,11 @@ async fn a_presentation_whose_peer_goes_as_the_hold_ends_has_no_effect() {
     assert_eq!(service.connections_held_for_tests(), 0);
     assert_eq!(
         service.accepted_generation(),
-        None,
+        accepted,
         "nothing was accepted for a peer that had gone"
     );
 
-    let mut next = controller_client(&host, 1).await;
+    let mut next = controller_client(&host, 2).await;
     read_session(&mut next, host.session_id)
         .await
         .expect("the next presentation is accepted and served");
@@ -1684,19 +1689,20 @@ async fn a_dead_presentation_does_not_fence_a_living_older_binding() {
 
 /// A presentation that never took authority does not wait for authority when its connection ends.
 ///
-/// A generation that is being decided holds the dispatch boundary and the authority record while it
-/// reads the journal. Presentations wait behind it and their peers go. Their connections are given
-/// back while both are still held, because a connection that was never bound has nothing to remove
-/// from the record.
+/// Presentations wait at a held boundary. A generation that is being decided holds the authority
+/// record while it reads the journal, and while it does, the peers of the waiting presentations
+/// go. Their connections are given back with the record still held, because a connection that was
+/// never bound has nothing to remove from it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_presentation_that_never_took_authority_ends_while_another_holds_the_authority() {
     let host = host(1).await;
     let service = &host.service;
-    let held = Held::boundary_and_authority(&host).await;
+    let boundary = Held::boundary(&host).await;
     let start = service.connections_held_for_tests();
-    let peers = presenting_many(&host, 3, 1);
+    let peers = presenting_many(&host, 3, 2);
     settle(|| service.presentations_waiting_for_tests() == 3).await;
     assert_eq!(service.presentations_waiting_for_tests(), 3);
+    let record = Held::authority(&host).await;
     peers_go(peers).await;
     settle(|| {
         service.presentations_waiting_for_tests() == 0
@@ -1708,5 +1714,6 @@ async fn a_presentation_that_never_took_authority_ends_while_another_holds_the_a
         start,
         "the connections of the peers that went are given back while the authority is held"
     );
-    held.release();
+    record.release();
+    boundary.release();
 }
