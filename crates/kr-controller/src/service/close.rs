@@ -640,11 +640,13 @@ impl Controller {
     /// list makes (the watch's look is [`Self::watch_closure_once`], and takes the same path
     /// through [`Self::crash_flight`]), and not written directly. A look that can take the
     /// session's ownership, which needs the worker's endpoint removed, reads the worker's journal
-    /// before it writes anything of this daemon's own, and gives the kept record's reason alone.
-    /// A look that cannot remove the endpoint reads no journal, and writes the record of this
-    /// daemon's own that its own pass gives. A look that ends with nothing recorded, because
-    /// another recovery holds the session, the kernel does not say that the worker ended, or no
-    /// worker row is left, starts the watch, as a write that failed does.
+    /// before it writes anything of this daemon's own. Where the journal gives no closure, and for
+    /// a look that cannot remove the endpoint and reads no journal, the record is built from that
+    /// look's own pass, and its reason is the kept record's, unless that pass establishes a reason
+    /// from a fact that the earlier look could not have ([`reason_rests_on_a_fact`]). A look that
+    /// ends with nothing recorded starts the watch, as a write that failed does: another recovery
+    /// holds the session or its lock cannot be made or taken, the kernel does not say that the
+    /// worker ended, or no worker row is left.
     fn record_known_closure_soon(self: &Arc<Self>, session_id: SessionId) {
         let (record, whose) = {
             let mut known = self
