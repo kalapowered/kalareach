@@ -186,6 +186,13 @@ pub struct Producer {
     /// reader has dealt with the failure, for this host's own tests.
     #[cfg(feature = "testing")]
     ledger_failures: std::sync::atomic::AtomicUsize,
+    /// How many asks the evidence loop has queued for the question ledger's reader, and how many
+    /// reads the reader has finished, for this host's own tests. Every queued ask is one read, so
+    /// while the loop waits and the two are equal no read is pending or under way.
+    #[cfg(feature = "testing")]
+    asks_queued: std::sync::atomic::AtomicUsize,
+    #[cfg(feature = "testing")]
+    reads_done: std::sync::atomic::AtomicUsize,
     #[cfg(feature = "testing")]
     before_the_send: crate::testing::Stall,
     /// How many helper threads of this producer are alive: its publisher, and the reader of the
@@ -282,6 +289,10 @@ impl Producer {
                 waits: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(feature = "testing")]
                 ledger_failures: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(feature = "testing")]
+                asks_queued: std::sync::atomic::AtomicUsize::new(0),
+                #[cfg(feature = "testing")]
+                reads_done: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(feature = "testing")]
                 before_the_send: crate::testing::Stall::default(),
                 #[cfg(feature = "testing")]
@@ -481,6 +492,20 @@ impl Producer {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Returns how many asks the evidence loop has queued for the question ledger's reader and how
+    /// many reads the reader has finished, for this host's own tests. A read is finished once the
+    /// reader has recorded what it found and counted a failure. Every queued ask is one read, and a
+    /// round queues its ask before it comes to its wait, so while the loop waits (see
+    /// [`Self::loop_rounds`]) and the two are equal, no read is pending or under way.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn ledger_asks(&self) -> (usize, usize) {
+        (
+            self.asks_queued.load(std::sync::atomic::Ordering::SeqCst),
+            self.reads_done.load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
     /// Stops the next publication after the publisher has taken the session and before it reads the
     /// facts, for this host's own tests. Returns the end that says the publisher has arrived there
     /// and the end that lets it go on; the stop fires once. Facts that join while it stands there
@@ -573,7 +598,15 @@ pub async fn follow_evidence(
         let facts = broker.application(reading);
         producer.observe_broker(facts.approval_pending, facts.turn_running);
         // A read that was asked for and not begun is enough for every ask after it.
+        #[cfg(not(feature = "testing"))]
         let _ = ask.try_send(());
+        // The same call, counted when it queues an ask, for this host's own tests.
+        #[cfg(feature = "testing")]
+        if ask.try_send(()).is_ok() {
+            producer
+                .asks_queued
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         // The lifecycle is the input domain's, which nothing that holds the session holds too.
         if !runtime.input().lock().state().is_running() {
             return;
@@ -677,6 +710,10 @@ fn read_the_ledger_apart(
                         .ledger_failures
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
+                #[cfg(feature = "testing")]
+                producer
+                    .reads_done
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
         })
         .expect("a thread for the question ledger's reader");
