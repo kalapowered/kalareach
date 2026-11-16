@@ -30,9 +30,13 @@ use crate::error::ClientError;
 
 /// How a session's control stream ended, as the reader read it.
 pub enum Ended {
-    /// The host finished its side of the stream and sent nothing more, or the owner closed or
-    /// dropped the session, which is how the reader tells the owner's own close: the owner asked
-    /// for it, so it is no failure.
+    /// The stream ended without a failure. A transport returns this for this side's own close,
+    /// which it knows by itself: the owner closed or dropped the session, which is how the reader
+    /// tells the owner's close, or, on the local link, the transport closed itself after a write
+    /// that a limit cut or that failed or was dropped part way (the call that cut the frame has
+    /// the cause, and each later call fails before a byte). On the network it is also the host's
+    /// clean end of the stream at a frame's boundary. On the local link it is never the peer: the
+    /// peer's end there is [`Ended::Failed`].
     Finished,
     /// Reading the stream failed: the transport's own failure, with what the transport said. On
     /// the local link every failed read is one, the peer's end at a frame's boundary included; on
@@ -57,6 +61,10 @@ pub enum Ordered {
 crate::debug_as_name!(Ended, Ordered, OrderedEvents);
 
 /// The notifications of one session, in the order the host sent them.
+///
+/// The holder drains it to its end or drops it when it is done: a holder that keeps it and reads
+/// nothing keeps the session's reader task, with the closed transport, the session's state and
+/// the item the reader waits to hand on, alive for as long as it keeps it.
 pub struct OrderedEvents {
     receiver: mpsc::Receiver<Ordered>,
 }
