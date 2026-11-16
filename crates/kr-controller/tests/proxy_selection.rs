@@ -132,14 +132,12 @@ async fn a_host_reaches_its_rendezvous_through_the_proxy_it_selected() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_network_setup_reaches_its_rendezvous_through_the_proxy_its_document_selects() {
     let proxy = ConnectProxy::refusing(403).await;
-    let host = kr_ipc::testing::TempHost::create();
     let mut network = ConfigurationDocument::empty().network;
     network.enabled = Nullable::some(true);
     network.proxy_url = Nullable::some(proxy.url.clone());
     let setup = NetworkSetup::from_configuration(
         &network,
-        &host.environment(),
-        kr_crypto::store::StoreSelection::File,
+        std::sync::Arc::new(kr_crypto::store::MemoryStore::new()),
     )
     .expect("a usable selection")
     .expect("a host on the network");

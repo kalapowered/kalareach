@@ -79,7 +79,7 @@ use std::sync::{Arc, Weak};
 use heard::Heard;
 use kr_crypto::connect::PairedPeer;
 use kr_crypto::keys::DeviceKeys;
-use kr_crypto::store::{SecretStore, StoreSelection};
+use kr_crypto::store::SecretStore;
 use kr_pairing::host::HostIdentity;
 use kr_protocol::ids::{ActorId, AuthorityRevision, ConnectionId, DeviceId, DeviceKeyRevision};
 use kr_protocol::metrics::{MetricOutcome, Transport};
@@ -151,45 +151,19 @@ impl NetworkSetup {
     /// the document's alone ([`NetworkSettings::from_selection`]), and nothing here is read from
     /// this process's environment: the owner is recorded by the pairing that establishes it.
     ///
-    /// Under [`StoreSelection::Platform`] the key store is the platform's own credential store
-    /// where there is one, and the documented owner-only directory where there is not; the
-    /// fallback is taken deliberately rather than discovered at the first write. Under
-    /// [`StoreSelection::File`] it is the directory this environment keeps its secrets in, which
-    /// is what a test, a bench or a demonstration run is given so that its keys leave with it.
+    /// The network's device keys live in `secrets`, the store the daemon opened for its own keys.
+    /// One state directory has one store, so this takes the store it is handed and chooses none:
+    /// a host that kept its keys in one store at one start has them in that store at the next.
     ///
     /// # Errors
     ///
-    /// Returns a configuration error naming the selection or the store that could not be read.
+    /// Returns a configuration error naming the selection that could not be used.
     pub fn from_configuration(
         network: &kr_protocol::hostinfo::configuration::NetworkSelection,
-        paths: &kr_ipc::paths::EnvironmentPaths,
-        selection: StoreSelection,
+        secrets: Arc<dyn SecretStore>,
     ) -> Result<Option<Self>> {
         let Some(settings) = NetworkSettings::from_selection(network)? else {
             return Ok(None);
-        };
-        let secrets: Arc<dyn SecretStore> = match selection {
-            StoreSelection::Platform => match kr_crypto::store::PlatformStore::open(
-                kr_ipc::verify::CONTROLLER_SECRET_SERVICE,
-            ) {
-                Ok(store) => Arc::new(store),
-                Err(platform) => Arc::new(
-                    kr_crypto::store::FileStore::open(paths.secrets_dir()).map_err(|file| {
-                        ControllerError::NotConfigured(format!(
-                            "this host has nowhere to keep its network keys: {platform}; {file}"
-                        ))
-                    })?,
-                ),
-            },
-            StoreSelection::File => Arc::from(
-                kr_crypto::store::open_store_in(&paths.secrets_dir())
-                    .map_err(|error| {
-                        ControllerError::NotConfigured(format!(
-                            "this run has nowhere to keep its network keys: {error}"
-                        ))
-                    })?
-                    .store,
-            ),
         };
         // A host whose platform cannot verify a service's certificate offers no code invitation,
         // and says so when one is asked for. The rendezvous goes through the proxy the endpoint

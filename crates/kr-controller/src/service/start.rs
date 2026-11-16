@@ -1016,8 +1016,10 @@ impl Controller {
         };
         // External destinations' credentials are kept in the same store as this host's own keys,
         // in a scope of their own, and never in the delivery journal.
-        let destination_secrets =
-            crate::push::secrets::DestinationSecrets::new(secret_store, setup.environment_id);
+        let destination_secrets = crate::push::secrets::DestinationSecrets::new(
+            Arc::clone(&secret_store),
+            setup.environment_id,
+        );
         let delivery = Arc::new(crate::push::DeliveryModule::open(
             &setup.paths,
             device_keys.notification_preview,
@@ -1164,7 +1166,7 @@ impl Controller {
             #[cfg(test)]
             withdrawals_waiting: std::sync::atomic::AtomicUsize::new(0),
             identity,
-            secret_store: setup.secret_store,
+            secret_store,
             generation,
             paths: setup.paths,
             plugin_bridge,
@@ -1676,8 +1678,7 @@ impl Controller {
         // leaving a host that looks up and cannot be reached.
         if let Some(setup) = net::NetworkSetup::from_configuration(
             &controller.started.network,
-            &controller.paths,
-            controller.secret_store(),
+            Arc::clone(controller.secret_store()),
         )? {
             net::register(&controller, setup).await?;
         }
@@ -2568,8 +2569,8 @@ pub struct ControllerSetup {
     /// Which store this daemon keeps its keys in.
     ///
     /// The closure above opens it for the identity; this is the same choice, for everything else
-    /// this daemon keeps a key in. The transport's device keys are the one that matters: they are
-    /// opened only when the environment selects a network, which is after startup.
+    /// this daemon keeps a key in. The store it opens for the daemon's device keys is the one the
+    /// network's keys are kept in as well: one state directory has one store.
     pub secret_store: kr_crypto::store::StoreSelection,
     /// The boot this host is running.
     pub boot_identity: BootIdentity,

@@ -472,8 +472,9 @@ pub struct Controller {
     #[cfg(test)]
     withdrawals_waiting: std::sync::atomic::AtomicUsize,
     identity: ControllerIdentity,
-    /// Which store this daemon keeps its keys in.
-    secret_store: kr_crypto::store::StoreSelection,
+    /// The store this daemon keeps its keys in: the one its device keys, its network's keys and
+    /// every other key of its host are kept in.
+    secret_store: Arc<dyn kr_crypto::store::SecretStore>,
     generation: ControllerGeneration,
     paths: EnvironmentPaths,
     boot_identity: BootIdentity,
@@ -1214,10 +1215,10 @@ impl Controller {
         &self.catalogue
     }
 
-    /// Returns which store this daemon keeps its keys in.
+    /// Returns the store this daemon keeps its keys in.
     #[must_use]
-    pub const fn secret_store(&self) -> kr_crypto::store::StoreSelection {
-        self.secret_store
+    pub const fn secret_store(&self) -> &Arc<dyn kr_crypto::store::SecretStore> {
+        &self.secret_store
     }
 
     /// Returns the environment's transfer service.
