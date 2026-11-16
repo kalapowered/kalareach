@@ -1103,6 +1103,15 @@ async fn ask(
     }
 }
 
+/// Whether the record of the attempt is told that the daemon took the stop: for a request that the
+/// daemon took and answered, and for no request whose outcome is not known.
+fn marker_told(request: &Request) -> bool {
+    match request {
+        Request::Told => true,
+        Request::MaybeAsked(_) => false,
+    }
+}
+
 /// A daemon answered the hello: asks it to stop, and waits for it to end.
 async fn stop_the_daemon(
     host: &HostPaths,
@@ -1214,7 +1223,7 @@ async fn stop_the_daemon(
             return refused(&mut client, id, &info, error, &refusal, json).await;
         }
     };
-    if matches!(request, Request::Told) {
+    if marker_told(&request) {
         let _ = progress.with_marker(|marker| marker.told());
     }
     drop(client);
@@ -2031,6 +2040,17 @@ fn look_wanted(lock: &Lock, process: Process, holder: Holder) -> bool {
     }
 }
 
+/// Whether a round reads the number of the process that the lock file names after its look: where
+/// the look showed a daemon of another generation, that process is the successor, and no other
+/// look makes the round read it.
+fn successor_wanted(look: Option<Endpoint>) -> bool {
+    match look {
+        Some(Endpoint::Another) => true,
+        Some(Endpoint::Nobody | Endpoint::Same(_) | Endpoint::Unproved(_) | Endpoint::Unclear)
+        | None => false,
+    }
+}
+
 /// What a round shows: the end (`End::Gone`, or `End::Successor`), nothing yet (none: the wait
 /// goes on) or, where the bound is reached, why the end is not shown. Every combination of what a
 /// round reads is an arm, with no catch-all arm over any of the readings, so that a new value of
@@ -2125,7 +2145,8 @@ fn bound_shows(round: &Round, at_bound: bool, why: Why) -> Option<End> {
 /// look that cannot be made leaves the daemon as not ended.
 ///
 /// Each round reads the lock, the process, where it matters the process that the lock file names,
-/// and, where [`look_wanted`] says so, the endpoint; [`what_the_round_shows`] says what that is.
+/// and, where [`look_wanted`] says so, the endpoint, and, where [`successor_wanted`] says so, the
+/// process that the lock file names after it; [`what_the_round_shows`] says what that is.
 async fn wait_for_the_end(
     operations: &impl Operations,
     old: Option<&ProcessStartIdentity>,
@@ -2146,7 +2167,7 @@ async fn wait_for_the_end(
         } else {
             None
         };
-        let successor = if matches!(look, Some(Endpoint::Another)) {
+        let successor = if successor_wanted(look) {
             operations.named_daemon()
         } else {
             None
@@ -4705,7 +4726,9 @@ mod tests {
     /// The functions whose syntax the check reads: the decisions over the readings of a round and
     /// what is said from them, the look's label and the producers of its value, and the decisions
     /// that stand beside them.
-    const SCANNED: [&str; 20] = [
+    const SCANNED: [&str; 22] = [
+        "successor_wanted",
+        "marker_told",
         "what_the_round_shows",
         "the_endpoint_decides",
         "a_successor_by_the_endpoint",
@@ -6652,16 +6675,14 @@ mod tests {
         )
     }
 
-    /// The successors that the lock file can name after a look: for a look of another generation
-    /// its process (5000) and none (where the lock file cannot be read, as on Windows), and none
-    /// after any other look.
+    /// The successors that the lock file can name after a look: where [`successor_wanted`] says
+    /// that the round reads it, its process (5000) and none (where the lock file cannot be read,
+    /// as on Windows), and none after any other look.
     fn successors_after(look: Look) -> Vec<Option<u64>> {
-        match look {
-            Some(Endpoint::Another) => vec![Some(5000), None],
-            Some(
-                Endpoint::Nobody | Endpoint::Same(_) | Endpoint::Unproved(_) | Endpoint::Unclear,
-            )
-            | None => vec![None],
+        if successor_wanted(look) {
+            vec![Some(5000), None]
+        } else {
+            vec![None]
         }
     }
 
@@ -6885,6 +6906,8 @@ mod tests {
     struct Composed {
         round: Round,
         request: Request,
+        /// Whether the marker is told that the daemon took the stop, as [`marker_told`] says.
+        marked_told: bool,
         said: Said<AfterRequest>,
         text: String,
     }
@@ -6918,6 +6941,7 @@ mod tests {
                 .to_string();
                 rows.push(Composed {
                     round: round.clone(),
+                    marked_told: marker_told(&request),
                     request,
                     said,
                     text,
@@ -7085,6 +7109,11 @@ mod tests {
             };
             if row.said.stop != Knows::Ended && row.said.stop != own {
                 broke("P15 the stop member of an unfinished request");
+            }
+            // P16: the marker is told that the daemon took the stop for a request that was told, and
+            // for no other: where the request's own stop member is `told`, and only there.
+            if row.marked_told != (row.request.knows() == Knows::Told) {
+                broke("P16 the told write");
             }
             // P13: "could not show what holds it" only where the lock was read as held (the
             // environment's own lock) and neither the same daemon was proved nor its process read as
@@ -7280,6 +7309,18 @@ mod tests {
                 held_ended,
                 "maybe_asked",
                 Box::new(|row| row.said.stop = Knows::Told),
+            ),
+            (
+                "P16 ",
+                held_ended,
+                "maybe_asked",
+                Box::new(|row| row.marked_told = true),
+            ),
+            (
+                "P16 ",
+                held_ended,
+                "told",
+                Box::new(|row| row.marked_told = false),
             ),
         ];
         for (property, readings_line, request, doctor) in cases {
