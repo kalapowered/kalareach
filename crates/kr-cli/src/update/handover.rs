@@ -286,7 +286,9 @@ pub async fn install_lock(
         match store.try_lock_install() {
             Ok(Some(lock)) => return Ok(lock),
             Ok(None) if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                // The pause does not run past the wait's bound.
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                tokio::time::sleep(Duration::from_millis(20).min(left)).await;
             }
             Ok(None) => {
                 return Err(CliError::UpdateDeferred(shown!(
