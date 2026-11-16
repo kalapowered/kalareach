@@ -892,6 +892,28 @@ impl Controller {
         ))
     }
 
+    /// The footing of a request that arrived on a network connection: the revision the request was
+    /// admitted under and the latch of that connection's write boundary, which is the latch its
+    /// registration holds once the first boundary is built. It has no deadline, since a record
+    /// that a request finds outlives the window that admitted it.
+    ///
+    /// Reads nothing: every member is carried by the caller. The registration's own latch is not
+    /// read from the table, because a registration has none before its first boundary exists.
+    pub(crate) fn footing_of_a_network_request(
+        &self,
+        connection_id: ConnectionId,
+        admitted_revision: AuthorityRevision,
+        latch: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> super::footing::Footing {
+        super::footing::Footing::admitted(
+            Arc::clone(&self.copies),
+            connection_id,
+            admitted_revision,
+            Some(Arc::clone(latch)),
+            None,
+        )
+    }
+
     /// Records that a connection decides a request under `grant_id`, so that a revocation of it
     /// reaches this connection. Returns whether the connection is still registered: one that is
     /// not has been withdrawn and acts under nothing.

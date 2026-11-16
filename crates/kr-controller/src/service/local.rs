@@ -551,6 +551,16 @@ impl Controller {
         self.before_the_shares_lock.arm()
     }
 
+    /// Arms the pause the next frame written to a network connection stops at once the authority
+    /// feed's refusal has been read, before the standing it is asked at the stream. Returns the end
+    /// that says the frame has arrived, and the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_after_the_feed_is_read(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.after_the_feed_is_read.arm()
+    }
+
     /// Arms the pause the next admission check stops at before its last reading of the fence. Returns
     /// the end that says the check has arrived, and the end that lets it go. The pause fires once.
     #[cfg(feature = "testing")]

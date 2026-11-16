@@ -811,6 +811,12 @@ pub struct Controller {
     /// Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     before_the_shares_lock: ThreadPause,
+    /// Where this host's own tests stop a frame written to a network connection once the authority
+    /// feed's refusal has been read, which is the last read that takes a lock, and before the
+    /// standing the frame is asked at the stream, so that a fence, a withdrawal, a revision or the
+    /// grant's own end can come after the last wait. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    after_the_feed_is_read: ThreadPause,
     /// Where this host's own tests stop an admission check just before its last reading of the
     /// fence, which takes the fence's lock, so that the deadline can pass in that wait. Compiled
     /// away in every shipped build.
