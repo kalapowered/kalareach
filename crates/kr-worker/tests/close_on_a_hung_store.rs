@@ -878,8 +878,6 @@ const TURN_7_ENDED: &str =
     r#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-7"}}}"#;
 const TURN_8_STARTED: &str =
     r#"{"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-8"}}}"#;
-const TURN_8_ENDED: &str =
-    r#"{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-8"}}}"#;
 
 /// One gateway instance bound to the host's own broker, and the connection that its application's
 /// frames reach the broker by. What the host's evidence loop reads is what these frames change.
