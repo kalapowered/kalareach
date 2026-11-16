@@ -1504,8 +1504,11 @@ async fn a_living_presentation_waits_through_a_long_hold_and_is_answered() {
 
 /// A presentation with a frame behind its token is not taken for a peer that has gone.
 ///
-/// The frame sits unread in the worker's socket while the presentation waits, which is what the
-/// system reports as bytes waiting and not as an end.
+/// The frame is larger than 4 KiB and small enough for the connection to hold, so that on every
+/// platform some of it stays in the connection while the presentation waits and the worker reads
+/// none of it: a Windows pipe's runtime takes the first 4 KiB of what arrives into a buffer of its
+/// own, and a smaller frame would leave nothing for the system to count. What the system reports is
+/// bytes waiting, and not an end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_presentation_with_a_frame_behind_its_token_is_not_taken_for_gone() {
     let host = host(1).await;
@@ -1539,9 +1542,14 @@ async fn a_presentation_with_a_frame_behind_its_token_is_not_taken_for_gone() {
         .expect("sends the token");
     settle(|| service.presentations_waiting_for_tests() == 1).await;
     assert_eq!(service.presentations_waiting_for_tests(), 1);
-    link.send(&ControlFrame::Event(
-        kr_protocol::envelope::ControlEvent::Keepalive,
-    ))
+    let large =
+        kr_protocol::envelope::ParamsValue::from_typed(&"x".repeat(5 * 1024)).expect("encodes");
+    link.send(&ControlFrame::Request(kr_protocol::envelope::Request {
+        request_id: kr_protocol::ids::RequestId::new(7),
+        method: Method::SessionRead.into(),
+        method_version: kr_protocol::method::MethodVersion::V1,
+        params: large,
+    }))
     .await
     .expect("sends a frame behind the token");
 
