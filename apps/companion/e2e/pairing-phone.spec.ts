@@ -156,6 +156,10 @@ test('lists the paths of a pairing the managed relay could not take as text, ins
   const list = page.getByRole('list', { name: 'Until then:' })
   await expect(list.getByRole('listitem')).toHaveText(paths)
   await expect(list.locator('b, a')).toHaveCount(0)
+  // The list is named by "Until then:", and the words are not also a paragraph of their own: a screen
+  // reader that follows the tree says them once.
+  const tree = await page.getByTestId('failure-alternatives').ariaSnapshot()
+  expect(tree.match(/Until then:/g)).toHaveLength(1)
   await page.locator('.pairing-column').screenshot({ path: shot('relay-capacity-largest') })
   expect(await overrunning(page, '.pairing-column'), 'nothing runs past the screen').toEqual([])
 })
