@@ -215,7 +215,7 @@ const SERVICE_REFUSED_REVOCATION_OWED_PAGE: &str = "The account service did not 
 /// Whose token a failed revocation was of, in each place that ends a token it does not keep: the
 /// words of the line begin with them.
 const WITHHELD: &str = "a withheld sign-in's";
-const REFUSED: &str = "a refused sign-in's";
+const CALL_OPEN: &str = "a call-open sign-in's";
 const UNKEPT: &str = "an unkept sign-in's";
 const REFUSED_EXCHANGE: &str = "a refused exchange's";
 
@@ -1717,7 +1717,7 @@ impl Inner {
                     // sign-in's is, queued before it is sent, and the browser is told of a
                     // revocation that is still owed as it is there.
                     let (commit, unrevoked) = held.signed_in.end_withheld(refresh).await;
-                    say_failed_revocation(REFUSED, unrevoked.as_ref());
+                    say_failed_revocation(CALL_OPEN, unrevoked.as_ref());
                     return Outcome::call_open(commit);
                 };
                 // The sign-in waited for the person, up to the end of its time, and the authority

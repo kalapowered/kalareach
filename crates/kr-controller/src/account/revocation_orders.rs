@@ -19,7 +19,7 @@ use kr_client::services::account::{
 use kr_crypto::store::{MemoryStore, SecretName, SecretStore};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 
-use super::{REFUSED, REFUSED_EXCHANGE, UNKEPT, WITHHELD, failed_revocation_line};
+use super::{CALL_OPEN, REFUSED_EXCHANGE, UNKEPT, WITHHELD, failed_revocation_line};
 
 /// What the store does with the next write of the revocation queue (a set or a delete).
 #[derive(Clone, Copy)]
@@ -500,7 +500,7 @@ async fn each_place_that_ends_a_token_words_its_line_with_its_own_first_words() 
     );
     for (whose, first_words) in [
         (WITHHELD, "kr-controller: a withheld sign-in's"),
-        (REFUSED, "kr-controller: a refused sign-in's"),
+        (CALL_OPEN, "kr-controller: a call-open sign-in's"),
         (UNKEPT, "kr-controller: an unkept sign-in's"),
         (REFUSED_EXCHANGE, "kr-controller: a refused exchange's"),
     ] {
