@@ -1132,7 +1132,14 @@ pub fn open_store(service: &str, fallback_directory: &Path) -> Result<OpenedStor
     if !FILE_FALLBACK_SUPPORTED {
         // There is no fallback on this platform, so there is nothing to record and nothing to
         // choose between: the protected store is the only store.
-        let store = PlatformStore::open(service)?;
+        let store = PlatformStore::open(service).map_err(|error| CryptoError::SecretStore {
+            message: format!(
+                "This host keeps its keys in {PLATFORM_STORE_NAME}, which cannot be opened from \
+                 here: {}. Start the host from a session where it opens. No key was made or \
+                 changed.",
+                message_of(&error)
+            ),
+        })?;
         return Ok(OpenedStore {
             store: Box::new(store),
             kind: StoreKind::Platform,
@@ -1152,7 +1159,10 @@ pub fn open_store(service: &str, fallback_directory: &Path) -> Result<OpenedStor
             // falling back would start from an empty store while the secrets still exist.
             let store = platform.map_err(|error| CryptoError::SecretStore {
                 message: format!(
-                    "this host recorded the platform credential store, which is now unavailable: {error}"
+                    "This host keeps its keys in the system credential store, which cannot be \
+                     opened from here: {}. Start the host from a session where that store opens, \
+                     such as your desktop session. No key was made or changed.",
+                    message_of(&error)
                 ),
             })?;
             Ok(OpenedStore {
@@ -1191,11 +1201,35 @@ pub fn open_store(service: &str, fallback_directory: &Path) -> Result<OpenedStor
                 }
                 Err(fallback_error) => Err(CryptoError::SecretStore {
                     message: format!(
-                        "no platform store ({platform_error}) and no fallback ({fallback_error})"
+                        "This host has nowhere to keep its keys. The system credential store \
+                         cannot be opened from here ({}), and the directory {} cannot be used \
+                         ({}). Make that directory usable, or start the host from a session where \
+                         the system credential store opens. No key was made.",
+                        message_of(&platform_error),
+                        fallback_directory.display(),
+                        message_of(&fallback_error)
                     ),
                 }),
             },
         },
+    }
+}
+
+/// What a platform where section 10 offers no fallback calls its protected store, for the words
+/// that say it cannot be opened.
+const PLATFORM_STORE_NAME: &str = if cfg!(any(target_os = "macos", target_os = "ios")) {
+    "the Keychain"
+} else if cfg!(windows) {
+    "the Credential Manager"
+} else {
+    "the system credential store"
+};
+
+/// The store's own words for why it failed, without the prefix every [`CryptoError`] carries.
+fn message_of(error: &CryptoError) -> String {
+    match error {
+        CryptoError::SecretStore { message } => message.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -2597,7 +2631,8 @@ mod tests {
                     );
                 }
                 None => {
-                    assert!(opened.is_err(), "{row}: the start is refused");
+                    let refusal = opened.expect_err(&format!("{row}: the start is refused"));
+                    assert_refusal_says_what_it_knows(&refusal.to_string());
                     assert!(!fallback_holds_secrets(&base).expect("a read"), "{row}");
                 }
             }
@@ -2633,7 +2668,48 @@ mod tests {
 
         switch.closes();
         let refused = StoreSelection::Platform.open(SELECTION_SERVICE, &base);
-        assert!(refused.is_err(), "no other store is taken");
+        let refusal = refused.expect_err("no other store is taken");
+        assert_refusal_says_what_it_knows(&refusal.to_string());
         assert!(!base.exists(), "nothing is made on disk");
+    }
+
+    /// A refusal names the store's own reason and says that no key was made, which is what the
+    /// code knows of a store it could not open.
+    fn assert_refusal_says_what_it_knows(refusal: &str) {
+        assert!(
+            refusal.contains("the stand-in is closed"),
+            "the store's own reason is in the refusal: {refusal}"
+        );
+        assert!(
+            refusal.contains("No key was made"),
+            "the refusal says that no key was made: {refusal}"
+        );
+    }
+
+    /// KR-REQ-10.47: a host with no record, whose platform store does not open and whose directory
+    /// cannot be used, has nowhere to keep its keys: the start is refused, the directory and the
+    /// store's reason are named, and nothing is made.
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+    ))]
+    #[test]
+    fn a_host_with_nowhere_to_keep_its_keys_is_refused_and_names_what_failed() {
+        let switch = stand_in::Switch::take(SELECTION_SERVICE);
+        let target = scratch_directory("selection-nowhere-target");
+        std::fs::create_dir_all(&target).expect("a target");
+        let base = scratch_directory("selection-nowhere");
+        std::os::unix::fs::symlink(&target, &base).expect("a link in the directory's place");
+        switch.closes();
+
+        let refusal = StoreSelection::Platform
+            .open(SELECTION_SERVICE, &base)
+            .expect_err("a directory that is a link is not used")
+            .to_string();
+        assert!(refusal.contains(&base.display().to_string()), "{refusal}");
+        assert_refusal_says_what_it_knows(&refusal);
+        assert!(!fallback_holds_secrets(&target).expect("a read"));
+        let _ = std::fs::remove_file(&base);
+        let _ = std::fs::remove_dir_all(&target);
     }
 }
