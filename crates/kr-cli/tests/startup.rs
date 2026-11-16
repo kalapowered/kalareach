@@ -5666,6 +5666,9 @@ struct TestDaemon {
     received: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     release: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// When the daemon left its accept loop, so that it listens no more: taken before the listener
+    /// is let go, so that whatever sees the endpoint vacant sees it after this instant.
+    stopped_listening: std::sync::Arc<std::sync::Mutex<Option<Instant>>>,
     thread: Option<std::thread::JoinHandle<()>>,
     socket: PathBuf,
 }
@@ -5693,7 +5696,13 @@ impl TestDaemon {
         let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (heard, released, over) = (received.clone(), release.clone(), ended.clone());
+        let stopped_listening = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let (heard, released, over, stopped) = (
+            received.clone(),
+            release.clone(),
+            ended.clone(),
+            stopped_listening.clone(),
+        );
         let build = build.to_owned();
         let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
         let boot_epoch = kr_ipc::identity::boot_epoch(&boot).expect("a boot epoch");
@@ -5731,6 +5740,7 @@ impl TestDaemon {
                     if over.load(std::sync::atomic::Ordering::SeqCst)
                         || lingers_until.is_some_and(|until| Instant::now() >= until)
                     {
+                        *stopped.lock().expect("the instant") = Some(Instant::now());
                         break;
                     }
                     let accepted =
@@ -5911,6 +5921,7 @@ impl TestDaemon {
             received,
             release,
             ended,
+            stopped_listening,
             thread: Some(thread),
             socket,
         }
@@ -5936,6 +5947,11 @@ impl TestDaemon {
 
     fn received(&self) -> Vec<String> {
         self.received.lock().expect("the record").clone()
+    }
+
+    /// The instant the daemon stopped listening, where it has.
+    fn stopped_listening_at(&self) -> Option<Instant> {
+        *self.stopped_listening.lock().expect("the instant")
     }
 
     /// Lets a held stop be answered.
@@ -6725,9 +6741,13 @@ fn the_end_of_a_daemon_that_closed_before_the_request_says_that_nothing_was_sent
 /// KR-REQ-07.12 (a request that could not be made after a closed connection): a daemon that
 /// answers the look, closes the connection and goes on answering for a second before it stops
 /// listening is waited for to its end, with no look at the endpoint that would find it still
-/// answering and give up at once. The result is the end's: exit 0 and `ended`. A command that
-/// composed its request before it saw the close asked a daemon that had closed, and waits for the
-/// end of a daemon that may have taken the stop; the result is the same.
+/// answering and give up at once. The result is the end's: exit 0 and the text of the end of a
+/// request that was never made. Two events show what the case holds. The first is the sentence,
+/// which is the unmade request's own: it names why the request could not be made and says that the
+/// command sent nothing, and the line that says a request was asked, which a command that composed
+/// its request before it saw the close prints on the error stream, is not there. The second is the
+/// daemon's own record that it stopped listening before the command ended: a command that took a
+/// daemon that still answers for one that had ended would end while the daemon listened.
 #[test]
 fn a_request_that_could_not_be_made_after_a_closed_connection_waits_for_the_daemons_end() {
     let host = Standalone::create();
@@ -6737,11 +6757,31 @@ fn a_request_that_could_not_be_made_after_a_closed_connection_waits_for_the_daem
         OnStop::CloseAndEndAfterASecond,
         true,
     );
-    let output = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
-    let said = document(&output, "kr host stop");
-    assert_eq!(output.status.code(), Some(0), "{said}");
-    assert_eq!(stop_of(&said), "ended", "{said}");
-    assert!(said["unsettled"].is_null(), "{said}");
+    let output = start(host.kr(&["host", "stop"])).finish("kr host stop");
+    let ended_at = Instant::now();
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{out}");
+    assert!(
+        out.starts_with("The control daemon for environment "),
+        "{out}"
+    );
+    assert!(
+        out.contains(" ended, and this command could not make its request for it: "),
+        "{out}"
+    );
+    assert!(
+        out.trim_end().ends_with("This command sent nothing."),
+        "{out}"
+    );
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(!said.contains("Asked the control daemon"), "{said}");
+    let stopped_at = daemon
+        .stopped_listening_at()
+        .unwrap_or_else(|| panic!("the command ended while the daemon still listened: {out}"));
+    assert!(
+        ended_at >= stopped_at,
+        "the command ended before the daemon stopped listening: {out}"
+    );
     assert!(attempts(&host).is_empty(), "no record stands");
     daemon.end();
 }
