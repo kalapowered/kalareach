@@ -964,10 +964,19 @@ final class LinkTapTests: HarnessTestCase {
             }
         }
         say("LINKLOOK \(named): stacked links sweep: \(taps) taps, \(other) at which the click named another link than the nearest words")
-        // The border: where the middle column's opened link first changes from one link to the next, or the middle of the gap.
+        // The border: where the middle column's opened link first changes from one link to the next, found to within a fraction
+        // of a point by halving the step that holds the change; or the middle of the gap between the two links' lines.
         var border = (top.maxY + bottom.minY) / 2
         for (before, after) in zip(owners, owners.dropFirst()) where before.name != nil && after.name != nil && before.name != after.name {
-            border = (before.y + after.y) / 2
+            var low = before.y
+            var high = after.y
+            for halving in 0..<5 {
+                let y = (low + high) / 2
+                let what = "\(named): stacked links, halving \(halving + 1) of 5 between \(String(format: "%.2f", Double(low))) and \(String(format: "%.2f", Double(high)))"
+                let result = tap(what, at: CGPoint(x: middle, y: y), shift: shift, within: 4)
+                if judge(result, among: all, what: what).opens == before.name { low = y } else { high = y }
+            }
+            border = (low + high) / 2
             break
         }
         var walk: [String] = []
