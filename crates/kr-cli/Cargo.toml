@@ -130,6 +130,8 @@ tempfile.workspace = true
 kr-service-stand-in = { path = "../../tests/support/service-stand-in" }
 # The stored-format checks read the types a store keeps from their definitions in the source.
 syn.workspace = true
+# The stop's tables walk every value of a set, and a count of the variants shows that each walk does.
+strum.workspace = true
 # The upgrade suite's device pairs with an installed host's daemon over the network on the loopback
 # interface, and connects to it, as a phone does.
 iroh.workspace = true
