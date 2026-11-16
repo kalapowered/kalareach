@@ -174,17 +174,18 @@ pub const LATER_CONNECTION_HOLDS_AUTHORITY: &str =
 /// bound is the attachment limit with room to reconnect rather than the attachment limit exactly.
 pub const MAX_CONNECTIONS: usize = kr_protocol::limits::MAX_CONCURRENT_ATTACHMENTS * 2;
 
-/// How long a presentation that finds the dispatch boundary held waits, with no release to wake
-/// it, before it asks whether its peer has gone and tries again the first time. Each wait after it
-/// is twice the one before, up to [`PRESENTATION_RETRY_CAP`].
-const PRESENTATION_FIRST_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
+/// How long a request that finds the dispatch boundary held (a presentation, a mutation, a
+/// prepared action's second pass) waits, with no release to wake it, before it asks whether its
+/// peer has gone and tries again the first time. Each wait after it is twice the one before, up to
+/// [`BOUNDARY_RETRY_CAP`].
+const BOUNDARY_FIRST_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
 
-/// The longest a presentation waits, with no release to wake it, between two tries for the
+/// The longest such a request waits, with no release to wake it, between two tries for the
 /// dispatch boundary.
 ///
-/// It is the longest, after its peer has gone, that a presentation keeps its connection when the
+/// It is the longest, after its peer has gone, that a request keeps its connection when the
 /// boundary is held throughout, apart from the time the system takes to run its task.
-const PRESENTATION_RETRY_CAP: std::time::Duration = std::time::Duration::from_millis(250);
+const BOUNDARY_RETRY_CAP: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// How many roles a connection can declare, which is how many counts of presentations begun a
 /// host keeps for its own tests.
@@ -747,13 +748,13 @@ impl Drop for DispatchGuard<'_> {
     }
 }
 
-/// What one try of a presentation came to.
-enum Presentation {
-    /// The boundary was free, and the token was decided under it.
-    Decided(ControlFrame),
+/// What one try of a request that waits for the dispatch boundary came to.
+enum Tried<T> {
+    /// The boundary was free, and the request was dealt with under it.
+    Done(T),
     /// The boundary is held and the peer is there: try again after a pause.
     Held,
-    /// The peer has gone, and nothing was decided for it.
+    /// The peer has gone, and nothing was done for it.
     PeerGone,
 }
 
@@ -3026,7 +3027,7 @@ impl WorkerService {
                         }
                         PeerState::Quiet => {
                             state.answering_held = ready.pending.caller.gate_restrictions.is_some();
-                            Some(self.dispatch_prepared(&mut state, *ready))
+                            self.dispatch_prepared(&mut state, *ready).await
                         }
                     }
                 }
@@ -3045,9 +3046,16 @@ impl WorkerService {
                         continue;
                     }
                     state.answering_held = ready.pending.caller.gate_restrictions.is_some();
-                    Some(self.dispatch_prepared(&mut state, *ready))
+                    self.dispatch_prepared(&mut state, *ready).await
                 }
             };
+            // A request that waited for the boundary found its peer gone. Nothing was done for it,
+            // and nothing behind it is served: not a frame already read ahead of it, nor one an
+            // overtaking reader held back. A key the peer sent behind a dropped mutation never
+            // reaches the input domain. The clean-up below ends what the connection holds.
+            if state.ended {
+                break;
+            }
             let answered_held = state.answering_held;
             // An accepted action to be prepared is prepared on a task of its own, for the reason a
             // launch and an upstream operation are answered on one: this socket carries the same
@@ -3793,6 +3801,7 @@ impl WorkerService {
                 #[cfg(feature = "testing")]
                 self.record_received(&mutation.method, &mutation.params);
                 let caller = Caller::local(state.facts.actor_id.clone());
+                // No reply when the peer has gone while the request waited for the boundary.
                 let reply = self
                     .mutation(
                         state,
@@ -3801,14 +3810,14 @@ impl WorkerService {
                         Freshness::Window(self.clock.now()),
                         false,
                     )
-                    .await;
+                    .await?;
                 // A launch the reader is deciding and an operation the upstream has not answered
                 // both have no answer yet, and this request is written when one of them does.
                 (state.pending_launch.is_none() && state.pending_upstream.is_none())
                     .then_some(reply)
             }
             ControlFrame::Forwarded(forwarded) => {
-                let reply = self.forwarded(state, &forwarded).await;
+                let reply = self.forwarded(state, &forwarded).await?;
                 (state.pending_launch.is_none() && state.pending_upstream.is_none())
                     .then_some(reply)
             }
@@ -4777,26 +4786,60 @@ impl WorkerService {
         let waiting = PresentationWaiting::begin(
             &self.presentations_waiting[presentation_role_slot(state.facts.controller_role)],
         );
-        let mut pause = PRESENTATION_FIRST_RETRY;
-        let decided = loop {
-            // Created before the try, so that a release between the try and the wait wakes it.
+        let decided = self
+            .wait_for_the_boundary(|| self.present_once(state, &nonce, token))
+            .await;
+        #[cfg(feature = "testing")]
+        drop(waiting);
+        decided
+    }
+
+    /// Waits for the dispatch boundary by trying for it, for as long as the peer is there to be
+    /// answered, and returns what `once` made of the try that took it, or nothing when the peer
+    /// has gone.
+    ///
+    /// Each failed try asks the system whether the peer has gone, in `once`, and the wait that
+    /// follows is cut short by the boundary's release. It holds no thread and no lock: a task that
+    /// waits is a timer on the connection's own task. The `Notified` is created before each try, so
+    /// a release between the try and the wait is not missed.
+    async fn wait_for_the_boundary<T>(&self, mut once: impl FnMut() -> Tried<T>) -> Option<T> {
+        let mut pause = BOUNDARY_FIRST_RETRY;
+        loop {
             let released = self.dispatch.released();
             tokio::pin!(released);
-            match self.present_once(state, &nonce, token) {
-                Presentation::Decided(answer) => break Some(answer),
-                Presentation::PeerGone => break None,
-                Presentation::Held => {}
+            match once() {
+                Tried::Done(done) => return Some(done),
+                Tried::PeerGone => return None,
+                Tried::Held => {}
             }
             tokio::select! {
                 () = &mut released => {}
                 () = tokio::time::sleep(pause) => {
-                    pause = (pause * 2).min(PRESENTATION_RETRY_CAP);
+                    pause = (pause * 2).min(BOUNDARY_RETRY_CAP);
                 }
             }
-        };
-        #[cfg(feature = "testing")]
-        drop(waiting);
-        decided
+        }
+    }
+
+    /// Takes the dispatch boundary when nobody holds it, and never waits.
+    fn try_boundary(&self) -> Option<DispatchGuard<'_>> {
+        match self.dispatch.try_lock() {
+            Ok(barrier) => Some(barrier),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                panic!("the dispatch barrier is not poisoned")
+            }
+        }
+    }
+
+    /// What a try that found the boundary held comes to: the peer has gone, or it is there and the
+    /// request waits.
+    fn after_a_failed_try<T>(state: &ConnectionState) -> Tried<T> {
+        if state.peer_has_gone() {
+            Tried::PeerGone
+        } else {
+            Tried::Held
+        }
     }
 
     /// One try of a presentation: takes the dispatch boundary when it is free and decides the
@@ -4807,22 +4850,12 @@ impl WorkerService {
         state: &mut ConnectionState,
         nonce: &Nonce256,
         token: &kr_protocol::worker::ControllerGenerationToken,
-    ) -> Presentation {
-        let _barrier = match self.dispatch.try_lock() {
-            Ok(barrier) => barrier,
-            Err(std::sync::TryLockError::WouldBlock) => {
-                #[cfg(feature = "testing")]
-                self.presentation_tries
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                return if state.peer_has_gone() {
-                    Presentation::PeerGone
-                } else {
-                    Presentation::Held
-                };
-            }
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                panic!("the dispatch barrier is not poisoned")
-            }
+    ) -> Tried<ControlFrame> {
+        let Some(_barrier) = self.try_boundary() else {
+            #[cfg(feature = "testing")]
+            self.presentation_tries
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Self::after_a_failed_try(state);
         };
         // Only the decision can wait, for the authority record and for the journal, so only it
         // leaves the executor: a try that finds the boundary held asks the system and returns.
@@ -4834,9 +4867,67 @@ impl WorkerService {
             // This narrows the window and cannot close it, since a peer can go at any time after
             // the question.
             if state.peer_has_gone() {
-                return Presentation::PeerGone;
+                return Tried::PeerGone;
             }
-            Presentation::Decided(self.accept_generation(state, nonce, token))
+            Tried::Done(self.accept_generation(state, nonce, token))
+        })
+    }
+
+    /// One try of a mutation: takes the dispatch boundary when it is free and deals with the
+    /// request under it, and otherwise asks whether the peer has gone. It holds nothing when it
+    /// returns.
+    fn receipt_once(
+        &self,
+        state: &mut ConnectionState,
+        mutation: &MutationRequest,
+        method: Method,
+        entry: &'static kr_protocol::authority::MethodEntry,
+        caller: &Caller,
+        freshness: Freshness,
+    ) -> Tried<Result<Answered>> {
+        let Some(_barrier) = self.try_boundary() else {
+            return Self::after_a_failed_try(state);
+        };
+        // The wait for the session and the commits are the body's, so only the body leaves the
+        // executor.
+        off_the_executor(|| {
+            // Asked again now that the boundary is held, before anything is read or written for
+            // this request: a peer that went since the last try is not answered, and no receipt,
+            // effect or answer is made for it. This narrows the window and cannot close it, since
+            // a peer can go at any time after the question.
+            if state.peer_has_gone() {
+                return Tried::PeerGone;
+            }
+            Tried::Done(self.receipted(state, mutation, method, entry, caller, freshness))
+        })
+    }
+
+    /// One try of a prepared action's second pass: takes the dispatch boundary when it is free and
+    /// finishes the action under it, and otherwise asks whether the peer has gone. It holds nothing
+    /// when it returns, and takes the action out of `ready` only when it finishes it.
+    fn prepared_once(
+        &self,
+        state: &mut ConnectionState,
+        ready: &mut Option<ReadyPreparation>,
+    ) -> Tried<(PendingPreparation, Result<Answered>)> {
+        let Some(_barrier) = self.try_boundary() else {
+            return Self::after_a_failed_try(state);
+        };
+        off_the_executor(|| {
+            // Asked again now that the boundary is held, before the action's receipt is read or
+            // changed: a peer that went since the last try is not answered, and the action is
+            // rejected by the caller of this try, not dispatched.
+            if state.peer_has_gone() {
+                return Tried::PeerGone;
+            }
+            let ReadyPreparation {
+                pending,
+                preparation,
+            } = ready
+                .take()
+                .expect("an action is held until it is finished");
+            let finished = self.continue_prepared(state, &pending, preparation);
+            Tried::Done((pending, finished))
         })
     }
 
@@ -6069,26 +6160,28 @@ impl WorkerService {
         caller: &Caller,
         freshness: Freshness,
         forwarded: bool,
-    ) -> ControlFrame {
+    ) -> Option<ControlFrame> {
         if let Some(local) = state.facts.local.as_ref() {
             local.free_request(mutation.request_id);
         }
         if !state.facts.negotiated {
-            return failure(mutation.request_id, &not_negotiated());
+            return Some(failure(mutation.request_id, &not_negotiated()));
         }
         if let Err(error) = self.check_authority(&state.facts) {
-            return failure(mutation.request_id, &error.to_protocol_error());
+            return Some(failure(mutation.request_id, &error.to_protocol_error()));
         }
         let Some(method) = mutation.method.method() else {
-            return failure(mutation.request_id, &unlisted());
+            return Some(failure(mutation.request_id, &unlisted()));
         };
         let Some(entry) = Self::entry(method, mutation.method_version, caller.ingress) else {
-            return failure(mutation.request_id, &unlisted());
+            return Some(failure(mutation.request_id, &unlisted()));
         };
         let restrictions = self.gate.restrictions();
         let allowed = match self.check_local_hold(&state.facts, method) {
             Ok(allowed) => allowed,
-            Err(error) => return failure(mutation.request_id, &error.to_protocol_error()),
+            Err(error) => {
+                return Some(failure(mutation.request_id, &error.to_protocol_error()));
+            }
         };
         let bounded = Self::bound_by_lease(caller, allowed, restrictions);
         let caller = bounded.as_ref().unwrap_or(caller);
@@ -6098,12 +6191,22 @@ impl WorkerService {
         {
             local.hold_request(mutation.request_id);
         }
-        // The marker, the effect and the outcome are commits, and the wait for the dispatch
-        // barrier and the session is for whatever else holds them. A thread that is in either is
-        // not one the recogniser's timer, or any other task, can be run on.
-        let dispatched =
-            off_the_executor(|| self.receipted(state, mutation, method, entry, caller, freshness));
-        self.answered(state, mutation, caller, forwarded, dispatched)
+        // The wait for the dispatch boundary is made of tries, so a request whose peer has gone
+        // leaves it at once. The marker, the effect and the outcome are commits, and the wait for
+        // the session is for whatever else holds it: a thread that is in it is not one the
+        // recogniser's timer, or any other task, can be run on.
+        self.wait_before_the_boundary();
+        let Some(dispatched) = self
+            .wait_for_the_boundary(|| {
+                self.receipt_once(state, mutation, method, entry, caller, freshness)
+            })
+            .await
+        else {
+            // No receipt, no effect and no answer: the connection ends.
+            state.ended = true;
+            return None;
+        };
+        Some(self.answered(state, mutation, caller, forwarded, dispatched))
     }
 
     /// Turns what a mutation came to into the frame that answers its request.
@@ -6237,26 +6340,37 @@ impl WorkerService {
 
     /// Finishes an accepted action whose effect has been prepared: the revalidation inside the
     /// boundary, the dispatch marker and the effect, as for any action, and then the answer.
-    fn dispatch_prepared(
+    ///
+    /// The wait for the boundary is made of tries, and a peer that has gone ends it: the action is
+    /// rejected and not dispatched, the connection ends, and there is no answer. The result is
+    /// then `None`.
+    async fn dispatch_prepared(
         &self,
         state: &mut ConnectionState,
         ready: ReadyPreparation,
-    ) -> ControlFrame {
-        let ReadyPreparation {
-            pending,
-            preparation,
-        } = ready;
-        let dispatched = off_the_executor(|| self.continue_prepared(state, &pending, preparation));
-        self.answered(
+    ) -> Option<ControlFrame> {
+        let mut held = Some(ready);
+        let finished = self
+            .wait_for_the_boundary(|| self.prepared_once(state, &mut held))
+            .await;
+        let Some((pending, dispatched)) = finished else {
+            if let Some(ready) = held.take() {
+                self.abandon_prepared(ready);
+            }
+            state.ended = true;
+            return None;
+        };
+        Some(self.answered(
             state,
             &pending.mutation,
             &pending.caller,
             pending.forwarded,
             dispatched,
-        )
+        ))
     }
 
-    /// The second pass of an action that was accepted and prepared.
+    /// The second pass of an action that was accepted and prepared, inside the dispatch boundary,
+    /// which the caller holds.
     ///
     /// Everything the first pass checked is checked again, now, inside the boundary. First what
     /// the connection holds: the authority it was admitted under. Then the action's own receipt,
@@ -6283,10 +6397,6 @@ impl WorkerService {
                 "this action's method is not one this worker serves".to_owned(),
             )
         })?;
-        let _barrier = self
-            .dispatch
-            .lock()
-            .expect("the dispatch barrier is not poisoned");
         self.wait_inside_boundary();
         self.revalidate_time();
         if let Err(error) = self.check_authority(&state.facts) {
@@ -6787,7 +6897,7 @@ impl WorkerService {
         &self,
         state: &mut ConnectionState,
         forwarded: &kr_protocol::local::ForwardedMutation,
-    ) -> ControlFrame {
+    ) -> Option<ControlFrame> {
         // The daemon's deadline is on the machine's own continuous clock, which this worker reads
         // too, so what is left of it is a subtraction rather than a guess: the journey cost
         // whatever it cost, and the deadline does not restart on arrival. It is anchored first, before
@@ -6813,13 +6923,13 @@ impl WorkerService {
         #[cfg(feature = "testing")]
         self.record_received(&forwarded.mutation.method, &forwarded.mutation.params);
         if state.facts.client_kind != LocalClientKind::Controller {
-            return failure(
+            return Some(failure(
                 forwarded.mutation.request_id,
                 &ProtocolError::new(
                     ErrorCode::PermissionDenied,
                     "only the control daemon forwards an admitted mutation",
                 ),
-            );
+            ));
         }
         // The daemon vouches for where the caller entered the host, and the registry decides which
         // ingress may reach which method. A paired device is the one remote ingress a worker
@@ -6828,20 +6938,20 @@ impl WorkerService {
         // not something this endpoint admits at all. A workflow is admitted for one method, the
         // close of the session its run started, and for nothing else.
         if let Some(refusal) = self.workflow_ingress_refusal(state, forwarded) {
-            return failure(forwarded.mutation.request_id, &refusal);
+            return Some(failure(forwarded.mutation.request_id, &refusal));
         }
         // A device envelope names the device, which is what makes the receipt attributable. One
         // that does not is malformed rather than merely unusual.
         if forwarded.actor.ingress == ActorIngress::PairedDevice
             && !forwarded.actor.device_id.is_present()
         {
-            return failure(
+            return Some(failure(
                 forwarded.mutation.request_id,
                 &ProtocolError::new(
                     ErrorCode::PermissionDenied,
                     "a paired-device envelope names the device it acts for",
                 ),
-            );
+            ));
         }
         // The marker travels to a proxy and nowhere else. A proxy forwards for somebody whose
         // receipts are not its own, which is what makes passing a retained result on a read. The
@@ -6943,6 +7053,11 @@ impl WorkerService {
         }
     }
 
+    /// Admits a mutation and carries it out, inside the dispatch boundary, which the caller holds.
+    ///
+    /// Everything from here to the recorded outcome happens inside the barrier. The authority this
+    /// request was admitted under cannot change underneath it, and two mutations cannot interleave
+    /// their checks with each other's effects.
     fn receipted(
         &self,
         state: &mut ConnectionState,
@@ -6953,14 +7068,6 @@ impl WorkerService {
         freshness: Freshness,
     ) -> Result<Answered> {
         let actor_id = caller.actor_id.clone();
-        self.wait_before_the_boundary();
-        // Everything from here to the recorded outcome happens inside the barrier. The authority
-        // this request was admitted under cannot change underneath it, and two mutations cannot
-        // interleave their checks with each other's effects.
-        let _barrier = self
-            .dispatch
-            .lock()
-            .expect("the dispatch barrier is not poisoned");
         self.wait_inside_boundary();
         // Section 9's time contract, before anything whose answer depends on an expiry. A wake, a
         // reboot or a step of the wall clock is revalidated here, on this mutation's own way
@@ -11280,6 +11387,9 @@ pub struct ConnectionState {
     /// This connection's own writer, which the wait for the dispatch boundary asks whether the
     /// peer has gone: the operating system answers through it, and nothing is read.
     pub(crate) peer_watch: Option<Arc<Mutex<kr_ipc::framed::FrameWriter>>>,
+    /// Set when a request that waited for the dispatch boundary found its peer gone and was dropped:
+    /// the connection's loop ends at once, before it serves anything behind that request.
+    pub(crate) ended: bool,
     /// What binding the caller to this session came to, for the mutation being dispatched now.
     ///
     /// Asking the kernel who the caller is takes as long as the kernel takes, so it is done before
@@ -11342,12 +11452,14 @@ impl ConnectionState {
                 .pid
                 .and_then(|pid| kr_ipc::identity::process_start_identity(pid).ok()),
             peer_watch: None,
+            ended: false,
             binding: None,
             next_request: 0,
         }
     }
 
-    /// Whether the operating system says the peer of this connection has gone.
+    /// Whether the operating system says the peer of this connection has gone: it has closed, or
+    /// ended what it sends and left nothing unread, or on Unix has hung up beside bytes it left.
     ///
     /// Nothing is read and nothing waits. A connection with no watch has no peer to ask, and its
     /// peer is taken as there.
