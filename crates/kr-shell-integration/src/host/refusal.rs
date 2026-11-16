@@ -96,9 +96,9 @@ pub enum Refusal {
     /// PowerShell, which was found, did not say where its profiles are: it did not answer in time,
     /// could not start or ended with an error.
     ProfilesUnanswered,
-    /// PowerShell, which was found, ended without saying where its profiles are, or said something
-    /// other than two full paths: nothing, a different number of lines, a line that does not decode
-    /// to text, an answer longer than the limit, or a path that is not full.
+    /// PowerShell, which was found, ended with code 0 and an answer that is too long, or that is
+    /// not two full paths in the form this host asked for: nothing, a different number of lines, a
+    /// line that does not decode to text, or a path that is not full.
     ProfilesNotUnderstood,
 }
 
@@ -247,9 +247,9 @@ impl fmt::Display for Refusal {
                  not start or ended with an error, so nothing was written for PowerShell",
             ),
             Self::ProfilesNotUnderstood => formatter.write_str(
-                "PowerShell's answer about where its profiles are was not understood: it ended \
-                 without an answer or said something other than two full paths, so nothing was \
-                 written for PowerShell",
+                "PowerShell's answer about where its profiles are was not understood: it was too \
+                 long, or it was not two full paths in the form that this host asked for, so \
+                 nothing was written for PowerShell",
             ),
             _ => Ok(()),
         }
