@@ -818,7 +818,9 @@ impl FrameSink for Arc<Recording> {
 }
 
 /// The record of the paired device a grant was issued to.
-pub(super) fn record_for(grant: &kr_protocol::grant::Grant) -> crate::service::net::devices::DeviceRecord {
+pub(super) fn record_for(
+    grant: &kr_protocol::grant::Grant,
+) -> crate::service::net::devices::DeviceRecord {
     crate::service::net::devices::DeviceRecord {
         device_id: grant.recipient_device_id,
         endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes([7; 32]),

@@ -2,10 +2,12 @@
 //!
 //! A kept answer, and a conflict that names a reused identifier, are read from a record and go only
 //! while the standing their request was admitted under holds. The writer reads the authority
-//! feed's refusal last among the reads that take a lock, and then asks, once and with no lock, the
-//! request's footing, the bounds the answer is written under and the grant's own end. Each case
-//! stops the writer where the feed has been read and before that question, ends the standing there,
-//! and finds that none of the answer was handed to the stream.
+//! feed's refusal last among the reads that take a lock, copies the cells of the bounds the answer
+//! is written under, and then asks, once and with no lock, those bounds by their copies, the
+//! request's footing, and last the grant's own end. Each case stops the writer where the feed has
+//! been read and the cells copied, before that question, ends the standing there, and finds that
+//! none of the answer was handed to the stream; the cases of a lease's bound find that it is
+//! judged by its copy.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
