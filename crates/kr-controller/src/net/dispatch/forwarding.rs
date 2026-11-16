@@ -517,7 +517,7 @@ impl RemoteConnection {
             // fence, or whose registration was withdrawn or replaced while the record was read, is
             // told that the outcome is not shown.
             Err(error @ ControllerError::SessionClosed { .. }) => {
-                *asked = Some(decided.clone().kept(validated));
+                *asked = Some(decided.clone().kept(self.footing_of(validated)));
                 if self.admitted_to_answer(validated).is_err() {
                     return Err(outcome_not_shown());
                 }
@@ -634,7 +634,7 @@ impl RemoteConnection {
                     // already held. It goes through the check every answer read from a record goes
                     // through first: a fence this host owes, or a registration withdrawn or
                     // replaced while the worker looked, stops it.
-                    *asked = Some(decided.clone().kept(validated));
+                    *asked = Some(decided.clone().kept(self.footing_of(validated)));
                     if self.admitted_to_answer(validated).is_err() {
                         return Err(outcome_not_shown());
                     }
@@ -702,7 +702,7 @@ impl RemoteConnection {
         Ok(self
             .ask_under(acting.clone(), session_id, entry, false)?
             .answering(answering)
-            .kept(validated))
+            .kept(self.footing_of(validated)))
     }
 
     /// Decides the read a retained answer of this daemon's own is written under, when it has one.
@@ -740,7 +740,7 @@ impl RemoteConnection {
         ) {
             return self
                 .ask(None, Method::OwnerConfirmationPending.entry(), false)
-                .map(|read| Some(read.answering(method).kept(validated)));
+                .map(|read| Some(read.answering(method).kept(self.footing_of(validated))));
         }
         let subject = mutation.target.session_id.as_ref().copied().or(reserved);
         if subject.is_some() {
@@ -778,9 +778,9 @@ impl RemoteConnection {
         // not an unknown outcome.
         let reused = kept.names_a_reused_identifier();
         *asked = Some(if reused {
-            decided.clone().admitted_under(validated)
+            decided.clone().admitted_under(self.footing_of(validated))
         } else {
-            decided.clone().kept(validated)
+            decided.clone().kept(self.footing_of(validated))
         });
         #[cfg(feature = "testing")]
         self.controller.after_the_retained_lookup.wait().await;
@@ -862,7 +862,7 @@ impl RemoteConnection {
         decided: &Asked,
         asked: &mut Option<Asked>,
     ) -> ProtocolError {
-        *asked = Some(decided.clone().kept(validated));
+        *asked = Some(decided.clone().kept(self.footing_of(validated)));
         if self.admitted_to_answer(validated).is_err() {
             return outcome_not_shown();
         }
@@ -885,7 +885,7 @@ impl RemoteConnection {
         asked: &mut Option<Asked>,
         validated: AuthorityRevision,
     ) -> ProtocolError {
-        *asked = Some(decided.clone().kept(validated));
+        *asked = Some(decided.clone().kept(self.footing_of(validated)));
         outcome_not_shown()
     }
 
