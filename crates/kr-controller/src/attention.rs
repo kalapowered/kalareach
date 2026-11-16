@@ -1270,8 +1270,9 @@ impl AttentionModule {
     }
 
     /// As [`Self::write_released`], for an answer that is also held to a lease: `lease` is asked
-    /// before every transport write as the ticket is, and when it stops holding, an answer none
-    /// of which has gone is taken back and its refusal is written instead.
+    /// before every transport write, and before the ticket's clock is compared, because the
+    /// lease's question can wait for a lock. When it stops holding, an answer none of which has
+    /// gone is taken back and its refusal is written instead.
     ///
     /// # Errors
     ///
@@ -1307,10 +1308,13 @@ impl AttentionModule {
                 // after the write, and the generated text of an answer is never written under a
                 // state that has gone.
                 let standing = ticket.standing();
+                // The lease is asked first, which takes the policy lock and so can wait, and the
+                // ticket's clock is compared after it: no wait stands after the comparison.
                 let may_write = || {
-                    (!text_held
-                        || (standing.is_some() && ticket.holds_text(&fences, self.release_ms())))
-                        && lease.is_none_or(|lease| (lease.refused)(&mut asked).is_none())
+                    lease.is_none_or(|lease| (lease.refused)(&mut asked).is_none())
+                        && (!text_held
+                            || (standing.is_some()
+                                && ticket.holds_text(&fences, self.release_ms())))
                 };
                 if begun {
                     writer.resume_frame_checked(may_write)
@@ -7369,6 +7373,96 @@ pub(crate) mod tests {
             received < whole_answer_bytes(),
             "the reader never holds the whole answer: {received} bytes came"
         );
+    }
+
+    /// KR-REQ-24.11: the lease that an answer is held to is asked before the ticket's clock is
+    /// compared, so that no wait for the lease's policy lock stands after the comparison. The
+    /// lease's question here waits, as that lock does, until the ticket's time has passed: the
+    /// answer with its text is not written, and the reader gets the answer with its text withheld.
+    /// The control: where the clock stands still in the wait, the answer is written whole.
+    ///
+    /// The lease is held to a clock the case moves, and the wait ends when the case lets it, so
+    /// how late the writer starts decides nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_ticket_is_compared_with_the_clock_after_the_lease_is_asked() {
+        for passes in [false, true] {
+            let temp = kr_ipc::testing::TempHost::create();
+            let clock = kr_ipc::clock::ManualSharedClock::new();
+            let module = module_held_to(&temp, &clock);
+            let session_id = SessionId::new(kr_ipc::new_uuid());
+            set_fence(
+                &module,
+                session_id,
+                SessionFence {
+                    recorded: Some(0),
+                    ..SessionFence::default()
+                },
+            )
+            .await;
+            let (mut writer, mut reader) = owner_connection(&temp, 1).await;
+            let until = clock.boot_elapsed_ms() + RELEASE_MARGIN_MS + 400;
+            let (arrived, reached) = std::sync::mpsc::channel::<()>();
+            let (let_go, waiting) = std::sync::mpsc::channel::<()>();
+            let writing = {
+                let module = Arc::clone(&module);
+                tokio::spawn(async move {
+                    // The lease's question waits once, where the first write is asked.
+                    let waiting = std::sync::Mutex::new(waiting);
+                    let asked = std::sync::atomic::AtomicBool::new(false);
+                    let refused = |_: &mut LeaseAsked| {
+                        if !asked.swap(true, Ordering::SeqCst) {
+                            arrived
+                                .send(())
+                                .expect("the case waits for the lease's question");
+                            waiting
+                                .lock()
+                                .expect("the wait is free")
+                                .recv_timeout(WRITER_LIVENESS)
+                                .expect("the case lets the lease's question go");
+                        }
+                        None
+                    };
+                    let written = module
+                        .write_released_held(
+                            &mut writer,
+                            StreamKind::Control,
+                            Released {
+                                frame: answer_of(64),
+                                withheld: Some(withheld()),
+                                ticket: ticket(&[session_id], 0, until),
+                            },
+                            Some(&LeaseHold { refused: &refused }),
+                        )
+                        .await;
+                    drop(writer);
+                    written
+                })
+            };
+            tokio::task::spawn_blocking(move || reached.recv_timeout(WRITER_LIVENESS))
+                .await
+                .expect("the wait ends")
+                .expect("the writer asks the lease");
+            if !passes {
+                // The ticket's time passes while the lease's question waits.
+                clock.advance(Duration::from_millis(400 + 1));
+            }
+            let_go.send(()).expect("the lease's question goes on");
+            tokio::time::timeout(WRITER_LIVENESS, writing)
+                .await
+                .expect("the write ends")
+                .expect("the write finishes")
+                .expect("an answer is written");
+            let read = reader
+                .read_message::<ControlFrame>()
+                .await
+                .expect("the reader gets an answer");
+            assert_eq!(
+                read,
+                if passes { answer_of(64) } else { withheld() },
+                "the clock moved past the ticket in the lease's wait: {}",
+                !passes
+            );
+        }
     }
 
     /// KR-REQ-24.11: a statement is applied while other sessions release text without pause: the
