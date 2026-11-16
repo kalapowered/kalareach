@@ -139,6 +139,7 @@ crates/kr-ipc/src/paths.rs | read_environment_id | IdentityUnavailable | 2 | own
 crates/kr-ipc/src/paths.rs | read_environment_marker | IdentityUnavailable | 3 | own | own | - | agrees
 crates/kr-ipc/src/paths.rs | read_owner_only_file | Io | 7 | own | own | - | agrees
 crates/kr-ipc/src/paths.rs | read_owner_only_file | UntrustedFile | 9 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | refuse_shared_root | Io | 1 | own | own | - | agrees
 crates/kr-ipc/src/paths.rs | resolve_here | Io | 1 | own | own | - | agrees
 crates/kr-ipc/src/paths.rs | sync_directory | Io | 1 | own | own | - | agrees
 crates/kr-ipc/src/paths.rs | write_owner_only_file | Io | 3 | own | own | - | agrees
