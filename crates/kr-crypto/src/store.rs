@@ -1326,7 +1326,7 @@ fn refusal(owner: KeyOwner, why: &Refusal) -> CryptoError {
 /// the daemon it starts, every time. The selection is not recorded anywhere: it is the caller's,
 /// made at each start, and [`open_store`]'s own `.store-kind` record continues to answer for the
 /// host rather than for a run. A run that names [`Self::File`] over a record that names the
-/// platform store is refused, because the host's keys are not in the directory.
+/// platform store is refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoreSelection {
     /// The operating system's credential store, with the fallback section 10 offers where it does.
@@ -1360,10 +1360,10 @@ impl StoreSelection {
 
 /// Refuses the directory store for a host whose record names the platform store.
 ///
-/// A host that [`open_store`] recorded the platform store for keeps its keys there, and not in the
-/// directory, so a start that names the directory is refused. The record is written only where
-/// there is a choice to record, so on a platform with no fallback there is no record to read and
-/// nothing to refuse.
+/// The record names the store that this host uses for its keys. Where it names the platform store,
+/// the daemon does not look in the directory for keys, so a start that names the directory is
+/// refused. The record is written only where there is a choice to record, so on a platform with no
+/// fallback there is no record to read and nothing to refuse.
 ///
 /// # Errors
 ///
@@ -2882,9 +2882,8 @@ mod tests {
     }
 
     /// KR-REQ-10.47: a host whose record names the platform store is not started with the
-    /// directory store: the keys are not in the directory. The start is refused before any key is
-    /// made, and a record that names the directory, or none, is served by the directory as
-    /// before.
+    /// directory store. The start is refused before any key is made, and a record that names the
+    /// directory, or none, is served by the directory as before.
     #[cfg(all(
         unix,
         not(any(target_os = "macos", target_os = "ios", target_os = "android"))

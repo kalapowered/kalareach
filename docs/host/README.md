@@ -1269,29 +1269,41 @@ the start is refused, and no key is made or moved. A host whose record names the
 using it, even where a secret service appears later. On macOS and Windows there is one store and no
 record.
 
-`file` is refused for a host whose record names the credential store: that host's keys are not in
-the directory. The refusal says so and names the option. On macOS and Windows no record exists, so
+`file` is refused for a host whose record names the credential store. The record names the store
+that this host uses for its keys. Where it names the platform store, the daemon does not look in
+the directory for keys. The refusal names the option. On macOS and Windows no record exists, so
 `file` there names a directory and uses the keys it finds in it.
 
-Two limits follow from the record. When the first write of a host's keys to the credential store
-fails after the record was made, the host stays tied to the credential store, and every start is
-refused until a person removes the `.store-kind` record. On macOS, a Keychain that cannot be used
-from a remote shell fails the start at its first read, with the keyring library's own words and not
-with the refusal above.
+Two limits remain:
+
+- When the first write of a host's keys to the credential store fails after the record was made,
+  the host stays tied to the credential store although no key exists there. A later start where
+  that store opens makes the keys there. Until then, a start where it does not open, or a start
+  with `--secret-store file`, is refused; a person who wants the directory instead removes the
+  `.store-kind` record before any key is made.
+- On macOS a Keychain that cannot be used from a remote shell fails the start at its first read,
+  with the Keychain's own words.
 
 A state directory can hold its network keys in the credential store and its device keys in the
 directory, if an earlier start chose the two stores apart. The daemon now uses the directory's set
 for everything, so the host's endpoint identity is the directory set's. To bring such a host to one
 set:
 
-1. Find which key set each paired device pinned. The host's endpoint identity in the device's
-   record is either the credential store's `{environment}/network-device` set or the directory's.
-2. Pair again the devices that pinned the credential store's set.
-3. Remove the credential store's `{environment}/network-device` items, which nothing reads.
+1. Find the devices to pair again. A device that pinned the credential store's set no longer
+   reaches the host, because the host's endpoint identity is now the directory set's. A device
+   that pinned the directory's set is not affected.
+2. On each device that no longer reaches the host, remove its own record of this host before it
+   pairs again, because both pairing forms refuse a host that the device already holds. On the
+   companion that is the `Forget <host name>` button on the pairing screen, which asks twice. Then
+   pair the device again.
+3. Before removing anything from the credential store, read the daemon's first line
+   (`kr-controller: keys in ...`). If it names the platform store, stop: the items there are then
+   the host's own keys. If it names the directory, remove the credential store's
+   `{environment}/network-device` items, which nothing reads.
 
-Do not copy one set over the other. The daemon used the directory's set for the membership key, the
-delivery module, backup enrolment, the authority feed's signer and the relay lease scope, and a
-copy would break each of them.
+The daemon used the directory's set for the membership key, the delivery module, backup
+enrolment, the authority feed's signer and the relay lease scope. A copy of the keyring's set over
+the directory's would break each of them.
 
 Under `file` both go in the environment's own `secrets` directory. `file` names where the keys go
 and nothing else: it allocates no directory and deletes nothing afterwards, so a run that wants its

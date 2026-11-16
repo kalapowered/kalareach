@@ -1192,11 +1192,12 @@ impl Host {
         let ending = kr_ipc::testing::Serving::guarding(&clients);
         // The endpoint configuration is this suite's own, so the network is registered here rather
         // than from the environment. Unless a case holds the daemon's timer, the network's keys
-        // are this suite's memory store, which a restart keeps so that the same endpoint comes
-        // back, while the daemon's own keys (the membership key, which
-        // `replace_host_authorisation` replaces on its own) stay in the environment's directory.
-        // So these cases run two key sets in one start on purpose: the product opens one store for
-        // both, and `network_key_store.rs` is where that is shown.
+        // are this suite's memory store, and the daemon's own keys stay in the environment's
+        // directory, so these cases run two key sets in one start where the product runs one.
+        // The reason is scope: these suites do not test where the keys are kept, a restart on the
+        // same tree would give the same endpoint back from the directory too, and rewriting them
+        // all to one store is no part of what they check. `network_key_store.rs` is where the
+        // one-store rule is shown.
         let joined = net::register(
             &controller,
             NetworkSetup {
