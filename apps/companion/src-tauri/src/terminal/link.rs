@@ -14,6 +14,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::FutureExt as _;
 use futures_util::future::BoxFuture;
 use kr_client::error::ClientError;
 use kr_client::ordered::{Ended, Ordered, OrderedEvents};
@@ -206,6 +207,34 @@ impl Events {
             return Some(item);
         }
         self.events.recv().await
+    }
+
+    /// What is in the channel now, in the order the host sent it, without waiting: the ones held
+    /// first, then at most [`EVENTS`] of the channel's own, so a reader that waited for room goes
+    /// on. It stops at the end of the session's reading, and a channel that closed with no end
+    /// before it is told as a `None` item.
+    ///
+    /// The channel is read outside tokio's cooperative budget: a budget that ran out would say the
+    /// channel is empty while notifications that came before an answer are in it.
+    pub(super) fn ready(&mut self) -> Vec<Option<Ordered>> {
+        let mut ready: Vec<Option<Ordered>> = self.held.drain(..).map(Some).collect();
+        for _ in 0..EVENTS {
+            match tokio::task::unconstrained(self.events.recv()).now_or_never() {
+                Some(Some(item)) => {
+                    let ended = matches!(item, Ordered::Ended(_));
+                    ready.push(Some(item));
+                    if ended {
+                        break;
+                    }
+                }
+                Some(None) => {
+                    ready.push(None);
+                    break;
+                }
+                None => break,
+            }
+        }
+        ready
     }
 
     /// Waits for `call` while taking what the reader hands on: the reader waits for room while its

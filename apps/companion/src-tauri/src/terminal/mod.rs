@@ -27,7 +27,7 @@ mod view;
 mod window;
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use kr_ipc::paths::EnvironmentPaths;
@@ -85,6 +85,8 @@ struct Held {
     commands: tokio::sync::mpsc::UnboundedSender<view::Command>,
     /// Becomes true once the view's task has ended.
     ended: tokio::sync::watch::Receiver<bool>,
+    /// The most items the view's queue of what it heard has held at one time.
+    queue_peak: Arc<AtomicUsize>,
 }
 
 /// The raw terminal views this application holds open.
@@ -171,6 +173,7 @@ impl TerminalViews {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
         let (ending, ended) = tokio::sync::watch::channel(false);
+        let queue_peak = Arc::new(AtomicUsize::new(0));
         // Held before the task starts, so a close that arrives at once finds it.
         self.lock().insert(
             id,
@@ -178,6 +181,7 @@ impl TerminalViews {
                 page: page.to_owned(),
                 commands,
                 ended,
+                queue_peak: Arc::clone(&queue_peak),
             },
         );
         let held = Arc::clone(&self.held);
@@ -186,7 +190,10 @@ impl TerminalViews {
                 Source::Local(locate) => view::Reach::Local(locate),
                 Source::Paired(dial, grant) => view::Reach::Paired(dial, *grant),
             };
-            let cause = view::run(reach, session_id, dimensions, receiver, &publish).await;
+            let cause = view::run(
+                reach, session_id, dimensions, receiver, &publish, queue_peak,
+            )
+            .await;
             // Before the view is told over, so whoever waits for its end finds it done.
             if cause == view::Cause::Lost
                 && let Some(on_lost) = on_lost
@@ -228,6 +235,17 @@ impl TerminalViews {
         if let Some(entry) = self.lock().get(&id) {
             let _ = entry.commands.send(view::Command::Lose);
         }
+    }
+
+    /// The most items a view's queue of what it heard has held at one time, or none for a view that
+    /// has ended or was never open. For a test of the queue's bound.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn queue_peak(&self, view: &str) -> Option<usize> {
+        let id = view.parse::<u64>().ok()?;
+        self.lock()
+            .get(&id)
+            .map(|entry| entry.queue_peak.load(Ordering::Relaxed))
     }
 
     /// Tells a view the page's grid is now `dimensions`. A view that has ended takes nothing.
@@ -437,6 +455,7 @@ mod tests {
                 page: "main".to_owned(),
                 commands,
                 ended,
+                queue_peak: Arc::default(),
             },
         );
         (views, receiver)
