@@ -1911,8 +1911,10 @@ async fn mutating(
 /// again.
 ///
 /// Four local clients attach and detach back to back, so the boundary is free only between one
-/// mutation and the next. A presentation that tries the boundary at intervals, and does not queue
-/// for it, must still be decided within the time a daemon waits for it.
+/// mutation and the next. The case shows the five-second bound, the time a daemon waits for a
+/// presentation, against a real stream of mutations. It does not show the wake: without it a
+/// presentation can still get in on some machines, and the case that shows the wake is
+/// `a_living_presentation_is_decided_in_a_gap_shorter_than_its_pause`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_living_presentation_is_decided_while_mutations_take_the_boundary_again_and_again() {
     let host = host(1).await;

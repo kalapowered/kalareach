@@ -4605,10 +4605,13 @@ impl WorkerService {
     /// tries and not of a lock that blocks: a presentation that finds the boundary held asks the
     /// operating system whether its peer has gone, and tries again after a pause that starts at
     /// five milliseconds and doubles to a quarter of a second, and that each release of the
-    /// boundary cuts short. A release wakes every presentation that waits, which then tries at once:
-    /// a stream of mutations that take the boundary again as soon as they let go of it cannot keep
-    /// a presentation out for as long as a pause. A peer that has gone ends the
-    /// presentation there. No acceptance runs for it, and its connection is read to its end at once
+    /// boundary cuts short. A release wakes every presentation that waits, which then tries at once.
+    /// That makes a presentation eligible at each release and promises it nothing: another holder
+    /// can win every race for the boundary, and there is no bound on how many releases a stream of
+    /// mutations can win. The pause is the interval at which a presentation asks its peer when
+    /// nothing wakes it, and no deadline for a release. Against a real stream of four clients the
+    /// presentation was decided inside five seconds in the case that tries it. A peer that has gone
+    /// ends the presentation there. No acceptance runs for it, and its connection is read to its end at once
     /// and its place in the worker's count of connections is given back, where a blocking wait
     /// would keep both, and a thread, until the hold ended. A peer that is there waits for the whole
     /// hold, however long, and tries for the boundary as soon as the holder lets go. The try, the
@@ -4621,9 +4624,10 @@ impl WorkerService {
     /// - A peer can go at any time after the last question, the one asked under the boundary, and
     ///   the acceptance then runs for a peer that has just gone. No design closes that window. Such
     ///   a presentation cannot collect: its answer fails to write and its connection ends.
-    /// - A Unix peer that sent bytes behind its token, and then went, is taken as there for as long
-    ///   as those bytes are unread, which is the whole hold. A client sends nothing behind its
-    ///   token until the worker has answered.
+    /// - A peer that sent bytes behind its token, and then went, is taken as there for as long as
+    ///   the system counts those bytes as waiting, which is the whole hold. On Unix that is every
+    ///   byte; on Windows it is what the runtime's own read of the pipe did not take. A client
+    ///   sends nothing behind its token until the worker has answered.
     /// - A peer that stops using a link without closing it is there, as far as the system can say.
     /// - On Windows a client that dropped its link is reported gone once its own runtime has
     ///   released the handle, which happens when that runtime next turns. A client whose runtime
