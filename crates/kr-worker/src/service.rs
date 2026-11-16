@@ -515,6 +515,10 @@ pub struct WorkerService {
     /// for this host's own tests. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     subscriptions_held: std::sync::atomic::AtomicUsize,
+    /// How many passes of the host's maintenance this service has begun, for this host's own tests.
+    /// It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    maintenance_passes: std::sync::atomic::AtomicUsize,
     /// How many threads of receipt reads this service has alive at this moment, for this host's
     /// own tests: a thread's own entry and exit move the count. It is compiled away in every
     /// shipped build.
@@ -978,6 +982,8 @@ impl WorkerService {
             host_cap_looks: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "testing")]
             subscriptions_held: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "testing")]
+            maintenance_passes: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "testing")]
             receipt_threads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(feature = "testing")]
@@ -1539,6 +1545,16 @@ impl WorkerService {
             .lock()
             .expect("the record is not poisoned")
             .clone()
+    }
+
+    /// Returns how many passes of the host's maintenance this service has begun, for this host's
+    /// own tests. The passes are made by the task that [`Self::serve`] starts and by
+    /// [`Self::maintain_now`], so a service that is not served and was never asked has begun none.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn maintenance_passes(&self) -> usize {
+        self.maintenance_passes
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Returns how many question subscriptions long polls are holding at this moment, for this
@@ -2260,6 +2276,9 @@ impl WorkerService {
 
     /// One pass of the host's maintenance, made on a thread the executor can do without.
     fn maintain_pass(&self) -> MaintenancePass {
+        #[cfg(feature = "testing")]
+        self.maintenance_passes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         off_the_executor(|| self.maintain_once())
     }
 

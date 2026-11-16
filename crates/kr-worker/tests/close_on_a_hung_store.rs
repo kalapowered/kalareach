@@ -108,7 +108,7 @@ struct Host {
     /// The files the shell writes: when it is ready, and when it was asked to stop.
     marks: tempfile::TempDir,
     // Ends the serving task when the fixture is dropped, whether or not a case closed it.
-    _serving: kr_ipc::testing::Serving,
+    _serving: Option<kr_ipc::testing::Serving>,
     // Declared last: the directory is removed after every field above has let go of its files.
     _temp: kr_ipc::testing::TempHost,
 }
@@ -156,16 +156,29 @@ async fn host() -> Host {
 
 /// A session whose shell ends when it is asked to stop, or one that notes the request and goes on.
 async fn host_of(ends_when_asked: bool) -> Host {
-    host_on(ends_when_asked, Arc::new(kr_ipc::clock::SystemSharedClock)).await
+    host_on(
+        ends_when_asked,
+        Arc::new(kr_ipc::clock::SystemSharedClock),
+        true,
+    )
+    .await
 }
 
 /// As [`host`], for a session whose runtime reads the continuous clock `clock`, which a case may
-/// move by hand: a question's deadline on that clock passes when the case moves it.
+/// move by hand: a question's deadline on that clock passes when the case moves it. The service is
+/// not served: the maintenance task that sweeps the question ledger on that clock is started by
+/// `serve` alone, so this host makes no maintenance pass (`WorkerService::maintenance_passes` is the
+/// count that a case confirms). The evidence loop does not need it: `WorkerService::new` starts
+/// the loop.
 async fn host_on_a_clock(clock: &kr_ipc::clock::ManualSharedClock) -> Host {
-    host_on(false, Arc::new(clock.clone())).await
+    host_on(false, Arc::new(clock.clone()), false).await
 }
 
-async fn host_on(ends_when_asked: bool, shared_clock: Arc<dyn kr_ipc::clock::SharedClock>) -> Host {
+async fn host_on(
+    ends_when_asked: bool,
+    shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
+    served: bool,
+) -> Host {
     let marks = tempfile::tempdir().expect("a directory on the internal disk");
     let ready = kr_worker::testing::shell_quoted(&marks.path().join("ready"));
     let script = if ends_when_asked {
@@ -245,7 +258,8 @@ async fn host_on(ends_when_asked: bool, shared_clock: Arc<dyn kr_ipc::clock::Sha
         )
         .expect("a worker service"),
     );
-    let serving = kr_ipc::testing::Serving::spawn(Arc::clone(&service).serve(listener));
+    let serving =
+        served.then(|| kr_ipc::testing::Serving::spawn(Arc::clone(&service).serve(listener)));
     let host = Host {
         service,
         runtime,
@@ -1626,30 +1640,6 @@ async fn the_loop_waits_after_round(producer: &Producer, after: usize, what: &st
     }
 }
 
-/// The session, held on a thread of its own until this is dropped.
-struct SessionHeld {
-    _release: std::sync::mpsc::Sender<()>,
-}
-
-/// Takes the session on a thread of its own and returns once that thread has it. The thread lets it
-/// go when the returned value is dropped, also when a case fails before it gets there.
-async fn hold_the_session(runtime: &Arc<SessionRuntime>) -> SessionHeld {
-    let (taken, has_taken) = std::sync::mpsc::channel();
-    let (release, released) = std::sync::mpsc::channel::<()>();
-    let runtime = Arc::clone(runtime);
-    std::thread::spawn(move || {
-        let _session = runtime.session();
-        let _ = taken.send(());
-        // Returns when the sender is dropped.
-        let _ = released.recv();
-    });
-    tokio::task::spawn_blocking(move || has_taken.recv_timeout(REACH))
-        .await
-        .expect("the thread that takes the session ended")
-        .expect("the session was taken within a bound");
-    SessionHeld { _release: release }
-}
-
 /// Waits until the evidence loop waits (a round that began has come to its wait, read on both sides
 /// of the other counts) and every ask that it queued for the ledger's reader is a read that the
 /// reader has finished: no read of the ledger is pending or under way.
@@ -1683,19 +1673,20 @@ async fn the_reader_has_finished_every_ask(producer: &Producer, what: &str) {
 /// 3. the reader is let go and the session's domain says that a question is open;
 /// 4. the loop is shown to go round once more, on the reader's wake, and to wait with the open
 ///    fact, so that its timer is armed with the clock still before the question's deadline;
-/// 5. the case takes the session and holds it to the end: the host's maintenance pass takes the
-///    session before it sweeps the ledger on the same clock (and a sweep wakes the loop when a
-///    question ends), so no pass gets to its sweep from here on. The first pass was made when the
-///    host began to serve and the next is 30 seconds or more after it, which is why the hold is
-///    only a guard;
-/// 6. the loop waits again and every ask that it queued for the ledger's reader is a read that the
+/// 5. the loop waits again and every ask that it queued for the ledger's reader is a read that the
 ///    reader has finished (`ledger_asks`): no read is pending or under way, so the next read of the
 ///    ledger comes only from a round that a wake begins;
+/// 6. the host makes no maintenance pass. Its pass sweeps the ledger on the same clock, and a sweep
+///    wakes the loop when a question ends, so a pass could end the question in the timer's place.
+///    The fixture does not serve this host, and the maintenance task is started by `serve` alone,
+///    so no pass is ever begun: the case confirms it before the clock moves
+///    (`maintenance_passes() == 0`) and again once the question has ended, so a pass that began in
+///    between would be seen;
 /// 7. only then does the clock move past the deadline. The question's waiters are the loop's timer
-///    (which the case waits for), the sweep (shut out in 5), a client's call that reads or sweeps
-///    the ledger (the case makes none) and the reader's own read (none is pending, and the reader
-///    asks nothing itself). The session stops counting the question, and the mutant that removes
-///    the timer's branch leaves it counted.
+///    (which the case waits for), the sweep (none, confirmed in 6), a client's call that reads or
+///    sweeps the ledger (the case makes none) and the reader's own read (none is pending, and the
+///    reader asks nothing itself). The session stops counting the question, and the mutant that
+///    removes the timer's branch leaves it counted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_question_that_runs_out_of_time_stops_counting_with_no_other_wake() {
     let clock = kr_ipc::clock::ManualSharedClock::new();
@@ -1744,12 +1735,12 @@ async fn a_question_that_runs_out_of_time_stops_counting_with_no_other_wake() {
         "after the reader recorded the open question: the reader's wake did not reach the loop",
     )
     .await;
-    let held = hold_the_session(&host.runtime).await;
-    the_reader_has_finished_every_ask(
-        &producer,
-        "with the fact open, the session held and the clock unmoved",
-    )
-    .await;
+    the_reader_has_finished_every_ask(&producer, "with the fact open and the clock unmoved").await;
+    assert_eq!(
+        host.service.maintenance_passes(),
+        0,
+        "the host began a maintenance pass before the clock moved, so a sweep of the ledger could end the question in the timer's place"
+    );
     assert_eq!(
         domain_application_state(&host),
         Some(ApplicationState::AwaitingInput),
@@ -1769,7 +1760,11 @@ async fn a_question_that_runs_out_of_time_stops_counting_with_no_other_wake() {
         Some(ApplicationState::ShellReady),
         "the session's domain said something other than a shell at its prompt once the question had run out of time"
     );
-    drop(held);
+    assert_eq!(
+        host.service.maintenance_passes(),
+        0,
+        "the host began a maintenance pass while the question ran out of time, so a sweep of the ledger, and not the loop's timer, may have ended it"
+    );
 }
 
 /// Two questions are open, and the maintenance pass's prune holds the session inside a write
