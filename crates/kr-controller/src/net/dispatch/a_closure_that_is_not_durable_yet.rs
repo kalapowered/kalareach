@@ -18,15 +18,19 @@ use super::write_boundary::paired_connection;
 use crate::service::a_close_a_worker_never_answers::{self as fake, Silent};
 use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
 
-/// What the daemon answers a close at its local door with.
-async fn closed_at_the_local_door(world: &Silent) -> SessionCloseResult {
+/// What the daemon answers a close at its local door with. The admission is taken by the caller,
+/// because it reads the registry.
+async fn closed_at_the_local_door(
+    world: &Silent,
+    carried: crate::authority::AdmittedMutation,
+) -> SessionCloseResult {
     world
         .controller
         .session_close(
             &fake::close_request(world.environment_id, world.session_id),
             &world.actor,
             Some(world.accepted),
-            fake::admission(&world.controller, world.accepted).await,
+            carried,
         )
         .await
         .into_answer_for_test()
@@ -109,10 +113,10 @@ async fn until_recorded_and_retired(world: &Silent) {
     .expect("the closure is recorded and the worker is retired");
 }
 
-/// A worker's closure, durable or volatile, is answered at once; while the registry's write of it
-/// stands, the same close at the local door and from a paired device is answered with the closure
-/// as the worker gave it, without reaching the worker; once the write is let go the registry holds
-/// the record with the word the worker gave it.
+/// A worker's closure, durable or volatile, is answered at once to a close from a paired device,
+/// while the registry's write of it stands; the same close at the local door is then answered with
+/// the closure as the worker gave it, without reaching the worker; once the write is let go the
+/// registry holds the record with the word the worker gave it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_closure_whose_write_stands_is_answered_at_both_doors_and_recorded_as_it_was_given() {
     for volatile in [false, true] {
@@ -127,37 +131,34 @@ async fn a_closure_whose_write_stands_is_answered_at_both_doors_and_recorded_as_
         let world = scripted::scripted(&script).await;
         let controller = &world.controller;
         let (connection, _) = paired_connection(controller, 36, EVERY_RIGHT);
+        // The admission of a close at the local door reads the registry, which the stalled write
+        // holds.
+        let carried = fake::admission(controller, world.accepted).await;
         let (arrived, release) = controller.stall_the_next_closure_write();
 
-        let local = closed_at_the_local_door(&world).await;
-        assert_eq!(local.durability, given, "{local:?}");
+        let paired = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            closed_at_the_paired_door(&world, &connection, 91),
+        )
+        .await
+        .expect("a close from a paired device is answered while the write of its closure stands");
+        assert_eq!(paired.durability, given, "{paired:?}");
         tokio::task::spawn_blocking(move || {
             arrived.recv_timeout(std::time::Duration::from_secs(30))
         })
         .await
         .expect("the wait for the write ends")
         .expect("the closure's write reaches the registry");
-        let paired = tokio::time::timeout(
+        let local = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            closed_at_the_paired_door(&world, &connection, 91),
-        )
-        .await
-        .expect("a close from a paired device is answered while the write stands");
-        assert_eq!(
-            (paired.state, paired.durability),
-            (SessionState::Closed, given),
-            "{paired:?}"
-        );
-        let again = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            closed_at_the_local_door(&world),
+            closed_at_the_local_door(&world, carried),
         )
         .await
         .expect("a close at the local door is answered while the write stands");
         assert_eq!(
-            (again.state, again.durability),
+            (local.state, local.durability),
             (SessionState::Closed, given),
-            "{again:?}"
+            "{local:?}"
         );
         assert_eq!(
             script.forwarded().len(),
