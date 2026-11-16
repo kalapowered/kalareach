@@ -205,11 +205,13 @@ describe('the scripted host reads input as native code does (KR-REQ-10.01)', () 
     const { port } = fakeHost()
     const view: TerminalView = await port.openTerminalView(SESSION_MAIN, { columns: 80, rows: 8 }, () => {})
     const wheel = { kind: 'wheel', take: 1, column: 0, line: 0, turns: 0, shift: false, alt: false, control: false }
+    const words =
+      "those are not this operation's parameters: a wheel turns between 1 and 1024 times either way, not 0"
+    // The fake plays native code, whose failure asks nothing more, and the boundary's line is the words.
     await expect(view.input(wheel as never)).rejects.toEqual({
       code: 'INVALID_ARGUMENT',
-      message:
-        "those are not this operation's parameters: a wheel turns between 1 and 1024 times either way, not 0",
-      user_action: 'nothing',
+      message: words,
+      line: words,
       retry: 'configuration_change'
     })
   })
@@ -473,7 +475,7 @@ describe("the scripted host reads a view's opening, size and moves as native cod
     expect(await said(view.resize({ columns: 1024, rows: 257 }))).toEqual({
       code: 'INVALID_ARGUMENT',
       message: "that is not a terminal's size: cells 263168 must not exceed 262144",
-      user_action: expect.any(String) as string,
+      line: expect.any(String) as string,
       retry: 'configuration_change'
     })
   })

@@ -18,6 +18,7 @@ import type { AttentionItem, AttentionReadResult } from '@kalareach/protocol'
 import { AppProvider } from '../../src/app/state'
 import { fakeHost, type FakeHostControls } from '../../src/host/fake'
 import type { HostError, HostInbox, HostRow, RefusedRequest } from '../../src/host/port'
+import { receivedFailure } from '../../src/host/tauri'
 import { MobileApp } from '../../src/mobile/MobileApp'
 import capacityRefusals from '../fixtures/capacity-refusals.json'
 
@@ -209,12 +210,14 @@ describe('the inbox of a phone paired with two hosts', () => {
     // lists one of its own.
     const outBefore = screen.getByRole('button', { name: /^Out of contact \(/ }).textContent
     controls.setInboxHosts([
-      refusingLaptop({
-        code: 'PERMISSION_DENIED',
-        message: 'this device may not read this host',
-        user_action: 'fix_configuration',
-        retry: 'configuration_change'
-      })
+      refusingLaptop(
+        receivedFailure({
+          code: 'PERMISSION_DENIED',
+          message: 'this device may not read this host',
+          user_action: 'fix_configuration',
+          retry: 'configuration_change'
+        })
+      )
     ])
     readNow()
     const refusal = await screen.findByTestId('inbox-refusal')
@@ -245,12 +248,12 @@ describe('the inbox of a phone paired with two hosts', () => {
     await waitFor(() => {
       expect(rowsOf('laptop')).toHaveLength(2)
     })
-    const lapsed: HostError = {
+    const lapsed: HostError = receivedFailure({
       code: 'PERMISSION_DENIED',
       message: 'this host’s bounded offline-validity policy has lapsed',
       user_action: 'nothing',
       retry: 'configuration_change'
-    }
+    })
     const cases: readonly (readonly [RefusedRequest, string])[] = [
       ['connection', 'laptop did not take this device’s connection'],
       ['host_info', 'laptop refused to say who it is'],
@@ -286,7 +289,12 @@ describe('the inbox of a phone paired with two hosts', () => {
       })
       controls.setInboxHosts([
         refusingLaptop(
-          { code: sent.code, message: sent.message, user_action: sent.user_action, retry: 'transient' },
+          receivedFailure({
+            code: sent.code,
+            message: sent.message,
+            user_action: sent.user_action,
+            retry: 'transient'
+          }),
           'connection'
         )
       ])
@@ -307,12 +315,12 @@ describe('the inbox of a phone paired with two hosts', () => {
     })
     controls.setInboxHosts([
       refusingLaptop(
-        {
+        receivedFailure({
           code: 'RESOURCE_UNAVAILABLE',
           message: 'the connection to this host ended before a lease was held',
           user_action: 'wait',
           retry: 'transient'
-        },
+        }),
         'connection'
       )
     ])
@@ -332,12 +340,14 @@ describe('the inbox of a phone paired with two hosts', () => {
       expect(rowsOf('laptop')).toHaveLength(2)
     })
     controls.setInboxHosts([
-      refusingLaptop({
-        code: 'PERMISSION_DENIED',
-        message: 'not for this device',
-        user_action: 'nothing',
-        retry: 'configuration_change'
-      })
+      refusingLaptop(
+        receivedFailure({
+          code: 'PERMISSION_DENIED',
+          message: 'not for this device',
+          user_action: 'nothing',
+          retry: 'configuration_change'
+        })
+      )
     ])
     readNow()
     // The host's words run into the next sentence only after a full stop.
@@ -431,12 +441,14 @@ describe('the inbox of a phone paired with two hosts', () => {
     // Lost, refused or read, the stale answer shows no contact, no refusal and no row.
     for (const stale of [
       lostLaptop(Date.now() - 5 * 60_000),
-      refusingLaptop({
-        code: 'PERMISSION_DENIED',
-        message: 'this device may not read this host',
-        user_action: 'fix_configuration',
-        retry: 'configuration_change'
-      }),
+      refusingLaptop(
+        receivedFailure({
+          code: 'PERMISSION_DENIED',
+          message: 'this device may not read this host',
+          user_action: 'fix_configuration',
+          retry: 'configuration_change'
+        })
+      ),
       laptopRead()
     ]) {
       controls.setInboxHosts([stale])

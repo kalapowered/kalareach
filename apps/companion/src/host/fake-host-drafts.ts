@@ -11,6 +11,7 @@
 import type { AttachmentHandle } from '@kalareach/protocol'
 
 import { fakeRetryOf } from './fake-retry'
+import { receivedFailure } from './tauri'
 import type { Settled } from './port'
 
 /** A refusal in the shape native code rejects with. */
@@ -75,12 +76,12 @@ const FIRST_MS = 1_763_000_000_000
 
 function refused(refusal: FakeRefusal): never {
   // eslint-disable-next-line @typescript-eslint/only-throw-error -- a refusal is data, as native code's is
-  throw {
+  throw receivedFailure({
     code: refusal.code,
     message: refusal.message,
     user_action: 'nothing',
     retry: fakeRetryOf(refusal.code)
-  }
+  })
 }
 
 /** The host's drafts for files. */

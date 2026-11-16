@@ -111,5 +111,19 @@
       "user_action": "nothing",
       "page": "sign in to your account again: this device cannot ask your organisation for the lease that lets it use this host"
     }
+  },
+  "voice_stop": {
+    "wait": {
+      "code": "RESOURCE_UNAVAILABLE",
+      "message": "RESOURCE_UNAVAILABLE: The host has not said whether it made the call. This device is still asking it, and ends the call if it did.",
+      "user_action": "wait",
+      "page": "The host has not said whether it made the call. This device is still asking it, and ends the call if it did. Wait a moment and try again."
+    },
+    "nothing": {
+      "code": "PERMISSION_DENIED",
+      "message": "PERMISSION_DENIED: this device may not end that call",
+      "user_action": "nothing",
+      "page": "this device may not end that call"
+    }
   }
 }
