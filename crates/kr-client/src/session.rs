@@ -1179,9 +1179,10 @@ impl Session {
     /// transport leaves: on the network transport the rest of the frame is written by the next
     /// write, so the request may reach the host with no one waiting for its answer; on the local
     /// link a drop inside the write closes the connection. Dropped once the frame is written, it
-    /// gives back its place among the outstanding mutations and its waiter; the action stays on
-    /// the book as held and unresolved, whatever the answer was, until its owner settles it
-    /// ([`Session::settle`]). So does an action whose call was dropped inside the write.
+    /// gives back its place among the outstanding mutations and its waiter. The action stays on
+    /// the book as held and unresolved until its owner settles it ([`Session::settle`]): an answer
+    /// that comes later does not clear it, whatever the answer was. An action whose call was
+    /// dropped inside the write stays on the book in the same way.
     ///
     /// # Errors
     ///
@@ -1496,6 +1497,10 @@ impl Session {
     /// As [`Session::mutate`]: the caller polls the call to its end. A drop inside the write of the
     /// frame leaves, on the network transport, a frame whose rest the next write sends, so the
     /// request may reach the host with no one waiting; on the local link it closes the connection.
+    /// A drop once the frame is written, at the wait for the answer, gives back the request's
+    /// place and its waiter and leaves the action on the book as held and unresolved until its
+    /// owner settles it ([`Session::settle`]): an answer that comes later does not clear it. An
+    /// action whose call was dropped inside the write stays on the book in the same way.
     ///
     /// # Errors
     ///
@@ -1523,6 +1528,8 @@ impl Session {
     ///
     /// The caller polls the call to its end, as for [`Session::send`]; the answer's future, once
     /// returned, is safe to drop and gives back the request's place among the outstanding ones.
+    /// The action it left stays on the book as held and unresolved until its owner settles it
+    /// ([`Session::settle`]): an answer that comes later does not clear it.
     ///
     /// # Errors
     ///
