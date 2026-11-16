@@ -1223,6 +1223,33 @@ async fn a_token_of_another_account_ends_the_call_and_a_warning_stands_before_th
     scene.stop_host().await;
 }
 
+/// The end of a call that the service has no record of is never read without the warning that
+/// stands before the next start: a read made at the moment the end has been written, and the
+/// update that carries it is not yet over, finds both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_end_a_service_without_the_call_causes_is_never_read_without_its_warning() {
+    let mut scene = scene().await;
+    scene.stand_in.treat_as_another_account(PHONE_TOKEN);
+    let prepared = scene.prepared().await;
+    scene.open_a_window_at_the_next_end();
+    let starting = scene
+        .phone
+        .companion
+        .start_call("voice_start", scene.start_request(&prepared));
+
+    let state = scene.read_in_the_window().await;
+
+    assert_eq!(state["ended"]["cause"], "no_such_call", "{state}");
+    assert!(
+        problem_words(&state, "no_such_call")
+            .iter()
+            .any(|words| words.contains("no such call")),
+        "the end is shown without its warning: {state}"
+    );
+    let _ = starting.await;
+    scene.stop_host().await;
+}
+
 /// A control whose token the service does not accept, after the host created the call, closes the
 /// call: the media stops, the host revokes the grant and closes the call at the service.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
