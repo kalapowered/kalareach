@@ -6368,15 +6368,128 @@ mod tests {
         all
     }
 
-    /// Whether a round can happen: the holder is read where [`holder_wanted`] says so (and the asked
-    /// process is named only where an identity exists), and the look is made where [`look_wanted`]
-    /// says so. These are the rounds that the wait makes.
+    /// The process that the lock file names, as the walk of the holder has it: none, the asked
+    /// process and another.
+    #[derive(Clone, Copy)]
+    enum Named {
+        Nobody,
+        TheAsked,
+        Another,
+    }
+
+    impl Every for Named {
+        fn first() -> Self {
+            Self::Nobody
+        }
+
+        fn after(&self) -> Option<Self> {
+            match self {
+                Self::Nobody => Some(Self::TheAsked),
+                Self::TheAsked => Some(Self::Another),
+                Self::Another => None,
+            }
+        }
+    }
+
+    impl Label for Named {
+        fn label(&self) -> String {
+            match self {
+                Self::Nobody => "none",
+                Self::TheAsked => "asked",
+                Self::Another => "other",
+            }
+            .to_owned()
+        }
+    }
+
+    impl Named {
+        /// The number that the lock file names: the asked process is 4000.
+        const fn pid(self) -> Option<u64> {
+            match self {
+                Self::Nobody => None,
+                Self::TheAsked => Some(4000),
+                Self::Another => Some(4001),
+            }
+        }
+    }
+
+    /// The identity of the asked process that a round has, as the walk of the holder has it: none
+    /// where the command has no identity of the process, and the asked process's.
+    #[derive(Clone, Copy)]
+    enum Identity {
+        None,
+        TheAsked,
+    }
+
+    impl Every for Identity {
+        fn first() -> Self {
+            Self::None
+        }
+
+        fn after(&self) -> Option<Self> {
+            match self {
+                Self::None => Some(Self::TheAsked),
+                Self::TheAsked => None,
+            }
+        }
+    }
+
+    impl Label for Identity {
+        fn label(&self) -> String {
+            match self {
+                Self::None => "none",
+                Self::TheAsked => "asked",
+            }
+            .to_owned()
+        }
+    }
+
+    impl Identity {
+        fn of(self) -> Option<ProcessStartIdentity> {
+            match self {
+                Self::None => None,
+                Self::TheAsked => Some(asked_process()),
+            }
+        }
+    }
+
+    /// The identity that a round has of the asked process: none where the command has no identity
+    /// of it, and its identity otherwise.
+    const fn identity_of(process: Process) -> Identity {
+        match process {
+            Process::NoIdentity => Identity::None,
+            Process::Running | Process::Ended | Process::Unreadable => Identity::TheAsked,
+        }
+    }
+
+    /// The values of `Holder` that a round reads where the lock file is read: what [`Holder::of`]
+    /// gives for each process that the lock file can name, with the identity that the round has,
+    /// each value once, in the order of the walk of the named process.
+    fn holders_read(process: Process) -> Vec<Holder> {
+        let identity = identity_of(process).of();
+        let mut all: Vec<Holder> = Vec::new();
+        for named in every::<Named>() {
+            let holder = Holder::of(named.pid(), identity.as_ref());
+            if !all
+                .iter()
+                .any(|seen| std::mem::discriminant(seen) == std::mem::discriminant(&holder))
+            {
+                all.push(holder);
+            }
+        }
+        all
+    }
+
+    /// Whether a round can happen: the holder is read where [`holder_wanted`] says so (to a value
+    /// that [`Holder::of`] gives), and the look is made where [`look_wanted`] says so. These are
+    /// the rounds that the wait makes.
     fn reachable(round: &Round) -> bool {
-        let wanted = holder_wanted(&round.lock, round.process);
-        let holder_read = match round.holder {
-            Holder::NotRead => !wanted,
-            Holder::Asked => wanted && round.process != Process::NoIdentity,
-            Holder::Nobody | Holder::Other(_) => wanted,
+        let holder_read = if holder_wanted(&round.lock, round.process) {
+            holders_read(round.process)
+                .iter()
+                .any(|read| std::mem::discriminant(read) == std::mem::discriminant(&round.holder))
+        } else {
+            round.holder == Holder::NotRead
         };
         holder_read && round.look.is_some() == look_wanted(&round.lock, round.process, round.holder)
     }
@@ -6388,11 +6501,7 @@ mod tests {
         for lock in every::<Lock>() {
             for process in every::<Process>() {
                 let holders: Vec<Holder> = if holder_wanted(&lock, process) {
-                    every::<Holder>()
-                        .into_iter()
-                        .filter(|holder| *holder != Holder::NotRead)
-                        .filter(|holder| *holder != Holder::Asked || process != Process::NoIdentity)
-                        .collect()
+                    holders_read(process)
                 } else {
                     vec![Holder::NotRead]
                 };
@@ -6500,15 +6609,21 @@ mod tests {
             }
         }
         out.push_str("\n## a request that could not be made: the first look, made where the connection was not closed\n");
-        out.push_str("closed=yes: no look is made, and the wait decides\n");
+        out.push_str(&format!(
+            "closed=yes: {}\n",
+            match first_look(true) {
+                FirstLook::NotMade => "no look is made, and the wait decides",
+                FirstLook::Made => "the endpoint is looked at once first",
+            }
+        ));
         for look in every::<Look>().into_iter().flatten() {
             out.push_str(&format!(
                 "closed=no look={} -> {}\n",
                 Some(look).label(),
-                if first_look_answers(look).is_some() {
-                    "answers"
-                } else {
-                    "the wait decides"
+                match (first_look(false), first_look_answers(look).is_some()) {
+                    (FirstLook::Made, true) => "answers",
+                    (FirstLook::Made, false) => "the wait decides",
+                    (FirstLook::NotMade, _) => "no look is made, and the wait decides",
                 }
             ));
         }
@@ -6524,7 +6639,307 @@ mod tests {
                 ));
             }
         }
+        walks_of_the_functions(&mut out);
         out
+    }
+
+    /// What a raw reading of the lock was, for the walk of [`Lock::of`].
+    #[derive(Clone, Copy)]
+    enum LockReading {
+        NotHeld,
+        Held,
+        Failed,
+    }
+
+    impl Every for LockReading {
+        fn first() -> Self {
+            Self::NotHeld
+        }
+
+        fn after(&self) -> Option<Self> {
+            match self {
+                Self::NotHeld => Some(Self::Held),
+                Self::Held => Some(Self::Failed),
+                Self::Failed => None,
+            }
+        }
+    }
+
+    impl Label for LockReading {
+        fn label(&self) -> String {
+            match self {
+                Self::NotHeld => "not_held",
+                Self::Held => "held",
+                Self::Failed => "failed",
+            }
+            .to_owned()
+        }
+    }
+
+    impl LockReading {
+        fn raw(self) -> std::result::Result<bool, Shown> {
+            match self {
+                Self::NotHeld => Ok(false),
+                Self::Held => Ok(true),
+                Self::Failed => Err(Shown::said("the lock could not be taken")),
+            }
+        }
+    }
+
+    /// What the system said of the process, raw, for the walk of [`Process::of`]: none where the
+    /// command has no identity.
+    #[derive(Clone, Copy)]
+    enum ProcessReading {
+        NoIdentity,
+        Running,
+        Ended,
+        Unknown,
+    }
+
+    impl Every for ProcessReading {
+        fn first() -> Self {
+            Self::NoIdentity
+        }
+
+        fn after(&self) -> Option<Self> {
+            match self {
+                Self::NoIdentity => Some(Self::Running),
+                Self::Running => Some(Self::Ended),
+                Self::Ended => Some(Self::Unknown),
+                Self::Unknown => None,
+            }
+        }
+    }
+
+    impl Label for ProcessReading {
+        fn label(&self) -> String {
+            match self {
+                Self::NoIdentity => "no_identity",
+                Self::Running => "running",
+                Self::Ended => "ended",
+                Self::Unknown => "unknown",
+            }
+            .to_owned()
+        }
+    }
+
+    impl ProcessReading {
+        fn raw(self) -> Option<ProcessState> {
+            match self {
+                Self::NoIdentity => None,
+                Self::Running => Some(ProcessState::Running),
+                Self::Ended => Some(ProcessState::Ended),
+                Self::Unknown => Some(ProcessState::Unknown {
+                    detail: "the system did not say".to_owned(),
+                }),
+            }
+        }
+    }
+
+    impl Every for ErrorSource {
+        fn first() -> Self {
+            Self::Reply
+        }
+
+        fn after(&self) -> Option<Self> {
+            match self {
+                Self::Reply => Some(Self::Closure),
+                Self::Closure => Some(Self::OwnFault),
+                Self::OwnFault => None,
+            }
+        }
+    }
+
+    impl Label for ErrorSource {
+        fn label(&self) -> String {
+            match self {
+                Self::Reply => "reply",
+                Self::Closure => "closure",
+                Self::OwnFault => "own_fault",
+            }
+            .to_owned()
+        }
+    }
+
+    impl Label for Route {
+        fn label(&self) -> String {
+            match self {
+                Self::Reply => "reply: an answer, nothing is looked at",
+                Self::OwnFault => "own_fault: nothing is looked at",
+                Self::TheEnd => "the_end: the daemon's end is looked for",
+            }
+            .to_owned()
+        }
+    }
+
+    impl Every for Decided {
+        fn first() -> Self {
+            Self::Ended(End::Gone)
+        }
+
+        fn after(&self) -> Option<Self> {
+            match self {
+                Self::Ended(End::Gone) => Some(Self::Ended(End::Successor(Some(5000)))),
+                Self::Ended(End::Successor(Some(_))) => Some(Self::Ended(End::Successor(None))),
+                Self::Ended(End::Successor(None)) => Some(Self::NotShown),
+                Self::NotShown => Some(Self::Answers(an_answer())),
+                Self::Answers(_) => None,
+                // A decision of the wait never holds an end that is not shown.
+                Self::Ended(End::NotEnded(..)) => None,
+            }
+        }
+    }
+
+    impl Label for Waited<'_> {
+        fn label(&self) -> String {
+            format!(
+                "waits_for={} json_pid={}",
+                self.old
+                    .map_or_else(|| "-".to_owned(), |old| old.pid.get().to_string()),
+                self.pid
+                    .map_or_else(|| "-".to_owned(), |pid| pid.to_string())
+            )
+        }
+    }
+
+    /// What a retry category is called in the table: its wire spelling.
+    fn category_label(category: RetryCategory) -> &'static str {
+        match category {
+            RetryCategory::NoRetry => "no_retry",
+            RetryCategory::Transient => "transient",
+            RetryCategory::Resync => "resync",
+            RetryCategory::ConfigurationChange => "configuration_change",
+            RetryCategory::OutcomeUnknown => "outcome_unknown",
+        }
+    }
+
+    impl Label for Split {
+        fn label(&self) -> String {
+            match self {
+                Self::Refused => "refused: nothing was taken, no wait",
+                Self::MaybeAsked => {
+                    "maybe_asked: the daemon is waited for as one that took the stop"
+                }
+            }
+            .to_owned()
+        }
+    }
+
+    /// The categories of every error code, each once, in the order of their names.
+    fn categories_of_every_code() -> Vec<RetryCategory> {
+        let mut all: Vec<RetryCategory> = Vec::new();
+        for code in ErrorCode::ALL {
+            let category = code.retry_category();
+            if !all.contains(&category) {
+                all.push(category);
+            }
+        }
+        all.sort_by_key(|category| category_label(*category));
+        all
+    }
+
+    /// The walks of the functions that decide a result which is the input of a section above:
+    /// each is printed by calling the product's own function over every value of what it takes.
+    fn walks_of_the_functions(out: &mut String) {
+        out.push_str("\n## the lock's reading, as the wait reads it\n");
+        for reading in every::<LockReading>() {
+            out.push_str(&format!(
+                "reading={} -> lock={}\n",
+                reading.label(),
+                Lock::of(reading.raw()).label()
+            ));
+        }
+        out.push_str("\n## the process's reading, as the wait reads it\n");
+        for reading in every::<ProcessReading>() {
+            out.push_str(&format!(
+                "reading={} -> process={}\n",
+                reading.label(),
+                Process::of(reading.raw()).label()
+            ));
+        }
+        out.push_str(
+            "\n## the process that the lock file names: the process it names, the identity of the asked process\n",
+        );
+        for named in every::<Named>() {
+            for identity in every::<Identity>() {
+                out.push_str(&format!(
+                    "named={} identity={} -> holder={}\n",
+                    named.label(),
+                    identity.label(),
+                    Holder::of(named.pid(), identity.of().as_ref()).label()
+                ));
+            }
+        }
+        out.push_str(
+            "\n## a request that could not be made: where a failure goes, by its source\n",
+        );
+        for source in every::<ErrorSource>() {
+            out.push_str(&format!(
+                "source={} -> {}\n",
+                source.label(),
+                route_of(source).label()
+            ));
+        }
+        out.push_str("\n## a request that could not be made: what a failure that the daemon's end can cause came to, by what the wait decided\n");
+        for accepted in [true, false] {
+            for decided in every::<Decided>() {
+                let label = match &decided {
+                    Decided::Ended(End::Successor(successor)) => format!(
+                        "ended_by_a_successor({})",
+                        successor.map_or_else(|| "-".to_owned(), |pid| pid.to_string())
+                    ),
+                    Decided::Ended(End::Gone | End::NotEnded(..))
+                    | Decided::NotShown
+                    | Decided::Answers(_) => decided.label(),
+                };
+                let before = before_by_the_wait(
+                    decided,
+                    accepted,
+                    an_environment(),
+                    Some(4000),
+                    &Shown::said("the connection was closed"),
+                );
+                let pid = match &before {
+                    Before::Ended { pid, .. } => {
+                        format!(
+                            " pid={}",
+                            pid.map_or_else(|| "-".to_owned(), |pid| pid.to_string())
+                        )
+                    }
+                    Before::Silent { .. } | Before::Answers(_) | Before::OwnFault => String::new(),
+                };
+                out.push_str(&format!(
+                    "accepted={} decided={} -> before={}{}\n",
+                    if accepted { "yes" } else { "no" },
+                    label,
+                    before.label(),
+                    pid
+                ));
+            }
+        }
+        out.push_str("\n## the process that the end of a stop is waited for by: the process that the lock file named, the process that the answer named\n");
+        for named in [None, Some(4000_u64)] {
+            for answered in [None, Some(4000_u64), Some(4001)] {
+                let holder = named.map(|_| asked_process());
+                let waited = process_waited_for(holder.as_ref(), answered);
+                out.push_str(&format!(
+                    "named={} answer={} -> {}\n",
+                    named.map_or_else(|| "none".to_owned(), |pid| pid.to_string()),
+                    answered.map_or_else(|| "none".to_owned(), |pid| pid.to_string()),
+                    waited.label()
+                ));
+            }
+        }
+        out.push_str(
+            "\n## the stop: where a refusal goes, by the retry category of its code (every code's category)\n",
+        );
+        for category in categories_of_every_code() {
+            out.push_str(&format!(
+                "category={} -> {}\n",
+                category_label(category),
+                split_of(category).label()
+            ));
+        }
     }
 
     /// The table that the code makes is the table that the repository holds: a change of a
