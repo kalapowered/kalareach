@@ -91,10 +91,29 @@ impl Host {
 }
 
 async fn host() -> Host {
-    let temp = kr_ipc::testing::TempHost::create();
+    host_over(
+        kr_ipc::testing::TempHost::create(),
+        SessionId::new(kr_ipc::new_uuid()),
+        1,
+        None,
+        |_| {},
+    )
+    .await
+}
+
+/// A host over the environment of `temp`, for `session_id`, serving the endpoint of display
+/// `display` and vouched for by `controller` where an earlier host of the environment made one.
+/// `prepare` is given the journal's path after its directory exists and before the session opens,
+/// so that a test can leave the journal in a state the open then reads.
+async fn host_over(
+    temp: kr_ipc::testing::TempHost,
+    session_id: SessionId,
+    display: u64,
+    controller: Option<Arc<ControllerIdentity>>,
+    prepare: impl FnOnce(&std::path::Path),
+) -> Host {
     let environment = temp.environment();
     let environment_id = temp.environment_id();
-    let session_id = SessionId::new(kr_ipc::new_uuid());
     let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
     let current = kr_ipc::identity::current_process_start_identity().expect("a process identity");
     let identity = Arc::new(
@@ -107,17 +126,19 @@ async fn host() -> Host {
         )
         .expect("a session key"),
     );
-    let store =
-        kr_crypto::store::open_store_in(&environment.secrets_dir()).expect("a secret store");
-    let controller = Arc::new(
-        ControllerIdentity::initialise(store.store.as_ref(), environment_id)
-            .expect("a controller identity"),
-    );
+    let controller = controller.unwrap_or_else(|| {
+        let store =
+            kr_crypto::store::open_store_in(&environment.secrets_dir()).expect("a secret store");
+        Arc::new(
+            ControllerIdentity::initialise(store.store.as_ref(), environment_id)
+                .expect("a controller identity"),
+        )
+    });
     let config = SessionConfig {
         session_id,
         session_epoch: SessionEpoch::V1,
         environment_id,
-        display_number: DisplayNumber::new(1),
+        display_number: DisplayNumber::new(display),
         shell: kr_worker::testing::posix_script("exec cat"),
         shell_mode: ShellMode::NativeCompat,
         worker_profile: WorkerProfile::HeadlessUser,
@@ -135,6 +156,7 @@ async fn host() -> Host {
     if let Some(parent) = journal_path.parent() {
         std::fs::create_dir_all(parent).expect("the journal directory");
     }
+    prepare(&journal_path);
     let mut session = TerminalSession::open(config).expect("opens the session");
     session.launch().expect("launches the shell");
     let runtime = Arc::new(
@@ -142,7 +164,7 @@ async fn host() -> Host {
             .expect("starts the runtime"),
     );
     let endpoint = environment
-        .worker_endpoint(DisplayNumber::new(1))
+        .worker_endpoint(DisplayNumber::new(display))
         .expect("an endpoint");
     let listener = Listener::bind(&endpoint).expect("binds the endpoint");
     let service = Arc::new(
@@ -1156,4 +1178,224 @@ async fn kr_req_23_34_a_workflow_ingress_reaches_neither_a_read_of_a_receipt_nor
         .expect_err("a workflow does not read a receipt");
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused}");
     assert_eq!(held(&host, asked.question_id).state, QuestionState::Pending);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The fence on a settled result while its removal is owed or the privacy state cannot be read
+// ---------------------------------------------------------------------------------------------
+
+/// A device answers a question and the session ends; a second host then opens over the same
+/// journal, which `prepare` has changed before its session opens. Returns the second host, the
+/// answer's parameters, its action, and the bytes the first session kept as its result.
+async fn reopened_after_an_answer(
+    prepare: impl FnOnce(&std::path::Path),
+) -> (Host, QuestionAnswerParams, ActionId, Vec<u8>) {
+    let first = host().await;
+    let mut daemon = daemon(&first).await;
+    let asked = ask(&first, "fenced");
+    let params = yes(&first, &asked);
+    let answered = action();
+    forward(
+        &mut daemon,
+        &first,
+        &device("phone"),
+        &reaching(0),
+        answered,
+        Method::QuestionAnswer,
+        &params,
+    )
+    .await
+    .expect("answered");
+    let stored = kept(&first, &device("phone").actor_id, answered).expect("a result is kept");
+    let (_, gate) = first
+        .service
+        .runtime()
+        .close(kr_protocol::session::ClosureReason::CloseRequested);
+    gate.release();
+    let _ = tokio::time::timeout(LIVENESS_DEADLINE, first.service.runtime().wait_closed()).await;
+    let Host {
+        _temp: temp,
+        session_id,
+        controller,
+        ..
+    } = first;
+    let second = host_over(temp, session_id, 2, Some(controller), prepare).await;
+    (second, params, answered, stored)
+}
+
+/// What the second host answers a device that reads the receipt and a device that asks again with
+/// the same payload: the question each shows, or `None` where the result is not shown.
+async fn what_the_readers_show(
+    host: &Host,
+    daemon: &mut BoundLink,
+    params: &QuestionAnswerParams,
+    answered: ActionId,
+) -> (Option<String>, Option<String>) {
+    let phone = device("phone");
+    let read = read_action(daemon, &phone, &reaching(0), answered)
+        .await
+        .expect("the receipt reads");
+    assert_eq!(read.receipt.state, ReceiptState::Applied);
+    let read_shows = read.result.as_ref().map(|result| {
+        resolved(result.clone())
+            .question()
+            .expect("a result that is shown shows the question")
+            .question
+            .clone()
+    });
+    let again = forward(
+        daemon,
+        host,
+        &phone,
+        &reaching(0),
+        answered,
+        Method::QuestionAnswer,
+        params,
+    )
+    .await
+    .expect("a duplicate is answered");
+    // A duplicate with no result to give is answered with the receipt as it stands.
+    let replay_shows = match again.to_typed::<ReceiptResponse>() {
+        Ok(response) => {
+            assert_eq!(response.receipt.state, ReceiptState::Applied);
+            None
+        }
+        Err(_) => Some(
+            resolved(again)
+                .question()
+                .expect("a result that is shown shows the question")
+                .question
+                .clone(),
+        ),
+    };
+    (read_shows, replay_shows)
+}
+
+fn the_question() -> Option<String> {
+    Some("Push the branch anyway?".to_owned())
+}
+
+fn put_the_record_right(host: &Host, generation: i64, enabled: i64) {
+    rusqlite::Connection::open(&host.journal_path)
+        .expect("the journal")
+        .execute(
+            "UPDATE privacy SET generation = ?1, enabled = ?2 WHERE id = 1",
+            [generation, enabled],
+        )
+        .expect("the record is put right");
+}
+
+fn collect(host: &Host) -> bool {
+    let mut session = host.service.runtime().session();
+    session.collect_expired();
+    session.privacy_cleanup_failure().is_none()
+}
+
+fn make_the_record_unreadable(journal: &std::path::Path) {
+    rusqlite::Connection::open(journal)
+        .expect("the journal")
+        .execute(
+            "UPDATE privacy SET generation = 'unreadable' WHERE id = 1",
+            [],
+        )
+        .expect("the record is made unreadable");
+}
+
+/// A session that cannot read its privacy state shows neither `action.read` nor a duplicate of
+/// the action the result it kept, and shows both whole once the state reads as off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_result_is_not_shown_while_the_state_cannot_be_read_and_is_shown_again_when_it_reads_off()
+{
+    let (host, params, answered, stored) =
+        reopened_after_an_answer(make_the_record_unreadable).await;
+    let mut daemon = daemon(&host).await;
+    assert!(
+        host.service
+            .runtime()
+            .session()
+            .privacy_cleanup_failure()
+            .is_some()
+    );
+    assert_eq!(
+        what_the_readers_show(&host, &mut daemon, &params, answered).await,
+        (None, None)
+    );
+    assert_eq!(
+        kept(&host, &device("phone").actor_id, answered),
+        Some(stored.clone()),
+        "the store still holds what no reader is shown"
+    );
+
+    put_the_record_right(&host, 0, 0);
+    assert!(collect(&host));
+    assert_eq!(
+        what_the_readers_show(&host, &mut daemon, &params, answered).await,
+        (the_question(), the_question())
+    );
+    assert_eq!(
+        kept(&host, &device("phone").actor_id, answered),
+        Some(stored),
+        "nothing that was never private was removed"
+    );
+}
+
+/// The same session, whose state then reads as on, removes the result and every reader agrees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_result_is_removed_when_a_state_that_could_not_be_read_reads_on() {
+    let (host, params, answered, _) = reopened_after_an_answer(make_the_record_unreadable).await;
+    let mut daemon = daemon(&host).await;
+    assert_eq!(
+        what_the_readers_show(&host, &mut daemon, &params, answered).await,
+        (None, None)
+    );
+    put_the_record_right(&host, 1, 1);
+    assert!(collect(&host));
+    assert_eq!(
+        what_the_readers_show(&host, &mut daemon, &params, answered).await,
+        (None, None)
+    );
+    assert_eq!(kept(&host, &device("phone").actor_id, answered), None);
+}
+
+/// A session reopened under privacy mode whose store refuses the removal owes it: no reader is
+/// shown the result, the store still holds it, and the removal when the store accepts it leaves
+/// the readers saying the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_result_is_not_shown_while_its_removal_is_owed() {
+    let (host, params, answered, stored) = reopened_after_an_answer(|journal| {
+        let store = rusqlite::Connection::open(journal).expect("the journal");
+        store
+            .execute(
+                "UPDATE privacy SET generation = 1, enabled = 1 WHERE id = 1",
+                [],
+            )
+            .expect("privacy mode is recorded as on");
+        store
+            .execute_batch(
+                "CREATE TRIGGER refuse_removal BEFORE DELETE ON results
+                 BEGIN SELECT RAISE(ABORT, 'the store refuses'); END;",
+            )
+            .expect("the store is made to refuse");
+    })
+    .await;
+    let mut daemon = daemon(&host).await;
+    assert_eq!(
+        what_the_readers_show(&host, &mut daemon, &params, answered).await,
+        (None, None)
+    );
+    assert_eq!(
+        kept(&host, &device("phone").actor_id, answered),
+        Some(stored)
+    );
+
+    rusqlite::Connection::open(&host.journal_path)
+        .expect("the journal")
+        .execute_batch("DROP TRIGGER refuse_removal")
+        .expect("the store accepts again");
+    assert!(collect(&host));
+    assert_eq!(
+        what_the_readers_show(&host, &mut daemon, &params, answered).await,
+        (None, None)
+    );
+    assert_eq!(kept(&host, &device("phone").actor_id, answered), None);
 }

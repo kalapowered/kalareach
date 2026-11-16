@@ -696,9 +696,17 @@ impl Session {
         // removal that the first maintenance pass makes, and until it has, or until a session that
         // cannot read its state reads that privacy mode is off, no reader is told of a byte of it.
         // To hide for a while a history that may not be private is the lesser harm.
+        //
+        // The receipts are fenced by the same reading and for the same time: until the removal of
+        // their content has run, or the state is read as off, no reader is told of a settled
+        // receipt's result or envelope. The journal is still this function's own here, so the
+        // fence is up before any reader can reach it.
         if privacy.is_enabled() || unresolved {
             history.stop_retaining();
             history.set_discard_owed(true);
+        }
+        if let Some(journal) = journal.as_mut() {
+            journal.set_content_owed(privacy.is_enabled() || unresolved);
         }
         // The same reading decides whether facts are captured: a session that cannot say privacy
         // mode is off captures none.
@@ -4611,6 +4619,7 @@ impl Session {
         // reader is told of it.
         self.history
             .set_discard_owed(self.privacy_cleanup.history.is_some());
+        self.settle_receipt_fence();
         Ok(enabling)
     }
 
@@ -4794,6 +4803,7 @@ impl Session {
                         self.privacy_cleanup.receipts = None;
                         self.history.resume_retaining();
                         self.history.set_discard_owed(false);
+                        self.settle_receipt_fence();
                         return;
                     }
                 }
@@ -4815,6 +4825,20 @@ impl Session {
                 // unresolved obligation above returns first.
                 None => self.privacy_cleanup.receipts = None,
             }
+            self.settle_receipt_fence();
+        }
+    }
+
+    /// Raises the fence on settled receipts' content while this session owes its removal or cannot
+    /// read whether privacy mode is on, and lowers it when neither is so.
+    ///
+    /// Called wherever the obligations change, so that the journal's readers answer from the
+    /// obligations as they stand ([`crate::journal::Journal::set_content_owed`]).
+    fn settle_receipt_fence(&mut self) {
+        let owed =
+            self.privacy_cleanup.unresolved.is_some() || self.privacy_cleanup.receipts.is_some();
+        if let Some(journal) = self.journal.as_mut() {
+            journal.set_content_owed(owed);
         }
     }
 
