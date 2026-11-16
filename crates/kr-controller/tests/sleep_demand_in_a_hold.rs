@@ -20,6 +20,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use kr_ipc::clock::{ManualSharedClock, SharedClock};
 use kr_protocol::broker::IntegrationMode;
 use kr_protocol::desktop::SleepInhibitionSetting;
 use kr_protocol::gateway::NativeFraming;
@@ -48,6 +49,9 @@ const REACH: Duration = Duration::from_secs(20);
 const WATCH: Duration = Duration::from_secs(3);
 /// How long a case waits for the host's count to come to a value it expects.
 const COUNT_BOUND: Duration = Duration::from_secs(60);
+/// How long the short question lives, on the worker's clock and on the wall clock: an hour, so that
+/// only the case's move of the worker's clock makes it due.
+const SHORT_EXPIRY_MS: u64 = 3_600_000;
 
 const AGENT_NOW: TimestampMs = TimestampMs::new(10);
 const AGENT_START: &str = r#"{"id":1,"method":"thread/start","params":{}}"#;
@@ -74,10 +78,25 @@ struct Rig {
 
 impl Rig {
     async fn start() -> Self {
+        Self::start_on(None).await
+    }
+
+    /// As [`Self::start`], for a worker whose runtime reads `clock`, the continuous clock that a
+    /// question's deadline is measured on and that the case moves by hand.
+    async fn start_on_a_clock(clock: &ManualSharedClock) -> Self {
+        Self::start_on(Some(Arc::new(clock.clone()))).await
+    }
+
+    async fn start_on(shared_clock: Option<Arc<dyn SharedClock>>) -> Self {
         let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
         document.preferences.sleep_inhibition =
             kr_protocol::scalars::Nullable::some(SleepInhibitionSetting::BatteryToo);
-        let adopted = Adopted::start_with_document(1, &document).await;
+        let adopted = match shared_clock {
+            Some(clock) => {
+                Adopted::start_with_document_on_a_shared_clock(1, &document, clock).await
+            }
+            None => Adopted::start_with_document(1, &document).await,
+        };
         let mut agent = bind_agent(&adopted.workers[0]).await;
         agent.selects_a_thread().await;
         Self { agent, adopted }
@@ -120,6 +139,19 @@ impl Rig {
                 "{what}: the host counted {counted:?} and never {expected:?}"
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Reads the host's count `scans` times and fails at the first read that is not `expected`.
+    /// Each read makes a scan of its own, which reads the worker's answer as it stands, so what a
+    /// state that is already there makes of the count is seen at the first read.
+    async fn counts_stay_for_scans(&self, expected: (u64, u64), scans: usize, what: &str) {
+        for scan in 1..=scans {
+            let counted = self.counts().await;
+            assert_eq!(
+                counted, expected,
+                "{what}: scan {scan} of the host counted {counted:?} and not {expected:?} while the hold stood"
+            );
         }
     }
 
@@ -449,16 +481,24 @@ async fn a_turn_that_starts_behind_a_stalled_broker_commit_keeps_the_count() {
 }
 
 /// Two questions are open and the scan counted them. A storage call holds the session by a write
-/// transaction in the file that the question ledger shares, one question runs out of time, and
-/// the ledger's expiry write fails after its busy wait. The other question stays open, so the
+/// transaction in the file that the question ledger shares, and only then does one question run
+/// out of time, by the worker's clock, which the case moves by hand. The ledger's reader writes
+/// the question's expiry, which fails after its busy wait. The other question stays open, so the
 /// host keeps counting a request waiting for a person.
-/// The hold stands past the busy wait, and a probe on the case's own thread shows that the ledger's
-/// read fails inside it, so a scan and a reader that took the error for no question (the base's)
-/// fail this case.
+///
+/// The order of events, each step confirmed by what the case observes and none by a delay:
+/// the scan counts both questions; the prune's hold is confirmed by its arrival; the clock moves
+/// past the short question's deadline, which was far off until then; the loop is woken, which asks
+/// the reader; the reader's own failed read is confirmed by the count of its failed reads (which
+/// rises once the reader has dealt with the failure); then the host's scan is read, a scan for each
+/// read, while the hold still stands. A scan and a reader that took the error for no question (the
+/// base's) show the lower count at the first of those reads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_question_whose_expiry_write_fails_beside_one_that_stays_open_keeps_the_count() {
-    let rig = Rig::start().await;
+    let clock = ManualSharedClock::new();
+    let rig = Rig::start_on_a_clock(&clock).await;
     let worker = rig.worker();
+    let producer = Arc::clone(worker.service.application());
     let ask = |request: &str, expiry_ms: Option<u64>| {
         worker
             .service
@@ -488,12 +528,13 @@ async fn a_question_whose_expiry_write_fails_beside_one_that_stays_open_keeps_th
                 },
                 kr_worker::questions::Now {
                     utc_ms: kr_ipc::now_ms(),
-                    boot_ms: kr_ipc::clock::boot_elapsed_ms(),
+                    boot_ms: clock.boot_elapsed_ms(),
                 },
             )
             .expect("a verified source asks");
     };
-    ask("short", Some(4_000));
+    // The short question is due an hour on the worker's clock from now, and the long one a day.
+    ask("short", Some(SHORT_EXPIRY_MS));
     ask("long", None);
     rig.counts_become(ASKED, "the scan sees the questions")
         .await;
@@ -514,44 +555,25 @@ async fn a_question_whose_expiry_write_fails_beside_one_that_stays_open_keeps_th
         rig.the_worker_answers_held().await,
         "the worker did not give a held answer while the prune stood"
     );
-    // The short question runs out of time while the hold stands, and the loop's wake asks the
-    // ledger's reader, whose expiry write meets the write lock and fails after its busy wait.
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    rig.agent.says(TURN_7_STARTED).await;
-    rig.agent.says(TURN_7_ENDED).await;
-    // What the case stands on: the same read on a thread of the case's own fails before the hold
-    // ends, because the write that the due question needs meets the write lock and gives up after
-    // its busy wait of five seconds. The ledger's reader makes this read at the frames above, so its
-    // error is there by the time the probe's is.
-    let probe = {
-        let service = Arc::clone(&worker.service);
-        tokio::task::spawn_blocking(move || {
-            service.questions().any_open(kr_worker::questions::Now {
-                utc_ms: kr_ipc::now_ms(),
-                boot_ms: kr_ipc::clock::boot_elapsed_ms(),
-            })
-        })
-    };
-    let read = tokio::time::timeout(Duration::from_secs(20), probe)
-        .await
-        .expect("the probe's read of the ledger returned within a bound")
-        .expect("the probe's thread ended");
-    assert!(
-        read.is_err(),
-        "a read of the ledger said {read:?} while the hold stood: the expiry write did not meet the write lock"
-    );
-    // The ledger's store admits one read at a time, so the reader's read and the probe's wait for
-    // each other, and whichever came second gives up a busy wait of five seconds after the first.
-    // The hold therefore stands for six seconds more, which holds both errors: the host counts
-    // the question that stays open for as long as the hold stands, and a scan that lowered its
-    // count on the reader's error would be seen doing it.
-    rig.counts_stay(ASKED, "after the ledger's expiry write failed")
+    // The hold stands and the short question is not due. The clock moves now, so the question is due
+    // only from here on, and a wake of the loop asks the ledger's reader, whose expiry write meets
+    // the write lock and fails after its busy wait of five seconds.
+    let failed_before = producer.failed_ledger_reads();
+    clock.advance(Duration::from_millis(SHORT_EXPIRY_MS + 1));
+    worker.service.move_application_clock(Duration::ZERO);
+    let began = Instant::now();
+    while producer.failed_ledger_reads() == failed_before {
+        assert!(
+            began.elapsed() < REACH,
+            "the ledger's reader did not fail a read within {REACH:?} of the question falling due: its expiry write did not meet the write lock"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The reader has dealt with its failed read. Each read of the host's count is a scan of its own
+    // that reads the worker's answer as it stands, so a reader that recorded the error as "no
+    // question" is seen at the first one.
+    rig.counts_stay_for_scans(ASKED, 3, "after the ledger's expiry write failed")
         .await;
-    rig.counts_stay(
-        ASKED,
-        "after the second read of the ledger gave up its busy wait",
-    )
-    .await;
     let _ = release.send(());
     pass.await.expect("the maintenance pass ended");
     rig.counts_become(ASKED, "after the hold ended: the long question is open")
