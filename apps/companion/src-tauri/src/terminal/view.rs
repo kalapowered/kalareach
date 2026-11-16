@@ -33,6 +33,7 @@ use kr_client::error::{ClientError, HostWord};
 use kr_client::input::{EndCause, InputEvent, InputEvents, InputLane, InputRefusal, InputTarget};
 use kr_client::ordered::Ordered;
 use kr_client::projection::{Applied, Projection, decode, is_projection_event};
+use kr_client::session::{Session, Settled};
 use kr_client::shown::Shown;
 use kr_keys::{KeyEventKind, Modifiers};
 use kr_protocol::attachment::{
@@ -42,7 +43,7 @@ use kr_protocol::attachment::{
 use kr_protocol::envelope::{ActionTarget, Notification, Outcome, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::hello::PACKAGE_VERSION;
-use kr_protocol::ids::{BuildId, GrantId, InputLeaseEpoch, RequestId, SessionId};
+use kr_protocol::ids::{ActionId, BuildId, GrantId, InputLeaseEpoch, RequestId, SessionId};
 use kr_protocol::input::{InputAcquireParams, InputBarrier, InputReleaseParams};
 use kr_protocol::local::LocalBuild;
 use kr_protocol::method::Method;
@@ -907,6 +908,29 @@ async fn next_lane_event(events: &mut Option<InputEvents>) -> Option<InputEvent>
     match events {
         Some(events) => events.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+/// Settles the action of an ending that the view composed and sent itself, once the host's word on
+/// it is definite: a result, or a refusal that the protocol sorts outside the transient and the
+/// unknown-outcome kinds. The session keeps such an action as unresolved until the view says what
+/// the answer came to, and a view that never did would reach the bound on unresolved actions and
+/// then have every later release, launch and detach refused before any byte went. An answer that
+/// is not definite leaves the action as the session's rule has it: asked after, or sent again.
+async fn settle_when_definite(
+    session: &Session,
+    action_id: ActionId,
+    answered: &Result<Settled, ClientError>,
+) {
+    let definite = match answered {
+        Ok(Settled::Result(_)) => true,
+        Ok(Settled::Receipt(_)) => false,
+        Err(ClientError::Host(refusal)) => HostWord::of(refusal.code).is_definite(),
+        Err(ClientError::ResyncRequired) => true,
+        Err(_) => false,
+    };
+    if definite {
+        session.settle(action_id).await;
     }
 }
 
@@ -1978,15 +2002,15 @@ impl View {
         });
         let call: link::Call = match queued {
             Ok(answer) => Box::pin(async move {
-                match answer.await {
-                    Ok(Ok(settled)) => settled.to_typed::<ParamsValue>(),
+                let answered = match answer.await {
+                    Ok(Ok(settled)) => Ok(settled),
                     // The lane ended before its turn, or past its bound: the view sends it itself.
-                    Ok(Err(ClientError::Withheld)) => {
-                        session.send(&composed).await?.to_typed::<ParamsValue>()
-                    }
+                    Ok(Err(ClientError::Withheld)) => session.send(&composed).await,
                     Ok(Err(failed)) => Err(failed),
                     Err(_) => Err(link::unknown()),
-                }
+                };
+                settle_when_definite(&session, composed.action_id(), &answered).await;
+                answered?.to_typed::<ParamsValue>()
             }),
             Err(_) => self.link.mutate(method, self.target.clone(), params),
         };
