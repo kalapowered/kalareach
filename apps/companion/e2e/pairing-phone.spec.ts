@@ -125,6 +125,41 @@ for (const surface of ['ios', 'android'] as const) {
   }
 }
 
+// A pairing that the managed relay could not take says this phone's own wait once, then lists the
+// paths the service named as text, each on its own line. In the narrowest column at the largest text
+// size a path that is one long word breaks inside the column, and none of it is read as markup.
+test('lists the paths of a pairing the managed relay could not take as text, inside the column, at the largest text size', async ({
+  page
+}) => {
+  await withSystemTextScale(page, LARGEST)
+  // As tall as the column is at this size, so that the picture shows the whole of it.
+  await page.setViewportSize({ width: 320, height: 3600 })
+  await page.goto('/harness.html?surface=ios&tab=hosts&scan=both')
+  await expect(page.locator('.m-shell')).toBeVisible()
+  const paths = [
+    '<b>A direct connection</b> between the devices, which needs no managed relay.',
+    `https://relay.example.org/${'a'.repeat(120)}`
+  ]
+  await page.evaluate((named) => {
+    window.krTestHost?.setPairing({
+      state: {
+        state: 'ended',
+        failure: { kind: 'relay_capacity', tries_left: null, retry_after_seconds: 90, alternatives: named },
+        mode: 'code',
+        service: null
+      }
+    })
+  }, paths)
+  await expect(page.getByTestId('failure-sentence')).toHaveText(
+    "The managed relay could not take this pairing now. Try again in about 2 minutes, or bring this device onto the host's network."
+  )
+  const list = page.getByRole('list', { name: 'Until then:' })
+  await expect(list.getByRole('listitem')).toHaveText(paths)
+  await expect(list.locator('b, a')).toHaveCount(0)
+  await page.locator('.pairing-column').screenshot({ path: shot('relay-capacity-largest') })
+  expect(await overrunning(page, '.pairing-column'), 'nothing runs past the screen').toEqual([])
+})
+
 // A request the host asks a phone to confirm keeps the words the whole width of the
 // row at the default text size on a phone 390 points wide, and the buttons go under them: beside
 // the words they took most of the row, and the title ran a word to a line.
