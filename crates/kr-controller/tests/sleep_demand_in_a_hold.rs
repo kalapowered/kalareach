@@ -142,19 +142,6 @@ impl Rig {
         }
     }
 
-    /// Reads the host's count `scans` times and fails at the first read that is not `expected`.
-    /// Each read makes a scan of its own, which reads the worker's answer as it stands, so what a
-    /// state that is already there makes of the count is seen at the first read.
-    async fn counts_stay_for_scans(&self, expected: (u64, u64), scans: usize, what: &str) {
-        for scan in 1..=scans {
-            let counted = self.counts().await;
-            assert_eq!(
-                counted, expected,
-                "{what}: scan {scan} of the host counted {counted:?} and not {expected:?} while the hold stood"
-            );
-        }
-    }
-
     /// Reads the host's count for [`WATCH`] and fails at the first read that is not `expected`.
     async fn counts_stay(&self, expected: (u64, u64), what: &str) {
         let until = Instant::now() + WATCH;
@@ -490,9 +477,10 @@ async fn a_turn_that_starts_behind_a_stalled_broker_commit_keeps_the_count() {
 /// the scan counts both questions; the prune's hold is confirmed by its arrival; the clock moves
 /// past the short question's deadline, which was far off until then; the loop is woken, which asks
 /// the reader; the reader's own failed read is confirmed by the count of its failed reads (which
-/// rises once the reader has dealt with the failure); then the host's scan is read, a scan for each
-/// read, while the hold still stands. A scan and a reader that took the error for no question (the
-/// base's) show the lower count at the first of those reads.
+/// rises once the reader has dealt with the failure); then the host's count is read for the watch's
+/// length while the hold still stands, as the cases above read it. A scan and a reader that took
+/// the error for no question (the base's) show the lower count in the first scan that hears the
+/// worker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_question_whose_expiry_write_fails_beside_one_that_stays_open_keeps_the_count() {
     let clock = ManualSharedClock::new();
@@ -569,10 +557,12 @@ async fn a_question_whose_expiry_write_fails_beside_one_that_stays_open_keeps_th
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    // The reader has dealt with its failed read. Each read of the host's count is a scan of its own
-    // that reads the worker's answer as it stands, so a reader that recorded the error as "no
-    // question" is seen at the first one.
-    rig.counts_stay_for_scans(ASKED, 3, "after the ledger's expiry write failed")
+    // The reader has dealt with its failed read, and the hold stands. The host's count is read for
+    // the watch's length, as in the cases above: a scan hears the worker only within its patience,
+    // and a scan that hears nothing keeps what it counted, so a reader that recorded the error as
+    // "no question" is seen by the first scan that hears the worker, and the watch is several scans
+    // after a state that is confirmed, not a margin that proves anything.
+    rig.counts_stay(ASKED, "after the ledger's expiry write failed")
         .await;
     let _ = release.send(());
     pass.await.expect("the maintenance pass ended");
