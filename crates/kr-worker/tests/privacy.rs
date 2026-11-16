@@ -1712,3 +1712,32 @@ fn while_the_removal_is_owed_no_reader_of_a_receipt_is_told_its_content_and_the_
     assert_eq!(reads(&session), after_the_removal());
     assert_eq!(what_the_store_holds(&temp, session_id), after_the_removal());
 }
+
+/// A session that could not read its privacy state captures no description facts, and captures
+/// them again, into a record of its own, once the state reads as off.
+#[test]
+fn a_session_that_reads_its_state_as_off_captures_description_facts_again() {
+    let (temp, mut session, session_id) = reopened_with_an_unreadable_privacy_record(false);
+    let facts = session.description_facts();
+    facts.note_intent("a prompt typed while the state cannot be read");
+    let unread = facts.read(0, Some(0));
+    assert!(unread.private, "the facts say they are private");
+    assert!(unread.facts.is_none(), "and hold nothing");
+
+    put_the_privacy_record_right(&temp, session_id, 0, 0);
+    session.collect_expired();
+    facts.note_intent("a prompt typed after the state reads as off");
+    let read = facts.read(0, Some(0));
+    assert!(!read.private, "capture is on again");
+    let record = read
+        .facts
+        .expect("the new prompt is a fact the description gets");
+    assert!(
+        format!("{record:?}").contains("after the state reads as off"),
+        "{record:?}"
+    );
+    assert!(
+        !format!("{record:?}").contains("cannot be read"),
+        "nothing from before the release is brought back: {record:?}"
+    );
+}
