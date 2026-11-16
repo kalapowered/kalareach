@@ -322,7 +322,8 @@ async fn open(
     let (link, mut events, target, serves_launch_surface, states_input_lane) = match reach {
         Reach::Local(locate) => open_local(locate, session_id).await?,
         Reach::Paired(dial, grant_id) => {
-            let (link, events, target) = open_paired(dial, *grant_id, session_id).await?;
+            let transport = dial.transport().await.map_err(not_opened)?;
+            let (link, events, target) = open_over(transport, *grant_id, session_id).await?;
             (link, events, target, None, false)
         }
     };
@@ -461,16 +462,15 @@ fn not_opened(unopened: Unopened) -> OpenFailure {
     }
 }
 
-/// Reaches a paired host on a connection of the view's own and has it open the session for the
-/// view, under the share the screen runs under.
-async fn open_paired(
-    dial: &crate::standing::Dial,
+/// Has a paired host open the session for the view on `transport`, a connection of the view's own,
+/// under the share the screen runs under.
+async fn open_over(
+    transport: Arc<dyn kr_client::transport::ControlTransport>,
     grant_id: Option<GrantId>,
     session_id: SessionId,
 ) -> Result<(Link, Events, ActionTarget), OpenFailure> {
     use kr_protocol::session::{SessionOpenParams, SessionOpenResult};
 
-    let transport = dial.transport().await.map_err(not_opened)?;
     let (link, mut events) =
         Link::over(transport, grant_id).map_err(|lost| OpenFailure::lost(&lost))?;
     let opened = link
