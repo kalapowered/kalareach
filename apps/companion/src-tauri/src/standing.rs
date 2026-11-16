@@ -42,7 +42,7 @@ use tauri::{AppHandle, Emitter as _};
 use tokio::sync::Notify;
 
 use crate::agent::Link;
-use crate::connection::{Asked, HeldAs, Unopened};
+use crate::connection::{Asked, HeldAs, NotReached, Unanswered, Unopened};
 use crate::device::Device;
 use crate::error::{CommandError, Result};
 
@@ -247,7 +247,7 @@ impl Dial {
             pairing.link.connect_paired_transport(&self.host, &identity),
         )
         .await
-        .map_err(|_| Unopened::unreached("the host did not answer in time"))?
+        .map_err(|_| Unopened::unreached(NotReached::NoAnswerInTime))?
         .map_err(|error| match error {
             // A connection that could not be given the lease the host needs, or whose account left,
             // is waited out: the opening stands and its watch dials again, as for a host that did
@@ -266,7 +266,11 @@ impl Dial {
         grant_id: Option<GrantId>,
     ) -> std::result::Result<Opening, Unopened> {
         let transport = self.transport().await?;
-        let session = Session::start(transport).map_err(|error| Unopened::unreached_by(&error))?;
+        let session = Session::start(transport).map_err(|error| match Unanswered::of(error) {
+            Ok(silence) => Unopened::unreached_by(silence),
+            // A host's answer is the host's, wherever it comes.
+            Err(answer) => Unopened::of_read(Asked::SessionOpen, ClientError::Host(answer)),
+        })?;
         let opened = tokio::time::timeout(
             OPEN_WITHIN,
             session.read::<_, SessionOpenResult>(
@@ -280,32 +284,29 @@ impl Dial {
         .await;
         let opened = match opened {
             Ok(Ok(opened)) => opened,
-            Ok(Err(ClientError::Host(refusal))) => {
-                // The host refused the connection, which the session tells from a refusal of this
-                // request, or it refused the request.
-                let unopened =
-                    Unopened::of_connection(&session, &ClientError::Host(refusal.clone()))
-                        .unwrap_or_else(|| {
-                            Unopened::Refused(Asked::SessionOpen, CommandError::from(refusal))
-                        });
-                session.close();
-                return Err(unopened);
-            }
-            Ok(Err(other)) => {
-                // This device ended the connection, because the account left or the keeper holds
-                // no lease the host took, and says so.
-                let unopened = match session.transport().ended_by_this_device() {
-                    Some(end) => Unopened::of_stop(end.error, end.action, HeldAs::Waited),
-                    None => Unopened::unreached_by(&other),
+            Ok(Err(error)) => {
+                let unopened = match Unanswered::of(error) {
+                    // The host refused the connection, which the session tells from a refusal of
+                    // this request, or it refused the request.
+                    Err(refusal) => {
+                        Unopened::of_connection(&session, &ClientError::Host(refusal.clone()))
+                            .unwrap_or_else(|| {
+                                Unopened::Refused(Asked::SessionOpen, CommandError::from(refusal))
+                            })
+                    }
+                    // This device ended the connection, because the account left or the keeper
+                    // holds no lease the host took, and says so.
+                    Ok(silence) => match session.transport().ended_by_this_device() {
+                        Some(end) => Unopened::of_stop(end.error, end.action, HeldAs::Waited),
+                        None => Unopened::unreached_by(silence),
+                    },
                 };
                 session.close();
                 return Err(unopened);
             }
             Err(_) => {
                 session.close();
-                return Err(Unopened::unreached(
-                    "the host did not open the session in time",
-                ));
+                return Err(Unopened::unreached(NotReached::SessionNotOpenedInTime));
             }
         };
         match opened {
@@ -323,9 +324,7 @@ impl Dial {
                 let standing = standing_of(&opened);
                 let Some(summary) = summary.0.clone() else {
                     session.close();
-                    return Err(Unopened::unreached(
-                        "the host opened a connection for no session",
-                    ));
+                    return Err(Unopened::unreached(NotReached::NoSessionOpened));
                 };
                 let link = Arc::new(Link::paired(
                     session,

@@ -174,9 +174,7 @@ impl Connection {
         match &self.reopen {
             // The one opened can be opened from again: it may take the place of this one.
             Some(reopen) => Ok(reopen().await?.reopening(Arc::clone(reopen))),
-            None => Err(Unopened::unreached(
-                "this application cannot open a second connection to this host",
-            )),
+            None => Err(Unopened::unreached(NotReached::NoSecondConnection)),
         }
     }
 
@@ -249,7 +247,7 @@ impl Connection {
         };
         let session = tokio::time::timeout(CONNECT_WITHIN, connecting)
             .await
-            .map_err(|_| Unopened::unreached("the host did not answer in time"))?
+            .map_err(|_| Unopened::unreached(NotReached::NoAnswerInTime))?
             .map_err(Unopened::of_link)?;
         // The connection is bound to the account signed in when it was dialled (`crate::bound`): if
         // that account left while the host was asked who it is, or at any time before this
@@ -263,7 +261,7 @@ impl Connection {
                 ),
             )
             .await
-            .map_err(|_| Unopened::unreached("the host did not say which environment it is"))?
+            .map_err(|_| Unopened::unreached(NotReached::EnvironmentNotSaid))?
             .map_err(|error| Unopened::of_call(&session, Asked::HostInfo, error))?;
             let rights = open_for_the_host(&session).await?;
             Ok::<_, Unopened>((info, rights))
@@ -361,7 +359,7 @@ async fn open_for_the_host(session: &Session) -> std::result::Result<Vec<ActionR
         ),
     )
     .await
-    .map_err(|_| Unopened::unreached("the host did not open the connection in time"))?
+    .map_err(|_| Unopened::unreached(NotReached::ConnectionNotOpenedInTime))?
     .map_err(|error| {
         Unopened::of_connection(session, &error).unwrap_or_else(|| match error {
             kr_client::ClientError::Host(refusal) => opening_refused(refusal),
@@ -445,6 +443,62 @@ pub(crate) enum HeldAs {
     Waited,
 }
 
+/// The causes of a host not being reached that this application says in words of its own: a closed
+/// set, each with the one sentence that tells it. The helper for a host that was not reached
+/// ([`Unopened::unreached`]) takes one of these and no text, so no sentence of a stop of the lease,
+/// or any other cause's, can be given to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NotReached {
+    /// The host did not answer a dial or a read in time.
+    NoAnswerInTime,
+    /// The host did not say which environment it is.
+    EnvironmentNotSaid,
+    /// The host did not open the connection in time.
+    ConnectionNotOpenedInTime,
+    /// The host did not open the session in time.
+    SessionNotOpenedInTime,
+    /// The host opened a connection that holds no session.
+    NoSessionOpened,
+    /// This connection cannot be opened a second time.
+    NoSecondConnection,
+}
+
+impl NotReached {
+    /// The sentence that tells this cause.
+    pub(crate) const fn words(self) -> &'static str {
+        match self {
+            Self::NoAnswerInTime => "the host did not answer in time",
+            Self::EnvironmentNotSaid => "the host did not say which environment it is",
+            Self::ConnectionNotOpenedInTime => "the host did not open the connection in time",
+            Self::SessionNotOpenedInTime => "the host did not open the session in time",
+            Self::NoSessionOpened => "the host opened a connection for no session",
+            Self::NoSecondConnection => {
+                "this application cannot open a second connection to this host"
+            }
+        }
+    }
+}
+
+/// A client error that is no answer of a host's, which is the only kind the helpers for a host that
+/// was not reached take ([`Unopened::unreached_by`], [`Unopened::lost`]). A stop of the lease
+/// reaches a client as the host's own answer ([`kr_client::ClientError::Host`]), so a stop's
+/// sentence cannot be held here: [`Self::of`] gives a host's answer back and holds nothing else of
+/// it.
+#[derive(Debug)]
+pub(crate) struct Unanswered(kr_client::ClientError);
+
+impl Unanswered {
+    /// The error as one that is no answer of a host's, or the host's answer when it is one.
+    pub(crate) fn of(
+        error: kr_client::ClientError,
+    ) -> std::result::Result<Self, kr_protocol::error::ProtocolError> {
+        match error {
+            kr_client::ClientError::Host(answer) => Err(answer),
+            other => Ok(Self(other)),
+        }
+    }
+}
+
 /// Why a dial or a call did not get its connection to a paired host.
 ///
 /// The cause is made where it is known and carried on unchanged: no text for a person is chosen
@@ -482,18 +536,18 @@ pub enum Unopened {
 }
 
 impl Unopened {
-    /// A host that was not reached, in words fixed in this program. It takes no other text, so a
-    /// route that holds a stop of the lease cannot be given the failure of a host that did not
-    /// answer, whose action is a wait: a stop goes through [`Self::of_stop`], and another
-    /// cause of a failure through the constructor of its own ([`Self::unreached_by`],
-    /// [`Self::lost`]).
-    pub(crate) fn unreached(reason: &'static str) -> Self {
-        Self::Unreached(CommandError::unavailable(reason))
+    /// A host that was not reached, for one of this application's own causes ([`NotReached`]). It
+    /// takes no text, so a route that holds a stop of the lease cannot be given the failure of a host
+    /// that did not answer, whose action is a wait: a stop goes through [`Self::of_stop`], and
+    /// another cause of a failure through the constructor of its own ([`Self::unreached_by`],
+    /// [`Self::lost`]), which take a client error that is no answer of a host's ([`Unanswered`]).
+    pub(crate) fn unreached(cause: NotReached) -> Self {
+        Self::Unreached(CommandError::unavailable(cause.words()))
     }
 
-    /// A host that was not reached for the reason a client error says.
-    pub(crate) fn unreached_by(error: &kr_client::ClientError) -> Self {
-        Self::Unreached(CommandError::unavailable(error.said().into_string()))
+    /// A host that was not reached for the reason a client error says, which is no host's answer.
+    pub(crate) fn unreached_by(error: Unanswered) -> Self {
+        Self::Unreached(CommandError::unavailable(error.0.said().into_string()))
     }
 
     /// The ONE conversion of a stop of the lease into what a route shows: its words and the action
@@ -544,9 +598,12 @@ impl Unopened {
     /// and otherwise that the host was not reached.
     #[must_use]
     pub fn of_read(asked: Asked, error: kr_client::ClientError) -> Self {
-        match error {
-            kr_client::ClientError::Host(_) => Self::Refused(asked, CommandError::from(error)),
-            other => Self::lost(other),
+        match Unanswered::of(error) {
+            Err(answer) => Self::Refused(
+                asked,
+                CommandError::from(kr_client::ClientError::Host(answer)),
+            ),
+            Ok(silence) => Self::lost(silence),
         }
     }
 
@@ -628,8 +685,8 @@ impl Unopened {
 
     /// A read that failed for a reason that is no answer of the host's: the host was not reached.
     #[must_use]
-    pub fn lost(error: kr_client::ClientError) -> Self {
-        Self::Unreached(CommandError::from(error))
+    pub(crate) fn lost(error: Unanswered) -> Self {
+        Self::Unreached(CommandError::from(error.0))
     }
 
     /// The failure, as a command that needed the connection answers with it. A connection that the
@@ -1275,5 +1332,58 @@ mod tests {
         assert!(!state.connected);
         assert_eq!(state.environment_id, None);
         assert_eq!(state.reason.as_deref(), Some("no host on this machine"));
+    }
+
+    /// The helper for a host that was not reached takes one of this application's own causes, and
+    /// each tells the sentence that the call it replaced told before the set was closed. A host
+    /// that was not reached is a wait.
+    #[test]
+    fn the_causes_of_a_host_not_reached_keep_their_sentences() {
+        for (cause, words) in [
+            (
+                NotReached::NoAnswerInTime,
+                "the host did not answer in time",
+            ),
+            (
+                NotReached::EnvironmentNotSaid,
+                "the host did not say which environment it is",
+            ),
+            (
+                NotReached::ConnectionNotOpenedInTime,
+                "the host did not open the connection in time",
+            ),
+            (
+                NotReached::SessionNotOpenedInTime,
+                "the host did not open the session in time",
+            ),
+            (
+                NotReached::NoSessionOpened,
+                "the host opened a connection for no session",
+            ),
+            (
+                NotReached::NoSecondConnection,
+                "this application cannot open a second connection to this host",
+            ),
+        ] {
+            assert_eq!(cause.words(), words, "{cause:?}");
+            let failure = Unopened::unreached(cause).into_error();
+            assert_eq!(failure.message, words, "{cause:?}");
+            assert_eq!(failure.user_action, "wait", "{cause:?}");
+        }
+    }
+
+    /// A host's answer is not held as an error that is no answer of a host's, so a stop of the
+    /// lease, which reaches a client as one, cannot be given to the helpers for a host that was not
+    /// reached.
+    #[test]
+    fn a_hosts_answer_is_never_held_as_no_answer_of_a_host() {
+        use kr_protocol::error::{ErrorCode, ProtocolError};
+
+        let answer =
+            ProtocolError::new(ErrorCode::PermissionDenied, "sign in to your account again");
+        let given = Unanswered::of(kr_client::ClientError::Host(answer.clone()))
+            .expect_err("a host's answer is given back");
+        assert_eq!(given, answer);
+        assert!(Unanswered::of(kr_client::ClientError::NoActionWindow).is_ok());
     }
 }

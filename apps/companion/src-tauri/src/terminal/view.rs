@@ -1669,7 +1669,7 @@ mod tests {
     /// and the others end it, and a refusal of a request names the request.
     #[test]
     fn a_view_tells_a_connection_that_was_not_opened_by_its_cause() {
-        use crate::connection::{Asked, Unopened};
+        use crate::connection::{Asked, NotReached, Unopened};
         use crate::error::CommandError;
 
         let refused = |asked, code| {
@@ -1714,7 +1714,7 @@ mod tests {
             failure.reason
         );
         // A host that was not reached is not one that refused.
-        let failure = not_opened(Unopened::unreached("it is asleep"));
+        let failure = not_opened(Unopened::unreached(NotReached::NoAnswerInTime));
         assert!(
             failure.lost && failure.reason.contains("could not be reached"),
             "{}",
