@@ -97,7 +97,8 @@ pub enum Refusal {
     /// could not start or ended with an error.
     ProfilesUnanswered,
     /// PowerShell, which was found, ended without saying where its profiles are, or said something
-    /// other than two paths.
+    /// other than two full paths: nothing, a different number of lines, a line that does not decode
+    /// to text, an answer longer than the limit, or a path that is not full.
     ProfilesNotUnderstood,
 }
 
@@ -247,7 +248,7 @@ impl fmt::Display for Refusal {
             ),
             Self::ProfilesNotUnderstood => formatter.write_str(
                 "PowerShell's answer about where its profiles are was not understood: it ended \
-                 without an answer or said something other than two paths, so nothing was \
+                 without an answer or said something other than two full paths, so nothing was \
                  written for PowerShell",
             ),
             _ => Ok(()),

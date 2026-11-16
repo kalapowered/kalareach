@@ -5184,6 +5184,7 @@ dependencies = [
 name = "kr-shell-integration"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "hmac 0.13.0",
  "kr-cbor",
  "kr-crypto",

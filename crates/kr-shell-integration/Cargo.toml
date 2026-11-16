@@ -21,6 +21,8 @@ path = "src/bin/kr-shell-fixtures.rs"
 testing = []
 
 [dependencies]
+# The profile question's answer travels as base64 of each path's UTF-8 bytes: no code page changes it.
+base64.workspace = true
 kr-cbor.workspace = true
 kr-crypto.workspace = true
 # A startup file's replacement is tried again while another program holds the file.
