@@ -2498,7 +2498,7 @@ dependencies = [
 [[package]]
 name = "filedescriptor"
 version = "0.8.3"
-source = "git+https://github.com/kalapowered/wezterm?rev=9a9015119497fd5803c35a10ea4ffc503f2a7dfb#9a9015119497fd5803c35a10ea4ffc503f2a7dfb"
+source = "git+https://github.com/kalapowered/wezterm?rev=f3227b5b167844e03ca588ad7093b3975602d287#f3227b5b167844e03ca588ad7093b3975602d287"
 dependencies = [
  "libc",
  "thiserror 2.0.20",
@@ -9658,12 +9658,12 @@ dependencies = [
 [[package]]
 name = "termwiz"
 version = "0.24.0"
-source = "git+https://github.com/kalapowered/wezterm?rev=9a9015119497fd5803c35a10ea4ffc503f2a7dfb#9a9015119497fd5803c35a10ea4ffc503f2a7dfb"
+source = "git+https://github.com/kalapowered/wezterm?rev=f3227b5b167844e03ca588ad7093b3975602d287#f3227b5b167844e03ca588ad7093b3975602d287"
 dependencies = [
  "anyhow",
  "bitflags 2.13.2",
  "fancy-regex 0.14.0",
- "filedescriptor 0.8.3 (git+https://github.com/kalapowered/wezterm?rev=9a9015119497fd5803c35a10ea4ffc503f2a7dfb)",
+ "filedescriptor 0.8.3 (git+https://github.com/kalapowered/wezterm?rev=f3227b5b167844e03ca588ad7093b3975602d287)",
  "finl_unicode",
  "fixedbitset 0.4.2",
  "image",
@@ -10518,7 +10518,7 @@ dependencies = [
 [[package]]
 name = "vtparse"
 version = "0.7.0"
-source = "git+https://github.com/kalapowered/wezterm?rev=9a9015119497fd5803c35a10ea4ffc503f2a7dfb#9a9015119497fd5803c35a10ea4ffc503f2a7dfb"
+source = "git+https://github.com/kalapowered/wezterm?rev=f3227b5b167844e03ca588ad7093b3975602d287#f3227b5b167844e03ca588ad7093b3975602d287"
 dependencies = [
  "utf8parse",
 ]
@@ -11092,7 +11092,7 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 [[package]]
 name = "wezterm-bidi"
 version = "0.2.3"
-source = "git+https://github.com/kalapowered/wezterm?rev=9a9015119497fd5803c35a10ea4ffc503f2a7dfb#9a9015119497fd5803c35a10ea4ffc503f2a7dfb"
+source = "git+https://github.com/kalapowered/wezterm?rev=f3227b5b167844e03ca588ad7093b3975602d287#f3227b5b167844e03ca588ad7093b3975602d287"
 dependencies = [
  "log",
  "wezterm-dynamic",
@@ -11101,7 +11101,7 @@ dependencies = [
 [[package]]
 name = "wezterm-blob-leases"
 version = "0.1.1"
-source = "git+https://github.com/kalapowered/wezterm?rev=9a9015119497fd5803c35a10ea4ffc503f2a7dfb#9a9015119497fd5803c35a10ea4ffc503f2a7dfb"
+source = "git+https://github.com/kalapowered/wezterm?rev=f3227b5b167844e03ca588ad7093b3975602d287#f3227b5b167844e03ca588ad7093b3975602d287"
 dependencies = [
  "getrandom 0.3.4",
  "sha2 0.10.9",
@@ -11112,7 +11112,7 @@ dependencies = [
 [[package]]
 name = "wezterm-cell"
 version = "0.1.0"
-source = "git+https://github.com/kalapowered/wezterm?rev=9a9015119497fd5803c35a10ea4ffc503f2a7dfb#9a9015119497fd5803c35a10ea4ffc503f2a7dfb"
+source = "git+https://github.com/kalapowered/wezterm?rev=f3227b5b167844e03ca588ad7093b3975602d287#f3227b5b167844e03ca588ad7093b3975602d287"
 dependencies = [
  "finl_unicode",
  "image",
@@ -11131,7 +11131,7 @@ dependencies = [
 [[package]]
 name = "wezterm-char-props"
 version = "0.1.3"
-source = "git+https://github.com/kalapowered/wezterm?rev=9a9015119497fd5803c35a10ea4ffc503f2a7dfb#9a9015119497fd5803c35a10ea4ffc503f2a7dfb"
+source = "git+https://github.com/kalapowered/wezterm?rev=f3227b5b167844e03ca588ad7093b3975602d287#f3227b5b167844e03ca588ad7093b3975602d287"
 dependencies = [
  "phf 0.11.3",
  "serde",
@@ -11141,7 +11141,7 @@ dependencies = [
 [[package]]
 name = "wezterm-color-types"
 version = "0.3.0"
-source = "git+https://github.com/kalapowered/wezterm?rev=9a9015119497fd5803c35a10ea4ffc503f2a7dfb#9a9015119497fd5803c35a10ea4ffc503f2a7dfb"
+source = "git+https://github.com/kalapowered/wezterm?rev=f3227b5b167844e03ca588ad7093b3975602d287#f3227b5b167844e03ca588ad7093b3975602d287"
 dependencies = [
  "csscolorparser",
  "deltae",
@@ -11153,7 +11153,7 @@ dependencies = [
 [[package]]
 name = "wezterm-dynamic"
 version = "0.2.1"
-source = "git+https://github.com/kalapowered/wezterm?rev=9a9015119497fd5803c35a10ea4ffc503f2a7dfb#9a9015119497fd5803c35a10ea4ffc503f2a7dfb"
+source = "git+https://github.com/kalapowered/wezterm?rev=f3227b5b167844e03ca588ad7093b3975602d287#f3227b5b167844e03ca588ad7093b3975602d287"
 dependencies = [
  "log",
  "ordered-float",
@@ -11165,7 +11165,7 @@ dependencies = [
 [[package]]
 name = "wezterm-dynamic-derive"
 version = "0.1.1"
-source = "git+https://github.com/kalapowered/wezterm?rev=9a9015119497fd5803c35a10ea4ffc503f2a7dfb#9a9015119497fd5803c35a10ea4ffc503f2a7dfb"
+source = "git+https://github.com/kalapowered/wezterm?rev=f3227b5b167844e03ca588ad7093b3975602d287#f3227b5b167844e03ca588ad7093b3975602d287"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -11175,7 +11175,7 @@ dependencies = [
 [[package]]
 name = "wezterm-escape-parser"
 version = "0.1.0"
-source = "git+https://github.com/kalapowered/wezterm?rev=9a9015119497fd5803c35a10ea4ffc503f2a7dfb#9a9015119497fd5803c35a10ea4ffc503f2a7dfb"
+source = "git+https://github.com/kalapowered/wezterm?rev=f3227b5b167844e03ca588ad7093b3975602d287#f3227b5b167844e03ca588ad7093b3975602d287"
 dependencies = [
  "base64 0.22.1",
  "bitflags 2.13.2",
@@ -11201,7 +11201,7 @@ dependencies = [
 [[package]]
 name = "wezterm-input-types"
 version = "0.1.0"
-source = "git+https://github.com/kalapowered/wezterm?rev=9a9015119497fd5803c35a10ea4ffc503f2a7dfb#9a9015119497fd5803c35a10ea4ffc503f2a7dfb"
+source = "git+https://github.com/kalapowered/wezterm?rev=f3227b5b167844e03ca588ad7093b3975602d287#f3227b5b167844e03ca588ad7093b3975602d287"
 dependencies = [
  "bitflags 1.3.2",
  "euclid",
@@ -11212,7 +11212,7 @@ dependencies = [
 [[package]]
 name = "wezterm-surface"
 version = "0.1.0"
-source = "git+https://github.com/kalapowered/wezterm?rev=9a9015119497fd5803c35a10ea4ffc503f2a7dfb#9a9015119497fd5803c35a10ea4ffc503f2a7dfb"
+source = "git+https://github.com/kalapowered/wezterm?rev=f3227b5b167844e03ca588ad7093b3975602d287#f3227b5b167844e03ca588ad7093b3975602d287"
 dependencies = [
  "bitflags 2.13.2",
  "fancy-regex 0.14.0",
@@ -11233,7 +11233,7 @@ dependencies = [
 [[package]]
 name = "wezterm-term"
 version = "0.1.0"
-source = "git+https://github.com/kalapowered/wezterm?rev=9a9015119497fd5803c35a10ea4ffc503f2a7dfb#9a9015119497fd5803c35a10ea4ffc503f2a7dfb"
+source = "git+https://github.com/kalapowered/wezterm?rev=f3227b5b167844e03ca588ad7093b3975602d287#f3227b5b167844e03ca588ad7093b3975602d287"
 dependencies = [
  "anyhow",
  "bitflags 1.3.2",

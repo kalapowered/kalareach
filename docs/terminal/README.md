@@ -310,10 +310,10 @@ Three kinds of sequence never reach the library, because the profile owns them o
 ### The library qualification record
 
 Repository: `https://github.com/kalapowered/wezterm`
-Revision: `9a9015119497fd5803c35a10ea4ffc503f2a7dfb`
+Revision: `f3227b5b167844e03ca588ad7093b3975602d287`
 
 That revision is `https://github.com/wezterm/wezterm` at
-`699fd77b44641c43476c945054cfae6518dbd632` plus the four accessors listed below, each of which is
+`699fd77b44641c43476c945054cfae6518dbd632` plus the seven changes listed below, each of which is
 a published change to the smallest surface that gives it.
 
 The revision serves kr-vt/1 for these reasons.
@@ -338,11 +338,13 @@ The revision serves kr-vt/1 for these reasons.
 The Unicode data behind the width model is pinned by the same revision: `emoji-data.txt` dated
 2020-01-28 and `emoji-variation-sequences-14.0.0.txt` dated 2021-06-08.
 
-#### The four accessors the revision adds
+#### What the revision adds
 
-Section 8 lists four pieces of state that the upstream revision keeps and does not let a consumer
-read. Each is a published accessor over the smallest surface that provides it, and each is what a
-snapshot needs rather than a convenience.
+The first four rows are the four pieces of state that section 8 lists and the upstream revision
+keeps without letting a consumer read them. Each is a published accessor over the smallest surface
+that provides it, and each is what a snapshot needs rather than a convenience. The last three rows
+serve the engine's rule for privacy mode: it keeps no row above the live screen while the mode is
+on, and no row of that interval afterwards.
 
 | Accessor | Why the profile needs it |
 | --- | --- |
@@ -350,6 +352,9 @@ snapshot needs rather than a convenience.
 | `TerminalState::saved_cursor()`, a shared reference to either buffer's saved cursor, with the saved rendition and character sets among its public fields | Section 8 lists saved cursors among the restored state, and a saved cursor that carries only a position restores the wrong colours from the wrong origin. Each buffer keeps its own, so a restoration reads both |
 | `TerminalState::inactive_screen()` | Section 8 requires a restoration sequence to reproduce **both** buffer states, and the accessor upstream exposes returns whichever buffer is active. Copying the primary buffer aside on every switch would be a second copy of state that can drift from the first, which is the failure the single-reducer rule exists to prevent |
 | `Line::compress_for_scrollback()` keeping the cells, attributes and wrap markers it was given | The pinned width model gives a cell to every scalar that has a width of its own, and a compact row that worked out where its cells are by clustering its text again would join adjacent scalars and drop the columns they held, so the compact form keeps the cell boundaries it was given |
+| `Line::caller_mark()` and `Line::set_caller_mark()`, a mark that goes with a line's content through a clone, a split, a rewrap and a join | A row's position is not its identity. A reverse index, an insert or a scroll moves a row past any position the engine could record, so the engine marks the line itself and the library carries the mark wherever it puts the content |
+| The scrolls inside left and right margins, carrying a line's caller mark to the line that receives its cells | Those scrolls copy cells between two line objects instead of moving the lines, so a mark that only travels with the line object would stay behind while the cells it describes moved |
+| `TerminalState::primary_screen_mut()`, the primary buffer with its scrollback, whichever buffer is active | While a full screen application holds the alternate buffer the library lends out only that buffer for writing, so the rows the primary buffer holds above its screen could not be given up until the application left |
 
 `kr_term::unicode::LIBRARY` carries the same record in the crate, and its `required_patch` list is
 empty: the pinned revision exposes everything section 8 asks a snapshot to carry.
