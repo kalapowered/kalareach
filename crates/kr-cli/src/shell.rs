@@ -288,8 +288,9 @@ fn entries_only(kind: ShellKind, targets: &[StartupTarget]) -> ShellReport {
 /// # Errors
 ///
 /// Returns a usage failure naming the package's entry when that path is not text, which no startup
-/// file can name, and a resource failure when the record or a startup file cannot be read or
-/// written.
+/// file can name, a refusal in the host's words when PowerShell is found and cannot say where its
+/// profiles are (nothing is written), and a resource failure when the record or a startup file
+/// cannot be read or written.
 pub fn install(
     package: &ShellPackage,
     layout: &HomeLayout,
@@ -298,14 +299,10 @@ pub fn install(
     nsh_bypass: bool,
     dry_run: bool,
 ) -> Result<ShellReport> {
-    install_targets(
-        package,
-        &layout.targets(package.kind()),
-        record,
-        paths,
-        nsh_bypass,
-        dry_run,
-    )
+    let targets = layout
+        .try_targets(package.kind())
+        .map_err(|refusal| CliError::Other(crate::shown::startup_refusal(&refusal)))?;
+    install_targets(package, &targets, record, paths, nsh_bypass, dry_run)
 }
 
 /// Installs into the targets it is given: the entry each file gets, the report of it and the record
@@ -850,6 +847,159 @@ mod tests {
         }
     }
 
+    /// The system's own program of this name: `true` ends with code 0 and prints nothing, `false`
+    /// with code 1. Each stands in for a PowerShell that was found and did not answer.
+    #[cfg(unix)]
+    fn system_program(name: &str) -> std::path::PathBuf {
+        ["/usr/bin", "/bin"]
+            .iter()
+            .map(|directory| std::path::Path::new(directory).join(name))
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| panic!("the system has no {name}"))
+    }
+
+    /// Every directory and file under `root` with the file's bytes, in order: what a home holds.
+    #[cfg(unix)]
+    fn held_under(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        fn walk(directory: &std::path::Path, found: &mut Vec<(std::path::PathBuf, Vec<u8>)>) {
+            let mut paths: Vec<_> = std::fs::read_dir(directory)
+                .expect("reads")
+                .map(|entry| entry.expect("an entry").path())
+                .collect();
+            paths.sort();
+            for path in paths {
+                if path.is_dir() {
+                    found.push((path.clone(), Vec::new()));
+                    walk(&path, found);
+                } else {
+                    found.push((path.clone(), std::fs::read(&path).expect("reads")));
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(root, &mut found);
+        found
+    }
+
+    #[cfg(unix)]
+    const PROFILES_NOT_UNDERSTOOD: &str = "PowerShell's answer about where its profiles are was \
+        not understood: it ended without an answer or said something other than two paths, so \
+        nothing was written for PowerShell";
+    #[cfg(unix)]
+    const PROFILES_UNANSWERED: &str = "PowerShell did not say where its profiles are: it did not \
+        answer in time, could not start or ended with an error, so nothing was written for \
+        PowerShell";
+
+    /// An install where PowerShell is found and ends without an answer, or with one that is not two
+    /// paths, says so in one line and writes nothing for PowerShell: no startup file and no record.
+    #[cfg(unix)]
+    #[test]
+    fn an_install_where_powershell_gave_no_answer_says_so_and_writes_nothing() {
+        let package = a_package_that_is_never_started(ShellKind::PowerShell);
+        for (name, program, line) in [
+            (
+                "code 0 and no answer",
+                system_program("true"),
+                PROFILES_NOT_UNDERSTOOD,
+            ),
+            ("code 1", system_program("false"), PROFILES_UNANSWERED),
+        ] {
+            for dry_run in [true, false] {
+                let home = tempfile::tempdir().expect("a directory");
+                let state = tempfile::tempdir().expect("a directory");
+                let record = EntryRecord::in_state_directory(&state.path().join("state"));
+                let layout = HomeLayout {
+                    home: home.path().to_path_buf(),
+                    zdotdir: None,
+                    xdg_config_home: None,
+                    powershell: Some(startup::PowerShell::plain(program.clone())),
+                };
+                let before = held_under(home.path());
+                let refused = install(&package, &layout, &record, &host_paths(), false, dry_run)
+                    .expect_err(&format!("{name}, dry run {dry_run}: refused"));
+                assert_eq!(refused.to_string(), line, "{name}, dry run {dry_run}");
+                assert_eq!(
+                    held_under(home.path()),
+                    before,
+                    "{name}, dry run {dry_run}: the home changed"
+                );
+                assert!(
+                    !record.path().exists(),
+                    "{name}, dry run {dry_run}: a record was written"
+                );
+            }
+        }
+    }
+
+    /// Where several shells are selected, a PowerShell that cannot be asked ends the install as a
+    /// refusal of any other shell does: the shells before it in the order are written, it is not,
+    /// and the shells after it are not tried. Status and removal go on without it.
+    #[cfg(unix)]
+    #[test]
+    fn a_powershell_that_cannot_be_asked_ends_the_install_after_the_shells_before_it() {
+        let home = tempfile::tempdir().expect("a directory");
+        let state = tempfile::tempdir().expect("a directory");
+        let record = EntryRecord::in_state_directory(&state.path().join("state"));
+        let layout = HomeLayout {
+            home: home.path().to_path_buf(),
+            zdotdir: None,
+            xdg_config_home: None,
+            powershell: Some(startup::PowerShell::plain(system_program("true"))),
+        };
+        let packages = [
+            a_package_that_is_never_started(ShellKind::Zsh),
+            a_package_that_is_never_started(ShellKind::PowerShell),
+            a_package_that_is_never_started(ShellKind::Fish),
+        ];
+        // What `kr shell install` does with the packages it selected: one result for all of them,
+        // and the first error ends it.
+        let installed = packages
+            .iter()
+            .map(|package| install(package, &layout, &record, &host_paths(), false, false))
+            .collect::<Result<Vec<_>>>();
+        assert_eq!(
+            installed.expect_err("the install is refused").to_string(),
+            PROFILES_NOT_UNDERSTOOD
+        );
+        let zshrc = home.path().join(".zshrc");
+        assert!(
+            startup::installed(&zshrc, &Placement::End),
+            "the shell before it is written"
+        );
+        assert_eq!(
+            held_under(home.path())
+                .into_iter()
+                .map(|(path, _)| path)
+                .collect::<Vec<_>>(),
+            std::slice::from_ref(&zshrc),
+            "nothing else is in the home: not PowerShell's, and not the shell after it"
+        );
+        assert_eq!(record.files(ShellKind::Zsh).expect("reads"), [zshrc]);
+        assert!(
+            record
+                .files(ShellKind::PowerShell)
+                .expect("reads")
+                .is_empty()
+        );
+        assert!(record.files(ShellKind::Fish).expect("reads").is_empty());
+
+        // Status and removal do not need PowerShell's answer: a broken one stops neither.
+        let reported = report(&packages[1], &layout);
+        assert!(
+            reported.entries.is_empty(),
+            "status has no entry to show for it"
+        );
+        let removed = remove(
+            ShellKind::PowerShell,
+            &layout,
+            &record,
+            &host_paths(),
+            false,
+        )
+        .expect("a removal is not stopped by a PowerShell that cannot be asked");
+        assert!(removed.entries.is_empty());
+    }
+
     /// KR-REQ-07.23: every refusal the shell integration makes is said as the refusal it is, one
     /// case for each class, and an ordinary failure of the file system is said as it always was.
     #[test]
@@ -889,6 +1039,8 @@ mod tests {
             Refusal::PlacementNotUnderstood,
             Refusal::PlacementOutsideTheProfile,
             Refusal::CheckNotUnderstood,
+            Refusal::ProfilesUnanswered,
+            Refusal::ProfilesNotUnderstood,
         ];
         let counted = |refusal: &Refusal| match refusal {
             Refusal::SignedForInstall
@@ -911,9 +1063,11 @@ mod tests {
             | Refusal::CheckUnanswered
             | Refusal::PlacementNotUnderstood
             | Refusal::PlacementOutsideTheProfile
-            | Refusal::CheckNotUnderstood => 1,
+            | Refusal::CheckNotUnderstood
+            | Refusal::ProfilesUnanswered
+            | Refusal::ProfilesNotUnderstood => 1,
         };
-        assert_eq!(classes.iter().map(counted).sum::<usize>(), 21);
+        assert_eq!(classes.iter().map(counted).sum::<usize>(), 23);
         for refusal in classes {
             let said = startup_failure(file, &refusal.clone().into()).to_string();
             assert!(
