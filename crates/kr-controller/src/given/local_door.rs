@@ -108,7 +108,7 @@ impl WrittenUnder {
     const fn of_a_record(footing: Footing, conflict: bool) -> Self {
         Self {
             footing,
-            ask: Ask::KEPT_ANSWER,
+            ask: Ask::KEPT_ANSWER.and_the_lease(),
             words: Words::Record { conflict },
         }
     }
