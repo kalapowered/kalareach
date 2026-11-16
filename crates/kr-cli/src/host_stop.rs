@@ -1435,10 +1435,10 @@ async fn ended_before_the_request(
     } else {
         operations.look(startup::ANSWER_BOUND.min(left())).await
     };
-    if let Some(answered) = first_look_answers(first) {
-        return Decided::Answers(answered);
+    match first_look_answers(first) {
+        Some(answered) => Decided::Answers(answered),
+        None => decided_by_the_wait(wait_for_the_end(operations, old, left()).await),
     }
-    decided_by_the_wait(wait_for_the_end(operations, old, left()).await)
 }
 
 /// What the first look makes of a request that could not be made: any answer at the endpoint is an
@@ -1456,8 +1456,7 @@ fn first_look_answers(look: Endpoint) -> Option<Answered> {
 /// anything else is an end that is not shown.
 fn decided_by_the_wait(end: End) -> Decided {
     match end {
-        End::NotEnded(_, Some(answered)) => Decided::Answers(answered),
-        End::NotEnded(_, None) => Decided::NotShown,
+        End::NotEnded(_, answer) => answer.map_or(Decided::NotShown, Decided::Answers),
         End::Gone | End::Successor(_) => Decided::Ended(end),
     }
 }
@@ -2180,10 +2179,10 @@ async fn wait_for_the_end(
             successor,
         };
         let at_bound = tokio::time::Instant::now() >= deadline;
-        if let Some(end) = what_the_round_shows(&round, at_bound) {
-            return end;
+        match what_the_round_shows(&round, at_bound) {
+            Some(end) => return end,
+            None => operations.pause(LOOK_EVERY.min(left())).await,
         }
-        operations.pause(LOOK_EVERY.min(left())).await;
     }
 }
 
@@ -4430,11 +4429,30 @@ mod tests {
         WildcardInWrapper,
         WildcardInOr,
         BareBinding,
+        BindingInWrapper,
         RestInTuple,
+        RestInStruct,
         MatchesMacro,
-        IfLetWithElse,
+        MacroNamesTheModule,
+        LetExpression,
         LetWithElse,
     }
+
+    /// Every refused form, so that a case can see that each has a row.
+    const REFUSED: [Form; 12] = [
+        Form::LoneWildcard,
+        Form::WildcardInTuple,
+        Form::WildcardInWrapper,
+        Form::WildcardInOr,
+        Form::BareBinding,
+        Form::BindingInWrapper,
+        Form::RestInTuple,
+        Form::RestInStruct,
+        Form::MatchesMacro,
+        Form::MacroNamesTheModule,
+        Form::LetExpression,
+        Form::LetWithElse,
+    ];
 
     /// Where a pattern stands, which is what makes a `_` or a binding in it a refused form.
     #[derive(Clone, Copy)]
@@ -4451,12 +4469,121 @@ mod tests {
         Payload,
     }
 
+    /// The names of the module's enums, structs and variants, from its syntax with the test module
+    /// left out.
+    fn names_of_the_module() -> &'static [String] {
+        struct Types(Vec<String>);
+
+        impl<'ast> syn::visit::Visit<'ast> for Types {
+            fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+                if module.ident != "tests" {
+                    syn::visit::visit_item_mod(self, module);
+                }
+            }
+
+            fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+                self.0.push(item.ident.to_string());
+                for variant in &item.variants {
+                    self.0.push(variant.ident.to_string());
+                }
+            }
+
+            fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+                self.0.push(item.ident.to_string());
+            }
+        }
+
+        static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        NAMES.get_or_init(|| {
+            let file = syn::parse_file(include_str!("host_stop.rs")).expect("the module parses");
+            let mut types = Types(Vec::new());
+            syn::visit::Visit::visit_file(&mut types, &file);
+            types.0
+        })
+    }
+
+    /// The words of `text` that stand outside a string literal.
+    fn words_outside_strings(text: &str) -> Vec<String> {
+        let (mut words, mut word) = (Vec::new(), String::new());
+        let (mut in_string, mut escaped) = (false, false);
+        for c in text.chars() {
+            if in_string {
+                match (escaped, c) {
+                    (true, _) => escaped = false,
+                    (false, '\\') => escaped = true,
+                    (false, '"') => in_string = false,
+                    (false, _) => {}
+                }
+            } else if c.is_alphanumeric() || c == '_' {
+                word.push(c);
+            } else {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+                in_string = c == '"';
+            }
+        }
+        if !word.is_empty() {
+            words.push(word);
+        }
+        words
+    }
+
     /// Walks a function's syntax and collects the refused forms.
     struct Scan {
         found: Vec<Form>,
+        names: &'static [String],
     }
 
     impl Scan {
+        /// Whether `path` names an enum, a struct or a variant of the module.
+        fn names_the_module(&self, path: &syn::Path) -> bool {
+            path.segments
+                .iter()
+                .any(|segment| self.names.contains(&segment.ident.to_string()))
+        }
+
+        /// Whether a pattern names an enum, a struct or a variant of the module.
+        fn pattern_names_the_module(&self, pattern: &syn::Pat) -> bool {
+            match pattern {
+                syn::Pat::Path(path) => self.names_the_module(&path.path),
+                syn::Pat::TupleStruct(variant) => {
+                    self.names_the_module(&variant.path)
+                        || variant
+                            .elems
+                            .iter()
+                            .any(|element| self.pattern_names_the_module(element))
+                }
+                syn::Pat::Struct(structure) => {
+                    self.names_the_module(&structure.path)
+                        || structure
+                            .fields
+                            .iter()
+                            .any(|field| self.pattern_names_the_module(&field.pat))
+                }
+                syn::Pat::Tuple(tuple) => tuple
+                    .elems
+                    .iter()
+                    .any(|element| self.pattern_names_the_module(element)),
+                syn::Pat::Slice(slice) => slice
+                    .elems
+                    .iter()
+                    .any(|element| self.pattern_names_the_module(element)),
+                syn::Pat::Or(or) => or
+                    .cases
+                    .iter()
+                    .any(|case| self.pattern_names_the_module(case)),
+                syn::Pat::Ident(binding) => binding
+                    .subpat
+                    .as_ref()
+                    .is_some_and(|(_, inner)| self.pattern_names_the_module(inner)),
+                syn::Pat::Reference(reference) => self.pattern_names_the_module(&reference.pat),
+                syn::Pat::Paren(paren) => self.pattern_names_the_module(&paren.pat),
+                syn::Pat::Type(typed) => self.pattern_names_the_module(&typed.pat),
+                _ => false,
+            }
+        }
+
         /// What a wildcard is at `within`.
         fn wildcard(&mut self, within: Within) {
             match within {
@@ -4468,7 +4595,7 @@ mod tests {
             }
         }
 
-        /// Reads the pattern of one arm.
+        /// Reads the pattern of one arm of a match that names the module.
         fn pattern(&mut self, pattern: &syn::Pat, within: Within) {
             match pattern {
                 syn::Pat::Wild(_) => self.wildcard(within),
@@ -4488,7 +4615,8 @@ mod tests {
                                 Within::Arm | Within::Or | Within::Tuple => {
                                     self.found.push(Form::BareBinding);
                                 }
-                                Within::Wrapper | Within::Payload => {}
+                                Within::Wrapper => self.found.push(Form::BindingInWrapper),
+                                Within::Payload => {}
                             }
                         }
                     }
@@ -4519,6 +4647,10 @@ mod tests {
                     }
                 }
                 syn::Pat::Struct(structure) => {
+                    // A struct is named by one segment and a variant by its enum and itself.
+                    if structure.rest.is_some() && structure.path.segments.len() == 1 {
+                        self.found.push(Form::RestInStruct);
+                    }
                     for field in &structure.fields {
                         self.pattern(&field.pat, Within::Payload);
                     }
@@ -4543,16 +4675,22 @@ mod tests {
     }
 
     impl<'ast> syn::visit::Visit<'ast> for Scan {
-        fn visit_arm(&mut self, arm: &'ast syn::Arm) {
-            self.pattern(&arm.pat, Within::Arm);
-            syn::visit::visit_arm(self, arm);
+        fn visit_expr_match(&mut self, expression: &'ast syn::ExprMatch) {
+            if expression
+                .arms
+                .iter()
+                .any(|arm| self.pattern_names_the_module(&arm.pat))
+            {
+                for arm in &expression.arms {
+                    self.pattern(&arm.pat, Within::Arm);
+                }
+            }
+            syn::visit::visit_expr_match(self, expression);
         }
 
-        fn visit_expr_if(&mut self, expression: &'ast syn::ExprIf) {
-            if matches!(*expression.cond, syn::Expr::Let(_)) && expression.else_branch.is_some() {
-                self.found.push(Form::IfLetWithElse);
-            }
-            syn::visit::visit_expr_if(self, expression);
+        fn visit_expr_let(&mut self, expression: &'ast syn::ExprLet) {
+            self.found.push(Form::LetExpression);
+            syn::visit::visit_expr_let(self, expression);
         }
 
         fn visit_local(&mut self, local: &'ast syn::Local) {
@@ -4567,8 +4705,18 @@ mod tests {
         }
 
         fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-            if mac.path.is_ident("matches") {
+            let last = mac
+                .path
+                .segments
+                .last()
+                .map(|segment| segment.ident.to_string());
+            if last.as_deref() == Some("matches") {
                 self.found.push(Form::MatchesMacro);
+            } else if words_outside_strings(&mac.tokens.to_string())
+                .iter()
+                .any(|word| self.names.contains(word))
+            {
+                self.found.push(Form::MacroNamesTheModule);
             }
             syn::visit::visit_macro(self, mac);
         }
@@ -4576,7 +4724,10 @@ mod tests {
 
     /// The refused forms in a function's syntax, in the order that they stand.
     fn forms_of(function: &syn::ItemFn) -> Vec<Form> {
-        let mut scan = Scan { found: Vec::new() };
+        let mut scan = Scan {
+            found: Vec::new(),
+            names: names_of_the_module(),
+        };
         syn::visit::Visit::visit_item_fn(&mut scan, function);
         scan.found
     }
@@ -4637,17 +4788,21 @@ mod tests {
         defined.found
     }
 
-    /// What the check says of a form of source: the form, whether the check refuses it, a plant
-    /// (a function that holds the form and nothing else that the check reads), and why. A refused
-    /// row's plant fails the check for that form's own reason and no other; a row that is not
-    /// refused has a plant that passes, and says why the generated table's file still shows the
-    /// change that the form would let through.
+    /// What the check says of a form of source: the form, the refused form that it gives (none where
+    /// the check does not refuse it), a plant (a function that holds the form and nothing else that
+    /// the check reads), and why. A refused row's plant fails the check for that form's own reason
+    /// and no other; a row that is not refused has a plant that passes, and says why.
     ///
-    /// The check reads the syntax of the functions that [`SCANNED`] names, so that a catch-all in a
-    /// decision over the sets is a failure of this case and not a change that a reviewer must see.
-    /// Every other function of the module's product part is named in [`NOT_SCANNED`], with the
-    /// refused forms that stand in it and the reason why no decision over the sets stands in it;
-    /// a function in neither list fails a case of its own. The forms:
+    /// The check reads the syntax of the functions that [`SCANNED`] names: in a `match` whose arms
+    /// name an enum, a struct or a variant of the module, a catch-all (a `_`, a binding that is no
+    /// variant's payload, the rest of a struct); a `let` expression wherever it stands; `let` with
+    /// an else; `matches!` by the last segment of its path; and a macro whose tokens name an enum,
+    /// a struct or a variant of the module, because the check cannot read a macro's body. Every
+    /// other function of the module's product part is named in [`NOT_SCANNED`], with the refused
+    /// forms that stand in it and the reason why no decision over the sets stands in it; a
+    /// function in neither list fails a case of its own. A spelling that no row of this table names
+    /// is not seen by this check. The generated tables, not this check, show the results of the
+    /// decisions. The forms:
     ///
     /// | form | verdict |
     /// | --- | --- |
@@ -4656,127 +4811,169 @@ mod tests {
     /// | `_` in `Some`, `Ok` or `Err` | refused |
     /// | `_` in an or-pattern | refused |
     /// | a bare binding as an arm, or in a tuple (`other =>`, `_other =>`) | refused |
+    /// | a binding in `Some`, `Ok` or `Err` (`Some(other) =>`) | refused |
     /// | a rest pattern in a tuple, a slice or `Some`, `Ok`, `Err` | refused |
+    /// | a rest pattern of a struct (`Round { .. }`) | refused |
     /// | `matches!` | refused |
-    /// | `if let` with an else | refused |
+    /// | `std::matches!`, `core::matches!` | refused |
+    /// | a macro whose tokens name an enum, a struct or a variant of the module | refused |
+    /// | `if let`, with an else | refused |
+    /// | `if let`, with no else | refused |
+    /// | `while let` | refused |
+    /// | a `let` chain (`if let A = x && ok`) | refused |
     /// | `let` with an else | refused |
-    /// | `_` or `..` as a member of a variant's or a struct's payload | not refused |
+    /// | `_` or `..` as a member of a variant's payload | not refused |
     /// | a binding with `@` | not refused |
     /// | a guard | not refused |
-    /// | `if let` with no else | not refused |
-    /// | `while let` | not refused |
     /// | `_` as a closure parameter or in a plain `let` | not refused |
     /// | a default made by a method (`unwrap_or`, `map_or`, `==`) | not refused |
     /// | an or-pattern of named values | not refused |
     /// | a bare `None` | not refused |
-    const FORMS: [(&str, bool, &str, &str); 18] = [
+    /// | a `match` that names nothing of the module | not refused |
+    const FORMS: &[(&str, Option<Form>, &str, &str)] = &[
         (
             "a lone `_` as an arm",
-            true,
+            Some(Form::LoneWildcard),
             "fn f(x: Lock) -> u8 { match x { Lock::Free => 1, _ => 2 } }",
             "it takes every value that the arms before it do not name, a value added later too",
         ),
         (
             "`_` in a tuple or a slice",
-            true,
+            Some(Form::WildcardInTuple),
             "fn f(x: (Lock, Process)) -> u8 { match x { (Lock::Free, _) => 1, (Lock::Held, Process::Ended) => 2 } }",
             "it takes every value of the element that it stands for",
         ),
         (
             "`_` in `Some`, `Ok` or `Err`",
-            true,
-            "fn f(x: Option<Endpoint>) -> u8 { match x { Some(_) => 1, None => 2 } }",
+            Some(Form::WildcardInWrapper),
+            "fn f(x: Option<Endpoint>) -> u8 { match x { Some(Endpoint::Nobody) => 1, Some(_) => 2, None => 3 } }",
             "it takes every value of the wrapped set",
         ),
         (
             "`_` in an or-pattern",
-            true,
+            Some(Form::WildcardInOr),
             "fn f(x: Lock) -> u8 { match x { Lock::Free | _ => 1 } }",
             "it takes every value, whatever the cases beside it name",
         ),
         (
             "a bare binding as an arm, or in a tuple (`other =>`, `_other =>`)",
-            true,
+            Some(Form::BareBinding),
             "fn f(x: Lock) -> u8 { match x { Lock::Free => 1, other => other.number() } }",
             "it takes every value like a lone `_`; an imported variant written without its path is a binding too",
         ),
         (
+            "a binding in `Some`, `Ok` or `Err` (`Some(other) =>`)",
+            Some(Form::BindingInWrapper),
+            "fn f(x: Option<Endpoint>) -> u8 { match x { Some(Endpoint::Nobody) => 1, Some(other) => other.number(), None => 2 } }",
+            "it takes every value of the wrapped set, as `Some(_)` does",
+        ),
+        (
             "a rest pattern in a tuple, a slice or `Some`, `Ok`, `Err`",
-            true,
+            Some(Form::RestInTuple),
             "fn f(x: (Lock, Process, Holder)) -> u8 { match x { (Lock::Free, ..) => 1, (Lock::Held, Process::Ended, Holder::Nobody) => 2 } }",
             "it takes every value of the elements that it stands for",
         ),
         (
+            "a rest pattern of a struct (`Round { .. }`)",
+            Some(Form::RestInStruct),
+            "fn f(x: Round) -> u8 { match x { Round { .. } => 1 } }",
+            "it leaves out the fields that it does not name, a set among them, and a field added later too",
+        ),
+        (
             "`matches!`",
-            true,
+            Some(Form::MatchesMacro),
             "fn f(x: Lock) -> bool { matches!(x, Lock::Free) }",
             "it gives one result for every value that its pattern does not name, a value added later too",
         ),
         (
-            "`if let` with an else",
-            true,
+            "`std::matches!`, `core::matches!`",
+            Some(Form::MatchesMacro),
+            "fn f(x: Lock) -> bool { std::matches!(x, Lock::Free) }",
+            "the macro is matched by the last segment of its path, so the crate's path before it changes nothing",
+        ),
+        (
+            "a macro whose tokens name an enum, a struct or a variant of the module",
+            Some(Form::MacroNamesTheModule),
+            "fn f(x: Lock) -> String { format!(\"{:?}\", Lock::Free) }",
+            "the check cannot read a macro's body, so a decision over a set that stands in one is not seen",
+        ),
+        (
+            "`if let`, with an else",
+            Some(Form::LetExpression),
             "fn f(x: Lock) -> u8 { if let Lock::Free = x { 1 } else { 2 } }",
             "its else takes every value that the pattern does not name",
         ),
         (
+            "`if let`, with no else",
+            Some(Form::LetExpression),
+            "fn f(x: Lock) { if let Lock::Held = x { act(); } }",
+            "a `let` expression is refused wherever it stands; a function with a match names every value",
+        ),
+        (
+            "`while let`",
+            Some(Form::LetExpression),
+            "fn f(mut x: Vec<Lock>) { while let Some(top) = x.pop() { act(top); } }",
+            "a `let` expression is refused wherever it stands; a function with a match names every value",
+        ),
+        (
+            "a `let` chain (`if let A = x && ok`)",
+            Some(Form::LetExpression),
+            "fn f(x: Lock) -> u8 { if let Lock::Free = x && ready() { 1 } else { 2 } }",
+            "its else takes every value that the chain does not take",
+        ),
+        (
             "`let` with an else",
-            true,
+            Some(Form::LetWithElse),
             "fn f(x: Lock) -> u8 { let Lock::Free = x else { return 2 }; 1 }",
             "its else takes every value that the pattern does not name",
         ),
         (
-            "`_` or `..` as a member of a variant's or a struct's payload",
-            false,
+            "`_` or `..` as a member of a variant's payload",
+            None,
             "fn f(x: Endpoint) -> u8 { match x { Endpoint::Same(_) => 1, Endpoint::Unproved(..) => 2, Endpoint::Nobody => 3, Endpoint::Another => 4, Endpoint::Unclear => 5 } }",
             "the variant itself is named, so a variant added later is a compile error; where the member that the placeholder takes is a set, the function's own comment says why no value of it changes the result, and the generated table walks every value of it",
         ),
         (
             "a binding with `@`",
-            false,
+            None,
             "fn f(x: Lock) -> u8 { match x { held @ Lock::Held => held.number(), Lock::Free => 1, Lock::Unreadable(_) => 2 } }",
             "the sub-pattern names the values that it takes, and one that is `_` is a refused form of its own (`held @ _` is a lone `_`)",
         ),
         (
             "a guard",
-            false,
+            None,
             "fn f(x: Lock) -> u8 { match x { Lock::Held if ready() => 1, Lock::Held => 2, Lock::Free => 3, Lock::Unreadable(_) => 4 } }",
             "the arm still names its value, and the match is exhaustive only by arms that have no guard, so a value added later is a compile error",
         ),
         (
-            "`if let` with no else",
-            false,
-            "fn f(x: Lock) { if let Lock::Held = x { act(); } }",
-            "it gives no result for a value that the pattern does not name, so there is no default to take a new value",
-        ),
-        (
-            "`while let`",
-            false,
-            "fn f(mut x: Vec<Lock>) { while let Some(top) = x.pop() { act(top); } }",
-            "it is a loop that ends where the pattern fails, and gives no result for the values",
-        ),
-        (
             "`_` as a closure parameter or in a plain `let`",
-            false,
+            None,
             "fn f(x: Lock) -> u8 { let _ = x; let g = |_| 1; g(0) }",
             "no value is decided by it",
         ),
         (
             "a default made by a method (`unwrap_or`, `map_or`, `==`)",
-            false,
+            None,
             "fn f(x: Option<u8>) -> u8 { x.unwrap_or(1) }",
             "the check reads patterns only; the functions that are scanned use such a default only over an error that has one meaning, and the generated tables show each result",
         ),
         (
             "an or-pattern of named values",
-            false,
+            None,
             "fn f(x: Lock) -> u8 { match x { Lock::Free | Lock::Held => 1, Lock::Unreadable(_) => 2 } }",
             "every value that it takes is named",
         ),
         (
             "a bare `None`",
-            false,
+            None,
             "fn f(x: Option<Endpoint>) -> u8 { match x { Some(Endpoint::Nobody) => 1, Some(Endpoint::Same(_)) => 2, Some(Endpoint::Unproved(_)) => 3, Some(Endpoint::Another) => 4, Some(Endpoint::Unclear) => 5, None => 6 } }",
             "it is the one value of `Option` that has no payload, and a value added to `Option` is not the product's to add",
+        ),
+        (
+            "a `match` that names nothing of the module",
+            None,
+            "fn f(x: Option<u8>) -> u8 { match x { Some(1) => 1, Some(_) => 2, None => 3 } }",
+            "the check cannot tell what such a match is over; a number, an option of one or a library's type is none of the module's own enums, structs or variants, and the check reads nothing in it",
         ),
     ];
 
@@ -4815,6 +5012,8 @@ mod tests {
         "ended_by",
         "unmade_ended",
         "ended_before_the_request_said",
+        "by_generation",
+        "stop_the_daemon",
         "Knows::word",
         "Request::knows",
         "Request::not_known",
@@ -4837,12 +5036,7 @@ mod tests {
     const NOT_SCANNED: &[(&str, &[Form], &str)] = &[
         (
             "ask",
-            &[
-                Form::MatchesMacro,
-                Form::WildcardInWrapper,
-                Form::LoneWildcard,
-                Form::WildcardInWrapper,
-            ],
+            &[Form::LetExpression, Form::MatchesMacro],
             "its patterns are over the answer to one request (a frame, a retry category, a timeout) and not over the readings of a round, and its default is the ruled one: anything but a whole answer is an outcome that is not known; the outcomes that it gives are the `Request` set, which the table walks",
         ),
         (
@@ -4857,13 +5051,8 @@ mod tests {
         ),
         (
             "stop",
-            &[Form::LetWithElse],
-            "its `let ... else` takes the one other variant of the link crate's `Listed` (a daemon of another major) to `Start::OtherMajor`, whose words the table of the start walks; `Listed` is no set of this module",
-        ),
-        (
-            "stop_the_daemon",
-            &[Form::WildcardInWrapper],
-            "its `Err(_)` is the elapsed time-out of the read of `host.info`, which carries no value; the other results of that read are named, and the request's and the wait's decisions are made in the functions that it calls",
+            &[Form::LetExpression, Form::LetWithElse],
+            "its `if let` takes the failure of the check that the command runs outside a session, and its `let ... else` takes the one other variant of the link crate's `Listed` (a daemon of another major) to `Start::OtherMajor`, whose words the table of the start walks; neither `Listed` nor that check's result is a set",
         ),
         (
             "closed_by_the_daemon",
@@ -4877,38 +5066,33 @@ mod tests {
         ),
         (
             "lock_held",
-            &[Form::WildcardInWrapper],
-            "its `Ok(_)` is the lock that was taken and dropped at once, which carries one value; the failure that means a daemon holds it is named, and any other failure is said; the sets are made from its result by `Lock::of`",
+            &[],
+            "it reads the lock by trying to take it and gives the one fact that it learned; its matches are over the lock's own result (a guard, the one failure that means a daemon holds it, any other failure) and name nothing of the module; `Lock::of` makes the set's value from its result",
         ),
         (
             "creates_under_way",
-            &[Form::LoneWildcard],
-            "its wildcard stands over a count of session creates, which is no set: any count that is not above zero says nothing",
+            &[],
+            "it words one sentence from a count of session creates; its wildcard stands over that count, which is no set, in a match that names nothing of the module",
         ),
         (
             "after_the_probe",
-            &[Form::WildcardInWrapper],
-            "its `Err(_)` is a failure of the probe's link, taken with a probe that was not answered to give the refusal as it was; the probe's answer is the protocol's result, no set of this module",
+            &[],
+            "it words a failure from the probe's result, which is the protocol's; its `Err(_)` stands in a match that names nothing of the module",
         ),
         (
             "host_info",
-            &[Form::BareBinding],
-            "its last arm takes every answer of the read of `host.info` that is not a withdrawn authority and types it; the answer is the host's result, no set of this module",
+            &[],
+            "its last arm takes every answer of the read of `host.info` that is not a withdrawn authority and types it; the answer is the host's result, no set of this module, and the match names nothing of the module",
         ),
         (
             "look_failed",
-            &[Form::BareBinding],
-            "its last arm takes every failure of the look but the deferred start lock and says it in its own words; `CliError` is no set of this module",
-        ),
-        (
-            "by_generation",
-            &[Form::WildcardInWrapper],
-            "its `Some(_)` stands after the arm that names the generation asked and takes a generation that differs, a number and no set; the table of the look walks the generation asked as none, equal and different",
+            &[],
+            "its last arm takes every failure of the look but the deferred start lock and says it in its own words; `CliError` is no set of this module, and the match names nothing of it",
         ),
         (
             "Progress::stage",
-            &[Form::LoneWildcard],
-            "it turns the stored number back into a `Stage`, and its wildcard stands over that number, which is no set, and gives the last stage",
+            &[],
+            "it turns the stored number back into a `Stage`; its wildcard stands over that number, which is no set, in a match that names nothing of the module",
         ),
         ("Progress::enter", &[], MAKES),
         ("Said::new", &[], MAKES),
@@ -4933,8 +5117,8 @@ mod tests {
         ),
         (
             "Progress::remove_marker",
-            &[],
-            "it reaches the record of the attempt under its lock and acts on it; it names no set and decides nothing over one",
+            &[Form::LetExpression],
+            "its `if let` takes the record of the attempt out of its lock, and the record is no set; it decides nothing over one",
         ),
         (
             "Interrupts::catch",
@@ -4943,8 +5127,8 @@ mod tests {
         ),
         (
             "Interrupts::next",
-            &[],
-            "it installs the process's signal handlers or waits for the signals and says which came first; `Interrupt` is the kind of signal that came and no set that a table walks",
+            &[Form::MacroNamesTheModule, Form::MacroNamesTheModule],
+            "its `select!` names `Interrupt`, the kind of signal that came, which no table walks; it waits for the process's signals and says which came first",
         ),
         (
             "one",
@@ -4963,8 +5147,8 @@ mod tests {
         ),
         (
             "run",
-            &[],
-            "it sets up the signals and the record of the attempt and calls `stop`; it holds no match",
+            &[Form::MacroNamesTheModule],
+            "its `select!` names `Interrupt` and `Stage`, which no table walks; it ignores a hangup after the request left by a comparison that the check does not read, which the startup case of a hangup after the request holds, and passes every other interrupt to `interrupted`",
         ),
         ("installation", &[], READS),
         ("Earlier::read", &[], READS),
@@ -5045,15 +5229,25 @@ mod tests {
     fn the_decisions_hold_no_form_that_the_check_refuses() {
         let file = syn::parse_file(include_str!("host_stop.rs")).expect("the module parses");
         let defined = defined_in(&file);
+        let mut wrong = Vec::new();
         for name in SCANNED {
             let function = function_named(&defined, name);
             assert!(!function.block.stmts.is_empty(), "{name} was read whole");
-            assert_eq!(forms_of(function), Vec::<Form>::new(), "{name}");
+            let found = forms_of(function);
+            if !found.is_empty() {
+                wrong.push(format!("{name} is scanned and holds {found:?}"));
+            }
         }
         for (name, forms, reason) in NOT_SCANNED {
-            assert_eq!(forms_of(function_named(&defined, name)), *forms, "{name}");
+            let found = forms_of(function_named(&defined, name));
+            if found != *forms {
+                wrong.push(format!(
+                    "{name} is named with {forms:?} and holds {found:?}"
+                ));
+            }
             assert!(!reason.is_empty(), "{name} has its reason");
         }
+        assert_eq!(wrong, Vec::<String>::new());
     }
 
     /// Every function of the module's product part stands in [`SCANNED`] or in [`NOT_SCANNED`],
@@ -5105,31 +5299,24 @@ mod tests {
     /// form of that row and for no other, and a row that is not refused has a plant that passes.
     #[test]
     fn each_form_of_the_check_has_a_plant_that_fails_or_passes_for_its_own_reason() {
-        let refused = [
-            Form::LoneWildcard,
-            Form::WildcardInTuple,
-            Form::WildcardInWrapper,
-            Form::WildcardInOr,
-            Form::BareBinding,
-            Form::RestInTuple,
-            Form::MatchesMacro,
-            Form::IfLetWithElse,
-            Form::LetWithElse,
-        ];
-        let mut next = 0;
-        for (form, is_refused, plant, reason) in FORMS {
+        for (form, refused, plant, reason) in FORMS {
             let function: syn::ItemFn = syn::parse_str(plant)
                 .unwrap_or_else(|error| panic!("the plant of `{form}` parses: {error}"));
             assert!(!reason.is_empty(), "{form} says why");
-            let found = forms_of(&function);
-            if is_refused {
-                assert_eq!(found, vec![refused[next]], "the plant of `{form}`");
-                next += 1;
-            } else {
-                assert_eq!(found, Vec::<Form>::new(), "the plant of `{form}`");
-            }
+            assert_eq!(
+                forms_of(&function),
+                refused.iter().copied().collect::<Vec<Form>>(),
+                "the plant of `{form}`"
+            );
         }
-        assert_eq!(next, refused.len(), "every refused form has a row");
+        for wanted in REFUSED {
+            assert!(
+                FORMS
+                    .iter()
+                    .any(|(_, refused, _, _)| *refused == Some(wanted)),
+                "{wanted:?} has a row"
+            );
+        }
     }
 
     /// The doc of the table says what the table says: its rows, in order, are the rows of
@@ -5149,7 +5336,11 @@ mod tests {
             .map(|(form, refused, _, _)| {
                 format!(
                     "{form} | {}",
-                    if *refused { "refused" } else { "not refused" }
+                    if refused.is_some() {
+                        "refused"
+                    } else {
+                        "not refused"
+                    }
                 )
             })
             .collect();
