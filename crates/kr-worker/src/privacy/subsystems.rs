@@ -18,27 +18,34 @@ use crate::privacy::{
     Step, Unavailable,
 };
 
-/// Retained session output, over the session's own history.
+/// Retained session output, over the session's own history and its canonical grid.
 ///
 /// This is the one section 24 names first: privacy mode disables content-history retention
 /// prospectively and removes what is already retained. The spool and the resident window are the
-/// content, and this is an adapter over them rather than a count of them: fencing stops the
-/// capture, and removing takes the bytes.
+/// content, and so are the grid's rows above the live screen, which a person can scroll to. This
+/// is an adapter over them rather than a count of them: fencing stops the capture, and removing
+/// takes the bytes. The grid gives up its rows when the capture is fenced and keeps none while
+/// the fence stands, and its live screen is left as it is.
 ///
 /// Local deletion is logical cleanup. This host removes its own records and does not claim the
 /// bytes are unrecoverable from the device they were on.
 #[derive(Debug)]
 pub struct RetainedHistory<'a> {
     history: &'a mut crate::history::OutputHistory,
+    grid: &'a mut crate::projection::TerminalEngine,
     fenced: bool,
 }
 
 impl<'a> RetainedHistory<'a> {
-    /// Builds the hook over one session's retained output.
+    /// Builds the hook over one session's retained output and canonical grid.
     #[must_use]
-    pub fn over(history: &'a mut crate::history::OutputHistory) -> Self {
+    pub fn over(
+        history: &'a mut crate::history::OutputHistory,
+        grid: &'a mut crate::projection::TerminalEngine,
+    ) -> Self {
         Self {
             history,
+            grid,
             fenced: false,
         }
     }
@@ -59,6 +66,10 @@ impl PrivacySubsystem for RetainedHistory<'_> {
         // The capture stops before the removal, so nothing is written behind the cleanup.
         self.fenced = true;
         self.history.stop_retaining();
+        // Giving up the grid's rows cannot fail and is complete when it returns, so it owes no
+        // retry. The alternate buffer's case, where the rows cannot be reached yet, is the grid's
+        // own: it gives them up when the primary buffer shows again.
+        self.grid.set_history_kept(false);
         Ok(Fenced {
             queues: 1,
             items: 0,
