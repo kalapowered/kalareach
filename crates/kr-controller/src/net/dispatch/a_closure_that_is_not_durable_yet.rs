@@ -140,32 +140,37 @@ async fn a_closure_whose_write_stands_is_answered_at_both_doors_and_recorded_as_
             std::time::Duration::from_secs(10),
             closed_at_the_paired_door(&world, &connection, 91),
         )
-        .await
-        .expect("a close from a paired device is answered while the write of its closure stands");
-        assert_eq!(paired.durability, given, "{paired:?}");
-        tokio::task::spawn_blocking(move || {
+        .await;
+        let reached = tokio::task::spawn_blocking(move || {
             arrived.recv_timeout(std::time::Duration::from_secs(30))
         })
-        .await
-        .expect("the wait for the write ends")
-        .expect("the closure's write reaches the registry");
+        .await;
         let local = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             closed_at_the_local_door(&world, carried),
         )
-        .await
-        .expect("a close at the local door is answered while the write stands");
+        .await;
+        let forwarded = script.forwarded().len();
+        // Let go before any assertion, so that a close that was not answered does not hold the
+        // program with the write that stands.
+        let _ = release.send(());
+        let paired = paired.expect(
+            "a close from a paired device is answered while the write of its closure stands",
+        );
+        reached
+            .expect("the wait for the write ends")
+            .expect("the closure's write reaches the registry");
+        let local = local.expect("a close at the local door is answered while the write stands");
+        assert_eq!(paired.durability, given, "{paired:?}");
         assert_eq!(
             (local.state, local.durability),
             (SessionState::Closed, given),
             "{local:?}"
         );
         assert_eq!(
-            script.forwarded().len(),
-            1,
+            forwarded, 1,
             "only the first close reaches the worker, volatile {volatile}"
         );
-        release.send(()).expect("the write is let go");
         until_recorded_and_retired(&world).await;
         assert_eq!(
             recorded_durability(&world).await,

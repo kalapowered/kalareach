@@ -698,7 +698,8 @@ impl Pause {
         (watch, release)
     }
 
-    /// Waits here when the pause is armed.
+    /// Waits here when the pause is armed, until it is let go or [`Pause::HOLDS_AT_MOST`] has
+    /// passed. A case that ends before it lets the pause go does not hold the program with it.
     pub(crate) fn wait(&self) {
         let armed = self
             .0
@@ -707,9 +708,12 @@ impl Pause {
             .take();
         if let Some((arrived, go)) = armed {
             let _ = arrived.send(());
-            let _ = go.recv();
+            let _ = go.recv_timeout(Self::HOLDS_AT_MOST);
         }
     }
+
+    /// The longest that an armed pause holds the work that has arrived at it.
+    pub(crate) const HOLDS_AT_MOST: std::time::Duration = std::time::Duration::from_secs(60);
 }
 
 /// What the attention store asks of the host about its wall clock.
