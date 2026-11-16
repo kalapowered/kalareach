@@ -2,11 +2,17 @@
 #
 # Held in both directions by the scan of the same name. The scope is the four pieces of the
 # function, the checks they call directly, the pure readers of the clocks and the gate, and the
-# broker's checks. A function that a scoped one calls and that is not listed is not read.
+# broker's checks, and the helpers that those checks call and that this list reads. A function of
+# this crate that a scoped body calls has to be a scoped one, an `outside` one or an `allow` name,
+# and a helper that is not read is not followed: what it calls is not seen.
 #
 # scope <file> <function>
 # site <file> <function> <callee> <how many calls>
 # outside <file> <function>
+# allow <name> ...
+# caller <callee> <file> <function> <count>
+# only <callee> <file> <function> <count>
+# held <file> <function> <callee> <guards>
 
 scope crates/kr-worker/src/service/standing.rs authority
 scope crates/kr-worker/src/service/standing.rs envelope
@@ -35,6 +41,13 @@ scope crates/kr-worker/src/action/time.rs utc_end_reached
 scope crates/kr-worker/src/broker/methods.rs checks
 scope crates/kr-worker/src/broker/mod.rs check_responsible
 scope crates/kr-worker/src/broker/mod.rs recheck_answer_trust
+scope crates/kr-worker/src/session.rs lease
+scope crates/kr-worker/src/session.rs attachment_capabilities
+scope crates/kr-worker/src/questions/mod.rs check_create
+scope crates/kr-worker/src/questions/mod.rs check_own
+scope crates/kr-worker/src/questions/mod.rs check_resolvable_reaching
+scope crates/kr-worker/src/questions/mod.rs question
+scope crates/kr-worker/src/questions/mod.rs sweep
 outside crates/kr-worker/src/service.rs decidable
 
 # The takes. Each is a lock of one domain, or the session's guard.
@@ -54,3 +67,143 @@ site crates/kr-worker/src/service.rs check_admission_limits session 1
 site crates/kr-worker/src/service.rs check_admission_limits lock 1
 # `Session::state()` is a read of the session the caller holds, not a take.
 site crates/kr-worker/src/service.rs check_preconditions state 2
+
+# The questions' ledger's lock, taken for one read or one check and let go with the call.
+site crates/kr-worker/src/questions/mod.rs check_create locked 1
+site crates/kr-worker/src/questions/mod.rs check_own locked 1
+site crates/kr-worker/src/questions/mod.rs check_resolvable_reaching locked 1
+site crates/kr-worker/src/questions/mod.rs question locked 1
+site crates/kr-worker/src/questions/mod.rs sweep locked 1
+# The input domain's lock, for the lease and for an attachment's capabilities.
+site crates/kr-worker/src/session.rs lease lock 1
+site crates/kr-worker/src/session.rs attachment_capabilities lock 1
+
+# The helpers that a scoped body calls and the scan does not read. Each definition was read for
+# the calls this roster counts (the lock, a try, the session, the state and a locked store), and
+# none makes one, except where a name is shared with a function that does:
+#
+# * `drop` is the standard function; the crate's `Drop` impls cannot be called by name.
+# * `all`, `read`, `named`, `recorded`, `capabilities` and `require_rich_work` are also declared by
+#   a function of another type that takes a lock. The callers here are the iterator's `all`, the
+#   questions' store's `read`, the clock floor's `named` and `recorded` (declared in another
+#   crate), the input domain's `capabilities` and the broker's volatile state's `require_rich_work`.
+#   The scan reads names and not receivers, so a change of receiver is not seen.
+# * A function that an `allow` name calls is not read: `check_attachment` reaches
+#   `holds_attachment`, which takes the input domain's lock, one call below the scan.
+# called from action/time.rs pure_proven_ms
+allow projected
+# called from action/time.rs pure_wall_ms
+allow get now_ms
+# called from action/time.rs utc_deadline_standing
+allow load named recorded
+# called from broker/methods.rs checks
+allow application_instance_id binding_revision check_turn mutations_suspended recheck
+allow require_in_time require_rich_work resource_id suspension_reason unknown_instance
+# called from broker/mod.rs check_responsible
+allow all component_disabled denied filter unknown_binding
+# called from broker/mod.rs recheck_answer_trust
+allow trusted_to_encode unknown
+# called from questions/mod.rs check_create
+allow check_request key
+# called from questions/mod.rs check_own
+allow check_token read_row
+# called from questions/mod.rs check_resolvable_reaching
+allow read
+# called from questions/mod.rs sweep
+allow drop expire_due expiry_events woken_by
+# called from service.rs check_accepted_deadline
+allow now
+# called from service.rs check_admission_limits
+allow bounded_by_outstanding check_outstanding check_supersession is_storage_failure journal_mut
+allow map outstanding outstanding_limit parse revision survives_a_journal_fault work_class
+# called from service.rs check_authority
+allow expect
+# called from service.rs check_dispatch_lease
+allow input permits refused
+# called from service.rs check_envelope
+allow contains epoch id is_remote params_application_instance
+# called from service.rs check_local_standing
+allow assert_not_held detail holds_local off_the_executor
+# called from service.rs check_preconditions
+allow as_str geometry output_cursor
+# called from service.rs check_restrictions
+allow restrictions
+# called from service.rs sweep_questions
+allow question_clock
+# called from service.rs uncertain_outcome_in_the_way
+allow clone uncertain_for_subject
+# called from service.rs uncertain_with_identity
+allow holds_back identity_of uncertain_for_subject_matching
+# called from service.rs validate
+allow any bound_source check_attachment check_capability check_decision_reached check_resolvable
+allow check_screen_reach check_session config detach_subject disclosure is_local_owner iter
+allow launching_attachment params_attachment reaches_question
+# called from service/standing.rs subject
+allow question_sweep
+# called from session.rs attachment_capabilities
+allow capabilities
+
+# The call sites, each in the one function that makes the call. A call from another function of the
+# files named here, or one call more or less, fails. The pieces, and the three functions that run
+# them: the first admission, the accept's hold and the dispatch after it.
+caller standing_pass crates/kr-worker/src/service.rs receipted 1
+caller standing_pass crates/kr-worker/src/service.rs admit_and_dispatch 1
+caller standing_pass crates/kr-worker/src/service.rs dispatch_accepted 1
+caller authority crates/kr-worker/src/service.rs receipted 1
+caller envelope crates/kr-worker/src/service.rs receipted 1
+caller limits crates/kr-worker/src/service.rs receipted 1
+caller limits crates/kr-worker/src/service.rs admit_and_dispatch 1
+caller subject crates/kr-worker/src/service.rs dispatch_accepted 1
+caller dispatch crates/kr-worker/src/service.rs dispatch_accepted 1
+# The checks that each piece makes, and where.
+caller check_authority crates/kr-worker/src/service/standing.rs authority 1
+caller check_validated_revision crates/kr-worker/src/service/standing.rs authority 1
+caller check_local_standing crates/kr-worker/src/service/standing.rs authority 1
+caller check_envelope crates/kr-worker/src/service/standing.rs envelope 1
+caller check_admission_limits crates/kr-worker/src/service/standing.rs limits 1
+caller validate crates/kr-worker/src/service/standing.rs subject 1
+caller check_preconditions crates/kr-worker/src/service/standing.rs subject 1
+caller check_dispatch_lease crates/kr-worker/src/service/standing.rs dispatch 1
+caller check_accepted_deadline crates/kr-worker/src/service/standing.rs dispatch 1
+caller decidable crates/kr-worker/src/service/standing.rs dispatch 1
+# The gate's standing comparison and the pure readers it uses.
+caller utc_deadline_standing crates/kr-worker/src/local_gate.rs check_bound 1
+caller pure_proven_ms crates/kr-worker/src/action/time.rs utc_deadline_standing 1
+caller pure_wall_ms crates/kr-worker/src/action/time.rs pure_proven_ms 1
+caller utc_end_reached crates/kr-worker/src/action/time.rs utc_deadline_standing 1
+# The broker's checks, and the expiry sweep inside the subject's check.
+caller check_responsible crates/kr-worker/src/broker/methods.rs checks 1
+caller recheck_answer_trust crates/kr-worker/src/broker/methods.rs checks 1
+caller sweep_questions crates/kr-worker/src/service.rs validate 3
+# The full check of the local owner, which raises the host's floor, stands outside the pass: the
+# two calls of the first admission's check and the one of the writer's.
+only check_utc_deadline crates/kr-worker/src/local_gate.rs check 1
+only check_utc_deadline crates/kr-worker/src/runtime.rs start_and_say_if_the_shell_ended 1
+only settled_utc_ms crates/kr-worker/src/local_gate.rs check 1
+
+# The guards held where a call is made, from the text before it: `BAR` is the dispatch barrier the
+# first admission takes, `SES` the session that a function is given or takes before the call.
+# The first admission asks the authority and the limits under the barrier alone, the envelope under
+# the barrier and a session of its own, and takes the session for the limits itself.
+held crates/kr-worker/src/service.rs receipted authority BAR
+held crates/kr-worker/src/service.rs receipted envelope BAR,SES
+held crates/kr-worker/src/service.rs receipted limits BAR
+held crates/kr-worker/src/service.rs receipted admit_and_dispatch BAR
+# The accept's hold: the uncertain outcome is asked again under the session that reaches the
+# accept, and the dispatch runs under it, each after the barrier that the caller took.
+held crates/kr-worker/src/service.rs admit_and_dispatch limits SES
+held crates/kr-worker/src/service.rs admit_and_dispatch dispatch_accepted SES
+held crates/kr-worker/src/service.rs dispatch_accepted subject SES
+held crates/kr-worker/src/service.rs dispatch_accepted dispatch SES
+# What each piece reads under, from its parameters. A pass that asks again is handed the session
+# the limits read under; the first admission hands none and the check takes one.
+held crates/kr-worker/src/service/standing.rs envelope check_envelope SES
+held crates/kr-worker/src/service/standing.rs limits check_admission_limits SES
+held crates/kr-worker/src/service/standing.rs subject validate SES
+held crates/kr-worker/src/service/standing.rs subject check_preconditions SES
+held crates/kr-worker/src/service/standing.rs dispatch check_dispatch_lease SES
+held crates/kr-worker/src/service/standing.rs dispatch check_accepted_deadline SES
+held crates/kr-worker/src/service/standing.rs dispatch decidable SES
+held crates/kr-worker/src/service/standing.rs authority check_authority none
+held crates/kr-worker/src/service/standing.rs authority check_validated_revision none
+held crates/kr-worker/src/service/standing.rs authority check_local_standing none
