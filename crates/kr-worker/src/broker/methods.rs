@@ -356,18 +356,75 @@ pub struct MutationAdmission {
     action: Option<ActionName>,
     /// The turn the operation was admitted against, where it acts on one.
     turn_id: Option<kr_protocol::ids::AgentTurnId>,
+    /// The deadline the host accepted for the action this admission carries out, once the host has
+    /// said which one it is.
+    accepted: Option<AcceptedUntil>,
+    /// When the resource this answer resolves stops accepting an answer, where it has a deadline.
+    resource_deadline: Option<TimestampMs>,
 }
 
 /// What a permit was admitted against, copied out of its admission so that the broker's checks can
 /// be asked again on the thread that makes the transport's call, where the permit itself cannot go.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct AdmittedAgainst {
     application_instance_id: ApplicationInstanceId,
     binding_revision: AgentBindingRevision,
     resource_id: Option<kr_protocol::ids::PendingResourceId>,
+    /// The deadline the host accepted for the action this admission carries out, with the clock it
+    /// is measured on, where the admission was made for one.
+    accepted: Option<AcceptedUntil>,
+    /// When the pending resource this admission answers stops accepting an answer.
+    resource_deadline: Option<TimestampMs>,
+}
+
+/// The deadline the host accepted for an action, on the continuous clock it was derived on.
+#[derive(Clone, Debug)]
+struct AcceptedUntil {
+    clock: std::sync::Arc<dyn kr_transport::clock::ContinuousClock>,
+    deadline: kr_transport::clock::ContinuousInstant,
+}
+
+/// The refusal for an answer that reaches a resource after its upstream deadline.
+fn upstream_deadline_passed(
+    resource_id: kr_protocol::ids::PendingResourceId,
+    deadline: TimestampMs,
+) -> BrokerError {
+    BrokerError::PreconditionFailed {
+        detail: format!(
+            "{resource_id}'s upstream deadline passed at {}, so this answer would reach nothing",
+            deadline.get()
+        ),
+    }
 }
 
 impl AdmittedAgainst {
+    /// Refuses where a deadline that bounds this operation has passed.
+    ///
+    /// The accepted deadline is read on its own clock and the resource's on the wall clock reading
+    /// the caller passes. Both are read by a caller that holds nothing between the reading and
+    /// what the operation does next, so a deadline that ended while locks were waited for is
+    /// seen here.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the admission gave for the same deadline: [`BrokerError::PermissionDenied`]
+    /// for the accepted deadline and [`BrokerError::PreconditionFailed`] for the resource's.
+    pub(crate) fn require_in_time(&self, wall_now: TimestampMs) -> Result<()> {
+        if let Some(accepted) = self.accepted.as_ref()
+            && accepted.clock.now() >= accepted.deadline
+        {
+            return Err(BrokerError::denied(
+                crate::action::window::ACCEPTED_DEADLINE_PASSED,
+            ));
+        }
+        if let (Some(resource_id), Some(deadline)) = (self.resource_id, self.resource_deadline)
+            && deadline.get() <= wall_now.get()
+        {
+            return Err(upstream_deadline_passed(resource_id, deadline));
+        }
+        Ok(())
+    }
+
     const fn application_instance_id(&self) -> ApplicationInstanceId {
         self.application_instance_id
     }
@@ -384,12 +441,24 @@ impl AdmittedAgainst {
 impl MutationAdmission {
     /// What this admission was made against, for the broker's checks to be asked again.
     #[must_use]
-    pub const fn admitted_against(&self) -> AdmittedAgainst {
+    pub fn admitted_against(&self) -> AdmittedAgainst {
         AdmittedAgainst {
             application_instance_id: self.application_instance_id,
             binding_revision: self.binding_revision,
             resource_id: self.resource_id,
+            accepted: self.accepted.clone(),
+            resource_deadline: self.resource_deadline,
         }
+    }
+
+    /// Records the deadline the host accepted for the action this admission carries out, on the
+    /// clock it was derived on, so that the broker asks it again where an effect lands.
+    pub(crate) fn hold_to_accepted_deadline(
+        &mut self,
+        clock: std::sync::Arc<dyn kr_transport::clock::ContinuousClock>,
+        deadline: kr_transport::clock::ContinuousInstant,
+    ) {
+        self.accepted = Some(AcceptedUntil { clock, deadline });
     }
 
     pub(crate) fn new(
@@ -410,6 +479,8 @@ impl MutationAdmission {
             resource_id: None,
             action: None,
             turn_id: request.turn_id.clone(),
+            accepted: None,
+            resource_deadline: None,
             permit: std::sync::Mutex::new(Some(ExecutionPermit {
                 request,
                 dispatch,
@@ -439,6 +510,7 @@ impl MutationAdmission {
     pub(crate) fn with_approval(mut self, claim: Claim, admission: DispatchAdmission) -> Self {
         self.provenance = admission.provenance;
         self.resource_id = Some(admission.resource.resource_id);
+        self.resource_deadline = admission.resource.deadline_ms.as_ref().copied();
         if let Some(permit) = self.held().as_mut() {
             permit.settlement = Some(claim);
             permit.approval = Some(admission);
@@ -1521,7 +1593,11 @@ impl Broker {
         // answer has already refused it, so what remains after this point is the transport's own
         // failure, which is what uncertainty is for. A marker this host could not write has sent
         // nothing, so the reservation goes back and the resource stays answerable.
-        if let Err(error) = self.commit_dispatch(&claim, now) {
+        #[cfg(feature = "testing")]
+        self.at_commit_pause();
+        if let Err(error) =
+            self.commit_dispatch(&claim, &admitted.admitted_against(), &permit.request, now)
+        {
             // No byte of this answer has been queued: what refused the marker is why, and the
             // resource is left to whoever now holds it, or answerable again if nobody does.
             crate::broker::settled(self.release_claim(&claim, now));
@@ -2310,7 +2386,9 @@ impl Broker {
         // binding can move while they are waited for. What the broker holds is read again after
         // them, so the last ask before the permit leaves is the broker's.
         dispatch.admit(request)?;
-        self.recheck_broker(&against, request)
+        self.recheck_broker(&against, request)?;
+        // The deadlines are read last, with nothing between their reading and the return.
+        against.require_in_time(self.deadline_now())
     }
 
     /// Asks the broker's checks again, immediately before the transport's call that takes the
@@ -2329,42 +2407,12 @@ impl Broker {
         #[cfg(feature = "testing")]
         self.at_submit_pause();
         self.recheck_broker(against, request)
+            .and_then(|()| against.require_in_time(self.deadline_now()))
             .map_err(|refusal| BrokerError::NotTransmitted(Box::new(refusal)))
     }
 
     fn recheck_broker(&self, admitted: &AdmittedAgainst, request: &UpstreamRequest) -> Result<()> {
-        let state = self.state();
-        state.volatile.require_rich_work()?;
-        let application_instance_id = admitted.application_instance_id();
-        let instance = state
-            .instances
-            .get(&application_instance_id)
-            .ok_or_else(|| crate::broker::unknown_instance(application_instance_id))?;
-        if let Some(reason) = instance.suspension_reason() {
-            return Err(BrokerError::mutations_suspended(reason));
-        }
-        if instance.binding_revision != admitted.binding_revision() {
-            return Err(BrokerError::StaleBinding {
-                detail: format!(
-                    "this was admitted at binding revision {} and the binding is at {}",
-                    admitted.binding_revision(),
-                    instance.binding_revision
-                ),
-            });
-        }
-        // A turn starts or ends without moving the binding's revision: what the operation names
-        // or needs of the turn is read again.
-        crate::broker::check_turn(
-            request.operation,
-            request.turn_id.as_ref(),
-            instance.turn_id.as_ref(),
-        )?;
-        // An answer is trusted to its decoder's authority, which an owner or a narrower
-        // installation withdraws without moving the revision either.
-        if let Some(resource_id) = admitted.resource_id() {
-            state.recheck_answer_trust(resource_id)?;
-        }
-        Ok(())
+        self.state().recheck_admitted(admitted, request)
     }
 
     /// Takes one admitted mutation's permit without handing it to the transport, so the caller
@@ -2409,6 +2457,55 @@ impl Broker {
 }
 
 impl crate::broker::BrokerState {
+    /// Checks again what an admission was made against, on the state the caller holds the lock
+    /// of: that rich work is neither fenced nor suspended, that the instance's binding is the one
+    /// the admission named, that the turn still fits the operation and that the answer's decoder
+    /// still holds its authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::PreconditionFailed`] while rich work is fenced or suspended,
+    /// [`BrokerError::StaleBinding`] when the binding moved and [`BrokerError::UnknownSubject`]
+    /// for an instance this broker no longer holds.
+    pub(crate) fn recheck_admitted(
+        &self,
+        admitted: &AdmittedAgainst,
+        request: &UpstreamRequest,
+    ) -> Result<()> {
+        self.volatile.require_rich_work()?;
+
+        let application_instance_id = admitted.application_instance_id();
+        let instance = self
+            .instances
+            .get(&application_instance_id)
+            .ok_or_else(|| crate::broker::unknown_instance(application_instance_id))?;
+        if let Some(reason) = instance.suspension_reason() {
+            return Err(BrokerError::mutations_suspended(reason));
+        }
+        if instance.binding_revision != admitted.binding_revision() {
+            return Err(BrokerError::StaleBinding {
+                detail: format!(
+                    "this was admitted at binding revision {} and the binding is at {}",
+                    admitted.binding_revision(),
+                    instance.binding_revision
+                ),
+            });
+        }
+        // A turn starts or ends without moving the binding's revision: what the operation names
+        // or needs of the turn is read again.
+        crate::broker::check_turn(
+            request.operation,
+            request.turn_id.as_ref(),
+            instance.turn_id.as_ref(),
+        )?;
+        // An answer is trusted to its decoder's authority, which an owner or a narrower
+        // installation withdraws without moving the revision either.
+        if let Some(resource_id) = admitted.resource_id() {
+            self.recheck_answer_trust(resource_id)?;
+        }
+        Ok(())
+    }
+
     /// Reads an answering action's call under the broker's lock: the resource it answers and the
     /// decision it carries.
     ///
@@ -2566,13 +2663,7 @@ impl crate::broker::BrokerState {
         if let Some(deadline) = resource.deadline_ms.as_ref()
             && deadline.get() <= now.get()
         {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!(
-                    "{resource_id}'s upstream deadline passed at {}, so this answer would reach \
-                     nothing",
-                    deadline.get()
-                ),
-            });
+            return Err(upstream_deadline_passed(resource_id, *deadline));
         }
         let entry = self.ledger.decoding(resource_id)?.ok_or_else(|| {
             BrokerError::PreconditionFailed {
@@ -2623,13 +2714,7 @@ impl crate::broker::BrokerState {
         if let Some(deadline) = resource.deadline_ms.as_ref()
             && deadline.get() <= now.get()
         {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!(
-                    "{}'s upstream deadline passed at {}, so this answer would reach nothing",
-                    params.resource_id,
-                    deadline.get()
-                ),
-            });
+            return Err(upstream_deadline_passed(params.resource_id, *deadline));
         }
         // The answer is written by whoever read the request: the component that read it, which
         // writes it before this and hands the bytes in, or the connector's table, which writes it

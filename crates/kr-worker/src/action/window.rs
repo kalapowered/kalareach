@@ -18,6 +18,10 @@ use kr_transport::window::{AcceptedDeadline, ActionWindowIssuer, WindowRefusal};
 
 use crate::error::{Result, WorkerError};
 
+/// What a caller is told when the deadline the host accepted for its action has passed before the
+/// action's effect.
+pub const ACCEPTED_DEADLINE_PASSED: &str = "the accepted deadline for this action has passed";
+
 /// Derives the accepted deadline of one first admission.
 ///
 /// `received_at` is when the host read the request, not when it reached this point. Section 9
