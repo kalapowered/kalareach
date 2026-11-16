@@ -1314,6 +1314,53 @@ impl TimeContract {
         })
     }
 
+    /// The wall clock's reading as it stands, with no lock and no side effect: the reading is not
+    /// kept and the floor is not raised.
+    ///
+    /// A check that asks again whether a UTC end has been reached reads this where it may take no
+    /// lock; what it leaves out against [`Self::proven_wall_ms`] is the kept reading and the
+    /// high-water projection, so it can read earlier than the proven reading and never later.
+    #[must_use]
+    pub fn pure_wall_ms(&self) -> u64 {
+        self.wall.now_ms().get()
+    }
+
+    /// The earliest the wall clock can honestly read now, as [`Self::proven_wall_ms`] reads it, with
+    /// no side effect: the mark is read under the contract's lock, the reading is not kept and the
+    /// floor is not raised.
+    #[must_use]
+    pub fn pure_proven_ms(&self) -> u64 {
+        let state = self.lock();
+        let now = self.pure_wall_ms();
+        state.high_water.map_or(now, |mark| {
+            now.max(mark.projected(self.continuous.boot_elapsed_ms()))
+        })
+    }
+
+    /// Decides one copy of authority against its UTC deadline as [`Self::check_utc_deadline`]
+    /// decides it, reading the clocks and the floor and changing none of them.
+    ///
+    /// Where the full check raises the floor to the reading and owes the daemon's record the value
+    /// it loaded, this reads the floor as it stands against the pure reading
+    /// ([`Self::pure_proven_ms`]), and a deadline it finds passed but not recorded refuses without
+    /// owing anything: the first admission and the writer's own full check owe it.
+    #[must_use]
+    pub fn utc_deadline_standing(&self, deadline_ms: u64) -> UtcDeadline {
+        let Some(floor) = self.floor.as_ref() else {
+            return UtcDeadline::NoFloor;
+        };
+        if !floor.named() {
+            return UtcDeadline::FloorLost;
+        }
+        if !utc_end_reached(floor.load(), self.pure_proven_ms(), deadline_ms) {
+            return UtcDeadline::Ahead;
+        }
+        if floor.recorded() >= deadline_ms {
+            return UtcDeadline::Passed;
+        }
+        UtcDeadline::Unrecorded
+    }
+
     /// Publishes `reading` in the host's clock floor and returns the floor as the raise left it,
     /// or the reading itself when this worker maps no floor.
     fn publish(&self, reading: u64) -> u64 {
@@ -1944,6 +1991,16 @@ impl TimeContract {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+/// Whether a UTC end has been reached, given the host floor's word and a reading of the wall clock:
+/// at either one at or above the end.
+///
+/// It is the one comparison that every pass and every ask of a UTC end makes, so that they cannot
+/// differ at the boundary: a deadline is reached at equality.
+#[must_use]
+pub const fn utc_end_reached(floor_word: u64, wall_ms: u64, end_ms: u64) -> bool {
+    floor_word >= end_ms || wall_ms >= end_ms
 }
 
 fn millis(duration: Duration) -> u64 {
@@ -3472,6 +3529,28 @@ mod tests {
         quiet.raise(WALL + 60_000);
         assert_eq!(quiet_contract.settled_utc_ms(), WALL + 60_000);
         assert_eq!(quiet.load(), WALL + 60_000);
+    }
+
+    /// A UTC end is reached when the floor's word or the wall reading is at it or above it, and is
+    /// not reached below both: the boundary is equality, for every pass and every ask alike.
+    #[test]
+    fn a_utc_end_is_reached_at_equality_by_either_reading() {
+        assert!(utc_end_reached(100, 0, 100), "the floor at the end");
+        assert!(utc_end_reached(0, 100, 100), "the wall reading at the end");
+        assert!(utc_end_reached(101, 0, 100), "the floor past the end");
+        assert!(
+            utc_end_reached(0, 101, 100),
+            "the wall reading past the end"
+        );
+        assert!(
+            utc_end_reached(150, 50, 100),
+            "one reading past it is enough"
+        );
+        assert!(!utc_end_reached(99, 99, 100), "both below");
+        assert!(
+            !utc_end_reached(0, 0, u64::MAX),
+            "nothing reaches the largest end"
+        );
     }
 
     #[test]

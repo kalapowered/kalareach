@@ -218,6 +218,37 @@ impl LocalGate {
         }
     }
 
+    /// Whether a held method is allowed to a local caller now, decided as [`Self::check`] decides
+    /// it and with no side effect: the clocks and the host's floor are read and none is changed,
+    /// and nothing is owed to the daemon's record.
+    ///
+    /// This is the comparison a pass that asks again makes. The full check stays with the first
+    /// admission and with the writer, which raise the floor and lay the lease's end over the
+    /// continuous clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns why it is refused.
+    pub fn check_bound(&self) -> Result<(), Refused> {
+        let bound = self.lock().bound;
+        match bound {
+            Bound::Open => Ok(()),
+            Bound::Unannounced => Err(Refused::NotTold),
+            Bound::Closed => Err(Refused::Closed),
+            Bound::Until {
+                boot_deadline_ms,
+                utc_deadline_ms,
+            } => {
+                if self.clock.boot_elapsed_ms() >= boot_deadline_ms
+                    || self.time.utc_deadline_standing(utc_deadline_ms) != UtcDeadline::Ahead
+                {
+                    return Err(Refused::Ended);
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Applies the statement of the generation that holds this worker's authority.
     pub fn apply(&self, generation: ControllerGeneration, access: LocalAccess) -> Applied {
         let mut inner = self.lock();
@@ -533,6 +564,47 @@ mod tests {
             Applied::Accepted { tightened: false }
         );
         assert!(gate.check().is_ok());
+    }
+
+    /// The comparison that a pass asking again makes refuses what the full check refuses, for
+    /// every state the gate can hold, and says no more.
+    #[test]
+    fn the_comparison_that_asks_again_refuses_what_the_full_check_refuses() {
+        let gate = gate();
+        gate.hold_until_told();
+        let agree = |gate: &LocalGate| {
+            assert_eq!(gate.check().map(|_| ()), gate.check_bound());
+        };
+        agree(&gate);
+        assert_eq!(gate.check_bound(), Err(Refused::NotTold));
+        let first = generation(1);
+        let now = kr_ipc::clock::SystemSharedClock.boot_elapsed_ms();
+        let states = [
+            (LocalBound::Open, Ok(())),
+            (LocalBound::Closed, Err(Refused::Closed)),
+            // A lease whose continuous end has passed.
+            (
+                LocalBound::Until {
+                    boot_deadline_ms: U64::new(now),
+                    utc_deadline_ms: U64::new(u64::MAX),
+                },
+                Err(Refused::Ended),
+            ),
+            // A lease that stands on the continuous clock, in a worker that maps no floor: its UTC
+            // end cannot be decided, so it is refused.
+            (
+                LocalBound::Until {
+                    boot_deadline_ms: U64::new(now + 3_600_000),
+                    utc_deadline_ms: U64::new(u64::MAX),
+                },
+                Err(Refused::Ended),
+            ),
+        ];
+        for (sequence, (bound, expected)) in (1..).zip(states) {
+            gate.apply(first, statement(sequence, bound));
+            assert_eq!(gate.check_bound(), expected, "{bound:?}");
+            agree(&gate);
+        }
     }
 
     /// A lease bound does not outlive the daemon that told it; `Open` and `Closed` carry no lease

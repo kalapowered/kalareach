@@ -402,7 +402,6 @@ fn a_switch_an_attesting_bridge_detects_invalidates_the_questions_asked_under_th
                 waiting.question.question_id,
                 waiting.question.revision,
                 Some(&QuestionAnswer::Decision { decided: true }),
-                now(2_200),
             )
             .is_err()
     );
