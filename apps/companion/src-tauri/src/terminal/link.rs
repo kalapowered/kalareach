@@ -253,6 +253,24 @@ impl Events {
         }
     }
 
+    /// Waits for `call` while reading and dropping what the reader hands on, as the end of a view
+    /// does: the reader waits for room while its channel is full, and what the view waits for may
+    /// wait behind the reader. What arrives is of no use to a view that has ended.
+    pub(super) async fn dropping_during<T>(&mut self, call: impl Future<Output = T>) -> T {
+        tokio::pin!(call);
+        loop {
+            tokio::select! {
+                biased;
+                out = &mut call => return out,
+                item = self.events.recv() => {
+                    if item.is_none() {
+                        return call.await;
+                    }
+                }
+            }
+        }
+    }
+
     /// Reads to the end of the session after `failed`, the failure of a call: the host's refusal of
     /// the connection when it arrives within [`REFUSAL_WAIT`], and otherwise the words of how the
     /// link ended. What arrives before the end is of no use to a call whose link is over.
