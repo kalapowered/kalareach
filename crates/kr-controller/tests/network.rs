@@ -4283,6 +4283,7 @@ async fn the_methods_a_grant_admits_answer_both_ingresses_but_for_what_a_device_
         SessionReadResult {
             endpoint: locally.endpoint.clone(),
             ..remotely
+            held: false,
         },
         locally,
         "a session the grant admits reads the same on both ingresses, but for the socket"

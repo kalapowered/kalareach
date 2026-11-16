@@ -316,9 +316,10 @@ pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
     include_str!("../retained/0.77/RELEASE"),
     include_str!("../retained/0.77/PLUGIN_HOST"),
     &[],
-    &[Compatible {
-        at: "AttentionHostRecord.session_event",
-        reason: "A member that is absent from the wire unless this build's worker recorded an \
+    &[
+        Compatible {
+            at: "AttentionHostRecord.session_event",
+            reason: "A member that is absent from the wire unless this build's worker recorded an \
                  agent turn that ended or a command that finished with a status other than \
                  nought, and a worker of the retained level never writes it, so this build's \
                  daemon reads a page of that level as one that records no such work, which is \
@@ -334,7 +335,24 @@ pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
                  client was released, so there is no shim: the public contract may change with a \
                  level move until public 1.0 freezes at the first client release \
                  (`docs/releases/packages.md`).",
-    }],
+        },
+        Compatible {
+            at: "SessionReadResult.held",
+            reason: "A member that is absent from the wire unless this build's worker answered a \
+                 read of its session while a storage call held the session, and a worker of the \
+                 retained level never writes it, so this build's daemon reads what that level \
+                 writes as an answer given with the session taken, which is what that level's \
+                 worker gave. A result that carries the member is written only by a worker of \
+                 this build. The daemon's sleep scan is its one reader: it never lowers what it \
+                 counted for the session on such an answer. The daemon's own answer to a client \
+                 never carries it. The retained level's daemon, whose result is a closed object, \
+                 cannot read a result that carries the member and takes the answer for a read \
+                 that failed, which is what it takes a read that is not answered for; its scan \
+                 keeps what it counted, as it does then. No client was released, so there is no \
+                 shim: the public contract may change with a level move until public 1.0 freezes \
+                 at the first client release (`docs/releases/packages.md`).",
+        },
+    ],
 )
 .with_public_majors(include_str!("../retained/0.77/PUBLIC_MAJORS"))];
 

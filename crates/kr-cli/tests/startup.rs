@@ -2673,6 +2673,7 @@ async fn a_worker_that_withholds_its_attachments(host: &Standalone, session_id: 
         last_command_block: Nullable::null(),
         outstanding_launches: Nullable::null(),
         metrics: None,
+        held: false,
     };
     let boot_epoch = kr_ipc::identity::boot_epoch(&boot).expect("a boot epoch");
     let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");

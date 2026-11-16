@@ -88,6 +88,14 @@ struct Same {
 
 const SAME: &[Same] = &[
     Same {
+        root: "SessionReadResult",
+        digest: "2d62f8643b64fbdf8ab926957a0959c608a115291fa5f4781e11c7c4d68b3e37",
+        reason: "A member that is absent from the wire unless the worker answered a read of its \
+                 session while a storage call held the session. A worker of the retained level \
+                 never writes it, and this build reads a result without it as one given with the \
+                 session taken, so what that level writes is read as before.",
+    },
+    Same {
         root: "the attention text a worker serves",
         digest: "e93a3879ea3bcb47d54d7e68724a6f0f4381abe849272bc6a8d52bb593042edb",
         reason: "A host event of a kind that carries a line of identifiers is answered with the \

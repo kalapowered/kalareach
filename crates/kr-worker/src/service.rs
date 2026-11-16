@@ -8595,6 +8595,7 @@ impl WorkerService {
                 &self.metrics_of(&session),
             ))
             .filter(|counted| !counted.is_empty()),
+            held: false,
         })
     }
 
@@ -8612,6 +8613,10 @@ impl WorkerService {
     /// waits for the session. It can say `Closed` with no closure record in the moment between the
     /// domain's change and the copy's publication. See [`crate::published`] for both, and for the
     /// older copy of a stage that a reader's record of what it heard can take.
+    ///
+    /// The answer says `held`, and nothing else sets that member: the daemon's sleep scan reads it
+    /// to keep what it had counted for the session, because the counts in this answer are what the
+    /// worker last recorded and not what the session holds.
     fn session_read_while_held(&self, params: &SessionReadParams) -> Result<ParamsValue> {
         let held = self.runtime.published().answer(self.runtime.input());
         Self::check_owned_session(held.summary.session_id, params.session_id)?;
@@ -8623,6 +8628,7 @@ impl WorkerService {
             last_command_block: Nullable::null(),
             outstanding_launches: Nullable(held.outstanding_launches.map(U64::new)),
             metrics: None,
+            held: true,
         })
     }
 

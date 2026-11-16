@@ -1566,6 +1566,7 @@ mod tests {
             last_command_block: Nullable::null(),
             outstanding_launches: Nullable::null(),
             metrics: None,
+            held: false,
         })
         .expect("a result")
     }
