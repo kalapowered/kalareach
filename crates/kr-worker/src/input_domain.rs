@@ -61,7 +61,7 @@ use kr_protocol::ids::{AttachmentId, AuthorityRevision, ConnectionId, InputLease
 use kr_protocol::input::{InputBarrier, InputLeaseState};
 use kr_protocol::local::{InputLaneReady, LaneCredit, LaneEnded, LaneLaunch, LaneWindow};
 use kr_protocol::scalars::{CanonicalSet, Nullable, U64};
-use kr_protocol::session::SessionState;
+use kr_protocol::session::{ApplicationState, SessionState};
 use kr_shell_integration::contract::fence::{LaunchStanding, LeaseView};
 use kr_shell_integration::contract::requests::LaunchTransactionId;
 use kr_term::win32::{Fidelity, KeyRecord, Keyboard, Refused};
@@ -562,6 +562,10 @@ pub struct InputDomain {
     /// The session's lifecycle state. Whether input is accepted is a question about it, so it lives
     /// here: the admission of a close and the refusal of the next keystroke are one step.
     state: SessionState,
+    /// What the session's application is doing. It lives here, beside the lifecycle state, because
+    /// a read of a session that something holds finds it here: the application's producer writes
+    /// it before it waits for the session, so demand that begins during a hold is in the answer.
+    application_state: Option<ApplicationState>,
     /// The session this domain belongs to, which a keystroke's request names.
     session_id: SessionId,
     lease: InputLease,
@@ -705,6 +709,7 @@ impl InputDomain {
     pub(crate) fn new(session_id: SessionId) -> Self {
         Self {
             state: SessionState::Creating,
+            application_state: None,
             session_id,
             lease: InputLease::new(),
             framer: PasteFramer::new(),
@@ -745,6 +750,30 @@ impl InputDomain {
     /// Moves the lifecycle.
     pub(crate) const fn set_state(&mut self, state: SessionState) {
         self.state = state;
+    }
+
+    /// Returns what the session's application is doing.
+    #[must_use]
+    pub const fn application_state(&self) -> Option<ApplicationState> {
+        self.application_state
+    }
+
+    /// Sets what the session's application is doing, and returns whether that changed anything.
+    ///
+    /// A session that no longer accepts input has no application to describe: closing leaves the
+    /// state as it was, and nothing sets it again afterwards.
+    pub(crate) fn set_application_state(&mut self, state: Option<ApplicationState>) -> bool {
+        if !self.state.accepts_input() || self.application_state == state {
+            return false;
+        }
+        self.application_state = state;
+        true
+    }
+
+    /// Puts the state the session itself gives its application: the shell at its prompt when the
+    /// shell has launched, and none once the session has closed.
+    pub(crate) const fn put_application_state(&mut self, state: Option<ApplicationState>) {
+        self.application_state = state;
     }
 
     /// Returns the session this domain belongs to.

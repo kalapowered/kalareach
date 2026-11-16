@@ -216,6 +216,7 @@ impl Producer {
                 return;
             }
             held.evidence = evidence;
+            self.record(&held);
         }
         self.publish();
     }
@@ -231,6 +232,7 @@ impl Producer {
                 return;
             }
             held.holder = holder;
+            self.record(&held);
         }
         self.publish();
     }
@@ -240,6 +242,24 @@ impl Producer {
         self.runtime
             .upgrade()
             .is_none_or(|runtime| !runtime.session().state().is_running())
+    }
+
+    /// Writes what the facts held come to into the session's input domain, where a read of a
+    /// session that something holds finds it.
+    ///
+    /// It is made as the fact joins the others, before the session is waited for, and with the
+    /// facts locked, so the writes go in the order the facts were joined in. A turn, a question or
+    /// a launch that begins while a storage call holds the session is therefore in the answer of
+    /// a read that cannot take the session. The domain's lock is taken last, for the write alone.
+    fn record(&self, held: &Held) {
+        let Some(runtime) = self.runtime.upgrade() else {
+            return;
+        };
+        let application = describe(held.evidence, &held.holder);
+        runtime
+            .input()
+            .lock()
+            .set_application_state(application.state);
     }
 
     /// Publishes what the held facts come to, if that is not what was published.
@@ -271,7 +291,6 @@ impl Producer {
                 // had. What was held waits for a session that is.
                 return;
             }
-            session.set_application_state(application.state);
             session.set_application(application.name.clone());
         }
         self.published.send_replace(application);
