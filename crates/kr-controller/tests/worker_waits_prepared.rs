@@ -364,8 +364,9 @@ async fn kr_req_23_30_a_cancellation_that_came_first_stays_when_the_owner_reject
 ///
 /// The client's loop is held in the wait for the boundary and reads nothing from its socket, so the
 /// cancellation the client writes behind the action stays unread. At the release the action is
-/// dispatched and answered first, and the cancellation is answered after it and refuses to cancel
-/// an action that has been dispatched.
+/// dispatched first and then the cancellation is read, and it refuses to cancel an action that has
+/// been dispatched. Both are answered; the order of the two answers is not promised, since the
+/// action's is written when the upstream has answered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_a_cancel_sent_behind_a_waiting_prepared_action_is_read_after_the_action() {
     let Some(mut waiting) = waiting_for_the_boundary(Hold::Boundary, false).await else {
@@ -430,15 +431,20 @@ async fn kr_req_23_30_a_cancel_sent_behind_a_waiting_prepared_action_is_read_aft
             outcomes.insert(response.request_id.get(), response.outcome);
         }
     }
-    assert_eq!(
-        order,
-        vec![1, 2],
-        "the action is answered before the cancellation"
-    );
+    // The two answers are written by different tasks: the action's by the one that waits for the
+    // upstream to answer, the cancellation's by the connection's loop as soon as it reads it. Their
+    // order is not promised and is not asserted. What is promised is the order of the two requests'
+    // effects: the action was dispatched before the cancellation was read, so the action's answer is
+    // its own and the cancellation is refused.
     assert!(
         matches!(outcomes[&1], Outcome::Ok(_)),
         "the action was dispatched: {:?}",
         outcomes[&1]
+    );
+    assert!(
+        !matches!(outcomes[&2], Outcome::Ok(_)),
+        "the cancellation was read after the action was dispatched and is refused: {:?}",
+        outcomes[&2]
     );
     let receipt = read_receipt(&mut waiting.watcher, waiting.action_id)
         .await
