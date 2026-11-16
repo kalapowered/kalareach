@@ -12,6 +12,12 @@ publish.workspace = true
 name = "kr-crypto-vectors"
 path = "src/bin/kr-crypto-vectors.rs"
 
+[features]
+# The stand-in a case puts in the platform credential store's place, so that a case can say whether
+# that store opens and what it holds without a real Secret Service, Keychain or Credential Manager.
+# It compiles to nothing without this feature, and no shipped build enables it.
+testing = []
+
 [dependencies]
 hkdf.workspace = true
 hmac.workspace = true
