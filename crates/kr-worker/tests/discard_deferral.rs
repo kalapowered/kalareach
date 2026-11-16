@@ -312,6 +312,25 @@ fn release_after_a_while(
     (let_go, thread)
 }
 
+/// Keeps the host's maintenance out until the returned end is sent to or dropped, once a pass that
+/// is under way has ended. The gate is held on a thread of its own, so that no lock is held across
+/// an await.
+async fn hold_maintenance_out(host: &Host) -> std::sync::mpsc::Sender<()> {
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let (taken, held_out) = tokio::sync::oneshot::channel::<()>();
+    let service = Arc::clone(&host.service);
+    std::thread::spawn(move || {
+        let _gate = service.hold_maintenance();
+        let _ = taken.send(());
+        let _ = held.recv();
+    });
+    tokio::time::timeout(LIVENESS, held_out)
+        .await
+        .expect("no pass of maintenance is under way for ever")
+        .expect("the gate is taken");
+    release
+}
+
 /// Whether an answer lists the history as unavailable. The answer's other parts are the
 /// attention store's, which a host with no daemon's attention connection leaves outstanding.
 fn lists_history(completion: &PrivacyCompletion) -> bool {
@@ -391,16 +410,20 @@ async fn the_pump_makes_the_owed_discard_right_after_the_write_it_waited_for() {
 /// The privacy call answers complete when the write in flight ends inside its bound: the call
 /// waits for it with nothing held, and its second hold makes the discard.
 ///
-/// The pump is stopped between the end of its write and its own hold, and let go only after the
-/// call's answer has been read, so the discard that the answer reports was made by the call's
-/// second hold and by nobody else: a call with no second hold answers that the history is
-/// unavailable, whichever of the two the scheduler runs first.
+/// Everything else that could make the discard is held out until the call's answer has been read.
+/// The pump is stopped between the end of its write and its own hold. The appender's gate runs only
+/// when a batch is taken, and the pump takes none while it is stopped. A pass of maintenance, which
+/// retries the same cleanup, is kept out by `hold_maintenance`, which waits for a pass under way
+/// to end first. So the discard that the answer reports was made by the call's second hold: a call
+/// with no second hold answers that the history is unavailable, whatever order the scheduler runs
+/// the rest in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_privacy_call_whose_write_ends_inside_its_bound_answers_complete() {
     let mut host = host(true).await;
     host.service
         .set_privacy_write_wait(Duration::from_secs(120));
     let mut authority = authority(&host).await;
+    let maintenance_out = hold_maintenance_out(&host).await;
     let resume = host.with_a_write_in_flight().await;
     let (pump_arrived, pump_go) = host.runtime.pause_after_next_spool_write();
     let letting_go = {
@@ -429,6 +452,9 @@ async fn a_privacy_call_whose_write_ends_inside_its_bound_answers_complete() {
         "the pump's write ended and the pump stood at its pause, so it made no discard"
     );
     pump_go.send(()).expect("the pump is let go");
+    maintenance_out
+        .send(())
+        .expect("maintenance is let back in");
 }
 
 /// At its bound the call answers with the completion that lists history as unavailable, and no

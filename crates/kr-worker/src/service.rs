@@ -553,6 +553,10 @@ pub struct WorkerService {
     /// compiled away in every shipped build.
     #[cfg(feature = "testing")]
     privacy_write_wait: Mutex<std::time::Duration>,
+    /// Held by a test to keep every pass of maintenance out: each pass takes it at its start. It
+    /// is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    maintenance_gate: Mutex<()>,
     /// How many question subscriptions the long polls this service is serving hold at this moment,
     /// for this host's own tests. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -1135,6 +1139,8 @@ impl WorkerService {
             host_cap_looks: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "testing")]
             privacy_write_wait: Mutex::new(PRIVACY_WRITE_WAIT),
+            #[cfg(feature = "testing")]
+            maintenance_gate: Mutex::new(()),
             #[cfg(feature = "testing")]
             subscriptions_held: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "testing")]
@@ -2595,6 +2601,11 @@ impl WorkerService {
 
     /// One pass of the host's maintenance.
     fn maintain_once(&self) -> MaintenancePass {
+        #[cfg(feature = "testing")]
+        let _gate = self
+            .maintenance_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (closed, awaits_the_host_cap_lock, times, output) = {
             // Maintenance passes through the same serial boundary a mutation does. Section 9
             // puts the revalidation a discontinuity owes *before* the host serves a mutation,
@@ -2677,6 +2688,17 @@ impl WorkerService {
     #[cfg(feature = "testing")]
     pub fn maintain_now(&self) {
         self.maintain_pass();
+    }
+
+    /// Keeps every pass of the host's maintenance out until the guard that this returns is
+    /// dropped, for this host's own tests. A pass already under way ends first, so that no pass
+    /// is inside the session or the barrier while the guard is held. It is compiled away in every
+    /// shipped build.
+    #[cfg(feature = "testing")]
+    pub fn hold_maintenance(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.maintenance_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Sets how long the privacy call waits for a write of the session's output that is in flight,
