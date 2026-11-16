@@ -230,9 +230,9 @@ impl RelayGrant {
 /// Whether every bound in `under` still holds by `judge`, reading each clock once. A bound that
 /// holds is passed with no lock and no call to a store; a bound found ended owes only what a lapse
 /// owes today, which the next step outside the poll writes: in UTC, the floor the reading raised;
-/// on the continuous clock, for the offline bound, the time it has spent. The offline bound's and a
-/// share's debts are noted under a mutex of their own ([`held_by`]), on the refusal's branch alone,
-/// which no landing follows.
+/// on the continuous clock, for the offline bound, the time it has spent. A share's debt is noted
+/// under a mutex of its own and the offline bound's by one atomic store ([`held_by`]), on the
+/// refusal's branch alone, which no landing follows.
 ///
 /// It loads each bound's cell after its first clock read, so it is for a check outside a poll. The
 /// writer's own standing is asked by [`copied_bounds_hold`].
@@ -741,7 +741,9 @@ impl RemoteOutput {
         // answer or a conflict was admitted under (the fence this host owes, the revision in force
         // and the connection's latch). Reading a bound's cell can wait, so the caller copies every
         // cell BEFORE the first read of a clock ([`Copied`]) and this compares the copies: after
-        // the copies nothing it reads allocates, frees, takes a lock or waits.
+        // the copies nothing it reads on the path that lets the answer through allocates, frees,
+        // takes a lock or waits. A bound found ended notes its debt on the refusal's branch alone,
+        // which no landing follows.
         let standing = |copied: &Copied| {
             copied_bounds_hold(
                 &self.authority.controller,
