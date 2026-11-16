@@ -2043,6 +2043,11 @@ mod an_owners_request_is_recorded_where_it_lands;
 #[cfg(test)]
 mod an_owners_answer_is_recorded_where_it_lands;
 
+/// Where the owner's list of outstanding confirmations lands: the two prepared lists, the bound,
+/// the question.
+#[cfg(test)]
+mod a_pending_list_is_written_where_it_lands;
+
 /// A closure whose recording is dropped while it waits for the locks after the record.
 #[cfg(test)]
 mod a_closure_that_is_cancelled;

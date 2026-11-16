@@ -433,6 +433,15 @@ impl Controller {
         let Ok(bytes) = kr_ipc::framed::FrameWriter::encode(kind, answer) else {
             return false;
         };
+        // The list that replaces this one where the lease it was decided under has ended, encoded
+        // here with the answer: nothing is encoded after the question that chooses between them.
+        let Ok(instead) = under
+            .instead()
+            .map(|frame| kr_ipc::framed::FrameWriter::encode(kind, frame))
+            .transpose()
+        else {
+            return false;
+        };
         // What the question was asked with, held until the transport's write has been made.
         let mut asked = LeaseAsked::default();
         let mut begun = false;
@@ -477,6 +486,14 @@ impl Controller {
                             begun = false;
                         }
                         Err(lapse) => {
+                            // The question that stopped the list is the choice: where it is the
+                            // lease's end, the list under the scope that no lease serves goes as
+                            // it was prepared.
+                            if lapse == Lapse::LeaseEnded
+                                && let Some(bytes) = &instead
+                            {
+                                return writer.write_frame(bytes).await.is_ok();
+                            }
                             let reply = under.withheld(lapse, request_id, || {
                                 self.lease_ended_reply(request_id, method)
                             });
@@ -1159,7 +1176,7 @@ impl Controller {
                         Ok(_) => match self.read_refused(&request) {
                             Some(refused) => refused,
                             None => {
-                                let answer = self.read_method(&actor_id, &request, false).await;
+                                let (answer, instead) = self.local_read(&actor_id, &request).await;
                                 // Checked again now the read has finished. A read that passed its
                                 // check and then waited for the registry can complete after the
                                 // authority behind it was withdrawn, and what the contract forbids
@@ -1170,7 +1187,8 @@ impl Controller {
                                         None => {
                                             let under = WrittenUnder::of_a_read(
                                                 self.footing_of_a_request(connection_id),
-                                            );
+                                            )
+                                            .listing(instead);
                                             if !self
                                                 .write_answer(
                                                     writer,
