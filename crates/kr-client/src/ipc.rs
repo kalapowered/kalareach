@@ -440,9 +440,12 @@ impl ControlTransport for IpcTransport {
             // away. It is returned as that failure, as every other failed read is, so that what a
             // session reports of how its connection ended carries what the link said. A session
             // ends on either result alike. Only this side's own close is the clean end.
+            // The order is fixed: when this side's close and the read's end are both ready in one
+            // poll, the close is taken first, and the read ends cleanly.
             let frame = tokio::select! {
-                frame = reader.read_message::<ControlFrame>() => frame,
+                biased;
                 () = closing => return Ok(None),
+                frame = reader.read_message::<ControlFrame>() => frame,
             };
             match frame {
                 Ok(frame) => {
@@ -950,11 +953,12 @@ mod tests {
         );
     }
 
-    /// An error that the read returned stays a failure when the owner's flag lands after it: this
+    /// An error that the read returns is a failure even when the owner's flag is already set: this
     /// side's close causes no read error, so no flag turns an error into the clean end. The flag is
-    /// raised alone, as the first step of a close, which holds the order with no wait.
+    /// raised alone, as the first step of a close, while the read waits and before the peer's end,
+    /// which holds the order with no wait.
     #[tokio::test]
-    async fn an_error_the_read_returned_is_kept_when_the_flag_lands_after_it() {
+    async fn an_error_the_read_returns_is_kept_when_the_flag_is_set() {
         let (transport, peer_reader, peer_writer, _tree) = over_a_raw_connection().await;
         let transport = std::sync::Arc::new(transport);
         let reading = tokio::spawn({
@@ -972,6 +976,46 @@ mod tests {
             matches!(read, Err(ClientError::Ipc(kr_ipc::IpcError::PeerClosed))),
             "{read:?}"
         );
+    }
+
+    /// A waker that gives each wake to a `Notify` as a permit, for a case that polls a read by
+    /// hand.
+    struct Wakes(tokio::sync::Notify);
+
+    impl std::task::Wake for Wakes {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.notify_one();
+        }
+    }
+
+    /// The read's end and the owner's close notice that are both ready in one poll: the close
+    /// notice is taken first, in a fixed order, so the read ends cleanly. The case polls the read
+    /// by hand: once while it waits, then after the peer's end has woken it and the owner has
+    /// closed, so that one poll finds both ready. The order is repeated, since a select that took
+    /// its branches in a random order would end the read as a failure about half of the times.
+    #[tokio::test]
+    async fn a_read_error_and_the_close_notice_in_one_poll_end_the_read_cleanly() {
+        for round in 0..32 {
+            let (transport, peer_reader, peer_writer, _tree) = over_a_raw_connection().await;
+            let wakes = std::sync::Arc::new(Wakes(tokio::sync::Notify::new()));
+            let waker = std::task::Waker::from(std::sync::Arc::clone(&wakes));
+            let mut cx = std::task::Context::from_waker(&waker);
+            let mut read = transport.recv();
+            assert!(
+                std::future::Future::poll(read.as_mut(), &mut cx).is_pending(),
+                "round {round}: the read waits for the socket"
+            );
+            drop((peer_reader, peer_writer));
+            tokio::time::timeout(WITHIN, wakes.0.notified())
+                .await
+                .expect("the peer's end woke the read");
+            transport.close();
+            let outcome = std::future::Future::poll(read.as_mut(), &mut cx);
+            assert!(
+                matches!(outcome, std::task::Poll::Ready(Ok(None))),
+                "round {round}: the read's end was taken before the owner's close: {outcome:?}"
+            );
+        }
     }
 
     /// The owner's own close, with the reader parked in a read of the real link, is the clean end.

@@ -805,9 +805,10 @@ async fn a_read_that_starts_after_the_owners_close_is_the_clean_end_and_touches_
 }
 
 /// This side's own close ends a read of the paired transport that waits, and the read returns the
-/// clean end and no error: the transport says so by what its connection recorded as the cause of
-/// its end, so a session that reads the end need not guess it from a flag raised afterwards. A
-/// connection that the host closed first stays a failure that keeps its error (the case below).
+/// clean end and no error: the transport says so by the cause that the read returned and by the
+/// mark that its close stored before it closed the connection, so a session that reads the end
+/// need not guess it from a flag raised afterwards. A connection that the host closed first stays a
+/// failure that keeps its error (the case below).
 #[tokio::test]
 async fn this_sides_own_close_is_the_clean_end_of_a_paired_read() {
     let host = side(1, true).await;
@@ -872,20 +873,6 @@ async fn a_connection_that_the_host_closed_is_not_one_that_this_side_closed() {
     assert!(
         !kr_client::transport::ControlTransport::is_closed(&closed_by_the_host),
         "the host closed the connection and this side did not"
-    );
-    // This side's close that follows changes what the read returned, and the read's end is
-    // classified by what it returned: the cause stays the host's.
-    kr_client::transport::ControlTransport::close(&closed_by_the_host);
-    assert!(
-        matches!(
-            &read_to_the_end,
-            Err(ClientError::Transport(
-                kr_transport::TransportError::StreamLost(
-                    kr_transport::ConnectionEnd::ClosedByPeer(_)
-                )
-            ))
-        ),
-        "a close of this side after the read returned its error took the host's cause away"
     );
     assert!(
         !kr_client::transport::ControlTransport::can_send(&closed_by_the_host),

@@ -166,16 +166,19 @@ pub trait ControlTransport: Send + Sync + std::fmt::Debug {
     /// transport's own close ended the read, or the peer finished the stream at a frame's boundary
     /// on a network connection.
     ///
-    /// A read's end is classified by what the read itself returned and by a mark that the
-    /// transport sets itself, before its own close touches the connection; it reads no record or
-    /// flag that a later close can change. On the network a read whose own cause says that this
-    /// side closed the connection ends cleanly only when the transport's own close was called, so
-    /// a close that another part of the program made (the endpoint's) is an error. On the local
-    /// link this side's close takes no read's result from it. Every other end is an error that
-    /// carries what the read returned (on the network the connection's cause, typed as
-    /// [`kr_transport::TransportError::StreamLost`]), and it stays that error when a close follows
-    /// it. The local link reports the peer's end at a frame's boundary as an error, and also
-    /// closes itself, and then returns `None`, after a write that was cut or failed part way.
+    /// An error that a read returned is never replaced: it carries what the read returned (on the
+    /// network the connection's cause, typed as [`kr_transport::TransportError::StreamLost`]), and
+    /// it stays that error when a close follows it. A frame that arrived before this side's close
+    /// may still be returned on the network, and a read that starts after the close, or that the
+    /// close ends, returns `None`. On the network a read whose own cause says that this side
+    /// closed the connection ends cleanly only when the transport's own close was made while the
+    /// connection stood: the close stores that mark before it touches the connection, after it has
+    /// asked whether the connection had already ended. A close that another part of the program
+    /// made (the endpoint's), and a close of this transport that came after the connection's end,
+    /// leave an error. The local link reports the peer's end at a frame's boundary as an error, and
+    /// also closes itself, and then returns `None`, after a write that was cut or failed part way;
+    /// a frame that completes while this side closes may be dropped there, and the read returns
+    /// `None`.
     ///
     /// Only the holder of the claim calls this.
     fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>>;
@@ -500,11 +503,13 @@ impl ControlTransport for NetworkTransport {
     /// Whether the connection's record says that a local close ended it: the library records
     /// `LocallyClosed` when the application calls `close`. That record is the LAST cause written to
     /// the connection and not the first: this side's close writes it over a close by the peer, and
-    /// the endpoint's own close (the pool's, under a live connection) writes it too, for a short
-    /// time, before the record becomes the endpoint driver's end. A send that is cut short resets
-    /// its stream and leaves the connection open, so this does not answer for that. It answers
-    /// whether a write may be tried, and no read's end depends on it: a read is classified by the
-    /// cause it returned and by this wrapper's own mark.
+    /// the endpoint's own close (the pool's, under a live connection) writes it too and leaves it
+    /// there: the library's endpoint driver stops only when no connection is left, so no later
+    /// cause replaces it. A send that is cut short resets its stream and leaves the connection
+    /// open, so this does not answer for that. It answers whether a write may be tried, and no
+    /// read's end depends on it: a read is classified by the cause it returned and by this
+    /// wrapper's own mark, which the owner's close stored from the existence of the connection's
+    /// record and from nothing else in it.
     fn is_closed(&self) -> bool {
         matches!(
             self.connection.close_reason(),
