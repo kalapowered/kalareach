@@ -35,8 +35,10 @@ pub enum Ended {
     /// tells the owner's close, or, on the local link, the transport closed itself after a write
     /// that a limit cut or that failed or was dropped part way (the call that cut the frame has
     /// the cause, and each later call fails before a byte). On the network it is also the host's
-    /// clean end of the stream at a frame's boundary. On the local link it is never the peer: the
-    /// peer's end there is [`Ended::Failed`].
+    /// clean end of the stream at a frame's boundary, and a close by this side counts only when
+    /// the transport's own close was called: a close that the transport did not make (the
+    /// endpoint's, under a live connection) is [`Ended::Failed`]. On the local link it is never
+    /// the peer: the peer's end there is [`Ended::Failed`].
     Finished,
     /// Reading the stream failed: the transport's own failure, with what the transport said. On
     /// the local link every failed read is one, the peer's end at a frame's boundary included; on
