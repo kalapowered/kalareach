@@ -255,12 +255,10 @@ impl Said for LeaseStop {
                 "sign in to your account again: your organisation's service does not take the \
                  sign-in this device holds",
             ),
-            Self::NotAMember => {
-                Shown::said(
-                    "this account is not a member of the organisation this host answers to; sign in \
+            Self::NotAMember => Shown::said(
+                "this account is not a member of the organisation this host answers to; sign in \
                      with an account that is a member, or ask your organisation's administrator",
-                )
-            }
+            ),
             Self::Refused(rule) => crate::shown!(
                 "this host refused the lease your organisation signed ({}); ask your \
                  organisation's administrator",

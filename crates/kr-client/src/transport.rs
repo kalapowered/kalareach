@@ -82,13 +82,15 @@ pub trait StreamOpener: Send + Sync + std::fmt::Debug {
 /// A connection this device ended itself, and why: the error the connection's calls are answered
 /// with, and what a person is asked to do after its words. A stop whose words say their own next
 /// step asks nothing more; one that states only a fact asks what the code of the error gives.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DeviceEnd {
     /// The error the connection's calls are answered with.
     pub error: ProtocolError,
     /// What a person is asked to do after the error's words.
     pub action: crate::retry::UserAction,
 }
+
+crate::debug_fields!(DeviceEnd { action });
 
 /// What a client needs from whichever transport it connected over.
 ///
