@@ -291,16 +291,16 @@ url = "=2.5.8"
 # imported. Blocking, rustls-backed and used with an explicit response-size limit.
 ureq = { version = "=3.4.2", default-features = false, features = ["rustls", "_ring"] }
 uuid = { version = "=1.26.1", features = ["v4"] }
-vtparse = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb" }
+vtparse = { git = "https://github.com/kalapowered/wezterm", rev = "f3227b5b167844e03ca588ad7093b3975602d287" }
 # The component engine, pinned to one exact release. A compiled-code cache entry is only valid for
 # the version that produced it, so the pin is part of the cache key rather than a convenience.
 wasmtime = { version = "=48.0.8", default-features = false, features = ["addr2line", "component-model", "cranelift", "demangle", "gc", "gc-drc", "gc-null", "runtime", "std"] }
 # The pinned terminal library's cell crate, which holds the width function. The width model takes it
 # directly so a client that builds for Apple's mobile systems measures text with the same tables.
-wezterm-cell = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb" }
-wezterm-escape-parser = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb", features = ["std"] }
-wezterm-surface = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb" }
-wezterm-term = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb" }
+wezterm-cell = { git = "https://github.com/kalapowered/wezterm", rev = "f3227b5b167844e03ca588ad7093b3975602d287" }
+wezterm-escape-parser = { git = "https://github.com/kalapowered/wezterm", rev = "f3227b5b167844e03ca588ad7093b3975602d287", features = ["std"] }
+wezterm-surface = { git = "https://github.com/kalapowered/wezterm", rev = "f3227b5b167844e03ca588ad7093b3975602d287" }
+wezterm-term = { git = "https://github.com/kalapowered/wezterm", rev = "f3227b5b167844e03ca588ad7093b3975602d287" }
 widestring = "=1.2.0"
 # Windows Hello for the companion's owner confirmations: the consent verifier and its window
 # interop, and the asynchronous operation it answers with. Both versions are already in the lock.

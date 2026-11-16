@@ -32,7 +32,7 @@
         },
         {
           "path": "profile.json",
-          "sha256": "e3793dc2c8ac6d1609c6b7e958b63f82fc9b2afe8666b333860dc45c9d36199d"
+          "sha256": "aa5981d11833cf82243d61a29dbbb01cf661e5a56cbed69608734961478e1349"
         }
       ],
       "name": "worker-responses",
@@ -42,7 +42,7 @@
       "fixtures": [
         {
           "path": "width.json",
-          "sha256": "cc95a1ae3aea46e8e3905f1edc6572cb3b64698a7f48df2ccbc8a89b3933bd2e"
+          "sha256": "8f2da1aa1c6490962fd35d84e6d14de182bd94d446af1794f7828ed4d7a80c7e"
         },
         {
           "path": "admission.json",
@@ -56,7 +56,7 @@
       "fixtures": [
         {
           "path": "profile.json",
-          "sha256": "e3793dc2c8ac6d1609c6b7e958b63f82fc9b2afe8666b333860dc45c9d36199d"
+          "sha256": "aa5981d11833cf82243d61a29dbbb01cf661e5a56cbed69608734961478e1349"
         },
         {
           "path": "input-encodings.json",
