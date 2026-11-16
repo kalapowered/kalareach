@@ -249,7 +249,9 @@ impl Controller {
             controller.check_fence()?;
             controller
                 .lease_is_live_until(end)
-                .map_err(ControllerError::from)
+                .map_err(ControllerError::from)?;
+            // The guard: the account holds this host until its write has returned.
+            Ok(crate::account::Guard::new(controller))
         })
     }
 
