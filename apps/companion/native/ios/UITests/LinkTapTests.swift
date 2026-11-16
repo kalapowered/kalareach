@@ -952,14 +952,21 @@ final class LinkTapTests: HarnessTestCase {
         // A link tapped while the composer has focus: the link opens once, and the report says where the focus is
         // and whether the keyboard is still up.
         composer.tap()
+        // The keyboard rises with an animation that a loaded simulator can slow, so it is waited for (10 seconds at most) and the
+        // report says how long it took and what the page's record saw of the tap.
+        let tapped = Date()
+        _ = app.keyboards.firstMatch.waitForExistence(timeout: 10)
+        let raisedAfter = Int(Date().timeIntervalSince(tapped) * 1000)
         Thread.sleep(forTimeInterval: 1.5)
         let keyboardBefore = app.keyboards.count
+        let composerEvents = record().events.suffix(4).map { "\($0.type)(\($0.target))" }.joined(separator: " ")
+        say("LINKTAP \(named): the composer's tap: keyboard up after \(raisedAfter) ms, keyboards \(keyboardBefore); \(recordText("TAPFOCUS")); the page's last events: \(composerEvents)")
         let reference = scroll(to: "reconnect")
         let withKeyboard = offset(of: reference)
         let words = reference.words[0]
         let focused = tap("\(named): a link while the composer has focus", at: CGPoint(x: words.midX, y: words.midY), shift: withKeyboard)
         say("LINKTAP \(named): composer focus: keyboards before \(keyboardBefore), after \(app.keyboards.count); opened \(focused.opened); \(focused.focus)")
-        XCTAssertGreaterThan(keyboardBefore, 0, "\(focused.label): the keyboard was not up before the tap")
+        XCTAssertGreaterThan(keyboardBefore, 0, "\(focused.label): the keyboard was not up before the tap, ten seconds after the tap on the composer")
         expectOpened(focused, "reconnect")
         // WebKit's own press moves the focus to the conversation (its tabindex) before the click, and the keyboard goes
         // with the composer's focus: the focus is on the conversation or on the link, never left in the composer.
