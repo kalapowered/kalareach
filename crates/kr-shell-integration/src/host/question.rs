@@ -17,7 +17,7 @@ pub enum Question {
     Profiles,
     /// Where an entry goes in a profile's text.
     Placement,
-    /// Whether the profile with the entry in it parses as it should.
+    /// The check of the profile with the entry in it.
     Check,
 }
 

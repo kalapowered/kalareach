@@ -174,11 +174,13 @@ impl HomeLayout {
     /// # Errors
     ///
     /// Returns [`Refusal::ProfilesUnanswered`] when the shell did not answer in time, could not
-    /// start or ended with an error, and [`Refusal::ProfilesNotUnderstood`] when it ended without an
-    /// answer or said something other than two full paths: an answer too long, one that does not
-    /// decode and a path that is not full are that. Both are refusals of this host
-    /// ([`Refusal::of`]). Where this host could not prepare the question or read the shell's answer
-    /// file, the error is its own failure with a file, and [`host_fault`](crate::host::question::host_fault) names the file.
+    /// start or ended with an error, and [`Refusal::ProfilesNotUnderstood`] when its answer was too
+    /// long or was not two full paths in the form that this host asked for: nothing, a different
+    /// number of lines, a line that does not decode to text and a path that is not full are that.
+    /// Both are refusals of this host ([`Refusal::of`]). Where this host could not prepare the
+    /// question, could not wait for the shell or could not read its answer file, the error is its
+    /// own failure, and [`host_fault`](crate::host::question::host_fault) names the path that failed
+    /// and the system's error.
     pub fn try_targets(&self, kind: ShellKind) -> std::io::Result<Vec<StartupTarget>> {
         self.targets_within(kind, PLACEMENT_DEADLINE)
     }
