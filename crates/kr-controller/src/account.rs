@@ -1582,22 +1582,8 @@ impl Inner {
                     // issued is revoked, queued before it is sent, and nothing is kept. The person
                     // is told as the keep tells them, so a revocation that is still owed is said.
                     let (commit, unrevoked) = held.signed_in.end_withheld(refresh).await;
-                    match unrevoked {
-                        None => {}
-                        Some(Unrevoked::Queued(error)) => eprintln!(
-                            "kr-controller: a withheld sign-in's token is in the queue of \
-                             revocations, but the send failed and the service did not take it: \
-                             {error}"
-                        ),
-                        Some(Unrevoked::Ended(error)) => eprintln!(
-                            "kr-controller: a withheld sign-in's token was ended at the service, \
-                             but the queue of revocations failed: {error}"
-                        ),
-                        Some(Unrevoked::Held(error)) => eprintln!(
-                            "kr-controller: a withheld sign-in's token reached neither the queue \
-                             nor the service, so the host holds it in memory and sends it the next \
-                             time it uses the account: {error}"
-                        ),
+                    if let Some(unrevoked) = unrevoked {
+                        eprintln!("kr-controller: a withheld sign-in's token: {unrevoked}");
                     }
                     return Outcome::withheld(commit);
                 };
