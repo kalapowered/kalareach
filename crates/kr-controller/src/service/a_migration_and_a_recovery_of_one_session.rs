@@ -15,7 +15,7 @@ use kr_protocol::session::{
 };
 
 use super::a_previous_boot_left_to_a_held_recovery::recorded_ended_worker;
-use super::close::Watch;
+use super::close::{Death, Watch, Whose};
 use crate::archive::OwnershipRefusal;
 use crate::service::Controller;
 use crate::service::net::tests::daemon;
@@ -324,6 +324,25 @@ async fn a_closure_is_not_recorded_from_under_a_recovery() {
     );
 }
 
+/// Makes the registry refuse the write that records a closure.
+fn refuse_closures(controller: &Controller) {
+    rusqlite::Connection::open(controller.paths.registry_database())
+        .expect("the registry opens beside the daemon's own handle")
+        .execute_batch(
+            "CREATE TRIGGER the_closure_is_not_kept BEFORE INSERT ON tombstones
+             BEGIN SELECT RAISE(ABORT, 'the registry keeps no closure'); END;",
+        )
+        .expect("the registry is made to refuse the write that records a closure");
+}
+
+/// Lets the registry take a closure again.
+fn take_closures_again(controller: &Controller) {
+    rusqlite::Connection::open(controller.paths.registry_database())
+        .expect("the registry opens beside the daemon's own handle")
+        .execute_batch("DROP TRIGGER the_closure_is_not_kept;")
+        .expect("the registry takes a closure again");
+}
+
 /// A worker that ended after the account it gave when it was asked to close, with a registry that
 /// refused the write that records it.
 struct AccountThatWasRefused {
@@ -428,13 +447,7 @@ impl AccountThatWasRefused {
             durability: Durability::Volatile,
             ..closure_of(session_id)
         };
-        rusqlite::Connection::open(controller.paths.registry_database())
-            .expect("the registry opens beside the daemon's own handle")
-            .execute_batch(
-                "CREATE TRIGGER the_closure_is_not_kept BEFORE INSERT ON tombstones
-                 BEGIN SELECT RAISE(ABORT, 'the registry keeps no closure'); END;",
-            )
-            .expect("the registry is made to refuse the write that records a closure");
+        refuse_closures(&controller);
         let (arrived, release) = controller.stall_the_next_closure_write();
         controller
             .settle_close_answer(
@@ -493,10 +506,7 @@ impl AccountThatWasRefused {
     }
 
     fn the_registry_takes_closures_again(&self) {
-        rusqlite::Connection::open(self.controller.paths.registry_database())
-            .expect("the registry opens beside the daemon's own handle")
-            .execute_batch("DROP TRIGGER the_closure_is_not_kept;")
-            .expect("the registry takes a closure again");
+        take_closures_again(&self.controller);
     }
 
     /// What the registry holds once a recovery has recorded the closure.
@@ -585,4 +595,81 @@ async fn a_failed_write_at_the_end_of_a_worker_keeps_the_account_it_gave() {
         .expect("the worker that ended is closed");
     assert_eq!(found, world.account, "the account the worker gave stands");
     assert_eq!(world.recorded().await, world.account);
+}
+
+/// A record of this daemon's own, of a worker that left none, does not replace in memory the
+/// account a worker gave. Where the write of the daemon's record fails, the account is what the
+/// next look records.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_of_the_daemons_own_does_not_replace_the_account_a_worker_gave() {
+    let world = AccountThatWasRefused::made().await;
+    let own = ClosureRecord {
+        reason: ClosureReason::WorkerCrash,
+        ..closure_of(world.session_id)
+    };
+    let refused = world.controller.write_closure(&own, Whose::Daemon).await;
+    assert!(
+        refused.is_err(),
+        "the write of the daemon's own record fails with the registry: {refused:?}"
+    );
+
+    world.the_registry_takes_closures_again();
+    let found = world
+        .recovery_looks()
+        .await
+        .expect("the registry answers")
+        .expect("the worker that ended is closed");
+    assert_eq!(found, world.account, "the account the worker gave stands");
+    assert_eq!(
+        world.recorded().await,
+        world.account,
+        "and it is the one recorded: the daemon's own record did not replace it"
+    );
+}
+
+/// A record of this daemon's own that its registry refused is the one it writes at the next look
+/// at the worker's end, and not a new one from that look, so that the registry gets the same record
+/// whichever retry runs first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_of_the_daemons_own_that_was_not_written_is_the_one_written_at_the_next_look() {
+    let temp = TempHost::create();
+    let controller = daemon(&temp).await;
+    let session_id = recorded_ended_worker(&controller, &temp).await;
+    let identity = kr_ipc::identity::ended_process_identity(4_000_003);
+    let fenced = crate::archive::Fenced::nothing(session_id);
+    let look = |reason| {
+        controller.record_final(
+            session_id,
+            reason,
+            &identity,
+            &fenced,
+            Death::ConfirmedBeforeAFence,
+        )
+    };
+
+    refuse_closures(&controller);
+    let refused = look(ClosureReason::WorkerCrash).await;
+    assert!(
+        refused.is_err(),
+        "the write of the daemon's own record fails with the registry: {refused:?}"
+    );
+    take_closures_again(&controller);
+    let written = look(ClosureReason::HostShutdown)
+        .await
+        .expect("the registry takes the record");
+    assert_eq!(
+        written.reason,
+        ClosureReason::WorkerCrash,
+        "the record of the first look is the one written at the next: {written:?}"
+    );
+    assert_eq!(
+        controller
+            .registry
+            .lock()
+            .await
+            .closure(session_id)
+            .expect("the registry answers"),
+        Some(written),
+        "and it is the one the registry holds"
+    );
 }
