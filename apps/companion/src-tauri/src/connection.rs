@@ -154,7 +154,7 @@ impl Connection {
         self.session
             .transport()
             .ended_by_this_device()
-            .map(CommandError::from)
+            .map(|end| CommandError::asking(end.error, end.action))
     }
 
     /// This connection, with the way another to the same host is opened.
@@ -272,11 +272,11 @@ impl Connection {
         let left = session.transport().ended_by_this_device();
         let (info, rights) = match (asked, left) {
             (Ok(asked), None) => asked,
-            (_, Some(refusal)) => {
+            (_, Some(end)) => {
                 session.close();
                 return Err(Unopened::Refused(
                     Asked::Connection,
-                    CommandError::from(refusal),
+                    CommandError::asking(end.error, end.action),
                 ));
             }
             (Err(failed), None) => {
@@ -477,6 +477,15 @@ pub enum Unopened {
 impl Unopened {
     pub(crate) fn unreached(reason: impl Into<String>) -> Self {
         Self::Unreached(CommandError::unavailable(reason))
+    }
+
+    /// As [`Self::unreached`], for a connection this device ended for a stop of the lease, with
+    /// the action that stop says: a stop whose words say when to try again asks nothing more.
+    pub(crate) fn unreached_asking(
+        reason: impl Into<String>,
+        action: kr_client::retry::UserAction,
+    ) -> Self {
+        Self::Unreached(CommandError::unavailable_asking(reason, action))
     }
 
     /// What a failed dial of the link says.
@@ -1004,7 +1013,7 @@ pub async fn forward_events<R: Runtime>(
                     .ended_by_this_device()
                     .map_or_else(
                         || "the connection to this host ended".to_owned(),
-                        |refusal| refusal.message,
+                        |end| end.error.message,
                     );
                 state.disconnected_from(&session, why);
                 let now = state.connection_state();

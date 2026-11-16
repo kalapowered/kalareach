@@ -1235,7 +1235,7 @@ struct LinkState {
     /// How many connections to such a host have presented their lease.
     presented: usize,
     /// What every presentation fails with, when it does.
-    failing_presentation: Option<kr_protocol::error::ProtocolError>,
+    failing_presentation: Option<kr_client::organisation::LeaseStop>,
     /// Whether a connection goes on whatever the host says of the lease it was given, as to a host
     /// that needs none.
     ignoring_presentation: bool,
@@ -1486,9 +1486,9 @@ impl LinkControl {
     }
 
     /// Makes every presentation of a lease fail, on every connection to any host, as a device that
-    /// cannot get its lease does, with `error`, or stops that.
-    pub fn fail_presentation(&self, error: Option<kr_protocol::error::ProtocolError>) {
-        self.state.lock().expect("the record").failing_presentation = error;
+    /// cannot get its lease does, with the failure the application makes of `stop`, or stops that.
+    pub fn fail_presentation(&self, stop: Option<kr_client::organisation::LeaseStop>) {
+        self.state.lock().expect("the record").failing_presentation = stop;
     }
 
     /// Holds the next request or mutation of `method`, on any connection, before it is sent, until
@@ -2113,7 +2113,7 @@ impl kr_client::transport::ControlTransport for Tapped {
         self.inner.reach()
     }
 
-    fn ended_by_this_device(&self) -> Option<kr_protocol::error::ProtocolError> {
+    fn ended_by_this_device(&self) -> Option<kr_client::transport::DeviceEnd> {
         // Counted once the answer is known, so a test that waits for the question acts after it.
         let ended = self.inner.ended_by_this_device();
         self.control
@@ -2314,10 +2314,8 @@ impl kr_client::pairing::link::HostLink for ControlledLink {
                 .expect("the record")
                 .failing_presentation
                 .clone();
-            if let Some(error) = failing {
-                return Err(kr_client::pairing::link::LinkError::membership_by_code(
-                    error,
-                ));
+            if let Some(stop) = failing {
+                return Err(companion_tauri::lease::failed(&stop));
             }
             let presented = self
                 .own

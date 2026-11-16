@@ -20,7 +20,6 @@ use kr_controller::service::net::config::NetworkSettings;
 use kr_controller::service::net::devices::DeviceRecord;
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::envelope::ControlFrame;
-use kr_protocol::error::ProtocolError;
 use kr_protocol::frame::StreamHeader;
 use kr_protocol::hello::{ActionWindow, ReceiveLimits};
 use kr_protocol::ids::{ActionId, ConnectionId, SessionId, TransferId};
@@ -173,7 +172,7 @@ impl ControlTransport for Counted {
     fn reach(&self) -> Option<Reach> {
         self.inner.reach()
     }
-    fn ended_by_this_device(&self) -> Option<ProtocolError> {
+    fn ended_by_this_device(&self) -> Option<kr_client::transport::DeviceEnd> {
         self.inner.ended_by_this_device()
     }
     fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()> {

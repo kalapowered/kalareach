@@ -482,7 +482,7 @@ impl ControlTransport for Placed {
         self.inner.reach()
     }
 
-    fn ended_by_this_device(&self) -> Option<ProtocolError> {
+    fn ended_by_this_device(&self) -> Option<kr_client::transport::DeviceEnd> {
         self.inner.ended_by_this_device()
     }
 
@@ -554,7 +554,7 @@ mod tests {
         fn initial_action_window(&self) -> ActionWindow {
             unreachable!("a case that only closes")
         }
-        fn ended_by_this_device(&self) -> Option<ProtocolError> {
+        fn ended_by_this_device(&self) -> Option<kr_client::transport::DeviceEnd> {
             None
         }
         fn send<'a>(&'a self, _frame: &'a ControlFrame) -> TransportFuture<'a, ()> {
@@ -656,7 +656,7 @@ mod tests {
         fn initial_action_window(&self) -> ActionWindow {
             unreachable!("a case that only opens streams and closes")
         }
-        fn ended_by_this_device(&self) -> Option<ProtocolError> {
+        fn ended_by_this_device(&self) -> Option<kr_client::transport::DeviceEnd> {
             None
         }
         fn send<'a>(&'a self, _frame: &'a ControlFrame) -> TransportFuture<'a, ()> {

@@ -14,6 +14,7 @@ import userEvent from '@testing-library/user-event'
 
 import { AppProvider } from '../../src/app/state'
 import { fakeHost, LOST_CONTROL, terminalScreen, type HeldReads } from '../../src/host/fake'
+import capacityRefusals from '../fixtures/capacity-refusals.json'
 import { DraftBook } from '../../src/model/draft-book'
 import { describeMode } from '../../src/mobile/model/gestures'
 import { MobileSession } from '../../src/mobile/views/MobileSession'
@@ -162,6 +163,34 @@ describe("the phone's session view keeps each read to its own session", () => {
     expect(screen.getByText('This host cannot be contacted right now.')).toBeInTheDocument()
     expect(screen.queryByText('Nothing in this conversation yet.')).toBeNull()
   })
+
+  // A refusal whose words say their own wait says it once: native code sends the words with an
+  // action of `nothing`, and the banner adds no line of its own after them.
+  it.each(Object.entries(capacityRefusals.agent_page))(
+    'shows the whole text native code sent for a refused read, with no line of the page after it: %s',
+    async (_kind, sent) => {
+      const { port } = fakeHost()
+      render(
+        <AppProvider
+          port={{
+            ...port,
+            sessionAgents: () =>
+              Promise.reject({
+                code: sent.code,
+                message: sent.message,
+                user_action: sent.user_action,
+                retry: 'transient'
+              })
+          }}
+        >
+          <OnSession sessionId={SESSION_MAIN} />
+        </AppProvider>
+      )
+
+      expect(await screen.findByText('This conversation could not be read')).toBeInTheDocument()
+      expect(screen.getByText(sent.page)).toBeInTheDocument()
+    }
+  )
 
   it('shows a refusal that came with no words as a refusal, not as an empty conversation', async () => {
     const { port } = fakeHost()

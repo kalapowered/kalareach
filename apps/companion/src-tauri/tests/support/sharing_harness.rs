@@ -87,7 +87,7 @@ impl ControlTransport for Lossy {
         self.inner.reach()
     }
 
-    fn ended_by_this_device(&self) -> Option<kr_protocol::error::ProtocolError> {
+    fn ended_by_this_device(&self) -> Option<kr_client::transport::DeviceEnd> {
         self.inner.ended_by_this_device()
     }
 

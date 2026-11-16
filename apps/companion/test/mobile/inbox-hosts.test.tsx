@@ -274,11 +274,11 @@ describe('the inbox of a phone paired with two hosts', () => {
     }
   })
 
-  // A failure that says its own wait says it once. Native code sends the words and an action of
-  // `nothing` when they carry the wait, and the code's own action when they do not; the row adds a
-  // line only for the second.
+  // A failure whose words say their own next step says it once: native code sends the words with an
+  // action of `nothing`, and the row adds no line of its own to them. Each stop of the lease is one,
+  // and the golden file holds its whole text.
   it.each(Object.entries(capacityRefusals.inbox))(
-    'tells the whole text native code sent for a refused connection, with a line of the page only where none was said: %s',
+    'tells the whole text native code sent for a refused connection, with no line of the page after it: %s',
     async (_kind, sent) => {
       const { controls } = start()
       await waitFor(() => {
@@ -298,6 +298,33 @@ describe('the inbox of a phone paired with two hosts', () => {
       expect(detail?.textContent).toBe(sent.row)
     }
   )
+
+  // Where the words state only a fact, the action native code names is said after them, once.
+  it('says the action native code names after words that state only a fact', async () => {
+    const { controls } = start()
+    await waitFor(() => {
+      expect(rowsOf('laptop')).toHaveLength(2)
+    })
+    controls.setInboxHosts([
+      refusingLaptop(
+        {
+          code: 'RESOURCE_UNAVAILABLE',
+          message: 'the connection to this host ended before a lease was held',
+          user_action: 'wait',
+          retry: 'transient'
+        },
+        'connection'
+      )
+    ])
+    readNow()
+    await waitFor(() => {
+      expect(screen.getByTestId('inbox-refusal')).toHaveAttribute('data-refused', 'connection')
+    })
+    const detail = screen.getByTestId('inbox-refusal').querySelector('.m-row-detail')
+    expect(detail?.textContent).toBe(
+      'the connection to this host ended before a lease was held. Wait a moment and try again. It answered, so contact is not lost. Its sessions may still be running; nothing here says they are not.'
+    )
+  })
 
   it('stops drawing the refusal once the host shows its inbox again', async () => {
     const { controls } = start()

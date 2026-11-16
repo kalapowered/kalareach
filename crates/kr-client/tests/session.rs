@@ -3441,7 +3441,7 @@ impl kr_client::transport::ControlTransport for HeldWrite {
         }
     }
 
-    fn ended_by_this_device(&self) -> Option<ProtocolError> {
+    fn ended_by_this_device(&self) -> Option<kr_client::transport::DeviceEnd> {
         None
     }
 
