@@ -2959,9 +2959,10 @@ mod tests {
     ];
 
     /// A program that prints each folder variable it is started with and the permissions of the
-    /// folder that names, and then its telemetry setting. Its text is written beside it and placed
-    /// by a process of its own, so this process never holds it open for writing while another test
-    /// starts a child.
+    /// folder that names, and then its telemetry setting. Every field ends with a NUL byte, which
+    /// no path can hold, so a folder whose path holds spaces or a line break is read back whole.
+    /// Its text is written beside it and placed by a process of its own, so this process never
+    /// holds it open for writing while another test starts a child.
     #[cfg(unix)]
     fn program_that_prints_its_folders(root: &Path) -> PathBuf {
         let program = root.join("shell");
@@ -2971,9 +2972,9 @@ mod tests {
             "#!/bin/sh\n\
              for name in XDG_CACHE_HOME XDG_DATA_HOME TMPDIR XDG_RUNTIME_DIR; do\n\
              eval \"folder=\\${$name-unset}\"\n\
-             printf '%s %s %s\\n' \"$name\" \"$folder\" \"$(ls -ld \"$folder\" | cut -c1-10)\"\n\
+             printf '%s\\0%s\\0%s\\0' \"$name\" \"$folder\" \"$(ls -ld \"$folder\" | cut -c1-10)\"\n\
              done\n\
-             printf 'POWERSHELL_TELEMETRY_OPTOUT %s\\n' \"${POWERSHELL_TELEMETRY_OPTOUT-unset}\"\n",
+             printf 'POWERSHELL_TELEMETRY_OPTOUT\\0%s\\0' \"${POWERSHELL_TELEMETRY_OPTOUT-unset}\"\n",
         )
         .expect("writes the program's text");
         kr_ipc::testing::place_and_start_once(&text, &program, &["--version"]);
@@ -3000,26 +3001,31 @@ mod tests {
         else {
             panic!("the program answers");
         };
-        let mut lines = said.lines();
+        let mut fields = said.split('\0');
+        let mut next = |what: &str| {
+            fields
+                .next()
+                .unwrap_or_else(|| panic!("a field for {what} in {said:?}"))
+                .to_owned()
+        };
         let mut folders = Vec::new();
         for (variable, _) in QUESTION_FOLDERS {
-            let line = lines.next().expect("a line for the variable");
-            let mut parts = line.split(' ');
-            assert_eq!(parts.next(), Some(variable), "{line}");
-            let folder = parts.next().expect("the folder").to_owned();
-            let mode = parts.next().unwrap_or_default().to_owned();
+            assert_eq!(next(variable), variable, "{said:?}");
+            let folder = next(variable);
+            let mode = next(variable);
             assert!(
                 Path::new(&folder).is_absolute(),
-                "{variable} is not an absolute path: {line}"
+                "{variable} is not an absolute path: {folder:?}"
             );
             let remains = Path::new(&folder).exists();
             folders.push((folder, mode, remains));
         }
-        let telemetry = lines
-            .next()
-            .and_then(|line| line.strip_prefix("POWERSHELL_TELEMETRY_OPTOUT "))
-            .expect("the telemetry line")
-            .to_owned();
+        assert_eq!(
+            next("the telemetry setting's name"),
+            "POWERSHELL_TELEMETRY_OPTOUT",
+            "{said:?}"
+        );
+        let telemetry = next("the telemetry setting");
         (folders, telemetry)
     }
 
@@ -3029,6 +3035,60 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_question_runs_in_folders_of_its_own_that_are_gone_when_it_ends() {
+        a_question_runs_in_folders_of_its_own();
+    }
+
+    /// The same where the temporary folder's path holds spaces: the question's folders are under
+    /// it, and what the shell reports of them must still be read back whole. The temporary folder
+    /// is a setting of the whole process, so the case runs itself in a process of its own with it,
+    /// and ends that process at a bound of its own.
+    #[cfg(unix)]
+    #[test]
+    fn a_question_runs_in_folders_of_its_own_where_the_temporary_folder_holds_a_space() {
+        const IN_THE_CHILD: &str = "KR_TEST_QUESTION_FOLDERS_IN_A_SPACED_TEMPORARY_FOLDER";
+        const NAME: &str =
+            "a_question_runs_in_folders_of_its_own_where_the_temporary_folder_holds_a_space";
+        const BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+        if std::env::var_os(IN_THE_CHILD).is_some() {
+            a_question_runs_in_folders_of_its_own();
+            return;
+        }
+        let outer = tempfile::tempdir().expect("a directory");
+        let spaced = outer.path().join("a temporary folder with spaces");
+        std::fs::create_dir(&spaced).expect("the temporary folder");
+        let said = outer.path().join("child.out");
+        let mut child = std::process::Command::new(std::env::current_exe().expect("this program"))
+            .args([NAME, "--test-threads=1"])
+            .env("TMPDIR", &spaced)
+            .env(IN_THE_CHILD, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::fs::File::create(&said).expect("the child's output file"))
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("this test program starts");
+        let deadline = std::time::Instant::now() + BOUND;
+        let status = loop {
+            match child.try_wait().expect("the wait for the child") {
+                Some(status) => break status,
+                None if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "the case in a spaced temporary folder stood at, not ended within {BOUND:?}"
+                    );
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(25)),
+            }
+        };
+        let output = std::fs::read_to_string(&said).unwrap_or_default();
+        assert!(
+            status.success() && output.contains("1 passed"),
+            "the case in the folder {spaced:?} ended with {status}: {output}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn a_question_runs_in_folders_of_its_own() {
         let root = tempfile::tempdir().expect("a directory");
         let program = program_that_prints_its_folders(root.path());
         let persons_own = root.path().join("persons-own");
