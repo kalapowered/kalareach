@@ -106,7 +106,8 @@ const LAUNCH_NOT_STARTED: &str =
 
 /// What a launch is told when an earlier launch's hold, or a release that waits, stands in the lane:
 /// nothing of it was sent.
-const LAUNCH_BEHIND_ANOTHER: &str = "The launch was not started: an earlier launch or release of this view is still waiting for the session.";
+const LAUNCH_BEHIND_ANOTHER: &str =
+    "The launch was not started: an earlier launch or release of this view stands before it.";
 
 /// How many recoveries in a row may pass without a complete screen before the view ends.
 ///

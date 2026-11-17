@@ -5955,7 +5955,7 @@ async fn a_second_refusal_of_a_release_is_shown_once_and_claims_no_end_of_contro
         .expect("the release was sent once more within the bound");
     link.refuse_with(&again, ErrorCode::PermissionDenied, "no way")
         .await;
-    let words = "The session did not accept this view's release of control: no way";
+    let words = "The session did not confirm this view's release of control: no way";
     let told = page
         .newest_within(3, |state| state["control"]["ended"] == words)
         .await
@@ -5983,7 +5983,7 @@ async fn a_release_refused_for_another_reason_is_shown_once_and_not_sent_again()
     let first = link.expect(Method::InputRelease).await;
     link.refuse_with(&first, ErrorCode::PermissionDenied, "not yours")
         .await;
-    let words = "The session did not accept this view's release of control: not yours";
+    let words = "The session did not confirm this view's release of control: not yours";
     page.newest_within(3, |state| state["control"]["ended"] == words)
         .await
         .expect("the refusal was shown within the bound");
@@ -6123,6 +6123,52 @@ async fn an_unreached_launch_is_not_sent_and_the_typing_behind_it_goes_in_order(
         })
         .await;
     assert_eq!(read_by(&host).last(), Some(&(1, 3, "z".to_owned())));
+    assert!(
+        link.call_within(QUIET).await.is_none(),
+        "no launch is on the wire"
+    );
+}
+
+/// A launch asked while an earlier launch stands in the lane is not started, in the ruled words:
+/// nothing of it is sent, and the earlier launch is not disturbed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_launch_behind_another_launch_is_not_started_and_says_so() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    three_keys_the_host_has_read(&page, &view, &host).await;
+    let first = page.invoke_later(
+        "terminal_view_launch",
+        json!({ "view": view, "press": the_press() }),
+    );
+    // The first launch has its barrier, and its hold stands until the host reaches it or the lane
+    // gives up.
+    barriers_taken(&page, &view, 1).await;
+    let second = page.invoke_later(
+        "terminal_view_launch",
+        json!({ "view": view, "press": the_press() }),
+    );
+    let told = tokio::time::timeout(AFTER_BARRIER, second)
+        .await
+        .expect("the page was told within the bound")
+        .expect("joins")
+        .expect_err("the second launch was not started");
+    assert_eq!(code(&told), "TERMINAL_UNAVAILABLE");
+    assert_eq!(
+        told["message"],
+        "The launch was not started: an earlier launch or release of this view stands before it."
+    );
+    let told = tokio::time::timeout(AFTER_BARRIER, first)
+        .await
+        .expect("the first launch was answered within the bound")
+        .expect("joins")
+        .expect_err("the first launch was not started either: its barrier was not reached");
+    assert_eq!(
+        told["message"],
+        "The launch was not started: the session had not accepted all the typing before it."
+    );
     assert!(
         link.call_within(QUIET).await.is_none(),
         "no launch is on the wire"

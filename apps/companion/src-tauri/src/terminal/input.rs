@@ -593,7 +593,7 @@ fn refused_take(refusal: &ProtocolError) -> String {
 /// What the person is told when the session refused to take back the control the view gave up.
 fn refused_release(refusal: &ProtocolError) -> String {
     format!(
-        "The session did not accept this view's release of control: {}",
+        "The session did not confirm this view's release of control: {}",
         Shown::protocol(refusal)
     )
 }
