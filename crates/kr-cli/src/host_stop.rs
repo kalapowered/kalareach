@@ -2052,7 +2052,7 @@ pub(crate) fn ended_by(
 /// ended, why the request could not be made and that this command sent nothing. It says nothing of
 /// which came first, which the command did not see. Where something holds the environment now, the
 /// words are those of any end that finds a successor.
-fn ended_before_the_request_said(
+pub(crate) fn ended_before_the_request_said(
     id: EnvironmentId,
     old: Option<u64>,
     ended: &End,
