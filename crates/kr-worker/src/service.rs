@@ -641,6 +641,19 @@ pub struct WorkerService {
     /// is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     after_the_dispatch_check_stall: crate::testing::Stall,
+    /// The highest restriction count of the local gate whose withdrawal of local connections is
+    /// owed.
+    withdrawals_owed: std::sync::atomic::AtomicU64,
+    /// The highest restriction count whose withdrawal has been run to its end by a statement's
+    /// acknowledgement.
+    withdrawals_done: std::sync::atomic::AtomicU64,
+    /// How many withdrawals of one connection are detaching its attachments now, which a
+    /// statement's acknowledgement waits for.
+    withdrawals_running: std::sync::atomic::AtomicUsize,
+    /// How many statements of what the local owner may do are waiting to be answered, which this
+    /// host's own tests read. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    statements_waiting: std::sync::atomic::AtomicUsize,
     /// How long, in milliseconds, an admitted operation has to reach its upstream, which this
     /// host's own tests shorten to reach the deadline without waiting out the shipped one. It is
     /// compiled away in every shipped build.
@@ -742,6 +755,9 @@ pub struct WorkerService {
 struct DispatchBoundary {
     lock: Mutex<()>,
     released: tokio::sync::Notify,
+    /// How many holds have ended, raised by the guard before it lets go, so that a count that has
+    /// moved past a sample says the hold in place at the sample is over.
+    releases: std::sync::atomic::AtomicU64,
 }
 
 impl DispatchBoundary {
@@ -749,18 +765,25 @@ impl DispatchBoundary {
         Self {
             lock: Mutex::new(()),
             released: tokio::sync::Notify::new(),
+            releases: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// How many holds have ended so far.
+    fn releases(&self) -> u64 {
+        self.releases.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Takes the boundary, waiting for whoever holds it.
     fn lock(&self) -> std::sync::LockResult<DispatchGuard<'_>> {
         self.lock
             .lock()
-            .map(|guard| DispatchGuard::new(guard, &self.released))
+            .map(|guard| DispatchGuard::new(guard, &self.released, &self.releases))
             .map_err(|poisoned| {
                 std::sync::PoisonError::new(DispatchGuard::new(
                     poisoned.into_inner(),
                     &self.released,
+                    &self.releases,
                 ))
             })
     }
@@ -769,11 +792,11 @@ impl DispatchBoundary {
     fn try_lock(&self) -> std::sync::TryLockResult<DispatchGuard<'_>> {
         self.lock
             .try_lock()
-            .map(|guard| DispatchGuard::new(guard, &self.released))
+            .map(|guard| DispatchGuard::new(guard, &self.released, &self.releases))
             .map_err(|refused| match refused {
                 std::sync::TryLockError::Poisoned(poisoned) => {
                     std::sync::TryLockError::Poisoned(std::sync::PoisonError::new(
-                        DispatchGuard::new(poisoned.into_inner(), &self.released),
+                        DispatchGuard::new(poisoned.into_inner(), &self.released, &self.releases),
                     ))
                 }
                 std::sync::TryLockError::WouldBlock => std::sync::TryLockError::WouldBlock,
@@ -792,20 +815,29 @@ impl DispatchBoundary {
 pub struct DispatchGuard<'a> {
     guard: Option<std::sync::MutexGuard<'a, ()>>,
     released: &'a tokio::sync::Notify,
+    releases: &'a std::sync::atomic::AtomicU64,
 }
 
 impl<'a> DispatchGuard<'a> {
-    const fn new(guard: std::sync::MutexGuard<'a, ()>, released: &'a tokio::sync::Notify) -> Self {
+    const fn new(
+        guard: std::sync::MutexGuard<'a, ()>,
+        released: &'a tokio::sync::Notify,
+        releases: &'a std::sync::atomic::AtomicU64,
+    ) -> Self {
         Self {
             guard: Some(guard),
             released,
+            releases,
         }
     }
 }
 
 impl Drop for DispatchGuard<'_> {
     fn drop(&mut self) {
-        // The lock goes first, so that a woken presentation finds it free.
+        // The count is raised before the lock goes, so that whoever sees it moved knows this hold
+        // has ended; the lock goes before the wake, so that a woken waiter finds it free.
+        self.releases
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         drop(self.guard.take());
         self.released.notify_waiters();
     }
@@ -908,6 +940,22 @@ enum Tried<T> {
     Held,
     /// The peer has gone, and nothing was done for it.
     PeerGone,
+}
+
+/// A withdrawal that is detaching a connection's attachments, counted for as long as it runs.
+struct RunningCount<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> RunningCount<'a> {
+    fn begin(count: &'a std::sync::atomic::AtomicUsize) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for RunningCount<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// A presentation that is waiting for the dispatch boundary, counted for as long as it waits. It is
@@ -1307,6 +1355,11 @@ impl WorkerService {
             delivery_end_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             after_the_dispatch_check_stall: crate::testing::Stall::default(),
+            withdrawals_owed: std::sync::atomic::AtomicU64::new(0),
+            withdrawals_done: std::sync::atomic::AtomicU64::new(0),
+            withdrawals_running: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "testing")]
+            statements_waiting: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "testing")]
             upstream_deadline_ms: std::sync::atomic::AtomicU64::new(
                 u64::try_from(UPSTREAM_SUBMIT_DEADLINE.as_millis()).unwrap_or(u64::MAX),
@@ -2305,6 +2358,16 @@ impl WorkerService {
         self.delivery_end_stall.arm()
     }
 
+    /// How many statements of what the local owner may do are waiting to be answered now, for this
+    /// host's own tests: each has changed the gate and waits for the hold in place, or for a
+    /// withdrawal.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn statements_waiting_for_tests(&self) -> usize {
+        self.statements_waiting
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Stops the next mutation that passes the dispatch boundary's check of the local owner's
     /// access, before it takes the session, for this host's own tests.
     ///
@@ -3012,6 +3075,20 @@ impl WorkerService {
             // announcement was refused rather than queued, and this is what makes the fence
             // happen anyway: the daemon's next announcement finds it done.
             self.fence_what_is_owed();
+            // A withdrawal that a restriction owes and whose statement's task was dropped with its
+            // connection: the hold is the one a withdrawal may run in, as a presentation's is.
+            let owed = self
+                .withdrawals_owed
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if self
+                .withdrawals_done
+                .load(std::sync::atomic::Ordering::SeqCst)
+                < owed
+            {
+                self.withdraw_local_connections();
+                self.withdrawals_done
+                    .fetch_max(owed, std::sync::atomic::Ordering::SeqCst);
+            }
             // One look at the session, and the lock released before anything else asks for
             // it. Collection records its own failure, so nothing here needs the lock a second
             // time to say that it failed.
@@ -3225,11 +3302,18 @@ impl WorkerService {
         // that no write can begin after it.
         let local_writes = {
             let service = Arc::downgrade(&self);
+            let asked = std::sync::atomic::AtomicBool::new(false);
             crate::local_gate::LocalWrites::new(
                 Arc::clone(&self.gate),
                 Arc::new(move || {
+                    // Once for each connection: every frame the writer then refuses asks again.
+                    if asked.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
                     if let Some(service) = service.upgrade() {
-                        service.withdraw(connection_id);
+                        tokio::spawn(async move {
+                            service.withdraw_after_the_hold(connection_id).await;
+                        });
                     }
                 }),
             )
@@ -4226,7 +4310,13 @@ impl WorkerService {
             ControlFrame::AuthorityRevision(notice) => Some(off_the_executor(|| {
                 self.acknowledge_revision(state, &notice)
             })),
-            ControlFrame::LocalAccess(access) => Some(self.accept_local_access(state, access)),
+            ControlFrame::LocalAccess(access) => {
+                let (answer, after) = self.accept_local_access(state, access);
+                Some(match after {
+                    Some(after) => self.after_a_statement(after, answer).await,
+                    None => answer,
+                })
+            }
             ControlFrame::PrivacyGeneration(notice) => {
                 Some(self.take_privacy(state, &notice).await)
             }
@@ -5586,17 +5676,20 @@ impl WorkerService {
         &self,
         state: &ConnectionState,
         access: kr_protocol::worker::LocalAccess,
-    ) -> ControlFrame {
+    ) -> (ControlFrame, Option<u64>) {
         if state.facts.client_kind != LocalClientKind::Controller
             || state.facts.controller_role != ControllerConnectionRole::Authority
         {
-            return failure(
-                RequestId::new(0),
-                &ProtocolError::new(
-                    ErrorCode::PermissionDenied,
-                    "only the control daemon's authority connection says what the local owner \
-                     may do",
+            return (
+                failure(
+                    RequestId::new(0),
+                    &ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "only the control daemon's authority connection says what the local \
+                         owner may do",
+                    ),
                 ),
+                None,
             );
         }
         // Held across the check and the application, and across nothing else: the generation the
@@ -5610,42 +5703,136 @@ impl WorkerService {
                 .lock()
                 .expect("the authority lock is not poisoned");
             if let Err(error) = Self::check_bound(&state.facts, &authority) {
-                return failure(RequestId::new(0), &error.to_protocol_error());
+                return (failure(RequestId::new(0), &error.to_protocol_error()), None);
             }
             let Some(generation) = state.facts.generation else {
-                return failure(
-                    RequestId::new(0),
-                    &ProtocolError::new(
-                        ErrorCode::PermissionDenied,
-                        "this connection has not proved a controller generation",
+                return (
+                    failure(
+                        RequestId::new(0),
+                        &ProtocolError::new(
+                            ErrorCode::PermissionDenied,
+                            "this connection has not proved a controller generation",
+                        ),
                     ),
+                    None,
                 );
             };
             self.gate.apply(generation, access)
         };
+        // Counted once the gate has changed, before anything waits: the hold of the dispatch
+        // boundary that is in place now is the last one that can have checked a local request
+        // under the earlier statement, so it is the one the acknowledgement waits for.
+        let after = self.dispatch.releases();
         match applied {
             crate::local_gate::Applied::Accepted { tightened } => {
                 if tightened {
-                    self.withdraw_local_connections();
+                    self.owe_a_withdrawal();
                 }
-                ControlFrame::LocalAccessAck(kr_protocol::worker::LocalAccessAck {
-                    sequence: access.sequence,
-                })
+                (
+                    ControlFrame::LocalAccessAck(kr_protocol::worker::LocalAccessAck {
+                        sequence: access.sequence,
+                    }),
+                    Some(after),
+                )
             }
-            crate::local_gate::Applied::Stale { held } => {
+            crate::local_gate::Applied::Stale { held } => (
                 ControlFrame::LocalAccessAck(kr_protocol::worker::LocalAccessAck {
                     sequence: U64::new(held),
-                })
-            }
-            crate::local_gate::Applied::Conflict => failure(
-                RequestId::new(0),
-                &ProtocolError::new(
-                    ErrorCode::InvalidArgument,
-                    "a statement of what the local owner may do repeats a sequence with another \
-                     content",
+                }),
+                Some(after),
+            ),
+            crate::local_gate::Applied::Conflict => (
+                failure(
+                    RequestId::new(0),
+                    &ProtocolError::new(
+                        ErrorCode::InvalidArgument,
+                        "a statement of what the local owner may do repeats a sequence with \
+                         another content",
+                    ),
                 ),
+                None,
             ),
         }
+    }
+
+    /// Records that the restriction the gate has just counted owes a withdrawal of the local
+    /// connections that hold something.
+    fn owe_a_withdrawal(&self) {
+        self.withdrawals_owed.fetch_max(
+            self.gate.restrictions(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    /// Waits for the hold of the dispatch boundary that was in place when `after` releases had
+    /// been counted, and for no later one.
+    ///
+    /// A mutation checks the local owner's access inside the boundary and applies its effect inside
+    /// the same hold, so once the hold that can have checked under the earlier statement has
+    /// ended, every effect of such a check is in the session. The wait is made of tries and holds
+    /// nothing: it ends when the count has moved past `after`, which the guard of the hold raises
+    /// before it lets go, or when a try finds the boundary free. A holder that takes the boundary
+    /// later checks under the new statement, and is not waited for.
+    async fn wait_for_the_hold(&self, after: u64) {
+        let mut pause = BOUNDARY_FIRST_RETRY;
+        loop {
+            let released = self.dispatch.released();
+            tokio::pin!(released);
+            if self.dispatch.releases() > after || self.try_boundary().is_some() {
+                return;
+            }
+            tokio::select! {
+                () = &mut released => {}
+                () = tokio::time::sleep(pause) => {
+                    pause = (pause * 2).min(BOUNDARY_RETRY_CAP);
+                }
+            }
+        }
+    }
+
+    /// Answers a statement of what the local owner may do only when no withdrawal it owes, or an
+    /// earlier statement owes, is pending: it waits for the hold in place when the gate changed,
+    /// runs the withdrawal that is owed itself, and waits for the detaches that another
+    /// withdrawal still runs. Nothing rests on the task of the statement that owed it.
+    async fn after_a_statement(&self, after: u64, answer: ControlFrame) -> ControlFrame {
+        #[cfg(feature = "testing")]
+        let _waiting = WaitingCount::begin(&self.statements_waiting);
+        self.wait_for_the_hold(after).await;
+        loop {
+            let owed = self
+                .withdrawals_owed
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if self
+                .withdrawals_done
+                .load(std::sync::atomic::Ordering::SeqCst)
+                < owed
+            {
+                off_the_executor(|| self.withdraw_local_connections());
+                self.withdrawals_done
+                    .fetch_max(owed, std::sync::atomic::Ordering::SeqCst);
+                continue;
+            }
+            if self
+                .withdrawals_running
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                return answer;
+            }
+            tokio::time::sleep(BOUNDARY_FIRST_RETRY).await;
+        }
+    }
+
+    /// Withdraws one local connection that its own writer found restricted, after the hold of the
+    /// dispatch boundary that was in place when the writer asked.
+    ///
+    /// The writer asks from a frame it is not allowed to write, which is after the gate changed,
+    /// and a mutation that checked before the change may still be pushing its attachment: the
+    /// withdrawal that ran now would not see it. It holds no lock while it waits.
+    async fn withdraw_after_the_hold(&self, connection_id: ConnectionId) {
+        let after = self.dispatch.releases();
+        self.wait_for_the_hold(after).await;
+        off_the_executor(|| self.withdraw(connection_id));
     }
 
     /// Withdraws every local connection that holds an attachment or a subscription.
@@ -6193,6 +6380,10 @@ impl WorkerService {
         let Some(registration) = held else {
             return;
         };
+        // Counted from the moment the registration is gone from the registry until the last
+        // attachment is detached, so that a statement's acknowledgement does not go out while
+        // this withdrawal is still detaching what a restriction asked it to take back.
+        let _running = RunningCount::begin(&self.withdrawals_running);
         if let Some(task) = registration
             .delivery
             .lock()
@@ -7680,6 +7871,16 @@ impl WorkerService {
         self.check_local_dispatch(&state.facts, method, caller)?;
         #[cfg(feature = "testing")]
         self.after_the_dispatch_check_stall.stand();
+        // A connection that a restriction withdrew stays open, but it holds no place in the
+        // registry any more, so no later withdrawal would find an attachment it made: it attaches
+        // on a new connection.
+        if method == Method::SessionAttach && state.withdrawn.is_set() {
+            return Err(WorkerError::PermissionDenied {
+                detail: "this connection was withdrawn when the host restricted what its local \
+                         owner may do; open a new one to attach"
+                    .to_owned(),
+            });
+        }
         let digest = kr_protocol::digest::mutation_digest(mutation, &actor_id)
             .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
 
