@@ -7,11 +7,12 @@
 //! write, a different number of writes, a scope row with no function and a row outside the scope
 //! each fail the case. The reader of source text, and what it does not see, is in
 //! `standing_scan/mod.rs`: it reads the body of every helper that a listed body calls by a name
-//! that this crate declares once, and the helpers those call in turn, and a name that several
-//! functions declare has to be allowed for the one body that calls it (the standard library's) or
-//! declared with the file of the definition that the body calls, which is read as well; so a
-//! helper that a listed body reaches by either is held to the same rows. What the scan does not
-//! follow is named in the header of the reader. The functions that make the time contract's writes
+//! that this crate declares once, and the helpers those call in turn (not the callee of a name
+//! that this roster counts), and in every body that is read a call to a name that several
+//! functions declare has to be a counted name, an `outside` one, allowed for that body (the
+//! standard library's or another crate's) or declared with the file of the definition that the
+//! body calls, which is read as well; so a helper that a listed body reaches by either is held to
+//! the same rows. What the scan does not follow is named in the header of the reader. The functions that make the time contract's writes
 //! (the full check, the second raise, the kept reading) are listed by caller across the whole
 //! crate.
 //!
