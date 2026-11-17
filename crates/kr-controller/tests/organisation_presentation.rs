@@ -813,8 +813,7 @@ async fn a_device_that_pairs_again_is_bound_to_no_organisation_until_it_presents
             }),
             ..net_support::proposal(SERVED)
         };
-        let record =
-            net_support::pair_with(&fixture.host, &device, &fixture.owner, grant).await;
+        let record = net_support::pair_with(&fixture.host, &device, &fixture.owner, grant).await;
         Member {
             device,
             record,
@@ -842,7 +841,9 @@ async fn a_device_that_pairs_again_is_bound_to_no_organisation_until_it_presents
         .present(&fixture, &raw, fixture.lease(2, &again, SERVED), None)
         .await
         .expect("the host installs the new record's lease");
-    read_host_info(&raw).await.expect("the new record is served");
+    read_host_info(&raw)
+        .await
+        .expect("the new record is served");
     let bound = fixture.listed().await.enrolments[0]
         .members
         .iter()
