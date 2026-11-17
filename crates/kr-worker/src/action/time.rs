@@ -4774,4 +4774,60 @@ mod tests {
             "the clock went back ten minutes from a reading that no bracket was taken for"
         );
     }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: a confirmation that is published after readings were taken
+    /// keeps the proofs stamped at or after its act and drops the older. The first look is held up
+    /// in all three tries and reads a peak ten minutes ahead of the owner's clock in the first,
+    /// while one confirmation is pending; the owner's second confirmation, made five seconds into
+    /// the look, is published only after it, and the clock is at the owner's level for the next
+    /// look. The peak is stamped after the second confirmation's act, so it refuses it.
+    #[test]
+    fn a_confirmation_published_late_keeps_the_proofs_stamped_after_its_act() {
+        let (floor, held, contract) = found_a_rollback_and_was_confirmed();
+        let start = held.wall.now_ms().get();
+        let began = held.continuous.boot_elapsed_ms();
+        held.sets_the_wall_before_reading(1, start + 600_000);
+        held.sets_the_wall_after_landing(1, start + 10_000);
+        held.arm(0, 3);
+        assert!(contract.observe().suspended);
+        floor.establish(start + 5_000, began + 5_000);
+        held.pass(Duration::from_secs(1));
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Unresolved,
+            "the clock went back ten minutes from a reading stamped after the owner's last act"
+        );
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: the proofs from before the owner's act are dropped when another
+    /// confirmation is met, so the bound does not fold one of them into a proof that is stamped
+    /// after the act. The first look is held up in all three tries and reads a peak in the first;
+    /// the owner then confirms again, and five more looks are held up in all three tries, which
+    /// would fill the set past the bound if the old proofs were still in it. The clock is at the
+    /// owner's level in the look that decides, and the peak, which came before the owner spoke,
+    /// refuses nothing.
+    #[test]
+    fn a_proof_from_before_the_owners_act_is_not_folded_into_one_stamped_after_it() {
+        let (floor, held, contract) = found_a_rollback_and_was_confirmed();
+        let start = held.wall.now_ms().get();
+        held.sets_the_wall_before_reading(1, start + 600_000);
+        held.sets_the_wall_after_landing(1, start + 10_000);
+        held.arm(0, 3);
+        assert!(contract.observe().suspended);
+        held.pass(Duration::from_secs(1));
+        floor.establish(held.wall.now_ms().get(), held.continuous.boot_elapsed_ms());
+        for _ in 0..5 {
+            held.pass(Duration::from_secs(1));
+            held.arm(0, 3);
+            assert!(contract.observe().suspended);
+        }
+        held.pass(Duration::from_secs(1));
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Trusted,
+            "a reading from before the owner's last act refuses nothing, folded or not"
+        );
+    }
 }
