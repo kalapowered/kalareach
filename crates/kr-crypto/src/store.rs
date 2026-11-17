@@ -1426,6 +1426,19 @@ const STORE_KIND_MARKER: &str = ".store-kind";
 /// The longest a valid marker is. Anything larger is a damaged or foreign file.
 const MAX_MARKER_LEN: u64 = 64;
 
+/// Which store `directory`'s record names, for a reader that must not choose, create or write
+/// anything: the same read [`open_store`] makes of it, and nothing else.
+///
+/// `None` means this host has not chosen yet.
+///
+/// # Errors
+///
+/// Returns [`CryptoError::SecretStore`] for a record that cannot be read, is too large or names an
+/// unknown backend.
+pub fn recorded_store_kind(directory: &Path) -> Result<Option<StoreKind>> {
+    read_recorded_kind(directory)
+}
+
 /// Reads the recorded choice.
 ///
 /// `None` means this host has not chosen yet. A marker that cannot be read, is too large or holds
@@ -2572,6 +2585,62 @@ mod tests {
                 refused.is_err(),
                 "{} named the store through a link and was accepted",
                 name.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A reader that must not choose names what the record names, none where there is no record,
+    /// and makes nothing: a directory that is not there stays not there.
+    #[test]
+    fn the_recorded_store_kind_is_read_and_nothing_is_made() {
+        let base = scratch_directory("recorded-kind");
+        assert_eq!(recorded_store_kind(&base).expect("no record"), None);
+        assert!(!base.exists(), "the read made the directory");
+        std::fs::create_dir_all(&base).expect("a directory");
+        // What the directory holds, by name and bytes: a read changes none of it, and writes no key.
+        let held = || {
+            let mut held: Vec<(std::ffi::OsString, Vec<u8>)> = std::fs::read_dir(&base)
+                .expect("the directory")
+                .map(|entry| {
+                    let path = entry.expect("an entry").path();
+                    (
+                        path.file_name().expect("a name").to_owned(),
+                        std::fs::read(&path).expect("its bytes"),
+                    )
+                })
+                .collect();
+            held.sort();
+            held
+        };
+        std::fs::write(base.join(STORE_KIND_MARKER), "platform\n").expect("a record");
+        let before = held();
+        assert_eq!(
+            recorded_store_kind(&base).expect("a record"),
+            Some(StoreKind::Platform)
+        );
+        assert_eq!(held(), before, "the read changed what the directory holds");
+        std::fs::write(base.join(STORE_KIND_MARKER), "file\n").expect("a record");
+        let before = held();
+        assert_eq!(
+            recorded_store_kind(&base).expect("a record"),
+            Some(StoreKind::FileFallback)
+        );
+        assert_eq!(held(), before, "the read changed what the directory holds");
+        for damaged in [
+            b"nonsense".to_vec(),
+            vec![b'x'; usize::try_from(MAX_MARKER_LEN).expect("a length") + 1],
+        ] {
+            std::fs::write(base.join(STORE_KIND_MARKER), &damaged).expect("a damaged record");
+            let before = held();
+            assert!(
+                recorded_store_kind(&base).is_err(),
+                "a damaged record is an error"
+            );
+            assert_eq!(
+                held(),
+                before,
+                "the refusal changed what the directory holds"
             );
         }
         let _ = std::fs::remove_dir_all(&base);
