@@ -579,13 +579,12 @@ async fn the_page_is_sent_no_secret_while_this_computer_pairs_and_confirms() {
 }
 
 /// KR-REQ-10.27, KR-REQ-10.06: this computer watches a host it owns while it pairs with another
-/// host whose configuration shares the first one's relay and selects another resolver. One key
-/// holds one endpoint on a relay, so reaching the owned host would close the endpoint the attempt
-/// uses. The attempt waits for its owner through several of the watcher's cycles and never loses
-/// its connection, the owned host is out of contact meanwhile, and once the attempt has ended the
-/// watcher reaches the owned host again and lists what it asks.
+/// host whose configuration shares the first one's relay and selects another resolver. The attempt
+/// waits for its owner through several of the watcher's cycles and never loses its connection, and
+/// the owned host is reached meanwhile: it is in contact and what it asks is listed during the
+/// attempt, and it stays so once the attempt has ended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_watcher_never_cuts_off_an_attempt_that_shares_its_relay() {
+async fn the_watcher_reaches_an_owned_host_while_an_attempt_on_a_shared_relay_runs() {
     const RELAY: &str = "https://relay.pairing.test";
     let owner_keys = DeviceKeys::generate().expect("keys");
     let owned =
@@ -624,6 +623,22 @@ async fn the_watcher_never_cuts_off_an_attempt_that_shares_its_relay() {
     let state = reached(&device, awaiting).await;
     assert!(awaiting(&state), "{state:?}");
 
+    // The owned host asks its owner while the attempt waits, and the watcher lists the request.
+    let mut owned_client = owned.client().await;
+    calls::request(
+        owned.environment_id,
+        &mut owned_client,
+        ConfirmationSubject::IssueInvitation {
+            mode: InviteModeKind::Direct,
+            rendezvous_origin: Nullable::null(),
+            grant_kind: InviteGrantKind::SessionInvitation,
+            proposed_grant: viewer(),
+        },
+    )
+    .await
+    .expect("the owned host asks its owner");
+    support::listed(&watcher, |request| request.checkable).await;
+
     // The owner takes long enough for the watcher to cycle several times, and for the attempt to
     // ask again once the host's window has made room for its question.
     tokio::time::sleep(Duration::from_secs(15)).await;
@@ -641,8 +656,8 @@ async fn the_watcher_never_cuts_off_an_attempt_that_shares_its_relay() {
     );
     assert_eq!(
         support::owned_host_in_contact(&device),
-        Some(false),
-        "the owned host waits while the attempt holds the relay"
+        Some(true),
+        "the owned host is reached while the attempt waits for its owner"
     );
 
     calls::confirm_candidate(
@@ -656,33 +671,18 @@ async fn the_watcher_never_cuts_off_an_attempt_that_shares_its_relay() {
     let state = reached(&device, paired).await;
     assert!(paired(&state), "{state:?}");
 
-    // The attempt has ended, and the owned host is reached again.
-    let mut owned_client = owned.client().await;
-    calls::request(
-        owned.environment_id,
-        &mut owned_client,
-        ConfirmationSubject::IssueInvitation {
-            mode: InviteModeKind::Direct,
-            rendezvous_origin: Nullable::null(),
-            grant_kind: InviteGrantKind::SessionInvitation,
-            proposed_grant: viewer(),
-        },
-    )
-    .await
-    .expect("the owned host asks its owner");
+    // The attempt has ended, and the owned host is still reached.
     support::listed(&watcher, |request| request.checkable).await;
     support::owned_host_shown(&device, true).await;
 }
 
 /// KR-REQ-10.06, KR-REQ-10.27: this computer owns two hosts whose configurations share a relay and
-/// select different resolvers, so reaching either closes the endpoint the other was reached
-/// through. The watcher visits both in turn and lists what each asks. While the person takes their
-/// time over the first host's request, spanning several of the watcher's cycles, the watcher does
-/// not reach the second host, whose connection would close the endpoint the review answers
-/// through: the review confirms, the first host records the answer, and once the review has ended
-/// the second host is reached again, its request listed under the reference it had.
+/// select different resolvers. The watcher visits both in turn and lists what each asks. While the
+/// person takes their time over the first host's request, spanning several of the watcher's cycles,
+/// the watcher reaches the second host and lists a request that it asks meanwhile, under the
+/// reference it will have afterwards: the review confirms and the first host records the answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_watcher_never_cuts_off_a_review_that_shares_its_relay() {
+async fn the_watcher_reaches_both_owned_hosts_while_a_review_is_open() {
     const RELAY: &str = "https://relay.pairing.test";
     let owner_keys = DeviceKeys::generate().expect("keys");
     let first =
@@ -712,9 +712,35 @@ async fn the_watcher_never_cuts_off_a_review_that_shares_its_relay() {
     let request = support::listed(&watcher, |request| request.host_name == "the test host").await;
     let waiting = support::listed(&watcher, |request| request.host_name == "the second host").await;
 
-    let outcome = tokio::time::timeout(WATCHDOG, watcher.review(&request.reference))
+    let reviewing = tokio::spawn({
+        let (watcher, reference) = (Arc::clone(&watcher), request.reference.clone());
+        async move { watcher.review(&reference).await }
+    });
+    // The second host asks again while the review is open, and the watcher lists it.
+    calls::request(
+        second.environment_id,
+        &mut second_client,
+        ConfirmationSubject::IssueInvitation {
+            mode: InviteModeKind::Direct,
+            rendezvous_origin: Nullable::null(),
+            grant_kind: InviteGrantKind::SessionInvitation,
+            proposed_grant: proposal(&[ActionRight::SessionView, ActionRight::FilesRead]),
+        },
+    )
+    .await
+    .expect("the second host asks again");
+    let meanwhile = support::listed(&watcher, |request| {
+        request.host_name == "the second host" && request.reference != waiting.reference
+    })
+    .await;
+    assert!(
+        !reviewing.is_finished(),
+        "the second host was reached while the review was open"
+    );
+    let outcome = tokio::time::timeout(WATCHDOG, reviewing)
         .await
         .expect("the review ends")
+        .expect("the review ran")
         .expect("reviewed");
     assert_eq!(outcome, ReviewOutcome::Confirmed);
     assert!(
@@ -727,10 +753,11 @@ async fn the_watcher_never_cuts_off_a_review_that_shares_its_relay() {
             .is_some(),
         "the first host recorded the answer"
     );
-    // The second host was out of contact while the review held the relay. Its request is listed
-    // again under the reference it had, so whatever the page knew of it still holds.
-    let again = support::listed(&watcher, |request| request.host_name == "the second host").await;
-    assert_eq!(again.reference, waiting.reference);
+    // Both of the second host's requests are listed after the review, each under the reference it
+    // had while the review was open, so whatever the page knew of them still holds.
+    let again = support::listed(&watcher, |request| request.reference == waiting.reference).await;
+    assert_eq!(again.host_name, "the second host");
+    support::listed(&watcher, |request| request.reference == meanwhile.reference).await;
 }
 
 /// KR-REQ-10.52: one request is confirmed at a time. While the person is being asked about one, a

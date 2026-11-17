@@ -84,13 +84,13 @@ use std::time::Duration;
 
 use companion_platform::notify::{Permission, PreviewKeys, RecipientKey, SenderKey};
 use companion_platform::push::{PendingRegistration, PendingState};
+use kr_client::Shown;
 use kr_client::pairing::paired::PairedHost;
 use kr_client::services::push::{InstallationSigner, PushGateway, Registration};
 use kr_client::services::{
     HttpDeadlines, HttpService, PushService, ServiceHttp, ServiceSigner, managed_response_limits,
 };
 use kr_client::session::ComposedMutation;
-use kr_client::{Said as _, Shown};
 use kr_ipc::paths::{read_owner_only_file, write_owner_only_file};
 use kr_protocol::ids::DeviceKeyRevision;
 use kr_protocol::ids::{ActionId, DeviceId, PushRegistrationId, PushSenderRecordId};
@@ -288,11 +288,6 @@ const TOKEN_REFUSED: &str =
 /// The most names a record that cannot be read is tried under before it is left where it is.
 const ASIDE_NAMES: u32 = 1_000;
 
-/// What a host that a look cannot reach without cutting off the host in use is shown as.
-const BESIDE_THE_HOST_IN_USE: &str = "This host is reached through the same relay as the host you \
-                                      are using. Choose Try again to turn notifications on for it; \
-                                      the host in use reconnects afterwards.";
-
 /// What a registration that was sent, or was about to be, is kept as until the host's answer
 /// settles it: what a restart leaves, and what the person is told then.
 const SENT_WORDS: &str = "This phone registered with the host and was interrupted before it heard \
@@ -442,9 +437,6 @@ impl From<String> for Stop {
 pub type PushFuture<'a, T> =
     Pin<Box<dyn Future<Output = std::result::Result<T, String>> + Send + 'a>>;
 
-/// A boxed future for a question the answer to which is yes or no.
-pub type AskFuture<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
-
 /// Why a change made over the line to a host did not happen, in words.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LineStop {
@@ -519,33 +511,22 @@ enum Next {
 /// How a run reaches its host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reach {
-    /// The person asked for it. The host's endpoint is held while the connection is open, and
-    /// reaching the host may close the endpoint of another host that shares its relay, as the
-    /// person's own choice of the host would.
+    /// The person asked for it.
     Asked,
-    /// A look at where notifications stand started it, in the background. It is a visit: it never
-    /// closes the endpoint of the host in use, and is refused when the host cannot be reached
-    /// without that. The host's endpoint is held while the connection is open.
+    /// A look at where notifications stand started it, in the background. It is a visit: a
+    /// connection that ends when the run does and is not opened again, which says whether the host
+    /// refused it.
     Visit,
 }
 
 /// How this phone reaches a host it is paired with, to hand it a delivery credential.
 pub trait Registrar: Send + Sync {
-    /// Opens the paired connection to `host`, and holds its endpoint until the connection is
-    /// dropped, so nothing this phone does for another host closes it in between.
+    /// Opens the paired connection to `host`.
     fn connect<'a>(
         &'a self,
         host: &'a PairedHost,
         reach: Reach,
     ) -> PushFuture<'a, Box<dyn HostLine + 'a>>;
-
-    /// Whether reaching `host` as a visit would be refused now because that would cut off the host
-    /// in use, asked before anything is done for the host and with nothing held. The answer is as
-    /// of now: the connection is the authority when it is made. A registrar that cannot tell says
-    /// no.
-    fn beside_the_host_in_use<'a>(&'a self, _host: &'a PairedHost) -> AskFuture<'a> {
-        Box::pin(async { false })
-    }
 
     /// Whether this phone can ask `host` what became of the registration sent under `action`
     /// without the person: it holds the request it sent, which the host answers from its record of
@@ -1679,11 +1660,6 @@ impl PushDesk {
         reach: Reach,
         job: Job,
     ) -> std::result::Result<Digest256, Stop> {
-        // A look never cuts off the host in use, so a host it cannot reach without that is not
-        // asked or told anything, and the words say why.
-        if reach == Reach::Visit && self.registrar.beside_the_host_in_use(host).await {
-            return Err(BESIDE_THE_HOST_IN_USE.to_owned().into());
-        }
         match job {
             Job::Full => {
                 // The person asked for a new registration after one whose outcome is not known.
@@ -2912,17 +2888,6 @@ impl ConnectionRegistrar {
 }
 
 impl Registrar for ConnectionRegistrar {
-    fn beside_the_host_in_use<'a>(&'a self, host: &'a PairedHost) -> AskFuture<'a> {
-        Box::pin(async move {
-            let in_use = || self.device.host_in_use().map(|using| using.network_config);
-            self.device
-                .pairing()
-                .link
-                .would_refuse_visit(&host.network_config, &in_use)
-                .await
-        })
-    }
-
     fn can_ask(&self, host: DeviceId, action: ActionId) -> bool {
         lock(&self.repeats).holds(host, action)
     }
@@ -2937,31 +2902,6 @@ impl Registrar for ConnectionRegistrar {
         reach: Reach,
     ) -> PushFuture<'a, Box<dyn HostLine + 'a>> {
         Box::pin(async move {
-            // The endpoint is held from before the connection is made until the line is dropped:
-            // a visit to another host that shares its relay would close it, and so would the
-            // host in use reconnecting. A look's run asks the pool whether the host in use allows
-            // it, in the same request as the hold.
-            let link = &self.device.pairing().link;
-            let unreached = |_| "the host did not answer in time".to_owned();
-            let held = match reach {
-                Reach::Asked => {
-                    tokio::time::timeout(
-                        crate::connection::CONNECT_WITHIN,
-                        link.hold(&host.network_config),
-                    )
-                    .await
-                }
-                Reach::Visit => {
-                    let in_use = || self.device.host_in_use().map(|using| using.network_config);
-                    tokio::time::timeout(
-                        crate::connection::CONNECT_WITHIN,
-                        link.visit_hold(&host.network_config, &in_use),
-                    )
-                    .await
-                }
-            }
-            .map_err(unreached)?
-            .map_err(|error| error.said().into_string())?;
             let connection = match reach {
                 Reach::Asked => crate::connection::Connection::paired(&self.device, host).await,
                 Reach::Visit => crate::connection::Connection::visited(&self.device, host).await,
@@ -2976,7 +2916,6 @@ impl Registrar for ConnectionRegistrar {
                 // Read before anything is sent: the host is forgotten after the run lost its claim,
                 // so a line that reads a count that already includes it is never sent a request.
                 forgettings: lock(&self.repeats).forgettings(host.host_device_id),
-                _held: held,
             }) as Box<dyn HostLine + 'a>)
         })
     }
@@ -2994,8 +2933,6 @@ struct ConnectionLine {
     repeats: Repeats,
     /// How many times the host had been forgotten when this line was made.
     forgettings: u64,
-    /// The hold on the host's endpoint, kept until the line is dropped.
-    _held: kr_client::pairing::link::EndpointHold,
 }
 
 impl ConnectionLine {

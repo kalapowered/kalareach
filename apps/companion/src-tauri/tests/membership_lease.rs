@@ -760,8 +760,8 @@ impl Rig {
             .expect("the connection ends one way or the other")
     }
 
-    /// The device visits the host, as it does a host it is not using: a connection of its own that
-    /// never closes the endpoint of the host in use, of which there is none here.
+    /// The device visits the host, as it does a host it is not using: a connection of its own, which
+    /// a hold on the application's own connections lets through.
     async fn visits(&self) -> Result<Session, LinkError> {
         let device = self.companion().device();
         let pairing = device.pairing();
@@ -775,7 +775,7 @@ impl Rig {
         let identity = pairing.paired_identity_for(&host);
         tokio::time::timeout(
             WATCHDOG,
-            pairing.link.visit_paired(&host, &identity, &|| None),
+            support::as_a_visit(pairing.link.connect_paired(&host, &identity)),
         )
         .await
         .expect("the visit ends one way or the other")

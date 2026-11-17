@@ -12,11 +12,9 @@
 //! No host holds up another. Each visit, from connecting to the answer, ends within
 //! [`VISIT_WITHIN`], so a host that takes the connection and answers nothing is out of contact for
 //! that cycle and nothing more; and the record of open sessions is never locked across a wait on
-//! the network. A review holds the endpoint its host is reached through from the ceremony to the
-//! answer, so the watcher's visit to another host on the same relay waits for it rather than
-//! closing the connection the answer goes over. The watcher's visits never cut off the connection to
-//! the host in use either: an owned host that cannot be reached without that stays out of contact
-//! for as long as another host is the one in use.
+//! the network. Every host is reached through the device's one endpoint, so a review, a visit and
+//! the host in use's own connection do not wait for one another or close one another's
+//! connections, whatever relays their hosts share.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -249,27 +247,15 @@ impl Owner {
             .into_iter()
             .find(|owned| owned.host_device_id == host_id)
             .ok_or_else(|| CommandError::refused("that request is not waiting here"))?;
-        let out_of_contact = || CommandError::unavailable("the host is not in contact");
-        // From the ceremony to the answer, nothing this computer does for another host may close
-        // the endpoint the answer goes over.
-        let _held = tokio::time::timeout(
-            VISIT_WITHIN,
-            self.device.pairing().link.hold(&host.network_config),
-        )
-        .await
-        .ok()
-        .and_then(std::result::Result::ok)
-        .ok_or_else(out_of_contact)?;
         // A session that answers now, and the challenge as the host holds it now: one the host
         // no longer holds open cannot be confirmed any more.
-        let (confirmations, holding) =
-            self.reach(&host, false).await.map_err(Missed::into_error)?;
+        let (confirmations, holding) = self.reach(&host).await.map_err(Missed::into_error)?;
         let outcome = match held_now(&holding, &listed) {
             Held::Unchanged(current) => confirmations.review(current, &*self.ceremony).await,
             Held::Changed => ReviewOutcome::CannotCheck,
             Held::Gone => ReviewOutcome::Expired,
         };
-        self.refresh(&host, false).await;
+        self.refresh(&host).await;
         Ok(outcome)
     }
 
@@ -277,7 +263,7 @@ impl Owner {
     async fn cycle(&self) {
         let owned = self.device.owner_hosts();
         for host in &owned {
-            self.refresh(host, true).await;
+            self.refresh(host).await;
         }
         let owns = |host: &DeviceId| owned.iter().any(|owned| owned.host_device_id == *host);
         lock(&self.sessions).retain(|host, _| owns(host));
@@ -294,11 +280,9 @@ impl Owner {
         }
     }
 
-    /// Asks `host` what it wants confirmed, and shows its answer, or that it is out of contact. A
-    /// visit leaves the host in use's connection alone; the answer to a review, which the person
-    /// asked for, does not.
-    async fn refresh(&self, host: &PairedHost, visiting: bool) {
-        let (found, listed) = match self.visit(host, visiting).await {
+    /// Asks `host` what it wants confirmed, and shows its answer, or that it is out of contact.
+    async fn refresh(&self, host: &PairedHost) {
+        let (found, listed) = match self.visit(host).await {
             Ok(listed) => (Contact::In, listed),
             Err(Missed::OutOfContact) => (Contact::Out, Vec::new()),
             Err(Missed::Refused(words)) => (Contact::Refused(words), Vec::new()),
@@ -308,12 +292,8 @@ impl Owner {
     }
 
     /// One visit to `host`: what it holds open, or why nothing was found.
-    async fn visit(
-        &self,
-        host: &PairedHost,
-        visiting: bool,
-    ) -> std::result::Result<Vec<Listed>, Missed> {
-        self.reach(host, visiting).await.map(|(_, listed)| listed)
+    async fn visit(&self, host: &PairedHost) -> std::result::Result<Vec<Listed>, Missed> {
+        self.reach(host).await.map(|(_, listed)| listed)
     }
 
     /// A session to `host` that answers now, and what the host holds open, found within
@@ -322,7 +302,6 @@ impl Owner {
     async fn reach(
         &self,
         host: &PairedHost,
-        visiting: bool,
     ) -> std::result::Result<(Arc<OwnerConfirmations>, Vec<Listed>), Missed> {
         let deadline = tokio::time::Instant::now() + VISIT_WITHIN;
         if let Some(open) = self.session(host.host_device_id) {
@@ -331,7 +310,7 @@ impl Owner {
                 _ => self.forget(host.host_device_id, &open),
             }
         }
-        let opened = tokio::time::timeout_at(deadline, self.open(host, visiting))
+        let opened = tokio::time::timeout_at(deadline, self.open(host))
             .await
             .map_err(|_| Missed::OutOfContact)??;
         let listed = tokio::time::timeout_at(deadline, opened.pending())
@@ -343,35 +322,32 @@ impl Owner {
     }
 
     /// A session to `host`, opened now: connected as the device this computer is there, through
-    /// the host's own network configuration, and aimed at the host's environment. A visit never
-    /// cuts off the connection to the host in use.
+    /// the host's own network configuration, and aimed at the host's environment.
     async fn open(
         &self,
         host: &PairedHost,
-        visiting: bool,
     ) -> std::result::Result<Arc<OwnerConfirmations>, Missed> {
         let pairing = self.device.pairing();
         let identity = pairing.paired_identity_for(host);
-        let session = if visiting {
-            let device = &self.device;
-            let in_use = || device.host_in_use().map(|using| using.network_config);
-            pairing.link.visit_paired(host, &identity, &in_use).await
-        } else {
-            pairing.link.connect_paired(host, &identity).await
-        }
-        .map_err(|error| match error {
-            // The host was reached and was asked nothing: this computer could not give it the
-            // lease it needs, and the words say why.
-            LinkError::Membership(refusal, _) => Missed::Refused(refusal.message),
-            // The host is not out of contact when this computer's own budget of connections to it
-            // is used, or when it has no room for this computer's connection: the next visit asks
-            // again. Any other cause is out of contact, a connection that the host refused at its
-            // admission among them.
-            other => match Unopened::of_link(other) {
-                unopened @ (Unopened::BudgetFull | Unopened::HostFull) => Self::no_room(&unopened),
-                _ => Missed::OutOfContact,
-            },
-        })?;
+        let session = pairing
+            .link
+            .connect_paired(host, &identity)
+            .await
+            .map_err(|error| match error {
+                // The host was reached and was asked nothing: this computer could not give it the
+                // lease it needs, and the words say why.
+                LinkError::Membership(refusal, _) => Missed::Refused(refusal.message),
+                // The host is not out of contact when this computer's own budget of connections to it
+                // is used, or when it has no room for this computer's connection: the next visit asks
+                // again. Any other cause is out of contact, a connection that the host refused at its
+                // admission among them.
+                other => match Unopened::of_link(other) {
+                    unopened @ (Unopened::BudgetFull | Unopened::HostFull) => {
+                        Self::no_room(&unopened)
+                    }
+                    _ => Missed::OutOfContact,
+                },
+            })?;
         let session = Arc::new(session);
         let channel = SessionChannel::open(Arc::clone(&session))
             .await

@@ -482,23 +482,6 @@ impl Pairing {
         };
         let mode = pending.mode;
         progress.send_replace(reconnecting(&pending));
-        // Nothing this device does for another host may close the endpoint the attempt uses.
-        let _held = match within(WAIT_STEP, self.link.hold(&pending.network_config)).await {
-            Ok(held) => held,
-            // The attempt was waiting for the owner, and this device cannot reach the host to ask
-            // whether the owner decided: what it knows is that it does not know.
-            Err(error) => {
-                let failure = PairingFailure::new(
-                    FailureKind::ApprovalUnknown,
-                    crate::shown!(
-                        "the host could not be reached to ask whether its owner approved this device: {}",
-                        error.said()
-                    ),
-                )
-                .with_tries(pending.tries_left);
-                return Some(ended(progress, Err(failure), mode, None));
-            }
-        };
         // The host may have committed this device already, and this device recorded it and
         // stopped before it let the waiting attempt go. The host now answers that endpoint as the
         // paired device, so the record is what reaches it.
@@ -672,14 +655,10 @@ impl Pairing {
         }
         drop(room);
 
-        // The host, at the endpoint its authenticated bundle pinned, which nothing this device does
-        // for another host may close while the attempt runs.
+        // The host, through the services its authenticated bundle pinned.
         progress.send_replace(AttemptState::Working {
             stage: Stage::ReachingHost,
         });
-        let _held = within(WAIT_STEP, self.link.hold(&bundle.network_config))
-            .await
-            .map_err(|error| link_failed(&error, tries).with_invitation_spent())?;
         let connection = within(
             WAIT_STEP,
             self.link.dial(&bundle.network_config, &bundle.endpoint_id),
@@ -2859,28 +2838,8 @@ mod tests {
             unreachable!("the host commits nothing")
         }
 
-        fn visit_paired_transport<'a>(
-            &'a self,
-            _host: &'a PairedHost,
-            _identity: &'a LocalIdentity,
-            _in_use: &'a super::super::link::HostInUse<'a>,
-        ) -> BoxFuture<'a, Result<Arc<dyn crate::transport::ControlTransport>, LinkError>> {
-            unreachable!("the host commits nothing")
-        }
-
-        fn hold<'a>(
-            &'a self,
-            _network: &'a kr_protocol::pairing::NetworkConfig,
-        ) -> BoxFuture<'a, Result<super::super::link::EndpointHold, LinkError>> {
-            unreachable!("a waiting device holds no endpoint of its own")
-        }
-
-        fn visit_hold<'a>(
-            &'a self,
-            _network: &'a kr_protocol::pairing::NetworkConfig,
-            _in_use: &'a super::super::link::HostInUse<'a>,
-        ) -> BoxFuture<'a, Result<super::super::link::EndpointHold, LinkError>> {
-            unreachable!("a waiting device holds no endpoint of its own")
+        fn forget_host<'a>(&'a self, _host: &'a EndpointKey) -> BoxFuture<'a, ()> {
+            Box::pin(async {})
         }
     }
 
@@ -3199,11 +3158,7 @@ mod tests {
             .await
             .expect("a connection to the peer");
         drop(accepted.await.expect("the peer's side"));
-        pool.endpoint(&network)
-            .await
-            .expect("the device's endpoint")
-            .close()
-            .await;
+        pool.close().await;
         peer.close().await;
         connection
     }

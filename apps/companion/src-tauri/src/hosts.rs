@@ -9,6 +9,7 @@
 //! with why. A command made while it is not connected is refused as such, and none is sent down a
 //! connection that is gone.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use kr_client::pairing::paired::PairedHost;
@@ -69,13 +70,19 @@ pub async fn use_host<R: Runtime>(app: &AppHandle<R>, host: PairedHost) -> Resul
 ///
 /// A local action. It reaches no host, so it works for one that no longer answers, among them one
 /// that revoked this computer. When `host` is the one in use its connection ends and none is in
-/// use until the person chooses another; any other host's connection is left as it is.
+/// use until the person chooses another; any other host's connection is left as it is. The
+/// device's one endpoint then forgets the host: its address lookups and the relays that no other
+/// host names. That is the last step, and it runs to its end in a task of its own, so a command
+/// that stops waiting for it does not leave the host in the endpoint.
 ///
 /// # Errors
 ///
 /// Returns a local failure when this computer's pairing records could not be changed, and then the
 /// host is still listed.
-pub fn forget_host<R: Runtime>(app: &AppHandle<R>, host: &PairedHost) -> Result<ConnectionState> {
+pub async fn forget_host<R: Runtime>(
+    app: &AppHandle<R>,
+    host: &PairedHost,
+) -> Result<ConnectionState> {
     let state = app.state::<AppState>();
     let device = state.device()?;
     state.forget_host(
@@ -93,6 +100,9 @@ pub fn forget_host<R: Runtime>(app: &AppHandle<R>, host: &PairedHost) -> Result<
     #[cfg(feature = "testing")]
     crate::told::tap(app, CONNECTION_EVENT, &now);
     let _ = app.emit(CONNECTION_EVENT, now);
+    let (link, endpoint) = (Arc::clone(&device.pairing().link), host.host_endpoint_id);
+    // A task that panics has left nothing to wait for, and the person's forgetting has been done.
+    let _ = tauri::async_runtime::spawn(async move { link.forget_host(&endpoint).await }).await;
     Ok(state.connection_state())
 }
 

@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use kr_client::error::Result;
 use kr_client::pairing::BoxFuture;
-use kr_client::pairing::link::{EndpointHold, HostInUse, HostLink, LinkError, Presentation};
+use kr_client::pairing::link::{HostLink, LinkError, Presentation};
 use kr_client::pairing::paired::PairedHost;
 use kr_client::session::Session;
 use kr_client::transport::{ControlTransport, Reach, StreamOpener, TransportFuture};
@@ -374,22 +374,6 @@ impl HostLink for Budgeted {
         })
     }
 
-    fn visit_paired_transport<'a>(
-        &'a self,
-        host: &'a PairedHost,
-        identity: &'a LocalIdentity,
-        in_use: &'a HostInUse<'a>,
-    ) -> BoxFuture<'a, std::result::Result<Arc<dyn ControlTransport>, LinkError>> {
-        Box::pin(async move {
-            let place = self.place_for(host).await?;
-            let transport = self
-                .inner
-                .visit_paired_transport(host, identity, in_use)
-                .await?;
-            Ok(Placed::over(transport, place))
-        })
-    }
-
     fn present_membership<'a>(
         &'a self,
         session: &'a Session,
@@ -401,27 +385,8 @@ impl HostLink for Budgeted {
             .present_membership(session, host, identity, presentation)
     }
 
-    fn hold<'a>(
-        &'a self,
-        network: &'a NetworkConfig,
-    ) -> BoxFuture<'a, std::result::Result<EndpointHold, LinkError>> {
-        self.inner.hold(network)
-    }
-
-    fn visit_hold<'a>(
-        &'a self,
-        network: &'a NetworkConfig,
-        in_use: &'a HostInUse<'a>,
-    ) -> BoxFuture<'a, std::result::Result<EndpointHold, LinkError>> {
-        self.inner.visit_hold(network, in_use)
-    }
-
-    fn would_refuse_visit<'a>(
-        &'a self,
-        network: &'a NetworkConfig,
-        in_use: &'a HostInUse<'a>,
-    ) -> BoxFuture<'a, bool> {
-        self.inner.would_refuse_visit(network, in_use)
+    fn forget_host<'a>(&'a self, host: &'a EndpointKey) -> BoxFuture<'a, ()> {
+        self.inner.forget_host(host)
     }
 
     fn relay_refusal(

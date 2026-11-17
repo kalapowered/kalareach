@@ -23,9 +23,7 @@ use kr_client::pairing::candidate::{AttemptState, Candidate, CandidateRoom, Pair
 use kr_client::pairing::clock::DeviceClock;
 use kr_client::pairing::failure::FailureKind;
 use kr_client::pairing::invitation::{Invitation, read_invitation};
-use kr_client::pairing::link::{
-    EndpointHold, EndpointPool, HostLink, IrohLink, LinkError, Preauth,
-};
+use kr_client::pairing::link::{EndpointPool, HostLink, IrohLink, LinkError, Preauth};
 use kr_client::pairing::owner::{
     CannotCheck, Ceremony, CeremonyKind, CeremonyOutcome, Listed, OwnerChannel, OwnerConfirmations,
     ReviewOutcome, SessionChannel, Subject,
@@ -505,8 +503,6 @@ struct WatchedLink {
     fresh_dials_fail: Arc<AtomicBool>,
     /// How long a dial that fails takes to fail.
     fresh_dial_stall: Option<Duration>,
-    /// Holding the endpoint of a host fails.
-    fail_hold: bool,
     /// Opening the pre-authorisation surface of a connection fails.
     fail_open: bool,
     /// What a failed dial is explained by, as a managed relay's standing answer would.
@@ -547,7 +543,6 @@ impl WatchedLink {
             sever_paired: false,
             fresh_dials_fail: Arc::new(AtomicBool::new(false)),
             fresh_dial_stall: None,
-            fail_hold: false,
             fail_open: false,
             relay_refused: None,
             first_open_delay: None,
@@ -616,13 +611,11 @@ fn severed() -> LinkError {
 }
 
 impl WatchedLink {
-    /// A connection to a paired host, counted, cut or gated as the test says, as a visit beside
-    /// the host in use when `visiting` is `Some`.
+    /// A connection to a paired host, counted, cut or gated as the test says.
     fn paired<'a>(
         &'a self,
         host: &'a PairedHost,
         identity: &'a LocalIdentity,
-        visiting: Option<&'a kr_client::pairing::link::HostInUse<'a>>,
     ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>> {
         self.paired_connects.fetch_add(1, Ordering::SeqCst);
         if self.severed.load(Ordering::SeqCst) {
@@ -635,14 +628,7 @@ impl WatchedLink {
             if self.sever_paired {
                 return Err(severed());
             }
-            match visiting {
-                Some(in_use) => {
-                    self.inner
-                        .visit_paired_transport(host, identity, in_use)
-                        .await
-                }
-                None => self.inner.connect_paired_transport(host, identity).await,
-            }
+            self.inner.connect_paired_transport(host, identity).await
         })
     }
 }
@@ -732,34 +718,11 @@ impl HostLink for WatchedLink {
         host: &'a PairedHost,
         identity: &'a LocalIdentity,
     ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>> {
-        self.paired(host, identity, None)
+        self.paired(host, identity)
     }
 
-    fn visit_paired_transport<'a>(
-        &'a self,
-        host: &'a PairedHost,
-        identity: &'a LocalIdentity,
-        in_use: &'a kr_client::pairing::link::HostInUse<'a>,
-    ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>> {
-        self.paired(host, identity, Some(in_use))
-    }
-
-    fn hold<'a>(
-        &'a self,
-        network: &'a NetworkConfig,
-    ) -> BoxFuture<'a, Result<EndpointHold, LinkError>> {
-        if self.fail_hold {
-            return Box::pin(async { Err(severed()) });
-        }
-        self.inner.hold(network)
-    }
-
-    fn visit_hold<'a>(
-        &'a self,
-        network: &'a NetworkConfig,
-        in_use: &'a kr_client::pairing::link::HostInUse<'a>,
-    ) -> BoxFuture<'a, Result<EndpointHold, LinkError>> {
-        self.inner.visit_hold(network, in_use)
+    fn forget_host<'a>(&'a self, host: &'a EndpointKey) -> BoxFuture<'a, ()> {
+        self.inner.forget_host(host)
     }
 }
 
@@ -2863,7 +2826,8 @@ fn stale_record(host: &Host, network_config: NetworkConfig) -> PairedHost {
 /// service that host's own configuration selects. Two hosts publish to two different servers, the
 /// device's address hints for both have gone stale, and it reaches both; an endpoint bound from
 /// the first host's configuration does not reach the second, and while the device reaches the
-/// first host the second host's server is never asked about it.
+/// first host the second host's server is never asked about it. A device that has not reached the
+/// second host before cannot reach it through the first host's services either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn each_host_is_reached_through_its_own_network_configuration() {
     let first_resolver = Resolver::start().await;
@@ -2880,11 +2844,12 @@ async fn each_host_is_reached_through_its_own_network_configuration() {
     let first_config = first.network().network_config().expect("a configuration");
     let second_config = second.network().network_config().expect("a configuration");
 
-    let device = ProductDevice::with_keys(device_keys, Arc::new(first.room.clone()), |link| {
-        Arc::new(link)
-    });
-    let reach = |host: &PairedHost| {
-        let pairing = Arc::clone(&device.pairing);
+    let device =
+        ProductDevice::with_keys(device_keys.clone(), Arc::new(first.room.clone()), |link| {
+            Arc::new(link)
+        });
+    let reach = |pairing: &Arc<Pairing>, host: &PairedHost| {
+        let pairing = Arc::clone(pairing);
         let host = host.clone();
         async move {
             let identity = pairing.paired_identity_for(&host);
@@ -2899,7 +2864,7 @@ async fn each_host_is_reached_through_its_own_network_configuration() {
     };
 
     let first_record = stale_record(&first, first_config.clone());
-    let reached_first = tokio::time::timeout(WATCHDOG, reach(&first_record)).await;
+    let reached_first = tokio::time::timeout(WATCHDOG, reach(&device.pairing, &first_record)).await;
     assert_eq!(
         reached_first
             .expect("in time")
@@ -2917,16 +2882,24 @@ async fn each_host_is_reached_through_its_own_network_configuration() {
 
     let second_record = stale_record(&second, second_config);
     assert_eq!(
-        tokio::time::timeout(WATCHDOG, reach(&second_record))
+        tokio::time::timeout(WATCHDOG, reach(&device.pairing, &second_record))
             .await
             .expect("in time")
             .expect("the second host is reached"),
         second.environment_id
     );
 
-    // The second host, through the first host's configuration: nothing there can find it.
+    // The second host, through the first host's configuration, for a device that has not reached it
+    // before: nothing there can find it.
+    let fresh = ProductDevice::with_keys(device_keys, Arc::new(first.room.clone()), |link| {
+        Arc::new(link)
+    });
     let misconfigured = stale_record(&second, first_config);
-    let reached = tokio::time::timeout(Duration::from_secs(20), reach(&misconfigured)).await;
+    let reached = tokio::time::timeout(
+        Duration::from_secs(20),
+        reach(&fresh.pairing, &misconfigured),
+    )
+    .await;
     assert!(
         !matches!(reached, Ok(Ok(_))),
         "a host is not reached through another host's services"
@@ -2955,8 +2928,8 @@ async fn attempt_through(
 }
 
 /// KR-REQ-10.19: a code attempt that fails on the way to the host, after the host locked its
-/// invitation to the attempt, says so: whichever of the three steps failed (holding the endpoint,
-/// the dial, opening the host's first surface), and whether a managed relay's refusal explains the
+/// invitation to the attempt, says so: whichever of the two steps failed (the dial, opening the
+/// host's first surface), and whether a managed relay's refusal explains the
 /// dial or not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_code_attempt_that_fails_on_the_way_to_the_host_says_its_invitation_is_spent() {
@@ -2968,12 +2941,7 @@ async fn a_code_attempt_that_fails_on_the_way_to_the_host_says_its_invitation_is
     };
     type Configure = Box<dyn FnOnce(&mut WatchedLink)>;
     // The kind each site ends as, as it is sent: a relay kind is made only with its figure.
-    let sites: [(&str, Configure, &str); 5] = [
-        (
-            "hold",
-            Box::new(|link: &mut WatchedLink| link.fail_hold = true),
-            "host_unreachable",
-        ),
+    let sites: [(&str, Configure, &str); 4] = [
         (
             "dial",
             Box::new(|link: &mut WatchedLink| link.severed.store(true, Ordering::SeqCst)),
@@ -3015,9 +2983,22 @@ async fn a_code_attempt_that_fails_on_the_way_to_the_host_says_its_invitation_is
     }
 }
 
+/// Waits until `link` has been asked to dial, which a resumed attempt does as soon as it has no
+/// connection to the host.
+async fn until_dialled(link: &WatchedLink) {
+    tokio::time::timeout(WATCHDOG, async {
+        while link.dials.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the resumed attempt dials the host");
+}
+
 /// KR-REQ-10.32: a device that starts again while its attempt waits for the owner, and cannot reach
-/// the host to ask, does not know whether the owner decided. It says so, and does not say that the
-/// invitation can no longer be used: the host is still holding it for this device.
+/// the host, keeps trying on its backoff. When the attempt's own time runs out it does not know
+/// whether the owner decided: it says so, does not say that the invitation can no longer be used
+/// (the host is still holding it for this device), and still says how many tries are left.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resume_that_cannot_reach_the_host_does_not_know_whether_the_owner_decided() {
     let owner_keys = keys();
@@ -3034,23 +3015,87 @@ async fn a_resume_that_cannot_reach_the_host_does_not_know_whether_the_owner_dec
     attempt.abort();
     let _ = attempt.await;
 
-    let (_link, making) = watching(|link| link.fail_hold = true);
+    let (link, making) = watching(|link| link.severed.store(true, Ordering::SeqCst));
     let restarted = device.restarted(making);
-    let (progress, _shown) = watch::channel(AttemptState::Idle);
-    let failure = tokio::time::timeout(WATCHDOG, restarted.resume(&progress))
+    let link = made(&link);
+    let (progress, shown) = watch::channel(AttemptState::Idle);
+    let resuming = tokio::spawn({
+        let restarted = Arc::clone(&restarted);
+        async move { restarted.resume(&progress).await }
+    });
+    until_dialled(&link).await;
+    assert!(
+        !resuming.is_finished(),
+        "the resume keeps trying while the attempt has time"
+    );
+    assert!(matches!(
+        &*shown.borrow(),
+        AttemptState::Reconnecting { .. }
+    ));
+
+    // The attempt's own time runs out.
+    device.clock.advance(Duration::from_secs(60 * 60));
+    let failure = tokio::time::timeout(WATCHDOG, resuming)
         .await
         .expect("the resumed attempt ends")
+        .expect("the resume ran")
         .expect("an attempt was waiting")
         .expect_err("not paired");
     assert_eq!(failure.kind, FailureKind::ApprovalUnknown);
     assert!(!failure.invitation_spent);
     assert_eq!(failure.tries_left, Some(MAX_CLIENT_ATTEMPTS - 1));
+}
+
+/// A device that starts again while its attempt waits for the owner, and cannot reach the host,
+/// goes on with the attempt when the host comes back inside the attempt's time: the host answers
+/// that its owner has not decided, and the owner's approval then pairs the device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resume_whose_host_comes_back_inside_the_attempts_time_goes_on_and_is_paired() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = invite_code(environment, &mut client, &viewer(), None, &owner).await;
+    let (origin, code, _) = code_of(&invited);
+
+    let device = ProductDevice::new(Arc::new(host.room.clone()), |link| Arc::new(link));
+    let (attempt, mut shown) = device.enter(&origin, &code);
+    awaiting_value(&mut shown).await;
+    attempt.abort();
+    let _ = attempt.await;
+
+    let (link, making) = watching(|link| link.severed.store(true, Ordering::SeqCst));
+    let restarted = device.restarted(making);
+    let link = made(&link);
+    let (progress, mut shown) = watch::channel(AttemptState::Idle);
+    let resuming = tokio::spawn({
+        let restarted = Arc::clone(&restarted);
+        async move { restarted.resume(&progress).await }
+    });
+    until_dialled(&link).await;
     assert!(
-        restarted
-            .hosts
-            .waiting_attempt()
-            .expect("readable")
-            .is_some(),
-        "the attempt is kept until a person stops it"
+        !resuming.is_finished(),
+        "the resume keeps trying while the host cannot be reached"
     );
+
+    // The host comes back: the attempt reaches it again and waits for the owner.
+    link.severed.store(false, Ordering::SeqCst);
+    tokio::time::timeout(
+        WATCHDOG,
+        shown.wait_for(|state| matches!(state, AttemptState::AwaitingApproval { .. })),
+    )
+    .await
+    .expect("the attempt reaches the host again")
+    .expect("the attempt runs");
+    calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+        .await
+        .expect("the owner approves");
+    tokio::time::timeout(WATCHDOG, resuming)
+        .await
+        .expect("the resumed attempt ends")
+        .expect("the resume ran")
+        .expect("an attempt was waiting")
+        .expect("paired");
+    assert!(matches!(&*shown.borrow(), AttemptState::Paired { .. }));
 }

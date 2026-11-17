@@ -2870,7 +2870,7 @@ pub async fn inbox_hosts(state: State<'_, AppState>) -> Result<Vec<crate::inbox:
 /// A local action that reaches no host, so it works after a host has revoked this computer. The
 /// host keeps what it holds of this device; this computer stops listing, using and trying it.
 #[tauri::command]
-pub fn hosts_forget<R: tauri::Runtime>(
+pub async fn hosts_forget<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, AppState>,
     reference: String,
@@ -2879,7 +2879,7 @@ pub fn hosts_forget<R: tauri::Runtime>(
         .device()?
         .host_by_reference(&reference)
         .ok_or_else(crate::hosts::unknown_host)?;
-    let forgotten = crate::hosts::forget_host(&app, &host)?;
+    let forgotten = crate::hosts::forget_host(&app, &host).await?;
     // What is kept of a host's notifications goes with the host. The host's own destination stays
     // until its owner removes this device: only the host revokes an authorisation it holds.
     if let Some(desk) = state.push() {
