@@ -838,10 +838,9 @@ async fn the_device_endpoint_sends_no_relay_token() {
 /// KR-REQ-10.02: an introduction on a closed endpoint is refused and changes nothing: the map
 /// keeps its relays, and the host is not recorded either.
 ///
-/// The record is read through the gate on the task that sets the map. `forget` starts that task
-/// for a host that the table holds with relays and for no other, so a hold that a `forget` of B
-/// does not reach shows that the table does not hold B, and a `forget` of A, which was
-/// introduced, reaches it, so the hold does see a recorded host.
+/// The record is read through the map. A `forget` sets the map equal to the table, so after the
+/// `forget` of A, which was introduced, the map holds the relay of every host that the table still
+/// holds: B's relay in it would show that the refused introduction recorded B.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_closed_device_endpoint_refuses_an_introduction() {
     let (r1, r2) = (LocalRelay::spawn().await, LocalRelay::spawn().await);
@@ -863,20 +862,11 @@ async fn a_closed_device_endpoint_refuses_an_introduction() {
         "B's relay did not enter the map"
     );
 
-    let (key_a, key_b) = (a.key(), b.key());
-    let mut hold = device.hold_next_map_task();
-    tokio::select! {
-        biased;
-        forgotten = device.forget(&key_b) => {
-            forgotten.expect("forgetting a host that is not recorded");
-        }
-        () = hold.reached() => panic!("B was recorded: forgetting it started a task for its relay"),
-    }
-    tokio::select! {
-        biased;
-        _ = device.forget(&key_a) => panic!("A's task ended while the hold is on it"),
-        () = hold.reached() => {}
-    }
+    device.forget(&a.key()).await.expect("forgetting A");
+    assert!(
+        !device.relay_urls().contains(&r2.url),
+        "B was recorded: the map that follows the table holds its relay"
+    );
 }
 
 /// KR-REQ-10.02: a caller that stops waiting for an introduction leaves the change to finish. The
@@ -942,6 +932,55 @@ async fn a_forgotten_hosts_relay_is_not_put_back_by_an_earlier_introduction() {
         "the late task did not put B's relay back"
     );
     assert_registry_has_nothing_for(&device, b.id()).await;
+    device.close().await;
+}
+
+/// KR-REQ-10.02: a `forget` leaves no relay of an earlier entry in the map when it returns, also
+/// when the entry that it removes names no relay. A host is introduced with a relay, then again
+/// with none by an introduction whose caller stops waiting while the task that sets the map is
+/// held: the table holds the entry with no relay and the map still holds the relay of the entry
+/// before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forget_leaves_no_relay_of_an_earlier_entry_in_the_map() {
+    let r1 = LocalRelay::spawn().await;
+    let a = Host::on(&r1, "A", 1).await;
+    let (with_relay, without_relay) = (a.view(&[&r1.url]), a.view(&[]));
+
+    let device = device(&[&r1], false).await;
+    device
+        .introduce(paired(&with_relay, &a))
+        .await
+        .expect("host A with its relay");
+    assert_eq!(device.relay_urls(), BTreeSet::from([r1.url.clone()]));
+
+    let mut hold = device.hold_next_map_task();
+    {
+        let introduction = device.introduce(paired(&without_relay, &a));
+        tokio::pin!(introduction);
+        tokio::select! {
+            _ = &mut introduction => panic!("the introduction ended while its task is held"),
+            () = hold.reached() => {}
+        }
+        // The caller stops waiting here, while the gate holds the task.
+    }
+    assert_eq!(
+        device.relay_urls(),
+        BTreeSet::from([r1.url.clone()]),
+        "the control: the held task has not changed the map"
+    );
+
+    device.forget(&a.key()).await.expect("forgetting A");
+    assert!(
+        device.relay_urls().is_empty(),
+        "the relay of A's earlier entry stays in the map after the forget returned"
+    );
+
+    hold.release().await;
+    assert!(
+        device.relay_urls().is_empty(),
+        "the late task did not put A's relay back"
+    );
+    assert_registry_has_nothing_for(&device, a.id()).await;
     device.close().await;
 }
 
