@@ -840,8 +840,10 @@ impl InvitationRows {
                 proof,
                 effect,
                 now,
-                terminal,
-                AcceptanceRow::Optional,
+                Standing {
+                    terminal,
+                    acceptance: AcceptanceRow::Optional,
+                },
             )
         });
         self.lifetimes.settle();
@@ -935,8 +937,10 @@ impl InvitationStore for InvitationRows {
                 issued_under,
                 &effect,
                 terms.issued_at_ms,
-                TerminalStanding::Bootstrap,
-                AcceptanceRow::Optional,
+                Standing {
+                    terminal: TerminalStanding::Bootstrap,
+                    acceptance: AcceptanceRow::Optional,
+                },
             )
         });
         self.lifetimes.settle();
@@ -1145,8 +1149,10 @@ fn commit_pairing(
         &commitment.owner_confirmation,
         &format!("pair.confirm {}", commitment.invitation_id),
         commitment.committed_at_ms,
-        TerminalStanding::Bootstrap,
-        AcceptanceRow::Required,
+        Standing {
+            terminal: TerminalStanding::Bootstrap,
+            acceptance: AcceptanceRow::Required,
+        },
     )?;
     insert_record(transaction, &record, &claim)?;
     transaction
@@ -1473,6 +1479,16 @@ pub enum TerminalStanding {
     },
 }
 
+/// What a consumption spends a confirmation under: what the terminal's proof is accepted as, and
+/// whether the confirmation must already have an acceptance row.
+#[derive(Clone, Debug)]
+pub(super) struct Standing {
+    /// What the controlling terminal's proof is spent under.
+    pub(super) terminal: TerminalStanding,
+    /// Whether the confirmation must already have an acceptance row.
+    pub(super) acceptance: AcceptanceRow,
+}
+
 /// Whether the confirmation a consumption spends must already have an acceptance row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AcceptanceRow {
@@ -1529,14 +1545,20 @@ pub(super) fn consume(
     proof: &OwnerConfirmationProof,
     effect: &str,
     now: TimestampMs,
-    terminal: TerminalStanding,
-    acceptance: AcceptanceRow,
+    standing: Standing,
 ) -> Result<()> {
-    let bound_to = match acceptance {
+    let bound_to = match standing.acceptance {
         AcceptanceRow::Optional => None,
         AcceptanceRow::Required => answering_device(transaction, proof)?,
     };
-    signer_still_authorised(transaction, lifetimes, refusal, proof, terminal, bound_to)?;
+    signer_still_authorised(
+        transaction,
+        lifetimes,
+        refusal,
+        proof,
+        standing.terminal,
+        bound_to,
+    )?;
     destination_still_held(transaction, proof)?;
     let request = encode(&proof.request)?;
     let action = text_of(&proof.request.action)?;
