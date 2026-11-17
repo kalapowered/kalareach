@@ -2658,6 +2658,98 @@ mod terminal_catalogue {
         host.stop().await;
     }
 
+    /// KR-REQ-10.06: a proof that an owner device answered through this host is spent, when the
+    /// caller presents it, only under the record that answered it, not under another record that
+    /// holds the same authorisation key. The owner device answers the catalogue's challenge and its
+    /// record is revoked; a record of another endpoint identity holds the same key. Presenting the
+    /// answered proof is refused, the answer stays unspent and nothing is enrolled. The control is a
+    /// proof that no one completed through this host, which a record holding the key presents and
+    /// which is spent as it always was.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_presented_proof_the_ended_record_answered_is_not_spent_under_the_record_that_holds_its_key()
+     {
+        let owner = keys();
+        let host = Host::start(&owner).await;
+        let environment = host.environment_id;
+        let first = host.owner.clone().expect("the host's owner device");
+        let mut client = host.client().await;
+        let published = Published::development();
+        let mut params = add(&host, &published, "development", &[]);
+        let challenge = calls::request(
+            environment,
+            &mut client,
+            ConfirmationSubject::CatalogueAdd(Box::new(params.clone())),
+        )
+        .await
+        .expect("the host describes the request");
+        let (proof, presented) = calls::sign(&challenge.request, &Signer::OwnerDevice(&owner));
+        calls::complete(environment, &mut client, proof.clone(), presented)
+            .await
+            .expect("the owner device answers");
+        let unspent = |host: &Host| -> bool {
+            rusqlite::Connection::open(host.registry_database())
+                .expect("the registry opens")
+                .query_row(
+                    "SELECT consumed_at_ms IS NULL FROM owner_confirmations
+                     WHERE confirmation_id = ?1 AND signer_device_id = ?2",
+                    rusqlite::params![
+                        challenge
+                            .request
+                            .confirmation_id
+                            .get()
+                            .as_bytes()
+                            .as_slice(),
+                        first.device_id.get().as_bytes().as_slice(),
+                    ],
+                    |row| row.get(0),
+                )
+                .expect("the acceptance record names the owner device that answered")
+        };
+        assert!(unspent(&host));
+
+        // Its record is revoked, and a record of another endpoint identity holds the same key.
+        let barrier = host
+            .network()
+            .revoke_device(first.device_id)
+            .await
+            .expect("the owner device is revoked");
+        assert!(barrier.holds(), "{barrier:?}");
+        let mut second = first.clone();
+        second.device_id = kr_protocol::ids::DeviceId::new(kr_ipc::new_uuid());
+        second.endpoint_id = *DeviceKeys::generate().expect("keys").transport.public();
+        second.revoked_at_ms = None;
+        second.expired_at_ms = None;
+        host.network()
+            .devices()
+            .commit(&second)
+            .expect("a record that holds the key of the revoked one");
+
+        params.owner_confirmation = Nullable::some(proof);
+        let refused = effect(environment, &mut client, &params).await.expect_err(
+            "the answer of the ended record is not spent under the record that holds its key",
+        );
+        assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+        assert!(
+            refused.message.contains("no longer an owner device"),
+            "the host says the device that answered is no longer an owner device: {refused:?}"
+        );
+        assert!(unspent(&host), "nothing was spent");
+        assert!(listed(environment, &mut client).await.is_empty());
+
+        // Control: a proof that no one completed through this host, presented by the record that
+        // holds the key now.
+        params.owner_confirmation = Nullable::some(host.confirm(
+            &owner,
+            SensitiveAction::TrustRepositoryRoot,
+            challenge.request.action_digest,
+        ));
+        effect(environment, &mut client, &params)
+            .await
+            .expect("a proof with no earlier record is spent as it was");
+        assert_eq!(listed(environment, &mut client).await, ["development"]);
+        host.stop().await;
+    }
+
     /// KR-REQ-10.05, KR-REQ-11.42: an answer to a challenge a caller described, even one whose
     /// digest is exactly a catalogue plan's digest, is not spent by a request that carries no
     /// proof: what the owner device was shown for it was the caller's description and not the

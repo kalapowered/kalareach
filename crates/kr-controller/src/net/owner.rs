@@ -1195,7 +1195,12 @@ impl OwnerAuthority {
             signer_device,
             &admission,
         )?;
-        if let Some(entry) = state.entries.get_mut(&key) {
+        // The first completion of a proof binds its answer to the record that signed it. A later
+        // completion of the same proof, under another action, is a copy of that answer: the record
+        // that holds the key now is not the one that answered, and does not become it.
+        if let Some(entry) = state.entries.get_mut(&key)
+            && entry.answer.is_none()
+        {
             entry.answer = Some(Answer {
                 proof: proof.clone(),
                 signer,
