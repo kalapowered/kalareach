@@ -413,7 +413,7 @@ crates/kr-worker/src/service.rs | WorkerService::desktop_checks | tokio::task::s
 crates/kr-worker/src/service.rs | WorkerService::install_command_backends | tokio::spawn | crate::broker::adoption::watch | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/service.rs | WorkerService::new | .spawn | crate::application::follow_evidence | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/service.rs | WorkerService::plugin_admissions_part | tokio::task::spawn_blocking | closure{.prepare} | 1 | joined | - | awaited where it stands
-crates/kr-worker/src/service.rs | WorkerService::release_expired_grants | tokio::task::spawn_blocking | closure{.fence_granted_input} | 1 | joined | - | awaited where it stands
+crates/kr-worker/src/service.rs | WorkerService::release_expired_grants | tokio::task::spawn_blocking | closure{.take_boundary} | 1 | joined | - | awaited where it stands
 crates/kr-worker/src/service.rs | WorkerService::run_connection | tokio::spawn | async{.finish_facts} | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/service.rs | WorkerService::run_connection | tokio::spawn | async{.finish_launch} | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/service.rs | WorkerService::run_connection | tokio::spawn | async{.finish_page} | 1 | other_crate | - | worker program: linked; the worker runs it
