@@ -2418,3 +2418,356 @@ fn a_statement_is_not_acknowledged_while_a_withdrawal_it_cannot_sweep_is_under_w
         meeting.when_complete
     );
 }
+
+/// The session's holdings recorded at the moment the daemon has its acknowledgement of a
+/// statement, or the reason it has none.
+type Answered = Arc<std::sync::Mutex<Option<Result<Held, String>>>>;
+
+/// Sends `access` over `daemon` on a task, and records what the session holds when the daemon has
+/// its acknowledgement.
+fn tell_and_read(world: &Arc<World>, daemon: BoundLink, access: LocalAccess) -> Answered {
+    let answered: Answered = Arc::default();
+    let record = Arc::clone(&answered);
+    let reader = Arc::clone(world);
+    tokio::spawn(async move {
+        let mut daemon = daemon;
+        let outcome = match daemon.announce_local_access(access).await {
+            Ok(_) => Ok(tokio::task::spawn_blocking(move || held(&reader))
+                .await
+                .expect("the session is read")),
+            Err(error) => Err(format!("{error:?}")),
+        };
+        *record.lock().expect("the record is not poisoned") = Some(outcome);
+        drop(daemon);
+    });
+    answered
+}
+
+/// Whether a statement sent by `tell_and_read` has been answered.
+fn is_answered(answered: &Answered) -> bool {
+    answered
+        .lock()
+        .expect("the record is not poisoned")
+        .is_some()
+}
+
+/// Sends `access` over `daemon` on a task and cares for no answer: the daemon's link may be one
+/// that a replacement has fenced, whose answer is never written.
+fn tell_and_forget(daemon: BoundLink, access: LocalAccess) {
+    tokio::spawn(async move {
+        let mut daemon = daemon;
+        let _ = daemon.announce_local_access(access).await;
+    });
+}
+
+/// Takes what a statement recorded, once it is there.
+fn recorded(answered: &Answered) -> Result<Held, String> {
+    answered
+        .lock()
+        .expect("the record is not poisoned")
+        .take()
+        .expect("the answer was recorded")
+}
+
+/// A statement that has changed the gate and is held after its wait, a replacement authority
+/// connection, an attach that was checked under the first statement and a further restriction that
+/// arrives on the replacement while the attach holds the boundary. Returns whether the further
+/// statement was answered while the attach held the boundary, and what the session held when it was
+/// answered.
+///
+/// The first statement is let go once the further one waits. Whatever the first marks as done, the
+/// further statement must still sweep for the restriction it owes after the attach has landed.
+async fn a_statement_marks_what_a_later_statement_owes() -> Result<(bool, Held), &'static str> {
+    let world = Arc::new(world("exec cat", true).await);
+    let mut window = world.window().await;
+    let mut first = world.authority(1).await;
+    tell(&mut first, open(1)).await;
+    world
+        .read(&mut window)
+        .await
+        .expect("the window is served under an open host");
+    let (at_the_hold, go_first) = world.service.stall_a_statement_after_its_hold();
+    let (checked, go_attach) = world.service.stall_a_mutation_after_its_dispatch_check();
+    let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+
+    // The first statement takes the lease that the host gave, which is still live, and stops at the
+    // end of its wait, before it runs the withdrawal it owes.
+    tell_and_forget(first, world.machine.lease(2, FAR_MS, FAR_MS));
+    if ends_by(deadline, async move { at_the_hold.await.is_ok() }).await != Some(true) {
+        return Err("the first statement never reached the end of its wait");
+    }
+    // The daemon's replacement connection presents the same generation. The first statement's task
+    // goes on although its link is fenced.
+    let second = world.authority(1).await;
+    // The window's attach passes the check under the lease and stops inside the boundary.
+    let attach_ended = start_the_geometry_attach(&world, window);
+    if ends_by(deadline, async move { checked.await.is_ok() }).await != Some(true) {
+        return Err("the attach never passed the dispatch boundary's check");
+    }
+    // The host closes: the second statement owes a restriction of its own and waits for the attach.
+    let answered = tell_and_read(&world, second, closed(3));
+    let waiting = Arc::clone(&world.service);
+    let record = Arc::clone(&answered);
+    if !holds_by(deadline, move || {
+        waiting.statements_waiting_for_tests() >= 2
+            || record.lock().expect("the record is not poisoned").is_some()
+    })
+    .await
+    {
+        return Err("the second statement neither waited for the attach nor was answered");
+    }
+    let answered_while_held = is_answered(&answered);
+
+    // The first statement is let go and ends: only the second is waiting.
+    go_first.send(()).expect("lets the first statement go");
+    let waiting = Arc::clone(&world.service);
+    let record = Arc::clone(&answered);
+    if !holds_by(deadline, move || {
+        waiting.statements_waiting_for_tests() <= 1
+            || record.lock().expect("the record is not poisoned").is_some()
+    })
+    .await
+    {
+        return Err("the first statement never ended");
+    }
+    // The attach lands.
+    go_attach.send(()).expect("lets the attach go");
+    let record = Arc::clone(&answered);
+    if !holds_by(deadline, move || {
+        record.lock().expect("the record is not poisoned").is_some()
+    })
+    .await
+    {
+        return Err("the second statement was never answered");
+    }
+    let at_the_answer = recorded(&answered).map_err(|_| "the second statement failed")?;
+    drop(received_by(deadline, attach_ended).await);
+    world.close();
+    Ok((answered_while_held, at_the_answer))
+}
+
+/// KR-REQ-17.54: a statement completes only the withdrawal it owes. An earlier statement that is
+/// still running must not mark done the withdrawal of a later restriction whose attach has not
+/// landed yet.
+///
+/// The first statement is let go while the second waits for an attach that was checked under the
+/// first. The attach then lands, and the second statement's answer must come with the window's
+/// attachment withdrawn.
+#[test]
+fn an_earlier_statement_does_not_complete_the_withdrawal_a_later_one_owes() {
+    let (answered_while_held, at_the_answer) =
+        on_a_runtime(a_statement_marks_what_a_later_statement_owes())
+            .expect("the schedule came about");
+    assert!(
+        !answered_while_held,
+        "the second statement was answered while the attach held the boundary"
+    );
+    assert!(
+        at_the_answer.attachments.is_empty(),
+        "the second statement was answered while the attach's attachment was in the session: {at_the_answer:?}"
+    );
+}
+
+/// A window that holds an attachment, a first statement that closes the host and is stopped right
+/// after the gate has changed, and a second statement on a replacement connection: the first
+/// generation's repeat, or a newer daemon's first. Returns what the session held when the second
+/// statement was answered.
+async fn the_second_statement_meets_a_gate_that_has_just_changed(
+    generation: u64,
+    statement: LocalAccess,
+) -> Result<Held, &'static str> {
+    let world = Arc::new(world("exec cat", true).await);
+    let mut window = world.window().await;
+    let mut first = world.authority(1).await;
+    tell(&mut first, open(1)).await;
+    let _attachment = world.attach(&mut window).await;
+    let (at_the_change, go_first) = world.service.stall_a_statement_after_the_gate_changes();
+    let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+
+    tell_and_forget(first, closed(2));
+    if ends_by(deadline, async move { at_the_change.await.is_ok() }).await != Some(true) {
+        return Err("the first statement never reached the end of its change");
+    }
+    let second = world.authority(generation).await;
+    let answered = tell_and_read(&world, second, statement);
+    let record = Arc::clone(&answered);
+    let was_answered = holds_by(deadline, move || {
+        record.lock().expect("the record is not poisoned").is_some()
+    })
+    .await;
+    let _ = go_first.send(());
+    if !was_answered {
+        return Err("the second statement was never answered");
+    }
+    let at_the_answer = recorded(&answered).map_err(|_| "the second statement failed")?;
+    drop(window);
+    world.close();
+    Ok(at_the_answer)
+}
+
+/// KR-REQ-17.54: a repeat of a statement on a replacement connection, answered right after the
+/// first statement changed the gate, is not answered before the withdrawal the first one owes.
+#[test]
+fn a_repeated_statement_meets_the_withdrawal_that_the_change_it_repeats_owes() {
+    let at_the_answer = on_a_runtime(the_second_statement_meets_a_gate_that_has_just_changed(
+        1,
+        closed(2),
+    ))
+    .expect("the schedule came about");
+    assert!(
+        at_the_answer.attachments.is_empty(),
+        "the repeat was answered while the window's attachment was in the session: {at_the_answer:?}"
+    );
+}
+
+/// KR-REQ-17.54: a newer daemon's first statement, which changes nothing the gate holds, is not
+/// answered before the withdrawal the earlier daemon's last statement owes.
+#[test]
+fn a_newer_daemons_statement_meets_the_withdrawal_that_the_change_before_it_owes() {
+    let at_the_answer = on_a_runtime(the_second_statement_meets_a_gate_that_has_just_changed(
+        2,
+        closed(1),
+    ))
+    .expect("the schedule came about");
+    assert!(
+        at_the_answer.attachments.is_empty(),
+        "the statement was answered while the window's attachment was in the session: {at_the_answer:?}"
+    );
+}
+
+/// A window with an attachment whose connection has ended and taken its attachment list but not
+/// yet counted or detached anything, and a statement that closes the host meanwhile. Returns whether
+/// the statement was answered before the end made its detach, and what the session held when it was
+/// answered.
+async fn a_statement_meets_a_connection_that_has_taken_its_attachments()
+-> Result<(bool, Held), &'static str> {
+    let world = Arc::new(world("exec cat", true).await);
+    let mut window = world.window().await;
+    let mut daemon = world.authority(1).await;
+    tell(&mut daemon, open(1)).await;
+    let _attachment = world.attach(&mut window).await;
+    let (at_the_take, go_end) = world.service.stall_a_connection_after_its_attachments_are_taken();
+    let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+
+    drop(window);
+    if ends_by(deadline, async move { at_the_take.await.is_ok() }).await != Some(true) {
+        return Err("the window's connection never reached the end of its take");
+    }
+    let answered = tell_and_read(&world, daemon, closed(2));
+    let waiting = Arc::clone(&world.service);
+    let record = Arc::clone(&answered);
+    let neither = !holds_by(deadline, move || {
+        waiting.detach_waits_for_tests() > 0
+            || record.lock().expect("the record is not poisoned").is_some()
+    })
+    .await;
+    if neither {
+        let _ = go_end.send(());
+        return Err("the statement neither waited for the end's detach nor was answered");
+    }
+    let answered_before_the_detach = is_answered(&answered);
+    let _ = go_end.send(());
+    let record = Arc::clone(&answered);
+    if !holds_by(deadline, move || {
+        record.lock().expect("the record is not poisoned").is_some()
+    })
+    .await
+    {
+        return Err("the statement was never answered");
+    }
+    let at_the_answer = recorded(&answered).map_err(|_| "the statement failed")?;
+    world.close();
+    Ok((answered_before_the_detach, at_the_answer))
+}
+
+/// KR-REQ-17.54: a statement is not answered between the moment a connection's end takes its
+/// attachment list and the moment it counts the detaches it owes.
+#[test]
+fn a_statement_is_not_answered_between_a_connections_take_of_its_attachments_and_their_count() {
+    let (answered_before_the_detach, at_the_answer) =
+        on_a_runtime(a_statement_meets_a_connection_that_has_taken_its_attachments())
+            .expect("the schedule came about");
+    assert!(
+        !answered_before_the_detach,
+        "the statement was answered while the end of a connection had taken its attachments and detached none"
+    );
+    assert!(
+        at_the_answer.attachments.is_empty(),
+        "the statement was answered while the attachment was in the session: {at_the_answer:?}"
+    );
+}
+
+/// A window that holds an attachment, a statement that tightens to a live lease and is stopped
+/// after its wait, a second attach of the window that is checked under the lease and stopped inside
+/// the boundary, and the end of the window's connection, stopped before it takes its attachments.
+/// The statement is let go and withdraws the window; the attach lands; a further statement closes
+/// the host. Returns what the session held when the further statement was answered.
+async fn a_push_meets_the_withdrawal_of_its_connection() -> Result<Held, &'static str> {
+    let world = Arc::new(world("exec cat", true).await);
+    let mut window = world.window().await;
+    let mut daemon = world.authority(1).await;
+    tell(&mut daemon, open(1)).await;
+    let _first_attachment = world.attach(&mut window).await;
+    let (at_the_hold, go_statement) = world.service.stall_a_statement_after_its_hold();
+    let (checked, go_attach) = world.service.stall_a_mutation_after_its_dispatch_check();
+    let (at_the_end, go_end) = world.service.stall_a_connection_at_its_end();
+    let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+
+    let (_acknowledged, daemon_end) =
+        start_the_statement(daemon, world.machine.lease(2, FAR_MS, FAR_MS));
+    if ends_by(deadline, async move { at_the_hold.await.is_ok() }).await != Some(true) {
+        return Err("the statement never reached the end of its wait");
+    }
+    // The window's second attach passes the check under the lease, and the latch check of its
+    // connection, and stops inside the boundary.
+    let attach_ended = start_the_geometry_attach(&world, window);
+    if ends_by(deadline, async move { checked.await.is_ok() }).await != Some(true) {
+        return Err("the attach never passed the dispatch boundary's check");
+    }
+    // The statement sweeps: it withdraws the window's connection, which takes its list.
+    go_statement.send(()).expect("lets the statement go");
+    let Some(daemon) = received_by(deadline, daemon_end).await else {
+        let _ = go_attach.send(());
+        let _ = go_end.send(());
+        return Err("the statement was never acknowledged");
+    };
+    // The attach pushes into the list the withdrawal took, or finds the connection withdrawn; the
+    // connection's own end is then stopped before it takes anything.
+    go_attach.send(()).expect("lets the attach go");
+    if ends_by(deadline, async move { at_the_end.await.is_ok() }).await != Some(true) {
+        let _ = go_end.send(());
+        return Err("the window's connection never reached its end");
+    }
+    // The host closes, and the connection's end has still detached nothing.
+    let answered = tell_and_read(&world, daemon, closed(3));
+    let record = Arc::clone(&answered);
+    let was_answered = holds_by(deadline, move || {
+        record.lock().expect("the record is not poisoned").is_some()
+    })
+    .await;
+    let _ = go_end.send(());
+    if !was_answered {
+        return Err("the further statement was never answered");
+    }
+    let at_the_answer = recorded(&answered).map_err(|_| "the further statement failed")?;
+    drop(received_by(deadline, attach_ended).await);
+    world.close();
+    Ok(at_the_answer)
+}
+
+/// KR-REQ-17.54: an attach that was checked before a withdrawal does not leave an attachment in a
+/// list that no registry holds.
+///
+/// The withdrawal of the window's connection takes its list while the attach waits inside the
+/// boundary. The attach then pushes its attachment; it must find the connection withdrawn and
+/// detach it, because the connection's own end has not yet taken anything and the further statement
+/// that closes the host cannot find the window any more.
+#[test]
+fn an_attach_that_lands_after_the_withdrawal_of_its_connection_leaves_nothing_in_the_session() {
+    let at_the_answer = on_a_runtime(a_push_meets_the_withdrawal_of_its_connection())
+        .expect("the schedule came about");
+    assert!(
+        at_the_answer.attachments.is_empty(),
+        "the further statement was answered while the attach's attachment was in the session: {at_the_answer:?}"
+    );
+}
