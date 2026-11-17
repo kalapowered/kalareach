@@ -2024,8 +2024,8 @@ impl PushDesk {
     }
 
     /// The second half: the host is told. The receivers hold the host's key first (the keys are
-    /// filed before the host is reached: filing is the platform's, and no connection to the host
-    /// is open while it runs), then the host is reached, then the gateway issues the credential, and
+    /// filed before the run opens its connection to the host: filing is the platform's), then the
+    /// host is reached, then the gateway issues the credential, and
     /// the registration carries it with the person's choice of previews. The full sequence also
     /// tells the host which preview key this phone holds.
     ///
