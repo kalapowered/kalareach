@@ -182,18 +182,39 @@ async fn until_the_revision_holds(host: &Host) -> RevocationBarrier {
     }
 }
 
+/// How long the daemon's own asks of a worker can take to settle it when they fail on a loaded
+/// runner and the product is correct, counted from the daemon's start.
+///
+/// A daemon asks a worker the registry holds behind the revision in force at its start and at each
+/// pass after, five seconds apart. One ask takes fifteen seconds at most: the ten seconds that a
+/// notice has to be acknowledged and the five of the worker's exchange. An ask that fails, because
+/// its link did not open or its acknowledgement ran out, is made again after a wait counted from
+/// its end, ten seconds after the first failure and then twenty, forty and sixty, and at the first
+/// pass that falls after the wait. A refusal costs only the pass.
+///
+/// Nothing in the case limits how many asks fail, since only load makes one fail. The figure covers
+/// four in a row, one for each step of that pace, and then the ask that settles the worker: four
+/// times (fifteen seconds of ask and five of pass), the waits of 10, 20, 40 and 60 seconds, and
+/// fifteen for the last ask. The wait stays at sixty seconds after the fourth failure, so a fifth
+/// adds eighty: a runner that fails that many asks in a row is not loaded and the case ends with
+/// its message.
+const THE_DAEMONS_ASKS_AT_THEIR_SLOWEST: Duration =
+    Duration::from_secs(4 * (15 + 5) + (10 + 20 + 40 + 60) + 15);
+
 /// Waits until the daemon's own ask of its worker has been settled: the registry holds the worker as
 /// having acknowledged the revision in force.
 ///
 /// A daemon asks a worker the registry holds behind the revision in force by itself, at its start
-/// and at each pass after (five seconds apart), and announces that revision to it. A worker that
-/// finds its dispatch boundary held answers that it will fence it later, and the ask ends there.
-/// A revocation made before the ask is settled is a second announcement beside it: the worker joins
-/// the two revisions into one fence, and the result of the newer reads the older one, which the
-/// worker cannot say what its fence named for.
+/// and at each pass after, and announces that revision to it. A worker that finds its dispatch
+/// boundary held answers that it will fence it later, and the ask ends there. A revocation made
+/// before the ask is settled is a second announcement beside it: the worker joins the two revisions
+/// into one fence, and the result of the newer reads the older one, which the worker cannot say what
+/// its fence named for.
+///
+/// The wait ends by `THE_DAEMONS_ASKS_AT_THEIR_SLOWEST`, which covers the pace of the asks.
 async fn until_the_daemon_has_settled_its_own_ask(host: &Host) {
     let revision = host.controller().policy().authority_revision().get();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline = tokio::time::Instant::now() + THE_DAEMONS_ASKS_AT_THEIR_SLOWEST;
     while acknowledged_in_the_registry(host) < revision {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -385,7 +406,12 @@ async fn a_restarted_daemon_does_not_read_a_worker_made_after_the_revisions_that
 
 /// KR-REQ-10.45, 09.13: the same, where the worker finds its dispatch boundary held when the
 /// daemon's own ask of it at the start arrives, as it does for a moment while another exchange is
-/// inside it. The worker owes that revision, and the daemon asks again at its next pass.
+/// inside it. The worker owes that revision, and the daemon asks again at a later pass.
+///
+/// The case forces at least one such refusal and no more than that. It does not force what the
+/// refusal can lead to: the daemon's next ask can settle the revision before the revocation, and an
+/// ask that fails before its notice is delivered gives the later result the same sentence about
+/// the earlier revision as a refusal does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_restarted_daemon_does_not_read_a_worker_that_refused_its_first_ask_after_the_revisions_that_passed()
  {
@@ -393,11 +419,12 @@ async fn a_restarted_daemon_does_not_read_a_worker_that_refused_its_first_ask_af
 }
 
 /// Three revocations, a stop, a worker made while the daemon is stopped, a start that adopts it,
-/// and one more revocation. Asserts that the result of the last names nothing of the revisions
-/// the worker was never told.
+/// and one more revocation. Asserts that the result of the revision in force at the restart and the
+/// result of the last name nothing of the revisions the worker was never told.
 ///
-/// `refuse_the_first_ask` makes the worker refuse the daemon's own ask at the start for its
-/// dispatch boundary, once.
+/// `refuse_the_first_ask` makes the worker refuse every announcement for its dispatch boundary
+/// from before the daemon starts until the case has seen the first refusal: at least one refusal of
+/// the daemon's own ask at the start, and any other that arrives before the case ends the refusing.
 async fn a_worker_made_after_the_revisions_that_passed_is_revoked_after_a_restart(
     refuse_the_first_ask: bool,
 ) {
@@ -418,7 +445,7 @@ async fn a_worker_made_after_the_revisions_that_passed_is_revoked_after_a_restar
     let host = stopped.start(settings).await;
     if refuse_the_first_ask {
         tokio::time::timeout(
-            Duration::from_secs(60),
+            THE_DAEMONS_ASKS_AT_THEIR_SLOWEST,
             worker.service.refused_for_the_boundary_beyond(0),
         )
         .await
@@ -433,6 +460,26 @@ async fn a_worker_made_after_the_revisions_that_passed_is_revoked_after_a_restar
     adopted.until_adopted(&adopted.workers[0]).await;
     until_the_daemon_has_settled_its_own_ask(&adopted.host).await;
 
+    // The daemon's own ask is the first announcement the worker took in, so the result of the
+    // revision in force at the restart is where a worker wrongly taken as recovered reads the
+    // revisions that passed before it was made.
+    let session_id = adopted.workers[0].session_id;
+    let detail_of_the_worker = |barrier: &RevocationBarrier| {
+        barrier
+            .workers
+            .iter()
+            .find(|reported| reported.session_id == session_id)
+            .expect("the worker is in the barrier")
+            .detail
+            .clone()
+    };
+    let at_the_restart = until_the_revision_holds(&adopted.host).await;
+    let detail = detail_of_the_worker(&at_the_restart);
+    assert!(
+        detail.is_empty(),
+        "the result of the revision in force at the restart says nothing of revisions the worker was never told: {detail:?}"
+    );
+
     adopted
         .host
         .controller()
@@ -440,15 +487,10 @@ async fn a_worker_made_after_the_revisions_that_passed_is_revoked_after_a_restar
         .await
         .expect("the revocation is recorded");
     let barrier = until_the_revision_holds(&adopted.host).await;
-    let reported = barrier
-        .workers
-        .iter()
-        .find(|reported| reported.session_id == adopted.workers[0].session_id)
-        .expect("the worker is in the barrier");
+    let detail = detail_of_the_worker(&barrier);
     assert!(
-        reported.detail.is_empty(),
-        "the result says nothing of revisions the worker was never told: {:?}",
-        reported.detail
+        detail.is_empty(),
+        "the result says nothing of revisions the worker was never told: {detail:?}"
     );
     adopted.stop().await;
 }
