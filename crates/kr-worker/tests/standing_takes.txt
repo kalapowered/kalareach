@@ -559,6 +559,7 @@ mention try_boundary crates/kr-worker/src/service.rs (declaration) 1
 mention try_boundary crates/kr-worker/src/service.rs prepared_once 1
 mention try_boundary crates/kr-worker/src/service.rs present_once 1
 mention try_boundary crates/kr-worker/src/service.rs receipt_once 1
+mention try_boundary crates/kr-worker/src/service.rs wait_for_the_hold 1
 mention try_take_boundary crates/kr-worker/src/service.rs acknowledge_revision 1
 mention try_take_boundary crates/kr-worker/src/service.rs try_boundary 1
 mention try_take_boundary crates/kr-worker/src/service/boundary.rs (declaration) 1

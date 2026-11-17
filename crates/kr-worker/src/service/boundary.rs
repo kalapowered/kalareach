@@ -86,6 +86,9 @@ pub(super) struct DispatchBoundary {
     /// thread compares it with a number that only that thread's own earlier store can equal, so
     /// relaxed loads and stores are enough; the mutex orders the holders.
     holder: AtomicU64,
+    /// How many holds have ended, raised by the guard before it lets go, so that a count that has
+    /// moved past a sample says the hold in place at the sample is over.
+    releases: AtomicU64,
     /// A pause between the unlock and the wake of the next release that the thread it names makes,
     /// which this host's own tests arm. A release made by any other thread passes it by. It is
     /// compiled away in every shipped build, and the service's file holds the function that waits
@@ -100,9 +103,15 @@ impl DispatchBoundary {
             lock: Mutex::new(()),
             released: tokio::sync::Notify::new(),
             holder: AtomicU64::new(0),
+            releases: AtomicU64::new(0),
             #[cfg(feature = "testing")]
             pause_after_unlock: Mutex::new(None),
         }
+    }
+
+    /// How many holds have ended so far.
+    pub(super) fn releases(&self) -> u64 {
+        self.releases.load(Ordering::SeqCst)
     }
 
     /// Takes the boundary, waiting for whoever holds it. A thread that holds it already would wait
@@ -185,6 +194,9 @@ impl Drop for DispatchGuard<'_> {
         // The record is cleared before the lock is let go: after it, the clear could erase the
         // number of the thread that took the boundary next.
         self.boundary.holder.store(0, Ordering::Relaxed);
+        // The count is raised before the lock goes, so that whoever sees it moved knows this hold
+        // has ended.
+        self.boundary.releases.fetch_add(1, Ordering::SeqCst);
         // The lock goes next, so that a woken presentation finds it free.
         drop(self.guard.take());
         #[cfg(feature = "testing")]
