@@ -7167,3 +7167,122 @@ async fn a_take_after_the_input_stream_ended_opens_a_new_stream_and_a_new_epoch(
         .await;
     assert_eq!(read_by(&host), vec![(lease.epoch, 0, "b".to_owned())]);
 }
+
+/// The session's answer to a view's attach, with a granted set that holds only what the view needs
+/// to watch: the right to type is not in it. The subscription is answered as a worker answers it.
+async fn attach_without_the_right_to_type(link: &mut Link, attach: &scripted_worker::Call) {
+    let asked: kr_protocol::attachment::SessionAttachParams = attach.params();
+    let mut attachment = scripted_worker::summary(
+        kr_protocol::ids::AttachmentId::new(kr_ipc::new_uuid()),
+        &asked,
+    );
+    let mut granted = kr_protocol::scalars::CanonicalSet::new();
+    granted.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
+    attachment.granted = granted;
+    link.answer(
+        attach,
+        &kr_protocol::attachment::SessionAttachResult {
+            attachment,
+            geometry: kr_protocol::attachment::GeometryState {
+                owner: kr_protocol::scalars::Nullable::null(),
+                epoch: kr_protocol::ids::GeometryEpoch::new(1),
+                dimensions: Dimensions::new(80, 24),
+            },
+            output_cursor: kr_protocol::scalars::U64::new(40),
+        },
+    )
+    .await;
+    let subscribe = link.expect(Method::EventsSubscribe).await;
+    link.answer(&subscribe, &scripted_worker::subscribed())
+        .await;
+}
+
+/// What the page is told when a take is refused because the session granted the view no right to
+/// type.
+const NOT_GRANTED_THE_RIGHT: &str =
+    "This view cannot take control: the session did not grant it the right to type.";
+
+/// After the take's refusal, the view has asked the host for nothing: no question whether it takes
+/// an input stream, no acquire, and no stream was ever opened; and no state that the page was sent
+/// showed the take as "taking".
+async fn nothing_asked_for_control(
+    page: &Page,
+    channel: u32,
+    host: &ScriptedHost,
+    link: &mut Link,
+) {
+    assert!(
+        link.call_within(QUIET).await.is_none(),
+        "neither a question about an input stream nor an acquire goes"
+    );
+    assert_eq!(
+        host.script.seen(|seen| seen.headers.len()),
+        0,
+        "no input stream was opened"
+    );
+    assert!(
+        page.states(channel)
+            .iter()
+            .all(|state| state["control"]["state"] != "taking"),
+        "the page never showed the take as taking: {:?}",
+        page.states(channel)
+    );
+}
+
+/// A take that the view got while it opened, on a session that then granted it no right to type, is
+/// refused before the page shows anything of it: the page shows the view watching, under the
+/// take's number, with the whole sentence; the view opens no input stream, also not at its start.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_take_made_while_the_view_opens_is_refused_when_the_attach_grants_no_right_to_type() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let at = reporting(Mouse::Sgr);
+    let view = page.open(host.session_id, at.window_columns, at.window_rows, 3);
+    let mut link = host.link().await;
+    let attach = link.expect(Method::SessionAttach).await;
+    // The command answers once the view has taken the take, which it does while it opens.
+    page.take(&view, 1);
+    attach_without_the_right_to_type(&mut link, &attach).await;
+    frame(&mut link, &at).await;
+    let shown = page
+        .newest_within(3, |state| state["state"] == "showing")
+        .await
+        .expect("the view showed the screen within the bound");
+    assert_eq!(
+        shown["control"],
+        json!({"number": 1, "state": "watching", "ended": NOT_GRANTED_THE_RIGHT}),
+        "the take is refused, whole"
+    );
+    nothing_asked_for_control(&page, 3, &host, &mut link).await;
+}
+
+/// A take on a view that was granted no right to type is refused as it is made, again and again:
+/// the page shows the view watching under each take's number with the whole sentence, and the view
+/// sends the host no question and no acquire, and opens no input stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_take_on_a_view_granted_no_right_to_type_is_refused_at_once_and_asks_the_host_for_nothing()
+ {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let at = reporting(Mouse::Sgr);
+    let view = page.open(host.session_id, at.window_columns, at.window_rows, 3);
+    let mut link = host.link().await;
+    let attach = link.expect(Method::SessionAttach).await;
+    attach_without_the_right_to_type(&mut link, &attach).await;
+    frame(&mut link, &at).await;
+    page.newest_within(3, |state| state["state"] == "showing")
+        .await
+        .expect("the view showed the screen within the bound");
+    for number in 1..=2 {
+        page.take(&view, number);
+        let refused = page
+            .newest_within(3, |state| control(state) == (number, "watching".to_owned()))
+            .await
+            .expect("the take was refused within the bound");
+        assert_eq!(
+            refused["control"]["ended"], NOT_GRANTED_THE_RIGHT,
+            "the view's sentence for a view granted no right to type, whole"
+        );
+    }
+    nothing_asked_for_control(&page, 3, &host, &mut link).await;
+}

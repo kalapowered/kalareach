@@ -75,6 +75,11 @@ const ENDED_BY_STREAM: &str = "Control ended: this view's input stream ended.";
 const NOT_TAKEN_BY_STREAM: &str =
     "This view could not take control: its input stream did not open. Take control again to retry.";
 
+/// Why every take is refused when the session's answer to the attach granted this view no right to
+/// type. The answer names no cause beyond that, and the words claim none.
+const NOT_TAKEN_FOR_WANT_OF_RIGHT: &str =
+    "This view cannot take control: the session did not grant it the right to type.";
+
 /// Why a view did not take an input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refused {
@@ -360,6 +365,9 @@ pub struct Lease {
     writes: BTreeMap<RequestId, InputLeaseEpoch>,
     /// Why control last ended or was refused, until a newer request.
     ended: Option<String>,
+    /// The session's answer to the attach granted this view no right to type: every take is
+    /// refused at once, and no lease is ever acquired.
+    no_typing_right: bool,
 }
 
 impl Lease {
@@ -371,12 +379,27 @@ impl Lease {
             return false;
         }
         self.asked = number;
-        self.wanted = take;
-        self.ended = None;
+        self.wanted = take && !self.no_typing_right;
+        self.ended = (take && self.no_typing_right).then(|| NOT_TAKEN_FOR_WANT_OF_RIGHT.to_owned());
         if !take && let Some(held) = self.held.take() {
             self.owed.push_back(held.epoch);
         }
         true
+    }
+
+    /// The session's answer to the attach granted this view no right to type. The take in force,
+    /// which a take made while the view opened left waiting, is refused, and so is every take
+    /// after it, at once. Returns whether control changed.
+    pub fn without_typing_right(&mut self) -> bool {
+        self.no_typing_right = true;
+        self.refused(NOT_TAKEN_FOR_WANT_OF_RIGHT.to_owned())
+    }
+
+    /// Whether the session granted this view the right to type, which a view needs for a lane and
+    /// for a take.
+    #[must_use]
+    pub fn has_typing_right(&self) -> bool {
+        !self.no_typing_right
     }
 
     /// The next call the lease owes the session, if any: leases to give back first, then the one
@@ -1036,6 +1059,50 @@ mod tests {
             "the next take clears the words"
         );
         assert_eq!(lease.owed(), Some(Owed::Acquire));
+    }
+
+    /// Where the session granted the view no right to type, a take is refused at once and nothing is
+    /// owed for it, a take that waited while the view opened is refused when the answer comes, and
+    /// the view can still give control back.
+    #[test]
+    fn a_view_without_the_right_to_type_refuses_every_take_at_once() {
+        let words = Some(NOT_TAKEN_FOR_WANT_OF_RIGHT);
+        let mut lease = Lease::default();
+        assert!(
+            lease.request(1, true),
+            "a take made while the view opened waits"
+        );
+        assert!(
+            lease.without_typing_right(),
+            "and is refused when the answer comes"
+        );
+        let control = lease.control();
+        assert_eq!((control.number, control.state), (1, ControlState::Watching));
+        assert_eq!(control.ended.as_deref(), words);
+        assert_eq!(lease.owed(), None, "no acquire is owed for it");
+        assert!(!lease.has_typing_right());
+        assert!(
+            lease.request(2, true),
+            "a later take is refused as it is made"
+        );
+        let control = lease.control();
+        assert_eq!((control.number, control.state), (2, ControlState::Watching));
+        assert_eq!(control.ended.as_deref(), words);
+        assert_eq!(lease.owed(), None);
+        assert!(lease.request(3, false));
+        assert_eq!(
+            lease.control().ended,
+            None,
+            "giving control back clears the words"
+        );
+        assert!(
+            Lease::default().has_typing_right(),
+            "a view starts with the right"
+        );
+        assert!(
+            !Lease::default().without_typing_right(),
+            "no take waits, so nothing changes"
+        );
     }
 
     #[test]
