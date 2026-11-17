@@ -74,13 +74,27 @@ fn spawn_accept(
     })
 }
 
+/// How long a case waits for something that correct code does at speed: an accept, a frame, a host
+/// task. A wait past it fails the case with a message of its own, so a failing case ends.
+const WAIT: Duration = Duration::from_secs(20);
+
 async fn accept_connection(endpoint: &Endpoint) -> Connection {
-    endpoint
-        .accept()
+    let incoming = tokio::time::timeout(WAIT, endpoint.accept())
         .await
-        .expect("an incoming connection")
+        .unwrap_or_else(|_| panic!("no connection arrived at the host within {WAIT:?}"))
+        .expect("an incoming connection");
+    tokio::time::timeout(WAIT, incoming)
         .await
+        .unwrap_or_else(|_| panic!("the connection did not complete within {WAIT:?}"))
         .expect("a connection")
+}
+
+/// The result of a host task a case spawned, awaited for at most [`WAIT`].
+async fn host_result<T>(what: &str, task: JoinHandle<T>) -> T {
+    tokio::time::timeout(WAIT, task)
+        .await
+        .unwrap_or_else(|_| panic!("{what} did not finish within {WAIT:?}"))
+        .unwrap_or_else(|error| panic!("{what} failed: {error}"))
 }
 
 /// KR-REQ-23.09, KR-REQ-23.13: over the stable `kalareach` ALPN the first bidirectional stream
@@ -967,7 +981,7 @@ async fn an_unpaired_endpoint_reaches_only_the_pairing_surface() {
         );
 
         connection.close(0u32.into(), b"done");
-        let _ = tokio::time::timeout(Duration::from_secs(5), serving).await;
+        host_result("the serving task", serving).await;
     }
 }
 
@@ -1020,7 +1034,110 @@ async fn an_unpaired_connection_runs_out_of_pairing_requests() {
         );
 
         connection.close(0u32.into(), b"done");
-        let _ = tokio::time::timeout(Duration::from_secs(5), serving).await;
+        host_result("the serving task", serving).await;
+    }
+}
+
+/// One pairing read on an open control stream: the refusal it was answered with, or `None`.
+async fn pairing_read(
+    writer: &mut FrameWriter,
+    reader: &mut FrameReader,
+    id: u64,
+) -> Option<ProtocolError> {
+    writer
+        .write_message(&request(Method::PairStatus, id))
+        .await
+        .expect("sent");
+    match read_frame::<Response>(reader).await.outcome {
+        Outcome::Ok(_) => None,
+        Outcome::Error(error) => Some(error),
+    }
+}
+
+/// KR-REQ-10.39, KR-REQ-23.19: the window of four and the total of sixteen are separate limits of
+/// the budget an unpaired connection gets, and each holds on both routes to the surface. The fifth
+/// request inside one window is refused as too many in a short interval while the connection stays
+/// open and, once the window has slid, is served again; the seventeenth request is refused as the
+/// whole budget used, although the window has room.
+#[tokio::test]
+async fn the_window_of_four_and_the_total_of_sixteen_limit_an_unpaired_connection_separately() {
+    let (host, client) = paired_pair().await;
+    for (way, directory, offered) in ways_to_the_pairing_surface(&client) {
+        let clock = ManualClock::new();
+        let limits = PreAuthLimits::default();
+        assert_eq!(
+            limits.max_requests_per_window, 4,
+            "the window the case reads"
+        );
+        assert_eq!(limits.max_requests, 16, "the total the case reads");
+        let serving = spawn_preauth(
+            &host,
+            directory,
+            Arc::new(RecordingSurface::default()),
+            limits,
+            clock.clone(),
+        );
+        let connection = client
+            .endpoint
+            .connect(direct_addr(&host), ALPN)
+            .await
+            .expect("a connection");
+        let (mut writer, mut reader) = control_streams(&connection).await;
+        writer.write_message(&offered).await.expect("sent");
+        let _ = read_frame::<HelloReply>(&mut reader).await;
+
+        // The window: four requests at one moment are served, the fifth is not.
+        let mut id = 0;
+        for _ in 0..4 {
+            id += 1;
+            assert_eq!(
+                pairing_read(&mut writer, &mut reader, id).await,
+                None,
+                "{way}: a request inside the window of four is served"
+            );
+        }
+        id += 1;
+        let windowed = pairing_read(&mut writer, &mut reader, id)
+            .await
+            .expect("the fifth request in the window is refused");
+        assert_eq!(windowed.code, ErrorCode::RateLimited, "{way}");
+        assert_eq!(
+            windowed.message, "too many pairing requests in a short interval",
+            "{way}: the window's own refusal, not the budget's"
+        );
+        // The connection stays open, and the window slides with the clock.
+        clock.advance(limits.window);
+        id += 1;
+        assert_eq!(
+            pairing_read(&mut writer, &mut reader, id).await,
+            None,
+            "{way}: once the window has slid the connection is served again"
+        );
+
+        // The total: requests spaced past the window are never windowed, and the budget still ends
+        // at sixteen. Six have been charged; ten more are served.
+        for _ in 0..10 {
+            clock.advance(limits.window);
+            id += 1;
+            assert_eq!(
+                pairing_read(&mut writer, &mut reader, id).await,
+                None,
+                "{way}: a request spaced past the window is served while the total has room"
+            );
+        }
+        clock.advance(limits.window);
+        id += 1;
+        let spent = pairing_read(&mut writer, &mut reader, id)
+            .await
+            .expect("the seventeenth request is refused");
+        assert_eq!(spent.code, ErrorCode::RateLimited, "{way}");
+        assert_eq!(
+            spent.message, "this connection has used its pairing request budget",
+            "{way}: the budget's own refusal, with the window clear"
+        );
+
+        connection.close(0u32.into(), b"done");
+        host_result("the serving task", serving).await;
     }
 }
 
@@ -1129,7 +1246,7 @@ async fn a_listed_endpoint_offering_its_records_device_id_is_still_asked_for_its
         ),
         "the paired branch waits for a proof and refuses what is not one"
     );
-    let (_connection, admitted) = accepting.await.expect("the host task");
+    let (_connection, admitted) = host_result("the host's handshake", accepting).await;
     assert!(admitted.is_err(), "the exchange ended without a connection");
 }
 
@@ -1168,7 +1285,7 @@ async fn a_proof_is_read_only_from_a_peer_that_offers_the_records_device_id() {
             .expect("a proof"),
         };
         let _ = writer.write_message(&proof).await;
-        let (_connection, admitted) = accepting.await.expect("the host task");
+        let (_connection, admitted) = host_result("the host's handshake", accepting).await;
         if reads_a_proof {
             assert!(
                 matches!(admitted, Ok(Admitted::Authorised(_))),
@@ -1931,9 +2048,14 @@ async fn control_streams<S: iroh::endpoint::ConnectionState>(
 }
 
 async fn read_frame<T: kr_protocol::wire::WireMessage>(reader: &mut FrameReader) -> T {
-    reader
-        .read_message()
+    tokio::time::timeout(WAIT, reader.read_message())
         .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "no {} frame arrived within {WAIT:?}",
+                std::any::type_name::<T>()
+            )
+        })
         .expect("a frame")
         .expect("the stream did not end")
 }

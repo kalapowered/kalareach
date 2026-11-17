@@ -983,6 +983,13 @@ fn a_live_record_of_the_endpoint_refuses_the_commit_before_the_spend() {
         .expect("readable")
         .expect("a record");
     let attempt = approve(&harness, &mut host);
+    assert!(
+        matches!(
+            &attempt,
+            Err(PairingError::EndpointPaired { device_id }) if *device_id == listed.device_id
+        ),
+        "the commit is refused for the listed record, not failed as a store: {attempt:?}"
+    );
     assert_the_live_refusal(&rows, invitation_id, &before, &attempt, listed.device_id);
     assert_eq!(
         spent_confirmations(&path),
@@ -1982,6 +1989,13 @@ fn two_commitments_for_one_endpoint_identity_leave_one_live_record_and_spend_not
         &mut second,
         Answered::ByTheOwnerDevice,
         &harness.identities_of(18, 19),
+    );
+    assert!(
+        matches!(
+            &attempt,
+            Err(PairingError::EndpointPaired { device_id }) if *device_id == listed
+        ),
+        "the second commit is refused for the listed record, not failed as a store: {attempt:?}"
     );
     assert_the_live_refusal(&rows, invitation_id, &before, &attempt, listed);
     assert_eq!(

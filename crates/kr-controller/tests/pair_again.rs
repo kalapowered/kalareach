@@ -1879,6 +1879,19 @@ async fn a_replacement_and_another_owner_mutation_are_refused_alike_while_a_debt
     host.stop().await;
 }
 
+/// The owner's view of one invitation, read within [`BOUND`].
+async fn owner_view(
+    client: &mut kr_ipc::client::LocalClient,
+    invitation_id: InvitationId,
+) -> Result<kr_protocol::preauth::PairStatusResult, kr_protocol::error::ProtocolError> {
+    within(
+        "the owner's view",
+        BOUND,
+        calls::owner_status(client, invitation_id),
+    )
+    .await
+}
+
 /// The code of the host's refusal of a pairing request, by its wire name.
 fn refusal_code(error: &kr_transport::TransportError) -> &'static str {
     let kr_transport::TransportError::Refused(error) = error else {
@@ -1924,7 +1937,7 @@ async fn a_device_the_host_still_lists_is_refused_at_the_redemption_and_the_owne
     let error = redeemed.outcome.as_ref().expect_err("the host refuses");
     assert_eq!(refusal_code(error), "PAIRING_ENDPOINT_PAIRED");
 
-    let status = calls::owner_status(&mut client, invited.invitation_id)
+    let status = owner_view(&mut client, invited.invitation_id)
         .await
         .expect("the owner's view");
     assert_eq!(
@@ -2066,15 +2079,18 @@ async fn a_repeated_redemption_of_a_listed_device_gets_the_first_refusals_code()
     assert_eq!(refusal_code(&repeated.expect_err("refused again")), first);
 
     // The candidate reads the same thing from the invitation's status.
-    let status: kr_protocol::preauth::PairStatusResult = fresh
-        .call(
+    let status: kr_protocol::preauth::PairStatusResult = within(
+        "the status",
+        BOUND,
+        fresh.call(
             Method::PairStatus,
             &kr_protocol::preauth::PairStatusParams {
                 invitation_id: invited.invitation_id,
             },
-        )
-        .await
-        .expect("the host answers the candidate");
+        ),
+    )
+    .await
+    .expect("the host answers the candidate");
     assert_eq!(
         status.status,
         PairStatus::Consumed {
@@ -2121,7 +2137,7 @@ async fn a_failed_read_of_the_list_at_the_redemption_locks_nothing_and_the_repea
         "the candidate is told that the host could not read its list"
     );
 
-    let status = calls::owner_status(&mut client, invited.invitation_id)
+    let status = owner_view(&mut client, invited.invitation_id)
         .await
         .expect("the owner's view");
     assert!(
@@ -2147,7 +2163,7 @@ async fn a_failed_read_of_the_list_at_the_redemption_locks_nothing_and_the_repea
         refusal_code(&again.expect_err("the repeat completes the check and is refused")),
         "PAIRING_ENDPOINT_PAIRED"
     );
-    let ended = calls::owner_status(&mut client, invited.invitation_id)
+    let ended = owner_view(&mut client, invited.invitation_id)
         .await
         .expect("the owner's view");
     assert_eq!(
@@ -2261,7 +2277,7 @@ async fn existing_after_the_refusal(
     client: &mut kr_ipc::client::LocalClient,
     invited: &PairInviteResult,
 ) -> Option<kr_protocol::invitation::ExistingPairing> {
-    let status = calls::owner_status(client, invited.invitation_id)
+    let status = owner_view(client, invited.invitation_id)
         .await
         .expect("the owner's view");
     assert_eq!(
@@ -2272,6 +2288,67 @@ async fn existing_after_the_refusal(
         "the invitation ended for the device that is listed"
     );
     status.owner.0.expect("an owner view").existing
+}
+
+/// KR-REQ-23.19, KR-REQ-10.39: a device that paired with the host and kept its record reaches the
+/// pairing surface on a fresh connection, by offering another device identifier than its record's,
+/// and reads the status of the invitation that committed its pairing. The host answers from its own
+/// record of the commit, to the endpoint that the commit named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_fresh_unpaired_connection_reads_the_status_of_a_real_commit() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let phone = Device::create().await;
+    let first = pair_with(&host, &phone, &owner, rights()).await;
+    let committed = first
+        .committed_invitation_id
+        .expect("the record names the invitation that committed it");
+    let mut client = host.client().await;
+    let invited = calls::invite_direct(
+        host.environment_id,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &rights(),
+        &Signer::OwnerDevice(&owner),
+    )
+    .await
+    .expect("a later invitation, whose payload addresses the host");
+
+    let (_connection, surface) = within("an unpaired connection", BOUND, async {
+        let candidate = phone.candidate();
+        let connection = calls::dial_until_connected(
+            candidate.endpoint,
+            calls::host_addr(&calls::direct_payload(&invited)),
+        )
+        .await;
+        let surface =
+            kr_transport::handshake::connect_unpaired(&connection, candidate.identity).await;
+        (connection, surface)
+    })
+    .await;
+    let mut surface = surface.expect("the listed endpoint reaches the pairing surface");
+    let status: Result<kr_protocol::preauth::PairStatusResult, _> = within(
+        "the status read",
+        BOUND,
+        surface.call(
+            Method::PairStatus,
+            &kr_protocol::preauth::PairStatusParams {
+                invitation_id: committed,
+            },
+        ),
+    )
+    .await;
+    match status
+        .expect("the host answers the status of the invitation that committed it")
+        .status
+    {
+        PairStatus::Committed { device_id, .. } => assert_eq!(
+            device_id, first.device_id,
+            "the commit names the record the host holds"
+        ),
+        other => panic!("the invitation that committed the pairing reads as {other:?}"),
+    }
+    host.stop().await;
 }
 
 /// KR-REQ-10.08: the owner's view names the record that the refusal named only while that record is
@@ -2396,7 +2473,7 @@ async fn an_invitation_that_did_not_end_for_a_listed_device_has_no_existing_memb
     )
     .await
     .expect("an invitation");
-    let open = calls::owner_status(&mut client, invited.invitation_id)
+    let open = owner_view(&mut client, invited.invitation_id)
         .await
         .expect("the owner's view");
     let view = open.owner.0.expect("an owner view");
@@ -2409,7 +2486,7 @@ async fn an_invitation_that_did_not_end_for_a_listed_device_has_no_existing_memb
     )
     .await
     .expect("the owner withdraws it");
-    let ended = calls::owner_status(&mut client, invited.invitation_id)
+    let ended = owner_view(&mut client, invited.invitation_id)
         .await
         .expect("the owner's view");
     assert_eq!(
@@ -2430,6 +2507,7 @@ use kr_protocol::pairing::{QrPayload, RendezvousOrigin};
 use kr_protocol::preauth::{PairStatusParams, PairStatusResult};
 use kr_protocol::rendezvous::{ClientFrame, decode_message};
 use kr_protocol::scalars::Nonce256;
+use net_support::pairing::Candidate;
 use net_support::room::CodeCandidate;
 
 /// Issues a code invitation at the host's default origin, once the owner device has confirmed it.
@@ -2489,7 +2567,7 @@ fn code_of(invited: &PairInviteResult) -> (RendezvousOrigin, String) {
 /// `pair.finish` the case sends. The device holds nothing of the host.
 async fn code_candidate<'a>(
     host: &Host,
-    phone: &'a Device,
+    presented: Candidate<'a>,
     client: &mut LocalClient,
     owner: &DeviceKeys,
 ) -> (PairInviteResult, CodeCandidate<'a>) {
@@ -2498,7 +2576,7 @@ async fn code_candidate<'a>(
     let mut candidate = within(
         "the room admitting the candidate",
         BOUND,
-        CodeCandidate::start(&host.room, phone.candidate(), &origin, &code),
+        CodeCandidate::start(&host.room, presented, &origin, &code),
     )
     .await
     .expect("admitted");
@@ -2524,7 +2602,11 @@ async fn a_device_the_host_still_lists_is_refused_at_the_code_finish_and_the_own
     let first = pair_with(&host, &phone, &owner, rights()).await;
     let listed = row_of(&host, first.device_id);
     let mut client = host.client().await;
-    let (invited, mut candidate) = code_candidate(&host, &phone, &mut client, &owner).await;
+    // The candidate presents another name than the one the host recorded.
+    let mut presented = phone.candidate();
+    presented.declared.device_name =
+        DeviceName::new("A name the host never recorded").expect("a name");
+    let (invited, mut candidate) = code_candidate(&host, presented, &mut client, &owner).await;
 
     let finished = within("the finish", BOUND, candidate.try_finish()).await;
     assert!(
@@ -2536,7 +2618,7 @@ async fn a_device_the_host_still_lists_is_refused_at_the_code_finish_and_the_own
         "PAIRING_ENDPOINT_PAIRED"
     );
 
-    let status = calls::owner_status(&mut client, invited.invitation_id)
+    let status = owner_view(&mut client, invited.invitation_id)
         .await
         .expect("the owner's view");
     assert_eq!(
@@ -2558,7 +2640,7 @@ async fn a_device_the_host_still_lists_is_refused_at_the_code_finish_and_the_own
     assert_eq!(
         existing.device_name.as_str(),
         first_name(&host, first.device_id),
-        "the name is the host's record's"
+        "the name is the host's record's, not the candidate's"
     );
     assert_eq!(existing.paired_at_ms, first.paired_at_ms);
     assert_eq!(
@@ -2588,7 +2670,8 @@ async fn a_repeated_finish_of_a_listed_device_gets_the_first_refusals_code() {
     let phone = Device::create().await;
     pair_with(&host, &phone, &owner, rights()).await;
     let mut client = host.client().await;
-    let (invited, mut candidate) = code_candidate(&host, &phone, &mut client, &owner).await;
+    let (invited, mut candidate) =
+        code_candidate(&host, phone.candidate(), &mut client, &owner).await;
 
     let mut first = within("the finish", BOUND, candidate.try_finish()).await;
     assert!(first.outcome.is_err(), "the host refuses the finish");
@@ -2658,7 +2741,8 @@ async fn a_room_admission_after_the_invitation_ended_for_a_listed_device_gets_th
     let phone = Device::create().await;
     pair_with(&host, &phone, &owner, rights()).await;
     let mut client = host.client().await;
-    let (invited, mut candidate) = code_candidate(&host, &phone, &mut client, &owner).await;
+    let (invited, mut candidate) =
+        code_candidate(&host, phone.candidate(), &mut client, &owner).await;
     let finished = within("the finish", BOUND, candidate.try_finish()).await;
     assert_eq!(
         refusal_code(finished.outcome.as_ref().expect_err("refused")),
@@ -2703,7 +2787,8 @@ async fn a_failed_read_of_the_list_at_the_code_finish_moves_nothing_and_the_repe
     let first = pair_with(&host, &phone, &owner, rights()).await;
     let listed = row_of(&host, first.device_id);
     let mut client = host.client().await;
-    let (invited, mut candidate) = code_candidate(&host, &phone, &mut client, &owner).await;
+    let (invited, mut candidate) =
+        code_candidate(&host, phone.candidate(), &mut client, &owner).await;
 
     let platform = unreadable(&host, first.device_id);
     let mut failed = within(
@@ -2719,7 +2804,7 @@ async fn a_failed_read_of_the_list_at_the_code_finish_moves_nothing_and_the_repe
         "the candidate is told that the host could not read its list"
     );
 
-    let status = calls::owner_status(&mut client, invited.invitation_id)
+    let status = owner_view(&mut client, invited.invitation_id)
         .await
         .expect("the owner's view");
     assert!(
@@ -2743,7 +2828,7 @@ async fn a_failed_read_of_the_list_at_the_code_finish_moves_nothing_and_the_repe
         refusal_code(&again.expect_err("the repeat completes the check and is refused")),
         "PAIRING_ENDPOINT_PAIRED"
     );
-    let ended = calls::owner_status(&mut client, invited.invitation_id)
+    let ended = owner_view(&mut client, invited.invitation_id)
         .await
         .expect("the owner's view");
     assert_eq!(
@@ -2819,6 +2904,10 @@ async fn after_the_owner_removes_a_listed_device_a_new_invitation_pairs_it_under
 /// KR-REQ-10.08: a record whose grant ran out, and whose end no one has read or recorded, is found
 /// at the binding and recorded there, and the device pairs again under a new identifier. Nothing
 /// connected since the grant ran out, so the end is not on record when the second pairing starts.
+///
+/// This is a flow control: it shows the whole flow with an end that no one had recorded, and the
+/// end could also be recorded at the commit. That it is the binding that records it is shown by the
+/// store-level case `the_binding_records_a_grant_that_ran_out_unread` in `pairing_store.rs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_grant_that_ran_out_unread_is_recorded_at_the_binding_and_the_device_pairs_again() {
     let (moved, clocks) = Moved::new();

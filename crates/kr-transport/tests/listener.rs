@@ -483,9 +483,9 @@ async fn answer_to_early_data(
         .expect("the offer was sent as early data");
     let _ = zero_rtt.handshake_completed().await;
 
-    reader
-        .read_message()
+    tokio::time::timeout(Duration::from_secs(20), reader.read_message())
         .await
+        .expect("the host answered the early data within 20 seconds")
         .expect("a reply")
         .expect("the stream did not end")
 }
@@ -541,6 +541,119 @@ async fn early_data_from_a_listed_endpoint_offering_another_device_id_is_refused
         "the early-data connection never reached the handler"
     );
 
+    listener.shutdown().await;
+}
+
+/// A host that lists the client's endpoint under its record's device identifier and serves a pairing
+/// surface that answers nothing, so a peer that offers another identifier reaches the surface.
+#[derive(Debug)]
+struct ListedHost {
+    client: PairedPeer,
+}
+
+impl PairedDirectory for ListedHost {
+    fn paired_peer(&self, endpoint_id: &EndpointKey) -> Option<PairedPeer> {
+        (endpoint_id == &self.client.endpoint_id).then_some(self.client)
+    }
+}
+
+#[derive(Debug)]
+struct SilentSurface;
+
+impl PairingSurface for SilentSurface {
+    fn call(
+        &self,
+        _method: kr_transport::preauth::PairingMethod,
+        _peer: &kr_transport::preauth::ConnectionPeer,
+        _params: &kr_protocol::envelope::ParamsValue,
+    ) -> Result<kr_protocol::envelope::ParamsValue, kr_protocol::error::ProtocolError> {
+        Ok(kr_protocol::envelope::ParamsValue::empty())
+    }
+}
+
+impl HostHandler for ListedHost {
+    fn principal_for(&self, device_id: &DeviceId) -> ActorId {
+        kr_transport::listener::device_principal(device_id)
+    }
+
+    fn authority_revision(&self) -> AuthorityRevision {
+        AuthorityRevision::default()
+    }
+
+    fn pairing_surface(&self) -> Option<Arc<dyn PairingSurface>> {
+        Some(Arc::new(SilentSurface))
+    }
+
+    fn serve(self: Arc<Self>, _session: AuthorisedSession) -> BoxFuture<'static, ()> {
+        Box::pin(async {})
+    }
+}
+
+/// KR-REQ-23.19: a listed endpoint that offers another device identifier reaches the pairing surface
+/// by the second route, and the listener holds it there to the same deadline as any unpaired peer:
+/// a peer that completes hello and then sends nothing has its connection closed by the host, as
+/// unpaired, when the exchange's deadline has passed.
+#[tokio::test]
+async fn an_idle_exchange_of_a_listed_endpoint_on_the_second_route_ends_at_the_deadline() {
+    let (host, client) = paired_pair().await;
+    let handler = Arc::new(ListedHost {
+        client: client.record,
+    });
+    let config = ListenerConfig {
+        accepted_kinds: vec![StreamKind::TerminalOutput],
+        handshake_deadline: Duration::from_secs(2),
+        ..ListenerConfig::new(
+            EndpointConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
+                ..EndpointConfig::default()
+            },
+            epochs(),
+            ControllerGeneration::new(1),
+        )
+    };
+    let listener = register(
+        config,
+        Arc::clone(&host.identity),
+        &host.keys.transport,
+        handler,
+    )
+    .await
+    .expect("a listener");
+    let connection = client
+        .endpoint
+        .connect(listener_addr(&listener), ALPN)
+        .await
+        .expect("a connection");
+    let (send, recv) = connection.open_bi().await.expect("a stream");
+    let mut writer = FrameWriter::new(send, StreamKind::Control);
+    let mut reader = FrameReader::new(recv, StreamKind::Control);
+    let another = ClientOffer {
+        device_id: DeviceId::new(Uuid::from_bytes([0xCA; 16])),
+        ..offer(&client)
+    };
+    writer.write_message(&another).await.expect("sent");
+    let hello = tokio::time::timeout(Duration::from_secs(20), reader.read_message())
+        .await
+        .expect("the host answered hello within 20 seconds")
+        .expect("a reply")
+        .expect("the stream did not end");
+    assert!(
+        matches!(hello, HelloReply::Selected(_)),
+        "the listed endpoint reaches the pairing surface and negotiates hello: {hello:?}"
+    );
+
+    // Nothing more is sent: the host's own deadline ends the exchange.
+    let closed = tokio::time::timeout(Duration::from_secs(20), connection.closed())
+        .await
+        .expect("the host ended the idle exchange within 20 seconds");
+    assert!(
+        matches!(
+            closed,
+            iroh::endpoint::ConnectionError::ApplicationClosed(ref close)
+                if close.error_code == kr_transport::listener::REFUSED_UNPAIRED.into()
+        ),
+        "the host closed the connection as unpaired: {closed:?}"
+    );
     listener.shutdown().await;
 }
 
