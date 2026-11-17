@@ -149,16 +149,23 @@ only check_utc_deadline crates/kr-worker/src/local_gate.rs check 1
 only check_utc_deadline crates/kr-worker/src/runtime.rs start_and_say_if_the_shell_ended 1
 only settled_utc_ms crates/kr-worker/src/local_gate.rs check 1
 
-# The guards held where a call is made, from the text before it: `BAR` is the dispatch barrier the
-# first admission takes, `SES` the session that a function is given or takes before the call.
-# The first admission asks the authority and the limits under the barrier alone, the envelope under
-# the barrier and a session of its own, and takes the session for the limits itself.
-held crates/kr-worker/src/service.rs receipted authority BAR
-held crates/kr-worker/src/service.rs receipted envelope BAR,SES
-held crates/kr-worker/src/service.rs receipted limits BAR
-held crates/kr-worker/src/service.rs receipted admit_and_dispatch BAR
+# The guards held where a call is made, from the text before it: `BAR` is a dispatch barrier that
+# the same function takes with a `let` that locks `dispatch`, `SES` the session that a function is
+# given or takes before the call. The first admission and the prepared path do not take the barrier
+# themselves: their callers, `receipt_once` and `prepared_once`, take it with `try_boundary` and
+# call `receipted` and `continue_prepared` while they hold it, and the reader does not know
+# `try_boundary` as a guard. So the rows of `receipted` and `continue_prepared` read no `BAR`: that
+# the barrier is held there is not read, and the one `caller` row of each function is what keeps
+# a call from anywhere else out.
+# The first admission asks the authority and the limits under no guard that the reader sees, the
+# envelope under a session of its own, and takes the session for the limits itself.
+caller receipted crates/kr-worker/src/service.rs receipt_once 1
+held crates/kr-worker/src/service.rs receipted authority none
+held crates/kr-worker/src/service.rs receipted envelope SES
+held crates/kr-worker/src/service.rs receipted limits none
+held crates/kr-worker/src/service.rs receipted admit_and_dispatch none
 # The accept's hold: the uncertain outcome is asked again under the session that reaches the
-# accept, and the dispatch runs under it, each after the barrier that the caller took.
+# accept, and the dispatch runs under it, each inside the barrier that the caller took.
 held crates/kr-worker/src/service.rs admit_and_dispatch limits SES
 held crates/kr-worker/src/service.rs admit_and_dispatch dispatch_accepted SES
 held crates/kr-worker/src/service.rs dispatch_accepted subject SES
@@ -218,10 +225,13 @@ site crates/kr-worker/src/broker/bridge.rs attested_thread state 1
 
 # The two functions that call the dispatch of an accepted action, each once: the first admission's
 # hold that reaches the accept, and the prepared path (an action prepared earlier and continued
-# here). Both hold the barrier and the session where they call it, and hand the session on.
+# here). Both run inside the barrier that their callers take (the first admission's `receipt_once`
+# and the prepared path's `prepared_once`, one call each), hold the session where they call it,
+# and hand the session on.
 caller dispatch_accepted crates/kr-worker/src/service.rs admit_and_dispatch 1
 caller dispatch_accepted crates/kr-worker/src/service.rs continue_prepared 1
-held crates/kr-worker/src/service.rs continue_prepared dispatch_accepted BAR,SES
+caller continue_prepared crates/kr-worker/src/service.rs prepared_once 1
+held crates/kr-worker/src/service.rs continue_prepared dispatch_accepted SES
 supplies crates/kr-worker/src/service.rs admit_and_dispatch dispatch_accepted 1 session
 supplies crates/kr-worker/src/service.rs continue_prepared dispatch_accepted 1 session
 
