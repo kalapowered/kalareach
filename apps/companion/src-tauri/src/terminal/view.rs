@@ -191,6 +191,10 @@ impl From<String> for OpenFailure {
     }
 }
 
+/// A way to ask whether a lane has ended, as the lane records it.
+#[cfg(feature = "testing")]
+type LaneEnded = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// What a test reads of a view while it runs, and the one thing it can give it: compiled in for the
 /// application's own tests and in no shipped build. The fields are shared with the registry's entry
 /// for the view, and no line of the view's own decisions reads any of them.
@@ -204,7 +208,7 @@ pub(super) struct Probe {
     /// The view's session, once its link is open.
     pub(super) session: Arc<std::sync::Mutex<Option<Arc<Session>>>>,
     /// Whether the view's input lane has ended, as the lane records it, once the lane is open.
-    pub(super) lane_ended: Arc<std::sync::Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>>,
+    pub(super) lane_ended: Arc<std::sync::Mutex<Option<LaneEnded>>>,
     /// Where the lane's waits come from in place of the shipped bounds, for the views that open
     /// after it was given.
     pub(super) lane_bounds: Option<Arc<dyn kr_transport::deadlines::Deadlines>>,
