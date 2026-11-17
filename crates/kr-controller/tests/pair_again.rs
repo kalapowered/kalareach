@@ -1727,3 +1727,133 @@ async fn a_share_naming_the_old_identifier_is_decided_on_the_old_record_alone() 
         host.stop().await;
     }
 }
+
+/// KR-REQ-10.08: while the host holds a published debt whose barrier has not started, the
+/// replacement and any other owner mutation are refused alike, with the words the host says for a
+/// fence it owes, and the replacement is not added. The invitation stays locked and unconsumed.
+/// Once the debt is gone, a fresh confirmation of the same invitation commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_replacement_and_another_owner_mutation_are_refused_alike_while_a_debt_is_published() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let phone = Device::create().await;
+    let first = pair_with(&host, &phone, &owner, rights()).await;
+    let spare_device = Device::create().await;
+    let spare = pair_with(&host, &spare_device, &owner, rights()).await;
+    let barrier = within(
+        "the revocation",
+        BOUND,
+        host.network().revoke_device(first.device_id),
+    )
+    .await
+    .expect("the device is revoked");
+    assert!(barrier.holds(), "{barrier:?}");
+
+    // The device with the ended record is bound to a new invitation, and a debt is published
+    // whose barrier has not started.
+    let signer = Signer::OwnerDevice(&owner);
+    let mut again = bind(&host, &phone, &owner).await;
+    host.controller().hold_fence(true);
+    let spent = count(
+        &host,
+        "SELECT COUNT(*) FROM owner_confirmations WHERE consumed_at_ms IS NOT NULL",
+    );
+    let events = count(&host, "SELECT COUNT(*) FROM pairing_events");
+
+    let replacement = within(
+        "the confirmation",
+        BOUND,
+        calls::confirm_candidate(
+            host.environment_id,
+            &mut again.client,
+            again.invitation_id,
+            &signer,
+        ),
+    )
+    .await
+    .expect_err("the replacement is refused while a debt is published");
+    let mut client = host.client().await;
+    let other = within(
+        "the other mutation",
+        BOUND,
+        calls::mutate::<_, kr_protocol::sharing::RevocationResult>(
+            host.environment_id,
+            &mut client,
+            Method::DeviceRevoke,
+            &kr_protocol::sharing::DeviceRevokeParams {
+                device_id: spare.device_id,
+            },
+        ),
+    )
+    .await
+    .expect_err("another owner mutation is refused while a debt is published");
+    assert_eq!(replacement.code, ErrorCode::PermissionDenied, "{replacement:?}");
+    assert!(
+        replacement
+            .message
+            .contains("this host withdrew authority and the fence that withdrawal owes"),
+        "{replacement:?}"
+    );
+    assert_eq!(other.code, replacement.code, "alike: {other:?}");
+    assert_eq!(other.message, replacement.message, "alike");
+
+    assert!(
+        host.record_of(spare.device_id).is_paired(),
+        "the other mutation changed nothing"
+    );
+    assert_eq!(
+        count(
+            &host,
+            "SELECT COUNT(*) FROM owner_confirmations WHERE consumed_at_ms IS NOT NULL"
+        ),
+        spent,
+        "no confirmation was spent"
+    );
+    assert_eq!(count(&host, "SELECT COUNT(*) FROM pairing_events"), events);
+    assert_eq!(
+        host.network()
+            .devices()
+            .rows_for_endpoint(&endpoint_of(&phone))
+            .expect("readable")
+            .len(),
+        1,
+        "no device row was written"
+    );
+    let state: (String, Option<String>) = registry(&host)
+        .query_row(
+            "SELECT state, consumed_reason FROM pairing_invitations WHERE invitation_id = ?1",
+            [again.invitation_id.get().as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the invitation's state");
+    assert_eq!(
+        state,
+        ("locked".to_owned(), None),
+        "the invitation is locked and not consumed"
+    );
+
+    // The debt is gone: a fresh confirmation of the same invitation commits.
+    host.controller().hold_fence(false);
+    let confirmed = within(
+        "the fresh confirmation",
+        BOUND,
+        calls::confirm_candidate(
+            host.environment_id,
+            &mut again.client,
+            again.invitation_id,
+            &signer,
+        ),
+    )
+    .await
+    .expect("a fresh confirmation commits once nothing is owed");
+    assert_ne!(confirmed.device_id, first.device_id);
+    assert_eq!(
+        host.network()
+            .devices()
+            .record_for_endpoint(&endpoint_of(&phone))
+            .expect("readable")
+            .map(|record| record.device_id),
+        Some(confirmed.device_id)
+    );
+    host.stop().await;
+}
