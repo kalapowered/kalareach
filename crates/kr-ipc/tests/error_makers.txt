@@ -23,7 +23,7 @@ crates/kr-cli/src/service_manager.rs | remove | Io | 2 | own | own | - | agrees
 crates/kr-cli/src/share.rs | ask_again | UnexpectedMessage | 2 | arrived | reply | - | agrees
 crates/kr-cli/src/share.rs | sent_within | UnexpectedMessage | 1 | arrived | reply | - | agrees
 crates/kr-cli/src/startup.rs | Log::from_file | Io | 1 | own | own | - | agrees
-crates/kr-cli/src/startup.rs | Log::open | Io | 1 | own | own | - | agrees
+crates/kr-cli/src/startup.rs | Log::opened | Io | 1 | own | own | - | agrees
 crates/kr-cli/src/startup.rs | Log::output | Io | 1 | own | own | - | agrees
 crates/kr-cli/src/startup.rs | nothing_listening | Socket | 1 | macro | pattern | - | -   # a matches! on the failure; no value is made
 crates/kr-client/src/chunks.rs | LocalCarrier::exchange | Frame | 1 | macro | pattern | - | -   # a matches! in a guard; no value is made
