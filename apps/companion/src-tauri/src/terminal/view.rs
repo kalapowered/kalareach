@@ -210,6 +210,9 @@ pub(super) struct Probe {
     pub(super) lane_ends: Arc<AtomicUsize>,
     /// How many releases of the lease the view has taken to send: the lease owed each one.
     pub(super) releases_queued: Arc<AtomicUsize>,
+    /// How many of the page's inputs have been put into the view's command queue, counted by the
+    /// registry where it puts them, so that a view that takes none still shows what waits for it.
+    pub(super) inputs_queued: Arc<AtomicUsize>,
     /// The view's session, once its link is open.
     pub(super) session: Arc<std::sync::Mutex<Option<Arc<Session>>>>,
     /// Whether the view's input lane has ended, as the lane records it, once the lane is open.

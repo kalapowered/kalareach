@@ -326,6 +326,17 @@ impl TerminalViews {
             .map(|probe| probe.releases_queued.load(Ordering::Relaxed))
     }
 
+    /// How many of the page's inputs have been put into a view's command queue so far, whether or
+    /// not the view has taken them: a view held by the page takes none, and this shows that one
+    /// waits for it. For a test of what the view does in the turn that takes an input.
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn inputs_queued(&self, view: &str) -> Option<usize> {
+        self.probe(view)
+            .map(|probe| probe.inputs_queued.load(Ordering::Relaxed))
+    }
+
     /// The last event sequence that the view's session has read from `stream`, whether or not the
     /// view has taken it, or none before the session has read any, for a view that has ended, or
     /// for one that was never open. The session's reader records it before it hands the event on.
@@ -428,6 +439,8 @@ impl TerminalViews {
             {
                 return ended();
             }
+            #[cfg(feature = "testing")]
+            entry.probe.inputs_queued.fetch_add(1, Ordering::Relaxed);
         }
         // A task that ends before it answers drops the answer: its view has ended and took nothing.
         answered.await.unwrap_or_else(|_| ended())
