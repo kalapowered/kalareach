@@ -1656,3 +1656,83 @@ fn a_newer_daemons_first_statement_is_not_answered_while_an_earlier_withdrawal_i
         "the statement was answered while the window's attachment was in the session: {held:?}"
     );
 }
+
+/// A window with a live stream whose second attach was checked before the host took access away,
+/// and the writer of its connection, which stops the stream's next frame and withdraws the window
+/// itself. Returns what the session held when the statement was answered.
+async fn the_writer_withdraws_a_window_whose_attach_is_in_flight() -> Result<Held, &'static str> {
+    let world = Arc::new(world("while true; do printf 'line\\n'; sleep 0.1; done", true).await);
+    let mut window = world.window().await;
+    let mut daemon = world.authority(1).await;
+    tell(&mut daemon, open(1)).await;
+    let first = world.attach(&mut window).await;
+    world.subscribe(&mut window, first).await;
+    let (checked, go_attach) = world.service.stall_a_mutation_after_its_dispatch_check();
+    let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+    let attach_ended = start_the_geometry_attach(&world, window);
+    if ends_by(deadline, async move { checked.await.is_ok() }).await != Some(true) {
+        return Err("the second attach never passed the dispatch boundary's check");
+    }
+
+    // The host closes: the gate changes at once, the next frame of the stream is refused, and both
+    // the statement and the writer's withdrawal wait for the attach's hold.
+    let (told, told_end) = std::sync::mpsc::channel();
+    tokio::spawn(async move {
+        tell(&mut daemon, closed(2)).await;
+        let _ = told.send(daemon);
+    });
+    // Either both wait for the hold, or the writer's withdrawal has gone ahead and taken the
+    // window's first attachment out of the session.
+    let waiting = Arc::clone(&world);
+    if !holds_by(deadline, move || {
+        waiting.service.statements_waiting_for_tests() >= 2 || waiting.holds_nothing()
+    })
+    .await
+    {
+        return Err("the statement and the writer's withdrawal did not both wait for the hold");
+    }
+    go_attach.send(()).expect("lets the attach go");
+    let acknowledged = tokio::task::spawn_blocking(move || {
+        told_end
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .ok()
+    })
+    .await
+    .ok()
+    .flatten();
+    if acknowledged.is_none() {
+        return Err("the statement was never acknowledged");
+    }
+    let reader = Arc::clone(&world);
+    let at_the_answer = tokio::task::spawn_blocking(move || held(&reader))
+        .await
+        .expect("the session is read");
+    let window = tokio::task::spawn_blocking(move || {
+        attach_ended
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .ok()
+    })
+    .await
+    .ok()
+    .flatten();
+    drop(window);
+    world.close();
+    Ok(at_the_answer)
+}
+
+/// KR-REQ-17.54: the writer's own withdrawal of a window waits for the hold of an attach that was
+/// checked before the restriction, so the attach's attachment is withdrawn with the window's.
+///
+/// The window's stream has frames. The attach is stopped after its check, the host takes access
+/// away, and the writer meets the next frame under the new statement. A withdrawal that ran at
+/// once would take the window out of the registry before the attach pushed, and nothing would look
+/// at the window again.
+#[test]
+fn a_window_the_writer_withdraws_does_not_keep_the_attach_that_was_in_flight() {
+    let held = on_a_runtime(the_writer_withdraws_a_window_whose_attach_is_in_flight())
+        .expect("the schedule came about");
+    assert!(
+        held.attachments.is_empty(),
+        "the statement was answered while an attachment of the window was in the session: {held:?}"
+    );
+}
