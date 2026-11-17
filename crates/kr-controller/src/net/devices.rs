@@ -2505,6 +2505,96 @@ mod tests {
         }
     }
 
+    /// Ends the record of `device` by `how`, as a revocation or as the end of its grant.
+    fn end_record(directory: &DeviceDirectory, device: &DeviceRecord, how: &str) {
+        match how {
+            "revoked" => assert!(
+                directory
+                    .revoke(device.device_id, TimestampMs::new(5_000))
+                    .expect("revoked")
+            ),
+            _ => directory
+                .record_expiry(device.device_id, TimestampMs::new(5_000))
+                .expect("expired"),
+        }
+    }
+
+    /// A late key declaration of the ended pairing, addressed to the device identifier it had,
+    /// reaches neither the ended row nor the record that took its endpoint identity: it is refused
+    /// for a record that was revoked and for one whose grant ran out, and both rows stay as they
+    /// were.
+    #[test]
+    fn a_late_key_declaration_under_an_ended_identifier_reaches_no_row() {
+        for ended in ["revoked", "expired"] {
+            let directory = DeviceDirectory::in_memory().expect("a directory");
+            let first = an_earlier_device(&directory, 41);
+            end_record(&directory, &first, ended);
+            let mut second = record(42);
+            second.endpoint_id = first.endpoint_id;
+            directory
+                .commit(&second)
+                .expect("a new record is committed");
+            let read = |record: &DeviceRecord| {
+                directory
+                    .record_for_device(record.device_id)
+                    .expect("readable")
+                    .expect("a row")
+            };
+            let (old_row, new_row) = (read(&first), read(&second));
+
+            let refused =
+                declare(&directory, &first, 1, Ok(declared(&first, 0x61))).expect("decided");
+            assert_eq!(
+                refused.outcome,
+                KeyDeclaration::Refused {
+                    code: ErrorCode::PermissionDenied,
+                    message: "this host does not pair with that device".to_owned(),
+                },
+                "{ended}"
+            );
+            assert_eq!(read(&first), old_row, "{ended}: the ended row is as it was");
+            assert_eq!(read(&second), new_row, "{ended}: the new row is as it was");
+        }
+    }
+
+    /// A device that pairs again has none of the key declarations that the ended record's
+    /// identifier made: the declaration the old identifier recorded is still found under it, as it
+    /// was, and the same action identifier under the new identifier finds none.
+    #[test]
+    fn a_key_declaration_of_an_ended_record_is_found_under_its_identifier_and_not_under_the_new_one()
+     {
+        for ended in ["revoked", "expired"] {
+            let directory = DeviceDirectory::in_memory().expect("a directory");
+            let first = an_earlier_device(&directory, 43);
+            let completed =
+                declare(&directory, &first, 1, Ok(declared(&first, 0x61))).expect("decided");
+            assert!(
+                matches!(completed.outcome, KeyDeclaration::Completed { .. }),
+                "{ended}: the declaration of the record that stands is recorded"
+            );
+            end_record(&directory, &first, ended);
+            let mut second = record(44);
+            second.endpoint_id = first.endpoint_id;
+            directory
+                .commit(&second)
+                .expect("a new record is committed");
+
+            let held = directory
+                .recorded_declaration(&first.principal(), action(1))
+                .expect("readable")
+                .expect("the ended record's declaration is still found under its identifier");
+            assert_eq!(held.payload_digest, completed.payload_digest, "{ended}");
+            assert_eq!(held.outcome, completed.outcome, "{ended}");
+            assert!(
+                directory
+                    .recorded_declaration(&second.principal(), action(1))
+                    .expect("readable")
+                    .is_none(),
+                "{ended}: the new identifier finds no declaration for the same action"
+            );
+        }
+    }
+
     /// Lifetimes over `directory` on a continuous clock a case moves, and that clock.
     fn lifetimes_over(
         directory: &std::sync::Arc<DeviceDirectory>,
