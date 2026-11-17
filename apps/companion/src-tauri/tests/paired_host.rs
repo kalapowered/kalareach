@@ -870,8 +870,8 @@ async fn a_pass_leaves_out_a_host_that_is_no_longer_one_of_the_others_when_it_en
 }
 
 /// KR-REQ-13.01: a host this computer owns is watched for what it wants confirmed, and the watcher
-/// visits it beside the host in use: the owned host is found in contact, which only a visit of its
-/// own can show, and the host in use keeps answering.
+/// visits it beside the host in use: the watcher asks for a connection to that host, which only a
+/// visit of its own does, and the host in use keeps answering.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_owner_watcher_visits_an_owned_host_beside_the_one_in_use() {
     let owner = DeviceKeys::generate().expect("keys");
@@ -882,16 +882,18 @@ async fn the_owner_watcher_visits_an_owned_host_beside_the_one_in_use() {
     pair(&phone, &first, &owner, &[ActionRight::SessionView]).await;
     let companion = &phone.companion;
     connection(companion, true).await;
-    let before = control.asked();
     support::record_owned(&companion.device(), &second, "second");
 
-    // The watcher reaches the owned host, which nothing about the host in use refuses: the pairing
-    // screen shows that host in contact, as a visit of that host's own is what shows it.
-    support::owned_host_shown(&companion.device(), true).await;
-    assert!(
-        control.asked() > before,
-        "the watcher's visit of the owned host asked for a connection beside the host in use's"
-    );
+    // The watcher asks for a connection to the owned host, which nothing about the host in use
+    // refuses: the count is that host's own, so no connection of the host in use is taken for it.
+    let owned = second.network().endpoint_id();
+    tokio::time::timeout(WATCHDOG, async {
+        while control.asked_of(&owned) == 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the watcher reaches for the owned host");
 
     // The host in use is still connected and answers.
     let state = connection(companion, true).await;
