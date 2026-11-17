@@ -7,12 +7,11 @@ description: >-
   service, so the second try is made here, after a pause of one minute.
 
   The step still fails when both tries fail: the evidence is part of the result, and a job that
-  kept none of it has not passed. A rule of `if-no-files-found: error` fails both tries when the
-  path holds nothing, as it fails the one try without this action; `warn` and `ignore` pass at
-  the first try when the path holds nothing, and no second try is made. Both tries keep the
-  same name, so the second one starts from nothing only where the first did not reach the
-  service. An upload that failed after the service had made its artifact fails the second try
-  too, on the name, and the step fails with it.
+  kept none of it has not passed. With `if-no-files-found: error` and nothing at the path both
+  tries fail, as the one try would without this action; with `warn` or `ignore` the first try
+  passes and there is no second. Both tries use the same name and no `overwrite`, which would
+  delete another artifact of that name. A first try that failed after the service had made the
+  artifact leaves the second one to fail on the name, and the step fails with it.
 
   Whether the step runs, and for how long, is the calling step's own `if` and `timeout-minutes`.
   A timeout there covers both tries and the pause.
