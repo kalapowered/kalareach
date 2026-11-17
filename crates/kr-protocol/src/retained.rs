@@ -48,7 +48,6 @@ use thiserror::Error;
 
 use crate::envelope::{ControlFrame, ParamsValue};
 use crate::hello::{PROTOCOL_VERSION, ProtocolVersion};
-use crate::input::{InputContent, InputWriteParams};
 use crate::local::LocalBuild;
 use crate::method::Method;
 use crate::update::{CompatibilityLevel, THIS_LEVEL};
@@ -73,9 +72,7 @@ pub const RETAINED_WORKER_LEVELS: [CompatibilityLevel; 1] = [CompatibilityLevel:
 /// in-level check compares both; a retained level keeps this list's surface.
 ///
 /// The lists a device is shown are the daemon's own answers and are not here, and neither are the
-/// methods passed through for a device, whose parameters and results are opaque to the daemon. The
-/// one exception is `input.write`, whose parameters [`Level::encode_input_write`] writes in the
-/// shape a retained worker reads.
+/// methods passed through for a device, whose parameters and results are opaque to the daemon.
 pub const SURFACE_ROOTS: &[&str] = &[
     "ActionReadParams",
     "ActionReadResult",
@@ -905,8 +902,7 @@ impl Level {
     ///
     /// The daemon's own reads of a worker have parameters on the surface ([`params_root`]); every
     /// other method is passed through for a caller, whose parameters are opaque to the daemon and
-    /// are written as they were given. `input.write` is the one passed-through method the daemon
-    /// does write for a level ([`Self::encode_input_write`]).
+    /// are written as they were given.
     ///
     /// # Errors
     ///
@@ -920,64 +916,6 @@ impl Level {
         if let (Which::Retained(retained), Some(root)) = (self.0, params_root(method)) {
             self.write(root, &mut value, retained)?;
         }
-        Ok(ParamsValue::new(value))
-    }
-
-    /// Writes the parameters of an `input.write` that a device sent as this level's worker reads
-    /// them.
-    ///
-    /// `input.write` is passed through for a device, and a retained worker reads the shape of the
-    /// level before this one: the bytes at the top of the parameters, with no `input` union. The
-    /// bytes variant is written in that shape. Key records have no counterpart there, and the
-    /// daemon cannot spell them for a worker whose terminal state it does not hold, so they are
-    /// refused and nothing is sent. A worker at the daemon's own level gets the parameters as they
-    /// were given, unread.
-    ///
-    /// This code goes once no retained level is below 0.78: it is a compatibility path for the
-    /// workers of a level below that, which outlive an update, and from the cut that retains 0.78
-    /// every worker reads the union. The removal takes with it the two paragraphs of
-    /// `docs/host/updates.md` that follow "A session that runs the release before": the one that
-    /// begins "`input.write` is the one passed-through method" and the one that begins "A companion
-    /// of the release before".
-    ///
-    /// # Errors
-    ///
-    /// Returns what this build's decoder refuses of the complete current type, and
-    /// [`CodecError::NotInLevel`] for key records.
-    pub fn encode_input_write(self, params: &ParamsValue) -> Result<ParamsValue, CodecError> {
-        let Which::Retained(retained) = self.0 else {
-            return Ok(params.clone());
-        };
-        // A level that reads the union is sent the write as it is.
-        if retained.level >= CompatibilityLevel::of(crate::hello::PackageVersion::new(0, 78, 0)) {
-            return Ok(params.clone());
-        }
-        // The whole current type first, so a malformed write is refused as a worker of this level
-        // would refuse it.
-        let typed: InputWriteParams = params.to_typed()?;
-        let bytes = match typed.input {
-            InputContent::Bytes { bytes } => bytes,
-            InputContent::ConsoleKeys { .. } => {
-                return Err(CodecError::NotInLevel {
-                    level: retained.level,
-                    refusal: Refusal::UnknownVariant {
-                        definition: "InputContent".to_owned(),
-                        found: "console_keys".to_owned(),
-                    },
-                });
-            }
-        };
-        let mut value = params.as_value().clone();
-        remove_member(&mut value, "input");
-        insert_member(&mut value, "bytes", CanonicalValue::Bytes(bytes.into_vec())).map_err(
-            |why| CodecError::NotInLevel {
-                level: retained.level,
-                refusal: Refusal::Rewrite {
-                    definition: "InputWriteParams".to_owned(),
-                    why,
-                },
-            },
-        )?;
         Ok(ParamsValue::new(value))
     }
 
