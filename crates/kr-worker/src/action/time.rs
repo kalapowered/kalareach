@@ -3591,6 +3591,35 @@ mod tests {
         );
     }
 
+    /// KR-REQ-09.18: whether a reading is new proof is decided at the earlier of the two readings
+    /// of the continuous clock, as the mark is taken there. The wall clock steps 150 ms forward
+    /// and the look is held up for a fifth of a second after it was read,
+    /// inside the bracket: at the earlier reading the wall is 153 ms past the projection and
+    /// raises the mark, at the later reading it is 47 ms short of it and would not. The wall clock
+    /// is then put back until it stands 5,050 ms behind the mark that the earlier reading made,
+    /// which is 4,897 ms behind the mark it would have been measured against otherwise.
+    #[test]
+    fn a_step_forward_inside_the_bracket_raises_the_mark_where_the_earlier_reading_projects_it() {
+        let held = Holdup::new(Duration::from_millis(200), true);
+        let contract = held.contract(None);
+        held.pass(Duration::from_secs(30));
+        contract.observe();
+        held.pass(Duration::from_secs(30));
+        held.wall.set(held.wall.now_ms().get() + 150);
+        held.arm(0, 1);
+        let found = contract.observe();
+        assert!(
+            !found.rolled_back && contract.trust() == WallClockTrust::Trusted,
+            "the held-up look is trusted"
+        );
+        held.pass(Duration::from_millis(800));
+        held.wall.set(held.wall.now_ms().get() - 5_050);
+        assert!(
+            contract.observe().rolled_back,
+            "the step back is found against the mark that the step forward raised"
+        );
+    }
+
     /// KR-REQ-09.18: the sample a contract begins with is not ahead of the clocks by a pause in it.
     #[test]
     fn a_pause_inside_the_first_sample_is_no_rollback_at_the_first_look() {
