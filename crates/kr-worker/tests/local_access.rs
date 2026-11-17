@@ -2655,7 +2655,9 @@ async fn a_statement_meets_a_connection_that_has_taken_its_attachments()
     let mut daemon = world.authority(1).await;
     tell(&mut daemon, open(1)).await;
     let _attachment = world.attach(&mut window).await;
-    let (at_the_take, go_end) = world.service.stall_a_connection_after_its_attachments_are_taken();
+    let (at_the_take, go_end) = world
+        .service
+        .stall_a_connection_after_its_attachments_are_taken();
     let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
 
     drop(window);
