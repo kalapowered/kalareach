@@ -25,6 +25,7 @@ use kr_transport::{ALPN, TransportError};
 use support::dns::NameServer;
 use support::front::RelayFront;
 use support::pkarr::PkarrRelay;
+use support::proxy::HttpProxy;
 use support::{LocalRelay, Side};
 use tokio::task::JoinHandle;
 
@@ -443,6 +444,17 @@ async fn the_device_publishes_its_own_record_to_no_server() {
     assert_eq!(pkarr.publications(&me), 0, "the device published nothing");
     assert!(!pkarr.holds(&me));
     assert_eq!(pkarr.lookups(&me), 0, "nobody asked about the device");
+
+    // The device's lookups go to this server for the host that owns them and for no other
+    // identity: the server holds the ordinary endpoint's record, and the registry is asked about
+    // that identity, which no host owns, as well as about the host.
+    assert_registry_has_nothing_for(&device, ordinary.endpoint.id()).await;
+    registry_yields(&device, a.id()).await;
+    assert_eq!(
+        pkarr.looked_up(),
+        BTreeSet::from([a.id().to_z32()]),
+        "the server was asked about the host and about no other identity"
+    );
     device.close().await;
 }
 
@@ -454,7 +466,20 @@ async fn one_relay_carries_two_hosts_and_a_direct_path_a_third() {
     let a = Host::on(&r1, "A", 1).await;
     let b = Host::on(&r1, "B", 2).await;
     let c = Host::direct("C", 3).await;
-    let (view_a, view_b, view_c) = (a.view(&[&r1.url]), b.view(&[&r1.url]), c.view(&[]));
+    let (p_a, p_b, p_c) = (
+        PkarrRelay::spawn(),
+        PkarrRelay::spawn(),
+        PkarrRelay::spawn(),
+    );
+    let (mut view_a, mut view_b, mut view_c) =
+        (a.view(&[&r1.url]), b.view(&[&r1.url]), c.view(&[]));
+    for (view, resolver) in [
+        (&mut view_a, &p_a),
+        (&mut view_b, &p_b),
+        (&mut view_c, &p_c),
+    ] {
+        view.discovery.pkarr_resolver_url = Some(resolver.url.clone());
+    }
 
     let device = device(&[&r1], false).await;
     for (view, host) in [(&view_a, &a), (&view_b, &b), (&view_c, &c)] {
@@ -485,6 +510,25 @@ async fn one_relay_carries_two_hosts_and_a_direct_path_a_third() {
         1,
         "one client of the relay for the device, whatever the number of hosts"
     );
+
+    // Three hosts, three resolvers, one dispatcher: each resolver is asked about its own host and
+    // about neither of the others.
+    for host in [&a, &b, &c] {
+        registry_yields(&device, host.id()).await;
+    }
+    for (resolver, own, others) in [
+        (&p_a, a.id(), [b.id(), c.id()]),
+        (&p_b, b.id(), [a.id(), c.id()]),
+        (&p_c, c.id(), [a.id(), b.id()]),
+    ] {
+        assert!(
+            resolver.lookups(&own) >= 1,
+            "a host's resolver is asked about that host"
+        );
+        for other in others {
+            assert_eq!(resolver.lookups(&other), 0, "and about no other host");
+        }
+    }
     device.close().await;
 }
 
@@ -922,5 +966,54 @@ async fn a_hold_that_the_gate_dropped_fails_both_its_waits() {
     let releasing = tokio::spawn(for_release.release());
     let message = panic_message(releasing.await);
     assert!(message.contains("gate dropped the hold"), "{message:?}");
+    device.close().await;
+}
+
+/// KR-REQ-10.02: a host's record resolver is reached through the proxy that the device's bind
+/// names, as the endpoint's other requests are. Two hosts have a resolver each, and the proxy is
+/// asked for each host's record at that host's own resolver.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hosts_resolver_is_reached_through_the_proxy_of_the_bind() {
+    let proxy = HttpProxy::forwarding();
+    let (p_a, p_b) = (PkarrRelay::spawn(), PkarrRelay::spawn());
+    let (key_a, id_a) = stranger();
+    let (key_b, id_b) = stranger();
+
+    let keys = DeviceKeys::generate().expect("device keys");
+    let config = EndpointConfig {
+        proxy_url: Some(proxy.url.clone()),
+        ..device_config(&[], false)
+    };
+    let device = DeviceEndpoint::bind(&config, &keys.transport)
+        .await
+        .expect("the device's endpoint");
+    for (resolver, key) in [(&p_a, &key_a), (&p_b, &key_b)] {
+        let view = EndpointConfig {
+            discovery: DiscoveryConfig {
+                pkarr_resolver_url: Some(resolver.url.clone()),
+                ..DiscoveryConfig::default()
+            },
+            ..EndpointConfig::default()
+        };
+        device
+            .introduce(HostServices::paired(&view, key).expect("a host's services"))
+            .await
+            .expect("a host");
+    }
+
+    for id in [id_a, id_b] {
+        registry_yields(&device, id).await;
+    }
+    let asked = proxy.asked();
+    for (resolver, id) in [(&p_a, id_a), (&p_b, id_b)] {
+        let record = format!("{}/{}", resolver.url, id.to_z32());
+        assert!(
+            asked
+                .iter()
+                .any(|asked| asked.method == "GET" && asked.target == record),
+            "GET {record} went through the bind's proxy: {asked:?}"
+        );
+        assert!(resolver.lookups(&id) >= 1, "and the resolver was reached");
+    }
     device.close().await;
 }

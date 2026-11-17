@@ -142,6 +142,12 @@ impl PkarrRelay {
         let held = self.held.lock().expect("the records");
         held.lookups.get(&endpoint.to_z32()).copied().unwrap_or(0)
     }
+
+    /// Every identity, in z-base-32, whose record was looked up here at least once.
+    pub fn looked_up(&self) -> std::collections::BTreeSet<String> {
+        let held = self.held.lock().expect("the records");
+        held.lookups.keys().cloned().collect()
+    }
 }
 
 impl Drop for PkarrRelay {
