@@ -5278,9 +5278,8 @@ fn methods(sent: &[scripted_worker::Call]) -> Vec<&str> {
 /// Two keys of one epoch, the first waiting for its answer; a release and a new take; the worker
 /// answers the first key and the acquire and never the second. The lane's writer waits for that
 /// answer for ever, and the release stands behind it. The person's close ends the view at once: the
-/// record of what the lane has not settled holds the second key although its epoch is over, so the
-/// view does not wait for a detach that cannot be written, and the connection's end is what ends
-/// the attachment.
+/// lane has a key of an older epoch in flight, so the view queues no detach, which could not be
+/// written, and the connection's end is what ends the attachment.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_close_after_a_new_take_does_not_wait_for_a_key_the_worker_never_answers() {
     let mut worker = ScriptedWorker::start(Challenge::Answered);
@@ -5319,9 +5318,9 @@ async fn a_close_after_a_new_take_does_not_wait_for_a_key_the_worker_never_answe
 
 /// A key that the worker answered, whose acceptance the lane has not handed on because the view
 /// is held inside a state it published, does not keep the close from writing the detach whole: the
-/// view applies what the lane already knows of its keys before it places the detach. The release
-/// that stands behind the key is written when the lane has the key's answer, which shows that the
-/// lane has the acceptance.
+/// lane has no key left, whatever the view has read of its words. The release that stands behind
+/// the key is written when the lane has the key's answer, which shows that the lane has the
+/// acceptance.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_key_answered_before_the_view_read_its_acceptance_does_not_stop_the_detach() {
     let mut worker = ScriptedWorker::start(Challenge::Answered);
@@ -5353,6 +5352,113 @@ async fn a_key_answered_before_the_view_read_its_acceptance_does_not_stop_the_de
         .closer(&view)();
     drop(held);
     page.held_becomes(0).await;
+    let sent = link.closed().await;
+    assert_eq!(
+        methods(&sent)
+            .iter()
+            .filter(|method| **method == "session.detach")
+            .count(),
+        1,
+        "the detach was written whole: {:?}",
+        methods(&sent)
+    );
+}
+
+/// A key that the worker answered, whose acceptance the view has read from the lane and set aside
+/// behind an update that it serves first, does not keep a close that is served meanwhile from
+/// writing the detach whole. The view is held inside the state of a first update; a second update
+/// reaches its session's channel, and the key's answer reaches the lane, whose release behind the
+/// key goes once it has the answer. When the view is let on, it takes the second update and the
+/// acceptance together, serves the update, and is held inside its state while the close waits: the
+/// acceptance is in the view's queue, not the lane's, when the close is served.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_whose_acceptance_waits_in_the_views_queue_does_not_stop_the_detach() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let mut lease = WorkerLease::at(4);
+    let (view, mut link) = controlling(
+        &page,
+        &mut worker,
+        3,
+        &Frame::live((10, 2), (10, 2), 0),
+        &mut lease,
+    )
+    .await;
+    page.text(&view, 1, "a").expect("the key is taken");
+    let key = link.expect(Method::InputWrite).await;
+    page.release(&view, 2);
+    page.newest(3, |state| control(state) == (2, "watching".to_owned()))
+        .await;
+    let first = page.states(3).len();
+    let held = Held::new(&page.gate);
+    link.push(
+        PROJECTION_DELTA_EVENT,
+        &delta(1, 40, 52, 10, 2, 0, vec![row(1, "one")]),
+    )
+    .await;
+    // The view is inside the state of the first update, and takes nothing.
+    page.state(3, first).await;
+    link.push(
+        PROJECTION_DELTA_EVENT,
+        &delta(1, 52, 64, 10, 2, 0, vec![row(1, "two")]),
+    )
+    .await;
+    lease.answer(&mut link, &key).await;
+    // The release goes once the lane has the key's answer. The second update came before that
+    // answer on the connection, so the session's channel holds it by now.
+    let release = link.expect(Method::InputRelease).await;
+    assert_eq!(release.params::<InputReleaseParams>().epoch.get(), 5);
+    held.let_pass(1);
+    // The view took the second update ahead of the acceptance, and is inside the update's state.
+    page.state(3, first + 1).await;
+    page.app
+        .state::<companion_tauri::terminal::TerminalViews>()
+        .closer(&view)();
+    drop(held);
+    page.held_becomes(0).await;
+    let sent = link.closed().await;
+    assert_eq!(
+        methods(&sent)
+            .iter()
+            .filter(|method| **method == "session.detach")
+            .count(),
+        1,
+        "the detach was written whole: {:?}",
+        methods(&sent)
+    );
+}
+
+/// Two keys typed one after the other, the first waiting for its answer; a release and a new take;
+/// the worker answers the acquire, and then refuses the first key, late, under the older epoch,
+/// which the lane reports by no event. The second key never left the lane's queue: the new epoch
+/// dropped it. The person closes before a key of the new epoch is accepted: the lane has no key
+/// left, so the close waits for the detach and the worker reads it whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_close_after_a_new_take_waits_for_the_detach_when_every_key_has_its_answer() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let mut lease = WorkerLease::at(4);
+    let (view, mut link) =
+        controlling(&page, &mut worker, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    page.text(&view, 1, "a").expect("the first key is taken");
+    page.text(&view, 1, "b").expect("the second key is taken");
+    let first = link.expect(Method::InputWrite).await;
+    page.release(&view, 2);
+    page.take(&view, 3);
+    let acquire = link.expect(Method::InputAcquire).await;
+    lease.answer(&mut link, &acquire).await;
+    page.newest(3, |state| control(state) == (3, "controlling".to_owned()))
+        .await;
+    link.refuse_with(&first, ErrorCode::LeaseLost, "the lease has moved on")
+        .await;
+    // The release of the older epoch goes once the lane has the first key's answer.
+    let release = link.expect(Method::InputRelease).await;
+    assert_eq!(release.params::<InputReleaseParams>().epoch.get(), 5);
+    lease.answer(&mut link, &release).await;
+    assert!(
+        ended_within_the_close_bound(&page, &view).await,
+        "the close did not end the view within its bound"
+    );
     let sent = link.closed().await;
     assert_eq!(
         methods(&sent)

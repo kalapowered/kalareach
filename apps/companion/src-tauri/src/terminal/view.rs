@@ -854,10 +854,8 @@ struct View {
     /// The calls the view has started, which the loop polls before it takes anything else. A call
     /// is never dropped before it completes while the loop runs.
     requests: FuturesUnordered<BoxFuture<'static, Done>>,
-    /// Every key the lane has taken and has not settled, in every epoch, by its epoch and number in
-    /// it. The lane settles a key when it says the host accepted or refused it, or that no key of
-    /// its epoch is in flight, and nothing else takes a key off: a key of an older epoch that is
-    /// in flight stays, because the lane's writer still waits for the host's answer to it. The
+    /// Every key the lane has taken and has not said the host settled, in every epoch, by its epoch
+    /// and number in it. The lane settles a key when it says the host accepted or refused it. The
     /// value is the view's number for the key, which the lease knows it by, until the lease was
     /// told that the key's epoch is over.
     keys: BTreeMap<(u64, u64), Option<RequestId>>,
@@ -1715,9 +1713,7 @@ impl View {
         }
         self.lane_epoch = Some(epoch);
         // The lane gives no event for a frame of an older epoch that is answered after this, so
-        // the lease is told now that none of them waits for an answer it will read. The lane still
-        // has such a frame unsettled while the host has not answered it, and the record keeps it:
-        // the lane's writer waits for that answer, and what is queued behind it waits too.
+        // the lease is told now that none of them waits for an answer it will read.
         for tag in self.keys.range_mut(..(epoch.get(), 0)).map(|(_, tag)| tag) {
             if let Some(tag) = tag.take() {
                 self.lease.answered(tag, Ok(ParamsValue::empty()));
@@ -2186,9 +2182,9 @@ impl View {
     /// to its end, so that its reader is released.
     async fn finish(&mut self, detach: bool) {
         self.requests = FuturesUnordered::new();
-        // What the lane already knows of the keys is applied before the detach is placed: a key
-        // that the host answered and whose acceptance or refusal the view has not read yet is not
-        // one that waits.
+        // What the lane already knows of the typing is applied before the detach is placed, in the
+        // order the lane said it: where the host has the typing before the detach, the detach
+        // names it.
         tokio::task::yield_now().await;
         for heard in std::mem::take(&mut self.heard) {
             if let Heard::Lane(Some(event)) = heard {
@@ -2224,10 +2220,11 @@ impl View {
 
     /// Writes the detach whole, behind the typing the lane holds.
     ///
-    /// On a link that carries the typing as requests it is queued behind the keys, and the view
-    /// waits for it to be written only when the lane has settled every key, in every epoch: a key
-    /// that the host has not answered holds the lane's writer, the view does not wait for it, and
-    /// the connection's end, which the worker detaches on, is what ends the attachment. On a link
+    /// On a link that carries the typing as requests it is queued behind the keys, and only where
+    /// the lane has no key queued or in flight, in any epoch, which the lane says: the view waits
+    /// for the detach to be written, and nothing stands between the lane's writer and it. Where a
+    /// key that the host has not answered holds the writer, nothing is queued, and the
+    /// connection's end, which the worker detaches on, is what ends the attachment. On a link
     /// with a stream of its own the detach waits for the lane to say the host has the typing, which
     /// the lane bounds. Whatever it waits for, the view reads and drops what the session says
     /// meanwhile, so that the session's reader, which waits for room in its channel while the view
@@ -2290,6 +2287,9 @@ impl View {
         else {
             return;
         };
+        if placed && !self.networked && self.lane.as_ref().is_some_and(InputLane::keys_pending) {
+            return;
+        }
         let queued = if placed && !self.networked {
             self.lane.as_ref().map(|lane| {
                 let (written, wait) = tokio::sync::oneshot::channel::<()>();
@@ -2307,9 +2307,7 @@ impl View {
         };
         match queued {
             Some((Ok(_answer), wait)) => {
-                if self.keys.is_empty() {
-                    let _ = self.events.dropping_during(wait).await;
-                }
+                let _ = self.events.dropping_during(wait).await;
             }
             // Nothing was queued: the lane cannot place it, or there is no lane.
             Some((Err(_), _)) | None => {
