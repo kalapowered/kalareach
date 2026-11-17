@@ -5928,6 +5928,72 @@ async fn an_unreached_release_goes_at_once_naming_the_typing_the_host_accepted()
     );
 }
 
+/// A release stays off the control stream until the host reaches its barrier: the view has taken the
+/// release's barrier, the host has accepted two of three frames, and nothing of the release is on the
+/// wire; once the host accepts the third, the release goes at once and names the three.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_release_stays_off_the_control_stream_until_the_host_reaches_its_barrier() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    three_keys_the_host_has_read(&page, &view, &host).await;
+    host.script.accept(1, 1);
+    page.release(&view, 2);
+    // The release has its barrier, which stands after the third frame and which the host has not
+    // reached: only the host's next acceptance lets the release go.
+    barriers_taken(&page, &view, 1).await;
+    assert!(
+        link.call_within(QUIET).await.is_none(),
+        "the release is not on the control stream before the host reaches its barrier"
+    );
+    host.script.accept(1, 2);
+    let release = link
+        .call_within(AFTER_BARRIER)
+        .await
+        .expect("the release went within the bound once the host reached the barrier");
+    assert_eq!(release.method, Method::InputRelease.to_string());
+    assert_eq!(
+        position(&release),
+        Some((1, 3)),
+        "the release names the three frames the host has"
+    );
+}
+
+/// A key that the host refuses on the input stream as the lease having moved on ends the view's
+/// control with the host's words, and the page is told so; the input of the take is refused after
+/// it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lease_refusal_on_the_input_stream_ends_control_with_the_hosts_words() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, _link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    page.text(&view, 1, "a").expect("the key is taken");
+    host.script
+        .until("the key", |seen| seen.frames.len() == 1)
+        .await;
+    host.script.refuse(1, 0, None, ErrorCode::LeaseLost);
+    let ended = page
+        .newest_within(3, |state| control(state) == (1, "watching".to_owned()))
+        .await
+        .expect("the refusal ended control within the bound");
+    let words = ended["control"]["ended"]
+        .as_str()
+        .expect("words of the end");
+    assert!(words.starts_with("Control ended"), "{words}");
+    assert_eq!(
+        code(
+            &page
+                .text(&view, 1, "late")
+                .expect_err("an input of the ended take")
+        ),
+        "LEASE_LOST"
+    );
+}
+
 /// A release that the host refuses because it had not taken the typing before it goes once more,
 /// with no position, and the page is told nothing of a refusal.
 #[tokio::test(flavor = "multi_thread")]
