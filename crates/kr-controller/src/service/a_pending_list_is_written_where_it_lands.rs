@@ -7,17 +7,22 @@
 //! question with that bound immediately before the transport takes any byte, and that question
 //! alone chooses which list the transport takes.
 //!
-//! The order of events of each case: the daemon's read of the list ends (its last real wait is the
-//! join of the blocking read that made both lists); the case makes the footing the door makes
-//! after that read; the case ends what it ends, in a step of its own, with nothing running beside
-//! it; the writer is then called, and its question stands after that step. The writer's own waits
-//! are the lease's reading, which a method held to the lease takes and this method does not, and
-//! the wait for room on a full socket. A case stages that wait with the socket filled to the byte
-//! before the writer starts: the writer's wait is counted, the case reads filler frames one at a
-//! time, under a bound, until the writer confirms that it has reached the end of its wait (how
-//! many reads the kernel needs before a socket is writable again is its own, and a case does not
-//! rest on one), the case ends what it ends there, and the fillers that remain are read after the
-//! writer goes on. The replies are read whole.
+//! The order of events of the cases that stop the list before the writer: the daemon's read of the
+//! list ends (its last real wait is the join of the blocking read that made both lists); the case
+//! makes the footing the door makes after that read; the case ends what it ends, in a step of its
+//! own, with nothing running beside it; the writer is then called, and its question stands after
+//! that step. The writer's own waits are the lease's reading, which a method held to the lease
+//! takes and this method does not, and the wait for room on a full socket.
+//!
+//! The four cases of the wait for room run the other way round: the writer starts first, on a
+//! socket the case has filled to the byte, and stops at the pause that stands after its wait for
+//! room. Before the fill the case consumes the writable mark that the connection's registration
+//! keeps, so that the writer's readiness call finds the socket full and waits; the case counts that
+//! wait, reads filler frames one at a time, under a bound, until the writer reports its arrival at
+//! the pause, and asserts that at least one read was needed (how many reads the kernel needs before
+//! a socket is writable again is its own, and a case does not rest on one). An arrival at the pause
+//! shows that a read of the peer ended a wait, and no more than that. The case ends what it ends
+//! there, the writer goes on, and the fillers that remain are read. The replies are read whole.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -327,8 +332,12 @@ async fn drained_until_the_writer_arrives(
             if read < fillers {
                 filler(reader).await;
                 read += 1;
+                // The writer's task runs on what the read freed: no pause is put between two
+                // reads, since a loaded machine stretches a pause and the bound is on the whole.
+                tokio::task::yield_now().await;
+            } else {
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
@@ -419,6 +428,14 @@ async fn written_after_a_wait_for_room(ends: Ends) -> (ControlFrame, ControlFram
         connection_id,
         ..
     } = staged().await;
+    // The registration of the writer's descriptor keeps a writable mark until a readiness call
+    // consumes it, and a call that finds the mark returns at once, with the socket full. The mark
+    // is consumed here, while the socket is empty, so that the readiness call the writer makes
+    // after the fill finds the socket full and waits for it.
+    tokio::time::timeout(Duration::from_secs(30), writer.writable().ready())
+        .await
+        .expect("the readiness call on the empty socket returns")
+        .expect("the connection can be waited on");
     let fillers = filled(&mut writer, &mut reader).await;
     let replacement_waits = matches!(
         ends,
@@ -462,6 +479,10 @@ async fn written_after_a_wait_for_room(ends: Ends) -> (ControlFrame, ControlFram
         );
     }
     let drained = drained_until_the_writer_arrives(&mut reader, &arrived, fillers).await;
+    assert!(
+        drained >= 1,
+        "the peer read at least one filler before the writer arrived, so a read ended its wait"
+    );
     match ends {
         Ends::Nothing => {}
         Ends::TheLeasesTime => continuous.advance(Duration::from_secs(16 * 60)),
@@ -482,7 +503,10 @@ async fn written_after_a_wait_for_room(ends: Ends) -> (ControlFrame, ControlFram
         .expect("the daemon wrote or ended the connection")
         .expect("the list reads");
     assert!(
-        writing.await.expect("the write ends"),
+        tokio::time::timeout(Duration::from_secs(30), writing)
+            .await
+            .expect("the writer's task ends")
+            .expect("the write ends"),
         "the connection goes on"
     );
     (read, full, closed)

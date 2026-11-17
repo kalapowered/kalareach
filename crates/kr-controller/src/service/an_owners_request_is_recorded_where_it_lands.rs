@@ -9,9 +9,10 @@
 //! asks the caller's own owner check again, then makes the question and the feed's ask again, so
 //! that what lapsed while the write stood rolls the transaction back.
 //!
-//! Each case stops the record at a wait and ends what it ends there: at the last wait, after the
-//! feed was asked and before the bound is copied, where the early asks meet it; or once the write
-//! has been made, where the last ask meets it. A device's grant that ends by the wall clock while
+//! Each case stops the record at a wait and ends what it ends there: before the transaction
+//! begins, which stands for the wait for the pairing records' write lock; at the last wait, after
+//! the feed was asked and before the bound is copied, where the early asks meet it; or once the
+//! write has been made, where the last ask meets it. A device's grant that ends by the wall clock while
 //! the write stands, with the landing's deadline an hour away, is found by the owner check asked
 //! again, and refused at the commit in the check's own words with no row recorded; a case counts
 //! the records that reached their first write, to tell a refusal at the commit from one before it.
@@ -513,8 +514,9 @@ async fn a_request_whose_deadline_passes_in_the_last_wait_is_refused_in_the_dead
     }
 }
 
-/// KR-REQ-17.54: a lease that is presented again in the last wait moves the bound to another
-/// lineage, which counts as an ended lease: the subject is decided again under the closed scope.
+/// KR-REQ-17.54: a lease that is presented again in the wait for the pairing records' write lock,
+/// before the record's transaction begins, moves the bound to another lineage, which counts as an
+/// ended lease: the subject is decided again under the closed scope.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_request_whose_bound_moves_before_its_transaction_is_decided_again_under_the_closed_scope()
  {

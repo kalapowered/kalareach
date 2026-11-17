@@ -6,8 +6,9 @@
 //! footing's one question with the copy; where the bound ended or moved, the challenge's display is
 //! decided again under the scope that no lease serves; the feed is asked once more with no lock;
 //! the two rows are written with nothing allocated or awaited between the question and the first
-//! write; and a last ask, immediately before the commit, makes the question and the feed's ask
-//! again, so that what lapsed while the writes stood rolls the transaction back.
+//! write; and a last ask, immediately before the commit, asks the signer's standing and the
+//! verification again, then makes the question and the feed's ask again, so that what lapsed while
+//! the writes stood rolls the transaction back.
 //!
 //! Each case stops the record at a wait and ends what it ends there: before the transaction begins,
 //! which stands for the wait for the pairing records' write lock; in the last wait, after the feed
@@ -561,7 +562,7 @@ async fn answered_by_an_owner_device(
             0x41,
             &[ActionRight::HostManage],
             kr_protocol::grant::GrantExpiry::At {
-                expires_at_ms: TimestampMs::new(kr_ipc::now_ms().get() + 10 * 60 * 1000),
+                expires_at_ms: TimestampMs::new(controller.wall_now_ms() + 10 * 60 * 1000),
             },
         ),
         Device::Organisational => paired_in(
