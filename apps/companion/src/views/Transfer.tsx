@@ -59,7 +59,7 @@ function whyNotReceiver(device: DeviceSummary, giving: GrantSummary, nowMs: numb
   const shareEnds = giving.ends_at_ms === null ? null : Number(giving.ends_at_ms)
   const pairingEnds = pairingEnd(device)
   if (pairingEnds !== null && (shareEnds === null || pairingEnds < shareEnds)) {
-    return 'Its pairing ends before this share does. Pair it again first.'
+    return 'Its pairing ends before this share does. Pair it again after the pairing has ended; the host refuses a new pairing while it stands.'
   }
   return null
 }

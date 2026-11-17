@@ -963,7 +963,7 @@ export class ScriptedSharing implements FakeSharing {
       )
       refuse(
         'INVALID_ARGUMENT',
-        `that device's pairing ends in ${String(minutes)} minutes, before this share would; choose a shorter lifetime or pair the device again`
+        `that device's pairing ends in ${String(minutes)} minutes, before this share would; choose a shorter lifetime, or pair the device again after the pairing has ended (the host refuses a new pairing while this one stands)`
       )
     }
     let live: GrantCreateResult['preview']['live_screen'] = null

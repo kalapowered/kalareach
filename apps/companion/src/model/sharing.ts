@@ -105,7 +105,7 @@ export function whyNot(device: DeviceSummary, nowMs: number): string | null {
   if (device.grant_expired) return 'Its pairing has ended. Pair it again to share a session with it.'
   const end = pairingEnd(device)
   if (end !== null && end - nowMs < SHORTEST_LEFT_MS) {
-    return 'Its pairing ends within a minute. Pair it again to share a session with it.'
+    return 'Its pairing ends within a minute. Pair it again after the pairing has ended; the host refuses a new pairing while it stands.'
   }
   return null
 }

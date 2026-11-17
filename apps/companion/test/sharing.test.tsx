@@ -65,13 +65,16 @@ async function reread(): Promise<void> {
 const PHONE = /Sam’s iPhone|Sam's iPhone/
 
 /** An owner share the device has accepted, so that there is something to hand over. */
-async function withOwnerShare(host: Host = fakeHost()): Promise<Awaited<ReturnType<typeof openSharing>>> {
+async function withOwnerShare(
+  host: Host = fakeHost(),
+  lasts = '15m'
+): Promise<Awaited<ReturnType<typeof openSharing>>> {
   const opened = await openSharing(host)
   const { controls, person } = opened
   await person.click(screen.getByRole('radio', { name: PHONE }))
   await person.click(screen.getByRole('radio', { name: /Owner/ }))
-  // A quarter of an hour: short enough for the other tablet’s pairing to carry it on.
-  await person.selectOptions(screen.getByTestId('lasts'), '15m')
+  // A quarter of an hour by default: short enough for the other tablet’s pairing to carry it on.
+  await person.selectOptions(screen.getByTestId('lasts'), lasts)
   await person.click(await screen.findByRole('checkbox', { name: /I understand this lets Sam/ }))
   await person.click(screen.getByTestId('invite'))
   await waitFor(() => {
@@ -539,6 +542,19 @@ describe('handing control over', () => {
     await person.click(within(sheet).getByRole('radio', { name: /Guest tablet/ }))
     expect(within(sheet).getByTestId('hand-over-ask')).toBeEnabled()
     expect(controls.sharing.sent().transfer).toBe(0)
+  })
+
+  it('says a device whose pairing ends before the share is paired again only after the pairing has ended', async () => {
+    const { person } = await withOwnerShare(fakeHost(), '1h')
+    await person.click(screen.getByTestId('hand-over-open'))
+    const sheet = await screen.findByTestId('hand-over')
+    const tablet = within(sheet).getByRole('radio', { name: /Guest tablet/ })
+    expect(tablet).toBeDisabled()
+    const words = tablet.closest('label')?.textContent ?? ''
+    expect(words).toContain(
+      'Its pairing ends before this share does. Pair it again after the pairing has ended; the host refuses a new pairing while it stands.'
+    )
+    expect(words).not.toMatch(/Pair it again first/)
   })
 
   it('hands the session over once an owner device has confirmed, and says so', async () => {
