@@ -53,8 +53,8 @@
 //!   guard held by the action takes away when the action ends, sent or given up.
 
 use super::{
-    Caller, ConnectionFacts, ConnectionState, ContinuousInstant, Made, Method, MutationRequest,
-    Prepared, Result, Session, WorkerService,
+    Caller, ConnectionFacts, ConnectionState, ContinuousInstant, DispatchGuard, Made, Method,
+    MutationRequest, Prepared, Result, Session, WorkerService,
 };
 
 /// Whether a pass is the first admission's or a later one's.
@@ -104,18 +104,29 @@ pub(super) struct Limited {
     pub(super) unreadable: Option<String>,
 }
 
-/// One pass of the standing function, in one mode.
+/// One pass of the standing function, in one mode, under the dispatch boundary.
+///
+/// A pass borrows the guard of the boundary for as long as it lives, so it cannot be made without
+/// the boundary held and the guard cannot be let go while a pass is in use.
 pub(super) struct StandingPass<'a> {
     service: &'a WorkerService,
     mode: Mode,
+    /// The boundary's guard. It is only held, never read.
+    _barrier: &'a DispatchGuard<'a>,
 }
 
 impl WorkerService {
-    /// Starts a pass of the standing function in `mode`.
-    pub(super) const fn standing_pass(&self, mode: Mode) -> StandingPass<'_> {
+    /// Starts a pass of the standing function in `mode`, under the dispatch boundary that `barrier`
+    /// holds.
+    pub(super) const fn standing_pass<'a>(
+        &'a self,
+        mode: Mode,
+        barrier: &'a DispatchGuard<'a>,
+    ) -> StandingPass<'a> {
         StandingPass {
             service: self,
             mode,
+            _barrier: barrier,
         }
     }
 }
