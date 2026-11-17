@@ -500,8 +500,9 @@ async fn a_paired_host_the_run_did_not_dial_is_not_in_the_map() {
 }
 
 /// Forgetting a host takes it out of the device's one endpoint before the command returns: the
-/// records hold no such host, and the relay map holds none that only that host named. The relay the
-/// two hosts share stays, and the host that is kept still answers.
+/// records already hold no such host when the link is told to forget it, and the relay map holds
+/// none that only that host named afterwards. The relay the two hosts share stays, and the host
+/// that is kept still answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forgetting_a_host_takes_it_out_of_the_one_endpoint() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -535,10 +536,31 @@ async fn forgetting_a_host_takes_it_out_of_the_one_endpoint() {
     );
 
     let reference = reference_for(companion, &forgotten);
+    // What the records hold at the moment the link is told to forget the host: the state's forgetting
+    // comes first, so a host that the endpoint is asked about is one the records no longer list.
+    let at_the_call = Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let (device, reference, seen) = (
+            Arc::clone(&device),
+            reference.clone(),
+            Arc::clone(&at_the_call),
+        );
+        control.at_the_forget(move || {
+            seen.lock()
+                .expect("the record")
+                .push(device.host_by_reference(&reference).is_none());
+        });
+    }
     companion
         .call("hosts_forget", json!({ "reference": reference }))
         .expect("the host is forgotten");
 
+    // The link was told once, and the records already held no such host when it was.
+    assert_eq!(
+        *at_the_call.lock().expect("the record"),
+        vec![true],
+        "the link forgot the host once, after the records let it go"
+    );
     // The command has returned: the state holds no such host, and the endpoint's relay addresses
     // hold the one both hosts named and not the one only the forgotten host named.
     assert!(
