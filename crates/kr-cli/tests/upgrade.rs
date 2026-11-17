@@ -671,8 +671,11 @@ fn configure_the_host(host: &Host, address: Option<&str>, suite: bool) {
 }
 
 impl Updated {
-    /// Puts the registry back to the version the release before writes, over this build's tables,
-    /// so that a rollback to that release can be made.
+    /// Puts the registry back to the version the release before writes, which its manifest lists
+    /// (15), over this build's tables, so that a rollback to that release can be made.
+    ///
+    /// Remove this, and every call of it, once the release before writes registry 18: it then reads
+    /// the registry as this build leaves it, and no case needs the put-back.
     ///
     /// This build raised the registry past what the release before reads, so a rollback to it is
     /// refused (`a_rollback_to_the_release_before_is_refused_for_the_registry_it_cannot_read`) and
@@ -1556,10 +1559,11 @@ fn registry_as_it_stands(host: &Host) -> (i64, Vec<String>, Vec<Vec<rusqlite::ty
 }
 
 /// This release writes the registry at a version that the release before does not read. A host
-/// that was updated cannot go back to it: the update check reads the registry's version, refuses
-/// the switch before it stops anything, and names the store and the versions the release before
-/// reads. The refusal changes nothing: the registry is as it was, the current release is still
-/// this one, and its daemon serves.
+/// that was updated cannot go back to it: the rollback stops the daemons it would hand over, reads
+/// the registry's version before it switches anything, refuses the switch naming the store and the
+/// versions the release before reads, and starts the daemons it stopped again from this release.
+/// The refusal changes nothing: the registry is as it was, the current release is still this one,
+/// and its daemon serves again.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_to_the_release_before_is_refused_for_the_registry_it_cannot_read() {
     let updated = Updated::new().await;
