@@ -2386,7 +2386,23 @@ impl WorkerService {
             .take();
         if let Some((arrived, go)) = armed {
             let _ = arrived.send(());
-            let _ = go.recv();
+            // The wait holds a thread of the runtime this worker runs on. A runtime whose other
+            // threads are all parked leaves its driver unserved while that thread blocks, so the
+            // sockets and timers of every connection, a statement that must arrive before this
+            // wait is released among them, would wait behind it. The thread hands what it holds
+            // to another before it blocks. A runtime that has one thread has nothing to hand it
+            // to, and there the wait only blocks.
+            let wait = move || {
+                let _ = go.recv();
+            };
+            let several = tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
+                runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+            });
+            if several {
+                tokio::task::block_in_place(wait);
+            } else {
+                wait();
+            }
         }
     }
 
