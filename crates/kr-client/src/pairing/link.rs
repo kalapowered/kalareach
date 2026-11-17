@@ -763,7 +763,7 @@ mod tests {
         let first = network(&[], Some("http://127.0.0.1:9/pkarr"), &["127.0.0.1:4001"]);
         let other_resolver = network(&[], Some("http://127.0.0.1:10/pkarr"), &[]);
         let relayed = network(
-            &["https://relay.example.test"],
+            &["https://127.0.0.1:9"],
             Some("http://127.0.0.1:11/pkarr"),
             &[],
         );
@@ -790,6 +790,103 @@ mod tests {
         assert!(!a.is_closed(), "no request closed the endpoint");
         pool.close().await;
         assert!(a.is_closed());
+    }
+
+    fn loopback() -> SocketAddr {
+        "127.0.0.1:0".parse().expect("loopback")
+    }
+
+    fn relay(url: &str) -> iroh::RelayUrl {
+        url.parse().expect("a relay URL")
+    }
+
+    /// An invitation's relays stay out of the endpoint's relay map when the device dials its host
+    /// to pair, and the dial reaches the host through the hint. Once the pairing has completed and
+    /// the device dials the host as a paired host, its relays are in the map.
+    #[tokio::test]
+    async fn an_invitations_relays_stay_out_of_the_map_until_the_pairing_completes() {
+        let peer_key = TransportIdentityKeyPair::generate().expect("a key");
+        let mut config =
+            EndpointConfig::from_network_config(&NetworkConfig::empty()).expect("a config");
+        config.bind_addr = Some(loopback());
+        let peer = kr_transport::endpoint::bind_listener(&config, &peer_key)
+            .await
+            .expect("a peer on loopback");
+        let accepting = peer.clone();
+        let accepted = tokio::spawn(async move {
+            let incoming = accepting.accept().await.expect("a connection arrives");
+            incoming.await.expect("the connection completes")
+        });
+        let invitation = network(
+            &["https://127.0.0.1:9"],
+            None,
+            &[&peer.bound_sockets()[0].to_string()],
+        );
+        let pool = Arc::new(
+            EndpointPool::new(TransportIdentityKeyPair::generate().expect("a key"))
+                .bound_to(loopback()),
+        );
+        let connection = IrohLink::new(Arc::clone(&pool))
+            .dial(&invitation, peer_key.public())
+            .await
+            .expect("the dial reaches the host through its hint");
+        assert!(
+            pool.relay_urls().await.is_empty(),
+            "the invitation's relay is not in the map"
+        );
+
+        pool.endpoint(&invitation, peer_key.public(), Standing::Paired)
+            .await
+            .expect("the paired host's endpoint");
+        assert_eq!(
+            pool.relay_urls().await,
+            BTreeSet::from([relay("https://127.0.0.1:9")]),
+            "the paired host's relay is in the map"
+        );
+        drop(connection);
+        drop(accepted.await.expect("the peer's side"));
+        pool.close().await;
+        peer.close().await;
+    }
+
+    /// Forgetting a host takes its own relay out of the map and leaves the relay it shares with
+    /// another host, and the endpoint stays open for the host that is left.
+    #[tokio::test]
+    async fn forgetting_a_host_takes_it_out_of_the_one_endpoint() {
+        let pool = EndpointPool::new(TransportIdentityKeyPair::generate().expect("a key"))
+            .bound_to(loopback());
+        let host = || {
+            *TransportIdentityKeyPair::generate()
+                .expect("a key")
+                .public()
+        };
+        let (first, second) = (host(), host());
+        let shared = "https://127.0.0.1:9";
+        let own = "https://127.0.0.1:10";
+        let endpoint = pool
+            .endpoint(&network(&[shared], None, &[]), &first, Standing::Paired)
+            .await
+            .expect("an endpoint");
+        pool.endpoint(
+            &network(&[shared, own], None, &[]),
+            &second,
+            Standing::Paired,
+        )
+        .await
+        .expect("an endpoint");
+        assert_eq!(
+            pool.relay_urls().await,
+            BTreeSet::from([relay(shared), relay(own)])
+        );
+
+        pool.forget(&second).await;
+        assert_eq!(
+            pool.relay_urls().await,
+            BTreeSet::from([relay(shared)]),
+            "the forgotten host's own relay left the map and the shared one stayed"
+        );
+        assert!(!endpoint.is_closed(), "forgetting a host closes nothing");
+        pool.close().await;
     }
 
     /// An error the host sent is a refusal whatever its code, and what the transport concluded
