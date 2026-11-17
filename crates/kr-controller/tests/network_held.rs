@@ -913,19 +913,21 @@ async fn kr_req_18_13_a_session_that_closes_leaves_an_invitation_that_ran_out_on
     host.stop().await;
 }
 
-/// How long the share of [`AnchoredShare`] lasts: a week, so that the rate allowance a reading
-/// credits less than the time that passes (a minute of a week) is wide enough for a machine that
-/// loses the processor for seconds between two steps of a case.
+/// How long the share of [`AnchoredShare`] lasts: a week, so that the rate allowance (a reading
+/// credits a minute less than the week that passes) leaves the wall clock room to lag by seconds.
 const SHARE_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// A host whose continuous clock only the suite moves and whose wall clock runs with the machine's
-/// and is moved by the suite, a device connected to it, and a share over an open session that
-/// the device has been shown, so that the host has anchored the share's grant on the continuous
-/// clock while that clock is trusted.
+/// A host whose two clocks only the suite moves, a device connected to it, and a share over an
+/// open session that the device has been shown, so that the host has anchored the share's grant
+/// on the continuous clock while that clock is trusted.
+///
+/// The wall clock is fixed: it reads what the suite last set and the time the machine runs on
+/// adds nothing to it, so a case that moves the clocks decides every reading of them whatever
+/// pause the machine takes between its steps.
 struct AnchoredShare {
     host: Host,
     continuous: kr_transport::clock::ManualClock,
-    wall: MovedWall,
+    wall: std::sync::Arc<std::sync::atomic::AtomicU64>,
     device: Device,
     record: DeviceRecord,
     connection: RawDevice,
@@ -937,10 +939,18 @@ impl AnchoredShare {
     async fn start() -> Self {
         let owner = DeviceKeys::generate().expect("owner keys");
         let continuous = kr_transport::clock::ManualClock::new();
-        let wall = MovedWall::new();
-        let mut clocks = wall.clocks();
-        clocks.continuous = std::sync::Arc::new(continuous.clone());
-        let host = Host::start_on_clocks(&owner, clocks).await;
+        let wall = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(kr_ipc::now_ms().get()));
+        let host = Host::start_on_clocks(
+            &owner,
+            kr_controller::service::Clocks {
+                continuous: std::sync::Arc::new(continuous.clone()),
+                wall: kr_controller::service::WallClock::from_fn({
+                    let wall = std::sync::Arc::clone(&wall);
+                    move || wall.load(std::sync::atomic::Ordering::SeqCst)
+                }),
+            },
+        )
+        .await;
         // The device's own pairing outlasts the move the cases make.
         let (device, record) =
             recipient_ending_in(&host, &owner, SHARE_LIFETIME + SHARE_LIFETIME).await;
@@ -970,6 +980,16 @@ impl AnchoredShare {
         }
     }
 
+    /// Where the host's wall clock stands now, in UTC milliseconds.
+    fn utc_ms(&self) -> u64 {
+        self.wall.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// When the share's invitation expires, in UTC milliseconds.
+    fn expires_at_ms(&self) -> u64 {
+        self.share.preview.expires_at_ms.get()
+    }
+
     /// Moves both clocks where no reader of the daemon reads: one that read between the two steps
     /// would pair the continuous clock as it is with UTC as it was, and the host would keep that
     /// as a clock that went backwards. UTC lags the continuous clock by `lag`, which a wall clock
@@ -977,7 +997,10 @@ impl AnchoredShare {
     fn move_both(&self, by: Duration, lag: Duration) {
         kr_controller::testing::while_no_reader_of_the_clocks_reads(self.host.controller(), || {
             self.continuous.advance(by);
-            self.wall.advance(by - lag);
+            self.wall.fetch_add(
+                u64::try_from((by - lag).as_millis()).expect("a span in milliseconds"),
+                std::sync::atomic::Ordering::SeqCst,
+            );
         });
     }
 
@@ -1011,24 +1034,32 @@ impl AnchoredShare {
 /// KR-REQ-18.13: the same for an invitation whose grant the host had anchored on the continuous
 /// clock while the clock was trusted, which then ran out there while the floor stays before its
 /// expiry: the close finds the end and writes it down, and leaves the invitation, so the device is
-/// told it ran out. The continuous clock goes the length of the share on, which ends the anchor
-/// whenever it was taken. A reading credits the time moved less the rate allowance, and UTC lags
-/// it by more than the allowance and less than the tolerance beyond it, so the floor any reader
-/// raises stays before the invitation's expiry for as long as the machine's own clock has not run
-/// on by the lag, whichever reader takes it and whenever.
+/// told it ran out. The continuous clock goes one millisecond past the anchor, the least that ends
+/// it. Both clocks are fixed after the move, so every reading finds the figures below whatever
+/// pause the machine takes: UTC lags the continuous clock by more than the rate allowance and
+/// less than that and the tolerance, and the floor a reading projects from the last anchor falls
+/// short of the time moved by the allowance, so both stay before the invitation's expiry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_18_13_a_close_writes_down_the_end_of_an_anchored_invitation_and_leaves_it() {
     const LAG: Duration = Duration::from_secs(40);
-    let moved = u64::try_from(SHARE_LIFETIME.as_millis()).expect("a span in milliseconds");
-    // A reading credits the time moved less the rate allowance, and a wall clock that lags by no
-    // more than that and the host's tolerance (five seconds) is not a clock that went back.
-    let credit_lost = moved - kr_ipc::clock::credited(moved);
+    let anchored = AnchoredShare::start().await;
+    // The grant was anchored with the wall clock where it stands: its anchor lasts until the
+    // invitation's expiry.
+    let moved_ms = anchored.expires_at_ms() - anchored.utc_ms() + 1;
+    let lag_ms = u64::try_from(LAG.as_millis()).expect("a lag in milliseconds");
     assert!(
-        u64::try_from(LAG.as_millis()).expect("a lag in milliseconds") < credit_lost + 5_000,
+        anchored.utc_ms() + moved_ms - lag_ms < anchored.expires_at_ms(),
+        "UTC after the move stays before the invitation's expiry"
+    );
+    assert!(
+        anchored.utc_ms() + kr_ipc::clock::credited(moved_ms) < anchored.expires_at_ms(),
+        "the floor a reading projects stays before the invitation's expiry"
+    );
+    assert!(
+        lag_ms < moved_ms - kr_ipc::clock::credited(moved_ms) + 5_000,
         "UTC lags by what a wall clock may"
     );
-    let anchored = AnchoredShare::start().await;
-    anchored.move_both(SHARE_LIFETIME, LAG);
+    anchored.move_both(Duration::from_millis(moved_ms), LAG);
 
     anchored
         .host
@@ -1055,9 +1086,14 @@ async fn kr_req_18_13_a_close_writes_down_the_end_of_an_anchored_invitation_and_
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_18_13_a_close_writes_no_end_for_an_invitation_the_floor_has_passed() {
     let anchored = AnchoredShare::start().await;
-    anchored.move_both(
-        SHARE_LIFETIME + Duration::from_secs(10),
-        Duration::from_secs(3),
+    // Both clocks go ten seconds past the invitation's expiry, UTC lagging by three: the wall
+    // clock is fixed after the move, so the floor stays past the expiry however long the machine
+    // pauses.
+    let moved_ms = anchored.expires_at_ms() - anchored.utc_ms() + 10_000;
+    anchored.move_both(Duration::from_millis(moved_ms), Duration::from_secs(3));
+    assert!(
+        anchored.utc_ms() >= anchored.expires_at_ms(),
+        "UTC is past the invitation's expiry"
     );
 
     anchored
