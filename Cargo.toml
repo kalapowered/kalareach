@@ -354,9 +354,13 @@ noq-proto = { git = "https://github.com/kalapowered/noq", rev = "d8d5e9153f22f52
 # several relays needs them: without them one relay that is slow or stops reading can delay the
 # traffic to hosts on other relays and can close their connections. There are four entries because
 # the library's `iroh` takes the other three crates by path, so fewer entries would build a second
-# copy of a crate. Remove all four, and the git sources they give the crates in the lock, when the
-# lock can take a released library under which the case in
-# `crates/kr-transport/tests/device_endpoint_stall.rs` holds its limit without them. The
+# copy of a crate. Remove all four, and the git sources that they give the crates in the lock, when
+# the lock can take a release of the library that holds all three changes (issue 4476 for the hold,
+# pull request 4686 for the bound on the close and pull request 4683 for the release of the slots of
+# dropped transmits, all at the library's project, or equal fixes) and under which the case in
+# `crates/kr-transport/tests/device_endpoint_stall.rs` prints `LIMIT 2000 ms: HELD` without these
+# entries. Read the condition from that line, not from the case's pass or fail: the case also
+# asserts the fork's own trace line for a dropped datagram, which a release can word differently. The
 # `patched_crates` test in `tests/conformance` names an entry that the lock records as unused. For
 # the same reason as `noq-udp`, `cargo audit` does not check these four crates while the entries
 # stand, and no workflow or script in this repository reads advisories against the library's
