@@ -1762,6 +1762,16 @@ impl InputLane {
 
     /// Whether a request that follows this lane's typing on a local connection asks for the count of
     /// bytes it discarded: only of a worker that states the input lane, which the caller said when it
+    /// Gives a way to ask, from outside the lane's holder, whether the lane has ended, as the lane
+    /// records it. Compiled in for tests and in no shipped build.
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn ended_probe(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        let shared = Arc::clone(&self.shared);
+        Arc::new(move || shared.lock().ended.is_some())
+    }
+
     /// made the target. A paired host sets this itself on what it forwards, so a network lane says no.
     #[must_use]
     pub const fn fenced_report(&self) -> bool {

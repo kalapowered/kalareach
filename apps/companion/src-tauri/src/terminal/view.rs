@@ -23,6 +23,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
+#[cfg(feature = "testing")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 
@@ -190,6 +191,42 @@ impl From<String> for OpenFailure {
     }
 }
 
+/// What a test reads of a view while it runs, and the one thing it can give it: compiled in for the
+/// application's own tests and in no shipped build. The fields are shared with the registry's entry
+/// for the view, and no line of the view's own decisions reads any of them.
+#[cfg(feature = "testing")]
+#[derive(Clone, Default)]
+pub(super) struct Probe {
+    /// The most items the view's queue of what it heard has held at one time.
+    pub(super) queue_peak: Arc<AtomicUsize>,
+    /// How many barriers the view has taken from its input lane.
+    pub(super) barriers: Arc<AtomicUsize>,
+    /// The view's session, once its link is open.
+    pub(super) session: Arc<std::sync::Mutex<Option<Arc<Session>>>>,
+    /// Whether the view's input lane has ended, as the lane records it, once the lane is open.
+    pub(super) lane_ended: Arc<std::sync::Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>>,
+    /// Where the lane's waits come from in place of the shipped bounds, for the views that open
+    /// after it was given.
+    pub(super) lane_bounds: Option<Arc<dyn kr_transport::deadlines::Deadlines>>,
+}
+
+#[cfg(feature = "testing")]
+impl Probe {
+    fn publish_session(&self, session: &Arc<Session>) {
+        *self
+            .session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(session));
+    }
+
+    fn publish_lane(&self, lane: &InputLane) {
+        *self
+            .lane_ended
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(lane.ended_probe());
+    }
+}
+
 /// Runs one view from its open until it ends or is closed, and says why it ended.
 pub(super) async fn run(
     reach: Reach<'_>,
@@ -197,8 +234,7 @@ pub(super) async fn run(
     dimensions: Dimensions,
     mut commands: UnboundedReceiver<Command>,
     publish: &Publish,
-    queue_peak: Arc<AtomicUsize>,
-    barriers: Arc<AtomicUsize>,
+    #[cfg(feature = "testing")] probe: Probe,
 ) -> Cause {
     // The window's reports, which take the page's sizes and moves while the view is opening too, and
     // control of the program, which a take made while it opens asks for once it is attached.
@@ -309,10 +345,12 @@ pub(super) async fn run(
         last: None,
         heard_in_flight: false,
         heard: VecDeque::new(),
-        queue_peak,
-        barriers,
+        #[cfg(feature = "testing")]
+        probe,
         publish: publish.clone(),
     };
+    #[cfg(feature = "testing")]
+    view.probe.publish_session(view.link.session());
     view.publish_state();
     view.open_lane();
     let ended = view.serve(&mut commands).await;
@@ -911,10 +949,9 @@ struct View {
     heard: VecDeque<Heard>,
     /// The most items the queue has held at one time, which a test reads to see that the queue is
     /// bounded.
-    queue_peak: Arc<AtomicUsize>,
-    /// How many barriers the view has taken from its lane, which a test reads to see where the
-    /// view waits.
-    barriers: Arc<AtomicUsize>,
+    /// What a test reads of the view while it runs.
+    #[cfg(feature = "testing")]
+    probe: Probe,
     publish: Publish,
 }
 
@@ -1108,7 +1145,9 @@ impl View {
     /// Puts `heard` at the end of the queue.
     fn queue(&mut self, heard: impl IntoIterator<Item = Heard>) {
         self.heard.extend(heard);
-        self.queue_peak
+        #[cfg(feature = "testing")]
+        self.probe
+            .queue_peak
             .fetch_max(self.heard.len(), Ordering::Relaxed);
     }
 
@@ -1741,6 +1780,11 @@ impl View {
         self.requests.push(Box::pin(async move {
             (tag, Completed::Lane(session.input_lane(target).await))
         }));
+        #[cfg(feature = "testing")]
+        let target = match &self.probe.lane_bounds {
+            Some(bounds) => target.bounded_by(Arc::clone(bounds)),
+            None => target,
+        };
     }
 
     /// The lane's opening ended: the lane is there to type on, or the words say why it is not.
@@ -1752,6 +1796,8 @@ impl View {
                 self.sync_epoch();
             }
             Err(failed) => {
+                #[cfg(feature = "testing")]
+                self.probe.publish_lane(&lane);
                 self.lane_lost = Some(format!("its input stream could not be opened: {failed}"));
             }
         }
@@ -2107,7 +2153,8 @@ impl View {
                     return Ok(Started::Sent(tag));
                 }
             };
-            self.barriers.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "testing")]
+            self.probe.barriers.fetch_add(1, Ordering::Relaxed);
             if launch.is_some() {
                 self.holds.insert(tag, launch.unwrap_or_default());
             }
@@ -2250,7 +2297,8 @@ impl View {
         if self.networked && placed {
             let barrier = self.lane.as_ref().and_then(|lane| lane.mark(None).ok());
             if let Some(barrier) = barrier {
-                self.barriers.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "testing")]
+                self.probe.barriers.fetch_add(1, Ordering::Relaxed);
                 // The detach names the barrier where the host has the typing before it, and where it
                 // does not, the typing it did accept, counting what it accepts while the close waits.
                 let reached = match self.lane_events.as_mut() {
