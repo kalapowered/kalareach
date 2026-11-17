@@ -838,8 +838,10 @@ async fn the_device_endpoint_sends_no_relay_token() {
 /// KR-REQ-10.02: an introduction on a closed endpoint is refused with the endpoint's own error and
 /// the map keeps its relays.
 ///
-/// The table cannot be read once the endpoint is closed: the library's lookup registry is gone and
-/// its relay map no longer changes, so the case holds what the refusal and the map show.
+/// The table cannot be read from outside once the endpoint is closed: the library's lookup registry
+/// is gone and its relay map no longer changes. The crate's own test of the same refusal reads the
+/// table (`an_introduction_on_a_closed_endpoint_is_refused_and_the_table_does_not_take_the_host`),
+/// so this case holds what the refusal and the map show.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_closed_device_endpoint_refuses_an_introduction() {
     let (r1, r2) = (LocalRelay::spawn().await, LocalRelay::spawn().await);
@@ -962,7 +964,12 @@ async fn a_forget_leaves_no_relay_of_an_earlier_entry_in_the_map() {
         "the control: the held task has not changed the map"
     );
 
-    device.forget(&a.key()).await.expect("forgetting A");
+    // The forget has its own task, which the hold does not stop; a wait that has no end is a fault
+    // that ends the case here.
+    tokio::time::timeout(PATIENCE, device.forget(&a.key()))
+        .await
+        .unwrap_or_else(|_| panic!("the forget of A did not return within the bound"))
+        .expect("forgetting A");
     assert!(
         device.relay_urls().is_empty(),
         "the relay of A's earlier entry stays in the map after the forget returned"
