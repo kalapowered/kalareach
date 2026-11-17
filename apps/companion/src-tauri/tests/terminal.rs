@@ -65,16 +65,16 @@ struct Page {
 }
 
 /// A case that ends, by passing or by failing at one of its bounds, ends what its page left waiting:
-/// a page call that waits for a barrier which never expires holds a blocking thread of the case's
-/// runtime, and the runtime does not end until that thread does, which it does only when the view
-/// answers the call. The page ends every wait of its bounded lanes for good and closes its views,
-/// so that a case that fails at its own bound ends there, whatever platform it runs on.
+/// a page call that waits holds a blocking thread of the case's runtime, and the runtime does not
+/// end until that thread does, which it does only when the view answers the call. Every page closes
+/// its views, and a page whose lanes take their waits from the case's own deadlines ends every one
+/// of those waits for good first, so that a case that fails at its own bound ends there, whatever
+/// platform it runs on.
 impl Drop for Page {
     fn drop(&mut self) {
-        let Some(deadlines) = &self.deadlines else {
-            return;
-        };
-        deadlines.finish();
+        if let Some(deadlines) = &self.deadlines {
+            deadlines.finish();
+        }
         let views = self.app.state::<companion_tauri::terminal::TerminalViews>();
         for view in self
             .opened
@@ -6000,11 +6000,13 @@ impl kr_transport::deadlines::Deadlines for BarrierDeadlines {
         if !matches!(kind, kr_transport::deadlines::DeadlineKind::Admission) {
             return kr_transport::deadlines::Deadlines::start(&self.timers, kind);
         }
+        // The subscription and the count come before the check of `finished`: a `finish` that
+        // comes after the check also comes after the subscription, and ends this wait.
+        let mut expired = self.expired.subscribe();
+        let seen = *expired.borrow();
         if self.finished.load(std::sync::atomic::Ordering::SeqCst) {
             return Box::pin(async {});
         }
-        let mut expired = self.expired.subscribe();
-        let seen = *expired.borrow();
         self.armed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let armed = ArmedWait(Arc::clone(&self.armed));
         Box::pin(async move {
