@@ -5512,3 +5512,150 @@ async fn a_device_that_is_refused_free_capacity_is_handed_its_own_wait() {
     assert!((1..=90).contains(&wait), "{wait}");
     assert_eq!(told_paths(&failure), STAND_IN_PATHS);
 }
+
+/// The record a device keeps of a host it owns, started with the keys of this device as its owner.
+fn owned(host: &Host) -> kr_client::pairing::paired::PairedHost {
+    let record = host.owner.clone().expect("the owner device");
+    let identity = host.network().pairing().identity();
+    kr_client::pairing::paired::PairedHost {
+        host_device_id: identity.device_id,
+        host_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
+        host_keys: identity.keys,
+        host_endpoint_id: host.network().endpoint_id(),
+        network_config: host.network().network_config().expect("the configuration"),
+        device_id: record.device_id,
+        grant_id: record.grant.grant_id,
+        proposed_grant: kr_pairing::grants::personal_owner_grant(),
+        name: None,
+        paired_at_ms: record.paired_at_ms.get(),
+        device_key_revision: kr_protocol::ids::DeviceKeyRevision::new(1),
+    }
+}
+
+/// Waits until the host answers a question on `session`, and fails a session that never does.
+async fn answers(session: &kr_client::Session, what: &str) {
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        session.read::<_, kr_protocol::sharing::DeviceListResult>(
+            Method::DeviceList,
+            &kr_protocol::sharing::DeviceListParams {
+                include_revoked: false,
+            },
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{what}: no answer came"))
+    .unwrap_or_else(|error| panic!("{what}: the host's answer was an error: {error}"));
+}
+
+/// A device reaches two hosts of its owner that name one real relay and resolve through different
+/// services, and neither connection is cut for the other: the relay holds one client for the
+/// device's key, a session that was answering still answers after each step, and the endpoint that
+/// the pool closes is gone before the next one takes the key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_owned_hosts_on_one_real_relay_with_other_services_are_both_reached_and_neither_is_cut()
+{
+    use kr_client::pairing::candidate::Candidate;
+    use kr_client::pairing::link::{EndpointPool, HostLink, IrohLink, Standing};
+    use kr_protocol::pairing::{DeviceName, DevicePlatform};
+
+    let relay = LocalRelay::spawn().await;
+    let behind = |resolver: &pkarr::PkarrRelay| kr_transport::config::EndpointConfig {
+        relay_urls: vec![relay.url.clone()],
+        relay_ca_roots: relay.ca_roots.clone(),
+        discovery: kr_transport::config::DiscoveryConfig {
+            pkarr_publisher_url: Some(resolver.url.clone()),
+            pkarr_resolver_url: Some(resolver.url.clone()),
+            ..kr_transport::config::DiscoveryConfig::default()
+        },
+        ..net_support::loopback()
+    };
+    let (first_service, second_service) = (pkarr::PkarrRelay::spawn(), pkarr::PkarrRelay::spawn());
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let first = Host::start_with_endpoint(&owner, behind(&first_service)).await;
+    let second = Host::start_with_endpoint(&owner, behind(&second_service)).await;
+    let (a, b) = (owned(&first), owned(&second));
+
+    // The device can be reached through the relay only: on a loopback pool it would reach each host
+    // directly, and a second endpoint at the relay would never show.
+    let pool = Arc::new(
+        EndpointPool::new(owner.transport.clone())
+            .bound_to("127.0.0.1:0".parse().expect("loopback"))
+            .through_relays_only()
+            .trusting_relays(relay.ca_roots.clone()),
+    );
+    let link = IrohLink::new(Arc::clone(&pool));
+    let device = Candidate::new(
+        owner.clone(),
+        DeviceName::new("An owner's computer").expect("a name"),
+        DevicePlatform::Macos,
+        kr_protocol::ids::BuildId::new("kr-test/0").expect("a build"),
+    );
+    let as_first = device.paired_identity(a.device_id, a.device_key_revision);
+    let as_second = device.paired_identity(b.device_id, b.device_key_revision);
+
+    let held = link
+        .connect_paired(&a, &as_first)
+        .await
+        .expect("the first host is reached through the relay");
+    answers(&held, "the first host answers").await;
+    let key = pool
+        .endpoint(&a.network_config, &a.host_endpoint_id, Standing::Paired)
+        .await
+        .expect("the device's endpoint")
+        .id();
+
+    let reached = link
+        .connect_paired(&b, &as_second)
+        .await
+        .expect("the second host is reached through the relay");
+    assert_eq!(
+        relay.sessions_of(&key),
+        1,
+        "the relay let the device's key in once, whatever the second host's services are"
+    );
+    answers(&reached, "the second host answers").await;
+    answers(
+        &held,
+        "the first host's session answers after the second was reached",
+    )
+    .await;
+
+    let again = link
+        .connect_paired(&b, &as_second)
+        .await
+        .expect("the second host is reached again");
+    answers(&again, "the second host answers on its second connection").await;
+    answers(
+        &held,
+        "the first host's session answers after the second was reached again",
+    )
+    .await;
+
+    let beside = link
+        .connect_paired(&a, &as_first)
+        .await
+        .expect("the first host is reached on a second connection");
+    answers(&beside, "the first host answers on its second connection").await;
+    answers(
+        &held,
+        "the first host's first session answers beside its second",
+    )
+    .await;
+    answers(&reached, "the second host's session answers still").await;
+    assert_eq!(
+        relay.sessions_of(&key),
+        1,
+        "the relay still holds one client"
+    );
+
+    // The pool closes its endpoint and waits for it, so a request after it binds another that is
+    // never beside the first at the relay.
+    drop((held, reached, again, beside));
+    pool.close().await;
+    let anew = link
+        .connect_paired(&a, &as_first)
+        .await
+        .expect("the first host is reached through a new endpoint");
+    answers(&anew, "the first host answers through the new endpoint").await;
+}
