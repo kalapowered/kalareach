@@ -323,9 +323,10 @@ pub struct Roster {
     /// The files whose definition of a shared name a function calls, by file, function and name:
     /// the declared target of a call to a name that several functions of the crate declare.
     pub calls: BTreeMap<(String, String, String), BTreeSet<String>>,
-    /// The argument that a call hands on, by file, function and callee: its position and its text
-    /// with the white space taken out.
-    pub supplies: BTreeMap<(String, String, String), (usize, String)>,
+    /// The argument that a call hands on, by file, function, callee and the argument's position:
+    /// its text with the white space taken out. The position is part of the key, so a row for one
+    /// argument of a call never replaces the row for another.
+    pub supplies: BTreeMap<(String, String, String, usize), String>,
     /// The functions that call a watched function, by the watched function, the file and the
     /// caller, with how many calls each makes.
     pub callers: BTreeMap<(String, String, String), usize>,
@@ -341,7 +342,11 @@ pub struct Roster {
 ///
 /// # Panics
 ///
-/// Panics on a row that is not one of the nine kinds, which is a fault of the roster.
+/// Panics on a row that is not one of the nine kinds, and on a row of a kind that holds one value
+/// per key (`site`, `supplies`, `caller` and `only`, `held`) whose key an earlier row already
+/// holds: a later row never replaces an earlier one unseen. A `scope`, `outside` or `allow` row
+/// that repeats is a set's member again, and a `calls` row adds a file to the body's set of
+/// targets, so neither can replace anything.
 pub fn parse(roster: &str) -> Roster {
     let mut rows = Roster::default();
     for line in roster.lines() {
@@ -356,7 +361,8 @@ pub fn parse(roster: &str) -> Roster {
                     .insert(((*file).to_owned(), (*function).to_owned()));
             }
             ["site", file, function, callee, count] => {
-                rows.sites.insert(
+                insert_once(
+                    &mut rows.sites,
                     (
                         (*file).to_owned(),
                         (*function).to_owned(),
@@ -389,17 +395,20 @@ pub fn parse(roster: &str) -> Roster {
                     .insert((*definition).to_owned());
             }
             ["supplies", file, function, callee, position, text @ ..] if !text.is_empty() => {
-                rows.supplies.insert(
+                insert_once(
+                    &mut rows.supplies,
                     (
                         (*file).to_owned(),
                         (*function).to_owned(),
                         (*callee).to_owned(),
+                        position.parse().expect("a position"),
                     ),
-                    (position.parse().expect("a position"), text.concat()),
+                    text.concat(),
                 );
             }
             ["caller", callee, file, function, count] => {
-                rows.callers.insert(
+                insert_once(
+                    &mut rows.callers,
                     (
                         (*callee).to_owned(),
                         (*file).to_owned(),
@@ -410,7 +419,8 @@ pub fn parse(roster: &str) -> Roster {
             }
             ["only", callee, file, function, count] => {
                 rows.everywhere.insert((*callee).to_owned());
-                rows.callers.insert(
+                insert_once(
+                    &mut rows.callers,
                     (
                         (*callee).to_owned(),
                         (*file).to_owned(),
@@ -425,7 +435,8 @@ pub fn parse(roster: &str) -> Roster {
                     .filter(|domain| *domain != "none")
                     .map(str::to_owned)
                     .collect();
-                rows.held.insert(
+                insert_once(
+                    &mut rows.held,
                     (
                         (*file).to_owned(),
                         (*function).to_owned(),
@@ -438,6 +449,15 @@ pub fn parse(roster: &str) -> Roster {
         }
     }
     rows
+}
+
+/// Puts a row's value in `rows` under its key and refuses a key that an earlier row holds.
+fn insert_once<K: Ord + std::fmt::Debug, V>(rows: &mut BTreeMap<K, V>, key: K, value: V) {
+    let shown = format!("{key:?}");
+    assert!(
+        rows.insert(key, value).is_none(),
+        "a roster row repeats the key {shown} of an earlier row"
+    );
 }
 
 /// Whether `name` is one of the `listed` names: equal to one, or, for a listed name that ends in
@@ -852,7 +872,7 @@ fn arguments_of(
 /// have the caller believe.
 fn supplied(files: &[(String, String)], roster: &Roster) -> Vec<String> {
     let mut problems = Vec::new();
-    for ((file, function, callee), (position, expected)) in &roster.supplies {
+    for ((file, function, callee, position), expected) in &roster.supplies {
         let Some((_, source)) = files.iter().find(|(name, _)| name == file) else {
             problems.push(format!(
                 "supplies {file} {function} {callee}: there is no such file"

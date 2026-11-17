@@ -399,3 +399,94 @@ fn a_new_caller_of_the_dispatch_of_an_accepted_action_is_reported() {
         "service.rs rogue calls dispatch_accepted 1 time(s) and no row lists the caller",
     );
 }
+
+const METHODS: &str = "crates/kr-worker/src/broker/methods.rs";
+const BROKER: &str = "crates/kr-worker/src/broker/mod.rs";
+
+#[test]
+fn the_record_at_the_brokers_recheck_replaced_by_one_with_no_grants_is_reported() {
+    // The repeat's `checks` call has two `supplies` rows, the record at argument 0 and the ask at
+    // argument 3; a record made again from the binding's identity holds neither the package
+    // grants nor the deadlines that the admission captured.
+    let found = planted(
+        METHODS,
+        "        self.state()\n            .checks(admitted, request, self.deadline_now(), Ask::Again)\n",
+        "        self.state()\n            .checks(&AdmittedAgainst::new(admitted.application_instance_id(), admitted.binding_revision()), request, self.deadline_now(), Ask::Again)\n",
+    );
+    finding_among(
+        &found,
+        "methods.rs recheck_broker calls checks handing &AdmittedAgainst::new(admitted.application_instance_id(),admitted.binding_revision()) as argument 0 and its supplies row says admitted",
+    );
+}
+
+#[test]
+fn the_ask_at_the_brokers_recheck_replaced_by_the_first_is_reported() {
+    let found = planted(
+        METHODS,
+        "        self.state()\n            .checks(admitted, request, self.deadline_now(), Ask::Again)\n",
+        "        self.state()\n            .checks(admitted, request, self.deadline_now(), Ask::Once)\n",
+    );
+    only_finding(
+        &found,
+        "methods.rs recheck_broker calls checks handing Ask::Once as argument 3 and its supplies row says Ask::Again",
+    );
+}
+
+#[test]
+fn the_record_at_the_dispatchs_last_ask_replaced_by_one_with_no_grants_is_reported() {
+    let found = planted(
+        BROKER,
+        "        state.checks(\n            against,\n            request,\n            self.deadline_now(),\n            crate::broker::methods::Ask::Again,\n        )?;\n",
+        "        state.checks(\n            &AdmittedAgainst::new(against.application_instance_id(), against.binding_revision()),\n            request,\n            self.deadline_now(),\n            crate::broker::methods::Ask::Again,\n        )?;\n",
+    );
+    finding_among(
+        &found,
+        "mod.rs commit_dispatch calls checks handing &AdmittedAgainst::new(against.application_instance_id(),against.binding_revision()) as argument 0 and its supplies row says against",
+    );
+}
+
+#[test]
+fn the_ask_at_the_dispatchs_last_ask_replaced_by_the_first_is_reported() {
+    let found = planted(
+        BROKER,
+        "            self.deadline_now(),\n            crate::broker::methods::Ask::Again,\n        )?;\n",
+        "            self.deadline_now(),\n            crate::broker::methods::Ask::Once,\n        )?;\n",
+    );
+    only_finding(
+        &found,
+        "mod.rs commit_dispatch calls checks handing crate::broker::methods::Ask::Once as argument 3 and its supplies row says crate::broker::methods::Ask::Again",
+    );
+}
+
+#[test]
+fn a_supplies_row_for_another_argument_of_the_same_call_keeps_the_earlier_row() {
+    let rows = scan::parse(
+        "supplies a.rs f g 0 first\nsupplies a.rs f g 3 second\nsupplies a.rs f h 0 third\n",
+    );
+    assert_eq!(rows.supplies.len(), 3);
+    let key = |position| ("a.rs".to_owned(), "f".to_owned(), "g".to_owned(), position);
+    assert_eq!(
+        rows.supplies.get(&key(0)).map(String::as_str),
+        Some("first")
+    );
+    assert_eq!(
+        rows.supplies.get(&key(3)).map(String::as_str),
+        Some("second")
+    );
+}
+
+#[test]
+fn a_row_that_repeats_the_key_of_an_earlier_row_is_refused() {
+    // Each kind that holds one value per key refuses a second row for it, so that a later row
+    // never replaces an earlier one unseen.
+    for text in [
+        "site a.rs f lock 1\nsite a.rs f lock 2\n",
+        "supplies a.rs f g 0 first\nsupplies a.rs f g 0 second\n",
+        "caller g a.rs f 1\ncaller g a.rs f 2\n",
+        "caller g a.rs f 1\nonly g a.rs f 2\n",
+        "held a.rs f g SES\nheld a.rs f g BAR\n",
+    ] {
+        let refused = std::panic::catch_unwind(|| scan::parse(text));
+        assert!(refused.is_err(), "{text}");
+    }
+}
