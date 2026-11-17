@@ -8,13 +8,14 @@
 //! milliseconds. That is a stress load, above what the product shows a host using.
 //!
 //! The first stops the relay once and asks the healthy host before the stop, during it and after
-//! the relay resumes. It fails unless every question is answered, the healthy host's connection
-//! stays open, each answer takes less than [`LIMIT_MS`], the run filled the stopped relay's queue,
-//! which the library's own line about a datagram dropped for a full queue shows, and the stopped
-//! front read next to nothing from the device, so that the queue was filled by a relay that stopped
-//! and not by the load alone. The limit
-//! is a bound of this test: it has room above what the library's changed relay transport gives and
-//! is far below what the release's hold gives.
+//! the relay resumes. It fails unless every question the healthy host is asked, from the first to
+//! the last and also between two phases, is answered, the healthy host's connection stays open, no
+//! answer takes [`LIMIT_MS`] or longer, the run filled the stopped relay's queue, which the
+//! library's own line about a datagram dropped for a full queue shows, and the stopped front read
+//! next to nothing from the device while it was stopped, so that the queue was filled by a relay
+//! that stopped and not by the load alone. The limit is a bound of this test: it has room above
+//! what the library's changed relay transport gives and is far below what the release's hold
+//! gives.
 //!
 //! The second stops the relay three times for five seconds, each time after the connections have had
 //! thirty seconds to come back to a steady send. It fails unless the hosts on the stopped relay keep
@@ -24,7 +25,9 @@
 //! asserts no count of them: a short stop can end before the queue is full.
 //!
 //! Both are outside the default suite: each runs for minutes, so they are asked for by name with
-//! `--ignored --nocapture`, which prints what they measured.
+//! `--ignored --nocapture`, which prints what they measured. They run with one test thread
+//! (`--test-threads=1`): the capture marks the device's endpoint for the whole process, so two
+//! cases that run at once would mix their lines.
 
 mod support;
 
@@ -51,8 +54,10 @@ const PATIENCE: Duration = Duration::from_secs(60);
 const INTERVAL: Duration = Duration::from_millis(100);
 
 /// The limit that a question's round trip to the healthy host is held to, in milliseconds. It is a
-/// bound of these cases and not a figure of the product.
+/// bound of these cases and not a figure of the product. An answer that takes this long or longer is
+/// over it.
 const LIMIT_MS: u64 = 2000;
+const LIMIT: Duration = Duration::from_millis(LIMIT_MS);
 
 /// How often the recovery case asks each host on the relay that stops.
 const HOST_INTERVAL: Duration = Duration::from_millis(250);
@@ -326,17 +331,11 @@ fn capture() -> &'static Arc<Seen> {
     })
 }
 
-/// What the stopped relay's actor was doing at `at`, by what the library logged since the switch
-/// for the device's endpoint and the front's URL alone.
-fn actor_state(
-    seen: &Seen,
-    endpoint: u64,
-    front: &RelayUrl,
-    switched: Instant,
-    at: Instant,
-) -> &'static str {
+/// What the stopped relay's actor was doing at `at`, by what the library logged since the switch,
+/// in `kept`: the lines of the device's endpoint about the front's URL, in the order they came.
+fn actor_state(kept: &[Logged], switched: Instant, at: Instant) -> &'static str {
     let mut dialling = false;
-    for logged in seen.of(endpoint, front) {
+    for logged in kept {
         if logged.when > at {
             break;
         }
@@ -529,14 +528,14 @@ fn dropped(seen: &Seen, endpoint: u64, relay: &RelayUrl, from: Instant, to: Inst
         .count()
 }
 
-/// The answers of one host's questions that took longer than the limit, the questions that got
-/// none, and the longest answer.
+/// The answers of one host's questions that took the limit or longer, the questions that got none,
+/// and the longest answer.
 fn tally(outcomes: &[(Instant, Result<Duration, String>)]) -> (usize, usize, Duration) {
     let (mut over, mut none, mut longest) = (0, 0, Duration::ZERO);
     for (_, outcome) in outcomes {
         match outcome {
             Ok(rtt) => {
-                over += usize::from(rtt.as_millis() > u128::from(LIMIT_MS));
+                over += usize::from(*rtt >= LIMIT);
                 longest = longest.max(*rtt);
             }
             Err(_) => none += 1,
@@ -785,16 +784,20 @@ async fn arrangement(hosts: usize) -> (Vec<String>, Vec<String>) {
         sender.abort();
     }
 
-    let phase = |from: usize, count: usize| -> Vec<(usize, Result<Duration, String>)> {
-        (from..(from + count).min(outcomes.len()))
+    // The three phases together hold every question that was asked: those before the switch, those
+    // from the switch to the resume, and every one after the resume, also the ones that the asking
+    // added while the case read its counts.
+    let phase = |from: usize, to: usize| -> Vec<(usize, Result<Duration, String>)> {
+        (from..to)
             .map(|index| (index, outcomes[index].1.clone()))
             .collect()
     };
     let phases = [
-        ("BEFORE", phase(first, BEFORE)),
-        ("DURING", phase(switch_index, DURING)),
-        ("AFTER", phase(resume_index, AFTER)),
+        ("BEFORE", phase(0, switch_index)),
+        ("DURING", phase(switch_index, resume_index)),
+        ("AFTER", phase(resume_index, outcomes.len())),
     ];
+    let kept = seen.of(world.device_span, &front.url);
     let mut lines = vec![format!("ARRANGEMENT K={hosts} N={connections}")];
     let mut worst: Option<(usize, Duration, &'static str)> = None;
     let (mut over, mut unanswered) = (0, 0);
@@ -806,10 +809,11 @@ async fn arrangement(hosts: usize) -> (Vec<String>, Vec<String>) {
         unanswered += rows.len() - answered.len();
         lines.push(figure(name, &answered, rows.len()));
         for (index, outcome) in rows {
-            let started_at = outcomes[*index].0;
-            let state = actor_state(seen, world.device_span, &front.url, switched, started_at);
+            // Read only for a question that went wrong: every kept line is read for it.
+            let state = || actor_state(&kept, switched, outcomes[*index].0);
             match outcome {
-                Ok(rtt) if rtt.as_millis() > u128::from(LIMIT_MS) => {
+                Ok(rtt) if *rtt >= LIMIT => {
+                    let state = state();
                     over += 1;
                     lines.push(format!(
                         "OVER {LIMIT_MS} ms: request {index} in {name} took {} ms, relay actor {state} (endpoint {me}, relay {})",
@@ -822,7 +826,8 @@ async fn arrangement(hosts: usize) -> (Vec<String>, Vec<String>) {
                 }
                 Ok(_) => {}
                 Err(reason) => lines.push(format!(
-                    "UNANSWERED: request {index} in {name}, relay actor {state} (endpoint {me}, relay {}): {reason}",
+                    "UNANSWERED: request {index} in {name}, relay actor {} (endpoint {me}, relay {}): {reason}",
+                    state(),
                     front.url
                 )),
             }
@@ -843,8 +848,8 @@ async fn arrangement(hosts: usize) -> (Vec<String>, Vec<String>) {
     lines.push(events_line(seen, world.device_span, me, &front.url));
     match worst {
         Some((index, rtt, state)) => lines.push(format!(
-            "LIMIT {LIMIT_MS} ms: PASSED BY {} ms AT REQUEST {index} WHILE {state} (K={hosts}, N={connections}); {over} answers took longer, {unanswered} questions had none",
-            rtt.as_millis() - u128::from(LIMIT_MS)
+            "LIMIT {LIMIT_MS} ms: PASSED BY {:?} AT REQUEST {index} WHILE {state} (K={hosts}, N={connections}); {over} answers took the limit or longer, {unanswered} questions had none",
+            rtt - LIMIT
         )),
         None if unanswered > 0 => lines.push(format!(
             "LIMIT {LIMIT_MS} ms: NOT SHOWN, {unanswered} questions had no answer (K={hosts}, N={connections})"
@@ -880,7 +885,7 @@ async fn arrangement(hosts: usize) -> (Vec<String>, Vec<String>) {
     }
     if over + unanswered != 0 {
         failures.push(format!(
-            "K={hosts}: the healthy host was not answered within the limit of {LIMIT_MS} ms: {over} answers took longer and {unanswered} questions had none"
+            "K={hosts}: the healthy host was not answered within the limit of {LIMIT_MS} ms: {over} answers took the limit or longer and {unanswered} questions had none"
         ));
     }
     if filled == 0 {
@@ -1009,7 +1014,7 @@ async fn recovery(
     }
     if over + none != 0 {
         failures.push(format!(
-            "the healthy host was not answered within the limit of {LIMIT_MS} ms: {over} answers took longer and {none} questions had none"
+            "the healthy host was not answered within the limit of {LIMIT_MS} ms: {over} answers took the limit or longer and {none} questions had none"
         ));
     }
     for (index, asker) in asking.into_iter().enumerate() {
