@@ -7489,7 +7489,7 @@ fn an_owner_acting_inside_a_reading_costs_that_reading_a_refusal() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
         right.advance(std::time::Duration::from_secs(60));
-        continuous.advance(std::time::Duration::from_secs(1));
+        continuous.advance(std::time::Duration::from_millis(200));
         published.establish(right.now_ms().get(), continuous.boot_elapsed_ms());
     }));
     session.observe_time();
@@ -7506,6 +7506,114 @@ fn an_owner_acting_inside_a_reading_costs_that_reading_a_refusal() {
         session.time().trust(),
         WallClockTrust::Trusted,
         "and the owner's next action frees the worker"
+    );
+}
+
+/// KR-REQ-09.19: an owner who acts inside a reading held up for a second, after the worker read
+/// the wall clock a minute low, is followed in that look. The held-up try is not kept against the
+/// owner's word, and the second try reads the corrected clock after it. (Kept, the stale reading
+/// would be stamped after the owner spoke and refuse the confirmation, as in the narrow case.)
+#[test]
+fn an_owner_acting_inside_a_held_up_reading_is_followed_when_the_reading_was_low() {
+    use kr_ipc::clock::SharedClock as _;
+    use kr_worker::action::time::WallClock as _;
+
+    let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+    let machine = DriftingMachine::fast_by(0);
+    let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+    let wall = Arc::new(WallThatMovesAfterItsNextReading {
+        inner: machine.wall.clone(),
+        after: std::sync::Mutex::new(None),
+    });
+    let mut session = Session::open(SessionConfig {
+        time: kr_worker::action::time::TimeSources {
+            wall: Arc::clone(&wall) as Arc<dyn kr_worker::action::time::WallClock>,
+            ..machine.sources_on(&floor)
+        },
+        ..session_config(&environment, session_id)
+    })
+    .expect("opens");
+    machine.runs(AN_HOUR);
+    machine.steps_back(std::time::Duration::from_secs(60));
+    session.observe_time();
+    assert_eq!(session.time().trust(), WallClockTrust::Unresolved);
+
+    let right = machine.wall.clone();
+    let continuous = machine.continuous.clone();
+    let published = Arc::clone(&floor);
+    *wall
+        .after
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+        right.advance(std::time::Duration::from_secs(60));
+        continuous.advance(std::time::Duration::from_secs(1));
+        published.establish(right.now_ms().get(), continuous.boot_elapsed_ms());
+    }));
+    session.observe_time();
+    assert_eq!(
+        session.time().trust(),
+        WallClockTrust::Trusted,
+        "the held-up reading is no reading taken after the owner spoke"
+    );
+}
+
+/// KR-REQ-09.19: an owner who acts inside a reading held up for a second, after the worker read a
+/// peak, costs that reading a refusal. The worker trusts its clock; the wall clock steps ten
+/// minutes ahead and the look's first try reads that peak; the owner sets the clock right and
+/// confirms it inside that try, after the reading; the second try reads the corrected clock, ten
+/// minutes behind the peak. The peak is stamped at the end of the held-up try, after the owner's
+/// word, so the step back is one the owner did not see: the worker stays unresolved. The owner's
+/// next action is followed.
+#[test]
+fn an_owner_acting_inside_a_held_up_reading_costs_that_reading_a_refusal() {
+    use kr_ipc::clock::SharedClock as _;
+    use kr_worker::action::time::WallClock as _;
+
+    let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+    let machine = DriftingMachine::fast_by(0);
+    let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+    let wall = Arc::new(WallThatMovesAfterItsNextReading {
+        inner: machine.wall.clone(),
+        after: std::sync::Mutex::new(None),
+    });
+    let mut session = Session::open(SessionConfig {
+        time: kr_worker::action::time::TimeSources {
+            wall: Arc::clone(&wall) as Arc<dyn kr_worker::action::time::WallClock>,
+            ..machine.sources_on(&floor)
+        },
+        ..session_config(&environment, session_id)
+    })
+    .expect("opens");
+    machine.runs(AN_HOUR);
+    session.observe_time();
+    assert_eq!(session.time().trust(), WallClockTrust::Trusted);
+
+    machine.wall.advance(std::time::Duration::from_secs(600));
+    let right = machine.wall.clone();
+    let continuous = machine.continuous.clone();
+    let published = Arc::clone(&floor);
+    *wall
+        .after
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+        right.set(right.now_ms().get() - 600_000);
+        continuous.advance(std::time::Duration::from_secs(1));
+        published.establish(right.now_ms().get(), continuous.boot_elapsed_ms());
+    }));
+    session.observe_time();
+    assert_eq!(
+        session.time().trust(),
+        WallClockTrust::Unresolved,
+        "the peak stands after the owner's word, so the step back is not one the owner saw"
+    );
+
+    machine.runs(std::time::Duration::from_secs(1));
+    machine.owner_establishes(&floor);
+    session.observe_time();
+    assert_eq!(
+        session.time().trust(),
+        WallClockTrust::Trusted,
+        "and the owner's next action is followed"
     );
 }
 
@@ -7651,65 +7759,94 @@ fn a_worker_that_looked_before_the_daemon_stated_its_record_takes_the_restatemen
     assert!(session.time().durable_state().0.owner_confirmed);
 }
 
-/// KR-REQ-09.18, KR-REQ-09.19: a restatement does not clear a rollback that falls between the two
-/// readings of one look. The worker has met nothing yet; the wall clock runs ten minutes ahead and
-/// the worker's look reads that peak and raises its mark; right after that reading the clock goes
-/// back a minute, and the daemon, which did not see the peak, states its record at the lower
-/// reading, later than the mark. The worker judges the restatement against a reading taken after
-/// it and answers to its own mark whatever the mark's age, so it distrusts its clock instead of
-/// replacing the peak. The control is the same look without the step back, which takes the
-/// restatement.
-#[test]
-fn a_restatement_does_not_clear_a_rollback_between_the_two_readings_of_one_look() {
+/// What a worker is and holds after a look at its clocks in which the wall clock reads ten
+/// minutes ahead and, right after the look's first reading of it, `by` passes on the continuous
+/// clock, the wall clock goes back a minute (or does not, when `steps_back` is false) and the
+/// daemon states its record at the reading it then has.
+fn a_look_with_a_restatement_inside(
+    by: std::time::Duration,
+    steps_back: bool,
+) -> (WallClockTrust, bool) {
     use kr_ipc::clock::SharedClock as _;
     use kr_worker::action::time::WallClock as _;
 
-    let looked = |steps_back: bool| {
-        let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
-        let machine = DriftingMachine::fast_by(0);
-        let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
-        let wall = Arc::new(WallThatMovesAfterItsNextReading {
-            inner: machine.wall.clone(),
-            after: std::sync::Mutex::new(None),
-        });
-        let mut session = Session::open(SessionConfig {
-            time: kr_worker::action::time::TimeSources {
-                wall: Arc::clone(&wall) as Arc<dyn kr_worker::action::time::WallClock>,
-                ..machine.sources_on(&floor)
-            },
-            ..session_config(&environment, session_id)
-        })
-        .expect("opens");
-        assert_eq!(session.time().trust(), WallClockTrust::Trusted);
-        machine.wall.advance(std::time::Duration::from_secs(600));
-        let (inner, continuous, stated) = (
-            machine.wall.clone(),
-            machine.continuous.clone(),
-            Arc::clone(&floor),
-        );
-        *wall
-            .after
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
-            continuous.advance(std::time::Duration::from_secs(1));
-            if steps_back {
-                inner.set(inner.now_ms().get() - 60_000);
-            }
-            assert!(stated.restate(inner.now_ms().get(), continuous.boot_elapsed_ms()));
-        }));
-        session.observe_time();
-        (
-            session.time().trust(),
-            session.time().durable_state().0.owner_confirmed,
-        )
-    };
+    let (_temp, environment, session_id) = a_journal_with_a_record_past_retention();
+    let machine = DriftingMachine::fast_by(0);
+    let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+    let wall = Arc::new(WallThatMovesAfterItsNextReading {
+        inner: machine.wall.clone(),
+        after: std::sync::Mutex::new(None),
+    });
+    let mut session = Session::open(SessionConfig {
+        time: kr_worker::action::time::TimeSources {
+            wall: Arc::clone(&wall) as Arc<dyn kr_worker::action::time::WallClock>,
+            ..machine.sources_on(&floor)
+        },
+        ..session_config(&environment, session_id)
+    })
+    .expect("opens");
+    assert_eq!(session.time().trust(), WallClockTrust::Trusted);
+    machine.wall.advance(std::time::Duration::from_secs(600));
+    let (inner, continuous, stated) = (
+        machine.wall.clone(),
+        machine.continuous.clone(),
+        Arc::clone(&floor),
+    );
+    *wall
+        .after
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+        continuous.advance(by);
+        if steps_back {
+            inner.set(inner.now_ms().get() - 60_000);
+        }
+        assert!(stated.restate(inner.now_ms().get(), continuous.boot_elapsed_ms()));
+    }));
+    session.observe_time();
+    (
+        session.time().trust(),
+        session.time().durable_state().0.owner_confirmed,
+    )
+}
+
+/// KR-REQ-09.18, KR-REQ-09.19: a restatement does not clear a rollback that falls between the two
+/// readings of one look. The worker has met nothing yet; the wall clock runs ten minutes ahead and
+/// the worker's look reads that peak and raises its mark; right after that reading, which takes
+/// 200 ms more of the continuous clock (inside the bracket), the clock goes back a minute, and the
+/// daemon, which did not see the peak, states its record at the lower reading, later than the
+/// mark. The worker judges the restatement against a reading taken after it and answers to its
+/// own mark whatever the mark's age, so it distrusts its clock instead of replacing the peak. The
+/// control is the same look without the step back, which takes the restatement.
+#[test]
+fn a_restatement_does_not_clear_a_rollback_between_the_two_readings_of_one_look() {
+    let by = std::time::Duration::from_millis(200);
     assert_eq!(
-        looked(true),
+        a_look_with_a_restatement_inside(by, true),
         (WallClockTrust::Unresolved, false),
         "a rollback between the two readings of a look is not cleared by a restatement"
     );
     assert_eq!(
-        looked(false),
+        a_look_with_a_restatement_inside(by, false),
+        (WallClockTrust::Trusted, true),
+        "the control: without the step back the worker takes the restatement"
+    );
+}
+
+/// KR-REQ-09.18, KR-REQ-09.19: the same order of events with the look held up for a second, so
+/// that its first try is wider than the bracket and the second try reads after the step back. The
+/// peak the first try read is in the worker's mark, stamped at the end of that try, so the second
+/// try finds the rollback and the restatement does not clear it. The control is the same look
+/// without the step back, which takes the restatement.
+#[test]
+fn a_restatement_does_not_clear_a_rollback_between_the_two_readings_of_a_held_up_look() {
+    let by = std::time::Duration::from_secs(1);
+    assert_eq!(
+        a_look_with_a_restatement_inside(by, true),
+        (WallClockTrust::Unresolved, false),
+        "a rollback inside a held-up reading is not cleared by a restatement"
+    );
+    assert_eq!(
+        a_look_with_a_restatement_inside(by, false),
         (WallClockTrust::Trusted, true),
         "the control: without the step back the worker takes the restatement"
     );
@@ -8147,11 +8284,11 @@ fn a_later_look_does_not_forget_the_rollback_an_earlier_look_found() {
 
 /// KR-REQ-09.18, KR-REQ-09.19: a reading the worker kept when it refused one confirmation is held
 /// against the next. The owner confirms the clock (A); the worker looks, and its second reading of
-/// the look finds the clock a minute low, so it refuses A. The owner had made a second confirmation
-/// (B) between the worker's two readings, which the daemon publishes after the look, when the clock
-/// is right again: B follows the reading the worker proved its mark at, so only the low reading
-/// the worker kept refuses it. The control is a confirmation the owner makes after the clock is
-/// right again.
+/// the look, a fifth of a second after its first (inside the bracket), finds the clock a minute low,
+/// so it refuses A. The owner had made a second confirmation (B) between the worker's two readings,
+/// which the daemon publishes after the look, when the clock is right again: B follows the reading
+/// the worker proved its mark at, so only the low reading the worker kept refuses it. The control
+/// is a confirmation the owner makes after the clock is right again.
 #[test]
 fn a_confirmation_the_worker_refused_leaves_the_next_to_answer_to_the_same_readings() {
     use kr_ipc::clock::SharedClock as _;
@@ -8176,8 +8313,9 @@ fn a_confirmation_the_worker_refused_leaves_the_next_to_answer_to_the_same_readi
         machine.runs(AN_HOUR);
         machine.owner_establishes(&floor);
         machine.runs(std::time::Duration::from_secs(1));
-        // The worker's first reading is the one its mark is proved at; B is made a second after
-        // it, and the clock falls a minute two seconds after it, before the second reading.
+        // The worker's first reading is the one its mark is proved at; B is made a tenth of a second
+        // after it, and the clock falls a minute a fifth of a second after it, before the second
+        // reading.
         let (proved_wall, proved_at) = (
             machine.wall.now_ms().get(),
             machine.continuous.boot_elapsed_ms(),
@@ -8187,8 +8325,8 @@ fn a_confirmation_the_worker_refused_leaves_the_next_to_answer_to_the_same_readi
             .after
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
-            continuous.advance(std::time::Duration::from_secs(2));
-            inner.advance(std::time::Duration::from_secs(2));
+            continuous.advance(std::time::Duration::from_millis(200));
+            inner.advance(std::time::Duration::from_millis(200));
             inner.set(inner.now_ms().get() - 60_000);
         }));
         session.observe_time();
@@ -8200,7 +8338,7 @@ fn a_confirmation_the_worker_refused_leaves_the_next_to_answer_to_the_same_readi
         machine.wall.advance(std::time::Duration::from_secs(60));
         machine.runs(std::time::Duration::from_secs(1));
         if b_was_made_before_the_clock_fell {
-            floor.establish(proved_wall + 1_000, proved_at + 1_000);
+            floor.establish(proved_wall + 100, proved_at + 100);
         } else {
             machine.owner_establishes(&floor);
         }
