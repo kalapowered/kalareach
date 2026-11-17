@@ -1176,6 +1176,31 @@ impl TimeContract {
             })
     }
 
+    /// Returns what a confirmation is decided against: [`Self::reference`], or what a held-up try
+    /// read where that is further, projected to `continuous_ms` and proved at the try's second
+    /// reading. A held-up try gives no comparison of its own and is no entry of the staircase, and
+    /// the mark does not move: the reading is kept only through the decision.
+    fn reference_kept(
+        &self,
+        state: &TimeState,
+        continuous_ms: u64,
+        held_up: &[HeldUp],
+    ) -> Option<Reference> {
+        let mut reference = self.reference(state, continuous_ms);
+        for tried in held_up {
+            let wall_ms = tried.wall_ms.saturating_add(kr_ipc::clock::credited(
+                continuous_ms.saturating_sub(tried.second_ms),
+            ));
+            if reference.is_none_or(|kept| wall_ms > kept.wall_ms) {
+                reference = Some(Reference {
+                    wall_ms,
+                    proved_at: tried.second_ms,
+                });
+            }
+        }
+        reference
+    }
+
     /// Returns the earliest the wall clock can honestly read now.
     ///
     /// Expiry against a UTC deadline uses this rather than the clock itself, so a reading the
@@ -1568,12 +1593,13 @@ impl TimeContract {
             state.followed = established.count;
             return true;
         }
+        let Attempt { narrow, held_up } = self.take();
         let Some(Taken {
             first_ms: continuous_ms,
             second_ms,
             wall_ms,
             ..
-        }) = self.take().narrow
+        }) = narrow
         else {
             // No narrow bracket: nothing is spent, and the confirmation is met again at the next
             // look.
@@ -1581,7 +1607,10 @@ impl TimeContract {
         };
         state.adopting = false;
         state.followed = established.count;
-        let reference = self.reference(state, second_ms);
+        // What the held-up tries of this following read is evidence of how far the clock had got
+        // after the owner spoke, so the decision is made against it: a peak that only they saw,
+        // and a clock that then went back, is the rollback the owner did not see.
+        let reference = self.reference_kept(state, second_ms, &held_up);
         let behind_its_reference = reference.filter(|reference| {
             reference.wall_ms.saturating_sub(wall_ms) > MAX_WALL_CLOCK_ROLLBACK_MS
         });
@@ -4033,5 +4062,59 @@ mod tests {
             "the clock is measured against what the host proved before it restarted"
         );
         assert_eq!(harness.contract.trust(), WallClockTrust::Trusted);
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: a peak that only a held-up try of the following of the owner read
+    /// is held against the confirmation. The worker trusts its clock and the owner confirms; at the
+    /// next look the first try of the following reads a wall ten minutes ahead, held up, and the
+    /// wall goes back a minute right after, before the narrow try. The narrow wall is far above the
+    /// worker's own mark, but a minute behind what the clock read after the owner spoke: the
+    /// confirmation is refused and the worker does not trust the clock.
+    #[test]
+    fn a_peak_only_a_held_up_try_of_the_following_read_refuses_the_confirmation_after_a_step_back()
+    {
+        let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+        let held = Holdup::new(HELD_UP, false);
+        let contract = held.contract(Some(Arc::clone(&floor)));
+        held.pass(Duration::from_secs(60));
+        contract.observe();
+        held.pass(Duration::from_secs(1));
+        floor.establish(held.wall.now_ms().get(), held.continuous.boot_elapsed_ms());
+        held.pass(Duration::from_secs(1));
+        let peak = held.wall.now_ms().get() + 600_000;
+        held.sets_the_wall_before_reading(2, peak);
+        held.sets_the_wall_after_landing(1, peak + 10_000 - 60_000);
+        held.arm(1, 1);
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Unresolved,
+            "the clock went back a minute from a reading taken after the owner spoke"
+        );
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: a pause alone in the first try of the following of the owner is
+    /// no rollback: the worker that found one and does not trust its clock follows the owner.
+    #[test]
+    fn a_pause_alone_in_a_held_up_try_of_the_following_is_followed() {
+        let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+        let held = Holdup::new(HELD_UP, false);
+        let contract = held.contract(Some(Arc::clone(&floor)));
+        held.pass(Duration::from_secs(60));
+        contract.observe();
+        held.pass(Duration::from_secs(60));
+        held.wall.set(held.wall.now_ms().get() - 8_000);
+        assert!(contract.observe().rolled_back);
+        assert_eq!(contract.trust(), WallClockTrust::Unresolved);
+        held.pass(Duration::from_secs(1));
+        floor.establish(held.wall.now_ms().get(), held.continuous.boot_elapsed_ms());
+        held.pass(Duration::from_secs(1));
+        held.arm(1, 1);
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Trusted,
+            "a pause in the following reads no peak, so the confirmation is followed"
+        );
     }
 }
