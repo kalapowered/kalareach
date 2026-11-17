@@ -308,6 +308,8 @@ names another. Core's lock takes these crates from Git:
 - from the project's noq fork, in place of the registry crate through the same table: `noq-proto`
 - from the project's simple-dns fork, in place of the registry crate through the same table:
   `simple-dns`
+- from the project's iroh fork, in place of the registry crates through the same table: `iroh`,
+  `iroh-base`, `iroh-dns`, `iroh-relay`
 
 An advisory filed against a crate's crates.io release does not reach its Git copy. No workflow or
 script in this repository reads advisories against the upstream repositories of these crates; that

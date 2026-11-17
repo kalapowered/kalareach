@@ -3818,8 +3818,7 @@ checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 [[package]]
 name = "iroh"
 version = "1.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3689cab508af9bcef7816c1201b403595ec6aa20e7d15e1f9683bb4be4a5b17"
+source = "git+https://github.com/kalapowered/iroh?rev=9139ea0efa1bea32dc73a0b80868963cf026178d#9139ea0efa1bea32dc73a0b80868963cf026178d"
 dependencies = [
  "axum",
  "backon",
@@ -3870,8 +3869,7 @@ dependencies = [
 [[package]]
 name = "iroh-base"
 version = "1.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43b72366b16001af3a51574233df88ca6d62da0215807549a769e7de887da803"
+source = "git+https://github.com/kalapowered/iroh?rev=9139ea0efa1bea32dc73a0b80868963cf026178d#9139ea0efa1bea32dc73a0b80868963cf026178d"
 dependencies = [
  "curve25519-dalek 5.0.0",
  "data-encoding",
@@ -3889,8 +3887,7 @@ dependencies = [
 [[package]]
 name = "iroh-dns"
 version = "1.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7481d0792dde1035a2b06ec06ed3cf6d01fcb1a494e6931b489e32073382048d"
+source = "git+https://github.com/kalapowered/iroh?rev=9139ea0efa1bea32dc73a0b80868963cf026178d#9139ea0efa1bea32dc73a0b80868963cf026178d"
 dependencies = [
  "arc-swap",
  "cfg_aliases 0.2.2",
@@ -3985,8 +3982,7 @@ dependencies = [
 [[package]]
 name = "iroh-relay"
 version = "1.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e5589e7c1475700686603a970275687f760df853bc6525c7eb1347aa31d7230"
+source = "git+https://github.com/kalapowered/iroh?rev=9139ea0efa1bea32dc73a0b80868963cf026178d#9139ea0efa1bea32dc73a0b80868963cf026178d"
 dependencies = [
  "blake3",
  "bytes",
