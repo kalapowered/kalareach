@@ -408,8 +408,9 @@ enum Held {
     Failed { retry_at: Instant },
 }
 
-/// One entry of the cache.
-#[derive(Clone, Debug)]
+/// One entry of the cache. It has no `Debug`: the request's task is a type from outside the
+/// workspace, and nothing prints an entry.
+#[derive(Clone)]
 struct Entry {
     held: Held,
     /// The task of the request that was made at `asked_at`, while there is one. It is stored in
