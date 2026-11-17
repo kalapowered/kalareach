@@ -311,6 +311,9 @@ struct Stopped {
     successor: Option<Option<u64>>,
     /// The generation of the daemon that was stopped, where the command read it.
     generation: Option<ControllerGeneration>,
+    /// The stop's own words, where its request could not be made and the daemon was seen to end:
+    /// the restart did not stop it, and says so before it says what its start did.
+    first: Option<Shown>,
 }
 
 /// A control daemon answers: asks how it was started, refuses before it stops anything where the
@@ -420,6 +423,7 @@ async fn restart_the_daemon(
         unsettled,
         successor,
         generation: Some(info.generation),
+        first: None,
     };
     after_the_end(host, environment, json, progress, past, begun, stopped, old).await
 }
@@ -457,36 +461,49 @@ async fn cut_said(
             )
             .await
         }
-        Cut::Unmade {
-            before: Before::Ended { pid, end, .. },
-            ..
-        } => {
-            let (generation, old) = match read {
-                Some((generation, old)) => (Some(generation), old),
-                None => (None, None),
-            };
-            let stopped = Stopped {
-                named: pid,
-                pid,
-                unsettled: None,
-                successor: match end {
-                    End::Successor(successor) => Some(successor),
-                    End::Gone | End::NotEnded(..) => None,
-                },
-                generation,
-            };
-            after_the_end(host, environment, json, progress, past, begun, stopped, old).await
-        }
-        Cut::Unmade { before, error } => host_stop::unmade_ended(
-            Which::Restart,
-            before,
-            &error,
-            id,
-            environment,
-            &begun.none,
-            json,
-            &begun.earlier,
-        ),
+        Cut::Unmade { before, error } => match ended_without_a_request(before) {
+            Ok((first, pid, end)) => {
+                let (generation, old) = match read {
+                    Some((generation, old)) => (Some(generation), old),
+                    None => (None, None),
+                };
+                let stopped = Stopped {
+                    named: pid,
+                    pid,
+                    unsettled: None,
+                    successor: match end {
+                        End::Successor(successor) => Some(successor),
+                        End::Gone | End::NotEnded(..) => None,
+                    },
+                    generation,
+                    first: Some(first),
+                };
+                after_the_end(host, environment, json, progress, past, begun, stopped, old).await
+            }
+            Err(before) => host_stop::unmade_ended(
+                Which::Restart,
+                *before,
+                &error,
+                id,
+                environment,
+                &begun.none,
+                json,
+                &begun.earlier,
+            ),
+        },
+    }
+}
+
+/// What a restart does with a request that could not be made: where the daemon was seen to end, or
+/// another daemon holds the environment now, it goes on to its start, with the stop's own words
+/// for that state as the first of its result (it did not stop the daemon); any other end is the
+/// stop's, which the caller says.
+fn ended_without_a_request(
+    before: Before,
+) -> std::result::Result<(Shown, Option<u64>, End), Box<Before>> {
+    match before {
+        Before::Ended { said, pid, end } => Ok((said, pid, end)),
+        other => Err(Box::new(other)),
     }
 }
 
@@ -529,8 +546,12 @@ async fn after_the_end(
     match proved {
         Ok(Proved::Ours(started)) => {
             progress.remove_marker();
+            let said = match &stopped.first {
+                None => restarted_said(id, stopped.named, &started, creates),
+                Some(first) => unmade_then_started_said(first, &started),
+            };
             host_stop::done(
-                &restarted_said(id, stopped.named, &started, creates),
+                &said,
                 &Facts {
                     started: Some(Some(started_fact(&started))),
                     ..facts
@@ -545,15 +566,22 @@ async fn after_the_end(
             cut,
         }) => {
             progress.remove_marker();
-            let said = match launched {
-                Some(started) if cut => stopped_and_another_serves_after_a_cut(
+            let said = match (&stopped.first, launched) {
+                (Some(first), launched) => unmade_and_another_serves_said(
+                    first,
+                    stopped.successor.is_some(),
+                    serving,
+                    launched,
+                    cut,
+                ),
+                (None, Some(started)) if cut => stopped_and_another_serves_after_a_cut(
                     id,
                     stopped.named,
                     serving,
                     &started,
                     creates,
                 ),
-                launched => stopped_and_another_already_serves_said(
+                (None, launched) => stopped_and_another_already_serves_said(
                     id,
                     stopped.named,
                     serving,
@@ -568,6 +596,7 @@ async fn after_the_end(
                 .reported(
                     environment,
                     Had::Daemon(stopped.named),
+                    stopped.first.as_ref(),
                     json,
                     progress,
                     &facts,
@@ -667,7 +696,7 @@ async fn start_where_none_ran(
         }
         Err(failed) => {
             failed
-                .reported(environment, Had::NoDaemon, json, progress, &none)
+                .reported(environment, Had::NoDaemon, None, json, progress, &none)
                 .await
         }
     }
@@ -724,6 +753,74 @@ impl Proved {
             ),
         }
     }
+}
+
+/// What a restart says where the stop's request could not be made, the daemon was seen to end and the
+/// daemon that this command started answers: the stop's own words for that state, then the start.
+fn unmade_then_started_said(first: &Shown, started: &Started) -> Shown {
+    shown!(
+        "{} This command then started a control daemon{} under the {} start. No session was stopped.",
+        *first,
+        process_said(started.pid.map(u64::from)),
+        start_said(started)
+    )
+}
+
+/// What a restart says where the stop's request could not be made, the daemon was seen to end and
+/// another daemon serves the environment: after a daemon that holds it since the end, nothing was
+/// started; otherwise what this command's own start came to, where it made one.
+fn unmade_and_another_serves_said(
+    first: &Shown,
+    successor: bool,
+    serving: Option<u64>,
+    launched: Option<Started>,
+    cut: bool,
+) -> Shown {
+    if successor {
+        return shown!(
+            "{} This command sent nothing and started none. No session was stopped.",
+            *first
+        );
+    }
+    match launched {
+        None => shown!(
+            "{} A control daemon already serves the environment{}. This command started none. No \
+             session was stopped.",
+            *first,
+            process_said(serving)
+        ),
+        Some(started) if cut => shown!(
+            "{} A control daemon now serves the environment{}. This command's own start{} does not \
+             serve it. No session was stopped.",
+            *first,
+            process_said(serving),
+            process_said(started.pid.map(u64::from))
+        ),
+        Some(started) => shown!(
+            "{} A control daemon already serves the environment{}. This command's own start{} did \
+             not take the environment. No session was stopped.",
+            *first,
+            process_said(serving),
+            process_said(started.pid.map(u64::from))
+        ),
+    }
+}
+
+/// What a restart says where the stop's request could not be made, the daemon was seen to end and
+/// the start failed: the stop's own words, the start's, and what to do.
+fn unmade_and_start_failed_said(first: &Shown, own: Shown, launched: bool) -> Shown {
+    let still = if launched {
+        Shown::said(" The requested daemon may still start.")
+    } else {
+        Shown::said("")
+    };
+    shown!(
+        "{} This command's start failed: {}.{} No session was stopped: its workers keep running and \
+         a local attach still works. Fix the cause and run kr host restart again.",
+        *first,
+        own,
+        still
+    )
 }
 
 /// What a restart says where the daemon that it started answers: the process that ended and the one
@@ -900,6 +997,7 @@ impl StartFailed {
         self,
         environment: &KnownEnvironment,
         had: Had,
+        first: Option<&Shown>,
         json: bool,
         progress: &Progress,
         facts: &Facts,
@@ -916,7 +1014,10 @@ impl StartFailed {
         {
             progress.remove_marker();
         }
-        let message = start_failed_said(id, had, self.error.said(), self.launched);
+        let message = match first {
+            None => start_failed_said(id, had, self.error.said(), self.launched),
+            Some(first) => unmade_and_start_failed_said(first, self.error.said(), self.launched),
+        };
         let error = match self.error {
             CliError::HostUnavailable(_) => CliError::HostUnavailable(message),
             CliError::Unfinished { code, .. } => CliError::Unfinished { code, message },
@@ -1615,6 +1716,117 @@ mod tests {
         ] {
             let (knows, said) = says(&host, stage, Beyond::Stop, false);
             assert_eq!(knows, expected, "{stage:?}: {said}");
+        }
+    }
+
+    /// The stop's own words for a request that could not be made where the daemon ended, as the
+    /// restart takes them, and the environment they name.
+    fn the_stops_words_for_an_end_without_a_request() -> (EnvironmentId, Shown) {
+        let id = kr_ipc::testing::TempHost::create().environment_id();
+        let first = host_stop::ended_before_the_request_said(
+            id,
+            Some(4000),
+            &End::Gone,
+            &Shown::said("the connection closed"),
+        );
+        assert_eq!(
+            first.to_string(),
+            format!(
+                "The control daemon for environment {id} (process 4000) ended, and this command \
+                 could not make its request for it: the connection closed. This command sent \
+                 nothing."
+            )
+        );
+        (id, first)
+    }
+
+    /// Where the stop's request could not be made and the daemon was seen to end, the restart says
+    /// the stop's own words first, that it did not stop the daemon, and then what its start did:
+    /// the start took the environment, another daemon serves it (with this command's own start
+    /// or with none, and after a cut exchange), another daemon holds it since the end, or the
+    /// start failed.
+    #[test]
+    fn a_request_that_could_not_be_made_where_the_daemon_ended_says_so_and_then_what_the_start_did()
+    {
+        let (_, first) = the_stops_words_for_an_end_without_a_request();
+        let x = first.to_string();
+        let start = start_said(&started(Some(40)));
+        assert_eq!(
+            unmade_then_started_said(&first, &started(Some(40))).to_string(),
+            format!(
+                "{x} This command then started a control daemon (process 40) under the {start} \
+                 start. No session was stopped."
+            )
+        );
+        assert_eq!(
+            unmade_and_another_serves_said(&first, false, Some(50), Some(started(Some(40))), false)
+                .to_string(),
+            format!(
+                "{x} A control daemon already serves the environment (process 50). This command's \
+                 own start (process 40) did not take the environment. No session was stopped."
+            )
+        );
+        assert_eq!(
+            unmade_and_another_serves_said(&first, false, Some(50), None, false).to_string(),
+            format!(
+                "{x} A control daemon already serves the environment (process 50). This command \
+                 started none. No session was stopped."
+            )
+        );
+        assert_eq!(
+            unmade_and_another_serves_said(&first, false, Some(50), Some(started(Some(40))), true)
+                .to_string(),
+            format!(
+                "{x} A control daemon now serves the environment (process 50). This command's own \
+                 start (process 40) does not serve it. No session was stopped."
+            )
+        );
+        assert_eq!(
+            unmade_and_another_serves_said(&first, true, Some(50), None, false).to_string(),
+            format!("{x} This command sent nothing and started none. No session was stopped.")
+        );
+        for (launched, still) in [
+            (false, ""),
+            (true, " The requested daemon may still start."),
+        ] {
+            assert_eq!(
+                unmade_and_start_failed_said(
+                    &first,
+                    Shown::said("the log could not be used"),
+                    launched
+                )
+                .to_string(),
+                format!(
+                    "{x} This command's start failed: the log could not be used.{still} No session \
+                     was stopped: its workers keep running and a local attach still works. Fix the \
+                     cause and run kr host restart again."
+                )
+            );
+        }
+    }
+
+    /// A request that could not be made where the daemon was seen to end, or another holds the
+    /// environment now, goes on to the start with the stop's own words and what the end was; any
+    /// other end of a request that could not be made is the stop's.
+    #[test]
+    fn only_an_end_that_was_seen_goes_on_to_the_start_and_any_other_is_the_stops() {
+        let said = Shown::said("the daemon ended");
+        for end in [End::Gone, End::Successor(Some(77))] {
+            let before = Before::Ended {
+                said: said.clone(),
+                pid: Some(4000),
+                end,
+            };
+            match ended_without_a_request(before) {
+                Ok((first, pid, _)) => {
+                    assert_eq!(first.to_string(), "the daemon ended");
+                    assert_eq!(pid, Some(4000));
+                }
+                Err(_) => panic!("an end that was seen goes on"),
+            }
+        }
+        for before in [Before::Silent { accepted: true }, Before::OwnFault] {
+            assert!(ended_without_a_request(before).is_err());
         }
     }
 }
