@@ -707,21 +707,24 @@ async fn a_lease_that_runs_out_ends_the_stream_the_worker_was_sending() {
     world.close();
 }
 
-/// KR-REQ-17.54: a mutation inside the dispatch boundary when the host restricts its local owner
-/// is not dispatched, even if the host is open again by the time it is released.
+/// KR-REQ-17.54: a mutation that was admitted before the host restricted its local owner, and
+/// takes the dispatch boundary after, is not dispatched, even if the host is open again by the
+/// time it takes it.
 ///
-/// The worker stops the mutation the moment it holds the boundary. The daemon closes the host and
-/// opens it again. The gate allows the mutation now, and what refuses it is that the owner was
-/// restricted while it waited: it was admitted under a state that has since been taken away.
+/// The worker stops the mutation after the checks of its entry and before it takes the boundary.
+/// The daemon closes the host and opens it again. The gate allows the mutation now, and what
+/// refuses it is that the owner was restricted while it waited: it was admitted under a state that
+/// has since been taken away. A mutation that already holds the boundary is not in this case: the
+/// statement is acknowledged only after it has ended, as the case that follows shows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_mutation_inside_the_dispatch_boundary_when_the_host_restricts_its_owner_is_not_dispatched()
+async fn a_mutation_admitted_before_the_host_restricts_its_owner_is_not_dispatched_after_the_restriction()
  {
     let world = world("exec cat", true).await;
     let mut window = world.window().await;
     let mut daemon = world.authority(1).await;
     tell(&mut daemon, open(1)).await;
 
-    let (inside, release) = world.service.pause_inside_boundary();
+    let (inside, release) = world.service.pause_before_the_boundary();
     let target = world.target();
     let session_id = world.session_id;
     let attaching = tokio::spawn(async move {
@@ -749,7 +752,10 @@ async fn a_mutation_inside_the_dispatch_boundary_when_the_host_restricts_its_own
         tokio::task::spawn_blocking(move || inside.recv_timeout(LIVENESS_DEADLINE).is_ok())
             .await
             .expect("the waiting thread finishes");
-    assert!(arrived, "the mutation never took the dispatch boundary");
+    assert!(
+        arrived,
+        "the mutation never reached the stop before the dispatch boundary"
+    );
 
     tell(&mut daemon, closed(2)).await;
     tell(&mut daemon, open(3)).await;
