@@ -90,20 +90,36 @@ A candidate that presents a direct invitation this host is not offering is refus
 refusal's code corresponds to the reason the direct invitation is no longer available
 (`PAIRING_EXPIRED` if the direct invitation timed out, `PAIRING_ATTEMPTS_EXHAUSTED` if it spent its
 guesses, or `PAIRING_REJECTED` for every other ending: the direct invitation was reused, cancelled,
-denied, or cancelled due to a host restart). The store will remember the reason that the direct
+denied, ended because the host lists the device that used it, or cancelled due to a host restart).
+The one exception is the device that the host refused as already listed: it gets
+`PAIRING_ENDPOINT_PAIRED` when it asks again, as the next paragraph says, and no other peer gets
+that code. The store will remember the reason that the direct
 invitation became unavailable even if the direct invitation object itself is no longer available. If
 the candidate provides an identifier this host never issued as a direct invitation, the method will
 complete with the error code `PERMISSION_DENIED`. That is all the candidate is told.
 
-A device that the host still lists as paired cannot be paired again. The host refuses it at
-`pair.finish` (code mode) or `pair.redeem` (direct mode), after the code or secret and the endpoint
-proofs and before the owner is shown a candidate, with the code `PAIRING_ENDPOINT_PAIRED`, and the
-invitation ends with the reason `endpoint_paired`. A repeat of the request, on the same connection
-or a new one, gets the same code, and `pair.status` reports the reason. The issuing owner's view of
-that invitation carries `existing`, the name and pairing date from the host's own record. The device
-shows `host_still_lists_device` and offers no retry: the owner removes the listed pairing, the
-person forgets the host on the device if the device still lists it, and a new invitation pairs it
-as a new device with a new identity.
+A device that the host still lists as paired cannot be paired again. The host reads its list of
+devices before the invitation changes state, and refuses the device at `pair.finish` (code mode) or
+`pair.redeem` (direct mode) once the code or secret and the endpoint proofs have held, so before the
+owner is shown a candidate. The refusal carries the code `PAIRING_ENDPOINT_PAIRED`, and the
+invitation ends with the reason `endpoint_paired`. A read of the list that fails changes nothing:
+the invitation stays as it was and the same request can be made again.
+
+A repeat of the request from that device, on the same connection or a new one, gets the same code
+while the host keeps that invitation: the current one, or one of the sixteen it keeps. In code mode
+a repeat of `pair.finish` gets it only while the refused invitation is the host's current one;
+after the host issues the next invitation or restarts, a repeat gets `PERMISSION_DENIED`.
+`pair.status` reports the reason to that device. Another device that presents the ended invitation,
+or a room admission that arrives after the end, gets `PAIRING_REJECTED` like any other ending, so
+no device is told that the host lists a device that it does not list.
+
+The issuing owner's view of that invitation carries `existing`, the name and pairing date from the
+host's own record, only while that record is in force. After the owner removed the record, or its
+grant ran out, the view carries no record and says that the pairing has ended. The device shows
+`host_still_lists_device` and offers no retry: the owner removes the listed pairing, the person
+forgets the host on the device if the device still lists it, and a new invitation pairs it as a new
+device with a new identity. That pairing needs the owner's confirmation on an owner device, as every
+pairing does, so where this device was the host's only owner device no device can confirm it.
 
 **The candidate** permits five attempts per entered code, and never retries a failed key
 confirmation automatically. The counter is keyed by an HMAC of the configured origin and the
