@@ -2879,14 +2879,7 @@ pub async fn hosts_forget<R: tauri::Runtime>(
         .device()?
         .host_by_reference(&reference)
         .ok_or_else(crate::hosts::unknown_host)?;
-    let forgotten = crate::hosts::forget_host(&app, &host).await?;
-    // What is kept of a host's notifications goes with the host. The host's own destination stays
-    // until its owner removes this device: only the host revokes an authorisation it holds.
-    if let Some(desk) = state.push() {
-        desk.forgotten(host.host_device_id);
-    }
-    state.inbox().forgotten(host.host_device_id);
-    Ok(forgotten)
+    crate::hosts::forget_host(&app, &host).await
 }
 
 /// The confirmations this computer's hosts ask for, as descriptions, and the ceremony this
