@@ -1013,7 +1013,8 @@ impl Controller {
             }
             return Err(ControllerError::InvalidArgument(format!(
                 "that device's pairing ends in {}, before this share would; choose a shorter \
-                 lifetime or pair the device again",
+                 lifetime, or pair the device again after the pairing has ended (the host \
+                 refuses a new pairing while this one stands)",
                 how_long(pairing_ends.saturating_sub(request.now_ms))
             )));
         }
@@ -2873,8 +2874,9 @@ impl Controller {
                 Ok(())
             } else {
                 Err(ControllerError::PermissionDenied {
-                    detail: "this device's grant has run out, so it cannot rotate its key; the \
-                             owner can invite a device this host has not paired before"
+                    detail: "this device's grant has run out, so it cannot rotate its key; it can \
+                             pair with this host again with a new invitation after it forgets \
+                             this host"
                         .to_owned(),
                 })
             }
@@ -3845,7 +3847,9 @@ mod tests {
     use crate::authority::AdmittedMutation;
     use crate::service::Controller;
     use crate::service::admission::AdmittedConnection;
-    use crate::service::authority_changes::{barrier_read_again, carries_what_was_given};
+    use crate::service::authority_changes::{
+        AuthorityCaller, barrier_read_again, carries_what_was_given,
+    };
     use crate::service::net::devices::DeviceRecord;
     use crate::service::net::tests::{daemon_on, manual_clocks};
 
@@ -4125,13 +4129,76 @@ mod tests {
                 let crate::error::ControllerError::PermissionDenied { detail } = &error else {
                     panic!("a grant that has run out is refused: {error}");
                 };
-                assert!(detail.contains("invite"), "{detail}");
+                assert!(
+                    detail.contains("again with a new invitation after it forgets this host"),
+                    "{detail}"
+                );
+                assert!(!detail.contains("has not paired before"), "{detail}");
                 assert_eq!(host.revisions(), (1, Some(1)));
             } else {
                 outcome.expect("the control registers");
                 assert_eq!(host.revisions(), (2, Some(2)));
             }
         }
+    }
+
+    /// KR-REQ-25.10: the host refuses a new pairing of a device it still lists, so a share that
+    /// would end after its recipient's pairing is refused with the time the pairing has left and
+    /// says to pair the device again only once the pairing has ended, with the reason. The
+    /// control: a share inside the pairing is accepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_share_past_the_pairings_end_is_told_when_the_device_can_be_paired_again() {
+        use kr_protocol::sharing::{AuthorityNotice, RoleSelection, SessionRole};
+
+        let now = kr_ipc::now_ms().get();
+        let host = Host::start(
+            GrantExpiry::At {
+                expires_at_ms: TimestampMs::new(now + 30 * 60_000),
+            },
+            false,
+        )
+        .await;
+        let share = |lifetime_ms: u64| {
+            let selection = RoleSelection::plain(SessionRole::Viewer);
+            crate::sharing::ShareRequest {
+                invitation_id: kr_protocol::ids::InvitationId::new(uuid(41)),
+                grant_id: GrantId::new(uuid(42)),
+                environment_id: host.controller.paths().environment_id(),
+                session_id: kr_protocol::ids::SessionId::new(uuid(43)),
+                issuer_device_id: host.controller.host_device_id(),
+                recipient_device_id: host.device_id,
+                parent_grant_id: None,
+                accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
+                selection,
+                lifetime_ms: Some(lifetime_ms),
+                live_screen: None,
+                named_questions: Vec::new(),
+                named_approvals: Vec::new(),
+                authority_revision: host.controller.policy().authority_revision(),
+                owner_confirmed: false,
+                now_ms: now,
+            }
+        };
+
+        let refused = host
+            .controller
+            .check_recipient_pairing(AuthorityCaller::Owner, &share(60 * 60_000))
+            .expect_err("a share past the pairing's end is refused");
+        assert_eq!(refused.code(), ErrorCode::InvalidArgument, "{refused}");
+        let said = refused.to_string();
+        assert!(said.contains("pairing ends in"), "{said}");
+        assert!(
+            said.contains("pair the device again after the pairing has ended"),
+            "{said}"
+        );
+        assert!(
+            said.contains("the host refuses a new pairing while this one stands"),
+            "{said}"
+        );
+
+        host.controller
+            .check_recipient_pairing(AuthorityCaller::Owner, &share(10 * 60_000))
+            .expect("a share inside the pairing is accepted");
     }
 
     /// A registration the journal has taken is finished in the directory whatever has happened to

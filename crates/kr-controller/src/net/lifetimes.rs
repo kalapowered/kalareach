@@ -227,8 +227,9 @@ impl GrantLifetimes {
     /// over.
     pub fn deadline(&self, record: &DeviceRecord) -> Result<Option<ContinuousInstant>> {
         let over = || ControllerError::PermissionDenied {
-            detail: "this device's grant has run out; the owner can invite a device this host \
-                     has not paired before"
+            detail: "this device's grant has run out; it can pair with this host again with a new \
+                     invitation after it forgets this host, and an owner device confirms the new \
+                     pairing"
                 .to_owned(),
         };
         match self.lifetime(record)? {
@@ -1309,9 +1310,9 @@ mod tests {
             .expect("the device");
         assert!(recorded.expired_at_ms.is_some(), "the expiry is on record");
 
-        // What a device whose grant has run out is told names a way forward this host takes: it
-        // refuses a second pairing of one device, so the owner invites a device it has not paired
-        // before. The end on record is read in a boot of its own, where no anchor is left.
+        // What a device whose grant has run out is told names a way forward this host takes: a new
+        // invitation, after the device forgets this host. The end on record is read in a boot of
+        // its own, where no anchor is left.
         let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
         let rebooted = lifetimes_at(
             &devices,
@@ -1327,7 +1328,14 @@ mod tests {
         let Err(ControllerError::PermissionDenied { detail }) = refused else {
             panic!("a grant that has run out is refused its deadline: {refused:?}");
         };
-        assert!(detail.contains("invite"), "{detail}");
+        assert!(
+            detail.contains(
+                "again with a new invitation after it forgets this host, and an owner device \
+                 confirms the new pairing"
+            ),
+            "{detail}"
+        );
+        assert!(!detail.contains("has not paired before"), "{detail}");
     }
 
     /// A device whose grant was anchored in this run and ran out on the continuous clock before it

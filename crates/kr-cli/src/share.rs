@@ -68,7 +68,8 @@ pub const SHARE_WORD: &str = "share";
 /// How long a share lasts when the person names nothing and the device's pairing allows it.
 const DEFAULT_LIFETIME_MS: u64 = 60 * 60_000;
 
-/// The shortest share the host is asked for: a pairing with less left than this is paired again.
+/// The shortest share the host is asked for: a pairing with less left than this ends before a share
+/// can begin.
 const MIN_LIFETIME_MS: u64 = 60_000;
 
 /// What is left of a pairing's end for the host to claim the share in: the host dates a share when
@@ -205,7 +206,8 @@ fn lifetime(asked: Option<Lasts>, pairing_ends_at_ms: Option<u64>, now_ms: u64) 
     if milliseconds < MIN_LIFETIME_MS {
         return Err(CliError::Usage(Shown::said(
             "that device's pairing ends in less than a minute, so a share to it would hardly \
-             begin; pair the device again first",
+             begin; once it has ended, the device has to be paired again before a session is \
+             shared with it",
         )));
     }
     Ok(milliseconds)
@@ -2044,6 +2046,41 @@ mod tests {
         ] {
             assert!(matches!(refused, Err(CliError::Usage(_))), "{refused:?}");
         }
+    }
+
+    /// The host refuses a new pairing of a device it still lists, so a share refused because the
+    /// pairing ends in under a minute says to pair the device again only once the pairing has
+    /// ended, and a share refused because the pairing has run out, which has ended, says it
+    /// without a condition.
+    #[test]
+    fn a_device_is_paired_again_only_after_its_pairing_has_ended() {
+        let refused = lifetime(None, Some(NOW + 30_000), NOW).expect_err("less than a minute left");
+        let CliError::Usage(said) = refused else {
+            panic!("a usage mistake: {refused:?}");
+        };
+        let said = said.as_str();
+        assert!(said.contains("once it has ended"), "it says when: {said}");
+        let when = said.find("once it has ended").expect("found above");
+        let again = said.find("paired again").expect(said);
+        assert!(
+            when < again,
+            "the condition comes before the remedy: {said}"
+        );
+        assert!(!said.contains("pair the device again first"), "{said}");
+
+        let mut ran_out = device(3, "old phone");
+        ran_out.grant_expired = true;
+        let refused = pick_device(&[ran_out], "old phone", &Shown::said(""))
+            .expect_err("a pairing that has run out takes no share");
+        let CliError::Usage(said) = refused else {
+            panic!("a usage mistake: {refused:?}");
+        };
+        assert!(
+            said.as_str()
+                .contains("pairing has run out; pair it again before"),
+            "{}",
+            said.as_str()
+        );
     }
 
     /// A share is asked for what is left of the end the person was shown, so the time spent at the

@@ -926,7 +926,8 @@ impl NetworkHost {
                 detail: "this device's record was withdrawn during the handshake".to_owned(),
             })?;
         // A grant issued under authority that has since been replaced is not current authority.
-        // The device pairs again, or the host advances its record; it does not act on the old one.
+        // The host advances its record, or the device pairs again once this record has ended; it
+        // does not act on the old one.
         if record.grant.authority_revision.get() > admitted_revision.get() {
             return Err(ControllerError::PermissionDenied {
                 detail: "this device's grant names an authority revision this host has not reached"
