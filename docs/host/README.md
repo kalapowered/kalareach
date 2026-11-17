@@ -9101,9 +9101,12 @@ connection the admission chose still takes frames, and what the operation needs 
 prompt is not submitted over a turn that began since, and a steer or a cancellation is not sent for
 a turn that ended or was replaced, since a turn starts and ends without moving the revision). An
 answer is also checked against its decoder's authority, which an owner or a narrower installation
-withdraws without moving the revision, and against what the connection carries; a revocation or a
-component fault disables the binding's rich capabilities and lets what it already admitted finish.
-A refusal there is proven: nothing was sent, the broker wrote no dispatch marker, and the receipt
+withdraws without moving the revision, and against what the connection carries. A plugin action,
+including the cancellation the host carries out itself, is checked against the package grants its
+admission needed: a narrower installation that removes one of them stops the action at that check,
+until the call that sends it. A revocation or a component fault disables the binding's rich
+capabilities and lets what it already admitted finish, and a binding that is due to end stays until
+its admitted action is sent. A refusal there is proven: nothing was sent, the broker wrote no dispatch marker, and the receipt
 is refused, not uncertain. What nothing orders is the interval between the take and the bytes reaching
 the transport's queue. A frame the host writes names its thread (an approval's answer names its
 request), so a frame past the take reaches the thread the binding named when it was admitted and
