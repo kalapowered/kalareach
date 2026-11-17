@@ -22,6 +22,9 @@ name: keep-evidence-test
 
 on:
   workflow_dispatch:
+  push:
+    branches-ignore: [main]
+    paths: [.github/workflows/keep-evidence-test.yml]
 
 permissions:
   contents: read
