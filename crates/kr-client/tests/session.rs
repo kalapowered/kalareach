@@ -4317,7 +4317,9 @@ async fn a_request_the_socket_cannot_take_before_its_time_runs_out_is_cut_off_an
 /// The case needs a socket that takes part of a frame of 900,000 bytes from a peer that reads
 /// nothing, which a Unix socket does. A Windows named pipe does not: its write takes the whole slice
 /// it is offered, and a send without a limit offers the whole frame as one slice, so the frame goes
-/// whole there and the premise cannot be made. It is for Unix alone.
+/// whole there and the premise cannot be made. It is for Unix alone; the rule holds on every
+/// platform by
+/// `a_bounded_send_dropped_after_part_of_its_frame_went_ends_the_connection`.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_send_dropped_inside_a_frame_ends_the_connection() {
@@ -4387,7 +4389,8 @@ async fn a_send_dropped_inside_a_frame_ends_the_connection() {
 /// nothing, which a Unix socket does. A Windows named pipe does not: its write takes the whole slice
 /// it is offered, and a send without a limit offers the whole frame as one slice, so the frame goes
 /// whole there, nothing is lost with the drop, and the next call waits behind it. It is for Unix
-/// alone.
+/// alone; the rule holds on every platform by
+/// `a_call_made_at_once_after_a_bounded_send_was_dropped_after_part_of_its_frame_went_is_refused_as_not_sent`.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_call_made_at_once_after_a_send_was_dropped_inside_a_frame_is_refused_as_not_sent() {
@@ -4428,6 +4431,180 @@ async fn a_call_made_at_once_after_a_send_was_dropped_inside_a_frame_is_refused_
     assert!(
         book.iter()
             .all(|action| action.action_id == first.action_id()),
+        "nothing of the refused call is on the book"
+    );
+    session.close();
+    serving.abort();
+}
+
+/// A bounded send whose task is dropped after part of its frame went ends the connection, on every
+/// platform: the session says that the connection ended, a later call is told so, and the peer
+/// acts on none of it.
+///
+/// The bounded write hands a frame to the connection in pieces and asks whether it is still wanted
+/// before each, so a frame of 900,000 bytes is part way to a peer that reads nothing whatever a
+/// socket or a pipe holds. The case drops the send at the third look: the first is the
+/// connection's, once it holds the turn, the second comes before the first piece goes, and the third
+/// before the next, so a piece is with the peer and the frame is not finished. A send dropped before
+/// a byte of its frame went leaves the connection standing, which
+/// `a_send_dropped_before_a_byte_of_its_frame_went_leaves_the_connection_standing` holds.
+#[tokio::test]
+async fn a_bounded_send_dropped_after_part_of_its_frame_went_ends_the_connection() {
+    let tree = kr_ipc::testing::TempHost::create();
+    let endpoint = tree
+        .paths()
+        .environment(tree.environment_id())
+        .controller_endpoint()
+        .expect("a controller endpoint");
+    let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("a local endpoint");
+    let script = Arc::new(HostScript::default());
+    script.unread.store(true, Ordering::Release);
+    let serving = spawn_local_host(listener, Arc::clone(&script));
+    let transport = kr_client::ipc::IpcTransport::connect(&endpoint, kr_cli_build_id())
+        .await
+        .expect("a local connection");
+    let session = Arc::new(Session::start(transport.shared()).expect("a session"));
+
+    let request = padded_request(&session, 0x68, 900_000).await;
+    let looks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dropped_inside_the_frame = {
+        let looks = Arc::clone(&looks);
+        move || {
+            if looks.fetch_add(1, Ordering::AcqRel) >= 2 {
+                std::panic::resume_unwind(Box::new("the send is dropped inside its frame"));
+            }
+            true
+        }
+    };
+    let sending = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move {
+            session
+                .send_before(
+                    &request,
+                    tokio::time::Instant::now() + Duration::from_secs(60),
+                    &dropped_inside_the_frame,
+                )
+                .await
+        })
+    };
+    let joined = bounded_send("the send that is dropped inside its frame", sending).await;
+    assert!(
+        joined.is_err_and(|error| error.is_panic()),
+        "the send ran past its third look"
+    );
+    assert_eq!(
+        looks.load(Ordering::Acquire),
+        3,
+        "the send was dropped at the look after the first piece"
+    );
+    assert!(
+        tokio::time::timeout(BOUNDED_SEND_OBSERVATION, session.closed())
+            .await
+            .is_ok(),
+        "the session did not record the end of the connection after its frame was dropped part way"
+    );
+    let read = bounded_send(
+        "a later call on a connection that ended",
+        session.read::<_, SessionList>(Method::SessionList, &Empty {}),
+    )
+    .await;
+    assert!(
+        matches!(read, Err(ClientError::ConnectionEnded)),
+        "a later call is told that the connection ended: {read:?}"
+    );
+
+    // The peer reads now: part of the frame, and then the end of the connection.
+    script.unread.store(false, Ordering::Release);
+    script.reading.notify_waiters();
+    assert!(
+        tokio::time::timeout(
+            BOUNDED_SEND_OBSERVATION,
+            script.served_to_the_end.notified()
+        )
+        .await
+        .is_ok(),
+        "the peer was not told that the connection ended"
+    );
+    assert!(
+        script.actions.lock().await.is_empty(),
+        "the peer read no request: the frame it was given stops short"
+    );
+    serving.abort();
+}
+
+/// A call that is made at once after a bounded send was dropped after part of its frame went, with
+/// no wait for the session's end, is refused as not sent, on every platform: the transport lost its
+/// writing side with the drop, the call is not registered, nothing of it is on the book, and its
+/// caller is told what the session tells for an ended connection. The send is dropped as
+/// `a_bounded_send_dropped_after_part_of_its_frame_went_ends_the_connection` drops it.
+#[tokio::test]
+async fn a_call_made_at_once_after_a_bounded_send_was_dropped_after_part_of_its_frame_went_is_refused_as_not_sent()
+ {
+    let tree = kr_ipc::testing::TempHost::create();
+    let endpoint = tree
+        .paths()
+        .environment(tree.environment_id())
+        .controller_endpoint()
+        .expect("a controller endpoint");
+    let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("a local endpoint");
+    let script = Arc::new(HostScript::default());
+    script.unread.store(true, Ordering::Release);
+    let serving = spawn_local_host(listener, Arc::clone(&script));
+    let transport = kr_client::ipc::IpcTransport::connect(&endpoint, kr_cli_build_id())
+        .await
+        .expect("a local connection");
+    let session = Arc::new(Session::start(transport.shared()).expect("a session"));
+
+    // Both requests are composed before the first is sent, so that nothing is awaited between the
+    // drop of the first and the call of the second.
+    let first = padded_request(&session, 0x75, 900_000).await;
+    let first_action = first.action_id();
+    let second = padded_request(&session, 0x76, 16).await;
+    let looks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dropped_inside_the_frame = {
+        let looks = Arc::clone(&looks);
+        move || {
+            if looks.fetch_add(1, Ordering::AcqRel) >= 2 {
+                std::panic::resume_unwind(Box::new("the send is dropped inside its frame"));
+            }
+            true
+        }
+    };
+    let sending = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move {
+            session
+                .send_before(
+                    &first,
+                    tokio::time::Instant::now() + Duration::from_secs(60),
+                    &dropped_inside_the_frame,
+                )
+                .await
+        })
+    };
+    let joined = bounded_send("the send that is dropped inside its frame", sending).await;
+    assert!(
+        joined.is_err_and(|error| error.is_panic()),
+        "the send ran past its third look"
+    );
+    assert_eq!(
+        looks.load(Ordering::Acquire),
+        3,
+        "the send was dropped at the look after the first piece"
+    );
+    let refused = bounded_send(
+        "a call made after the writing side was lost",
+        session.send(&second),
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(ClientError::ConnectionEnded)),
+        "a call made after the writing side was lost is refused as not sent: {refused:?}"
+    );
+    let book = session.submitted_actions().await;
+    assert!(
+        book.iter().all(|action| action.action_id == first_action),
         "nothing of the refused call is on the book"
     );
     session.close();
