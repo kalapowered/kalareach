@@ -1548,7 +1548,7 @@ configuration /home/someone/.config/kalareach/environments/ab12cd34/config.json 
 ok             The runtime directory is owner-only
 warning        Every published descriptor answered its challenge
                1 verified, 1 quarantined
-               A worker that was busy when the daemon started returns when the next read of its session, the session list, a local caller's prompt or a device's link looks for it. A descriptor that is still counted after that is never used: remove it once its session is known to be gone.
+               A worker that was busy when the daemon started returns once it is free, when a read of its session, the session list, a local caller's prompt or a device's link looks for it. A descriptor that is still counted after that is never used: remove it once its session is known to be gone.
 not_applicable Catalogue metadata and its capability evidence
                no catalogue is synchronised on this host
 14 checks: 12 passed, 1 with something worth knowing, 0 failed, 1 not applicable

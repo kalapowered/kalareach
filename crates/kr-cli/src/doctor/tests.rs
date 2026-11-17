@@ -34,7 +34,12 @@ fn checks() -> Vec<DoctorCheck> {
                 .stated(" verified, ")
                 .number(1)
                 .stated(" quarantined"),
-            Some("A quarantined descriptor is never used."),
+            Some(
+                "A worker that was busy when the daemon started returns once it is free, when a \
+                 read of its session, the session list, a local caller's prompt or a device's \
+                 link looks for it. A descriptor that is still counted after that is never used: \
+                 remove it once its session is known to be gone.",
+            ),
         ),
         DoctorCheck::new(
             "catalogue",
@@ -95,7 +100,7 @@ fn the_default_output_shows_evidence_only_where_a_check_did_not_pass() {
         "a warning's evidence is: {text}"
     );
     assert!(
-        text.contains("A quarantined descriptor is never used."),
+        text.contains("A descriptor that is still counted after that is never used"),
         "and its remedy with it: {text}"
     );
     assert!(
