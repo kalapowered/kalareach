@@ -5683,3 +5683,63 @@ async fn a_held_lease_continues_across_a_replacement_of_its_pairing_record() {
         "no second lease was opened"
     );
 }
+
+/// KR-REQ-17.51: a request that the keeper made while the device's record stood, and that the
+/// service answers after the record was replaced, is saved under the endpoint. The next pass finds
+/// the endpoint paired by the new record and keeps the lease: no ending is sent for it, and the
+/// pair holds the one lease the service opened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lease_answered_after_the_record_was_replaced_is_kept_for_the_pair() {
+    let rig = Rig::start().await;
+    let phone = Device::create().await;
+    rig.served.web().fail_matching(
+        ISSUE,
+        serde_json::json!({ "destination_endpoint_key": destination_of(&phone) }),
+        1,
+        Moment::Gate,
+    );
+    let first = pair_with(
+        &rig.host,
+        &phone,
+        &rig.owner,
+        proposal(&[ActionRight::SessionView]),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(180), async {
+        while rig.requests_for(&first) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the keeper asks for the pair's lease, and the service holds the request");
+
+    rig.host
+        .network()
+        .revoke_device(first.device_id)
+        .await
+        .expect("the device is revoked");
+    let second = pair_with(
+        &rig.host,
+        &phone,
+        &rig.owner,
+        proposal(&[ActionRight::SessionView]),
+    )
+    .await;
+    rig.served.web().release_held();
+    rig.until("the pair holds the lease the held request opened", || {
+        rig.holds(&second)
+    })
+    .await;
+    rig.pass().await;
+    rig.pass().await;
+
+    let leases = rig.leases_for(&second);
+    assert_eq!(leases.len(), 1, "the service opened one lease for the pair");
+    assert!(leases[0].live, "the lease stands");
+    assert_eq!(rig.revocations_of(&leases[0].lease_id), 0);
+    assert_eq!(rig.endings_owed(), 0);
+    assert_eq!(
+        rig.lease_in_the_record(&second),
+        Some(Some(leases[0].lease_id.clone()))
+    );
+}
