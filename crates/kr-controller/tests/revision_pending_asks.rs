@@ -2549,9 +2549,15 @@ async fn a_paired_devices_link_is_refused_while_the_worker_is_out_and_adopts_it_
     assert_eq!(worker.attachments(), 0, "nothing reached the worker");
 
     let_go_and_wait(&host, worker, held).await;
-    device_attach(&link, &host, session_id)
-        .await
-        .expect("the link's next try adopts the worker and opens the session");
+    let adopted = device_attach(&link, &host, session_id).await;
+    if let Err(error) = &adopted {
+        assert_ne!(
+            error.code(),
+            kr_protocol::error::ErrorCode::UnknownSession,
+            "the link's next try is refused as a session the host does not serve: {error}"
+        );
+    }
+    adopted.expect("the link's second attach is answered");
     assert_eq!(
         worker.attachments(),
         1,
