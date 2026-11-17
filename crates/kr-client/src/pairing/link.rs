@@ -306,15 +306,17 @@ pub trait HostLink: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
-    /// Takes `host`, the pairing the person forgot, out of this device's one endpoint: its address
-    /// lookups are no longer asked and each relay that no other host names leaves the relay map. A
-    /// connection that is open stays open until whoever holds it closes it. A host the device never
-    /// dialled changes nothing.
+    /// Takes `host`, the pairing the person forgot, out of this device's one endpoint, unless
+    /// another pairing of the same host that is not forgotten introduced it: its address lookups are
+    /// no longer asked and each relay that no other host names leaves the relay map. A connection
+    /// that is open stays open until whoever holds it closes it. A host the device never dialled
+    /// changes nothing.
     ///
-    /// A dial that began under that pairing and reaches the endpoint after this call is refused, and
-    /// one that was in the middle of putting the host there is taken back, so the host is not in the
-    /// endpoint when the call has returned. A new pairing with the same host is another pairing and
-    /// is not refused.
+    /// A dial under that pairing that reaches the endpoint after this call began is refused. A dial
+    /// that is in the middle of introducing the host is waited for, or stopped by its caller, and
+    /// the host it introduced goes with the rest, so the host is not in the endpoint when the call
+    /// has returned, unless another pairing keeps it there. A new pairing with the same host is
+    /// another pairing and is not refused.
     ///
     /// A link that wraps another forwards this call. It has no default, so that a wrapper cannot
     /// leave a forgotten host in the endpoint by forgetting to.
@@ -452,6 +454,10 @@ impl Bound {
 ///
 /// The locks are taken in one order on every path: a host's own lock, then the device lock.
 /// [`Self::close`] and every other path that holds the device lock take no host's lock.
+///
+/// The endpoint holds one entry for each host, with the services of the last introduction, and a
+/// device holds one record of a host, so two pairings of one host that are not forgotten, with
+/// different network configurations, do not meet.
 pub struct EndpointPool {
     transport: TransportIdentityKeyPair,
     bind: Option<SocketAddr>,
@@ -596,7 +602,10 @@ impl EndpointPool {
     /// or a first bind holds it, which a forget waits for in any case, and for the transport's
     /// change of the relay map, which takes the transport's own turn and the library's sends to its
     /// socket task. Nothing in it waits on the network but the library's own close, which the
-    /// library bounds. A dial of another host and a forget of another host do not wait for it.
+    /// library bounds. A dial or a forget of another host does not wait for this host's lock. It
+    /// can wait for what all hosts share: the device lock, which a first bind and a close hold, and
+    /// the transport's turn at the relay map, which the change of one host's relays holds for as
+    /// long as one send to the library's socket task.
     pub async fn forget(&self, host: &EndpointKey, pairing: DeviceId) {
         self.forgotten
             .lock()
@@ -1481,11 +1490,12 @@ mod tests {
         pool.close().await;
     }
 
-    /// A forget waits for the introduction of its own host and for nothing else: while a dial of one
-    /// host is held, a dial of another host returns, and so does a forget of another host. A dial that
-    /// began before the forget still returns its endpoint, and the host is out when both have ended.
+    /// A forget waits for the introduction of its own host, and not for the host's lock when it is
+    /// another host's: while a dial of one host is held in its introduction, a dial of another host
+    /// returns, and so does a forget of another host. A dial that began before the forget still
+    /// returns its endpoint, and the host is out when both have ended.
     #[tokio::test]
-    async fn a_forget_waits_for_the_introduction_of_its_host_and_no_other_host_waits() {
+    async fn a_forget_waits_for_the_introduction_of_its_host_and_not_for_the_lock_of_another() {
         let pool = loopback_pool();
         let (held_host, other, unknown) = (key(), key(), key());
         let held_relay = "https://127.0.0.1:10";

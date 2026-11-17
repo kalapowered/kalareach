@@ -1294,8 +1294,8 @@ impl LinkControl {
         *self.forgetting.lock().expect("the record") = Some(Arc::new(look));
     }
 
-    /// Holds the next dial of `host` that has passed the device endpoint's first look at its
-    /// pairing and is about to introduce the host, until the hold is released.
+    /// Holds the next dial of `host` that holds the host's lock in the device endpoint, has decided
+    /// on its pairing and is about to introduce the host, until the hold is released.
     ///
     /// # Panics
     ///
