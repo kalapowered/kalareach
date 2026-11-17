@@ -865,7 +865,7 @@ impl DeviceDirectory {
         self.transaction(|transaction| {
             // No clock is read here, so every record that has not ended counts as standing.
             let claim = claim_endpoint(transaction, None, &record.endpoint_id)?
-                .map_err(ClaimRefusal::into_error)?;
+                .map_err(|claimed| claimed.into_error_until(None))?;
             insert_record(transaction, record, &claim)
         })?;
         self.note_change();
@@ -1809,13 +1809,8 @@ pub(crate) enum ClaimRefusal {
 }
 
 impl ClaimRefusal {
-    /// The refusal as the controller gives it, with the words a person reads.
-    pub(crate) fn into_error(self) -> ControllerError {
-        self.into_error_until(None)
-    }
-
-    /// As [`Self::into_error`], naming the moment a pairing's invitation stays open until when the
-    /// refusal is that pairing's.
+    /// The refusal as the controller gives it, with the words a person reads, naming the moment a
+    /// pairing's invitation stays open until when the refusal is that pairing's.
     pub(crate) fn into_error_until(self, open_until: Option<&str>) -> ControllerError {
         match self {
             Self::Live => ControllerError::PermissionDenied {
@@ -2631,7 +2626,7 @@ mod tests {
     ) -> Result<()> {
         directory.transaction(|transaction| {
             let claim = claim_endpoint(transaction, lifetimes, &second.endpoint_id)?
-                .map_err(ClaimRefusal::into_error)?;
+                .map_err(|claimed| claimed.into_error_until(None))?;
             insert_record(transaction, second, &claim)
         })
     }
