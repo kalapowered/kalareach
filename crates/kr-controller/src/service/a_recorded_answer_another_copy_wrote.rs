@@ -1218,20 +1218,47 @@ async fn an_attention_record_that_cannot_be_read_is_not_told_after_a_fence_lands
 
 /// A workflow install whose grant the daemon holds, under a fresh action identifier: the request an
 /// automation case sends. The grant is the one a person sharing a session would have issued, with
-/// every right the workflow's node needs.
+/// every right the workflow's node needs. The node raises an attention notice, a kind that every
+/// platform carries out: a node that runs a command is refused where no POSIX shell is run.
 pub(super) fn a_workflow_install(
     temp: &kr_ipc::testing::TempHost,
     controller: &Controller,
 ) -> MutationRequest {
+    use kr_protocol::automation::{AttentionNoticeParams, WorkflowActionKind, WorkflowNode};
+    use kr_protocol::rights::ActionRight;
+
+    let node = WorkflowNode {
+        node_id: "notice".to_owned(),
+        action_kind: WorkflowActionKind::AttentionNotice,
+        action_params: serde_json::to_string(&AttentionNoticeParams {
+            summary: "recorded by another copy".to_owned(),
+        })
+        .expect("a notice node's typed parameters"),
+        declared_environment: Nullable::null(),
+    };
+    a_workflow_install_of(
+        temp,
+        controller,
+        node,
+        &[ActionRight::AutomationManage, ActionRight::SessionView],
+    )
+}
+
+/// A workflow install of the one node `node`, whose grant carries `rights`.
+fn a_workflow_install_of(
+    temp: &kr_ipc::testing::TempHost,
+    controller: &Controller,
+    node: kr_protocol::automation::WorkflowNode,
+    rights: &[kr_protocol::rights::ActionRight],
+) -> MutationRequest {
     use kr_protocol::automation::{
-        WorkflowActionKind, WorkflowDeadlines, WorkflowDefinition, WorkflowInstallParams,
-        WorkflowNode, WorkflowResourceScope, WorkflowTrigger,
+        WorkflowDeadlines, WorkflowDefinition, WorkflowInstallParams, WorkflowResourceScope,
+        WorkflowTrigger,
     };
     use kr_protocol::grant::{
         EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector,
     };
     use kr_protocol::ids::{GrantId, WorkflowId};
-    use kr_protocol::rights::ActionRight;
     use kr_protocol::scalars::{CanonicalSet, Uuid};
 
     // The grant the workflow acts under, with every right its node needs, as a person sharing a
@@ -1245,15 +1272,7 @@ pub(super) fn a_workflow_install(
         authority_revision: controller.policy().authority_revision(),
         environment_selector: EnvironmentSelector::Any,
         session_selector: SessionSelector::Any,
-        actions: [
-            ActionRight::AutomationManage,
-            ActionRight::TerminalInput,
-            ActionRight::SessionCreate,
-            ActionRight::SessionClose,
-            ActionRight::WorkspaceManage,
-        ]
-        .into_iter()
-        .collect(),
+        actions: rights.iter().copied().collect(),
         history: HistoryScope {
             lower_bound_ms: Nullable::null(),
             include_live_screen: false,
@@ -1288,19 +1307,7 @@ pub(super) fn a_workflow_install(
             event_type: "manual".to_owned(),
         },
         resource_scope: WorkflowResourceScope::default(),
-        nodes: vec![WorkflowNode {
-            node_id: "tests".to_owned(),
-            action_kind: WorkflowActionKind::RunTests,
-            action_params: serde_json::to_string(&kr_protocol::automation::RunTestsParams {
-                suite: "unit".to_owned(),
-                version: kr_protocol::changeset::VersionRef {
-                    change_set_id: kr_protocol::ids::ChangeSetId::new(Uuid::from_bytes([0x5d; 16])),
-                    version: kr_protocol::ids::ChangeSetVersion::new(1),
-                },
-            })
-            .expect("a test node's typed parameters"),
-            declared_environment: Nullable::null(),
-        }],
+        nodes: vec![node],
         edges: Vec::new(),
         deadlines: WorkflowDeadlines::default(),
         grant_reference: grant.grant_id,
@@ -1391,6 +1398,62 @@ async fn an_automation_action_another_copy_recorded_is_not_given_back_after_a_fe
         .expect_err("a fence that landed before the journal stops the record it gives back");
     refused_for_a_fence(&refused);
     controller.hold_fence(false);
+}
+
+/// KR-REQ-09.09: a command is run as a session's root through a POSIX shell, which Windows has
+/// not, so an install whose node runs one is refused when it is offered, with the word of a host
+/// that carries out no action of that kind. The automation cases above install a node every
+/// platform carries out and show the journal's rule on each.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_workflow_whose_node_runs_a_command_is_refused_where_no_posix_shell_is_run() {
+    use kr_protocol::automation::{RunTestsParams, WorkflowActionKind, WorkflowNode};
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::scalars::Uuid;
+
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let node = WorkflowNode {
+        node_id: "tests".to_owned(),
+        action_kind: WorkflowActionKind::RunTests,
+        action_params: serde_json::to_string(&RunTestsParams {
+            suite: "unit".to_owned(),
+            version: kr_protocol::changeset::VersionRef {
+                change_set_id: kr_protocol::ids::ChangeSetId::new(Uuid::from_bytes([0x5d; 16])),
+                version: kr_protocol::ids::ChangeSetVersion::new(1),
+            },
+        })
+        .expect("a test node's typed parameters"),
+        declared_environment: Nullable::null(),
+    };
+    let mutation = a_workflow_install_of(
+        &temp,
+        &controller,
+        node,
+        &[
+            ActionRight::AutomationManage,
+            ActionRight::TerminalInput,
+            ActionRight::SessionCreate,
+            ActionRight::SessionClose,
+            ActionRight::WorkspaceManage,
+        ],
+    );
+    let refused = controller
+        .automation_mutation(
+            &actor_id,
+            &mutation,
+            Method::WorkflowInstall,
+            carried(&controller, connection_id),
+            None,
+        )
+        .await
+        .into_answer_for_test()
+        .expect_err("a node that runs a command is refused where no POSIX shell is run");
+    assert_eq!(refused.code, ErrorCode::ResourceUnavailable, "{refused:?}");
+    assert!(
+        refused.message.contains("run_tests"),
+        "the word names the kind: {refused:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
