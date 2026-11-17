@@ -4926,11 +4926,10 @@ spool and not in it, so nothing that lists or measures a spool meets it. Privacy
 with the output, and nothing is recorded while retention is off. Eviction removes the rows of output that went, at the next
 write, and the archive's collection does the same for a closed session.
 
-A rollback to the release before this one keeps every byte, cursor and gap, because that release
-reads a spool by its own rules and takes only the segment files; it ignores the index. While it runs,
-new output has no times, and its eviction and its privacy purge remove segments and leave the index
-file, whose rows describe output that is gone and are removed by the next pass of a release that
-knows the file. Until then the file holds instants and no content.
+A rollback to the release before this one keeps every byte, cursor, gap and time, because that
+release keeps the same index in the same form: its workers record times for new output, its
+eviction removes the rows of output that went, its privacy purge removes the file with the output,
+and its daemon answers `history.times` from the file.
 
 `history.times` reads the intervals between two cursors of a closed session through the control
 daemon, at most 2,048 to an answer, with the cursor to ask from next. A session with no index, or

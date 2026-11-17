@@ -446,10 +446,12 @@ impl WorkerLinks {
     /// A link to a worker on this machine knows what the worker stated, so a worker that does not
     /// state that it serves the read is not asked, and the host does not take its refusal of a
     /// method it does not list for a missing right. On a host this device is paired with, no worker
-    /// answered the hello: the host's daemon refuses the read for a worker that does not state it,
-    /// and a daemon of an earlier release refuses it as unlisted, which the client library tells
-    /// from a withdrawn right by asking for what the same right reads. Either way the answer is
-    /// that the read is not served.
+    /// answered the hello, so the read goes to the host. Its daemon forwards the read to the worker
+    /// and does not refuse it for a worker that states no capability. A daemon of an earlier release
+    /// refuses it for such a worker as an unsupported capability, and one that does not list the
+    /// method refuses it as unlisted, which the client library tells from a withdrawn right by
+    /// asking for what the same right reads. A refusal of either kind is the answer that the read is
+    /// not served.
     ///
     /// # Errors
     ///
