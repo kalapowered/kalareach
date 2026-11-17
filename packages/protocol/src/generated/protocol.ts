@@ -1931,7 +1931,13 @@ export type PairStatus =
         /**
          * Why it was consumed.
          */
-        reason: 'denied' | 'expired' | 'cancelled' | 'attempts_exhausted' | 'host_restarted'
+        reason:
+          | 'denied'
+          | 'expired'
+          | 'cancelled'
+          | 'attempts_exhausted'
+          | 'host_restarted'
+          | 'endpoint_paired'
       }
     }
 /**
@@ -21696,7 +21702,13 @@ export interface PairStatusResult {
           /**
            * Why it was consumed.
            */
-          reason: 'denied' | 'expired' | 'cancelled' | 'attempts_exhausted' | 'host_restarted'
+          reason:
+            | 'denied'
+            | 'expired'
+            | 'cancelled'
+            | 'attempts_exhausted'
+            | 'host_restarted'
+            | 'endpoint_paired'
         }
       }
 }
