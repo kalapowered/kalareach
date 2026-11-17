@@ -2241,6 +2241,309 @@ async fn a_living_presentation_is_decided_in_a_gap_shorter_than_its_pause() {
         .expect("the presenting connection holds the authority");
 }
 
+/// How many tries a presentation makes at a held boundary before the case lets it go: at the cap of
+/// a quarter of a second between tries they take a little over half a minute, so a wait that gives
+/// up after a hundred tries, after sixty-four or after thirty seconds is still waiting when the
+/// count is reached.
+const TRIES_AT_A_HELD_BOUNDARY: u64 = 130;
+
+/// A living presentation does not give up. It keeps trying for a boundary that stays held through
+/// many tries, whatever their count or the time they take, and is decided when the boundary is
+/// let go.
+///
+/// The wait for the tries counts them and fails only when they stop coming, as every wait of these
+/// cases does: the case asserts no time of the presentation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_living_presentation_does_not_give_up_while_the_boundary_stays_held() {
+    let host = host(1).await;
+    let service = &host.service;
+    let boundary = Held::boundary(&host).await;
+    let before = service.presentation_tries_for_tests();
+    let living = presenting(&host, 1);
+    await_progress(
+        "the presentation's tries at the held boundary",
+        || service.presentation_tries_for_tests(),
+        || {
+            living.is_finished()
+                || service.presentation_tries_for_tests() >= before + TRIES_AT_A_HELD_BOUNDARY
+        },
+    )
+    .await;
+    assert!(
+        !living.is_finished(),
+        "the presentation gave up with the boundary still held, after {} tries",
+        service.presentation_tries_for_tests() - before
+    );
+    assert_eq!(
+        service.presentations_waiting_for_tests(),
+        1,
+        "the presentation still waits for the held boundary"
+    );
+    boundary.release();
+    let (mut link, answer) = tokio::time::timeout(WAIT, living)
+        .await
+        .expect("the presentation is decided once the boundary is free")
+        .expect("the task ends");
+    answer.expect("the presentation is accepted");
+    read_session(&mut link, host.session_id)
+        .await
+        .expect("the presenting connection holds the authority");
+}
+
+/// How many times a case lets go of the boundary and takes it again while its waiters try.
+const RELEASES: u64 = 300;
+
+/// A pause that a waiter asks its timer for and that none of these cases' waiters should ever need:
+/// a waiter that is woken at each release does not wait out a pause, and the first pauses, of five,
+/// ten, twenty and forty milliseconds, are all that a few stalls of the machine could cost it.
+const A_PAUSE_NOBODY_WAITS_OUT: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// The dispatch boundary, held on a thread of its own and let go of and taken again at once, over
+/// and over: a release that wakes every waiter and finds the boundary held again when they try.
+///
+/// Each release comes as soon as every one of the waiters has tried again since the last, which is
+/// while the last of them is still between its try and its wait. That is the moment a release must
+/// not be lost in, and the waiters' own counts of what they asked their timers for show whether
+/// any was: a waiter that was not woken, or that missed the release, waits its pause out, and the
+/// pause it asks for next is twice as long. A waiter that is woken at each release asks for the
+/// first pause only.
+struct Pulsing {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    released: Arc<std::sync::atomic::AtomicU64>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Pulsing {
+    /// Takes the boundary and, once `waiters` more tries have been counted, lets it go and takes it
+    /// again, `RELEASES` times, which counts one try for a release until `waiters` presentations
+    /// wait.
+    async fn start(host: &Host, waiters: u64) -> Self {
+        use std::sync::atomic::Ordering;
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let released = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (held, confirmed) = tokio::sync::oneshot::channel::<()>();
+        let service = Arc::clone(&host.service);
+        let thread = std::thread::spawn({
+            let stop = Arc::clone(&stop);
+            let released = Arc::clone(&released);
+            move || {
+                let mut boundary = Some(service.hold_the_dispatch_boundary());
+                let _ = held.send(());
+                for _ in 0..RELEASES {
+                    // Until all the waiters wait, one try is enough for a release: the waiters that
+                    // are there are woken at each, and none of them waits a pause out while the
+                    // others are still making their connections.
+                    let needed = if service.presentations_waiting_for_tests() as u64 >= waiters {
+                        waiters
+                    } else {
+                        1
+                    };
+                    let seen = service.presentation_tries_for_tests();
+                    while service.presentation_tries_for_tests() < seen + needed {
+                        if stop.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        std::thread::yield_now();
+                    }
+                    drop(boundary.take());
+                    boundary = Some(service.hold_the_dispatch_boundary());
+                    released.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        tokio::time::timeout(WAIT, confirmed)
+            .await
+            .expect("the boundary is held in time")
+            .expect("the holder ended without holding the boundary");
+        Self {
+            stop,
+            released,
+            thread: Some(thread),
+        }
+    }
+
+    fn released(&self) -> u64 {
+        self.released.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Ends the holder and lets go of the boundary, whether or not the case went on to the end.
+impl Drop for Pulsing {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Lets the waiters, `waiters` presentations of living peers, try while the boundary is let go of
+/// and taken again `RELEASES` times, and returns the longest pause that any wait asked its timer
+/// for, with how many releases there were. It stops at once when a pause longer than
+/// `A_PAUSE_NOBODY_WAITS_OUT` was asked for, or when the presentations have all been decided (a
+/// try that finds the boundary in the instant that it is free decides one, which is no fault).
+async fn pause_asked_for_through_releases(waiters: usize) -> (std::time::Duration, u64) {
+    let host = host(1).await;
+    let service = &host.service;
+    let pulsing = Pulsing::start(&host, waiters as u64).await;
+    let waiting = presenting_many(&host, waiters, 1);
+    await_progress(
+        "the releases",
+        || pulsing.released() + service.presentation_tries_for_tests(),
+        || {
+            pulsing.released() >= RELEASES
+                || service.largest_boundary_step_for_tests() > A_PAUSE_NOBODY_WAITS_OUT
+                || waiting.iter().all(tokio::task::JoinHandle::is_finished)
+        },
+    )
+    .await;
+    let asked = service.largest_boundary_step_for_tests();
+    let released = pulsing.released();
+    drop(pulsing);
+    peers_go(waiting).await;
+    (asked, released)
+}
+
+/// A release wakes every presentation that waits, not one of them.
+///
+/// Three presentations wait at the boundary, which is let go of and taken again at once each time
+/// all three have tried. A release that woke one of them leaves the other two to wait their pause
+/// out, and each pause that is waited out is twice the one before it, so that the pauses asked for
+/// pass forty milliseconds within a few releases. A release that wakes all three keeps every one at
+/// the first pause for the whole of the case. What the waits asked of their timers is a count of
+/// what they requested, and no measure of how long anything took.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_release_wakes_every_presentation_that_waits() {
+    let (asked, released) = pause_asked_for_through_releases(3).await;
+    assert!(
+        asked <= A_PAUSE_NOBODY_WAITS_OUT,
+        "a waiter waited its pause out and asked for {asked:?} after {released} releases: a \
+         release did not wake every presentation"
+    );
+}
+
+/// A release that comes between a presentation's try and its wait is not missed.
+///
+/// One presentation waits at the boundary, which is let go of and taken again at once, as soon as
+/// the presentation has tried: while it is between the try that found the boundary held and the
+/// wait, which is the moment a wait that is made after its try would miss the release in. A
+/// presentation that missed one waits its pause out and asks for twice that pause next, so that the
+/// pauses asked for pass forty milliseconds within a few releases; one that misses none stays at the
+/// first pause for the whole of the case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_release_between_a_try_and_the_wait_is_not_missed() {
+    let (asked, released) = pause_asked_for_through_releases(1).await;
+    assert!(
+        asked <= A_PAUSE_NOBODY_WAITS_OUT,
+        "the waiter waited its pause out and asked for {asked:?} after {released} releases: a \
+         release that came between its try and its wait was missed"
+    );
+}
+
+/// What a presentation did while the release that it waits for stood between its unlock and its
+/// wake.
+#[derive(Debug, PartialEq, Eq)]
+enum WhileTheReleaseStood {
+    /// It took the boundary, which it found unlocked.
+    TookTheBoundary,
+    /// It was woken and found the boundary held.
+    WokenAtALockedBoundary,
+    /// Neither happened before the guard against a hang.
+    Neither,
+}
+
+/// A release unlocks the boundary before it wakes the presentations that wait.
+///
+/// A presentation waits at a held boundary with its pause at the cap, and has just tried. The
+/// holder lets go on a thread of its own, and the release stops between its unlock and its wake
+/// (a pause of the worker's that is armed for the case). Nothing has been woken then, and the
+/// boundary is unlocked: the presentation takes it when its own pause is over, which is what the
+/// case waits for. A release that woke first would have sent the presentation to try while the
+/// boundary was still held, and the case sees that instead: a try counted with the boundary
+/// locked. While the release stands, the case waits on threads of the blocking pool, and none of
+/// its waits is a timer of the runtime: the holder is a thread of the standard library, and holds
+/// no thread of the runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_release_unlocks_the_boundary_before_it_wakes_a_presentation() {
+    let host = host(1).await;
+    let service = Arc::clone(&host.service);
+    let (arrived, go) = service.pause_after_the_boundary_is_unlocked();
+    let (drop_now, wait) = std::sync::mpsc::channel::<()>();
+    let (held, confirmed) = tokio::sync::oneshot::channel::<()>();
+    let holder = std::thread::spawn({
+        let service = Arc::clone(&service);
+        move || {
+            let boundary = service.hold_the_dispatch_boundary();
+            let _ = held.send(());
+            let _ = wait.recv();
+            drop(boundary);
+        }
+    });
+    tokio::time::timeout(WAIT, confirmed)
+        .await
+        .expect("the boundary is held in time")
+        .expect("the holder ended without holding the boundary");
+    let living = presenting(&host, 1);
+    // The pause is at its cap, and a try has just found the boundary held: the next is a quarter of
+    // a second away.
+    assert!(
+        settle(|| service.presentation_tries_for_tests() >= 8).await,
+        "the presentation tries again and again"
+    );
+    let seen = service.presentation_tries_for_tests();
+    assert!(
+        settle(|| service.presentation_tries_for_tests() > seen).await,
+        "the presentation tries again"
+    );
+    let counted = service.presentation_tries_for_tests();
+
+    drop_now.send(()).expect("the holder is there");
+    let reached = tokio::task::spawn_blocking(move || arrived.recv_timeout(WAIT))
+        .await
+        .expect("the wait ends");
+    let stood = if reached.is_ok() {
+        let service = Arc::clone(&service);
+        let (living, verdict) = tokio::task::spawn_blocking(move || {
+            // A bound on the polls that only guards against a hang: what the case waits for comes
+            // by itself, as the presentation's own pause ends or as the wake reaches it.
+            for _ in 0..WAIT.as_millis() {
+                if living.is_finished() {
+                    return (living, WhileTheReleaseStood::TookTheBoundary);
+                }
+                if service.presentation_tries_for_tests() > counted {
+                    return (living, WhileTheReleaseStood::WokenAtALockedBoundary);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            (living, WhileTheReleaseStood::Neither)
+        })
+        .await
+        .expect("the wait ends");
+        Some((living, verdict))
+    } else {
+        None
+    };
+    // The release goes on, whatever the case found.
+    let _ = go.send(());
+    holder.join().expect("the holder ends");
+    let (living, verdict) = stood.expect("the release reached the pause");
+    assert_eq!(
+        verdict,
+        WhileTheReleaseStood::TookTheBoundary,
+        "while the release stood between its unlock and its wake, the presentation found the \
+         boundary locked and was not woken at an unlocked one"
+    );
+    let (mut link, answer) = tokio::time::timeout(WAIT, living)
+        .await
+        .expect("the presentation is decided")
+        .expect("the task ends");
+    answer.expect("the presentation is accepted");
+    read_session(&mut link, host.session_id)
+        .await
+        .expect("the presenting connection holds the authority");
+}
+
 /// A worker that is stopped while presentations wait does not wait for the hold on their account.
 ///
 /// Presentations whose clients are there wait at a held boundary, on a runtime that this case builds
