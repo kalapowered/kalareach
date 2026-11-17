@@ -648,10 +648,8 @@ impl PairingAdmissions {
                     // in this locked step (a spawn does not wait), with the count and the time of
                     // the ask, so no dial finds the ask counted and its task not yet stored.
                     let this = self.clone();
-                    let task = tokio::spawn({
-                        let key = key.clone();
-                        async move { this.ask(key, request).await }
-                    });
+                    let task_key = key.clone();
+                    let task = tokio::spawn(async move { this.ask(task_key, request).await });
                     entry.request = Some(task.abort_handle());
                     asked = Some(task);
                 }
