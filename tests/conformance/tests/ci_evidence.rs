@@ -767,7 +767,7 @@ fn every_evidence_upload_has_a_second_try_after_a_pause_and_fails_the_job_when_b
                 })
                 .collect();
             assert!(
-                uploads.len() % 2 == 0,
+                uploads.len().is_multiple_of(2),
                 "{file}: the {name} job has an upload that is not a first try and a second one"
             );
             let mut ids = Vec::new();
