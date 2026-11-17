@@ -27,6 +27,7 @@ use kr_protocol::projection::{
 };
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
 use kr_protocol::session::Dimensions;
+use scripted_worker::host::lane_host::Out;
 use scripted_worker::host::{ScriptedHost, Takes};
 use scripted_worker::{
     CallKind, Challenge, Frame, Keys, Link, Mouse, Negotiated, ScriptedWorker, Stated, WATCHDOG,
@@ -6679,4 +6680,79 @@ async fn a_definite_launch_answer_releases_the_typing_behind_it_in_order() {
         .until_soon("the key behind the launch", |seen| seen.frames.len() == 4)
         .await;
     assert_eq!(read_by(&host).last(), Some(&(1, 3, "z".to_owned())));
+}
+
+/// A lane that ends with a barrier still waiting says so behind its end, and the view reads on to
+/// say it: a launch whose barrier the host never reached is told at once that it was not started,
+/// and nothing of it is sent. The lane's wait for the barrier is never ended by time, so only the
+/// lane's end can answer the launch.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_launch_waiting_for_its_barrier_when_the_lane_ends_is_not_started_at_once() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let deadlines = BarrierDeadlines::new();
+    let page = Page::over_bounded(&mut host, &deadlines);
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    three_keys_the_host_has_read(&page, &view, &host).await;
+    let pressing = page.invoke_later(
+        "terminal_view_launch",
+        json!({ "view": view, "press": the_press() }),
+    );
+    barriers_taken(&page, &view, 1).await;
+    host.script.say(Out::Reset);
+    page.lane_ends(&view).await;
+    let told = tokio::time::timeout(STATE_BOUND, pressing)
+        .await
+        .expect("the page was told within the bound once the lane had ended")
+        .expect("joins")
+        .expect_err("the launch was not started");
+    assert_eq!(code(&told), "TERMINAL_UNAVAILABLE");
+    assert_eq!(
+        told["message"],
+        "The launch was not started: the session had not accepted all the typing before it."
+    );
+    assert!(
+        link.call_within(QUIET).await.is_none(),
+        "no launch is on the wire"
+    );
+}
+
+/// A release waiting for its barrier when the lane ends goes once the view has read the end, and
+/// names the typing that the host did accept: the host's window is three frames, the view took four
+/// keys, and the host accepted the first. The host reads the fourth key once the lane has applied
+/// that acceptance, so the case knows the lane has it before the host ends the stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_release_waiting_for_its_barrier_when_the_lane_ends_goes_naming_the_accepted_typing() {
+    let mut host = ScriptedHost::start(lane_window(3)).await;
+    let deadlines = BarrierDeadlines::new();
+    let page = Page::over_bounded(&mut host, &deadlines);
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    keys_beyond_the_window(&page, &view, &host, &["a", "b", "c", "d"]).await;
+    host.script.accept(1, 0);
+    host.script
+        .until_soon(
+            "the fourth key, written once the lane has the acceptance",
+            |seen| seen.frames.len() == 4,
+        )
+        .await;
+    page.release(&view, 2);
+    barriers_taken(&page, &view, 1).await;
+    assert!(
+        link.call_within(QUIET).await.is_none(),
+        "the release is not on the control stream before its barrier is reached or the lane ends"
+    );
+    host.script.say(Out::Reset);
+    let release = link
+        .call_within(AFTER_BARRIER)
+        .await
+        .expect("the release went within the bound once the lane had ended");
+    assert_eq!(release.method, Method::InputRelease.to_string());
+    assert_eq!(
+        position(&release),
+        Some((1, 1)),
+        "the release names the one frame the host accepted, not the four admitted"
+    );
 }

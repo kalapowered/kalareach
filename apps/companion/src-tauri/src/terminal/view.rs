@@ -1842,19 +1842,20 @@ impl View {
                 None
             }
             InputEvent::EpochEnded { .. } | InputEvent::LaunchReserved { .. } => None,
-            InputEvent::Ended { cause, .. } => match cause {
-                // The connection's end reaches the loop through the session's own notifications.
-                EndCause::Connection { .. } | EndCause::Finished | EndCause::Closed => {
-                    self.lane_events = None;
-                    None
-                }
-                EndCause::Reset | EndCause::Breach(_) | EndCause::Uncertain(_) => {
-                    self.lane_events = None;
+            InputEvent::Ended { cause, .. } => {
+                // The lane's handle goes, which is what lets its events end, and the reader is kept
+                // and read to its end: what the lane says behind its end, the barriers it did not
+                // reach, is served as any other word of the lane. The connection's end reaches the
+                // loop through the session's own notifications.
+                self.lane = None;
+                if matches!(
+                    cause,
+                    EndCause::Reset | EndCause::Breach(_) | EndCause::Uncertain(_)
+                ) {
                     self.lane_lost = Some("its input stream ended".to_owned());
-                    self.lane = None;
-                    None
                 }
-            },
+                None
+            }
         }
     }
 
