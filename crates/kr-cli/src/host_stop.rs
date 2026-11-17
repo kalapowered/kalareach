@@ -7042,13 +7042,18 @@ mod tests {
             .len()
     }
 
+    /// The name of the set that a walk gives values of.
+    fn set_of<T>(_: &[T]) -> &'static str {
+        std::any::type_name::<T>()
+    }
+
     /// Holds the walk of a set to the set. The one list of the set's variants, each as a path, is
     /// the count and also the arms of a `match` with no wildcard arm: the macro writes each
     /// pattern itself, so an entry that would match more than one variant (a wildcard or a
     /// binding) is no path and does not build, and a variant added to the set is an error in the
     /// test build until the list names it. A walk that gives fewer distinct variants than the list
-    /// names fails the assertion. A variant named twice makes the count larger than any walk can
-    /// give, so that the assertion fails for it too.
+    /// names fails the assertion, which names the set. A variant named twice makes the count
+    /// larger than any walk can give, so that the assertion fails for it too.
     macro_rules! the_walk_gives_every_variant {
         ($walk:expr; $($variant:path),+ $(,)?) => {{
             let walk = $walk;
@@ -7057,7 +7062,12 @@ mod tests {
                     $($variant { .. } => {})+
                 }
             }
-            assert_eq!(variants_walked(&walk), [$(stringify!($variant)),+].len());
+            assert_eq!(
+                variants_walked(&walk),
+                [$(stringify!($variant)),+].len(),
+                "the walk of {} gives a different number of distinct variants than its list names",
+                set_of(&walk)
+            );
         }};
     }
 
