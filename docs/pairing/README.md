@@ -95,6 +95,16 @@ invitation became unavailable even if the direct invitation object itself is no 
 the candidate provides an identifier this host never issued as a direct invitation, the method will
 complete with the error code `PERMISSION_DENIED`. That is all the candidate is told.
 
+A device that the host still lists as paired cannot be paired again. The host refuses it at
+`pair.finish` (code mode) or `pair.redeem` (direct mode), after the code or secret and the endpoint
+proofs and before the owner is shown a candidate, with the code `PAIRING_ENDPOINT_PAIRED`, and the
+invitation ends with the reason `endpoint_paired`. A repeat of the request, on the same connection
+or a new one, gets the same code, and `pair.status` reports the reason. The issuing owner's view of
+that invitation carries `existing`, the name and pairing date from the host's own record. The device
+shows `host_still_lists_device` and offers no retry: the owner removes the listed pairing, the
+person forgets the host on the device if the device still lists it, and a new invitation pairs it
+as a new device with a new identity.
+
 **The candidate** permits five attempts per entered code, and never retries a failed key
 confirmation automatically. The counter is keyed by an HMAC of the configured origin and the
 normalised full code under a distinct random local key from secure storage, never a transport or

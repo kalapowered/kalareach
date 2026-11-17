@@ -357,6 +357,12 @@ limits are what the control stream enforces, in both directions.
 
 ### Unpaired connections
 
+The host reads the device identifier in the client's offer before it chooses the branch of the
+handshake. A connection from an endpoint that the host lists as paired is on the paired branch only
+when it offers the identifier of that record, which the connection proof binds. An offer of any
+other identifier from that endpoint is an unpaired connection: it reaches the pairing surface with
+the same limits as any other, and an ordinary reconnect takes the path it always took.
+
 An endpoint with no paired record is not refused. It exchanges only the first two frames above, the
 offer and the host's selection, with no proofs. The client checks the selection as a paired client
 does, against its offer and against the endpoint iroh authenticated. What only an invitation or a
