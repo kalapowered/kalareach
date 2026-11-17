@@ -3150,6 +3150,196 @@ async fn kr_req_23_30_a_declared_cancellation_whose_grant_is_withdrawn_before_it
     }
 }
 
+/// The suite's instance with a package bound to it from the admissions, so that a snapshot reaches
+/// its binding as it reaches any installed one: the descriptor's binding is forgotten and the
+/// package's takes its place, with the declared cancellation registered on it.
+struct Installed {
+    admissions: kr_worker::broker::catalogue::Admissions,
+    sources: kr_worker::broker::connectors::ConnectorSources,
+    package: kr_protocol::admission::AdmittedPackage,
+    _packages: tempfile::TempDir,
+}
+
+impl Installed {
+    fn bind(host: &Host) -> Self {
+        use kr_worker::broker::catalogue::testing;
+        use kr_worker::broker::connectors::fixture;
+        let packages = tempfile::tempdir().expect("a directory on the internal disk");
+        let source = fixture::package(
+            packages.path(),
+            std::path::Path::new(fixture::FORWARDER),
+            &fixture::Shape::claude_code(),
+        )
+        .expect("the package is written");
+        let package = testing::admitted(&source);
+        let admissions = kr_worker::broker::catalogue::Admissions::new();
+        let sources = kr_worker::broker::connectors::ConnectorSources::new();
+        let broker = host.service.broker();
+        let frame = testing::hand_over(
+            &admissions,
+            &sources,
+            broker,
+            testing::Snapshot::admitting(1, vec![package.clone()]),
+        );
+        broker.forget_binding(binding());
+        broker
+            .bind(
+                binding(),
+                instance(),
+                source.package_digest,
+                frame,
+                kr_worker::broker::binder::MatchedExecutable {
+                    path: "/usr/local/bin/claude".to_owned(),
+                    digest: Digest256::from_bytes(fixture::QUALIFIED_DIGEST),
+                },
+                kr_ipc::now_ms(),
+            )
+            .expect("the package binds from the admissions");
+        let refused = broker
+            .register_actions(binding(), &[cancel_declaration()])
+            .expect("the action is registered");
+        assert!(refused.is_empty(), "{refused:?}");
+        Self {
+            admissions,
+            sources,
+            package,
+            _packages: packages,
+        }
+    }
+
+    /// A snapshot that revokes the package's release under the policy that disables at once.
+    fn revoke(&self, host: &Host, round: u64) {
+        use kr_worker::broker::catalogue::testing;
+        testing::hand_over(
+            &self.admissions,
+            &self.sources,
+            host.service.broker(),
+            testing::Snapshot {
+                policy: kr_protocol::admission::RevocationPolicy::DisableAtOnce,
+                releases: vec![kr_protocol::admission::ReleaseState {
+                    revocation: Nullable::some(kr_protocol::admission::AdmissionRevocation {
+                        reason: "compromised".to_owned(),
+                        revoked_at: TimestampMs::new(5),
+                        statement: "Do not run this release.".to_owned(),
+                    }),
+                    ..testing::release_of(&self.package)
+                }],
+                ..testing::Snapshot::admitting(round, Vec::new())
+            },
+        );
+    }
+}
+
+/// KR-REQ-25.22 and KR-REQ-23.30: the count that keeps a binding that is due to end belongs to the
+/// thread that makes the transport's call, and not to the future that waits for it. The service's
+/// deadline stops the caller's wait while that thread stands at its pause; a revocation lands, and
+/// the binding stays, ending, while the call is still to be made. When the call has been made the
+/// action has reached the upstream, and the binding closes at a snapshot after it.
+///
+/// The case waits for the thread's pause through a blocking thread of its own and never through a
+/// timer of the runtime, which is what the deadline runs on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_25_22_an_ending_binding_stays_while_the_thread_of_a_cancellation_whose_deadline_passed_still_stands()
+ {
+    let host = host().await;
+    register(&host, None);
+    let installed = Installed::bind(&host);
+    // The evidence is recorded for the binding that stands now: a binding that changed would have
+    // invalidated what was recorded before it.
+    record_evidence(
+        &host,
+        "agent.cancel",
+        CapabilityRevision::new(1),
+        kr_protocol::broker::InstanceCapabilityState::QualifiedAvailable,
+    );
+    let transport = real_transport_with(&host, upstream_rich_cancelling()).await;
+    host.service
+        .set_upstream_deadline_for_tests(std::time::Duration::from_millis(50));
+    host.service
+        .broker()
+        .set_turn(
+            instance(),
+            Some(kr_protocol::ids::AgentTurnId::new("turn-1").expect("valid")),
+        )
+        .expect("a turn is running");
+    let mut client = cli(&host).await;
+    let window_id = client.action_window().action_window_id.clone();
+    let mut mutation =
+        plugin_invocation(&host, 60, window_id, "turn.cancel", Nullable::null(), b"{}");
+    let mut params: kr_protocol::agent::PluginActionInvokeParams =
+        mutation.params.to_typed().expect("the parameters decode");
+    params.plugin_id = installed.package.plugin_id.clone();
+    mutation.params = ParamsValue::from_typed(&params).expect("encodes");
+
+    let (arrived, release) = host.service.broker().pause_before_submit();
+    let mut sending = tokio::spawn(async move {
+        let outcome = send(&mut client, mutation).await;
+        (outcome, client)
+    });
+    // Whichever comes first: the thread's arrival at its pause, or an answer to the caller, which
+    // before the pause is a refusal the case did not mean to make.
+    tokio::select! {
+        arrived = tokio::task::spawn_blocking(move || arrived.recv_timeout(LIVENESS_DEADLINE)) => {
+            arrived
+                .expect("the wait ends")
+                .expect("the call reaches the thread that makes the transport's call");
+        }
+        answered = &mut sending => {
+            panic!("the caller was answered before the call reached its thread: {:?}",
+                answered.expect("the mutation is answered").0);
+        }
+    }
+    // The service's deadline passes while the thread stands at its pause: the caller is told that
+    // the outcome cannot be established, and the future that waited for the thread is gone.
+    let (outcome, _client) = sending.await.expect("the mutation is answered");
+    let Outcome::Error(error) = outcome else {
+        panic!("a cancellation whose call has not been made is not an applied one: {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown, "{error:?}");
+
+    installed.revoke(&host, 2);
+    let ending = host
+        .service
+        .broker()
+        .binding_record(binding())
+        .expect("the binding stays while the thread's call is still to be made");
+    assert!(ending.ending, "and is ending");
+    assert!(
+        !transport
+            .read
+            .lock()
+            .expect("the record is not poisoned")
+            .contains("turn/interrupt"),
+        "nothing has reached the upstream yet"
+    );
+
+    release.send(()).expect("the call is let go");
+    let _identifier = transport.identifier_of(1).await;
+    assert!(
+        transport
+            .read
+            .lock()
+            .expect("the record is not poisoned")
+            .contains("turn/interrupt"),
+        "a revocation lets what was admitted finish: the cancellation reached the upstream"
+    );
+    // The thread ends its work just after its call, so the first snapshots after the call may
+    // still find it; one that finds it ended closes the binding, and none closes it before.
+    let started = std::time::Instant::now();
+    let mut round = 2;
+    while host.service.broker().binding_record(binding()).is_some() {
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the binding closes once the thread's call has ended"
+        );
+        round += 1;
+        installed.revoke(&host, round);
+        tokio::task::spawn_blocking(|| std::thread::sleep(std::time::Duration::from_millis(20)))
+            .await
+            .expect("the pause ends");
+    }
+}
+
 /// KR-REQ-09.05: a connection that has ended carries no evidence: a reply the upstream wrote
 /// before the connection went is not read afterwards, and the receipt stays unknown.
 ///
