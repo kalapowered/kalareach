@@ -693,9 +693,10 @@ pub struct WorkerService {
     /// The highest restriction count whose withdrawal has been run to its end by a statement's
     /// acknowledgement.
     withdrawals_done: std::sync::atomic::AtomicU64,
-    /// How many withdrawals are detaching a connection's attachments now, plus how many detaches
-    /// the end of a connection still owes, which a statement's acknowledgement waits for.
-    withdrawals_running: std::sync::atomic::AtomicUsize,
+    /// The withdrawals that are detaching a connection's attachments now, and the detaches that the
+    /// end of a connection still owes, each under a ticket, which a statement's acknowledgement
+    /// waits for.
+    detach_tickets: Arc<DetachTickets>,
     /// How many statements of what the local owner may do are waiting to be answered, which this
     /// host's own tests read. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -963,7 +964,7 @@ impl<K: Ord> OwedSet<K> {
 }
 
 /// Work on the session that a clean-up owes.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum SessionWork {
     /// Rejects an accepted action whose connection ended before it was dispatched, when its receipt
     /// is still the one that the acceptance at journal sequence `accepted_at` made: a receipt that
@@ -974,8 +975,10 @@ enum SessionWork {
         action_id: kr_protocol::ids::ActionId,
         accepted_at: u64,
     },
-    /// Detaches an attachment the connection kept.
-    Detach(AttachmentId),
+    /// Detaches an attachment the connection kept. The entry carries the ticket of that detach, and
+    /// the ticket ends when the entry is dropped, done or not, so that nothing waits for a detach
+    /// that no entry is left to make.
+    Detach(AttachmentId, Ticket),
 }
 
 /// What one try of a request that waits for the dispatch boundary came to.
@@ -1000,19 +1003,110 @@ struct Captured {
     ceiling: u64,
 }
 
-/// A withdrawal that is detaching a connection's attachments, counted for as long as it runs.
-struct RunningCount<'a>(&'a std::sync::atomic::AtomicUsize);
+/// The detaches of a connection's attachments that are owed or running now, each under a
+/// [`Ticket`], which a statement of what the local owner may do looks at when its answer is due.
+///
+/// A statement reads [`Self::limit`] once, after the sweeps it owes, and waits until no ticket
+/// below it is pending: the detaches that exist then, and not the ones that start later. The
+/// numbers are taken and kept in one mutex, so a ticket that is registered before a limit is read
+/// is pending when the limit is. The mutex takes nothing while it is held and is never held across
+/// an await.
+#[derive(Debug, Default)]
+struct DetachTickets {
+    state: Mutex<TicketState>,
+}
 
-impl<'a> RunningCount<'a> {
-    fn begin(count: &'a std::sync::atomic::AtomicUsize) -> Self {
-        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self(count)
+#[derive(Debug, Default)]
+struct TicketState {
+    /// The number the next ticket gets.
+    next: u64,
+    /// The numbers of the tickets whose detach is not made yet.
+    pending: std::collections::BTreeSet<u64>,
+}
+
+impl DetachTickets {
+    /// Registers `count` tickets in one step, in the order of the numbers they get.
+    fn begin(self: &Arc<Self>, count: usize) -> Vec<Ticket> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("the detach tickets are not poisoned");
+        (0..count)
+            .map(|_| {
+                let number = state.next;
+                state.next += 1;
+                state.pending.insert(number);
+                Ticket {
+                    tickets: Arc::clone(self),
+                    number,
+                }
+            })
+            .collect()
+    }
+
+    /// Registers one ticket.
+    fn begin_one(self: &Arc<Self>) -> Ticket {
+        let mut ticket = self.begin(1);
+        ticket.pop().expect("one ticket was registered")
+    }
+
+    /// The number the next ticket gets: every ticket that exists now is below it.
+    fn limit(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("the detach tickets are not poisoned")
+            .next
+    }
+
+    /// Whether a ticket below `limit` is still pending.
+    fn pending_below(&self, limit: u64) -> bool {
+        self.state
+            .lock()
+            .expect("the detach tickets are not poisoned")
+            .pending
+            .first()
+            .is_some_and(|first| *first < limit)
     }
 }
 
-impl Drop for RunningCount<'_> {
+/// One detach that is owed or running, from its registration until this value is dropped. It is
+/// handed on by moving it, and it ends wherever it is dropped, an error return or an unwinding
+/// included, so no path can leave a statement waiting for a detach that nothing will make.
+#[derive(Debug)]
+struct Ticket {
+    tickets: Arc<DetachTickets>,
+    number: u64,
+}
+
+impl Drop for Ticket {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        // An unwinding may be what drops this, so a poisoned lock is not a reason to panic again.
+        self.tickets
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending
+            .remove(&self.number);
+    }
+}
+
+impl PartialEq for Ticket {
+    fn eq(&self, other: &Self) -> bool {
+        self.number == other.number
+    }
+}
+
+impl Eq for Ticket {}
+
+impl PartialOrd for Ticket {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Ticket {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.number.cmp(&other.number)
     }
 }
 
@@ -1433,7 +1527,7 @@ impl WorkerService {
             detach_waits: std::sync::atomic::AtomicUsize::new(0),
             withdrawals_owed: std::sync::atomic::AtomicU64::new(0),
             withdrawals_done: std::sync::atomic::AtomicU64::new(0),
-            withdrawals_running: std::sync::atomic::AtomicUsize::new(0),
+            detach_tickets: Arc::new(DetachTickets::default()),
             #[cfg(feature = "testing")]
             statements_waiting: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "testing")]
@@ -3104,15 +3198,17 @@ impl WorkerService {
                     #[cfg(feature = "testing")]
                     self.owed_done[0].fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
-                SessionWork::Detach(attachment_id) => {
+                SessionWork::Detach(attachment_id, ticket) => {
                     #[cfg(feature = "testing")]
                     self.owed_done[1].fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let _ = session.detach(attachment_id);
                     // The fence this detach moved, and any terminator it produced, reach the
                     // writer here.
                     self.runtime.flush_input();
-                    self.withdrawals_running
-                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    // The session is let go before the detach's ticket ends, so that nothing is
+                    // taken under the session for it.
+                    drop(session);
+                    drop(ticket);
                 }
             }
         }
@@ -4414,11 +4510,12 @@ impl WorkerService {
         }
         #[cfg(feature = "testing")]
         self.connection_end_stall.stand();
-        // Counted from the hold of the list that gives them up until each is detached, here or by
-        // the service's own pass, so that a statement's acknowledgement does not go out while a
-        // detach under the earlier statement is owed: a sweep that reads the list sees them or
-        // sees the count.
-        let attachments = state.facts.take_attachments(&self.withdrawals_running);
+        // Each attachment gets a ticket in the hold of the list that gives it up, and the ticket
+        // ends when it is detached, here or by the service's own pass, so that a statement's
+        // acknowledgement does not go out while a detach under the earlier statement is owed: a
+        // sweep that reads the list sees the attachment, or reads the tickets after it and sees the
+        // ticket.
+        let attachments = state.facts.take_attachments(&self.detach_tickets);
         #[cfg(feature = "testing")]
         self.attachments_taken_stall.stand();
         self.detach_or_owe(attachments);
@@ -6033,14 +6130,18 @@ impl WorkerService {
 
     /// Answers a statement of what the local owner may do only when no withdrawal it owes, or an
     /// earlier statement owes, is pending: it waits for the hold in place when the gate changed,
-    /// runs the withdrawal that is owed itself, and waits for the detaches that another
-    /// withdrawal still runs. Nothing rests on the task of the statement that owed it.
+    /// runs the withdrawal that is owed itself, and waits for the detaches that exist once that
+    /// withdrawal is run. Nothing rests on the task of the statement that owed it.
     ///
     /// The statement completes what it captured and no more: the withdrawal it runs, and the mark
     /// that says it is done, stop at the restriction count it was made under. A restriction a later
     /// statement made is that statement's to complete, after the hold that statement waits for;
     /// marking it done here would let it be answered with no sweep after a checked attach has
     /// landed.
+    ///
+    /// The detaches it waits for are fixed too: the tickets that exist when its sweeps have ended.
+    /// A connection that ends after that takes a ticket the statement does not wait for, since what
+    /// that connection attached it attached under the statement that is in force.
     async fn after_a_statement(&self, captured: Captured, answer: ControlFrame) -> ControlFrame {
         #[cfg(feature = "testing")]
         let _waiting = WaitingCount::begin(&self.statements_waiting);
@@ -6055,25 +6156,22 @@ impl WorkerService {
             if self
                 .withdrawals_done
                 .load(std::sync::atomic::Ordering::SeqCst)
-                < owed
+                >= owed
             {
-                off_the_executor(|| self.withdraw_local_connections());
-                self.withdrawals_done
-                    .fetch_max(owed, std::sync::atomic::Ordering::SeqCst);
-                continue;
+                break;
             }
-            if self
-                .withdrawals_running
-                .load(std::sync::atomic::Ordering::SeqCst)
-                == 0
-            {
-                return answer;
-            }
+            off_the_executor(|| self.withdraw_local_connections());
+            self.withdrawals_done
+                .fetch_max(owed, std::sync::atomic::Ordering::SeqCst);
+        }
+        let limit = self.detach_tickets.limit();
+        while self.detach_tickets.pending_below(limit) {
             #[cfg(feature = "testing")]
             self.detach_waits
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             tokio::time::sleep(BOUNDARY_FIRST_RETRY).await;
         }
+        answer
     }
 
     /// Withdraws one local connection that its own writer found restricted, after the hold of the
@@ -6627,12 +6725,12 @@ impl WorkerService {
         // The authority binding goes with the registration. A connection whose registration has
         // been withdrawn must not still be one a generation speaks through.
         self.unbind(connection_id);
-        // Counted from before the registration leaves the registry until the last attachment is
+        // Ticketed from before the registration leaves the registry until the last attachment is
         // detached, so that a statement's acknowledgement does not go out while this withdrawal is
         // still detaching what a restriction asked it to take back: a sweep that runs after the
-        // remove finds no registration and sees only this count. It is lowered again by the
-        // return below where the remove finds nothing.
-        let _running = RunningCount::begin(&self.withdrawals_running);
+        // remove finds no registration and sees only this ticket. It ends when the function does,
+        // by the return below where the remove finds nothing too.
+        let _ticket = self.detach_tickets.begin_one();
         let held = self
             .admitted
             .lock()
@@ -6738,22 +6836,26 @@ impl WorkerService {
     /// rest to the service at the first that finds it held. An identifier that another connection
     /// has detached already is detached again to no effect, and is owed like the others, since
     /// finding that out needs the session too.
-    fn detach_or_owe(&self, attachments: Vec<AttachmentId>) {
+    ///
+    /// Each attachment comes with the ticket of its detach. The ticket ends when the detach is
+    /// made, with the session let go first, and goes with the attachment into the entry that owes
+    /// it: a ticket moves, and ends wherever it is dropped.
+    fn detach_or_owe(&self, attachments: Vec<(AttachmentId, Ticket)>) {
         let mut rest = attachments.into_iter();
-        while let Some(attachment_id) = rest.next() {
+        while let Some((attachment_id, ticket)) = rest.next() {
             let Some(mut session) = self.runtime.try_session() else {
                 self.clean_up_owed.session.owe_all(
-                    std::iter::once(attachment_id)
+                    std::iter::once((attachment_id, ticket))
                         .chain(rest)
-                        .map(SessionWork::Detach),
+                        .map(|(attachment_id, ticket)| SessionWork::Detach(attachment_id, ticket)),
                 );
                 return;
             };
             let _ = session.detach(attachment_id);
             // The fence this detach moved, and any terminator it produced, reach the writer here.
             self.runtime.flush_input();
-            self.withdrawals_running
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            drop(session);
+            drop(ticket);
         }
     }
 
@@ -12381,16 +12483,17 @@ impl ConnectionFacts {
             .contains(&attachment_id)
     }
 
-    /// Takes every attachment this connection still owns, and raises `pending` by their number in
-    /// the same hold of the list, so that no reader of the list sees it empty while the detaches
-    /// are not counted.
-    fn take_attachments(&self, pending: &std::sync::atomic::AtomicUsize) -> Vec<AttachmentId> {
+    /// Takes every attachment this connection still owns, each with a ticket that `tickets`
+    /// registers in the same hold of the list, so that no reader of the list sees it empty while
+    /// the detaches have no ticket.
+    fn take_attachments(&self, tickets: &Arc<DetachTickets>) -> Vec<(AttachmentId, Ticket)> {
         let mut held = self
             .attachments
             .lock()
             .expect("the attachment list is not poisoned");
-        pending.fetch_add(held.len(), std::sync::atomic::Ordering::SeqCst);
-        std::mem::take(&mut *held)
+        let taken = std::mem::take(&mut *held);
+        let given = tickets.begin(taken.len());
+        taken.into_iter().zip(given).collect()
     }
 }
 
