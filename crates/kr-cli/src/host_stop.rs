@@ -1016,8 +1016,8 @@ fn record_said(recorded: &attempt::Recorded, id: EnvironmentId) -> Shown {
 
 /// What every message that no control daemon runs says of the attempts recorded for an
 /// environment: nothing where there is none, and otherwise a space and each record's words. A
-/// restart's record of the start that it is making is its own, and the failure of that start does
-/// not say it. It removes nothing.
+/// command's record is its own whatever phase it last wrote, and the failure of its start does not
+/// say it: a record is its own where the process that wrote it is this process. It removes nothing.
 #[must_use]
 pub fn records_said(environment: &EnvironmentPaths) -> Shown {
     let id = environment.environment_id();
@@ -1025,12 +1025,8 @@ pub fn records_said(environment: &EnvironmentPaths) -> Shown {
     let said: Vec<Shown> = attempt::recorded(environment)
         .iter()
         .filter(|recorded| {
-            let start = recorded.attempt.command == attempt::Command::Restart
-                && recorded.attempt.phase == attempt::Phase::Starting;
-            !(start
-                && own
-                    .as_ref()
-                    .is_ok_and(|own| *own == recorded.attempt.process))
+            !own.as_ref()
+                .is_ok_and(|own| *own == recorded.attempt.process)
         })
         .map(|recorded| record_said(recorded, id))
         .collect();
@@ -3678,6 +3674,18 @@ mod tests {
                 format!(" The last record of a {name} (process {pid}) is at {at}: {tail}"),
             );
         }
+        // The process that wrote the record lives, and is not this one.
+        #[cfg(unix)]
+        let mut other = std::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .expect("a live process");
+        #[cfg(unix)]
+        let (pid, other_identity) = (
+            other.id(),
+            identity::process_start_identity(other.id()).expect("an identity"),
+        );
+        #[cfg(unix)]
         for (command, name) in [
             (attempt::Command::Stop, "kr host stop"),
             (attempt::Command::Restart, "kr host restart"),
@@ -3690,7 +3698,7 @@ mod tests {
             let record = attempt::Attempt {
                 command,
                 phase: attempt::Phase::Told,
-                process: identity::current_process_start_identity().expect("an identity"),
+                process: other_identity.clone(),
                 at_ms: 1,
                 daemon: None,
             };
@@ -3705,6 +3713,11 @@ mod tests {
                     " A {name} is under way for environment {id} (process {pid}, last recorded at {at}); wait for it."
                 ),
             );
+        }
+        #[cfg(unix)]
+        {
+            let _ = other.kill();
+            let _ = other.wait();
         }
     }
 
@@ -3996,11 +4009,11 @@ mod tests {
     }
 
     /// What a message that no control daemon runs says of the records names no record that is the
-    /// command's own: a restart's record of the start that it is making is not said by the message
-    /// of that start's failure, and a record of another process, or of this process in another
-    /// phase, is.
+    /// command's own, whatever phase it last wrote (the write of the phase that follows can fail
+    /// and leave an earlier one): a record of this process is not said by the message of the
+    /// failure of its own start, and a record of another process is, in every phase.
     #[test]
-    fn a_restarts_record_of_its_own_start_is_not_said_to_the_command_that_made_it() {
+    fn a_command_does_not_say_its_own_record_in_any_phase() {
         let temp = kr_ipc::testing::TempHost::create();
         let environment = temp.environment();
         let id = environment.environment_id();
@@ -4021,22 +4034,21 @@ mod tests {
             .expect("writes the record");
         };
         let own = || identity::current_process_start_identity().expect("an identity");
-        write("its-own-start", attempt::Phase::Starting, own());
-        assert_eq!(
-            records_said(&environment).to_string(),
-            "",
-            "the record of the start that this command is making is its own"
-        );
-        write("its-own-stop", attempt::Phase::Told, own());
+        for (file, phase) in [
+            ("its-own-asking", attempt::Phase::Asking),
+            ("its-own-told", attempt::Phase::Told),
+            ("its-own-starting", attempt::Phase::Starting),
+            ("its-own-failed-start", attempt::Phase::StartFailed),
+        ] {
+            write(file, phase, own());
+            assert_eq!(
+                records_said(&environment).to_string(),
+                "",
+                "this process's record in the phase {phase:?} is its own"
+            );
+        }
         let pid = std::process::id();
         let at = crate::shown::utc_moment(1);
-        assert_eq!(
-            records_said(&environment).to_string(),
-            format!(
-                " A kr host restart is under way for environment {id} (process {pid}, last recorded at {at}); wait for it."
-            ),
-            "this process's record in another phase is still said"
-        );
         write(
             "another-start",
             attempt::Phase::Starting,

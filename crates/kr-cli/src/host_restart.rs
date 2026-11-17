@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use kr_client::shown;
 use kr_client::shown::{Said, Shown};
-use kr_controller::attempt::{self, Marker};
+use kr_controller::attempt::Marker;
 use kr_ipc::client::LocalClient;
 use kr_ipc::paths::HostPaths;
 use kr_protocol::error::ErrorCode;
@@ -1346,14 +1346,15 @@ impl StartFailed {
     }
 }
 
-/// Writes the command's record before it asks for anything, and keeps it where an interrupt finds
-/// it. `daemon` is the daemon the attempt stops, where there is one.
+/// Writes the record of a start that asks for no stop, as `starting` from its first write, and
+/// keeps it where an interrupt finds it. `daemon` is the daemon that ended before the start, where
+/// the command read it.
 fn begin_the_record(
     environment: &KnownEnvironment,
     daemon: Option<kr_protocol::identity::ProcessStartIdentity>,
     progress: &Progress,
 ) -> std::result::Result<(), kr_ipc::IpcError> {
-    let marker = Marker::begin(&environment.paths, attempt::Command::Restart, daemon)?;
+    let marker = Marker::begin_start(&environment.paths, daemon)?;
     *progress
         .marker
         .lock()
@@ -1580,6 +1581,7 @@ fn interrupt_says(progress: &Progress, stage: Stage, past: &Past) -> (Knows, Sho
 mod tests {
     use super::*;
     use crate::host_stop::Request;
+    use kr_controller::attempt;
 
     fn started(pid: Option<u32>) -> Started {
         Started {
@@ -2468,6 +2470,22 @@ mod tests {
                 Shown::ipc(&error)
             )
         );
+    }
+
+    /// A start that asked for no stop writes its record as `starting` from the first write, so
+    /// that a command killed between that write and the next leaves no record that says it was
+    /// asking a daemon to stop.
+    #[test]
+    fn the_record_of_a_start_that_asked_for_no_stop_begins_as_starting() {
+        let (_temp, environment) = an_environment();
+        let progress = Progress::new(environment.environment_id);
+        begin_the_record(&environment, None, &progress).expect("writes the record");
+        let found = attempt::recorded(&environment.paths);
+        assert_eq!(found.len(), 1, "one record stands");
+        assert_eq!(found[0].attempt.command, attempt::Command::Restart);
+        assert_eq!(found[0].attempt.phase, attempt::Phase::Starting);
+        progress.remove_marker();
+        assert!(attempt::recorded(&environment.paths).is_empty());
     }
 
     /// The restart's sentence for another daemon that held the environment after the stopped
