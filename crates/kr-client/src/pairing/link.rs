@@ -800,52 +800,43 @@ impl Preauth for Unpaired {
 }
 
 /// The hold a test puts on the next dial of a host that has looked at its pairing and is about to
-/// introduce the host to the endpoint, which [`EndpointPool::hold_next_introduce_of`] arms.
+/// introduce the host to the endpoint, which [`EndpointPool::hold_next_introduce_of`] arms. A test
+/// waits for the dial on a thread of its own, by asking [`Self::is_reached`].
 #[cfg(feature = "testing")]
 pub struct IntroduceHold {
-    reached: Option<std::sync::mpsc::Receiver<()>>,
-    seen: bool,
-    release: Option<tokio::sync::oneshot::Sender<()>>,
+    reached: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    seen: std::sync::atomic::AtomicBool,
+    release: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
-
-/// How long a wait on a hold may take before it is a failure: a bound on a fault, and no time that
-/// anything is expected to take.
-#[cfg(feature = "testing")]
-const HOLD_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[cfg(feature = "testing")]
 impl IntroduceHold {
-    /// Waits, on a thread of its own, until a dial is held at the hold.
-    ///
-    /// # Panics
-    ///
-    /// Panics when no dial reaches the hold within the bound.
-    pub async fn reached(&mut self) {
-        let receiver = self.reached.take().expect("the hold is waited on once");
-        let (receiver, outcome) = tokio::task::spawn_blocking(move || {
-            let outcome = receiver.recv_timeout(HOLD_PATIENCE);
-            (receiver, outcome)
-        })
-        .await
-        .expect("the wait ran");
-        self.reached = Some(receiver);
-        outcome.expect("a dial reached the hold within the bound");
-        self.seen = true;
-    }
-
     /// Whether a dial has reached the hold so far.
-    pub fn is_reached(&mut self) -> bool {
-        if !self.seen
-            && let Some(receiver) = &self.reached
-        {
-            self.seen = receiver.try_recv().is_ok();
+    pub fn is_reached(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.seen.load(Ordering::SeqCst) {
+            return true;
         }
-        self.seen
+        let arrived = self
+            .reached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .try_recv()
+            .is_ok();
+        if arrived {
+            self.seen.store(true, Ordering::SeqCst);
+        }
+        arrived
     }
 
     /// Lets the held dial go on, or the next one that reaches the hold pass at once.
-    pub fn release(&mut self) {
-        if let Some(release) = self.release.take() {
+    pub fn release(&self) {
+        let release = self
+            .release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(release) = release {
             let _ = release.send(());
         }
     }
@@ -873,10 +864,9 @@ mod gate {
     use super::IntroduceHold;
 
     /// The one hold that is armed, if any: the next dial of its host that reaches the gate takes it.
-    #[derive(Debug, Default)]
+    #[derive(Default)]
     pub(super) struct Gate(Mutex<Option<Armed>>);
 
-    #[derive(Debug)]
     struct Armed {
         host: EndpointKey,
         reached: mpsc::Sender<()>,
@@ -909,9 +899,9 @@ mod gate {
                 release: releasing,
             });
             IntroduceHold {
-                reached: Some(reaching),
-                seen: false,
-                release: Some(release),
+                reached: Mutex::new(reaching),
+                seen: std::sync::atomic::AtomicBool::new(false),
+                release: Mutex::new(Some(release)),
             }
         }
     }
@@ -1162,7 +1152,7 @@ mod tests {
 
         // The forget lands after the dial's first look and before its introduction: the second look
         // takes the host out again.
-        let mut hold = pool.hold_next_introduce_of(&host);
+        let hold = Arc::new(pool.hold_next_introduce_of(&host));
         let dialling = tokio::spawn({
             let (pool, config) = (Arc::clone(&pool), config.clone());
             async move {
@@ -1171,7 +1161,19 @@ mod tests {
                     .map(|_| ())
             }
         });
-        hold.reached().await;
+        let waiting = Arc::clone(&hold);
+        tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !waiting.is_reached() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "a dial reached the hold within the bound"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        })
+        .await
+        .expect("the wait ran");
         pool.forget(&host, pairing(2)).await;
         hold.release();
         assert!(
