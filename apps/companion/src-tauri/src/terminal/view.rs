@@ -979,8 +979,6 @@ struct View {
     heard_in_flight: bool,
     /// What the loop has heard and not yet served, in the order the host sent it.
     heard: VecDeque<Heard>,
-    /// The most items the queue has held at one time, which a test reads to see that the queue is
-    /// bounded.
     /// What a test reads of the view while it runs.
     #[cfg(feature = "testing")]
     probe: Probe,
