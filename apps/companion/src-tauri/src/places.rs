@@ -385,7 +385,7 @@ impl HostLink for Budgeted {
             .present_membership(session, host, identity, presentation)
     }
 
-    fn forget_host<'a>(&'a self, host: &'a EndpointKey) -> BoxFuture<'a, ()> {
+    fn forget_host<'a>(&'a self, host: &'a PairedHost) -> BoxFuture<'a, ()> {
         self.inner.forget_host(host)
     }
 

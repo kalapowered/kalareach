@@ -2838,7 +2838,7 @@ mod tests {
             unreachable!("the host commits nothing")
         }
 
-        fn forget_host<'a>(&'a self, _host: &'a EndpointKey) -> BoxFuture<'a, ()> {
+        fn forget_host<'a>(&'a self, _host: &'a PairedHost) -> BoxFuture<'a, ()> {
             Box::pin(async {})
         }
     }

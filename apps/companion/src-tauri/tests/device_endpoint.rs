@@ -16,10 +16,12 @@ mod support;
 use std::sync::Arc;
 
 use companion_tauri::AppState;
+use companion_tauri::inbox::{HostInbox, InboxDesk};
 use companion_tauri::settings::Hosts as _;
 use companion_tauri::settings::connected::ConnectedHosts;
 use kr_client::pairing::BoxFuture;
 use kr_client::pairing::owner::{Ceremony, CeremonyKind, CeremonyOutcome};
+use kr_client::pairing::paired::PairedHost;
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::{MemoryStore, SecretStore, store_device_keys};
 use kr_protocol::ids::{DeviceId, SessionId};
@@ -347,8 +349,15 @@ async fn a_host_in_use_keeps_its_terminal_view_while_the_member_check_asks_a_hos
     let published = companion.states(11).len();
 
     // (3) The second host revokes the second owner device. (4) The member check runs again, over
-    // every owned host beside the one in use.
+    // every owned host beside the one in use: first as the settings' own refresh, which drops the
+    // revoked device from the members only when the second host's word is heard, and then as the
+    // check's own lists.
     rig.second_host_revokes_the_other_device().await;
+    let members = rig.devices()["members"].as_array().expect("members").len();
+    assert_eq!(
+        members, 1,
+        "the revoked device is not retained, so the next key is not wrapped to it"
+    );
     let after = rig.asked().await;
     assert!(
         !after.silent && !after.refused,
@@ -360,11 +369,6 @@ async fn a_host_in_use_keeps_its_terminal_view_while_the_member_check_asks_a_hos
             .iter()
             .any(|device| device.device_id == rig.other && device.revoked)),
         "an answer says the device was revoked"
-    );
-    let members = rig.devices()["members"].as_array().expect("members").len();
-    assert_eq!(
-        members, 1,
-        "the revoked device is not retained, so the next key is not wrapped to it"
     );
 
     // The terminal view is the same connection: nothing ended or began again in it, and it takes
@@ -578,4 +582,202 @@ async fn forgetting_a_host_takes_it_out_of_the_one_endpoint() {
             json!({ "params": { "environment_id": null, "include_closed": false } }),
         )
         .expect("the host that is kept still answers");
+}
+
+/// Waits, on a thread of its own, until `ready` holds. A hook holds the path that is waited on, so
+/// the wait is made by a blocking thread and no timer of the runtime.
+async fn until(what: &'static str, ready: impl Fn() -> bool + Send + 'static) {
+    tokio::task::spawn_blocking(move || {
+        let deadline = std::time::Instant::now() + WATCHDOG;
+        while !ready() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    })
+    .await
+    .expect("the wait ran");
+}
+
+/// The record this application holds now of the paired host `host`.
+fn record_of(device: &companion_tauri::device::Device, host: &Host) -> PairedHost {
+    device
+        .pairing()
+        .hosts
+        .list()
+        .expect("the records")
+        .into_iter()
+        .find(|paired| paired.host_endpoint_id == host.network().endpoint_id())
+        .expect("the host is recorded")
+}
+
+/// A visit of the inbox, as the application makes one, started now: it asks every paired host that
+/// is not the one in use.
+fn visit_started(
+    desk: &Arc<InboxDesk>,
+    device: &Arc<companion_tauri::device::Device>,
+) -> tokio::task::JoinHandle<Vec<HostInbox>> {
+    let (desk, device) = (Arc::clone(desk), Arc::clone(device));
+    tokio::spawn(async move { desk.visit(&device).await })
+}
+
+/// A visit that began before the person forgot a host does not put the host back into the device's
+/// endpoint, in each order that the forget and the visit's dial can meet, and another pairing with
+/// the same host is admitted at once while the forgotten pairing's dial stays refused. The visit is the
+/// inbox's own, over a paired host that is not the one in use; the host's unshared relay is the
+/// evidence, for it enters the map only when the host is introduced.
+///
+/// (a) The forget returns before the visit's dial reaches the endpoint: the dial is refused and does
+/// not even reach the introduction. (b) The forget lands after the dial's first look at its pairing
+/// and before it introduces the host: the second look takes the host out again. (c) The forget lands
+/// after the dial reached the endpoint: the forget takes the host out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_visit_that_began_before_the_forget_does_not_put_the_host_back() {
+    const SHARED: &str = "https://127.0.0.1:11";
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let kept = host_on(&owner, &[SHARED], FIRST_RESOLVER).await;
+    let first = host_on(&owner, &[SHARED, "https://127.0.0.1:12"], SECOND_RESOLVER).await;
+    let second = host_on(&owner, &[SHARED, "https://127.0.0.1:13"], SECOND_RESOLVER).await;
+    let third = host_on(&owner, &[SHARED, "https://127.0.0.1:14"], SECOND_RESOLVER).await;
+    let control = LinkControl::new();
+    let phone = unpaired_phone_controlled(&kept, &control);
+    let companion = &phone.companion;
+    let device = companion.device();
+    pair(&phone, &kept, &owner, &[ActionRight::SessionView]).await;
+    let used = companion
+        .call(
+            "hosts_use",
+            json!({ "reference": reference_for(companion, &kept) }),
+        )
+        .expect("the kept host is chosen");
+    assert_eq!(used["connected"], true, "{used}");
+    let desk = Arc::new(InboxDesk::default());
+    let forget = |host: &Host| {
+        companion
+            .call(
+                "hosts_forget",
+                json!({ "reference": reference_for(companion, host) }),
+            )
+            .expect("the host is forgotten");
+    };
+
+    // (a) The visit's dial is held on its way to the endpoint, the person forgets the host and the
+    // command returns, and the dial is let go.
+    pair(&phone, &first, &owner, &[ActionRight::SessionView]).await;
+    let old = record_of(&device, &first);
+    let mut at_the_introduction = control.hold_next_introduce_of(&old.host_endpoint_id);
+    at_the_introduction.release();
+    control.hold();
+    let visit = visit_started(&desk, &device);
+    until("the visit's dial is held on its way to the endpoint", {
+        let control = Arc::clone(&control);
+        move || control.held() >= 1
+    })
+    .await;
+    forget(&first);
+    control.stop_holding();
+    control.release_all();
+    let found = visit.await.expect("the visit ran");
+    assert!(
+        found.is_empty(),
+        "the forgotten host is not reported: {found:?}"
+    );
+    assert!(
+        !at_the_introduction.is_reached(),
+        "the refused dial never reached the introduction"
+    );
+    assert_eq!(
+        control.relay_urls().await,
+        relays(&[SHARED]),
+        "the forgotten host's own relay was not put back"
+    );
+
+    // (b) The visit's dial is let through to the endpoint and held between its first look and the
+    // introduction, the person forgets the host, and the dial goes on.
+    pair(&phone, &second, &owner, &[ActionRight::SessionView]).await;
+    let mut at_the_introduction =
+        control.hold_next_introduce_of(&record_of(&device, &second).host_endpoint_id);
+    control.hold();
+    let visit = visit_started(&desk, &device);
+    until("the visit's dial is held on its way to the endpoint", {
+        let control = Arc::clone(&control);
+        move || control.held() >= 1
+    })
+    .await;
+    control.stop_holding();
+    control.release_all();
+    at_the_introduction.reached().await;
+    forget(&second);
+    assert_eq!(control.relay_urls().await, relays(&[SHARED]));
+    at_the_introduction.release();
+    let found = visit.await.expect("the visit ran");
+    assert!(
+        found.is_empty(),
+        "the forgotten host is not reported: {found:?}"
+    );
+    assert_eq!(
+        control.relay_urls().await,
+        relays(&[SHARED]),
+        "the dial's second look took the host out again"
+    );
+
+    // (c) The visit's connection is held after the endpoint took its host in, the person forgets the
+    // host, and the connection is let go.
+    pair(&phone, &third, &owner, &[ActionRight::SessionView]).await;
+    let arrivals = control.hold_dialled(record_of(&device, &third).host_endpoint_id);
+    let visit = visit_started(&desk, &device);
+    tokio::task::spawn_blocking(move || arrivals.recv_timeout(WATCHDOG))
+        .await
+        .expect("the wait ran")
+        .expect("the visit's connection reaches the hold");
+    assert_eq!(
+        control.relay_urls().await,
+        relays(&[SHARED, "https://127.0.0.1:14"]),
+        "the endpoint took the visited host in"
+    );
+    forget(&third);
+    assert_eq!(
+        control.relay_urls().await,
+        relays(&[SHARED]),
+        "the forget took the host out of the endpoint under the visit"
+    );
+    control.release_dialled();
+    let found = visit.await.expect("the visit ran");
+    assert!(
+        found.is_empty(),
+        "the forgotten host is not reported: {found:?}"
+    );
+    assert_eq!(
+        control.relay_urls().await,
+        relays(&[SHARED]),
+        "the visit that ended after the forget left the host out"
+    );
+
+    // Another pairing with the same host has an identity of its own, so nothing admits it and nothing
+    // refuses it: the endpoint takes its host in at once, its relay is in the map, and the dial of the
+    // forgotten pairing stays refused. (The host's store holds one row for each endpoint of a device,
+    // so this computer cannot be paired with the same host a second time; the second pairing is the
+    // record that a new pairing would have written, with the identity the host would have given.)
+    let new = PairedHost {
+        device_id: DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16])),
+        ..old.clone()
+    };
+    assert_ne!(new.device_id, old.device_id);
+    device
+        .pairing()
+        .hosts
+        .record(new.clone())
+        .expect("the record of the new pairing is kept");
+    control
+        .dial_as(&new)
+        .await
+        .expect("the endpoint takes the host of the new pairing in");
+    assert_eq!(
+        control.relay_urls().await,
+        relays(&[SHARED, "https://127.0.0.1:12"]),
+        "the new pairing's relay is in the map"
+    );
+    assert!(
+        control.dial_as(&old).await.is_err(),
+        "the dial of the forgotten pairing is refused"
+    );
 }

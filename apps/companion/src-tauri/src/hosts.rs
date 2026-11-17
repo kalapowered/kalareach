@@ -75,7 +75,9 @@ pub async fn use_host<R: Runtime>(app: &AppHandle<R>, host: PairedHost) -> Resul
 /// the host: its address lookups and the relays that no other host names. That is the last step,
 /// and it runs to its end in a task of its own, so a command that stops waiting for it, or an
 /// application that ends in it, leaves nothing else of the forgetting undone, and the host is not
-/// left in the endpoint. The only thing that waits for the endpoint is the command's return.
+/// left in the endpoint. The only thing that waits for the endpoint is the command's return. A
+/// visit or a look that began before the forget and dials the host after it is refused by the
+/// endpoint, so it does not put the host back.
 ///
 /// # Errors
 ///
@@ -108,9 +110,9 @@ pub async fn forget_host<R: Runtime>(
         desk.forgotten(host.host_device_id);
     }
     state.inbox().forgotten(host.host_device_id);
-    let (link, endpoint) = (Arc::clone(&device.pairing().link), host.host_endpoint_id);
+    let (link, forgotten) = (Arc::clone(&device.pairing().link), host.clone());
     // A task that panics has left nothing to wait for, and the person's forgetting has been done.
-    let _ = tauri::async_runtime::spawn(async move { link.forget_host(&endpoint).await }).await;
+    let _ = tauri::async_runtime::spawn(async move { link.forget_host(&forgotten).await }).await;
     Ok(state.connection_state())
 }
 
