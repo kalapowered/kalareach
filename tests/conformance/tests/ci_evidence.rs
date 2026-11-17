@@ -7,7 +7,7 @@
 //! directories; a job for each class of test on the runner the workflow gives it, whose step is not
 //! disabled and runs under the condition the workflow gives it, with the matrix leg that condition
 //! names still in the matrix; the landing workflow's triggers; the evidence check and the strict
-//! uploads, neither disabled, each made by the upload action of the directory the tests write to,
+//! uploads, neither disabled, each made by the evidence action of the directory the tests write to,
 //! after the step that writes last, none of them cut short or kept for less than the repository's
 //! default; and the table of those jobs in the conformance document. It reads the workflow as text,
 //! line by line, which holds its layout (jobs at two spaces, steps at six, a trigger or a key on a
@@ -673,10 +673,10 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
                  {writer}, which writes after it"
             );
             // The action that uploads, and the directory it uploads: the one the tests write to.
-            assert!(
-                value_at(&upload, 8, "uses")
-                    .is_some_and(|action| action.starts_with("actions/upload-artifact@")),
-                "the {job_name} job's upload of {artefact} is not made by the upload action"
+            assert_eq!(
+                value_at(&upload, 8, "uses").as_deref(),
+                Some("./.github/actions/keep-evidence"),
+                "the {job_name} job's upload of {artefact} is not made by the evidence action"
             );
             assert_eq!(
                 value_at(&upload, 10, "path").map(|found| compact(&found)),
@@ -697,6 +697,99 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
         documented_jobs(&document),
         held,
         "the conformance document's table of classes names the jobs the workflow's test holds"
+    );
+}
+
+/// KR-REQ-21.01, the action that the landing and conformance workflows keep their evidence
+/// through: it makes the upload twice and no more, each time by the pinned upload action with
+/// the name, the path and the rule it was given and no input of its own (no `overwrite`, which
+/// would delete another artifact of the name, and no retention), the first with its failure let
+/// pass and the second the same, so that the step that follows decides; and that step fails when
+/// the second try did not keep the evidence, whatever the rule for a path that holds nothing.
+#[test]
+fn the_evidence_action_makes_the_upload_twice_and_fails_when_both_tries_fail() {
+    let action = fs::read_to_string(repository().join(".github/actions/keep-evidence/action.yml"))
+        .expect("the evidence action");
+    let text: String = action
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .flat_map(|line| [line, "\n"])
+        .collect();
+    let steps: Vec<&str> = text.split("\n    - name: ").skip(1).collect();
+    let tries: Vec<&str> = steps
+        .iter()
+        .copied()
+        .filter(|step| step.contains("\n      uses: "))
+        .collect();
+    assert_eq!(tries.len(), 2, "the action makes two tries and no more");
+    let conditions = [
+        "${{ always() }}",
+        "${{ !cancelled() && steps.first.outcome == 'failure' }}",
+    ];
+    for ((step, id), condition) in tries.iter().zip(["first", "second"]).zip(conditions) {
+        assert_eq!(
+            value_at(step, 6, "id").as_deref(),
+            Some(id),
+            "the {id} try has another id"
+        );
+        let uses = value_at(step, 6, "uses").expect("a try is made by an action");
+        let (name, pin) = uses
+            .split_once('@')
+            .expect("an action is named with its pin");
+        assert_eq!(
+            name, "actions/upload-artifact",
+            "the {id} try is made by another action"
+        );
+        assert!(
+            pin.len() == 40 && pin.chars().all(|c| c.is_ascii_hexdigit()),
+            "the {id} try's action is not pinned by its full commit"
+        );
+        assert_eq!(
+            value_at(step, 6, "continue-on-error").as_deref(),
+            Some("true"),
+            "the {id} try lets its failure pass to the step that decides"
+        );
+        assert_eq!(
+            own_condition(step, 6),
+            Some(compact(condition)),
+            "the {id} try runs under another condition than {condition}"
+        );
+        for input in ["name", "path", "if-no-files-found"] {
+            assert_eq!(
+                value_at(step, 8, input).as_deref(),
+                Some(format!("${{{{ inputs.{input} }}}}").as_str()),
+                "the {id} try does not pass {input} on as it was given"
+            );
+        }
+        let inputs = step
+            .lines()
+            .filter(|line| key_value(line).is_some_and(|(at, _, _)| at == 8))
+            .count();
+        assert_eq!(
+            inputs, 3,
+            "the {id} try sets an input beyond the three it was given"
+        );
+    }
+    let letting_pass = text
+        .lines()
+        .filter(|line| key_value(line).is_some_and(|(_, key, _)| key == "continue-on-error"))
+        .count();
+    assert_eq!(
+        letting_pass, 2,
+        "a step other than the two tries lets its failure pass"
+    );
+    let failing: Vec<&str> = steps
+        .iter()
+        .copied()
+        .filter(|step| step.contains("exit 1"))
+        .collect();
+    assert_eq!(failing.len(), 1, "one step fails the action");
+    assert_eq!(
+        own_condition(failing[0], 6),
+        Some(compact(
+            "${{ always() && steps.first.outcome == 'failure' && steps.second.outcome != 'success' }}"
+        )),
+        "the step that fails the action runs under another condition than both tries failing"
     );
 }
 
