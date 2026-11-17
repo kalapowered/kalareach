@@ -851,7 +851,12 @@ impl TimeContract {
     fn sample(&self) {
         let Attempt { narrow, held_up } = self.take();
         let mut state = self.lock();
-        Self::start_mark(&mut state, &held_up);
+        // A mark that is there already was read back, and is not touched here. One that this
+        // sample starts follows its readings: each wall that is not behind the mark's projection
+        // replaces it, as a wall does at a look, so that a peak that a later try read is not lost
+        // to the first one.
+        let starts = state.high_water.is_none();
+        Self::start_mark(&mut state, starts, &held_up);
         let Some(Taken {
             first_ms: continuous_ms,
             active_ms,
@@ -869,21 +874,30 @@ impl TimeContract {
             continuous_ms,
             active_ms,
         });
-        Self::start_mark_at(&mut state, wall_ms, continuous_ms);
+        Self::start_mark_at(&mut state, starts, wall_ms, continuous_ms);
     }
 
     /// Starts the mark from what the held-up tries read, each at its second reading.
-    fn start_mark(state: &mut TimeState, held_up: &[HeldUp]) {
+    fn start_mark(state: &mut TimeState, starts: bool, held_up: &[HeldUp]) {
         for tried in held_up {
-            Self::start_mark_at(state, tried.wall_ms, tried.second_ms);
+            Self::start_mark_at(state, starts, tried.wall_ms, tried.second_ms);
         }
     }
 
-    /// Only a host with nothing recorded starts its mark here. One that read a checkpoint back has
-    /// its mark from that, and overwriting it with whatever the clock reads now would throw away
-    /// the only thing a restarted host knows about its own past.
-    fn start_mark_at(state: &mut TimeState, wall_ms: u64, continuous_ms: u64) {
-        if state.high_water.is_none() && state.trust == WallClockTrust::Trusted {
+    /// Only a host with nothing recorded starts its mark here, and only while it is trusted. One
+    /// that read a checkpoint back has its mark from that, and overwriting it with whatever the
+    /// clock reads now would throw away the only thing a restarted host knows about its own past.
+    ///
+    /// `starts` says that the mark was not there when the sample began. Then the mark is the first
+    /// wall read, and each later one that is not behind its projection takes its place.
+    fn start_mark_at(state: &mut TimeState, starts: bool, wall_ms: u64, continuous_ms: u64) {
+        if !starts || state.trust != WallClockTrust::Trusted {
+            return;
+        }
+        if state
+            .high_water
+            .is_none_or(|mark| wall_ms >= mark.projected(continuous_ms))
+        {
             state.high_water = Some(HighWater {
                 wall_ms,
                 continuous_ms,
@@ -3394,6 +3408,10 @@ mod tests {
         /// service moves it while the host is held up.
         set_after: std::sync::atomic::AtomicI64,
         set_to: std::sync::atomic::AtomicU64,
+        /// The wall clock is set to the value in `set_before_to` just before the `set_before`th
+        /// reading of it from when it was armed, as a clock moves between two tries.
+        set_before: std::sync::atomic::AtomicI64,
+        set_before_to: std::sync::atomic::AtomicU64,
     }
 
     impl Holdup {
@@ -3413,6 +3431,8 @@ mod tests {
                 slip: std::sync::atomic::AtomicBool::new(false),
                 set_after: std::sync::atomic::AtomicI64::new(0),
                 set_to: std::sync::atomic::AtomicU64::new(0),
+                set_before: std::sync::atomic::AtomicI64::new(0),
+                set_before_to: std::sync::atomic::AtomicU64::new(0),
             })
         }
 
@@ -3427,6 +3447,15 @@ mod tests {
                 .store(wall_ms, std::sync::atomic::Ordering::SeqCst);
             self.set_after
                 .store(landing, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Sets the wall clock to `wall_ms` just before its `reading`th reading from now, the first
+        /// being 1.
+        fn sets_the_wall_before_reading(&self, reading: i64, wall_ms: u64) {
+            self.set_before_to
+                .store(wall_ms, std::sync::atomic::Ordering::SeqCst);
+            self.set_before
+                .store(reading, std::sync::atomic::Ordering::SeqCst);
         }
 
         /// The host is awake and nothing holds it up: every clock moves on.
@@ -3459,6 +3488,9 @@ mod tests {
     impl WallClock for Holdup {
         fn now_ms(&self) -> TimestampMs {
             use std::sync::atomic::Ordering::SeqCst;
+            if self.set_before.fetch_sub(1, SeqCst) == 1 {
+                self.wall.set(self.set_before_to.load(SeqCst));
+            }
             let lands = if self.skip.load(SeqCst) > 0 {
                 self.skip.fetch_sub(1, SeqCst);
                 false
@@ -3952,5 +3984,54 @@ mod tests {
         held.pass(Duration::from_secs(1));
         assert!(contract.observe().rolled_back);
         assert_eq!(contract.trust(), WallClockTrust::Unresolved);
+    }
+
+    /// KR-REQ-09.18: the mark the first sample starts is not left at a pause after the wall was
+    /// read. The first try reads the wall and is held up for ten seconds after it; the mark is not
+    /// ten seconds behind the clocks because of it, so a step back of fourteen seconds, made a
+    /// second after the sample, is found at the first look and not forgiven for four seconds.
+    #[test]
+    fn a_pause_after_the_wall_of_the_first_sample_does_not_hide_a_step_back_from_the_first_look() {
+        let held = Holdup::new(HELD_UP, true);
+        held.arm(0, 1);
+        let contract = held.contract(None);
+        held.pass(Duration::from_secs(1));
+        held.wall.set(held.wall.now_ms().get() - 14_000);
+        assert!(
+            contract.observe().rolled_back,
+            "the step back is measured against the narrow reading that followed the pause"
+        );
+        assert_eq!(contract.trust(), WallClockTrust::Unresolved);
+    }
+
+    /// KR-REQ-09.18: a peak that only the second of two held-up tries of the first sample read is
+    /// in the mark, as the first one's is: the wall reads a peak in the second try and goes back a
+    /// minute before the narrow one, and the first look finds the step back.
+    #[test]
+    fn a_peak_only_the_second_held_up_try_of_the_first_sample_read_is_in_the_mark() {
+        let held = Holdup::new(HELD_UP, false);
+        let peak = WALL + 600_000;
+        held.sets_the_wall_after_landing(1, peak);
+        held.sets_the_wall_before_reading(3, peak + 10_000 - 60_000);
+        held.arm(0, 2);
+        let contract = held.contract(None);
+        held.pass(Duration::from_secs(1));
+        assert!(contract.observe().rolled_back);
+        assert_eq!(contract.trust(), WallClockTrust::Unresolved);
+    }
+
+    /// KR-REQ-09.18: the first sample does not move a mark that was read back. The wall reads three
+    /// seconds past the restored mark when the contract is built, and then 1.8 s behind it: that
+    /// is inside the stricter tolerance of a restored mark, which would be exceeded if the sample's
+    /// wall had replaced the mark (4.8 s against 4.75 s).
+    #[test]
+    fn a_restored_mark_is_not_moved_by_the_first_sample() {
+        let harness = restored(2, WALL + 3_000, Some(earlier_boot_state()));
+        harness.wall.set(WALL - 1_800);
+        assert!(
+            !harness.contract.observe().rolled_back,
+            "the clock is measured against what the host proved before it restarted"
+        );
+        assert_eq!(harness.contract.trust(), WallClockTrust::Trusted);
     }
 }
