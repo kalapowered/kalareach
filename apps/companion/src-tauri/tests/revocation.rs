@@ -3951,9 +3951,12 @@ async fn a_host_forgotten_while_the_view_asks_it_is_not_shown() {
         .expect("the host's reference")
         .to_owned();
 
-    // The view's visit is held on its way to the host, the person forgets the host, and the visit
-    // is let go.
-    rig.control.hold();
+    // The view's visit is held at its request for the host's devices, a request that only the view
+    // sends (the owner watcher's connection to the host asks for its pending requests), so the hold
+    // stands on this view's visit and on no other connection. The person forgets the host there, and
+    // the visit is let go.
+    rig.control
+        .hold_next_request(kr_protocol::method::Method::DeviceList);
     let state = rig.app.app.state::<AppState>();
     let (revocations, context) = (
         state.revocations().expect("the revocations"),
@@ -3963,10 +3966,10 @@ async fn a_host_forgotten_while_the_view_asks_it_is_not_shown() {
     let control = Arc::clone(&rig.control);
     tokio::task::spawn_blocking(move || {
         let deadline = std::time::Instant::now() + WATCHDOG;
-        while control.held() == 0 {
+        while !control.request_is_held() {
             assert!(
                 std::time::Instant::now() < deadline,
-                "the view's visit is held on its way to the host"
+                "the view's visit is held at its request for the host's devices"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -3976,8 +3979,7 @@ async fn a_host_forgotten_while_the_view_asks_it_is_not_shown() {
     rig.app
         .call("hosts_forget", json!({ "reference": reference }))
         .expect("the host is forgotten");
-    rig.control.stop_holding();
-    rig.control.release_all();
+    rig.control.release_request();
 
     let shown = serde_json::to_value(view.await.expect("the view ran")).expect("the view");
     assert!(

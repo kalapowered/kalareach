@@ -632,9 +632,9 @@ fn visit_started(
 /// (a) The forget returns before the visit's dial reaches the endpoint: the dial is refused and does
 /// not even reach the introduction. (b) The forget begins while the dial is held between its decision
 /// and its introduction: the forget waits for the introduction and then takes the host out. (c) The
-/// forget lands after the dial reached the endpoint and before its connection is made: the forget
-/// takes the host out, and the connection that is made afterwards puts nothing back, for it is made
-/// with the endpoint the dial was given and asks the pool for nothing.
+/// forget lands after the dial introduced the host and its connection is made, before the visit is
+/// given the connection: the forget takes the host out under the visit, and the visit that ends
+/// afterwards leaves the host out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_visit_that_began_before_the_forget_does_not_put_the_host_back() {
     const SHARED: &str = "https://127.0.0.1:11";
@@ -733,8 +733,8 @@ async fn a_visit_that_began_before_the_forget_does_not_put_the_host_back() {
         "the forget took out the host that the dial introduced while it waited"
     );
 
-    // (c) The visit's connection is held after the endpoint took its host in, the person forgets the
-    // host, and the connection is let go.
+    // (c) The visit's connection is held once it is made, after the endpoint took its host in, the
+    // person forgets the host, and the connection is let go.
     pair(&phone, &third, &owner, &[ActionRight::SessionView]).await;
     let arrivals = control.hold_dialled(record_of(&device, &third).host_endpoint_id);
     let visit = visit_started(&desk, &device);
