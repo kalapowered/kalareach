@@ -566,8 +566,6 @@ impl EndpointPool {
             Standing::Invited => None,
         };
         let lock = self.lock_of(host);
-        #[cfg(feature = "testing")]
-        self.gate.pass(host, gate::Point::BeforeTheLock).await;
         let _held = lock.lock().await;
         // The decision: made with the lock held, after any forget that held it first.
         if pairing.is_some_and(|pairing| self.is_forgotten(pairing)) {
@@ -575,9 +573,7 @@ impl EndpointPool {
         }
         let device = self.bound().await?;
         #[cfg(feature = "testing")]
-        self.gate
-            .pass(host, gate::Point::BeforeTheIntroduction)
-            .await;
+        self.gate.pass(host).await;
         // The record is made here, with no await between it and the table's insert, which the
         // first poll of `introduce` makes: a caller that stops waiting inside the introduction
         // leaves the entry in the table, and the record stays with it.
@@ -899,10 +895,9 @@ impl Preauth for Unpaired {
     }
 }
 
-/// The hold a test puts on the next dial of a host at one of two places, which
-/// [`EndpointPool::hold_next_dial_of`] (before the dial asks for its host's lock) and
-/// [`EndpointPool::hold_next_introduce_of`] (after it decided, before it introduces the host) arm. A
-/// test waits for the dial on a thread of its own, by asking [`Self::is_reached`].
+/// The hold a test puts on the next dial of a host, between its decision and the introduction,
+/// which [`EndpointPool::hold_next_introduce_of`] arms. A test waits for the dial on a thread of
+/// its own, by asking [`Self::is_reached`].
 #[cfg(feature = "testing")]
 pub struct IntroduceHold {
     reached: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
@@ -951,14 +946,7 @@ impl EndpointPool {
     /// that crate's.
     #[must_use]
     pub fn hold_next_introduce_of(&self, host: &EndpointKey) -> IntroduceHold {
-        self.gate.arm(*host, gate::Point::BeforeTheIntroduction)
-    }
-
-    /// Arms a hold on the next dial of `host`, before it asks for the host's lock and so before it
-    /// decides: it stops there until the hold is released.
-    #[must_use]
-    pub fn hold_next_dial_of(&self, host: &EndpointKey) -> IntroduceHold {
-        self.gate.arm(*host, gate::Point::BeforeTheLock)
+        self.gate.arm(*host)
     }
 }
 
@@ -971,35 +959,22 @@ mod gate {
 
     use super::IntroduceHold;
 
-    /// Where in a dial a hold stands.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    pub(super) enum Point {
-        /// Before the dial asks for its host's lock.
-        BeforeTheLock,
-        /// After the dial decided, before it introduces the host.
-        BeforeTheIntroduction,
-    }
-
-    /// The one hold that is armed, if any: the next dial of its host that reaches its point takes it.
+    /// The one hold that is armed, if any: the next dial of its host that reaches the gate takes it.
     #[derive(Default)]
     pub(super) struct Gate(Mutex<Option<Armed>>);
 
     struct Armed {
         host: EndpointKey,
-        point: Point,
         reached: mpsc::Sender<()>,
         release: oneshot::Receiver<()>,
     }
 
     impl Gate {
-        /// Holds the calling dial of `host` if a hold is armed for that host at `point`.
-        pub(super) async fn pass(&self, host: &EndpointKey, point: Point) {
+        /// Holds the calling dial of `host` if a hold is armed for that host.
+        pub(super) async fn pass(&self, host: &EndpointKey) {
             let armed = {
                 let mut armed = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-                if armed
-                    .as_ref()
-                    .is_some_and(|armed| armed.host == *host && armed.point == point)
-                {
+                if armed.as_ref().is_some_and(|armed| armed.host == *host) {
                     armed.take()
                 } else {
                     None
@@ -1011,12 +986,11 @@ mod gate {
             }
         }
 
-        pub(super) fn arm(&self, host: EndpointKey, point: Point) -> IntroduceHold {
+        pub(super) fn arm(&self, host: EndpointKey) -> IntroduceHold {
             let (reached, reaching) = mpsc::channel();
             let (release, releasing) = oneshot::channel();
             *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(Armed {
                 host,
-                point,
                 reached,
                 release: releasing,
             });
@@ -1610,34 +1584,56 @@ mod tests {
         pool.close().await;
     }
 
-    /// A dial that began before the forget and asks for the lock only after the forget ended meets
-    /// the mark: it is held before the lock, the forget runs to its end, and the dial is let go and
-    /// refused. A decision made before the lock would let it through.
+    /// A dial that began before the forget and gets the host's lock after the forget marked its
+    /// pairing is refused. The case holds the host's lock, starts the dial, then the forget, and
+    /// lets the lock go once the forget has marked: the lock hands itself on in the order in which
+    /// its callers came, so the dial gets it first, and it decides with the lock held. A decision
+    /// made before the lock would have been made when the dial began, before the mark, and would
+    /// let the dial through.
     #[tokio::test]
-    async fn a_dial_that_began_before_the_forget_is_refused_when_it_asks_for_the_lock_after_it() {
+    async fn a_dial_that_began_before_the_forget_is_refused_when_it_gets_the_lock_after_the_mark() {
         let pool = loopback_pool();
-        let own = "https://127.0.0.1:10";
+        let other_relay = "https://127.0.0.1:10";
+        let own = "https://127.0.0.1:20";
         let config = network(&[own], Some(RESOLVER), &[]);
-        let early = key();
-        pool.endpoint(&config, &early, Standing::Paired(pairing(2)))
-            .await
-            .expect("the pairing is reached");
-        let before_the_lock = Arc::new(pool.hold_next_dial_of(&early));
-        let (_, dialled) = dialling(&pool, &config, early, 2);
-        until("the dial is held before the lock", {
-            let before_the_lock = Arc::clone(&before_the_lock);
-            move || before_the_lock.is_reached()
+        // The endpoint is bound by another host, so that the table can be read afterwards.
+        pool.endpoint(
+            &network(&[other_relay], Some(RESOLVER), &[]),
+            &key(),
+            Standing::Paired(pairing(9)),
+        )
+        .await
+        .expect("the other host is reached and the endpoint is bound");
+
+        let host = key();
+        let case_holds_the_lock = pool.lock_of(&host).lock_owned().await;
+        let (_, dialled) = dialling(&pool, &config, host, 2);
+        // The case, the map and the dial hold a copy of the lock, and this wait's own copy is the
+        // fourth: the dial is waiting for the lock.
+        until("the dial waits for the host's lock", {
+            let lock = pool.lock_of(&host);
+            move || Arc::strong_count(&lock) >= 4
         })
         .await;
-        let (_, forgotten) = forgetting(&pool, early, 2);
-        heard("the forget returns", forgotten).await;
-        before_the_lock.release();
+        let (_, forgotten) = forgetting(&pool, host, 2);
+        until("the forget has marked its pairing", {
+            let pool = Arc::clone(&pool);
+            move || pool.is_forgotten(pairing(2))
+        })
+        .await;
+        drop(case_holds_the_lock);
+
         assert!(
             !heard("the dial ends", dialled).await,
-            "the dial that began before the forget is refused when it asks for the lock after it"
+            "the dial that began before the forget is refused when it gets the lock after the mark"
         );
-        assert!(!table_holds(&pool, &early).await);
-        assert!(pool.relay_urls().await.is_empty());
+        heard("the forget returns", forgotten).await;
+        assert!(!table_holds(&pool, &host).await);
+        assert_eq!(
+            pool.relay_urls().await,
+            BTreeSet::from([relay(other_relay)]),
+            "the refused dial put no relay in the map"
+        );
         pool.close().await;
     }
 
