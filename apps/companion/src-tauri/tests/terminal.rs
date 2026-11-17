@@ -7622,15 +7622,25 @@ async fn a_view_that_holds_the_lease_ends_control_when_the_host_finishes_its_inp
         paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
     host.script.say(Out::Finish);
     page.lane_ends_served(&view, 1).await;
-    let ended = page
-        .newest_within(3, |state| control(state) == (1, "watching".to_owned()))
-        .await
-        .expect("the host's finish ended control within the bound");
+    // The arm publishes control's end before it counts the lane's end: the state is there now.
+    let ended = page.states(3).last().cloned().expect("a state");
+    assert_eq!(
+        control(&ended),
+        (1, "watching".to_owned()),
+        "the host's finish ended control as the view served the end of the lane"
+    );
     assert_eq!(
         ended["control"]["ended"], "Control ended: this view's input stream ended.",
         "the stream's words, whole"
     );
     let release = release_of_the_epoch_within_the_bound(&mut link, lease.epoch).await;
+    assert_eq!(
+        page.app
+            .state::<companion_tauri::terminal::TerminalViews>()
+            .releases_queued(&view),
+        Some(1),
+        "a lane that ends by another cause owes one release, which the view queued"
+    );
     lease.answer(&mut link, &release).await;
     assert!(
         link.call_within(QUIET).await.is_none(),
