@@ -91,7 +91,8 @@ const STOP_FOR: Duration = Duration::from_secs(5);
 /// the last pump waits at the gate. This bounds the wait only: it does not bound the dispatch of
 /// the blocking thread or the case's next poll, and a pump that misses it is not necessarily stuck,
 /// because a host under load can delay a pump past it. The case then fails the stop with a line of
-/// its own and judges no window for it. It is shorter than a stop, so each stop keeps a window.
+/// its own and judges no window for it. A bound shorter than a stop does not by itself give a
+/// window: the window's recorded start is supplied by the case's own question.
 const STAND: Duration = Duration::from_secs(3);
 
 /// The longest that a connection to a host on the relay that resumed may take to answer a question
@@ -488,8 +489,9 @@ async fn send_loop(connection: Connection, sent: Arc<AtomicUsize>) {
 type Outcome = Option<(Instant, Result<Duration, String>)>;
 
 /// Asks one question on a task of its own. The task takes the question's start right before it
-/// asks and the answer's arrival right after the answer comes, so both are recorded by the task
-/// that sends and receives. `began` is sent once the start is taken.
+/// asks and its observation of the answer right after its call returns, so both are recorded by
+/// the task that sends and receives; the second is never earlier than the answer's arrival.
+/// `began` is sent once the start is taken.
 fn spawn_question(
     connection: Connection,
     slots: &Arc<Mutex<Vec<Outcome>>>,
@@ -1147,8 +1149,10 @@ async fn recovery(hosts: usize, stops: usize, stop_for: Duration) -> (Vec<String
     // either way, so a question that was asked once every pump waited at the gate gets no answer
     // before the resume. Every instant compared here is taken where its event happens, at the event,
     // and no instant of the case's own task is used: the stop's confirmation and the resume by the
-    // front under its lock, a question's start and its answer's arrival by the question's own task.
-    // A delay of any task can only move the question's recorded start or arrival later. A clock may
+    // front under its lock, a question's start and its observation of the answer by the question's
+    // own task. A delay of any task can only move the question's recorded start or observation
+    // later. The stop itself is not judged from the questions: it passes only on the front's own
+    // record of a stop, and the questions can only refuse it. A clock may
     // give equal instants, so a question that began at the resume's instant counts in the window.
     for (number, ((_, resumed), stood)) in windows.iter().zip(&stood).enumerate() {
         let Some(stood) = stood else { continue };
