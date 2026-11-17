@@ -96,7 +96,7 @@ question=profiles way=failed stand-in=ends with code 1
 question=profiles way=signalled stand-in=ends by SIGKILL
 question=profiles way=unread stand-in=takes the answer file away and ends with code 0
 question=profiles way=not_started stand-in=is not there to be started
-question=profiles way=wait_failed stand-in=another thread of the process takes the program's end before this host's wait sees it, so the wait fails (a process of its own)
+question=profiles way=wait_failed stand-in=the run's process ignores SIGCHLD, so the system takes the program's end and the wait fails (a process of its own)
 question=profiles way=not_prepared stand-in=the temporary folder is a file, so the call's folder cannot be made (a process of its own)
 question=placement way=too_long stand-in=an answer of 70000 letters
 question=placement way=not_text stand-in=bytes that are not UTF-8
@@ -104,7 +104,7 @@ question=placement way=failed stand-in=ends with code 1
 question=placement way=signalled stand-in=ends by SIGKILL
 question=placement way=unread stand-in=takes the answer file away and ends with code 0
 question=placement way=not_started stand-in=is not there to be started
-question=placement way=wait_failed stand-in=another thread of the process takes the program's end before this host's wait sees it, so the wait fails (a process of its own)
+question=placement way=wait_failed stand-in=the run's process ignores SIGCHLD, so the system takes the program's end and the wait fails (a process of its own)
 question=placement way=not_prepared stand-in=the temporary folder is a file, so the call's folder cannot be made (a process of its own)
 question=check way=too_long stand-in=an answer of 70000 letters
 question=check way=not_text stand-in=bytes that are not UTF-8
@@ -112,7 +112,7 @@ question=check way=failed stand-in=ends with code 1
 question=check way=signalled stand-in=ends by SIGKILL
 question=check way=unread stand-in=takes the answer file away and ends with code 0
 question=check way=not_started stand-in=is not there to be started
-question=check way=wait_failed stand-in=another thread of the process takes the program's end before this host's wait sees it, so the wait fails (a process of its own)
+question=check way=wait_failed stand-in=the run's process ignores SIGCHLD, so the system takes the program's end and the wait fails (a process of its own)
 question=check way=not_prepared stand-in=the temporary folder is a file, so the call's folder cannot be made (a process of its own)
 question=profiles way=wrong_form stand-in=no answer
 question=profiles way=wrong_form stand-in=blank lines
