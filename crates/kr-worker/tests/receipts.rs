@@ -2257,7 +2257,7 @@ async fn the_connection_after_a_taken_send(sending: Sending) {
     );
 
     // The answer is kept on this device with the two older sends of it recorded.
-    let directory = tempfile::TempDir::new().expect("a directory");
+    let directory = kr_ipc::testing::PrivateTempDir::create();
     let drafts = AnswerDrafts::open(directory.path().join("answers")).expect("the store opens");
     let draft = AnswerDraft {
         version: answers::ANSWER_FORMAT,

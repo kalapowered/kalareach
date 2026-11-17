@@ -364,11 +364,10 @@ mod cases {
     use crate::error::ClientError;
     use crate::shown::{IoFault, Shown};
 
-    fn temporary() -> tempfile::TempDir {
-        tempfile::Builder::new()
-            .prefix("kr-marker-")
-            .tempdir_in(std::env::temp_dir())
-            .expect("a directory on the internal disk")
+    /// An owner-only directory under the temporary one, as the client's own state is: a store read
+    /// back on Windows is refused for the access list that a plain temporary directory inherits.
+    fn temporary() -> kr_ipc::testing::PrivateTempDir {
+        kr_ipc::testing::PrivateTempDir::create()
     }
 
     fn uuid(byte: u8) -> Uuid {
