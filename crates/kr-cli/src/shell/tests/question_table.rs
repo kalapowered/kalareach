@@ -444,17 +444,81 @@ fn the_install_says(
 /// What the install said, as the table says it: the home is `/home/person`, and the call's folder is
 /// `/tmp/kr-shell-ask-ID`, under `temporary`.
 fn as_the_table_says(text: &str, ground: &Ground, temporary: &Path) -> String {
-    let mut text = text.to_owned();
     let prefix = temporary.join("kr-shell-ask-").display().to_string();
-    while let Some(at) = text.find(&prefix) {
+    // One scan from the front that goes on after each id it replaced: the replacement starts with
+    // `/tmp/kr-shell-ask-`, which is the prefix itself where the temporary folder is `/tmp`, and a
+    // text that is searched again from where it was changed would find its own replacement for ever.
+    let mut said = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(&prefix) {
         let name = at + prefix.len();
-        let ends = text[name..]
+        let ends = rest[name..]
             .find(|letter: char| !(letter.is_ascii_hexdigit() || letter == '-'))
-            .map_or(text.len(), |offset| name + offset);
-        text.replace_range(at..ends, "/tmp/kr-shell-ask-ID");
+            .map_or(rest.len(), |offset| name + offset);
+        said.push_str(&rest[..at]);
+        said.push_str("/tmp/kr-shell-ask-ID");
+        rest = &rest[ends..];
     }
-    text.replace(&ground.home.to_string_lossy().into_owned(), "/home/person")
+    said.push_str(rest);
+    said.replace(&ground.home.to_string_lossy().into_owned(), "/home/person")
         .replace(&ground.root.to_string_lossy().into_owned(), "/tmp/walk")
+}
+
+/// How long a case that starts stand-ins is given. The longest of them ends in seconds on a busy
+/// machine, and every wait of the install for a program is bounded, so a case that has not ended in
+/// this time is not waiting for a program: it is stood at, and says so.
+const CASE_BOUND: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long a case that only reads text is given.
+const TEXT_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Runs `body` on a thread of its own and waits for it for up to `bound`. A body that panics fails
+/// the case with its own message, and a body that has not ended by `bound` fails it with a message
+/// that names the case, so that no case can stand without a bound of its own. The thread of a body
+/// that does not end is left to go with the test program.
+fn within(name: &str, bound: std::time::Duration, body: impl FnOnce() + Send + 'static) {
+    use std::sync::mpsc::RecvTimeoutError;
+
+    let (ended, ending) = std::sync::mpsc::channel();
+    let thread = std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            body();
+            let _ = ended.send(());
+        })
+        .expect("a thread for the case");
+    match ending.recv_timeout(bound) {
+        Ok(()) => thread.join().expect("a body that ended"),
+        // The body dropped its end without sending: it panicked, and says what it said.
+        Err(RecvTimeoutError::Disconnected) => match thread.join() {
+            Ok(()) => panic!("{name}: the body ended without saying so"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        },
+        Err(RecvTimeoutError::Timeout) => {
+            panic!("{name}: stood at, not ended within {bound:?}")
+        }
+    }
+}
+
+/// The call's folder is named by its id in what the install says wherever the temporary folder is,
+/// and where that is `/tmp` the id's own text starts with the folder's name: what the walk makes of
+/// the install's words must name each call folder once and must not read its own replacement.
+#[test]
+fn a_call_folder_in_slash_tmp_is_replaced_by_its_id_once() {
+    const NAME: &str = "a_call_folder_in_slash_tmp_is_replaced_by_its_id_once";
+    within(NAME, TEXT_BOUND, || {
+        let ground = ground();
+        let said = "/tmp/kr-shell-ask-3f9c1d2e-0b7a-4c55-9d1e-2a6b8c7d9e0f/said: could not be read: No such file or directory (os error 2)";
+        assert_eq!(
+            as_the_table_says(said, &ground, Path::new("/tmp")),
+            "/tmp/kr-shell-ask-ID/said: could not be read: No such file or directory (os error 2)"
+        );
+        let twice = "/tmp/kr-shell-ask-1a2b and /tmp/kr-shell-ask-3c4d/said";
+        assert_eq!(
+            as_the_table_says(twice, &ground, Path::new("/tmp")),
+            "/tmp/kr-shell-ask-ID and /tmp/kr-shell-ask-ID/said"
+        );
+    });
 }
 
 /// Makes every way that a stand-in can make in this process at every question, through the install,
