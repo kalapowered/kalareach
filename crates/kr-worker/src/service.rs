@@ -983,6 +983,18 @@ enum Tried<T> {
     PeerGone,
 }
 
+/// What a statement of what the local owner may do captured in the hold of the authority lock
+/// that changed the gate.
+#[derive(Clone, Copy)]
+struct Captured {
+    /// The releases of the dispatch boundary counted once the gate had changed: the hold that is
+    /// in place then is the one the statement waits for.
+    after: u64,
+    /// The restriction count the change left: the highest withdrawal the statement may run and
+    /// mark done.
+    ceiling: u64,
+}
+
 /// A withdrawal that is detaching a connection's attachments, counted for as long as it runs.
 struct RunningCount<'a>(&'a std::sync::atomic::AtomicUsize);
 
@@ -4375,13 +4387,13 @@ impl WorkerService {
         }
         #[cfg(feature = "testing")]
         self.connection_end_stall.stand();
-        let attachments = state.facts.take_attachments();
+        // Counted from the hold of the list that gives them up until each is detached, here or by
+        // the service's own pass, so that a statement's acknowledgement does not go out while a
+        // detach under the earlier statement is owed: a sweep that reads the list sees them or
+        // sees the count.
+        let attachments = state.facts.take_attachments(&self.withdrawals_running);
         #[cfg(feature = "testing")]
         self.attachments_taken_stall.stand();
-        // Counted until each is detached, here or by the service's own pass, so that a statement's
-        // acknowledgement does not go out while a detach under the earlier statement is owed.
-        self.withdrawals_running
-            .fetch_add(attachments.len(), std::sync::atomic::Ordering::SeqCst);
         self.detach_or_owe(attachments);
         // A window that outlived its connection could first-admit a request through a connection
         // that no longer exists, so the connection's windows go when it does, and so does its
@@ -4501,9 +4513,9 @@ impl WorkerService {
                 self.acknowledge_revision(state, &notice)
             })),
             ControlFrame::LocalAccess(access) => {
-                let (answer, after) = self.accept_local_access(state, access);
-                Some(match after {
-                    Some(after) => self.after_a_statement(after, answer).await,
+                let (answer, captured) = self.accept_local_access(state, access);
+                Some(match captured {
+                    Some(captured) => self.after_a_statement(captured, answer).await,
                     None => answer,
                 })
             }
@@ -5862,11 +5874,16 @@ impl WorkerService {
     /// revision, and the generation proof comes first. A statement that takes access away, a move
     /// to `Closed` or to an earlier end, withdraws the local connections that hold something, so
     /// a held input lease is released and input already queued is discarded.
+    ///
+    /// What the statement completes is what it captures here, in the one hold of the authority
+    /// lock that changes the gate: the restriction count it is of, and the withdrawal that count
+    /// owes. A later statement captures its own, in its own hold of the lock, and no statement
+    /// completes more than it captured.
     fn accept_local_access(
         &self,
         state: &ConnectionState,
         access: kr_protocol::worker::LocalAccess,
-    ) -> (ControlFrame, Option<u64>) {
+    ) -> (ControlFrame, Option<Captured>) {
         if state.facts.client_kind != LocalClientKind::Controller
             || state.facts.controller_role != ControllerConnectionRole::Authority
         {
@@ -5885,9 +5902,9 @@ impl WorkerService {
         // Held across the check and the application, and across nothing else: the generation the
         // statement is of is the one the connection proved, a newer one is installed under this
         // same lock, and so a statement of a superseded daemon that passed the check cannot be
-        // applied after the newer daemon's. The withdrawal below takes each connection's writer,
-        // so the lock is let go first.
-        let applied = {
+        // applied after the newer daemon's. The withdrawal itself takes each connection's writer,
+        // so it runs after the lock is let go; that it is owed is recorded before.
+        let (applied, ceiling) = {
             let authority = self
                 .authority
                 .lock()
@@ -5907,31 +5924,43 @@ impl WorkerService {
                     None,
                 );
             };
-            self.gate.apply(generation, access)
+            let applied = self.gate.apply(generation, access);
+            // Every change of the gate is made under this lock, so the count read here is the one
+            // this statement's change left: the restrictions it is of, and no later one.
+            let ceiling = self.gate.restrictions();
+            if matches!(
+                applied,
+                crate::local_gate::Applied::Accepted { tightened: true }
+            ) {
+                // Owed before the lock goes, so that no statement that comes after this change,
+                // a repeat on a replacement connection or a newer daemon's first, can read the
+                // gate without reading the withdrawal it owes.
+                self.withdrawals_owed
+                    .fetch_max(ceiling, std::sync::atomic::Ordering::SeqCst);
+            }
+            (applied, ceiling)
         };
         #[cfg(feature = "testing")]
         self.after_the_gate_change_stall.stand();
         // Counted once the gate has changed, before anything waits: the hold of the dispatch
         // boundary that is in place now is the last one that can have checked a local request
-        // under the earlier statement, so it is the one the acknowledgement waits for.
+        // under the earlier statement, so it is the one the acknowledgement waits for. A holder
+        // that takes the boundary between the change and this count checks under the new
+        // statement and is waited for too, which is one hold more and never a later one again.
         let after = self.dispatch.releases();
+        let captured = Captured { after, ceiling };
         match applied {
-            crate::local_gate::Applied::Accepted { tightened } => {
-                if tightened {
-                    self.owe_a_withdrawal();
-                }
-                (
-                    ControlFrame::LocalAccessAck(kr_protocol::worker::LocalAccessAck {
-                        sequence: access.sequence,
-                    }),
-                    Some(after),
-                )
-            }
+            crate::local_gate::Applied::Accepted { .. } => (
+                ControlFrame::LocalAccessAck(kr_protocol::worker::LocalAccessAck {
+                    sequence: access.sequence,
+                }),
+                Some(captured),
+            ),
             crate::local_gate::Applied::Stale { held } => (
                 ControlFrame::LocalAccessAck(kr_protocol::worker::LocalAccessAck {
                     sequence: U64::new(held),
                 }),
-                Some(after),
+                Some(captured),
             ),
             crate::local_gate::Applied::Conflict => (
                 failure(
@@ -5947,24 +5976,17 @@ impl WorkerService {
         }
     }
 
-    /// Records that the restriction the gate has just counted owes a withdrawal of the local
-    /// connections that hold something.
-    fn owe_a_withdrawal(&self) {
-        self.withdrawals_owed.fetch_max(
-            self.gate.restrictions(),
-            std::sync::atomic::Ordering::SeqCst,
-        );
-    }
-
     /// Waits for the hold of the dispatch boundary that was in place when `after` releases had
-    /// been counted, and for no later one.
+    /// been counted, and for no more than the one that follows it: a holder that took the
+    /// boundary between the change and the count can be the one waited for.
     ///
     /// A mutation checks the local owner's access inside the boundary and applies its effect inside
     /// the same hold, so once the hold that can have checked under the earlier statement has
     /// ended, every effect of such a check is in the session. The wait is made of tries and holds
     /// nothing: it ends when the count has moved past `after`, which the guard of the hold raises
     /// before it lets go, or when a try finds the boundary free. A holder that takes the boundary
-    /// later checks under the new statement, and is not waited for.
+    /// later checks under the new statement; waiting for it is safe, and is never more than one
+    /// hold.
     async fn wait_for_the_hold(&self, after: u64) {
         let mut pause = BOUNDARY_FIRST_RETRY;
         loop {
@@ -5986,16 +6008,23 @@ impl WorkerService {
     /// earlier statement owes, is pending: it waits for the hold in place when the gate changed,
     /// runs the withdrawal that is owed itself, and waits for the detaches that another
     /// withdrawal still runs. Nothing rests on the task of the statement that owed it.
-    async fn after_a_statement(&self, after: u64, answer: ControlFrame) -> ControlFrame {
+    ///
+    /// The statement completes what it captured and no more: the withdrawal it runs, and the mark
+    /// that says it is done, stop at the restriction count it was made under. A restriction a later
+    /// statement made is that statement's to complete, after the hold that statement waits for;
+    /// marking it done here would let it be answered with no sweep after a checked attach has
+    /// landed.
+    async fn after_a_statement(&self, captured: Captured, answer: ControlFrame) -> ControlFrame {
         #[cfg(feature = "testing")]
         let _waiting = WaitingCount::begin(&self.statements_waiting);
-        self.wait_for_the_hold(after).await;
+        self.wait_for_the_hold(captured.after).await;
         #[cfg(feature = "testing")]
         self.after_the_hold_stall.stand();
         loop {
             let owed = self
                 .withdrawals_owed
-                .load(std::sync::atomic::Ordering::SeqCst);
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .min(captured.ceiling);
             if self
                 .withdrawals_done
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -12303,14 +12332,16 @@ impl ConnectionFacts {
             .contains(&attachment_id)
     }
 
-    /// Takes every attachment this connection still owns.
-    fn take_attachments(&self) -> Vec<AttachmentId> {
-        std::mem::take(
-            &mut *self
-                .attachments
-                .lock()
-                .expect("the attachment list is not poisoned"),
-        )
+    /// Takes every attachment this connection still owns, and raises `pending` by their number in
+    /// the same hold of the list, so that no reader of the list sees it empty while the detaches
+    /// are not counted.
+    fn take_attachments(&self, pending: &std::sync::atomic::AtomicUsize) -> Vec<AttachmentId> {
+        let mut held = self
+            .attachments
+            .lock()
+            .expect("the attachment list is not poisoned");
+        pending.fetch_add(held.len(), std::sync::atomic::Ordering::SeqCst);
+        std::mem::take(&mut *held)
     }
 }
 
