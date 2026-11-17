@@ -3,10 +3,10 @@
 //!
 //! An applied policy is the revision an organisation's policy stands at on this host, which is the
 //! floor under it, and the adapters the policy allows. It is kept in `organisation-policy.json`
-//! beside the registry and not in the registry's enrolment rows: an earlier release reads the
-//! registry and has no place for it, so a registry that held one could not be read when the host
-//! goes back to that release. That release does not name this file, so it leaves it alone, and it
-//! applied no policy. A switch to a release that names no such store would lift the adapter lists
+//! beside the registry and not in the registry's enrolment rows: a release from before this store
+//! reads the registry and has no place for it, so a registry that held one could not be read when
+//! the host goes back to such a release. That release does not name this file, so it leaves it
+//! alone, and it applied no policy. A switch to a release that names no such store would lift the adapter lists
 //! the entries state, so the updater refuses it, with nothing switched, while an entry states one.
 //!
 //! One record holds every enrolment's policy and is written in one write, owner only, so a reader

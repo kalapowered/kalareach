@@ -13,8 +13,8 @@
 //! is the record of its action.
 //!
 //! The record is a database of its own, and not a table of the registry: the registry's schema is
-//! one every release before this one has to be able to read, and an answer nothing before this
-//! release asks for is not a reason to move it.
+//! one every release before this one has to be able to read, and an answer, which no release before
+//! the capability checks asks for, is not a reason to move it.
 
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};

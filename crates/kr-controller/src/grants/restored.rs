@@ -12,11 +12,11 @@
 //! The record is written when the host first finds the feed ahead, before it carries out anything
 //! again and before it raises the registry. Once the registry has moved, the comparison finds
 //! nothing, so the finding has to be on disk first. A start reads it and waits again: when it names
-//! the row the host holds, when it names another row (an earlier release rewrote the row, or the
-//! owner changed it while the wait stood, and nobody confirmed the row now held), and when it
-//! cannot be read. A host that finds no record waits for nothing, which is all it can do: a record
-//! removed by hand, or never written because an earlier release found the restore, leaves nothing
-//! to read.
+//! the row the host holds, when it names another row (a release from before this record rewrote
+//! the row, or the owner changed it while the wait stood, and nobody confirmed the row now held),
+//! and when it cannot be read. A host that finds no record waits for nothing, which is all it can
+//! do: a record removed by hand, or never written because a release from before this record found
+//! the restore, leaves nothing to read.
 //!
 //! The file names the row by a digest ([`subject_of`]) of its content less what ordinary running
 //! rewrites. The digest does not decide whether the host waits, which the three cases above leave
@@ -34,9 +34,9 @@
 //! holds [`MOST_OWED`] entries; a host that reads no feed reads a list of exactly that length as
 //! full.
 //!
-//! An earlier release does not name this store, so it neither reads nor writes the file, and a host
-//! that goes back to it serves the restored row to remote devices as that release always did. The
-//! file stays, and the release that knows it waits again on the next start.
+//! A release from before this store does not name it, so it neither reads nor writes the file, and
+//! a host that goes back to one serves the restored row to remote devices as that release always
+//! did. The file stays, and the release that knows it waits again on the next start.
 //!
 //! The limits. The file is in the state directory, so a restore of that directory removes or
 //! replaces it. A host that is stopped between its first finding and the write, and starts with
