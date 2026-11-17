@@ -86,15 +86,38 @@ struct Bracketed<T> {
     read: T,
 }
 
+/// What a try that was held up read: its two readings of the continuous clock stood further apart
+/// than [`DISCONTINUITY_TOLERANCE`].
+///
+/// Its wall reading proves one thing, that the wall clock had read that much by `second`, and a
+/// pause cannot make that wrong, because the continuous clock is read after the wall clock. It
+/// says nothing of where the wall clock stood at the first reading, so it is no comparison against
+/// a mark or an anchor.
+struct HeldUp<T> {
+    /// The continuous clock after the others were read: where the reading is stamped.
+    second: ContinuousInstant,
+    read: T,
+}
+
+/// What [`ClockTrust::bracketed`] hands back: the narrow reading, if one was had in three tries,
+/// and what each try held up before it read.
+struct Tries<T> {
+    narrow: Option<Bracketed<T>>,
+    held_up: Vec<HeldUp<T>>,
+}
+
+/// What the boot clock and the wall clock read together.
+type Pair = (u64, u64);
+
 /// What a caller is told when no narrow bracket could be taken in three tries.
 ///
-/// It finds nothing wrong with the clock, so it is not the clock's distrust: nothing was decided or
-/// recorded, and a caller may try again. An establishment says besides that the owner's
-/// confirmation was not spent.
+/// It finds nothing wrong with the clock, so it is not the clock's distrust: nothing was decided
+/// from the readings, trust has not changed, and a caller may try again. An establishment says
+/// besides that the owner's confirmation was not spent.
 fn clocks_not_read(establishing: bool) -> ControllerError {
     let mut detail = "this host could not read its clocks together just now: it was held up \
-                      between the readings in all three tries, so it used no reading and \
-                      decided or recorded nothing; try again"
+                      between the readings in all three tries, so it decided nothing from them \
+                      and its clock trust has not changed; try again"
         .to_owned();
     if establishing {
         detail.push_str("; it did not spend the owner's confirmation");
@@ -272,22 +295,131 @@ impl ClockTrust {
     /// Reads `read` between two readings of the continuous clock, and again while they are
     /// further apart than the tolerance of a discontinuity, three tries in all.
     ///
-    /// `None` is no reading now, which no caller turns into a distrust: a wide bracket decides
-    /// nothing.
-    fn bracketed<T>(&self, read: impl Fn() -> T) -> Option<Bracketed<T>> {
+    /// No narrow reading is no reading now, which no caller turns into a distrust: a wide bracket
+    /// decides no comparison. What each try held up read is handed back with its second reading,
+    /// for a caller that has a wall reading in it to fold in ([`Self::fold_held_up`]).
+    fn bracketed<T>(&self, read: impl Fn() -> T) -> Tries<T> {
+        let mut held_up = Vec::new();
         for _ in 0..BRACKET_TRIES {
             let first = self.clock.now();
             let value = read();
             let second = self.clock.now();
             if second.saturating_duration_since(first) <= DISCONTINUITY_TOLERANCE {
-                return Some(Bracketed {
-                    first,
-                    second,
-                    read: value,
-                });
+                return Tries {
+                    narrow: Some(Bracketed {
+                        first,
+                        second,
+                        read: value,
+                    }),
+                    held_up,
+                };
+            }
+            held_up.push(HeldUp {
+                second,
+                read: value,
+            });
+        }
+        Tries {
+            narrow: None,
+            held_up,
+        }
+    }
+
+    /// Publishes the wall reading of each try held up in the host's floor: the floor is a maximum
+    /// with no continuous stamp, so a pause cannot make a publication wrong.
+    fn publish_held_up(&self, held_up: &[HeldUp<Pair>]) {
+        for tried in held_up {
+            self.floor.observe(tried.read.1);
+        }
+    }
+
+    /// Folds what the tries held up read into this host's marks, as a narrow reading's wall moves
+    /// them, each at its second reading: the floor, the highest wall reading seen and, while the
+    /// clock is trusted, the anchor, under the tests a narrow reading is raised under. A wide wall
+    /// is no comparison and distrusts nothing, but a peak that only a held-up try read is then in
+    /// the marks, so a step back made inside the held-up reading is found. Where a narrow raise
+    /// writes, this writes: the durable mark of a stored reading is raised at once, and a step
+    /// forward the anchor shows is owed its write.
+    ///
+    /// Returns the first failure to raise the durable mark.
+    fn fold_held_up(
+        &self,
+        state: &mut State,
+        devices: &DeviceDirectory,
+        source: Source,
+        held_up: &[HeldUp<Pair>],
+    ) -> Option<ControllerError> {
+        self.publish_held_up(held_up);
+        let mut failed = None;
+        for tried in held_up {
+            let wall_ms = tried.read.1;
+            let (_, _, error) = Self::raise_mark(state, devices, source, wall_ms);
+            failed = failed.or(error);
+            if !state.distrusted {
+                Self::advance_anchor(state, wall_ms, tried.second);
             }
         }
-        None
+        failed
+    }
+
+    /// Raises the highest wall reading seen to `wall_ms`: in the durable mark when the reading is a
+    /// stored one, and in memory either way. Returns the highest reading seen as the raise left it,
+    /// how far `wall_ms` is behind the mark before it, and the failure to write the durable mark,
+    /// which a stored reading's caller answers after it has decided from what memory holds.
+    fn raise_mark(
+        state: &mut State,
+        devices: &DeviceDirectory,
+        source: Source,
+        wall_ms: u64,
+    ) -> (u64, u64, Option<ControllerError>) {
+        let mut store_error = None;
+        let (latest, behind_mark) = match source {
+            Source::Stored => match devices.utc_at_least(TimestampMs::new(wall_ms)) {
+                Ok(observed) => (observed.now.get(), observed.behind_ms),
+                Err(error) => {
+                    store_error = Some(error);
+                    (
+                        state.mark_ms.max(wall_ms),
+                        state.mark_ms.saturating_sub(wall_ms),
+                    )
+                }
+            },
+            Source::Watched => {
+                let behind = state.mark_ms.saturating_sub(wall_ms);
+                (state.mark_ms.max(wall_ms), behind)
+            }
+        };
+        state.mark_ms = state.mark_ms.max(latest);
+        (latest, behind_mark, store_error)
+    }
+
+    /// Moves the anchor to a wall reading taken at `at` where that is new proof, and ends the
+    /// allowance of a restored anchor where the reading is past it.
+    ///
+    /// The anchor moves forward only: a reading at or beyond what this host could prove is new
+    /// proof, and one behind it is slippage the tolerance forgives, which must not move the anchor
+    /// or the next one would be forgiven against the moved anchor.
+    fn advance_anchor(state: &mut State, wall_ms: u64, at: ContinuousInstant) {
+        if state
+            .anchor
+            .is_none_or(|anchor| wall_ms >= anchor.projected(at))
+        {
+            state.anchor = Some(Anchor { wall_ms, at });
+            // A step forward is written down; time passing is not.
+            let stepped = state.saved.is_none_or(|saved| {
+                wall_ms.saturating_sub(saved.projected(at)) > unwritten_step_ms()
+            });
+            if stepped {
+                state.owed.anchor = true;
+            }
+        }
+        // A reading a whole step beyond the restored anchor is at or past the furthest an
+        // unwritten step could have taken the clock, so the anchor is this host's own again.
+        if state.restored.is_some_and(|restored| {
+            wall_ms >= restored.projected(at).saturating_add(unwritten_step_ms())
+        }) {
+            state.restored = None;
+        }
     }
 
     fn held(&self) -> MutexGuard<'_, State> {
@@ -313,6 +445,7 @@ impl ClockTrust {
             ..
         } = self
             .bracketed(|| self.boot_clock.boot_elapsed_ms())
+            .narrow
             .ok_or_else(|| clocks_not_read(false))?;
         state.mark_ms = record.observed_ms.unwrap_or(0);
         state.distrusted = record.untrusted_at_ms.is_some();
@@ -358,7 +491,9 @@ impl ClockTrust {
     /// at the next reading, which only an owner clears. The anchor is taken at the first reading
     /// and a rollback is measured at the second, so each error of a narrow bracket is toward
     /// distrust and no larger than the tolerance. No narrow bracket in three tries is no reading:
-    /// nothing is decided, moved or written.
+    /// nothing is decided from the clocks and trust does not change. What a try held up read is
+    /// evidence all the same, and is folded in at its second reading before the narrow reading is
+    /// compared, after three held-up tries too ([`Self::fold_held_up`]).
     fn transition(
         &self,
         state: &mut State,
@@ -372,35 +507,25 @@ impl ClockTrust {
         // The boot clock before the wall clock, as the establishment reads them: a reading the
         // floor shows the workers is the pair, and a pause between the two readings must leave
         // the pair asking more of a worker's clock, never less.
-        let Bracketed {
-            first: at,
-            second: compared_at,
-            read: (boot_ms, wall_ms),
-        } = self
-            .bracketed(|| (self.boot_clock.boot_elapsed_ms(), self.wall.now_ms()))
-            .ok_or_else(|| clocks_not_read(false))?;
+        let tries = self.bracketed(|| (self.boot_clock.boot_elapsed_ms(), self.wall.now_ms()));
         // The durable mark is raised by the reading; when that write fails, what the mark and the
         // anchor held in memory prove is decided all the same and the failure is answered after,
         // so a rollback this reading saw is not lost with the write.
-        let mut store_error = None;
-        let (latest, behind_mark) = match source {
-            Source::Stored => match devices.utc_at_least(TimestampMs::new(wall_ms)) {
-                Ok(observed) => (observed.now.get(), observed.behind_ms),
-                Err(error) => {
-                    store_error = Some(error);
-                    (
-                        state.mark_ms.max(wall_ms),
-                        state.mark_ms.saturating_sub(wall_ms),
-                    )
-                }
-            },
-            Source::Watched => {
-                let behind = state.mark_ms.saturating_sub(wall_ms);
-                (state.mark_ms.max(wall_ms), behind)
-            }
+        let mut store_error = self.fold_held_up(state, devices, source, &tries.held_up);
+        let Some(Bracketed {
+            first: at,
+            second: compared_at,
+            read: (boot_ms, wall_ms),
+        }) = tries.narrow
+        else {
+            // What the held-up tries read is folded in, and a step forward it shows is owed its
+            // write like any other: written now, as a narrow reading's is.
+            let at_ms = state.mark_ms;
+            let _ = self.write_owed(state, devices, at_ms);
+            return Err(clocks_not_read(false));
         };
-        state.mark_ms = state.mark_ms.max(latest);
-        let held = state.anchor.map_or(0, |anchor| anchor.projected(at));
+        let (latest, behind_mark, raised) = Self::raise_mark(state, devices, source, wall_ms);
+        store_error = store_error.or(raised);
         let projected = state
             .anchor
             .map_or(0, |anchor| anchor.projected(compared_at));
@@ -419,26 +544,7 @@ impl ClockTrust {
             self.publish(state);
         }
         if !state.distrusted {
-            // The anchor moves forward only: a reading at or beyond what this host could prove is
-            // new proof, and one behind it is slippage the tolerance forgives, which must not
-            // move the anchor or the next one would be forgiven against the moved anchor.
-            if state.anchor.is_none() || wall_ms >= held {
-                state.anchor = Some(Anchor { wall_ms, at });
-                // A step forward is written down; time passing is not.
-                let stepped = state.saved.is_none_or(|saved| {
-                    wall_ms.saturating_sub(saved.projected(at)) > unwritten_step_ms()
-                });
-                if stepped {
-                    state.owed.anchor = true;
-                }
-            }
-            // A reading a whole step beyond the restored anchor is at or past the furthest an
-            // unwritten step could have taken the clock, so the anchor is this host's own again.
-            if state.restored.is_some_and(|restored| {
-                wall_ms >= restored.projected(at).saturating_add(unwritten_step_ms())
-            }) {
-                state.restored = None;
-            }
+            Self::advance_anchor(state, wall_ms, at);
         }
         if let Some(qualified) = platform_qualified
             && !qualified
@@ -530,7 +636,7 @@ impl ClockTrust {
             // Written as the anchor projects at the later reading of the continuous clock, with
             // the boot clock read between the two, so a restart in this boot adds the time between
             // and is never short.
-            match self.bracketed(|| self.boot_clock.boot_elapsed_ms()) {
+            match self.bracketed(|| self.boot_clock.boot_elapsed_ms()).narrow {
                 None => outcome = outcome.and(Err(clocks_not_read(false))),
                 Some(Bracketed {
                     second: at,
@@ -730,14 +836,18 @@ impl ClockTrust {
         // Read inside the boundary, like every other reading of this clock: the moment the owner
         // established is the moment this host is at now, not one sampled before it got here. No
         // narrow bracket refuses here, before the transaction, so the owner's confirmation is not
-        // spent.
-        let Bracketed {
+        // spent. What the tries held up read is published in the floor all the same; the
+        // establishment replaces the marks, so it folds nothing else.
+        let tries = self.bracketed(|| (self.boot_clock.boot_elapsed_ms(), self.wall.now_ms()));
+        self.publish_held_up(&tries.held_up);
+        let Some(Bracketed {
             first: at,
             read: (boot_ms, wall_ms),
             ..
-        } = self
-            .bracketed(|| (self.boot_clock.boot_elapsed_ms(), self.wall.now_ms()))
-            .ok_or_else(|| clocks_not_read(true))?;
+        }) = tries.narrow
+        else {
+            return Err(clocks_not_read(true));
+        };
         let established = TimestampMs::new(wall_ms);
         devices.guarded_transaction(guarded, |transaction| {
             establish_clock_in(transaction, established, &self.boot, boot_ms)?;
@@ -782,7 +892,7 @@ impl ClockTrust {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
     use std::sync::{OnceLock, Weak};
     use std::time::Duration;
 
@@ -2057,6 +2167,11 @@ mod tests {
         by: Duration,
         /// How many of the next readings the pause lands in.
         armed: Arc<AtomicU64>,
+        /// The wall clock is set to `set_to` right after the pause has landed in a reading of it
+        /// for the `set_after`th time, as an owner or a time service moves it while the host is
+        /// held up.
+        set_after: Arc<AtomicI64>,
+        set_to: Arc<AtomicU64>,
     }
 
     impl Pause {
@@ -2066,11 +2181,19 @@ mod tests {
                 continuous: continuous.clone(),
                 by,
                 armed: Arc::new(AtomicU64::new(0)),
+                set_after: Arc::new(AtomicI64::new(0)),
+                set_to: Arc::new(AtomicU64::new(0)),
             }
         }
 
         fn arm(&self, times: u64) {
             self.armed.store(times, Ordering::SeqCst);
+        }
+
+        /// Sets the wall clock to `wall_ms` right after the pause has landed `landing` times.
+        fn sets_the_wall_after(&self, landing: i64, wall_ms: u64) {
+            self.set_to.store(wall_ms, Ordering::SeqCst);
+            self.set_after.store(landing, Ordering::SeqCst);
         }
 
         /// Lets the pause pass when one is armed, and says whether it did.
@@ -2139,16 +2262,25 @@ mod tests {
         /// A host whose wall clock lets `by` pass on every clock, in each reading of it that the
         /// returned pause is armed for.
         fn pausing(machine: &Machine, by: Duration) -> (Self, Pause) {
+            Self::pausing_over(machine, Arc::new(UtcFloor::at(0)), by)
+        }
+
+        /// As [`Self::pausing`], publishing in `floor`.
+        fn pausing_over(machine: &Machine, floor: Arc<UtcFloor>, by: Duration) -> (Self, Pause) {
             let continuous = ManualClock::new();
             let pause = Pause::new(machine, &continuous, by);
             let wall = Arc::clone(&machine.wall);
             let landing = pause.clone();
             let trust = ClockTrust::new(
                 crate::service::WallClock::from_fn(move || {
-                    landing.lands();
-                    wall.load(Ordering::SeqCst)
+                    let landed = landing.lands();
+                    let reading = wall.load(Ordering::SeqCst);
+                    if landed && landing.set_after.fetch_sub(1, Ordering::SeqCst) == 1 {
+                        wall.store(landing.set_to.load(Ordering::SeqCst), Ordering::SeqCst);
+                    }
+                    reading
                 }),
-                Arc::new(UtcFloor::at(0)),
+                floor,
                 Arc::new(continuous.clone()),
                 Arc::new(machine.boot_clock.clone()),
                 machine.boot.clone(),
@@ -2167,11 +2299,11 @@ mod tests {
     /// What a person is told when no reading could be taken, and what an owner is told besides
     /// when the clock was being established.
     const NOT_READ: &str = "this host could not read its clocks together just now: it was held \
-        up between the readings in all three tries, so it used no reading and decided or \
-        recorded nothing; try again";
+        up between the readings in all three tries, so it decided nothing from them and its \
+        clock trust has not changed; try again";
     const NOT_READ_ESTABLISHING: &str = "this host could not read its clocks together just now: \
-        it was held up between the readings in all three tries, so it used no reading and \
-        decided or recorded nothing; try again; it did not spend the owner's confirmation";
+        it was held up between the readings in all three tries, so it decided nothing from them \
+        and its clock trust has not changed; try again; it did not spend the owner's confirmation";
 
     fn assert_not_read(error: &crate::error::ControllerError, text: &str) {
         use kr_protocol::error::{ErrorCode, RetryCategory};
@@ -2316,11 +2448,12 @@ mod tests {
     }
 
     /// KR-REQ-09.17, KR-REQ-09.18: three tries that are all held up give no reading: a refusal
-    /// to try again, no distrust, no anchor moved and nothing written. A step back made between
-    /// the tries is found by the next clean reading, and a clock that did not go back is trusted
-    /// by it.
+    /// to try again, no distrust, and nothing owed. The only write is the raise of the durable
+    /// mark that a stored reading makes at the reading itself, to the highest wall the tries read:
+    /// a reader that keeps its mark in memory writes nothing. A step back made between the tries
+    /// is found by the next clean reading, and a clock that did not go back is trusted by it.
     #[test]
-    fn three_wide_tries_give_no_reading_and_change_nothing() {
+    fn three_wide_tries_give_no_reading_and_decide_nothing() {
         for reader in [Reader::Sample, Reader::Observe, Reader::Watch] {
             for step_back in [false, true] {
                 let devices = DeviceDirectory::in_memory().expect("a directory");
@@ -2342,10 +2475,14 @@ mod tests {
                 );
                 assert!(run.trust.is_trusted_now(), "{case}: no distrust is set");
                 assert!(!run.trust.owes_a_write(), "{case}: nothing is owed");
+                let mut expected = record;
+                if !matches!(reader, Reader::Watch) {
+                    expected.observed_ms = Some(machine.wall());
+                }
                 assert_eq!(
                     devices.clock_record().expect("the record"),
-                    record,
-                    "{case}: nothing is written"
+                    expected,
+                    "{case}: the record changes by the raise of the durable mark and nothing else"
                 );
                 assert_eq!(
                     proven(&run, &devices),
@@ -2393,6 +2530,189 @@ mod tests {
             .expect("the next try establishes");
         assert!(spent.load(Ordering::SeqCst));
         assert!(proven(&run, &devices));
+    }
+
+    /// KR-REQ-09.17, KR-REQ-09.18: what a try that was held up read is evidence of how far the
+    /// wall clock had got. The wall clock steps ten minutes ahead and the reading's first try reads
+    /// that peak, held up for ten seconds; the clock goes back a minute right after it, and the
+    /// second try is narrow. The peak is in the floor and in the marks, so the reading finds the
+    /// step back; without the held-up try the clock reads ten minutes ahead of everything the
+    /// host holds and nothing is found. The control is the same reading without the step back.
+    #[test]
+    fn a_peak_only_a_held_up_try_read_is_in_the_marks_and_the_floor() {
+        for reader in [Reader::Sample, Reader::Observe, Reader::Watch] {
+            for step_back in [true, false] {
+                let devices = DeviceDirectory::in_memory().expect("a directory");
+                let machine = Machine::new();
+                let floor = Arc::new(UtcFloor::at(0));
+                let (run, pause) = Run::pausing_over(&machine, Arc::clone(&floor), PAUSE);
+                read(&run, &devices, reader).expect("reads");
+                run.pass(MINUTE);
+                machine.set_wall(machine.wall() + 600_000);
+                let peak = machine.wall() + 10_000;
+                if step_back {
+                    pause.sets_the_wall_after(1, peak - 60_000);
+                }
+                pause.arm(1);
+                read(&run, &devices, reader).expect("reads in spite of the pause");
+                let case = format!("{reader:?}, step back {step_back}");
+                assert_eq!(
+                    run.trust.is_trusted_now(),
+                    !step_back,
+                    "{case}: the step back is found at that reading, and only that"
+                );
+                assert_eq!(floor.get(), peak, "{case}: the peak is in the floor");
+                if !matches!(reader, Reader::Watch) {
+                    assert_eq!(
+                        devices.clock_record().expect("the record").observed_ms,
+                        Some(peak),
+                        "{case}: and in the durable mark"
+                    );
+                }
+            }
+        }
+    }
+
+    /// KR-REQ-09.17, KR-REQ-09.18: a peak that only the three held-up tries of one reading read is
+    /// kept, though the reading decides nothing from them and is refused: the floor holds it, and
+    /// the next clean reading finds a step back made after it, and only that. A step forward the
+    /// tries showed is written at once, as a narrow reading's would be.
+    #[test]
+    fn a_peak_only_the_three_held_up_tries_of_one_reading_read_is_kept() {
+        for reader in [Reader::Sample, Reader::Observe, Reader::Watch] {
+            for step_back in [true, false] {
+                let devices = DeviceDirectory::in_memory().expect("a directory");
+                let machine = Machine::new();
+                let floor = Arc::new(UtcFloor::at(0));
+                let (run, pause) = Run::pausing_over(&machine, Arc::clone(&floor), PAUSE);
+                read(&run, &devices, reader).expect("reads");
+                run.pass(MINUTE);
+                machine.set_wall(machine.wall() + 600_000);
+                let peak = machine.wall() + 30_000;
+                if step_back {
+                    pause.sets_the_wall_after(3, peak - 60_000);
+                }
+                pause.arm(3);
+                let error = read(&run, &devices, reader).expect_err("no reading is taken");
+                let case = format!("{reader:?}, step back {step_back}");
+                assert_not_read(&error, NOT_READ);
+                assert!(run.trust.is_trusted_now(), "{case}: no distrust is set");
+                assert!(
+                    !run.trust.owes_a_write(),
+                    "{case}: the step forward the tries showed is written"
+                );
+                assert_eq!(floor.get(), peak, "{case}: the peak is in the floor");
+                assert_eq!(
+                    proven(&run, &devices),
+                    !step_back,
+                    "{case}: the next clean reading finds a step back made after the peak, and only that"
+                );
+            }
+        }
+    }
+
+    /// KR-REQ-09.17, KR-REQ-09.18: a peak that only the three held-up tries of one reading read is
+    /// in the host's record, so a host that starts again in the same boot finds a step back made
+    /// after it. The store refuses the write of the anchor, so the durable mark is the only record
+    /// of the peak, and the first reading after the restart finds the step back against it: the
+    /// load puts the mark in memory and the stored reading is measured against it in the same
+    /// transition. The control is the same sequence without the step back.
+    #[test]
+    fn a_peak_only_three_held_up_tries_read_survives_a_restart() {
+        for reader in [Reader::Sample, Reader::Observe] {
+            for step_back in [true, false] {
+                let store = Store::new();
+                let devices = store.open();
+                let machine = Machine::new();
+                let (run, pause) = Run::pausing(&machine, PAUSE);
+                read(&run, &devices, reader).expect("reads");
+                run.pass(MINUTE);
+                refuse_writes_of(&devices, "anchor_wall_ms");
+                machine.set_wall(machine.wall() + 600_000);
+                let peak = machine.wall() + 30_000;
+                if step_back {
+                    pause.sets_the_wall_after(3, peak - 60_000);
+                }
+                pause.arm(3);
+                read(&run, &devices, reader).expect_err("no reading is taken");
+                allow_writes_of(&devices, "anchor_wall_ms");
+                drop(run);
+                let restarted = Run::on(&machine);
+                assert_eq!(
+                    proven(&restarted, &store.open()),
+                    !step_back,
+                    "{reader:?}, step back {step_back}: the restarted host finds a step back made after the peak, and only that"
+                );
+            }
+        }
+    }
+
+    /// KR-REQ-09.17, KR-REQ-09.18: a pause alone in a held-up try is no step back, at that
+    /// reading or at the next, and no step forward the host owes a write for. The pause lands
+    /// just before the continuous clock's second reading, after the wall clock was read: the try's
+    /// wall reading is ten seconds behind its stamp, which is no peak and moves no anchor.
+    #[test]
+    fn a_pause_after_the_wall_reading_in_a_held_up_try_is_no_step_back_at_that_reading_or_the_next()
+    {
+        let devices = DeviceDirectory::in_memory().expect("a directory");
+        let machine = Machine::new();
+        let continuous = ManualClock::new();
+        let pause = Pause::new(&machine, &continuous, PAUSE);
+        let after_the_wall = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let trust = {
+            let wall = Arc::clone(&machine.wall);
+            let arming = pause.clone();
+            let after_the_wall = Arc::clone(&after_the_wall);
+            ClockTrust::new(
+                crate::service::WallClock::from_fn(move || {
+                    let reading = wall.load(Ordering::SeqCst);
+                    if after_the_wall.swap(false, Ordering::SeqCst) {
+                        arming.arm(1);
+                    }
+                    reading
+                }),
+                Arc::new(UtcFloor::at(0)),
+                Arc::new(Slipping {
+                    inner: continuous.clone(),
+                    pause: pause.clone(),
+                }),
+                Arc::new(machine.boot_clock.clone()),
+                machine.boot.clone(),
+            )
+        };
+        let run = Run {
+            machine: machine.clone(),
+            continuous,
+            trust,
+        };
+        assert!(proven(&run, &devices));
+        run.pass(MINUTE);
+        after_the_wall.store(true, Ordering::SeqCst);
+        assert!(proven(&run, &devices), "no step back at that reading");
+        assert!(!run.trust.owes_a_write(), "and no step to write");
+        run.pass(MINUTE);
+        assert!(proven(&run, &devices), "and none at the next");
+    }
+
+    /// KR-REQ-09.17, KR-REQ-09.19: what the tries of an establishment held up read is in the
+    /// floor, though the establishment is refused before its transaction.
+    #[test]
+    fn the_walls_of_the_held_up_tries_of_an_establishment_are_in_the_floor() {
+        let devices = DeviceDirectory::in_memory().expect("a directory");
+        let machine = Machine::new();
+        let floor = Arc::new(UtcFloor::at(0));
+        let (run, pause) = Run::pausing_over(&machine, Arc::clone(&floor), PAUSE);
+        assert!(proven(&run, &devices));
+        run.pass(MINUTE);
+        machine.set_wall(machine.wall() + 600_000);
+        let peak = machine.wall() + 30_000;
+        pause.arm(3);
+        run.trust
+            .establish_with(&devices, BootEpoch::new(0), &|commit| commit(), |_, _| {
+                Ok(())
+            })
+            .expect_err("no reading is taken");
+        assert_eq!(floor.get(), peak);
     }
 
     /// KR-REQ-09.17: a pause between the host's reading of the continuous clock and of the boot
