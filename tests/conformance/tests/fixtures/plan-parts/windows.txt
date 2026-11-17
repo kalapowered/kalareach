@@ -62,6 +62,7 @@ the terminal input encoder :: cargo test --locked -p kr-keys -- --show-output
 the loopback listener a sign-in comes back to :: cargo test --locked -p kr-loopback -- --show-output
 the host's sign-in and sign-out through the daemon :: cargo test --locked -p kr-controller --test voice_broker sign -- --show-output
 the client and the command line held to the rendering rule :: cargo test --locked -p kr-client --test shown_rule -- --show-output
+the client's session over the local connection :: cargo test --locked -p kr-client --test session -- --show-output
 the shared directory flush :: cargo test --locked -p kr-flush -- --show-output
 each store opens and reads what the previous holder committed while it still maps the index :: cargo test --locked -p kr-controller -p kr-changeset -p kr-delivery -p kr-describe -p kr-automation --lib a_previous_holder_that_is_letting_go -- --show-output
 a command node refused where no command can be run :: cargo test --locked -p kr-automation --test definitions a_command_node_is_refused_where_no_command_can_be_run -- --show-output

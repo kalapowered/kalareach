@@ -1422,6 +1422,11 @@ fn windows() -> Vec<Step> {
         ),
         Step::cargo(
             Group::Rust,
+            "the client's session over the local connection",
+            &["test", "--locked", "-p", "kr-client", "--test", "session"],
+        ),
+        Step::cargo(
+            Group::Rust,
             "the shared directory flush",
             &["test", "--locked", "-p", "kr-flush"],
         ),
