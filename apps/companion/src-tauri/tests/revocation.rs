@@ -3938,3 +3938,54 @@ async fn a_request_sent_while_the_person_is_at_the_dialog_for_sharing_again_stop
         "the phone holds no key"
     );
 }
+
+/// A host the person forgets while the view is asking it is not in the view that is returned: the
+/// records are looked at again once the asking is over, so the host is not listed as one that did not
+/// answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_forgotten_while_the_view_asks_it_is_not_shown() {
+    let rig = Rig::start().await;
+    rig.with_settings_sync().await;
+    let reference = host_by(&rig.view().await, "feed")["reference"]
+        .as_str()
+        .expect("the host's reference")
+        .to_owned();
+
+    // The view's visit is held on its way to the host, the person forgets the host, and the visit
+    // is let go.
+    rig.control.hold();
+    let state = rig.app.app.state::<AppState>();
+    let (revocations, context) = (
+        state.revocations().expect("the revocations"),
+        state.revocation_context(),
+    );
+    let view = tokio::spawn(async move { revocations.view(&context).await });
+    let control = Arc::clone(&rig.control);
+    tokio::task::spawn_blocking(move || {
+        let deadline = std::time::Instant::now() + WATCHDOG;
+        while control.held() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the view's visit is held on its way to the host"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    })
+    .await
+    .expect("the wait ran");
+    rig.app
+        .call("hosts_forget", json!({ "reference": reference }))
+        .expect("the host is forgotten");
+    rig.control.stop_holding();
+    rig.control.release_all();
+
+    let shown = serde_json::to_value(view.await.expect("the view ran")).expect("the view");
+    assert!(
+        shown["hosts"]
+            .as_array()
+            .expect("hosts")
+            .iter()
+            .all(|host| host["reference"] != reference),
+        "the forgotten host is not shown: {shown}"
+    );
+}
