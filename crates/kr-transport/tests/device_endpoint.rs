@@ -835,12 +835,11 @@ async fn the_device_endpoint_sends_no_relay_token() {
     inside.close().await;
 }
 
-/// KR-REQ-10.02: an introduction on a closed endpoint is refused and changes nothing: the map
-/// keeps its relays, and the host is not recorded either.
+/// KR-REQ-10.02: an introduction on a closed endpoint is refused with the endpoint's own error and
+/// the map keeps its relays.
 ///
-/// The record is read through the map. A `forget` sets the map equal to the table, so after the
-/// `forget` of A, which was introduced, the map holds the relay of every host that the table still
-/// holds: B's relay in it would show that the refused introduction recorded B.
+/// The table cannot be read once the endpoint is closed: the library's lookup registry is gone and
+/// its relay map no longer changes, so the case holds what the refusal and the map show.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_closed_device_endpoint_refuses_an_introduction() {
     let (r1, r2) = (LocalRelay::spawn().await, LocalRelay::spawn().await);
@@ -860,12 +859,6 @@ async fn a_closed_device_endpoint_refuses_an_introduction() {
         device.relay_urls(),
         BTreeSet::from([r1.url.clone()]),
         "B's relay did not enter the map"
-    );
-
-    device.forget(&a.key()).await.expect("forgetting A");
-    assert!(
-        !device.relay_urls().contains(&r2.url),
-        "B was recorded: the map that follows the table holds its relay"
     );
 }
 
