@@ -309,8 +309,8 @@ pub trait HostLink: Send + Sync {
     /// Takes `host`, the pairing the person forgot, out of this device's one endpoint, unless
     /// another pairing of the same host that is not forgotten introduced it: its address lookups are
     /// no longer asked and each relay that no other host names leaves the relay map. A connection
-    /// that is open stays open until whoever holds it closes it. A host the device never dialled
-    /// changes nothing.
+    /// that is open stays open until whoever holds it closes it. A forget of a host the device never
+    /// dialled takes no host out and brings the relay map to the table.
     ///
     /// A dial under that pairing that reaches the endpoint after this call began is refused. A dial
     /// that is in the middle of introducing the host is waited for, or stopped by its caller, and
@@ -406,8 +406,9 @@ pub enum Standing {
 /// An endpoint of the pool, with what the pool knows of the hosts that were introduced to it.
 struct Bound {
     endpoint: DeviceEndpoint,
-    /// For each host introduced to this endpoint by a pairing, the pairings that introduced it and
-    /// have not been forgotten. It describes this endpoint and no other, so a close takes it along,
+    /// For each host, the pairings of it that are recorded and not forgotten. A pairing is
+    /// recorded before its introduction, and stays after one that failed, until it is forgotten.
+    /// It describes this endpoint and no other, so a close takes it along,
     /// and the endpoint that the next request binds starts with none. Only a path that holds the
     /// host's own lock reads or changes a host's set; the mutex is never held across an await.
     introduced: std::sync::Mutex<BTreeMap<EndpointKey, BTreeSet<DeviceId>>>,
@@ -592,8 +593,9 @@ impl EndpointPool {
 
     /// Takes `host` out of the endpoint when `pairing`, the identity the host gave this device in
     /// the pairing the person forgot, was the last pairing that introduced it: its lookups, and
-    /// each relay that no other host names. A host that another pairing introduced stays. Nothing
-    /// changes for a host the endpoint was never introduced to, or before an endpoint is bound.
+    /// each relay that no other host names. A host that another pairing introduced stays. No host
+    /// leaves for one the endpoint was never introduced to, though the relay map is still brought to
+    /// the table, and nothing changes before an endpoint is bound.
     ///
     /// The pairing is marked first, so that no dial that begins under it is let through, and then
     /// the forget takes the host's own lock and removes the host while it holds it. It waits for
@@ -605,7 +607,7 @@ impl EndpointPool {
     /// library bounds. A dial or a forget of another host does not wait for this host's lock. It
     /// can wait for what all hosts share: the device lock, which a first bind and a close hold, and
     /// the transport's turn at the relay map, which the change of one host's relays holds for as
-    /// long as one send to the library's socket task.
+    /// long as its sends to the library's socket task, one for each relay it inserts or removes.
     pub async fn forget(&self, host: &EndpointKey, pairing: DeviceId) {
         self.forgotten
             .lock()
@@ -1764,12 +1766,14 @@ mod tests {
         dial.abort();
         assert!(dial.await.is_err(), "the dial was dropped");
 
-        pool.forget(&host, pairing(1)).await;
+        let (_, forgotten) = forgetting(&pool, host, 1);
+        heard("the forget of pairing 1 returns", forgotten).await;
         assert!(
             table_holds(&pool, &host).await,
             "the host stays when pairing 1 is forgotten, since pairing 2 is not"
         );
-        pool.forget(&host, pairing(2)).await;
+        let (_, forgotten) = forgetting(&pool, host, 2);
+        heard("the forget of pairing 2 returns", forgotten).await;
         assert!(
             !table_holds(&pool, &host).await && pool.relay_urls().await.is_empty(),
             "the host goes when the last pairing that introduced it is forgotten"
