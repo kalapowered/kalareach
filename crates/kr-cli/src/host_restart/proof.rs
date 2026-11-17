@@ -779,14 +779,21 @@ mod tests {
             vec![cut(), hangs()],
             vec![at_once(Some(1))],
         );
-        let (said, _) = failed_with(
+        // The case's own bound, past the proof's: a proof that waits on the answer that is never
+        // read ends here, by this message, and not by the limit of the test program.
+        let proved = tokio::time::timeout(
+            BOUND + Duration::from_secs(5),
             prove(
                 &supplied,
                 Old::Generation(ControllerGeneration::new(4)),
                 BOUND,
-            )
-            .await,
+            ),
+        )
+        .await
+        .expect(
+            "the proof ended at its own bound and did not wait for an answer that is never read",
         );
+        let (said, _) = failed_with(proved);
         assert!(
             said.contains("no control daemon gave a whole answer within 30 seconds"),
             "{said}"
