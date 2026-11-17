@@ -1842,6 +1842,27 @@ impl Page {
     /// The `index`th state `channel` is sent, and none when it is not sent within [`STATE_BOUND`]: a
     /// case that must fail by an assertion of its own, and not by the harness's watchdog, asks for a
     /// state this way.
+    /// Waits, under [`STATE_BOUND`], until the registry has put `count` of the page's inputs into
+    /// the view's command queue: a view that the page holds takes none, so this is what shows that
+    /// an input waits for it.
+    async fn inputs_queued(&self, view: &str, count: usize) {
+        let views = self.app.state::<companion_tauri::terminal::TerminalViews>();
+        let queued = tokio::time::timeout(STATE_BOUND, async {
+            while views
+                .inputs_queued(view)
+                .is_none_or(|inputs| inputs < count)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            queued.is_ok(),
+            "the view's command queue had not received {count} inputs within the bound: it received {:?}",
+            views.inputs_queued(view)
+        );
+    }
+
     async fn state_within(&self, channel: u32, index: usize) -> Option<Value> {
         tokio::time::timeout(STATE_BOUND, async {
             loop {
@@ -7737,4 +7758,167 @@ async fn a_view_that_holds_the_lease_ends_as_lost_when_the_hosts_connection_ends
         "{trace:?}"
     );
     refused_after_the_end(&page, &view);
+}
+
+/// The connection of a view that holds control goes with output still in the socket, the view's
+/// channel is full, and a key is written meanwhile: the key's write fails, and the lane ends by the
+/// connection's cause by its own bound before the session has recorded the end (the session's
+/// reader waits for room in the channel before it reads to the end of the socket), so that the
+/// view serves the lane's end ahead of the session's. Control ends and nothing is owed: a release
+/// cannot reach the host on a connection that is gone, and the host gives the lease back at the
+/// connection's end. The view serves the rest of the output at the page's pace, however long that
+/// takes, and ends with the session's own closing words.
+///
+/// The page holds the view while the worker writes the screens that the view, the session's
+/// channel and the session's reader hold between them, then the session's closing event, and goes.
+/// The page's key reaches the view's queue while the view is held at its first screen, and the
+/// page lets exactly one state pass, which is the turn that takes the key: the reader has then
+/// room for one screen, not for the closing event, so no end is recorded. The lane's wait for the
+/// record runs out while the view is held at its second screen, and the page lets the view pass
+/// one state at a time until it has served the lane's end.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_view_whose_connection_went_with_output_unread_serves_it_and_gives_nothing_back() {
+    // What the view, the session's channel and the session's reader hold between them.
+    const SCREENS: u64 = 1 + 256 + 1;
+    // Longer than the wait for the rest of the output that a release that cannot be sent starts.
+    const PAUSE: Duration = Duration::from_secs(3);
+    // More than the lane's wait for the session's record of the end (two seconds).
+    const LANE_WAIT: Duration = Duration::from_secs(3);
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let mut lease = WorkerLease::at(4);
+    let (view, link) = controlling(
+        &page,
+        &mut worker,
+        3,
+        &Frame::live((10, 2), (10, 2), 0),
+        &mut lease,
+    )
+    .await;
+    let views = page.app.state::<companion_tauri::terminal::TerminalViews>();
+    let shown = page.states(3).len();
+    let held = Held::new(&page.gate);
+    let session = worker.session_id.to_string();
+    let host = tokio::spawn(async move {
+        let mut link = link;
+        for number in 0..SCREENS {
+            link.push(
+                PROJECTION_DELTA_EVENT,
+                &delta(
+                    1,
+                    40 + number,
+                    41 + number,
+                    10,
+                    2,
+                    0,
+                    vec![row(1, &format!("screen {number}"))],
+                ),
+            )
+            .await;
+        }
+        link.push(
+            kr_protocol::session::SESSION_CLOSED_EVENT,
+            &json!({ "session_id": session }),
+        )
+        .await;
+        drop(link);
+    });
+    let gone = tokio::time::timeout(STATE_BOUND, host).await;
+    assert!(
+        gone.is_ok_and(|host| host.is_ok()),
+        "the worker did not write its output and go within the bound while the page held the view"
+    );
+    assert!(
+        page.state_within(3, shown).await.is_some(),
+        "the view did not reach its first state of the output within the bound"
+    );
+    // The key goes to the view's queue while the view is held at its first screen, and the one
+    // state that the page lets pass is the turn after which the view takes the key: the page lets
+    // it pass once the registry has put the key into the queue, which the held view cannot take.
+    let inputs = views.inputs_queued(&view).unwrap_or(0);
+    let key = page.invoke_later(
+        "terminal_view_input",
+        json!({"view": view, "input": {"kind": "text", "take": 1, "text": "k"}}),
+    );
+    page.inputs_queued(&view, inputs + 1).await;
+    held.let_pass(1);
+    let taken = answered(key, "the key of the held view").await;
+    assert!(
+        taken.is_ok(),
+        "the view refused the key it took after its first state: {taken:?}"
+    );
+    assert!(
+        page.state_within(3, shown + 1).await.is_some(),
+        "the view did not publish its second state of the output within the bound"
+    );
+    let mut recorded = shown + 2;
+    page.lane_ends(&view).await;
+    // The lane records its end at once, and says it to the view only when its own wait for the
+    // session's record has passed: the page holds the view until then, so that the lane's end is
+    // ready when the view next looks.
+    tokio::time::sleep(LANE_WAIT).await;
+    assert_eq!(
+        views.lane_ends_served(&view),
+        Some(0),
+        "the held view has served no end of its lane"
+    );
+    // The end of the lane waits in the view's queue behind what the session's channel held when the
+    // view looked: one state of that output passes at a time.
+    let mut served = false;
+    for _ in 0..400 {
+        if views.lane_ends_served(&view).is_some_and(|ends| ends >= 1) {
+            served = true;
+            break;
+        }
+        held.let_pass(1);
+        assert!(
+            page.state_within(3, recorded).await.is_some(),
+            "the view did not publish the state {recorded} within the bound: it served {:?} ends of its lane; the states that show control ended are {:?} of {}",
+            views.lane_ends_served(&view),
+            page.states(3)
+                .iter()
+                .enumerate()
+                .filter(|(_, state)| state["control"]["ended"] != Value::Null)
+                .map(|(at, _)| at)
+                .collect::<Vec<_>>(),
+            page.states(3).len()
+        );
+        recorded += 1;
+    }
+    assert!(
+        served,
+        "the view did not serve the end of its lane within 400 states"
+    );
+    // The view goes on being held while the connection's end is behind it: what the end of the
+    // lane owed, if anything, has been taken by now.
+    tokio::time::sleep(PAUSE).await;
+    assert_eq!(
+        views.releases_queued(&view),
+        Some(0),
+        "the view queued a release of a lease on a connection that is gone"
+    );
+    drop(held);
+    let ended = page
+        .newest_within(3, |state| state["state"] == "ended")
+        .await
+        .expect("the view ended within the bound once the page let it go");
+    assert_eq!(
+        ended["reason"], "This session has closed.",
+        "the view serves the rest of the output and ends with the session's own words"
+    );
+    let expected: Vec<String> = (0..SCREENS)
+        .map(|number| format!("screen {number}"))
+        .collect();
+    assert_eq!(
+        flood_texts(&page.states(3), shown),
+        expected,
+        "every screen the worker sent is shown, in order"
+    );
+    assert!(
+        page.states(3).iter().any(|state| {
+            state["state"] == "showing"
+                && state["control"]["ended"] == "Control ended: this view's input stream ended."
+        }),
+        "control ended with the stream's words"
+    );
 }
