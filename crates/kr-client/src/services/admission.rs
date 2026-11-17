@@ -112,7 +112,9 @@ const SUSPEND: Duration = Duration::from_secs(10 * 60);
 /// be on its way.
 ///
 /// The bound exists because the mark that a request is on its way is cleared only by the request's
-/// own end, and a mark that is never cleared must not keep an answer standing for ever.
+/// own end, and a mark that is never cleared (a task that died, a service that never answers) must
+/// neither keep an answer standing for ever nor stop every later request for the entry. The one
+/// bound limits both.
 const REQUEST_BOUND: Duration = DEFAULT_TOTAL_DEADLINE.saturating_add(Duration::from_secs(1));
 
 /// What a device asks the service for.
@@ -463,9 +465,12 @@ impl Entry {
                 .is_some_and(|asked| now.saturating_duration_since(asked) < REQUEST_BOUND)
     }
 
-    /// Whether a dial that starts `now` asks for this entry again.
+    /// Whether a dial that starts `now` asks for this entry again. A request that has not ended
+    /// within [`REQUEST_BOUND`] is taken to be lost, and does not stop the next one: the product's
+    /// exchange ends at its deadline, which is shorter, so two requests for one entry are never on
+    /// their way together.
     fn asks_again(&self, now: Instant) -> bool {
-        if self.pending || (self.asks >= MOST_ASKS && !self.window_passed(now)) {
+        if self.request_on_its_way(now) || (self.asks >= MOST_ASKS && !self.window_passed(now)) {
             return false;
         }
         match self.held {
