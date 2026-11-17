@@ -327,8 +327,15 @@ async fn drained_until_the_writer_arrives(
     fillers: usize,
 ) -> usize {
     let mut read = 0;
+    // The bound is read from the clock at every turn of the loop, and the timeout beside it is the
+    // second guard: a loaded machine can stretch a timer, and the loop must still end by its bound.
+    let begun = std::time::Instant::now();
     tokio::time::timeout(Duration::from_secs(30), async {
         while arrived.try_recv().is_err() {
+            assert!(
+                begun.elapsed() < Duration::from_secs(30),
+                "the writer reaches the end of its wait within thirty seconds, {read} of {fillers} fillers read"
+            );
             if read < fillers {
                 filler(reader).await;
                 read += 1;
