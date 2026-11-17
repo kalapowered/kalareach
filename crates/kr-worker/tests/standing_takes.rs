@@ -6,10 +6,12 @@
 //! scope row with no function and a row outside the scope each fail the case. The reader of source
 //! text, and what it does not see, is in `standing_scan/mod.rs`: it reads the body of every helper
 //! that a listed body calls by a name that this crate declares once, and the helpers those call in
-//! turn, so a helper that takes a lock is found where it stands; a name that several functions
-//! declare has to be a scoped function, an `outside` one, allowed for the one body that calls it (a
-//! method of the standard library or of another crate) or given the file of its definition by a
-//! `calls` row (a function of this crate).
+//! turn (not the callee of a name that this roster counts: `lock`, `try_lock`, `session`, `state`
+//! and `locked` stand for their callees' bodies, which are not read), so a helper that takes a
+//! lock is found where it stands; in every body that is read, scoped or followed, a call to a name
+//! that several functions declare has to be a counted name, an `outside` one, allowed for that
+//! body (a method of the standard library or of another crate) or given the file of its definition
+//! by a `calls` row (a function of this crate).
 //!
 //! Beside the takes the roster holds the call sites of the pass: the functions that call a piece,
 //! the checks that each piece calls, the guards (the dispatch barrier and the session) that a
