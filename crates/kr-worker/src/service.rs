@@ -13591,6 +13591,7 @@ impl UpstreamHandoff {
                     taken.transmission(),
                     deadline,
                     self.rechecked_before_submit(),
+                    None,
                 )
                 .await?;
                 *late = pending.late_handle();
@@ -13602,11 +13603,15 @@ impl UpstreamHandoff {
                 encode(&answered)
             }
             UpstreamKind::PluginAction => {
-                let taken = self.broker.take_plugin_action(&self.admitted)?;
+                let mut taken = self.broker.take_plugin_action(&self.admitted)?;
+                // The count of the action as open work goes with the thread that can still ask
+                // the repeat or make the call, not with this future, which the deadline drops.
+                let open = taken.open_work();
                 let pending = submit_within(
                     taken.transmission(),
                     deadline,
                     self.rechecked_before_submit(),
+                    open,
                 )
                 .await?;
                 *late = pending.late_handle();
@@ -13643,7 +13648,7 @@ async fn answer_within(
             broker.recheck_before_submit(&against, request)
         }
     };
-    let pending = match submit_within(marked.transmission(), deadline, rechecked).await {
+    let pending = match submit_within(marked.transmission(), deadline, rechecked, None).await {
         Ok(pending) => pending,
         Err(error) => {
             drop(marked);
@@ -13661,6 +13666,11 @@ async fn answer_within(
 ///
 /// A transport that blocks there holds that thread and nothing else. What it returns after the
 /// deadline is dropped: the call's outcome is no longer anybody's to report.
+///
+/// `open` is the count of an action as open work of its binding. The thread holds it until its
+/// work has ended: the repeat refused the action, the call returned, or the thread never started.
+/// The deadline stops this wait and not the thread, so what the thread can still do (ask the
+/// repeat, which reads the binding, and make the call) is what keeps a binding that is due to end.
 async fn submit_within(
     (dispatch, request): (
         Arc<dyn crate::broker::UpstreamDispatch>,
@@ -13672,10 +13682,12 @@ async fn submit_within(
     ) -> std::result::Result<(), crate::broker::BrokerError>
     + Send
     + 'static,
+    open: Option<crate::broker::methods::OpenAction>,
 ) -> Result<crate::broker::PendingTransmission> {
     // The broker's checks are asked once more on the thread that makes the call, with nothing but
     // the call after them: the hop to this thread waits for the blocking pool.
     let submitting = tokio::task::spawn_blocking(move || {
+        let _open = open;
         recheck(&request)?;
         dispatch.submit(&request)
     });
