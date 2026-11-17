@@ -957,8 +957,9 @@ wait for one another. `HostLink::forget_host` takes a host the person forgot out
 its lookups, and each relay that no other host names. A connection to that host that is open stays
 open until whoever holds it closes it. The pool closes its endpoint only when `EndpointPool::close`
 is called and when the run ends. `close` waits until the endpoint has finished closing, so that no
-second endpoint holds the key beside it, and the next request binds a new endpoint and introduces
-its host again.
+second endpoint holds the key beside it, for a caller that awaits it to its end; a caller that drops
+it part way leaves the endpoint closing, and the next request binds another beside it. The next
+request after a close binds a new endpoint and introduces its host again.
 
 The verification value is computed here, from the transcript, and grouped `f3c1 46fd` by the
 function the host and the command line use. The device shows it only once the host's answer to

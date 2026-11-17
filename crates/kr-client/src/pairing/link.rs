@@ -11,9 +11,11 @@
 //! One key holds one endpoint on a relay at a time: a relay keeps one active client per key and
 //! parks the other. With one endpoint for every host, no request for one host refuses, closes or
 //! restarts the connection of another. The pool closes its endpoint only when it is asked to
-//! ([`EndpointPool::close`]), which waits until the endpoint has finished closing, so that no
-//! second endpoint holds the key beside it, and when the run ends. The next request after a close
-//! binds a new endpoint and introduces its host again.
+//! ([`EndpointPool::close`]) and when the run ends. A close waits until the endpoint has finished
+//! closing, so that no second endpoint holds the key beside it, for a caller that awaits it to
+//! its end; a caller that drops it part way leaves the endpoint closing while the next request
+//! binds another. The next request after a close binds a new endpoint and introduces its host
+//! again.
 //!
 //! A host the person forgets is taken out of the endpoint ([`HostLink::forget_host`]): its lookups
 //! are no longer asked and the relays that no other host names leave the map. A connection that
@@ -493,6 +495,9 @@ impl EndpointPool {
 
     /// Closes the endpoint and waits until it has finished closing, so that the endpoint a later
     /// request binds is never beside it on a relay. The pool's lock is held until then.
+    ///
+    /// A caller awaits it to its end. One that drops it part way leaves the endpoint closing, and
+    /// the next request binds another beside it.
     pub async fn close(&self) {
         let mut device = self.device.lock().await;
         if let Some(open) = device.take() {

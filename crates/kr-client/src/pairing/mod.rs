@@ -6,7 +6,7 @@
 //! | [`invitation`] | The one invitation reader: a scanned or pasted QR payload, read as the host issued it |
 //! | [`candidate`] | This device pairing: the short-code attempt, the start's lookup, and the wait for the owner that both modes share |
 //! | [`direct`] | Redeeming a direct invitation |
-//! | [`link`] | How a device reaches a host over iroh: one dialling endpoint per set of services, and the pre-authorisation surface |
+//! | [`link`] | How a device reaches a host over iroh: the device's one dialling endpoint, and the pre-authorisation surface |
 //! | [`paired`] | The paired-host records, and an attempt still waiting for its owner |
 //! | [`owner`] | An owner device answering its hosts' owner-confirmation challenges |
 //! | [`failure`] | How an attempt ended, as a person is told it |
