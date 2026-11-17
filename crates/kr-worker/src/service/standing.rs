@@ -30,7 +30,7 @@
 //!
 //! # What a piece writes
 //!
-//! No piece notes a fault and none writes a receipt. Three writes are made inside the pieces, each
+//! No piece notes a fault and none writes a receipt. Four writes are made inside the pieces, each
 //! as at the base:
 //!
 //! * `subject`, in the first mode, runs the expiry sweep of the questions (through `validate`)
@@ -38,7 +38,10 @@
 //!   moved is `expired` by the time the check refuses it;
 //! * a journal that fails a read of the limits records the fault itself, inside the read;
 //! * `dispatch`, for a mutation the broker owns, takes the broker's claim, its permit and its
-//!   token (`decidable`), which is the admission itself: a second pass cannot run it again.
+//!   token (`decidable`), which is the admission itself: a second pass cannot run it again;
+//! * the same admission counts a refusal that the journal's fence causes (`note_fenced`, in
+//!   `admit_mutation_in`): rich work is fenced while the journal is faulted, and the refusal is
+//!   counted in the gap.
 
 use super::{
     Caller, ConnectionFacts, ConnectionState, ContinuousInstant, Made, Method, MutationRequest,
@@ -46,12 +49,15 @@ use super::{
 };
 
 /// Whether a pass is the first admission's or a later one's.
+///
+/// In both modes a journal that fails a read of the limits records the fault itself, inside the
+/// read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Mode {
-    /// The first admission: its refusals are plain errors, and it makes the work that changes
-    /// something (the sweep of the questions, the note of a failed journal).
+    /// The first admission: its refusals are plain errors, and it runs the expiry sweep of the
+    /// questions inside the check of the subject.
     First,
-    /// A pass that asks again, after a wait and before an effect: it changes nothing.
+    /// A pass that asks again, after a wait and before an effect: it runs no sweep.
     Again,
 }
 
