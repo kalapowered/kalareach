@@ -500,6 +500,28 @@ fn approve(harness: &Harness, host: &mut Host<'_>) -> Result<PairingCommitment, 
         approved.action_digest(),
         Some(harness.client_keys.public_keys()),
     );
+    // The owner's answer is recorded as the controller records it when the owner completes the
+    // confirmation, so the pairing's commit finds the acceptance row it spends: the device channels
+    // name the device whose record answered, and the terminal's bootstrap names none.
+    let answered_by = match harness.channel {
+        ConfirmationChannel::LocalBootstrapTerminal => None,
+        _ => harness.owner_device_id,
+    };
+    harness
+        .rows
+        .record_answered(
+            &approval.proof,
+            &PairingAction {
+                actor: harness.owner.actor_id.clone(),
+                action_id: ActionId::new(kr_ipc::new_uuid()),
+                digest: Digest256::from_bytes([5; 32]),
+                subject: ActionSubject::Completed(approval.request.confirmation_id),
+            },
+            TimestampMs::new(10),
+            answered_by,
+            &|| Ok(()),
+        )
+        .expect("the answer is recorded");
     host.confirm(
         &harness.by(&approval, harness.owner_keys.authorisation.public()),
         &mut harness.ledger.lock().expect("the ledger"),
@@ -796,18 +818,20 @@ fn a_completed_pairing_writes_its_device_commitment_event_and_confirmation_toget
     );
 }
 
-/// KR-REQ-10.08: a pairing whose commit fails leaves nothing behind. Here the device row cannot be
-/// written, because its endpoint is already on record, and the transaction writes no commitment,
-/// no event and no consumption either; the invitation stays where it was.
-#[test]
-fn a_commit_that_cannot_write_the_device_writes_nothing() {
-    let temp = tempfile::TempDir::new().expect("a directory on the internal disk");
-    let path = temp.path().join("registry.sqlite3");
-    let (directory, rows) = open(&path);
-    let harness = Harness::new(rows.clone());
-    let mut host = harness.issue();
-    bind(&harness, &mut host);
-    // Another device already holds this candidate's endpoint.
+/// The number of owner confirmations an effect has spent in the file.
+fn spent_confirmations(path: &std::path::Path) -> i64 {
+    rusqlite::Connection::open(path)
+        .expect("the registry opens")
+        .query_row(
+            "SELECT COUNT(*) FROM owner_confirmations WHERE consumed_at_ms IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .expect("a count")
+}
+
+/// A record that another device holds on this candidate's endpoint identity.
+fn squatter(harness: &Harness) -> kr_controller::service::net::devices::DeviceRecord {
     let mut squatter = device_record(&PairingCommitment {
         invitation_id: InvitationId::new(Uuid::from_bytes([3; 16])),
         attempt_id: kr_protocol::ids::AttemptId::new(Uuid::from_bytes([4; 16])),
@@ -833,8 +857,32 @@ fn a_commit_that_cannot_write_the_device_writes_nothing() {
     })
     .expect("a record");
     squatter.committed_invitation_id = None;
-    directory.commit(&squatter).expect("the other device");
+    // A grant that does not run out, so the record stands whatever the clock says.
+    squatter.grant.expiry = kr_protocol::grant::GrantExpiry::Never;
+    squatter
+}
 
+/// KR-REQ-10.08: a pairing whose commit fails after its confirmation was spent leaves nothing
+/// behind. Here the device row cannot be written, because a trigger of the file refuses it, and
+/// the transaction takes back the spend, the commitment and the event as well; the invitation stays
+/// where it was and the confirmation is still unspent.
+#[test]
+fn a_commit_that_cannot_write_the_device_writes_nothing() {
+    let temp = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.sqlite3");
+    let (_, rows) = open(&path);
+    let harness = Harness::new(rows.clone());
+    let mut host = harness.issue();
+    bind(&harness, &mut host);
+    rusqlite::Connection::open(&path)
+        .expect("the registry opens")
+        .execute_batch(
+            "CREATE TRIGGER refuse_every_device BEFORE INSERT ON network_devices
+             BEGIN SELECT RAISE(ABORT, 'no device is written'); END;",
+        )
+        .expect("the fault");
+
+    let spent_before = spent_confirmations(&path);
     let invitation_id = host.invitation_id();
     let before = rows
         .load(invitation_id)
@@ -851,9 +899,68 @@ fn a_commit_that_cannot_write_the_device_writes_nothing() {
             .expect("a record"),
         before
     );
+    assert_eq!(
+        spent_confirmations(&path),
+        spent_before,
+        "the spend was taken back"
+    );
     assert!(rows.commitment(invitation_id).expect("readable").is_none());
     assert!(rows.event_for(invitation_id).expect("readable").is_none());
     assert!(rows.events_after(None, 10).expect("readable").is_empty());
+}
+
+/// A record of the candidate's endpoint identity that has neither been revoked nor expired refuses
+/// the commit before anything is spent: the refusal is a permission refusal and no store failure,
+/// the confirmation stays unspent, and the invitation is as it was.
+#[test]
+fn a_live_record_of_the_endpoint_refuses_the_commit_before_the_spend() {
+    let temp = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.sqlite3");
+    let (directory, rows) = open(&path);
+    let harness = Harness::new(rows.clone());
+    let mut host = harness.issue();
+    bind(&harness, &mut host);
+    directory
+        .commit(&squatter(&harness))
+        .expect("the other device");
+
+    let spent_before = spent_confirmations(&path);
+    let invitation_id = host.invitation_id();
+    let before = rows
+        .load(invitation_id)
+        .expect("readable")
+        .expect("a record");
+    let attempt = approve(&harness, &mut host);
+    assert!(
+        matches!(
+            &attempt,
+            Err(PairingError::Refused { code, reason })
+                if *code == ErrorCode::PermissionDenied && reason.contains("still lists this device")
+        ),
+        "{attempt:?}"
+    );
+    assert_eq!(
+        rows.load(invitation_id)
+            .expect("readable")
+            .expect("a record"),
+        before,
+        "the invitation is not consumed"
+    );
+    assert_eq!(
+        spent_confirmations(&path),
+        spent_before,
+        "nothing was spent"
+    );
+    assert!(rows.commitment(invitation_id).expect("readable").is_none());
+    assert!(rows.events_after(None, 10).expect("readable").is_empty());
+    assert_eq!(
+        directory
+            .rows_for_endpoint(&harness.client_keys.public_keys().transport)
+            .expect("readable")
+            .len(),
+        1,
+        "no second record"
+    );
 }
 
 /// KR-REQ-10.06: an owner confirmation is consumed once. A second consumption of the same proof is
@@ -880,6 +987,7 @@ fn a_spent_confirmation_cannot_be_spent_again() {
                 subject: ActionSubject::Completed(approval.request.confirmation_id),
             },
             TimestampMs::new(10),
+            None,
             &|| Ok(()),
         )
         .expect("answered");
@@ -981,6 +1089,7 @@ fn an_action_identifier_is_spent_on_one_payload_across_the_pairing_methods() {
         &approval.proof,
         &completed,
         TimestampMs::new(10),
+        None,
         &|| Ok(()),
     )
     .expect("answered");

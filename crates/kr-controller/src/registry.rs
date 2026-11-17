@@ -66,7 +66,7 @@ use crate::error::{ControllerError, Result};
 /// opens the other three before it writes the version, at a daemon's start and when an update
 /// brings the file forward alike, so a file that records `N` has all four at the shape `N` stands
 /// for.
-pub const SCHEMA_VERSION: i64 = 16;
+pub const SCHEMA_VERSION: i64 = 18;
 
 /// The newest schema version above [`SCHEMA_VERSION`] that this build reads without writing it.
 ///
@@ -76,7 +76,7 @@ pub const SCHEMA_VERSION: i64 = 16;
 /// update reads it. Its own next acceptance records the document at the version it writes, in a
 /// registry that stays at this version. A copy of the accepted document that this build cannot
 /// read stops the daemon's start ([`crate::config::from_record`]).
-pub const READS_THROUGH_SCHEMA_VERSION: i64 = 17;
+pub const READS_THROUGH_SCHEMA_VERSION: i64 = 19;
 
 /// The oldest schema version this build brings forward. A writer that stops handling an older
 /// shape raises this past the last version that wrote it.
@@ -1041,6 +1041,7 @@ impl Registry {
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
+                self.migrate_16_to_18()?;
             }
             Some(2) => {
                 self.migrate_2_to_3()?;
@@ -1057,6 +1058,7 @@ impl Registry {
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
+                self.migrate_16_to_18()?;
             }
             Some(3) => {
                 self.migrate_3_to_4()?;
@@ -1072,6 +1074,7 @@ impl Registry {
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
+                self.migrate_16_to_18()?;
             }
             Some(4) => {
                 self.migrate_4_to_5()?;
@@ -1086,6 +1089,7 @@ impl Registry {
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
+                self.migrate_16_to_18()?;
             }
             Some(5) => {
                 self.migrate_5_to_6()?;
@@ -1099,6 +1103,7 @@ impl Registry {
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
+                self.migrate_16_to_18()?;
             }
             Some(6) => {
                 self.migrate_6_to_7()?;
@@ -1111,6 +1116,7 @@ impl Registry {
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
+                self.migrate_16_to_18()?;
             }
             Some(7) => {
                 self.migrate_7_to_8()?;
@@ -1122,6 +1128,7 @@ impl Registry {
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
+                self.migrate_16_to_18()?;
             }
             Some(8) => {
                 self.migrate_8_to_9()?;
@@ -1132,6 +1139,7 @@ impl Registry {
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
+                self.migrate_16_to_18()?;
             }
             Some(9) => {
                 self.migrate_9_to_10()?;
@@ -1141,6 +1149,7 @@ impl Registry {
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
+                self.migrate_16_to_18()?;
             }
             Some(10) => {
                 self.migrate_10_to_11()?;
@@ -1149,6 +1158,7 @@ impl Registry {
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
+                self.migrate_16_to_18()?;
             }
             Some(11) => {
                 self.migrate_11_to_12()?;
@@ -1156,23 +1166,37 @@ impl Registry {
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
+                self.migrate_16_to_18()?;
             }
             Some(12) => {
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
+                self.migrate_16_to_18()?;
             }
             Some(13) => {
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
+                self.migrate_16_to_18()?;
             }
             Some(14) => {
                 self.migrate_14_to_15()?;
                 self.migrate_15_to_16()?;
+                self.migrate_16_to_18()?;
             }
-            Some(15) => self.migrate_15_to_16()?,
+            Some(15) => {
+                self.migrate_15_to_16()?;
+                self.migrate_16_to_18()?;
+            }
+            Some(16) => self.migrate_16_to_18()?,
+            Some(17) => {
+                return Err(ControllerError::RegistryUnavailable {
+                    detail: "this registry is at schema version 17, which no release wrote"
+                        .to_owned(),
+                });
+            }
             Some(version) => {
                 return Err(ControllerError::RegistryUnavailable {
                     detail: format!(
@@ -1610,6 +1634,45 @@ impl Registry {
         self.connection
             .execute("UPDATE schema_version SET version = 16", [])
             .map_err(ControllerError::registry)?;
+        Ok(())
+    }
+
+    /// Version 16 to 18: one record of an endpoint identity that has not ended, and what a
+    /// pairing's commit binds to the record that answered.
+    ///
+    /// The device table no longer holds an endpoint identity unique for ever: a record that was
+    /// revoked or has expired stays under its own device id, and a partial unique index allows at
+    /// most one record of an endpoint identity that has neither mark. The table is rebuilt for it,
+    /// with every row carried across, in the same transaction that writes the version. The
+    /// acceptance record gains the device whose record answered a confirmation, and the
+    /// invitations the device one was refused for; the other writers add both columns when they
+    /// open the file, which a migration does before it writes the version.
+    ///
+    /// Version 17 is not written: a release that reads this registry through 17 reads the schema of
+    /// 16, and this one is not that schema, so a build that reads only up to 17 refuses it. A file
+    /// at 17 is refused here, as a version no release wrote. A rollback to a release that reads
+    /// through 16 or 17 is refused for a registry at this version.
+    ///
+    /// This migration, the rebuild it runs and the oldest-shape branch of the table's open go in
+    /// the first release after every install has opened the registry at this version.
+    fn migrate_16_to_18(&self) -> Result<()> {
+        self.connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(ControllerError::registry)?;
+        let outcome = crate::service::net::devices::rebuild_for_one_live_record_per_endpoint(
+            &self.connection,
+        )
+        .and_then(|()| {
+            self.connection
+                .execute("UPDATE schema_version SET version = 18", [])
+                .map(|_| ())
+        })
+        .and_then(|()| self.connection.execute_batch("COMMIT"));
+        if let Err(error) = outcome {
+            // A batch that stopped at a failed statement leaves its transaction open.
+            let _ = self.connection.execute_batch("ROLLBACK");
+            return Err(ControllerError::registry(error));
+        }
         Ok(())
     }
 
@@ -4830,7 +4893,8 @@ mod tests {
     /// later.
     #[test]
     fn a_registry_at_an_earlier_version_comes_forward_with_the_rows_it_held() {
-        for from in 9..SCHEMA_VERSION {
+        // Version 17 was never written by a release: a registry that records it is refused.
+        for from in (9..SCHEMA_VERSION).filter(|from| *from != 17) {
             let directory = tempfile::tempdir().expect("a directory");
             let path = directory.path().join("registry.sqlite3");
             drop(Registry::open(&path, environment()).expect("a registry"));
@@ -4897,8 +4961,14 @@ mod tests {
         drop(connection);
 
         let carried = Registry::bring_forward(&path, environment()).expect("brings it forward");
-        assert_eq!(carried, Some(Carried { from: 15, to: 16 }));
-        assert_eq!(recorded(&path), vec![16]);
+        assert_eq!(
+            carried,
+            Some(Carried {
+                from: 15,
+                to: SCHEMA_VERSION
+            })
+        );
+        assert_eq!(recorded(&path), vec![SCHEMA_VERSION]);
         let store = GrantDirectory::open(&path).expect("the grant store opens");
         assert_eq!(
             store

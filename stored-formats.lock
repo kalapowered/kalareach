@@ -527,11 +527,11 @@
           "kind": "sqlite_table",
           "table": "schema_version"
         },
-        "version": 16,
+        "version": 18,
         "migrates_from": 1,
-        "reads_through": 17
+        "reads_through": 19
       },
-      "digest": "60b6109b5aee6f8479da08b92e7ab915572fa0449c2f683cac4453dc9938954c",
+      "digest": "c19c278f3139d878885d28b429b2ffc8628b061fcb06e72c95894e74e773ad31",
       "kept": [
         "SessionCreateParams",
         "ClosureRecord",

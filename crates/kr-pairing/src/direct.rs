@@ -165,6 +165,7 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
             failed_confirmations: 0,
             deadline_monotonic_ms: clock.monotonic_ms().saturating_add(INVITATION_LIFETIME_MS),
             boot_identity: clock.boot_identity(),
+            refused_for: None,
         };
         store.create(&record, approval.proof)?;
         let expires_at_ms =
