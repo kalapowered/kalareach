@@ -445,8 +445,8 @@ pub struct MutationAdmission {
 /// admission so that the broker's checks can be asked again on the thread that makes the
 /// transport's call, where the permit itself cannot go.
 ///
-/// It is the whole of what [`crate::broker::BrokerState::checks`] reads besides the broker's own
-/// state and what the first admission adds to the question ([`Ask::First`]), so the admission and
+/// It is the whole of what `BrokerState::checks` reads besides the broker's own
+/// state and what the first admission adds to the question (`Ask::First`), so the admission and
 /// every later ask put the same question.
 #[derive(Clone, Debug)]
 pub struct AdmittedAgainst {
