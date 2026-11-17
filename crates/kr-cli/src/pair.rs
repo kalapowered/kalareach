@@ -1160,6 +1160,17 @@ fn status_document(invitation_id: InvitationId, result: &PairStatusResult) -> Do
             )
             .with("approval", closed(&view.approval))
             .with(
+                "existing",
+                view.existing.as_ref().map(|existing| {
+                    Document::new()
+                        .with(
+                            "device_name",
+                            Asked::text(Request::Devices, existing.device_name.as_str()),
+                        )
+                        .with("paired_at_ms", closed(&existing.paired_at_ms))
+                }),
+            )
+            .with(
                 "event",
                 view.event.as_ref().map(|event| {
                     Document::new()
@@ -1253,6 +1264,33 @@ fn describe_status(
             crate::shown::platform(candidate.platform)
         ));
     }
+    if matches!(
+        result.status,
+        PairStatus::Consumed {
+            reason: PairingConsumedReason::EndpointPaired
+        }
+    ) {
+        // The name and the date are the host's own record of the device, never the candidate's.
+        lines.push(
+            match result
+                .owner
+                .0
+                .as_ref()
+                .and_then(|view| view.existing.as_ref())
+            {
+                Some(existing) => stdout_line!(
+                    "The device that used this invitation is already paired with this host as {} since \
+                     {}. Remove that pairing, then issue a new invitation.",
+                    Asked::text(Request::Devices, existing.device_name.as_str()),
+                    crate::shown::utc_moment(existing.paired_at_ms.get())
+                ),
+                None => stdout_line!(
+                    "The device that used this invitation is already paired with this host. Remove \
+                     that pairing, then issue a new invitation."
+                ),
+            },
+        );
+    }
     if matches!(result.status, PairStatus::AwaitingApproval { .. }) {
         lines.push(stdout_line!(
             "Check the new device shows the same value, then approve it with:"
@@ -1269,7 +1307,7 @@ const fn ended_because(reason: PairingConsumedReason) -> &'static str {
         PairingConsumedReason::Cancelled => "the invitation was withdrawn",
         PairingConsumedReason::AttemptsExhausted => "too many wrong codes were tried",
         PairingConsumedReason::HostRestarted => "the host restarted before it finished",
-        PairingConsumedReason::EndpointPaired => "the pairing did not finish",
+        PairingConsumedReason::EndpointPaired => "the device is already paired with this host",
     }
 }
 
@@ -1594,7 +1632,11 @@ mod tests {
                 &describe_status(invitation_id, &result, 0),
             );
         }
-        for asked in ["owner.candidate.device_name", "owner.event.device_name"] {
+        for asked in [
+            "owner.candidate.device_name",
+            "owner.event.device_name",
+            "owner.existing.device_name",
+        ] {
             assert!(shown.contains(asked), "{asked} shows what was asked for");
         }
     }
@@ -1625,6 +1667,60 @@ mod tests {
         // Module (0, 0) is the finder pattern's corner, at cell row 2 (modules 4 and 5) and
         // column 4: dark above, dark below.
         assert_eq!(cells[2][4], '\u{2588}');
+    }
+
+    /// KR-REQ-10.08: the issuing view of an invitation that ended because the device is already
+    /// paired says which pairing stands, from the host's own record of it, and says it plainly
+    /// where the view carries no record.
+    #[test]
+    fn an_invitation_that_ended_for_a_listed_device_says_which_pairing_stands() {
+        use crate::output::planted::planted;
+
+        let invitation_id = InvitationId::new(Uuid::from_bytes([9; 16]));
+        let ended = PairStatus::Consumed {
+            reason: PairingConsumedReason::EndpointPaired,
+        };
+        let said = |result: &PairStatusResult| {
+            describe_status(invitation_id, result, 0)
+                .iter()
+                .map(|line| line.text().to_owned())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let bare = PairStatusResult {
+            status: ended,
+            owner: kr_protocol::scalars::Nullable::null(),
+        };
+        let shown = said(&bare);
+        assert!(
+            shown.contains("ended: the device is already paired with this host."),
+            "{shown}"
+        );
+        assert!(
+            shown.contains(
+                "The device that used this invitation is already paired with this host. Remove that \
+                 pairing, then issue a new invitation."
+            ),
+            "{shown}"
+        );
+        let mut recorded = planted::<PairStatusResult>()
+            .into_iter()
+            .find(|result| result.owner.0.is_some())
+            .expect("a result with an owner's view");
+        recorded.status = ended;
+        recorded.owner.0.as_mut().expect("a view").existing =
+            Some(kr_protocol::invitation::ExistingPairing {
+                device_name: kr_protocol::pairing::DeviceName::new("Ana phone").expect("a name"),
+                paired_at_ms: TimestampMs::new(1_767_225_600_000),
+            });
+        let shown = said(&recorded);
+        assert!(
+            shown.contains(
+                "already paired with this host as Ana phone since 2026-01-01 00:00:00 UTC. Remove \
+                 that pairing, then issue a new invitation."
+            ),
+            "{shown}"
+        );
     }
 
     /// KR-REQ-10.37: the verification value is printed in the same two groups of four the new
