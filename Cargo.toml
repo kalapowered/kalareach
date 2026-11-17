@@ -345,6 +345,26 @@ noq-udp = { git = "https://github.com/n0-computer/noq", rev = "04807b674cff617cb
 # cargo writes when it takes the registry crate instead, and when the lock holds a second package
 # of a patched crate or takes it from a source other than its entry's.
 noq-proto = { git = "https://github.com/kalapowered/noq", rev = "d8d5e9153f22f521bc5768c83fc4a50963d02bf3" }
+# The transport library: `iroh` 1.4.1 and the three crates that its repository builds with it,
+# `iroh-base`, `iroh-dns` and `iroh-relay`. This source is the published release of that version
+# with three changes to its relay transport: "drop datagrams for a relay whose queue is full
+# instead of waiting", "bound the wait for the relay server to finish closing an idle connection"
+# and "release relay channel slots of dropped relay transmits", the last one the commit of a pull
+# request at the library's project. The release holds none of them, and an endpoint that serves
+# several relays needs them: without them one relay that is slow or stops reading can delay the
+# traffic to hosts on other relays and can close their connections. There are four entries because
+# the library's `iroh` takes the other three crates by path, so fewer entries would build a second
+# copy of a crate. Remove all four, and the git sources they give the crates in the lock, when the
+# lock can take a released library under which the case in
+# `crates/kr-transport/tests/device_endpoint_stall.rs` holds its limit without them. The
+# `patched_crates` test in `tests/conformance` names an entry that the lock records as unused. For
+# the same reason as `noq-udp`, `cargo audit` does not check these four crates while the entries
+# stand, and no workflow or script in this repository reads advisories against the library's
+# repository: that watch is kept outside it.
+iroh = { git = "https://github.com/kalapowered/iroh", rev = "9139ea0efa1bea32dc73a0b80868963cf026178d" }
+iroh-base = { git = "https://github.com/kalapowered/iroh", rev = "9139ea0efa1bea32dc73a0b80868963cf026178d" }
+iroh-dns = { git = "https://github.com/kalapowered/iroh", rev = "9139ea0efa1bea32dc73a0b80868963cf026178d" }
+iroh-relay = { git = "https://github.com/kalapowered/iroh", rev = "9139ea0efa1bea32dc73a0b80868963cf026178d" }
 
 [workspace.lints.rust]
 missing_docs = "warn"
