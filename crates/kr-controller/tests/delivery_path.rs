@@ -6872,9 +6872,11 @@ async fn a_push_registration_answered_after_its_record_was_replaced_writes_nothi
     let (_answer, (again, ended)) = tokio::join!(late_registration, replacing);
 
     // The client's request can end when its connection closes, which says nothing of the host's
-    // action: that goes on past the gateway's answer by asking for the registry's lock. The owner's
-    // device list asks for the same lock, and the lock is handed on in the order it was asked for,
-    // so the list is answered only after the late action has passed it, by a refusal or by a write.
+    // action. The host serves the owner's device list only after it has served the revocation and
+    // the new pairing, and the list asks for the registry's lock, which the late registration asks
+    // for after the gateway's answer: the lock is handed on in the order it was asked for, so a
+    // registration that is still running has passed it, by a refusal or by a write, before the
+    // list is answered.
     let mut owner = environment.host.client().await;
     let _: kr_protocol::sharing::DeviceListResult = net_support::pairing::read(
         &mut owner,
