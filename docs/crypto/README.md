@@ -386,11 +386,11 @@ carries authority, so a plaintext that names another kind does not decode and `o
 
 The routing record outside the box is untrusted too, and it names a payload kind of its own. A
 service may serve an item whose routing record names a kind this release does not know, such as
-the authority-bearing kind that earlier releases of the contract listed and nothing produced. The
-reader does not stop on it: the client decodes a page item by item, drops an item whose envelope it
-cannot decode, and acknowledges it with the page, so the items beside it are read. A service
-that still admits the removed kind therefore costs a reader nothing but the dropped item, and the
-items placed before the service refuses it are dropped by the client and not by the service.
+the authority-bearing kind that the contract of level 0.77 and earlier listed and nothing produced.
+The reader does not stop on it: the client decodes a page item by item, drops an item whose envelope
+it cannot decode, and acknowledges it with the page, so the items beside it are read. A service that
+still admits the removed kind therefore costs a reader nothing but the dropped item, and the items
+placed before the service refuses it are dropped by the client and not by the service.
 
 ## Recovery
 

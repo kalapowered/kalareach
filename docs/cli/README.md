@@ -784,11 +784,13 @@ the session's terminal, with the reason that the session closed. This behaviour 
 local sessions, and will involve starting the kr control daemon in the environment if necessary
 (which `kr attach` may do).
 
-A bridge to a daemon, worker or helper that does not read a bridge's opening frame is refused with
-a sentence that names both builds and says what to do. A helper that cannot read the opening frame
-gets the advice to update kr there; a daemon or worker that answers an ordinary connection but not
-the one a bridge makes gets the advice to restart it or to attach from inside the environment with
-the kr of its own build.
+A bridge to an environment whose daemon or worker is of another compatibility level, as every
+release of level 0.78 is for this one, is refused with a sentence that names both builds and says to
+update kr in one of them so both are of one release. A helper from before 0.62.0 cannot read the
+opening frame, so the command says that the environment runs a kr that states no protocol version,
+and to update kr there. A daemon or worker from before 0.62.0 answers an ordinary connection but not
+the one a bridge makes, so the command names both builds and says to restart it or to attach from
+inside the environment with the kr of its own build.
 
 A terminal that falls behind does not end the attachment. When what the bridge holds for it passes 8
 MiB, the output and screen frames are dropped, and one resynchronise marker is left in their place.

@@ -687,12 +687,14 @@ impl<'a> Writer<'a> {
     /// (`?1000h ?1002h`). It is wrong for `?1003h ?1000h` (a terminal has 1000) and for `?1000h
     /// ?1002h ?1003h ?1003l` (a terminal has none), which such a worker cannot tell from it.
     ///
-    /// Remove the choice when the lowest retained level is 0.79, and not before: a daemon of 0.79
-    /// still runs workers of the first 29 of the 41 releases of level 0.78, which lack the
-    /// one-state tracking in `kr-term`'s `ModeState`, and their screens reach this projection. A
-    /// screen then holds at most one of the three. The floor of `check_build` in `kr-cli`'s
-    /// `attach.rs` does not show it: it limits which workers the `kr attach` command reads, not
-    /// which workers the daemon runs.
+    /// The cut to level 0.79 met the condition for removing the choice, as it met the same
+    /// condition of the exception in `kr-cli`'s `mouse.rs`. The only caller of this code is
+    /// `kr attach`, and it draws a worker only when `check_build` in `kr-cli`'s `attach.rs`
+    /// finds the worker at this build's level. Every worker of level 0.79 holds the one-state
+    /// tracking in `kr-term`'s `ModeState`, which came with `packages/v0.78.0+557993289f82`. A
+    /// screen then holds at most one of the three. A daemon of 0.79 still runs workers of the
+    /// first 29 releases of level 0.78, but `kr attach` hands each one to the `kr` of its own
+    /// release or refuses it.
     fn mouse_tracking(&mut self, tracking: Option<u16>) {
         for mode in MOUSE_TRACKING_MODES {
             self.mode_of(super::ProjectedModeSpelling::Dec, *mode, false);
@@ -718,12 +720,14 @@ impl<'a> Writer<'a> {
     /// that changed, so it can leave both on as well. 1006 is taken, as the last word of such a
     /// worker's own frame was.
     ///
-    /// Remove the choice when the lowest retained level is 0.79, and not before: a daemon of 0.79
-    /// still runs workers of the first 29 of the 41 releases of level 0.78, which lack the
-    /// one-state encoding in `kr-term`'s `ModeState`, and their screens reach this projection. A
-    /// screen then holds at most one of the two. The floor of `check_build` in `kr-cli`'s
-    /// `attach.rs` does not show it: it limits which workers the `kr attach` command reads, not
-    /// which workers the daemon runs.
+    /// The cut to level 0.79 met the condition for removing the choice, as it met the same
+    /// condition of the exception in `kr-cli`'s `mouse.rs`. The only caller of this code is
+    /// `kr attach`, and it draws a worker only when `check_build` in `kr-cli`'s `attach.rs`
+    /// finds the worker at this build's level. Every worker of level 0.79 holds the one-state
+    /// encoding in `kr-term`'s `ModeState`, which came with `packages/v0.78.0+557993289f82`. A
+    /// screen then holds at most one of the two. A daemon of 0.79 still runs workers of the
+    /// first 29 releases of level 0.78, but `kr attach` hands each one to the `kr` of its own
+    /// release or refuses it.
     fn mouse_encoding(&mut self, encoding: Option<u16>) {
         for mode in MOUSE_ENCODING_MODES {
             self.mode_of(super::ProjectedModeSpelling::Dec, *mode, false);
