@@ -4022,11 +4022,11 @@ impl PasteLeftOpen {
         }
         retained_within(&runtime, b"kr-pasted", LIVENESS_DEADLINE).await;
         Self {
-            _host: host,
             runtime,
             clock,
             id,
             epoch,
+            _host: host,
         }
     }
 

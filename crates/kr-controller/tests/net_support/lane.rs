@@ -106,10 +106,10 @@ impl ScriptedLane {
         let task = tokio::spawn(serve(listener, Arc::clone(&shared), ready, received));
         Self {
             endpoint,
-            _dir: dir,
             shared,
             commands,
             task,
+            _dir: dir,
         }
     }
 
