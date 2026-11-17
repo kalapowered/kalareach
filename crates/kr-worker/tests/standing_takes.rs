@@ -249,6 +249,91 @@ fn no_session_handed_to_the_second_limits_call_is_reported() {
 }
 
 #[test]
+fn a_take_of_the_dispatch_boundary_planted_in_the_first_admission_is_reported() {
+    // The first admission runs inside the barrier that its caller holds, so a take of the boundary
+    // in its own body would wait on itself: each of its `held` rows fails with the take read before
+    // the call. The compiler holds that the guard is a guard; this says that no second one is taken.
+    let found = planted(
+        SERVICE,
+        "        let actor_id = caller.actor_id.clone();\n        self.wait_inside_boundary();\n",
+        "        let actor_id = caller.actor_id.clone();\n        let _again = self.take_boundary();\n        self.wait_inside_boundary();\n",
+    );
+    let held = |callee: &str, live: &str, row: &str| {
+        format!(
+            "crates/kr-worker/src/service.rs receipted calls {callee} holding {live} and its held row says {row}"
+        )
+    };
+    assert_eq!(
+        found,
+        [
+            held("authority", "{\"TAKE\"}", "{}"),
+            held("envelope", "{\"SES\", \"TAKE\"}", "{\"SES\"}"),
+            held("limits", "{\"TAKE\"}", "{}"),
+            held("admit_and_dispatch", "{\"TAKE\"}", "{}"),
+        ]
+    );
+}
+
+#[test]
+fn a_take_of_the_dispatch_boundary_before_the_first_admission_is_reported() {
+    // A take in `receipt_once`, before the call of the first admission, also waits on the barrier
+    // that the function holds; a `try` is read as a take too.
+    let found = planted(
+        SERVICE,
+        "            Tried::Done(self.receipted(state, mutation, method, entry, caller, freshness, &barrier))",
+        "            let _again = self.try_take_boundary();\n            Tried::Done(self.receipted(state, mutation, method, entry, caller, freshness, &barrier))",
+    );
+    only_finding(
+        &found,
+        "service.rs receipt_once calls receipted holding {\"TAKE\"} and its held row says {}",
+    );
+}
+
+#[test]
+fn a_session_taken_before_the_call_of_the_prepared_path_is_reported() {
+    // The prepared path takes the session where the accept's hold does, inside `continue_prepared`
+    // and not before it: a session held in `prepared_once` at the call is not a take of the
+    // boundary, and the same row refuses it.
+    let found = planted(
+        SERVICE,
+        "            let ReadyPreparation {\n",
+        "            let _session = self.runtime.session();\n            let ReadyPreparation {\n",
+    );
+    only_finding(
+        &found,
+        "service.rs prepared_once calls continue_prepared holding {\"SES\"} and its held row says {}",
+    );
+}
+
+#[test]
+fn the_two_entries_begin_with_the_check_that_their_guard_is_the_services_own() {
+    // The compiler holds that each entry is handed a guard and not whose it is; the entry says so
+    // first, before any work. A unit case in `service/boundary.rs` shows the first admission refusing
+    // the guard of another service. The prepared path cannot be built in a unit case (its pending
+    // action holds a component's request), so its check is read here, as the first statement.
+    let files = scan::tree();
+    let (_, source) = files
+        .iter()
+        .find(|(name, _)| name == SERVICE)
+        .expect("the service is in the tree");
+    for entry in ["    fn receipted(", "    fn continue_prepared("] {
+        assert_eq!(source.matches(entry).count(), 1, "{entry}");
+        let after = &source[source.find(entry).expect("the entry")..];
+        let end = ") -> Result<Answered> {";
+        let open = after.find(end).expect("its signature") + end.len();
+        let start: String = after[open..]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .take(60)
+            .collect();
+        assert!(
+            start.starts_with("assert!(barrier.is_of(&self.dispatch),"),
+            "{entry} begins with {start}"
+        );
+    }
+}
+
+#[test]
 fn a_session_handed_to_the_first_admissions_limits_is_reported() {
     let found = planted(
         SERVICE,

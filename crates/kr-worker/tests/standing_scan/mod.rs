@@ -16,11 +16,19 @@
 //! * a call through a function pointer or a closure that is passed in, a macro's expansion, or a
 //!   call to a name that no function of this crate declares (the standard library and other
 //!   crates);
-//! * the dispatch barrier, which this reader does not read at all: the compiler holds it, because
-//!   the functions that run under the barrier (`receipted`, `continue_prepared`,
-//!   `admit_and_dispatch`, `dispatch_accepted` and `standing_pass`) take a borrow of its guard as a
-//!   parameter, the pass keeps that borrow, and the guard can be made only by the module that
-//!   holds the boundary. No row names the barrier;
+//! * the dispatch barrier's guard, which this reader does not read: the compiler holds that the
+//!   functions that run under the barrier (`receipted`, `continue_prepared`,
+//!   `admit_and_dispatch`, `dispatch_accepted` and `standing_pass`) and the bodies that the other
+//!   takers of the barrier run (`revalidate_time`, `accept_generation`, `fence` and
+//!   `fence_what_is_owed`) are called with a borrow of a guard, that the pass keeps its borrow, and
+//!   that a boundary can be taken only in its own module (a service takes its one boundary through
+//!   two methods written there). It does not hold that the guard is the service's own: the two
+//!   entries `receipted` and `continue_prepared` check that before any work, and a test shows the
+//!   check. The one thing this reader says of the barrier is narrow and reads no guard lifetime:
+//!   where a `held` row's call stands, a call of `take_boundary` or `try_take_boundary` anywhere
+//!   before it in the function counts as the domain `TAKE`, bound or not, dropped or not, so a
+//!   `none` row refuses a second take under the held barrier. The wrapper `try_boundary` is not
+//!   read;
 //! * what a guard is, beyond the names it knows: a `let` that calls `session` (SES) and a
 //!   parameter whose type names `Session` (SES, held or not: a `supplies` row tells two calls
 //!   apart). `let Some(x) =` and `let Ok(x) =` bind `x`, with the initialiser after the pattern,
@@ -92,7 +100,8 @@
 //!   call inside a function that the scan reads is judged by its site row.
 //! * `only <callee> <file> <function> <count>`: as `caller`, in every file of the crate.
 //! * `held <file> <function> <callee> <guards>`: the guards that `function` holds where it calls
-//!   `callee`, as a comma list of `SES` (the session) or `none`.
+//!   `callee`, as a comma list of `SES` (the session), `TAKE` (a take of the dispatch boundary
+//!   before the call) or `none`.
 //! * `supplies <file> <function> <callee> <position> <text>`: the argument at `position` (from
 //!   zero) of every call of `callee` from `function`, with its white space taken out, is `text`. A
 //!   row for each argument of one call stands beside the others. It reads what a call hands on
@@ -1109,8 +1118,8 @@ fn depths(text: &[char]) -> Vec<i32> {
 }
 
 /// The domain a guard belongs to, from the text that makes it: a function's parameter of the
-/// session's type, or a `let` whose initialiser calls `session`, holds the session (SES). The
-/// dispatch barrier is not read: the compiler holds it.
+/// session's type, or a `let` whose initialiser calls `session`, holds the session (SES). A take of
+/// the dispatch boundary is read by `takes_the_boundary`, and its guard's lifetime is not.
 fn domain_of(made: &[char], parameter: bool) -> Option<&'static str> {
     if parameter {
         return idents(made)
@@ -1122,6 +1131,15 @@ fn domain_of(made: &[char], parameter: bool) -> Option<&'static str> {
         .iter()
         .any(|(_, name)| name == "session")
         .then_some("SES")
+}
+
+/// Whether a text calls one of the two methods through which a service takes its dispatch
+/// boundary. It reads no guard lifetime: a call anywhere in the text counts, whether its result is
+/// bound, dropped or let go.
+fn takes_the_boundary(text: &[char]) -> bool {
+    calls(text)
+        .iter()
+        .any(|(_, name)| name == "take_boundary" || name == "try_take_boundary")
 }
 
 /// Whether the `let` at `start` follows `if`, `while` or `&&`: it binds for the block of its
@@ -1348,7 +1366,10 @@ fn held(files: &[(String, String)], roster: &Roster) -> Vec<String> {
                 .filter(|span| span.name == function && span.open < at && at < span.close)
                 .max_by_key(|span| span.open)
                 .expect("the function that the call stands in");
-            let live = live_guards(&text, &open_braces, span, at);
+            let mut live = live_guards(&text, &open_braces, span, at);
+            if takes_the_boundary(&text[span.open..at]) {
+                live.insert("TAKE".to_owned());
+            }
             if live != *row {
                 problems.push(format!(
                     "{file} {function} calls {callee} holding {live:?} and its held row says {row:?}"
