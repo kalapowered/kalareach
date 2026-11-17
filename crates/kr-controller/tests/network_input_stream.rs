@@ -30,8 +30,8 @@ use kr_protocol::ids::{
     ActionId, AttachmentId, GeometryEpoch, InputLeaseEpoch, InputSequence, RequestId, SessionId,
 };
 use kr_protocol::input::{
-    InputAck, InputAcquireParams, InputAcquireResult, InputBarrier, InputFrame, InputLeaseResult,
-    InputLeaseState, InputReleaseParams, InputWriteResult, input_claim,
+    InputAck, InputAcquireParams, InputAcquireResult, InputBarrier, InputContent, InputFrame,
+    InputLeaseResult, InputLeaseState, InputReleaseParams, InputWriteResult, input_claim,
 };
 use kr_protocol::local::{InputLaneReady, LaneEnded, LaneLaunch, LaneWindow};
 use kr_protocol::method::Method;
@@ -3778,11 +3778,12 @@ async fn a_worker_that_does_not_state_the_lane_is_served_by_the_adapter() {
     rig.stop().await;
 }
 
-/// The calls a stand-in for the worker was given, in the order it was given them, and the most it
-/// had at once.
+/// The calls a stand-in for the worker was given, in the order it was given them, the bytes each
+/// carried, and the most it had at once.
 #[derive(Default)]
 struct Calls {
     sequences: Mutex<Vec<u64>>,
+    bytes: Mutex<Vec<Vec<u8>>>,
     now: AtomicU64,
     peak: AtomicU64,
 }
@@ -3790,6 +3791,12 @@ struct Calls {
 impl Calls {
     fn sequences(&self) -> Vec<u64> {
         self.sequences.lock().expect("not poisoned").clone()
+    }
+
+    /// The bytes of each call, in the order of the calls. A call that carries key records and no
+    /// bytes is recorded with none.
+    fn bytes(&self) -> Vec<Vec<u8>> {
+        self.bytes.lock().expect("not poisoned").clone()
     }
 
     fn started(&self) -> usize {
@@ -3836,6 +3843,10 @@ fn script_calls(
         .input_stages()
         .script_serial_calls(move |params| {
             let sequence = params.sequence.get();
+            let bytes = match &params.input {
+                InputContent::Bytes { bytes } => bytes.as_slice().to_vec(),
+                _ => Vec::new(),
+            };
             let answer = answer(sequence);
             let record = Arc::clone(&record);
             let gate = gate.clone();
@@ -3845,6 +3856,7 @@ fn script_calls(
                     .lock()
                     .expect("not poisoned")
                     .push(sequence);
+                record.bytes.lock().expect("not poisoned").push(bytes);
                 let now = record.now.fetch_add(1, Ordering::SeqCst) + 1;
                 record.peak.fetch_max(now, Ordering::SeqCst);
                 if let Some(gate) = gate {
@@ -3861,6 +3873,9 @@ fn script_calls(
 /// `answer` and to the others is that it took them, and reads what the host tells the device until
 /// the stream ends. A device that is to be answered for all it wrote finishes its stream when
 /// `finish` is true.
+///
+/// A device whose stream stays open hears no end after a refusal, so for it the read stops at the
+/// first refusal it is told, and the end is `None`: what the case reads is in `told`.
 async fn typed_three_with(
     answer: SerialAnswer,
     finish: bool,
@@ -3868,7 +3883,7 @@ async fn typed_three_with(
     Rig,
     Arc<Calls>,
     Vec<InputAck>,
-    kr_transport::Result<Option<InputAck>>,
+    Option<kr_transport::Result<Option<InputAck>>>,
 ) {
     let rig = Rig::start_withholding_the_lane().await;
     let calls = script_calls(&rig, None, move |sequence| {
@@ -3890,11 +3905,24 @@ async fn typed_three_with(
     let mut told = Vec::new();
     let ended = loop {
         match next_on(&mut reader).await {
-            Ok(Some(ack)) => told.push(ack),
-            ended => break ended,
+            Ok(Some(ack)) => {
+                let refused = matches!(ack, InputAck::Refused { .. });
+                told.push(ack);
+                if refused && !finish {
+                    break None;
+                }
+            }
+            ended => break Some(ended),
         }
     };
     (rig, calls, told, ended)
+}
+
+/// The refusals among the acknowledgements that a device was told.
+fn refusals(told: &[InputAck]) -> Vec<&InputAck> {
+    told.iter()
+        .filter(|ack| matches!(ack, InputAck::Refused { .. }))
+        .collect()
 }
 
 /// A worker refuses frame 1 with `code` before it could accept it: the device is told once, in the
@@ -3903,13 +3931,10 @@ async fn typed_three_with(
 async fn a_refusal_is_told_and_final(code: ErrorCode) {
     let (rig, calls, told, ended) = typed_three_with(gives(code), true).await;
     assert!(
-        matches!(ended, Ok(None)),
+        matches!(ended, Some(Ok(None))),
         "the stream ends cleanly: {ended:?}"
     );
-    let refusals: Vec<&InputAck> = told
-        .iter()
-        .filter(|ack| matches!(ack, InputAck::Refused { .. }))
-        .collect();
+    let refusals = refusals(&told);
     assert_eq!(refusals.len(), 1, "the refusal is told once: {told:?}");
     match refusals[0] {
         InputAck::Refused {
@@ -3935,9 +3960,16 @@ async fn a_refusal_is_told_and_final(code: ErrorCode) {
 
 /// A worker's answer to frame 1 leaves it unknown whether the worker took the frame: the device is
 /// told nothing of the frame, the stream is reset, and nothing is sent again.
-async fn an_uncertain_frame_cuts_the_stream(answer: SerialAnswer) {
-    let (rig, calls, told, ended) = typed_three_with(answer, false).await;
-    assert!(ended.is_err(), "the stream is reset: {ended:?}");
+async fn an_uncertain_frame_cuts_the_stream(
+    rig: Rig,
+    calls: Arc<Calls>,
+    told: Vec<InputAck>,
+    ended: Option<kr_transport::Result<Option<InputAck>>>,
+) {
+    assert!(
+        matches!(ended, Some(Err(_))),
+        "the stream is reset: {ended:?}"
+    );
     assert!(
         told.iter()
             .all(|ack| matches!(ack, InputAck::Accepted { through, .. } if through.get() == 0)),
@@ -4003,6 +4035,28 @@ async fn a_second_frame_is_not_sent_while_the_first_waits_for_its_answer() {
     rig.stop().await;
 }
 
+/// The call that the host makes for a frame carries the bytes the device typed in that frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_for_a_frame_carries_the_bytes_of_that_frame() {
+    let rig = Rig::start_withholding_the_lane().await;
+    let calls = script_calls(&rig, None, |_| took());
+    let mut stream = rig.open().await;
+    for (sequence, key) in [b"a", b"b", b"c"].into_iter().enumerate() {
+        type_and_wait(&rig, &mut stream, sequence as u64, key).await;
+    }
+    assert_eq!(
+        calls.sequences(),
+        vec![0, 1, 2],
+        "each frame once, in order"
+    );
+    assert_eq!(
+        calls.bytes(),
+        vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+        "each call carries the bytes of its frame"
+    );
+    rig.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refusal_for_room_is_final_and_not_retried() {
     a_refusal_is_told_and_final(ErrorCode::ResourceUnavailable).await;
@@ -4030,31 +4084,57 @@ async fn an_unmarked_permission_denied_answer_is_a_refusal_before_acceptance() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_marked_permission_denied_answer_after_acceptance_leaves_the_frame_uncertain() {
-    an_uncertain_frame_cuts_the_stream(SerialAnswer::Marked(ProtocolError::new(
+    let answer = SerialAnswer::Marked(ProtocolError::new(
         ErrorCode::PermissionDenied,
         "the worker's words",
-    )))
-    .await;
+    ));
+    let (rig, calls, told, ended) = typed_three_with(answer, false).await;
+    assert!(
+        refusals(&told).is_empty(),
+        "the frame is not told as refused: {told:?}"
+    );
+    an_uncertain_frame_cuts_the_stream(rig, calls, told, ended).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_answer_with_any_other_code_leaves_the_frame_uncertain() {
-    an_uncertain_frame_cuts_the_stream(gives(ErrorCode::StorageUnavailable)).await;
+    let (rig, calls, told, ended) =
+        typed_three_with(gives(ErrorCode::StorageUnavailable), false).await;
+    assert!(
+        refusals(&told).is_empty(),
+        "the frame is not told as refused: {told:?}"
+    );
+    an_uncertain_frame_cuts_the_stream(rig, calls, told, ended).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unknown_outcome_leaves_the_frame_uncertain() {
-    an_uncertain_frame_cuts_the_stream(gives(ErrorCode::OutcomeUnknown)).await;
+    let (rig, calls, told, ended) = typed_three_with(gives(ErrorCode::OutcomeUnknown), false).await;
+    assert!(
+        refusals(&told).is_empty(),
+        "the frame is not told as refused: {told:?}"
+    );
+    an_uncertain_frame_cuts_the_stream(rig, calls, told, ended).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_answer_that_never_comes_leaves_the_frame_uncertain() {
-    an_uncertain_frame_cuts_the_stream(SerialAnswer::Silent).await;
+    let (rig, calls, told, ended) = typed_three_with(SerialAnswer::Silent, false).await;
+    assert!(
+        refusals(&told).is_empty(),
+        "the frame is not told as refused: {told:?}"
+    );
+    an_uncertain_frame_cuts_the_stream(rig, calls, told, ended).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_link_lost_under_the_call_leaves_the_frame_uncertain() {
-    an_uncertain_frame_cuts_the_stream(SerialAnswer::Lost).await;
+    let (rig, calls, told, ended) = typed_three_with(SerialAnswer::Lost, false).await;
+    assert!(
+        refusals(&told).is_empty(),
+        "the frame is not told as refused: {told:?}"
+    );
+    an_uncertain_frame_cuts_the_stream(rig, calls, told, ended).await;
 }
 
 /// The authority behind a frame is withdrawn after the host decided it and before its call is
@@ -5595,6 +5675,13 @@ async fn a_decision_waiting_for_the_registry_is_let_go_before_a_detach_waits_for
         .await
         .expect("the stream task stopped reading in time")
         .expect("the count stands");
+    // The task lets the decision go before it says that it stopped reading, with the registry
+    // still held.
+    assert_eq!(
+        stages.counts().decisions_waiting,
+        0,
+        "the decision that waited for the registry was let go with the loop"
+    );
     drop(registry);
     the_registry_comes_back(&rig).await;
 
@@ -5666,6 +5753,13 @@ async fn a_decision_waiting_for_the_registry_is_let_go_before_a_withdrawal_waits
         .await
         .expect("the stream task stopped reading in time")
         .expect("the count stands");
+    // The task lets the decision go before it says that it stopped reading, with the registry
+    // still held.
+    assert_eq!(
+        stages.counts().decisions_waiting,
+        0,
+        "the decision that waited for the registry was let go with the loop"
+    );
     drop(registry);
     the_registry_comes_back(&rig).await;
 
