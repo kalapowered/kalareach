@@ -490,7 +490,27 @@ fn bind(harness: &Harness, host: &mut Host<'_>) -> ApprovedCandidate {
         .expect("a locked candidate")
 }
 
+/// How the owner's answer to the pairing's confirmation stands in the acceptance record when the
+/// pairing is committed.
+#[derive(Clone, Copy)]
+enum Answered {
+    /// Recorded by the device whose record the harness holds, as `complete` records it.
+    ByTheOwnerDevice,
+    /// Recorded with no device named, as a build that did not record the device left it.
+    NamingNoDevice,
+    /// Never recorded: the proof reaches the commit with no acceptance row.
+    Never,
+}
+
 fn approve(harness: &Harness, host: &mut Host<'_>) -> Result<PairingCommitment, PairingError> {
+    approve_answered(harness, host, Answered::ByTheOwnerDevice)
+}
+
+fn approve_answered(
+    harness: &Harness,
+    host: &mut Host<'_>,
+    answered: Answered,
+) -> Result<PairingCommitment, PairingError> {
     let approved = host
         .locked_candidate()
         .expect("digests")
@@ -503,25 +523,27 @@ fn approve(harness: &Harness, host: &mut Host<'_>) -> Result<PairingCommitment, 
     // The owner's answer is recorded as the controller records it when the owner completes the
     // confirmation, so the pairing's commit finds the acceptance row it spends: the device channels
     // name the device whose record answered, and the terminal's bootstrap names none.
-    let answered_by = match harness.channel {
-        ConfirmationChannel::LocalBootstrapTerminal => None,
+    let answered_by = match (harness.channel, answered) {
+        (ConfirmationChannel::LocalBootstrapTerminal, _) | (_, Answered::NamingNoDevice) => None,
         _ => harness.owner_device_id,
     };
-    harness
-        .rows
-        .record_answered(
-            &approval.proof,
-            &PairingAction {
-                actor: harness.owner.actor_id.clone(),
-                action_id: ActionId::new(kr_ipc::new_uuid()),
-                digest: Digest256::from_bytes([5; 32]),
-                subject: ActionSubject::Completed(approval.request.confirmation_id),
-            },
-            TimestampMs::new(10),
-            answered_by,
-            &|| Ok(()),
-        )
-        .expect("the answer is recorded");
+    if !matches!(answered, Answered::Never) {
+        harness
+            .rows
+            .record_answered(
+                &approval.proof,
+                &PairingAction {
+                    actor: harness.owner.actor_id.clone(),
+                    action_id: ActionId::new(kr_ipc::new_uuid()),
+                    digest: Digest256::from_bytes([5; 32]),
+                    subject: ActionSubject::Completed(approval.request.confirmation_id),
+                },
+                TimestampMs::new(10),
+                answered_by,
+                &|| Ok(()),
+            )
+            .expect("the answer is recorded");
+    }
     host.confirm(
         &harness.by(&approval, harness.owner_keys.authorisation.public()),
         &mut harness.ledger.lock().expect("the ledger"),
@@ -1674,5 +1696,105 @@ fn an_owner_grant_that_runs_out_by_utc_first_commits_nothing() {
     assert!(
         expired.expired_at_ms.is_some(),
         "the expiry found inside the transaction is on record"
+    );
+}
+
+/// A pairing's confirmation is spent only as an acceptance row records it: a proof that reaches the
+/// commit with no acceptance row is refused, and so is one of a device channel whose row names no
+/// device. The refusal stands before the spend and before any record of the device exists.
+#[test]
+fn a_pairing_is_refused_when_its_confirmation_has_no_acceptance_row_naming_the_device() {
+    for answered in [Answered::Never, Answered::NamingNoDevice] {
+        let temp = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let path = temp.path().join("registry.sqlite3");
+        let (directory, rows) = open(&path);
+        let harness = Harness::new(rows.clone());
+        let mut host = harness.issue();
+        bind(&harness, &mut host);
+        let spent_before = spent_confirmations(&path);
+        let refused = approve_answered(&harness, &mut host, answered);
+        assert!(
+            matches!(refused, Err(PairingError::OwnerConfirmationRequired)),
+            "{refused:?}"
+        );
+        assert_eq!(
+            spent_confirmations(&path),
+            spent_before,
+            "nothing was spent"
+        );
+        assert!(
+            directory
+                .rows_for_endpoint(&harness.client_keys.public_keys().transport)
+                .expect("readable")
+                .is_empty(),
+            "no record of the device was written"
+        );
+    }
+}
+
+/// A confirmation answered by one owner record is not made good by another record of the same key:
+/// once the record that answered has been revoked, a new owner record that holds the key does not
+/// stand for it, and the commit is refused.
+#[test]
+fn a_confirmation_is_spent_only_while_the_record_that_answered_it_stands() {
+    let temp = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.sqlite3");
+    let (directory, rows) = open(&path);
+    let harness = Harness::new(rows.clone());
+    let mut host = harness.issue();
+    bind(&harness, &mut host);
+    let answering = harness.owner_device_id.expect("the owner's device");
+    // The confirmation is answered by the first record; then that record ends and a second owner
+    // record with the same key takes its place.
+    let approved = host
+        .locked_candidate()
+        .expect("digests")
+        .expect("a locked candidate");
+    let approval = harness.approval(
+        SensitiveAction::ConfirmDevice,
+        approved.action_digest(),
+        Some(harness.client_keys.public_keys()),
+    );
+    harness
+        .rows
+        .record_answered(
+            &approval.proof,
+            &PairingAction {
+                actor: harness.owner.actor_id.clone(),
+                action_id: ActionId::new(kr_ipc::new_uuid()),
+                digest: Digest256::from_bytes([6; 32]),
+                subject: ActionSubject::Completed(approval.request.confirmation_id),
+            },
+            TimestampMs::new(10),
+            Some(answering),
+            &|| Ok(()),
+        )
+        .expect("answered");
+    directory
+        .revoke(answering, TimestampMs::new(harness.clock_wall()))
+        .expect("revoked");
+    directory
+        .commit(&owner_device_with(
+            &harness.owner_keys,
+            DeviceId::new(kr_ipc::new_uuid()),
+            GrantExpiry::Never,
+        ))
+        .expect("a new owner record of the same key");
+    let spent_before = spent_confirmations(&path);
+    let refused = host.confirm(
+        &harness.by(&approval, harness.owner_keys.authorisation.public()),
+        &mut harness.ledger.lock().expect("the ledger"),
+        &approved,
+        &harness.identities(),
+        None,
+    );
+    assert!(
+        matches!(refused, Err(PairingError::OwnerConfirmationRequired)),
+        "{refused:?}"
+    );
+    assert_eq!(
+        spent_confirmations(&path),
+        spent_before,
+        "nothing was spent"
     );
 }
