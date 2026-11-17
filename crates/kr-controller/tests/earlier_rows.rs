@@ -768,6 +768,10 @@ fn recorded_version(path: &Path) -> i64 {
         .expect("a version")
 }
 
+/// A device row as the migration case reads it: the device, its endpoint, when it was revoked and
+/// its grant.
+type DeviceRow = (Vec<u8>, Vec<u8>, Option<i64>, Vec<u8>);
+
 /// What the file says of `network_devices` and what hangs on it, in a fixed order.
 fn device_schema(path: &Path) -> Vec<(String, String, String)> {
     let connection = rusqlite::Connection::open(path).expect("the registry opens");
@@ -806,7 +810,7 @@ fn a_registry_at_16_is_rebuilt_so_an_ended_endpoint_identity_is_free() {
             "oldest shape {oldest}"
         );
         let connection = rusqlite::Connection::open(&path).expect("the registry opens");
-        let rows: Vec<(Vec<u8>, Vec<u8>, Option<i64>, Vec<u8>)> = connection
+        let rows: Vec<DeviceRow> = connection
             .prepare(
                 "SELECT device_id, endpoint_id, revoked_at_ms, grant FROM network_devices
                  ORDER BY device_id",
@@ -954,7 +958,10 @@ fn a_registry_at_17_is_refused_as_a_version_no_release_wrote() {
     let temp = tempfile::tempdir().expect("a directory on the internal disk");
     let path = temp.path().join("registry.db");
     registry_left_at(&path, 17, false);
-    let error = open_registry(&path).err().expect("refused").to_string();
+    let error = match open_registry(&path) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("a registry at 17 is refused"),
+    };
     assert!(error.contains("schema version 17"), "{error}");
     assert_eq!(recorded_version(&path), 17, "nothing was changed");
 }
