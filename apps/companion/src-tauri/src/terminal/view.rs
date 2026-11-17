@@ -31,7 +31,7 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt as _, StreamExt as _};
 use kr_client::error::{ClientError, HostWord};
-use kr_client::input::{EndCause, InputEvent, InputEvents, InputLane, InputRefusal, InputTarget};
+use kr_client::input::{InputEvent, InputEvents, InputLane, InputRefusal, InputTarget};
 use kr_client::ordered::Ordered;
 use kr_client::projection::{Applied, Projection, decode, is_projection_event};
 use kr_client::session::{Session, Settled};
@@ -1900,7 +1900,7 @@ impl View {
                 None
             }
             InputEvent::LaunchReserved { .. } => None,
-            InputEvent::Ended { cause, .. } => {
+            InputEvent::Ended { .. } => {
                 // The lane's handle goes, which is what lets its events end, and the reader is kept
                 // and read to its end: what the lane says behind its end, the barriers it did not
                 // reach, is served as any other word of the lane. The connection's end reaches the
@@ -1909,15 +1909,11 @@ impl View {
                 // Whatever ended it, a key typed now is refused for an ended stream, which is what
                 // the lane is, and never for one that is not open yet.
                 self.lane_lost = Some("its input stream ended".to_owned());
-                if matches!(
-                    cause,
-                    EndCause::Reset | EndCause::Breach(_) | EndCause::Uncertain(_)
-                ) {
-                    // A view that holds the lease ends control: the keys of a new stream need a new
-                    // epoch, and the lease's epoch is given back.
-                    if self.lease.stream_ended() {
-                        self.control_changed();
-                    }
+                // Whatever ended it, a view that holds the lease ends control: no key can be
+                // written under it any more, the keys of a new stream need a new epoch, and the
+                // lease's epoch is given back.
+                if self.lease.stream_ended() {
+                    self.control_changed();
                 }
                 #[cfg(feature = "testing")]
                 self.probe.lane_ends.fetch_add(1, Ordering::Relaxed);

@@ -7497,13 +7497,11 @@ async fn an_acquire_answered_in_the_look_that_has_the_lanes_end_ends_control_wit
     release_of_the_epoch_within_the_bound(&mut link, lease.epoch).await;
 }
 
-/// The host finishes its side of the input stream while the view holds the lease, which the lane
-/// reads as the end of the stream (it did not end by a reset, a breach or an unknown outcome): a key
-/// that the person types after the view served that end is refused for an ended stream, in the
-/// view's words for an input that did not reach the program, and not for a stream that is not open
-/// yet.
+/// The host finishes its side of the input stream while the view holds the lease: control ends with
+/// the lane, so a key that the person types after the view served that end is refused as the view
+/// refuses any key it holds no control for, in its words and with its code, whole.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_key_after_the_host_finished_the_input_stream_is_refused_for_an_ended_stream() {
+async fn a_key_after_the_host_finished_the_input_stream_is_refused_as_a_key_without_control() {
     let mut host = ScriptedHost::start(lane_window(8)).await;
     let page = Page::over(&mut host);
     let mut lease = WorkerLease::default();
@@ -7513,9 +7511,10 @@ async fn a_key_after_the_host_finished_the_input_stream_is_refused_for_an_ended_
     page.lane_ends_served(&view, 1).await;
     let refused = page
         .text(&view, 1, "a")
-        .expect_err("a key with no stream to write it on");
+        .expect_err("a key with no control and no stream to write it on");
+    assert_eq!(code(&refused), "LEASE_LOST", "{refused}");
     assert_eq!(
-        refused["message"], "That input did not reach the program: its input stream ended.",
+        refused["message"], "This view does not control the program.",
         "{refused}"
     );
 }
@@ -7604,4 +7603,85 @@ async fn a_key_the_worker_could_not_say_it_took_ends_control_and_the_next_take_o
         "the first key of the new lane is number 0 of the new epoch"
     );
     assert!(lease.epoch > 5, "a new take has a new epoch");
+}
+
+/// The host finishes its side of the input stream while the view holds the lease, and leaves the
+/// control connection open: the page is not left showing control that no stream can use. Control
+/// ends with the stream's words, whole, the epoch is given back once with no position, and nothing
+/// more follows. The next take opens a new stream (the host is asked, a second header comes) and
+/// takes a newer epoch, and the first key on it is number 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_view_that_holds_the_lease_ends_control_when_the_host_finishes_its_input_stream() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    host.script.say(Out::Finish);
+    page.lane_ends_served(&view, 1).await;
+    let ended = page
+        .newest_within(3, |state| control(state) == (1, "watching".to_owned()))
+        .await
+        .expect("the host's finish ended control within the bound");
+    assert_eq!(
+        ended["control"]["ended"], "Control ended: this view's input stream ended.",
+        "the stream's words, whole"
+    );
+    let release = release_of_the_epoch_within_the_bound(&mut link, lease.epoch).await;
+    lease.answer(&mut link, &release).await;
+    assert!(
+        link.call_within(QUIET).await.is_none(),
+        "the epoch is given back once, and nothing more follows"
+    );
+    let first_epoch = lease.epoch;
+    page.take(&view, 2);
+    takes_the_stream_when_asked(&mut link).await;
+    host.script
+        .until("the second input stream's header", |seen| {
+            seen.headers.len() == 2
+        })
+        .await;
+    let acquire = acquire_within_the_bound(&mut link).await;
+    lease.answer(&mut link, &acquire).await;
+    page.newest_within(3, |state| control(state) == (2, "controlling".to_owned()))
+        .await
+        .expect("the second take took control within the bound");
+    assert!(lease.epoch > first_epoch, "a new stream has a new epoch");
+    page.text(&view, 2, "b").expect("the key is taken");
+    host.script
+        .until_soon("the key on the new stream", |seen| seen.frames.len() == 1)
+        .await;
+    assert_eq!(read_by(&host), vec![(lease.epoch, 0, "b".to_owned())]);
+}
+
+/// The host's connection ends while the view holds the lease: the view ends as lost, as any view
+/// does when its connection goes, and the page's commands after it are refused as on any lost link.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_view_that_holds_the_lease_ends_as_lost_when_the_hosts_connection_ends() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, _link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    host.lose_the_network().await;
+    let ended = page
+        .newest_within(3, |state| state["state"] == "ended")
+        .await
+        .expect("the view ended within the bound once the host's connection went");
+    let trace: Vec<(String, String, String)> = page
+        .states(3)
+        .iter()
+        .map(|state| {
+            (
+                state["state"].to_string(),
+                state["control"]["state"].to_string(),
+                state["control"]["ended"].to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        ended["reason"], "The connection to this session ended.",
+        "{trace:?}"
+    );
+    refused_after_the_end(&page, &view);
 }
