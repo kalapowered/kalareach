@@ -276,69 +276,6 @@ fn a_write_prints_its_variant_and_its_size_and_nothing_it_carries() {
     }
 }
 
-/// The retained level's worker, from the build it states.
-fn retained_worker() -> Level {
-    let level = Level::of(Some(&LocalBuild {
-        build_id: BuildId::new("kr-worker/0.1.0").expect("a build identifier"),
-        protocol_version: PackageVersion::new(0, 77, 0),
-    }))
-    .expect("the retained level");
-    assert!(!level.is_this());
-    level
-}
-
-/// The write a device sends today and the write the release before read, as the two releases wrote
-/// the same values: the daemon writes the first as the second for a retained worker, and sends a
-/// worker of its own level what it was given. The pair is called here by hand because the retained
-/// table lists no definition of this write: `InputWriteParams` is not a root of the surface.
-#[test]
-fn a_write_for_a_retained_worker_is_what_the_release_before_wrote() {
-    let current = include_bytes!("../retained/0.77/golden/input-write.current.cbor");
-    let retained = include_bytes!("../retained/0.77/golden/input-write.retained.cbor");
-    let sent = ParamsValue::new(kr_cbor::decode(current, &Limits::DEFAULT).expect("a value"));
-    let typed: InputWriteParams = sent.to_typed().expect("the current write reads");
-    assert_eq!(
-        typed,
-        write_of(InputContent::Bytes {
-            bytes: Bytes::new(b"\x1b[A\xffq".to_vec())
-        })
-    );
-    assert_eq!(
-        kr_cbor::to_canonical_vec(&typed).expect("it writes"),
-        current,
-        "the current bytes are what this build writes"
-    );
-    let written = retained_worker()
-        .encode_input_write(&sent)
-        .expect("a bytes write has a counterpart");
-    assert_eq!(kr_cbor::encode(written.as_value()), retained);
-    assert_eq!(
-        Level::this().encode_input_write(&sent).expect("unchanged"),
-        sent
-    );
-}
-
-/// Key records have no counterpart at the level before, and nothing is written for it: the refusal
-/// names them. A write the current type does not read is refused as the type refuses it, not as a
-/// lack of the level.
-#[test]
-fn key_records_have_no_counterpart_at_a_retained_worker_and_a_malformed_write_is_not_one() {
-    match retained_worker().encode_input_write(&write_with(keys_input())) {
-        Err(CodecError::NotInLevel { refusal, .. }) => {
-            assert!(refusal.to_string().contains("console_keys"), "{refusal}");
-        }
-        other => panic!("expected a refusal by name, got {other:?}"),
-    }
-    let malformed = write_with(map(vec![(
-        "kind",
-        CanonicalValue::Text("console_keys".to_owned()),
-    )]));
-    assert!(matches!(
-        retained_worker().encode_input_write(&malformed),
-        Err(CodecError::Cbor(_))
-    ));
-}
-
 /// A retained level that reads the union is sent the write as it was given: the rewrite is for the
 /// levels below it, and a key-record write reaches a worker of such a level whole.
 #[test]

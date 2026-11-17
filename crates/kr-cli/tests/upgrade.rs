@@ -2228,21 +2228,18 @@ async fn a_mutation_of_a_paired_device_is_performed_by_the_worker_of_the_release
 }
 
 /// KR-REQ-26.06, KR-REQ-08.53, KR-REQ-20.23: a device paired with the updated host types into the
-/// session of the release before through the new daemon. Its bytes are written in the shape that
-/// worker reads and the session's shell runs them; its console key records are refused by the
-/// daemon, by name, because that worker has no counterpart for them, and the shell runs nothing of
-/// them. The refused write spends no sequence number: the next bytes write takes it.
+/// session of the release before through the new daemon. That worker reads the same input as this
+/// build's, so the daemon gives it a bytes write as it is and a write of console key records as it
+/// is, and the session's shell runs the line of each, in the order the writes were numbered.
 ///
 /// Each line the shell runs makes a file named by an arithmetic expansion the typed text does not
 /// contain, so a file shows that the line was run and not that it was typed. The files are waited
 /// for while the session is live, which is when the worker forwards what it accepted.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_paired_device_types_bytes_into_the_session_of_the_release_before_and_its_key_records_are_refused()
- {
+async fn a_paired_device_types_bytes_and_key_records_into_the_session_of_the_release_before() {
     use kr_protocol::attachment::{
         AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
     };
-    use kr_protocol::error::ErrorCode;
     use kr_protocol::ids::{InputLeaseEpoch, InputSequence};
     use kr_protocol::input::{
         ConsoleKey, InputAcquireParams, InputAcquireResult, InputContent, InputWriteParams,
@@ -2339,38 +2336,38 @@ async fn a_paired_device_types_bytes_into_the_session_of_the_release_before_and_
         .await
         .expect("the worker of the release before takes the bytes of a paired device");
 
-    // Key records spelling a line the shell must not run. The refusal is the daemon's: a worker of
-    // the release before would answer with an invalid argument.
-    let keys = format!(": > '{}'/refused-$((6*7))\n", marks.display())
+    // Key records spelling a line the shell has to run: the characters, then the Enter key.
+    let key = |virtual_key: u16, unicode: u16| ConsoleKey {
+        virtual_key,
+        scan_code: 0,
+        unicode,
+        key_down: true,
+        control_keys: 0,
+        repeat: 1,
+    };
+    let mut keys: Vec<ConsoleKey> = format!(": > '{}'/keys-$((6*7))", marks.display())
         .chars()
-        .map(|character| ConsoleKey {
-            virtual_key: 0,
-            scan_code: 0,
-            unicode: u16::try_from(u32::from(character)).expect("a basic plane character"),
-            key_down: true,
-            control_keys: 0,
-            repeat: 1,
+        .map(|character| {
+            key(
+                0,
+                u16::try_from(u32::from(character)).expect("a basic plane character"),
+            )
         })
         .collect();
-    let refused = owner
+    keys.push(key(0x0d, 0x0d));
+    owner
         .session
         .write_input(&write(1, InputContent::ConsoleKeys { keys }))
         .await
-        .expect_err("the daemon has no way to give key records to that worker");
-    assert_eq!(
-        refused.code(),
-        ErrorCode::UnsupportedCapability,
-        "{refused}"
-    );
+        .expect("the worker of the release before takes the key records of a paired device");
     owner
         .session
-        .write_input(&write(1, typed("after")))
+        .write_input(&write(2, typed("after")))
         .await
-        .expect("the refused write spent no sequence number");
+        .expect("the write after the key records takes the next sequence number");
 
-    // The shell ran the lines it was given, in order: the file of the line after the refusal is
-    // there, so a line of the refused records, which came before it, has been run if it ever was.
-    for name in ["kept-42", "after-42"] {
+    // The shell ran the lines it was given, in order.
+    for name in ["kept-42", "keys-42", "after-42"] {
         let file = marks.join(name);
         until(
             &format!("the shell to run the line that makes {name}"),
@@ -2378,10 +2375,6 @@ async fn a_paired_device_types_bytes_into_the_session_of_the_release_before_and_
         )
         .await;
     }
-    assert!(
-        !marks.join("refused-42").exists(),
-        "the shell ran nothing of the refused key records"
-    );
 
     updated.the_worker_is_as_it_was().await;
     host.close(&updated.kr_now(), &updated.display);

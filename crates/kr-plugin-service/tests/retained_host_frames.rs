@@ -21,7 +21,7 @@ use kr_protocol::frame::StreamKind;
 use kr_protocol::scalars::Nonce256;
 use serde_json::Value;
 
-const RECORD: &str = include_str!("../../kr-protocol/retained/0.77/plugin-host-frames.json");
+const RECORD: &str = include_str!("../../kr-protocol/retained/0.78/plugin-host-frames.json");
 
 fn unhex(text: &str) -> Vec<u8> {
     assert_eq!(text.len() % 2, 0, "{text}");

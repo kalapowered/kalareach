@@ -66,6 +66,17 @@
         "kr_protocol crates/kr-protocol/src/scalars.rs: u64_schema"
       ]
     },
+    "AgentTurnId": {
+      "digest": "3195c51a8e08dd900f6d46fd83847782309eb4b8b305f42ae3a2652c3ec38728",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: MAX_OPAQUE_ID_LEN",
+        "kr_protocol crates/kr-protocol/src/ids.rs: OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: impl OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id! invocation",
+        "kr_protocol crates/kr-protocol/src/ids.rs: validate_opaque_id"
+      ]
+    },
     "ApplicationInstanceId": {
       "digest": "a04fae26ce4fb30788f7ef1797904d9979b6a0e89e7a880d57aa32828c202f76",
       "followed": [
@@ -120,8 +131,14 @@
         "kr_protocol crates/kr-protocol/src/attachment.rs: AttachmentSummary"
       ]
     },
+    "AttentionHostRecord": {
+      "digest": "5e8a7b903039d58297233e2b2b1ce7f986d6d6161f058cf1bb0917ffb71e8878",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/attention.rs: AttentionHostRecord"
+      ]
+    },
     "AttentionSource": {
-      "digest": "1c024cd18bb2ce791e8ab6b249fd38e0a15a4fc559ffdc8659288cad220d465f",
+      "digest": "415befd07fa85ab6141cfc8fcdde142f37070a4889f3444e326fe2a1e02e585f",
       "followed": [
         "kr_protocol crates/kr-protocol/src/attention.rs: wire_enum",
         "kr_protocol crates/kr-protocol/src/attention.rs: wire_enum! invocation",
@@ -809,7 +826,7 @@
       ]
     },
     "Sentence": {
-      "digest": "b8f5face0bf30ea556af06a2c488f86dbb2fd4fe095cfdbde9194f971eca4caf",
+      "digest": "423f7e31f152001115ead12955b5c3e2eb0b960ddf22eaf43497f413300ae634",
       "followed": [
         "kr_protocol crates/kr-protocol/src/hostinfo.rs: Composed",
         "kr_protocol crates/kr-protocol/src/hostinfo.rs: ContentClass",
@@ -1171,7 +1188,7 @@
       ]
     },
     "the attention text a worker serves": {
-      "digest": "408597cdeb5f040de3ceffb3a695b9c0495855e30ec320dbe3a70d392855389c",
+      "digest": "e93a3879ea3bcb47d54d7e68724a6f0f4381abe849272bc6a8d52bb593042edb",
       "followed": [
         "kr_worker crates/kr-worker/src/attention_source.rs: texts"
       ]
