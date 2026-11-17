@@ -53,10 +53,11 @@ fn target() -> ReleaseName {
 
 /// A daemon serving its local endpoint in this process, over a tree of its own.
 struct Serving {
-    temp: kr_ipc::testing::TempHost,
     controller: Arc<Controller>,
     endpoint: Endpoint,
     serving: tokio::task::JoinHandle<crate::error::Result<()>>,
+    /// Declared last: the folder is removed after every field above has let go of its files.
+    temp: kr_ipc::testing::TempHost,
 }
 
 impl Drop for Serving {
