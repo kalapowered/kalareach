@@ -1519,16 +1519,6 @@ async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_f
     host.worker_ended(&updated.worker).await;
 }
 
-/// KR-REQ-26.10: a session of this release whose journal holds a name for the application in its
-/// foreground is read by the release before, once the session has closed and the host has been
-/// rolled back to it: the archive of that release reads the summary row, which keeps the shape every
-/// release reads, and shows the session as it did before, with no application. This release shows
-/// a closed session no application either, whatever its journal holds: the application is what is in
-/// the foreground of a session, and a closed session has none.
-///
-/// A worker clears the application when its session closes, so the journal is written the way a
-/// worker that did not would write it, through the worker's own journal, once the session's worker
-/// has ended.
 /// What the registry file holds that a refused rollback must leave as it is: its version, the text
 /// of every table and index, and every device row.
 fn registry_as_it_stands(host: &Host) -> (i64, Vec<String>, Vec<Vec<rusqlite::types::Value>>) {
@@ -1619,6 +1609,16 @@ async fn a_rollback_to_the_release_before_is_refused_for_the_registry_it_cannot_
     host.worker_ended(&updated.worker).await;
 }
 
+/// KR-REQ-26.10: a session of this release whose journal holds a name for the application in its
+/// foreground is read by the release before, once the session has closed and the host has been
+/// rolled back to it: the archive of that release reads the summary row, which keeps the shape every
+/// release reads, and shows the session as it did before, with no application. This release shows
+/// a closed session no application either, whatever its journal holds: the application is what is in
+/// the foreground of a session, and a closed session has none.
+///
+/// A worker clears the application when its session closes, so the journal is written the way a
+/// worker that did not would write it, through the worker's own journal, once the session's worker
+/// has ended.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_closed_session_naming_an_application_is_read_by_the_release_before_after_a_rollback() {
     let updated = Updated::new().await;
