@@ -8109,11 +8109,7 @@ impl WorkerService {
         // registry any more, so no later withdrawal would find an attachment it made: it attaches
         // on a new connection.
         if method == Method::SessionAttach && state.withdrawn.is_set() {
-            return Err(WorkerError::PermissionDenied {
-                detail: "this connection was withdrawn when the host restricted what its local \
-                         owner may do; open a new one to attach"
-                    .to_owned(),
-            });
+            return Err(withdrawn_connection_refusal());
         }
         #[cfg(feature = "testing")]
         self.after_the_dispatch_check_stall.stand();
@@ -11398,7 +11394,19 @@ impl WorkerService {
                 if state.origin.is_some_and(|origin| !origin.clipboard_writes) {
                     session.decline_clipboard_writes(attachment_id);
                 }
-                state.facts.add_attachment(attachment_id);
+                // The attachment goes into the connection's list only if the connection is not
+                // withdrawn, read under the list's own lock: a withdrawal sets the latch before it
+                // takes the list, so this push goes into the list the withdrawal takes, or finds
+                // the latch. Where it finds it, the attachment is detached in this same hold of the
+                // session, and the connection gets the refusal a withdrawn connection gets.
+                if !state
+                    .facts
+                    .add_attachment_unless_withdrawn(&state.withdrawn, attachment_id)
+                {
+                    let _ = session.detach(attachment_id);
+                    self.runtime.flush_input();
+                    return Err(withdrawn_connection_refusal());
+                }
                 Ok((encode(&result)?, AfterEffect::None))
             }
             Method::SessionDetach => {
@@ -12293,6 +12301,15 @@ pub struct ConnectionFacts {
     pub actor_id: ActorId,
 }
 
+/// The refusal a connection that a restriction withdrew gets when it asks to attach.
+fn withdrawn_connection_refusal() -> WorkerError {
+    WorkerError::PermissionDenied {
+        detail: "this connection was withdrawn when the host restricted what its local owner may \
+                 do; open a new one to attach"
+            .to_owned(),
+    }
+}
+
 impl ConnectionFacts {
     /// Whether this connection can first-admit a mutation under an action window of its own.
     ///
@@ -12308,12 +12325,24 @@ impl ConnectionFacts {
             ))
     }
 
-    /// Records an attachment this connection now owns.
-    fn add_attachment(&self, attachment_id: AttachmentId) {
-        self.attachments
+    /// Records an attachment this connection now owns, unless `latch` says the connection has been
+    /// withdrawn. The latch is read with the list's lock held, so the record and the check are one
+    /// step against a withdrawal, which sets the latch and only then takes the list. Returns
+    /// whether the attachment was recorded.
+    fn add_attachment_unless_withdrawn(
+        &self,
+        latch: &Withdrawal,
+        attachment_id: AttachmentId,
+    ) -> bool {
+        let mut held = self
+            .attachments
             .lock()
-            .expect("the attachment list is not poisoned")
-            .push(attachment_id);
+            .expect("the attachment list is not poisoned");
+        if latch.is_set() {
+            return false;
+        }
+        held.push(attachment_id);
+        true
     }
 
     /// Forgets an attachment this connection has given up.
