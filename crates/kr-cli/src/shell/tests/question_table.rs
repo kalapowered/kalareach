@@ -464,11 +464,12 @@ fn as_the_table_says(text: &str, ground: &Ground, temporary: &Path) -> String {
         .replace(&ground.root.to_string_lossy().into_owned(), "/tmp/walk")
 }
 
-/// How long a case that starts stand-ins is given. The longest of them ends in seconds on a busy
-/// machine. Every wait of the install for a program is bounded by the few seconds of the ask, and
-/// the first start of a stand-in by the five minutes that the helper placing it allows, which fails
-/// the case with the helper's own message. This bound is longer than that wait, so a case that has
-/// not ended in this time is not waiting at any one program: it is stood at, and says so.
+/// The whole budget of a case that starts stand-ins, from its set-up to its last assertion. It has
+/// to cover the first start of a stand-in, for which the helper that places it allows up to five
+/// minutes and fails the case with its own message at that limit; the install's questions, each of
+/// which the install gives sixty seconds; and the set-up before them. The longest case ends in
+/// seconds on a busy machine. A case that has not ended within this budget fails with a message
+/// that names it.
 const CASE_BOUND: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// How long the helper that a case starts in a process of its own is given. It is shorter than the
