@@ -540,7 +540,7 @@ impl EndpointPool {
     /// and the pool is not asked again.
     ///
     /// A dial of a host that is already introduced, with the same services, holds the host's lock
-    /// across no await but the device lock that [`Self::bound`] takes.
+    /// across no await but the one for the device lock, which binds the endpoint when none is open.
     ///
     /// # Errors
     ///

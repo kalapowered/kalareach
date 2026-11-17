@@ -75,9 +75,12 @@ pub async fn use_host<R: Runtime>(app: &AppHandle<R>, host: PairedHost) -> Resul
 /// the host: its address lookups and the relays that no other host names. That is the last step,
 /// and it runs to its end in a task of its own, so a command that stops waiting for it, or an
 /// application that ends in it, leaves nothing else of the forgetting undone, and the host is not
-/// left in the endpoint. The only thing that waits for the endpoint is the command's return. A
-/// visit or a look that began before the forget and dials the host after it is refused by the
-/// endpoint, so it does not put the host back.
+/// left in the endpoint. The only thing that waits for the endpoint is the command's return. The
+/// endpoint's forget waits for the introduction of its own host, if a visit or a look is making
+/// one, and then takes the host out, so a visit or a look that began before the forget does not put
+/// the host back, and one that reaches the endpoint after it is refused. When that takes long the
+/// host is already gone from the list and the connection event has been sent: only the command's
+/// answer is late.
 ///
 /// # Errors
 ///
