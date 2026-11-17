@@ -3335,12 +3335,15 @@ mod tests {
     }
 
     /// What `ask_and_wait` gave on a real connection, and the attempts that the stand-in daemon
-    /// found where the request reached it and where the command let go of the connection.
+    /// found where the request reached it, where the next request that the command made on the
+    /// connection reached it (`None` where there was none), and where the command let go of the
+    /// connection.
     struct Observed {
         environment: KnownEnvironment,
         progress: Progress,
         result: std::result::Result<Settled, Cut>,
         at_the_request: Vec<attempt::Attempt>,
+        at_the_next_request: Option<Vec<attempt::Attempt>>,
         at_the_close: Vec<attempt::Attempt>,
         _temp: kr_ipc::testing::TempHost,
     }
@@ -3373,7 +3376,7 @@ mod tests {
         let daemon = tokio::spawn(async move {
             let (mut reader, mut writer) = greet(&listener, id).await;
             if matches!(standing, StandIn::ClosesAndEnds) {
-                return (Vec::new(), Vec::new());
+                return (Vec::new(), None, Vec::new());
             }
             let ControlFrame::Mutation(request) = reader
                 .read_message::<ControlFrame>()
@@ -3396,19 +3399,22 @@ mod tests {
                 refused(false)
             };
             write_outcome(&mut writer, request.request_id, outcome).await;
-            // Whatever else the command writes here is refused too. The loop ends where the command
-            // lets go of the connection, and the daemon ends with the listener after it.
+            // Whatever else the command writes here is refused too, and the first of it finds the
+            // records as the command left them before it wrote it. The loop ends where the
+            // command lets go of the connection, and the daemon ends with the listener after it.
+            let mut at_the_next_request = None;
             while let Ok(frame) = reader.read_message::<ControlFrame>().await {
                 let next = match frame {
                     ControlFrame::Mutation(next) => next.request_id,
                     ControlFrame::Request(next) => next.request_id,
                     _ => continue,
                 };
+                at_the_next_request.get_or_insert_with(|| attempts_of(&seen));
                 write_outcome(&mut writer, next, refused(false)).await;
             }
             let at_the_close = attempts_of(&seen);
             drop(listener);
-            (at_the_request, at_the_close)
+            (at_the_request, at_the_next_request, at_the_close)
         });
         let client = LocalClient::connect(&endpoint, LocalClientKind::Cli, crate::build_id())
             .await
@@ -3440,15 +3446,16 @@ mod tests {
             &none,
         )
         .await;
-        let (at_the_request, at_the_close) = match daemon {
+        let (at_the_request, at_the_next_request, at_the_close) = match daemon {
             Some(daemon) => daemon.await.expect("the daemon saw the command's request"),
-            None => (Vec::new(), Vec::new()),
+            None => (Vec::new(), None, Vec::new()),
         };
         Observed {
             environment,
             progress,
             result,
             at_the_request,
+            at_the_next_request,
             at_the_close,
             _temp: temp,
         }
@@ -3499,14 +3506,22 @@ mod tests {
     }
 
     /// A stop that the daemon refuses is recorded as asking where the request arrives, and the
-    /// record is removed before anything more is asked of the daemon: the command is at the stage
-    /// that says it was refused, and nothing was told.
+    /// record is removed before anything more is asked of the daemon, where the check of the
+    /// refusal reaches it: the command is at the stage that says it was refused, and nothing was
+    /// told.
     #[tokio::test]
     async fn a_refused_stop_removes_its_record_before_the_check_and_stays_at_the_refused_stage() {
         let observed = ask_and_wait_against(StandIn::RefusesTheStop).await;
         assert!(matches!(observed.result, Err(Cut::Said(_))));
         assert_eq!(observed.at_the_request.len(), 1);
         assert_eq!(observed.at_the_request[0].phase, attempt::Phase::Asking);
+        let Some(at_the_check) = &observed.at_the_next_request else {
+            panic!("the command made the check of the refusal on the connection");
+        };
+        assert!(
+            at_the_check.is_empty(),
+            "the record was removed before the check reached the daemon: {at_the_check:?}"
+        );
         assert!(
             observed.at_the_close.is_empty(),
             "the record was removed before the check on the connection: {:?}",

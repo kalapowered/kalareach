@@ -356,14 +356,21 @@ mod tests {
             service.is_none(),
             "a manager gives its own environment: {service:?}"
         );
-        launch.variables[0].value = Nullable(Some("/absolute".to_owned()));
+        // A path that is absolute on the platform that runs the case: a value without a drive is
+        // relative on Windows.
+        let absolute_path = if cfg!(windows) {
+            r"C:\absolute"
+        } else {
+            "/absolute"
+        };
+        launch.variables[0].value = Nullable(Some(absolute_path.to_owned()));
         let absolute = compare(
             &launch,
             ControllerStartup::Standalone,
             Path::new("/state"),
             true,
             Record::Named(None),
-            |variable| (variable == name).then(|| "/absolute".to_owned()),
+            |variable| (variable == name).then(|| absolute_path.to_owned()),
         );
         assert!(
             absolute.is_none(),
