@@ -872,6 +872,74 @@ fn a_registry_at_16_is_rebuilt_so_an_ended_endpoint_identity_is_free() {
     }
 }
 
+/// The columns the early steps of the ladder add, each with the version its step brings the file
+/// to. A file left at an earlier version lacks them.
+const ADDED_BY_THE_EARLY_STEPS: &[(i64, &str, &str)] = &[
+    (2, "reservations", "create_intent"),
+    (2, "reservations", "claimed_key"),
+    (2, "environment", "authority_revision"),
+    (2, "workers", "acknowledged_revision"),
+    (3, "environment", "fence_owed_revision"),
+    (3, "environment", "accepted_revision"),
+    (3, "environment", "accepted_document"),
+    (4, "workers", "stated_source"),
+    (6, "workers", "desktop_session_id"),
+    (6, "workers", "login_generation"),
+];
+
+/// Takes from the file at `path` the columns that the steps after `version` add, so that the file
+/// is left as a build that wrote `version` left it in those tables.
+fn without_the_columns_added_after(path: &Path, version: i64) {
+    let connection = rusqlite::Connection::open(path).expect("the registry opens");
+    for (to, table, column) in ADDED_BY_THE_EARLY_STEPS {
+        if version < *to {
+            connection
+                .execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column};"))
+                .unwrap_or_else(|error| panic!("{table}.{column} goes: {error}"));
+        }
+    }
+}
+
+/// Every version a registry can be left at, from 1 to 16 (17 was written by no release), is
+/// brought to the version this build writes with the device table rebuilt and both rows carried
+/// across, and the file's device schema equals a new file's. The file is made as
+/// `registry_left_at` makes it: a registry as this build makes it, its device table put back to
+/// the earlier shape, its version set back to the version under test, and the columns that the
+/// steps after that version add taken away, so the ladder runs from that version's arm to its end.
+/// The other tables are those of this build, which every other step meets as `CREATE TABLE IF NOT
+/// EXISTS` and as an update of rows.
+#[test]
+fn a_registry_left_at_any_earlier_version_is_brought_forward_to_the_shape_of_a_new_file() {
+    let temp = tempfile::tempdir().expect("a directory on the internal disk");
+    let fresh = temp.path().join("fresh.db");
+    drop(open_registry(&fresh).expect("a new registry"));
+    for version in (1..kr_controller::registry::SCHEMA_VERSION).filter(|version| *version != 17) {
+        for oldest in [false, true] {
+            let path = temp.path().join(format!("from-{version}-{oldest}.db"));
+            registry_left_at(&path, version, oldest);
+            without_the_columns_added_after(&path, version);
+            drop(open_registry(&path).unwrap_or_else(|error| {
+                panic!("from version {version}, oldest shape {oldest}: {error}")
+            }));
+            assert_eq!(
+                recorded_version(&path),
+                kr_controller::registry::SCHEMA_VERSION,
+                "from version {version}, oldest shape {oldest}"
+            );
+            assert_eq!(
+                device_schema(&path),
+                device_schema(&fresh),
+                "from version {version}, oldest shape {oldest}: the schema is a new file's"
+            );
+            let rows: i64 = rusqlite::Connection::open(&path)
+                .expect("the registry opens")
+                .query_row("SELECT COUNT(*) FROM network_devices", [], |row| row.get(0))
+                .expect("a count");
+            assert_eq!(rows, 2, "from version {version}: both rows are carried");
+        }
+    }
+}
+
 /// A second open of a migrated registry changes nothing, and a registry at 18 is not rebuilt.
 #[test]
 fn a_registry_that_was_brought_forward_is_not_rebuilt_again() {
