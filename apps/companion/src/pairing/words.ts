@@ -196,7 +196,17 @@ function codeWords(
         action: 'done'
       }
     case 'already_paired':
-      return { sentence: 'This device is already paired with this host.', action: 'done' }
+      return {
+        sentence:
+          "This device already holds a pairing with this host. If the host's owner removed this device or its pairing ran out, forget the host here first, then pair with a new invitation.",
+        action: 'done'
+      }
+    case 'host_still_lists_device':
+      return {
+        sentence:
+          "This host still lists this device as paired. Ask the host's owner to remove this device from the host, then pair with a new invitation.",
+        action: 'done'
+      }
     case 'not_an_invitation':
       return { sentence: 'That is not a KalaReach invitation.', action: 'new_invitation' }
     case 'newer_invitation':

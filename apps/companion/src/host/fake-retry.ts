@@ -49,6 +49,7 @@ const CATEGORY = new Map<string, HostError['retry']>([
   ['PAIRING_EXPIRED', 'no_retry'],
   ['PAIRING_REJECTED', 'no_retry'],
   ['PAIRING_ATTEMPTS_EXHAUSTED', 'no_retry'],
+  ['PAIRING_ENDPOINT_PAIRED', 'no_retry'],
   ['UNKNOWN_SESSION', 'no_retry'],
   ['AMBIGUOUS_SESSION', 'no_retry'],
   ['AMBIGUOUS_ATTACHMENT', 'no_retry'],

@@ -605,6 +605,7 @@ export type FailureKind =
   | 'relay_fault'
   | 'host_mismatch'
   | 'already_paired'
+  | 'host_still_lists_device'
   | 'not_an_invitation'
   | 'newer_invitation'
   | 'nothing_to_paste'
