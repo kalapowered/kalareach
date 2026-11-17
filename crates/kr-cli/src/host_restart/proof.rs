@@ -423,6 +423,7 @@ mod tests {
             pid: Some(pid),
             start: ControllerStartup::Standalone,
             manager: None,
+            held: true,
         })
     }
 
@@ -630,6 +631,7 @@ mod tests {
             pid: None,
             start: ControllerStartup::Standalone,
             manager: None,
+            held: false,
         };
         let launched = AtomicBool::new(true);
         let launch = crate::startup::launched_after_the_answer(
@@ -840,6 +842,7 @@ mod tests {
             pid: None,
             start: ControllerStartup::Standalone,
             manager: None,
+            held: false,
         });
         let supplied = Supplied::new(Duration::ZERO, started, vec![cut()], vec![at_once(None)]);
         let (said, _) = failed_with(
