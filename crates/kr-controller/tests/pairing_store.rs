@@ -136,13 +136,29 @@ fn lifetimes_on(
     clock: &ManualClock,
     wall: kr_controller::service::WallClock,
 ) -> Arc<GrantLifetimes> {
+    lifetimes_with_floor(
+        directory,
+        clock,
+        wall,
+        Arc::new(kr_controller::grants::policy::UtcFloor::default()),
+    )
+}
+
+/// As [`lifetimes_on`], reading UTC through `floor`, which a case holds to lose this boot's clock
+/// continuity.
+fn lifetimes_with_floor(
+    directory: &Arc<DeviceDirectory>,
+    clock: &ManualClock,
+    wall: kr_controller::service::WallClock,
+    floor: Arc<kr_controller::grants::policy::UtcFloor>,
+) -> Arc<GrantLifetimes> {
     Arc::new(GrantLifetimes::new(
         Arc::clone(directory),
         Arc::new(clock.clone()),
         Arc::new(ManualSharedClock::new()),
         kr_ipc::identity::boot_identity().expect("a boot identity"),
         wall,
-        Arc::new(kr_controller::grants::policy::UtcFloor::default()),
+        floor,
     ))
 }
 
@@ -394,10 +410,15 @@ impl Harness {
     }
 
     fn identities(&self) -> GrantIdentities {
+        self.identities_of(8, 9)
+    }
+
+    /// The identifiers of a second record for the same host: the grant's and the device's own.
+    fn identities_of(&self, grant: u8, device: u8) -> GrantIdentities {
         GrantIdentities {
-            grant_id: GrantId::new(Uuid::from_bytes([8; 16])),
+            grant_id: GrantId::new(Uuid::from_bytes([grant; 16])),
             issuer_device_id: self.host_device(),
-            recipient_device_id: DeviceId::new(Uuid::from_bytes([9; 16])),
+            recipient_device_id: DeviceId::new(Uuid::from_bytes([device; 16])),
             authority_revision: AuthorityRevision::new(1),
         }
     }
@@ -511,6 +532,16 @@ fn approve_answered(
     host: &mut Host<'_>,
     answered: Answered,
 ) -> Result<PairingCommitment, PairingError> {
+    approve_as(harness, host, answered, &harness.identities())
+}
+
+/// As [`approve_answered`], committing the device under `identities`.
+fn approve_as(
+    harness: &Harness,
+    host: &mut Host<'_>,
+    answered: Answered,
+    identities: &GrantIdentities,
+) -> Result<PairingCommitment, PairingError> {
     let approved = host
         .locked_candidate()
         .expect("digests")
@@ -548,7 +579,7 @@ fn approve_answered(
         &harness.by(&approval, harness.owner_keys.authorisation.public()),
         &mut harness.ledger.lock().expect("the ledger"),
         &approved,
-        &harness.identities(),
+        identities,
         None,
     )
 }
@@ -1797,4 +1828,316 @@ fn a_confirmation_is_spent_only_while_the_record_that_answered_it_stands() {
         spent_before,
         "nothing was spent"
     );
+}
+
+/// How many records of one endpoint identity have neither been revoked nor expired.
+fn live_rows_of(path: &Path, harness: &Harness) -> i64 {
+    rusqlite::Connection::open(path)
+        .expect("the registry opens")
+        .query_row(
+            "SELECT COUNT(*) FROM network_devices
+             WHERE endpoint_id = ?1 AND revoked_at_ms IS NULL AND expired_at_ms IS NULL",
+            [harness
+                .client_keys
+                .public_keys()
+                .transport
+                .as_bytes()
+                .as_slice()],
+            |row| row.get(0),
+        )
+        .expect("a count")
+}
+
+/// `squatter`'s record with a grant that runs out at `expires_at_ms`.
+fn expiring_squatter(
+    harness: &Harness,
+    expires_at_ms: u64,
+) -> kr_controller::service::net::devices::DeviceRecord {
+    let mut record = squatter(harness);
+    record.grant.expiry = GrantExpiry::At {
+        expires_at_ms: TimestampMs::new(expires_at_ms),
+    };
+    record
+}
+
+/// The refusal a live record of the endpoint identity gives a commit, in its words.
+fn assert_the_live_refusal(attempt: &Result<PairingCommitment, PairingError>) {
+    assert!(
+        matches!(
+            attempt,
+            Err(PairingError::Refused { code, reason })
+                if *code == ErrorCode::PermissionDenied && reason.contains("still lists this device")
+        ),
+        "{attempt:?}"
+    );
+}
+
+/// KR-REQ-10.08: two commitments for one endpoint identity, made while no record of it exists,
+/// leave one live record. The second commit is refused before its confirmation is spent: it
+/// writes no spend, no device row and no event, and its invitation is not consumed.
+#[test]
+fn two_commitments_for_one_endpoint_identity_leave_one_live_record_and_spend_nothing_for_the_second()
+ {
+    let temp = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.sqlite3");
+    // The host reads UTC where the pairing's clock stands, so the first record's grant, which the
+    // harness issues for two minutes from then, is in force when the second commit reads it.
+    let directory = Arc::new(DeviceDirectory::open(&path).expect("the registry database opens"));
+    directory
+        .commit(&owner_device())
+        .expect("the host's owner device");
+    prepare(&directory).expect("the pairing tables exist");
+    let rows = InvitationRows::new(
+        Arc::clone(&directory),
+        lifetimes_on(
+            &directory,
+            &ManualClock::new(),
+            kr_controller::service::WallClock::from_fn(|| 1_764_000_000_000),
+        ),
+        Arc::default(),
+    );
+    let harness = Harness::new(rows.clone());
+    let mut first = harness.issue();
+    bind(&harness, &mut first);
+    let mut second = harness.issue();
+    bind(&harness, &mut second);
+
+    approve(&harness, &mut first).expect("the first commitment commits");
+    let spent_before = spent_confirmations(&path);
+    let invitation_id = second.invitation_id();
+    let before = rows
+        .load(invitation_id)
+        .expect("readable")
+        .expect("a record");
+    let attempt = approve_as(
+        &harness,
+        &mut second,
+        Answered::ByTheOwnerDevice,
+        &harness.identities_of(18, 19),
+    );
+    assert_the_live_refusal(&attempt);
+    assert_eq!(
+        rows.load(invitation_id)
+            .expect("readable")
+            .expect("a record"),
+        before,
+        "the second invitation is not consumed"
+    );
+    assert_eq!(
+        spent_confirmations(&path),
+        spent_before,
+        "the second confirmation is not spent"
+    );
+    assert!(rows.commitment(invitation_id).expect("readable").is_none());
+    assert_eq!(
+        rows.events_after(None, 10).expect("readable").len(),
+        1,
+        "only the first pairing has an event"
+    );
+    assert_eq!(live_rows_of(&path, &harness), 1);
+    assert_eq!(
+        directory
+            .rows_for_endpoint(&harness.client_keys.public_keys().transport)
+            .expect("readable")
+            .len(),
+        1,
+        "no second record"
+    );
+}
+
+/// KR-REQ-10.08, the commit's half of a device that pins a host identity the host no longer
+/// serves: the host still lists the device, so the commit is refused before anything is spent. An
+/// owner device that reaches the host revokes the record, and a new invitation, confirmed again,
+/// commits a record under a new device identifier while the old identifier stays ended.
+#[test]
+fn a_record_that_the_owner_revokes_lets_a_new_invitation_commit_under_a_new_identifier() {
+    let temp = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.sqlite3");
+    let (directory, rows) = open(&path);
+    let harness = Harness::new(rows.clone());
+    let listed = squatter(&harness);
+    directory
+        .commit(&listed)
+        .expect("the host lists the device");
+
+    let mut refused = harness.issue();
+    bind(&harness, &mut refused);
+    let spent_before = spent_confirmations(&path);
+    let invitation_id = refused.invitation_id();
+    let before = rows
+        .load(invitation_id)
+        .expect("readable")
+        .expect("a record");
+    assert_the_live_refusal(&approve(&harness, &mut refused));
+    assert_eq!(
+        rows.load(invitation_id)
+            .expect("readable")
+            .expect("a record"),
+        before,
+        "the invitation is not consumed"
+    );
+    assert_eq!(spent_confirmations(&path), spent_before);
+
+    assert!(
+        directory
+            .revoke(listed.device_id, TimestampMs::new(20))
+            .expect("revoked"),
+        "the owner's revocation ends the listed record"
+    );
+    let mut again = harness.issue();
+    bind(&harness, &mut again);
+    let new_identifier = DeviceId::new(Uuid::from_bytes([19; 16]));
+    let commitment = approve_as(
+        &harness,
+        &mut again,
+        Answered::ByTheOwnerDevice,
+        &harness.identities_of(18, 19),
+    )
+    .expect("the new invitation commits");
+    assert_eq!(commitment.device_id, new_identifier);
+    let endpoint = harness.client_keys.public_keys().transport;
+    assert_eq!(
+        directory
+            .record_for_endpoint(&endpoint)
+            .expect("readable")
+            .map(|record| record.device_id),
+        Some(new_identifier),
+        "the endpoint identity reads the new record"
+    );
+    assert!(
+        directory
+            .record_for_device(listed.device_id)
+            .expect("readable")
+            .is_some_and(|old| !old.is_paired()),
+        "the old identifier stays ended"
+    );
+    assert_eq!(live_rows_of(&path, &harness), 1);
+}
+
+/// KR-REQ-10.08: a record whose grant ran out before the commit is marked as run out by the
+/// lifetimes' own path, once, outside the transaction, and the commit then finds the end on record
+/// and writes the new record.
+#[test]
+fn a_grant_that_ran_out_before_the_commit_is_marked_once_and_its_endpoint_identity_is_free() {
+    let temp = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.sqlite3");
+    let clock = ManualClock::new();
+    let (directory, rows) = open_with(&path, &clock);
+    let harness = Harness::new(rows.clone());
+    let listed = expiring_squatter(&harness, kr_ipc::now_ms().get() + 60_000);
+    directory
+        .commit(&listed)
+        .expect("the host lists the device");
+    assert!(
+        rows.lifetimes().in_force(&listed).expect("decided"),
+        "the grant is in force and anchored in this boot"
+    );
+    let told = Arc::new(Mutex::new(Vec::new()));
+    rows.lifetimes().pending_expiry().on_recorded({
+        let told = Arc::clone(&told);
+        move |device_id| told.lock().expect("the list").push(device_id)
+    });
+
+    let mut host = harness.issue();
+    bind(&harness, &mut host);
+    clock.advance(Duration::from_secs(61));
+    approve_as(
+        &harness,
+        &mut host,
+        Answered::ByTheOwnerDevice,
+        &harness.identities_of(18, 19),
+    )
+    .expect("the grant ran out, so the endpoint identity takes a new record");
+    assert!(
+        directory
+            .record_for_device(listed.device_id)
+            .expect("readable")
+            .is_some_and(|old| old.expired_at_ms.is_some()),
+        "the end of the grant is on record"
+    );
+    assert_eq!(
+        *told.lock().expect("the list"),
+        vec![listed.device_id],
+        "whoever waits on the end was told once"
+    );
+    assert_eq!(live_rows_of(&path, &harness), 1);
+}
+
+/// KR-REQ-10.08: a record that this host cannot prove has ended counts as live. With this boot's
+/// clock continuity lost, a record whose grant is past its end is not marked, the commit is refused
+/// before its confirmation is spent, and nothing about the record is written. A revocation reads no
+/// clock, and a new invitation then commits.
+#[test]
+fn a_record_whose_end_the_host_cannot_prove_counts_as_live_until_it_is_revoked() {
+    let temp = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.sqlite3");
+    let clock = ManualClock::new();
+    let floor = Arc::new(kr_controller::grants::policy::UtcFloor::default());
+    let directory = Arc::new(DeviceDirectory::open(&path).expect("the registry database opens"));
+    directory
+        .commit(&owner_device())
+        .expect("the host's owner device");
+    prepare(&directory).expect("the pairing tables exist");
+    let lifetimes = lifetimes_with_floor(
+        &directory,
+        &clock,
+        kr_controller::service::WallClock::system(),
+        Arc::clone(&floor),
+    );
+    let rows = InvitationRows::new(Arc::clone(&directory), lifetimes, Arc::default());
+    let harness = Harness::new(rows.clone());
+    let listed = expiring_squatter(&harness, kr_ipc::now_ms().get() + 60_000);
+    directory
+        .commit(&listed)
+        .expect("the host lists the device");
+    assert!(rows.lifetimes().in_force(&listed).expect("decided"));
+
+    let mut refused = harness.issue();
+    bind(&harness, &mut refused);
+    clock.advance(Duration::from_secs(61));
+    floor.lose_continuity();
+    let spent_before = spent_confirmations(&path);
+    let invitation_id = refused.invitation_id();
+    let before = rows
+        .load(invitation_id)
+        .expect("readable")
+        .expect("a record");
+    assert_the_live_refusal(&approve(&harness, &mut refused));
+    assert_eq!(
+        rows.load(invitation_id)
+            .expect("readable")
+            .expect("a record"),
+        before,
+        "the invitation is not consumed"
+    );
+    assert_eq!(
+        spent_confirmations(&path),
+        spent_before,
+        "nothing was spent"
+    );
+    let record = directory
+        .record_for_device(listed.device_id)
+        .expect("readable")
+        .expect("the listed record");
+    assert!(
+        record.expired_at_ms.is_none() && record.revoked_at_ms.is_none(),
+        "no mark is written: {record:?}"
+    );
+    assert_eq!(rows.lifetimes().pending_expiry().owed(), 0);
+
+    assert!(
+        directory
+            .revoke(listed.device_id, TimestampMs::new(30))
+            .expect("revoked")
+    );
+    let mut again = harness.issue();
+    bind(&harness, &mut again);
+    approve_as(
+        &harness,
+        &mut again,
+        Answered::ByTheOwnerDevice,
+        &harness.identities_of(18, 19),
+    )
+    .expect("a new invitation commits once the record is revoked");
+    assert_eq!(live_rows_of(&path, &harness), 1);
 }
