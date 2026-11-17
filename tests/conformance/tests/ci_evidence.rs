@@ -723,9 +723,10 @@ fn the_evidence_action_makes_the_upload_twice_and_fails_when_both_tries_fail() {
         .collect();
     assert_eq!(tries.len(), 2, "the action makes two tries and no more");
     let conditions = [
-        "${{ always() }}",
+        "${{ always() && inputs.only-load != 'true' }}",
         "${{ !cancelled() && steps.first.outcome == 'failure' }}",
     ];
+    let mut pins = Vec::new();
     for ((step, id), condition) in tries.iter().zip(["first", "second"]).zip(conditions) {
         assert_eq!(
             value_at(step, 6, "id").as_deref(),
@@ -744,6 +745,7 @@ fn the_evidence_action_makes_the_upload_twice_and_fails_when_both_tries_fail() {
             pin.len() == 40 && pin.chars().all(|c| c.is_ascii_hexdigit()),
             "the {id} try's action is not pinned by its full commit"
         );
+        pins.push(pin.to_owned());
         assert_eq!(
             value_at(step, 6, "continue-on-error").as_deref(),
             Some("true"),
@@ -770,6 +772,52 @@ fn the_evidence_action_makes_the_upload_twice_and_fails_when_both_tries_fail() {
             "the {id} try sets an input beyond the three it was given"
         );
     }
+    assert_eq!(
+        pins[0], pins[1],
+        "the two tries call different versions of the upload action"
+    );
+    // The pause stands between the two tries, and is the one step that waits.
+    let position_of = |id: &str| {
+        steps
+            .iter()
+            .position(|step| value_at(step, 6, "id").as_deref() == Some(id))
+            .unwrap_or_else(|| panic!("the action has no step with the id {id}"))
+    };
+    let pauses: Vec<usize> = (0..steps.len())
+        .filter(|&at| {
+            steps[at]
+                .lines()
+                .any(|line| line.trim().starts_with("sleep "))
+        })
+        .collect();
+    assert_eq!(pauses.len(), 1, "one step of the action waits");
+    assert!(
+        position_of("first") < pauses[0] && pauses[0] < position_of("second"),
+        "the pause does not stand between the first try and the second"
+    );
+    assert!(
+        steps[pauses[0]]
+            .lines()
+            .any(|line| line.trim() == "sleep 60"),
+        "the pause is not 60 seconds"
+    );
+    // Every step after the first try waits on that try having failed, so that a call that only
+    // loads the action (the first try skips) runs none of them.
+    for step in steps
+        .iter()
+        .filter(|step| value_at(step, 6, "id").as_deref() != Some("first"))
+    {
+        assert!(
+            own_condition(step, 6)
+                .is_some_and(|condition| condition.contains("steps.first.outcome=='failure'")),
+            "a step after the first try runs whether or not the first try failed: {step}"
+        );
+    }
+    assert!(
+        text.lines().any(|line| line.trim()
+            == "value: ${{ steps.first.outcome == 'success' && '1' || (steps.second.outcome == 'success' && '2' || '') }}"),
+        "the output `tries` is not 1 for the first try, 2 for the second and empty for neither"
+    );
     let letting_pass = text
         .lines()
         .filter(|line| key_value(line).is_some_and(|(_, key, _)| key == "continue-on-error"))
@@ -790,6 +838,96 @@ fn the_evidence_action_makes_the_upload_twice_and_fails_when_both_tries_fail() {
             "${{ always() && steps.first.outcome == 'failure' && steps.second.outcome != 'success' }}"
         )),
         "the step that fails the action runs under another condition than both tries failing"
+    );
+}
+
+/// KR-REQ-21.01, where the evidence action is fetched: the runner fetches the upload action that
+/// the evidence action calls when the first step that calls the evidence action starts, which
+/// would be after the hours of work that the evidence comes from. So a job that keeps evidence
+/// through it calls it once in its `only-load` mode, right after its checkout and before any step
+/// that builds or tests, by a step that has no condition and does not let its failure pass, and
+/// keeps its evidence by calls that name an artifact and a path, after it.
+#[test]
+fn every_job_that_keeps_evidence_loads_the_evidence_action_right_after_its_checkout() {
+    const ACTION: &str = "./.github/actions/keep-evidence";
+    let mut jobs_that_keep = 0;
+    for file in ["core-ci.yml", "conformance.yml"] {
+        let workflow = fs::read_to_string(repository().join(".github/workflows").join(file))
+            .expect("a workflow");
+        for name in jobs_of(&workflow) {
+            let steps = steps_of(&job(&workflow, &name));
+            let calls: Vec<usize> = (0..steps.len())
+                .filter(|&at| value_at(&steps[at], 8, "uses").as_deref() == Some(ACTION))
+                .collect();
+            if calls.is_empty() {
+                continue;
+            }
+            jobs_that_keep += 1;
+            let loading: Vec<usize> = calls
+                .iter()
+                .copied()
+                .filter(|&at| {
+                    value_at(&steps[at], 10, "only-load")
+                        .is_some_and(|value| value.trim_matches('"') == "true")
+                })
+                .collect();
+            assert_eq!(
+                loading.len(),
+                1,
+                "{file}: the {name} job does not call the evidence action once to load it"
+            );
+            let at = loading[0];
+            let checkout = steps
+                .iter()
+                .position(|step| {
+                    value_at(step, 8, "uses")
+                        .is_some_and(|action| action.starts_with("actions/checkout@"))
+                })
+                .unwrap_or_else(|| panic!("{file}: the {name} job has no checkout"));
+            assert_eq!(
+                at,
+                checkout + 1,
+                "{file}: the {name} job does not load the evidence action right after its checkout"
+            );
+            assert!(
+                own_condition(&steps[at], 8).is_none()
+                    && !is_disabled(&steps[at])
+                    && value_at(&steps[at], 8, "timeout-minutes").is_none(),
+                "{file}: the {name} job's load of the evidence action has a condition that can \
+                 skip it, or lets its failure pass"
+            );
+            for step in &steps[..at] {
+                for word in ["cargo ", "pnpm ", "scripts/"] {
+                    assert!(
+                        !step.contains(word),
+                        "{file}: a step of the {name} job that builds or tests comes before the \
+                         load of the evidence action: {step}"
+                    );
+                }
+            }
+            let keeping: Vec<usize> = calls.iter().copied().filter(|&call| call != at).collect();
+            assert!(
+                !keeping.is_empty(),
+                "{file}: the {name} job loads the evidence action and keeps nothing through it"
+            );
+            for call in keeping {
+                assert!(
+                    call > at,
+                    "{file}: the {name} job keeps evidence before it loads"
+                );
+                assert!(
+                    value_at(&steps[call], 10, "name").is_some()
+                        && value_at(&steps[call], 10, "path").is_some()
+                        && value_at(&steps[call], 10, "only-load").is_none(),
+                    "{file}: a call of the evidence action in the {name} job names no artifact \
+                     or no path"
+                );
+            }
+        }
+    }
+    assert!(
+        jobs_that_keep > 0,
+        "no job keeps evidence through the action"
     );
 }
 

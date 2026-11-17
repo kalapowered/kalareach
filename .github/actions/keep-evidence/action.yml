@@ -16,34 +16,54 @@ description: >-
   Whether the step runs, and for how long, is the calling step's own `if` and `timeout-minutes`.
   A timeout there covers both tries and the pause.
 
+  The runner fetches the upload action that this action calls when this action's own step starts,
+  not when the job is set up. A job that keeps evidence therefore calls this action once with
+  `only-load` right after its checkout, so that the fetch is made with the job's other downloads
+  and not after the hours of work that the evidence comes from.
+
 inputs:
   name:
-    description: The artifact's name. It must not be the name of another artifact of the run.
-    required: true
+    description: >-
+      The artifact's name. It must not be the name of another artifact of the run. Required
+      unless `only-load` is `true`.
+    required: false
   path:
-    description: A file, a directory or a wildcard pattern, or several of them on lines of their own.
-    required: true
+    description: >-
+      A file, a directory or a wildcard pattern, or several of them on lines of their own.
+      Required unless `only-load` is `true`.
+    required: false
   if-no-files-found:
     description: >-
       What a try does when the path holds nothing: `warn`, `error` or `ignore`, as the upload
       action reads it.
     required: false
     default: warn
+  only-load:
+    description: >-
+      `true` makes every step of this action skip, so that the call only has the runner fetch the
+      upload action. It keeps nothing and takes no `name` or `path`.
+    required: false
+    default: 'false'
 
 outputs:
   tries:
-    description: "'1' when the first try kept the evidence, '2' when the second one did."
-    value: ${{ steps.first.outcome == 'success' && '1' || '2' }}
+    description: >-
+      '1' when the first try's upload step ended without failing, '2' when the second one's did
+      and the first one's failed, and empty when neither did (both failed and the action failed,
+      or the call was `only-load`). An upload step that ends without failing has kept an artifact
+      unless the rule is `warn` or `ignore` and the path held nothing.
+    value: ${{ steps.first.outcome == 'success' && '1' || (steps.second.outcome == 'success' && '2' || '') }}
 
 runs:
   using: composite
   steps:
     # The caller's condition has already decided that this action runs, so every step here stands
     # under `always()` or `!cancelled()` and not under the default `success()`, which a job that
-    # is already red would never pass.
+    # is already red would never pass. With `only-load` the first try skips, and every later step
+    # waits on the first try having failed, so none of them runs either.
     - name: Keep the evidence
       id: first
-      if: ${{ always() }}
+      if: ${{ always() && inputs.only-load != 'true' }}
       continue-on-error: true
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
