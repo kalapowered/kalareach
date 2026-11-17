@@ -20,12 +20,17 @@ use std::time::{Duration, Instant};
 
 use kr_controller::service::net::devices::DeviceRecord;
 use kr_crypto::keys::DeviceKeys;
+use kr_protocol::confirmation::ConfirmationSubject;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{DeviceId, InvitationId};
-use kr_protocol::invitation::{InviteGrantKind, PairConfirmParams};
+use kr_protocol::invitation::{
+    InviteGrantKind, InviteMode, InviteModeKind, PairConfirmParams, PairInviteParams,
+    PairInviteResult,
+};
 use kr_protocol::method::Method;
 use kr_protocol::pairing::ProposedGrant;
 use kr_protocol::rights::ActionRight;
+use kr_protocol::scalars::Nullable;
 use net_support::pairing::{self as calls, Signer};
 use net_support::worker::Adopted;
 use net_support::{Device, Host, Moved, connect, pair_with, paired_dial, proposal};
@@ -533,5 +538,224 @@ async fn a_local_caller_carrying_an_owner_devices_proof_spends_it_and_the_row_na
         );
         assert!(spent, "the pairing spent the confirmation");
     }
+    host.stop().await;
+}
+
+/// How many answered confirmations name `device_id` as the record that answered, and how many of
+/// those were spent.
+fn answers_of(host: &Host, device_id: DeviceId) -> (i64, i64) {
+    registry(host)
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(consumed_at_ms IS NOT NULL), 0)
+             FROM owner_confirmations WHERE signer_device_id = ?1",
+            [device_id.get().as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the answers")
+}
+
+/// KR-REQ-10.06: an answer that an owner device gave is taken only while the record that gave it
+/// stands, not while some record holds the same authorisation key. The owner device answers the
+/// confirmation of issuing an invitation and its record is revoked; a record of another endpoint
+/// identity then holds the same key. The host does not take the old answer: it refuses the
+/// invitation, spends nothing and issues nothing. The new record's own answer is taken, and the old
+/// one is passed over without being spent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_answer_is_not_taken_once_its_record_ended_though_a_new_record_holds_its_key() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let first = host.owner.clone().expect("the host's owner device");
+    let signer = Signer::OwnerDevice(&owner);
+    let mut client = host.client().await;
+    let subject = || ConfirmationSubject::IssueInvitation {
+        mode: InviteModeKind::Direct,
+        rendezvous_origin: Nullable::null(),
+        grant_kind: InviteGrantKind::SessionInvitation,
+        proposed_grant: rights(),
+    };
+    let invite = PairInviteParams {
+        mode: InviteMode::Direct,
+        grant_kind: InviteGrantKind::SessionInvitation,
+        proposed_grant: rights(),
+    };
+
+    // The owner device answers; nothing spends the answer yet.
+    calls::confirm_subject(host.environment_id, &mut client, subject(), &signer)
+        .await
+        .expect("the owner device answers");
+    assert_eq!(answers_of(&host, first.device_id), (1, 0));
+    let invitations = count(&host, "SELECT COUNT(*) FROM pairing_invitations");
+
+    // Its record is revoked, and a record of another endpoint identity holds the same key.
+    let barrier = within(
+        "the revocation",
+        BOUND,
+        host.network().revoke_device(first.device_id),
+    )
+    .await
+    .expect("the owner device is revoked");
+    assert!(barrier.holds(), "{barrier:?}");
+    let mut second = first.clone();
+    second.device_id = DeviceId::new(kr_ipc::new_uuid());
+    second.endpoint_id = *DeviceKeys::generate().expect("keys").transport.public();
+    second.revoked_at_ms = None;
+    second.expired_at_ms = None;
+    host.network()
+        .devices()
+        .commit(&second)
+        .expect("a record that holds the key of the revoked one");
+
+    let refused = within(
+        "the invitation",
+        BOUND,
+        calls::mutate::<_, PairInviteResult>(
+            host.environment_id,
+            &mut client,
+            Method::PairInvite,
+            &invite,
+        ),
+    )
+    .await
+    .expect_err("the answer of the ended record is not taken");
+    assert_eq!(
+        refused.code,
+        ErrorCode::OwnerConfirmationRequired,
+        "{refused:?}"
+    );
+    assert!(
+        refused.message.contains("no longer holds"),
+        "the host says the authority behind the answer has gone: {refused:?}"
+    );
+    assert_eq!(
+        answers_of(&host, first.device_id),
+        (1, 0),
+        "nothing was spent"
+    );
+    assert_eq!(
+        count(&host, "SELECT COUNT(*) FROM pairing_invitations"),
+        invitations,
+        "no invitation was issued"
+    );
+
+    // The new record answers for itself, with the same key, and is taken; the old answer stays
+    // unspent.
+    calls::invite_direct(
+        host.environment_id,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &rights(),
+        &signer,
+    )
+    .await
+    .expect("the new record's answer is taken");
+    assert_eq!(answers_of(&host, second.device_id), (1, 1));
+    assert_eq!(answers_of(&host, first.device_id), (1, 0));
+    host.stop().await;
+}
+
+/// Every row of `table`, as stored.
+fn rows_of(host: &Host, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    let connection = registry(host);
+    let mut statement = connection
+        .prepare(&format!("SELECT * FROM {table} ORDER BY 1"))
+        .expect("prepares");
+    let columns = statement.column_count();
+    statement
+        .query_map([], |row| {
+            (0..columns).map(|column| row.get(column)).collect()
+        })
+        .expect("rows")
+        .collect::<Result<_, _>>()
+        .expect("every row")
+}
+
+/// KR-REQ-10.08: nothing the ended record held carries over to the record that replaces it. The
+/// ended record has a route for an action and a deadline for its grant, and the host has an
+/// owner. After the device pairs again, the new record's identifier finds no route and no
+/// deadline, the old ones are as they were, the ended row is byte for byte what it was when the
+/// revocation finished, and the owner is the same one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn nothing_the_ended_record_held_carries_over_to_the_record_that_replaces_it() {
+    use kr_controller::service::net::devices::ActionRoute;
+    use kr_protocol::scalars::{Digest256, TimestampMs};
+
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let phone = Device::create().await;
+    let first = pair_with(&host, &phone, &owner, rights()).await;
+    let directory = host.network().devices();
+    let old_actor = kr_transport::listener::device_principal(&first.device_id);
+    let action = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+    let digest = Digest256::from_bytes([7; 32]);
+    let now = TimestampMs::new(kr_ipc::now_ms().get());
+    let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+    assert_eq!(
+        directory
+            .claim_action_route(&old_actor, action, None, digest, now)
+            .expect("a route"),
+        ActionRoute::Recorded
+    );
+    directory
+        .record_grant_deadline(first.device_id, &boot, 123_456)
+        .expect("a deadline");
+
+    let barrier = within(
+        "the revocation",
+        BOUND,
+        host.network().revoke_device(first.device_id),
+    )
+    .await
+    .expect("the device is revoked");
+    assert!(barrier.holds(), "{barrier:?}");
+    let revoked = row_of(&host, first.device_id);
+    let old_deadline = directory
+        .grant_deadline_in(first.device_id, &boot)
+        .expect("readable");
+    let owner_rows = rows_of(&host, "host_owner");
+    assert_eq!(owner_rows.len(), 1, "the host has its owner");
+
+    let second = within(
+        "the second pairing",
+        BOUND,
+        pair_with(&host, &phone, &owner, rights()),
+    )
+    .await;
+    let new_actor = kr_transport::listener::device_principal(&second.device_id);
+
+    // N10: the ended row is as it was when the revocation finished.
+    assert_eq!(row_of(&host, first.device_id), revoked);
+    // N1: the new identifier is told it is the first to claim the action, and the old route is
+    // still the old record's.
+    assert_eq!(
+        directory
+            .claim_action_route(&new_actor, action, None, digest, now)
+            .expect("a route"),
+        ActionRoute::Recorded,
+        "the new record finds no route of the old one"
+    );
+    assert!(
+        matches!(
+            directory
+                .claim_action_route(&old_actor, action, None, digest, now)
+                .expect("a route"),
+            ActionRoute::Existing(_)
+        ),
+        "the old route stands under the old identifier"
+    );
+    // N7: no deadline for the new identifier, and the old one is as it was.
+    assert_eq!(
+        directory
+            .grant_deadline_in(second.device_id, &boot)
+            .expect("readable"),
+        None
+    );
+    assert_eq!(
+        directory
+            .grant_deadline_in(first.device_id, &boot)
+            .expect("readable"),
+        old_deadline
+    );
+    // N9: the owner is the same.
+    assert_eq!(rows_of(&host, "host_owner"), owner_rows);
     host.stop().await;
 }
