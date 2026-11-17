@@ -215,6 +215,13 @@ held crates/kr-worker/src/service.rs continue_prepared dispatch_accepted BAR,SES
 supplies crates/kr-worker/src/service.rs admit_and_dispatch dispatch_accepted 1 session
 supplies crates/kr-worker/src/service.rs continue_prepared dispatch_accepted 1 session
 
+# The binder's count of open work: `close_ended` keeps an ending binding while `admitted_open` says
+# that an approval or a plugin action of that binding is still open. The count is read at a
+# snapshot, outside the standing pass, so it is a lifetime check and not a part of the pass; the
+# body is read here so that a lock taken in it is seen, and its one caller is named.
+scope crates/kr-worker/src/broker/binder.rs admitted_open
+caller admitted_open crates/kr-worker/src/broker/binder.rs close_ended 1
+
 # The names that a body calls where the receiver is a type of the standard library or of another
 # crate: the receiver's type was read in the body, from a parameter, a field's declared type or a
 # local's initialiser, and no function of this crate is called. A name that this crate declares too
@@ -228,6 +235,7 @@ allow crates/kr-worker/src/action/time.rs utc_deadline_standing load named recor
 allow crates/kr-worker/src/attachments.rs geometry new
 allow crates/kr-worker/src/attachments.rs get get
 allow crates/kr-worker/src/broker/arbitration.rs get get
+allow crates/kr-worker/src/broker/binder.rs admitted_open any get load
 allow crates/kr-worker/src/broker/bridge.rs attested_thread all clone get iter next
 allow crates/kr-worker/src/broker/capability.rs is_usable get record
 allow crates/kr-worker/src/broker/capability.rs map get
@@ -313,6 +321,7 @@ allow crates/kr-worker/src/service.rs validate any as_str contains iter
 calls crates/kr-worker/src/action/time.rs pure_proven_ms projected crates/kr-worker/src/action/time.rs
 calls crates/kr-worker/src/action/time.rs pure_wall_ms now_ms crates/kr-worker/src/action/time.rs
 calls crates/kr-worker/src/broker/agents.rs attested attested_thread crates/kr-worker/src/broker/bridge.rs
+calls crates/kr-worker/src/broker/binder.rs admitted_open iter crates/kr-worker/src/broker/arbitration.rs
 calls crates/kr-worker/src/broker/bridge.rs attested_thread attested_thread crates/kr-worker/src/broker/bridge.rs
 calls crates/kr-worker/src/broker/ledger.rs fault of crates/kr-worker/src/broker/ledger.rs
 calls crates/kr-worker/src/broker/ledger.rs of observe crates/kr-worker/src/persistence/fault.rs
