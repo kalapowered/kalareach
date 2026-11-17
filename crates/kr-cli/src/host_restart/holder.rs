@@ -252,7 +252,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_holder_that_never_answers_ends_the_wait_at_the_bound() {
         let supplied = Supplied::new(vec![at_once(Ok(true))], vec![at_once(Endpoint::Unclear)]);
-        assert_eq!(wait(&supplied, BOUND).await, Holder::Silent { replied: false });
+        assert_eq!(
+            wait(&supplied, BOUND).await,
+            Holder::Silent { replied: false }
+        );
         assert_eq!(supplied.start.elapsed(), BOUND);
         let calls = supplied.calls();
         assert!(
@@ -296,7 +299,10 @@ mod tests {
                 takes: None,
             }],
         );
-        assert_eq!(wait(&supplied, BOUND).await, Holder::Silent { replied: false });
+        assert_eq!(
+            wait(&supplied, BOUND).await,
+            Holder::Silent { replied: false }
+        );
         assert_eq!(supplied.start.elapsed(), BOUND);
     }
 }
