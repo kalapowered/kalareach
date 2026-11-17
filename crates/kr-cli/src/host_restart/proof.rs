@@ -619,6 +619,84 @@ mod tests {
         );
     }
 
+    /// What the start gives where the task's request was withdrawn before a starter took it and a
+    /// daemon answered: the launch is none, as the start on Windows says it.
+    #[cfg(windows)]
+    fn a_withdrawn_task_request() -> Option<Started> {
+        let task = Started {
+            pid: None,
+            start: ControllerStartup::Standalone,
+            manager: None,
+        };
+        let launched = AtomicBool::new(true);
+        let launch = crate::startup::launched_after_the_answer(
+            Ok(kr_ipc::starter::Withdrawal::Withdrawn),
+            task,
+            &launched,
+        );
+        assert!(!launched.load(Ordering::SeqCst));
+        launch
+    }
+
+    /// KR-REQ-07.12 (Windows, a withdrawn task request and a whole proof): another daemon answers,
+    /// and the proof names no launch of this command's, where an unproved launch would say that a
+    /// daemon was asked for and cannot be told from the one that answers.
+    #[cfg(windows)]
+    #[tokio::test(start_paused = true)]
+    async fn a_withdrawn_task_request_with_a_whole_proof_is_another_daemon_with_no_launch() {
+        let supplied = Supplied::new(
+            Duration::ZERO,
+            a_withdrawn_task_request(),
+            vec![says(5, Some(900))],
+            vec![],
+        );
+        let proved = prove(
+            &supplied,
+            Old::Generation(ControllerGeneration::new(4)),
+            BOUND,
+        )
+        .await;
+        assert!(
+            matches!(
+                proved,
+                Ok(Proved::Another {
+                    serving: Some(900),
+                    launched: None,
+                    cut: false
+                })
+            ),
+            "another daemon, no launch"
+        );
+    }
+
+    /// KR-REQ-07.12 (Windows, a withdrawn task request and a proof that is cut): no daemon gives a
+    /// whole answer at the bound, and the failure says that this command could not read which
+    /// daemon serves the environment, and never that it started one.
+    #[cfg(windows)]
+    #[tokio::test(start_paused = true)]
+    async fn a_withdrawn_task_request_with_a_cut_proof_never_says_that_a_daemon_was_started() {
+        let supplied = Supplied::new(
+            Duration::ZERO,
+            a_withdrawn_task_request(),
+            vec![cut()],
+            vec![at_once(None)],
+        );
+        let (said, launched) = failed_with(
+            prove(
+                &supplied,
+                Old::Generation(ControllerGeneration::new(4)),
+                BOUND,
+            )
+            .await,
+        );
+        assert_eq!(
+            said,
+            "this command could not read which control daemon serves the environment, and no \
+             control daemon gave a whole answer within 30 seconds"
+        );
+        assert!(!launched);
+    }
+
     /// A daemon that answers the information request and withholds the answer to the launch-only
     /// request, on every connection, as a host does that owes a fence it has not yet raised: the
     /// proof never has a whole exchange, and ends at the bound with a failure that says that no
