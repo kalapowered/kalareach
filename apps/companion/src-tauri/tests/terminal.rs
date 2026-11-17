@@ -1692,6 +1692,22 @@ impl Page {
         .ok()
     }
 
+    /// The `index`th state `channel` is sent, and none when it is not sent within [`STATE_BOUND`]: a
+    /// case that must fail by an assertion of its own, and not by the harness's watchdog, asks for a
+    /// state this way.
+    async fn state_within(&self, channel: u32, index: usize) -> Option<Value> {
+        tokio::time::timeout(STATE_BOUND, async {
+            loop {
+                if let Some(state) = self.states(channel).get(index) {
+                    return state.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .ok()
+    }
+
     /// The newest state `channel` has been sent, once it is one `holds` accepts.
     async fn newest(&self, channel: u32, holds: impl Fn(&Value) -> bool) -> Value {
         tokio::time::timeout(WATCHDOG, async {
@@ -4963,7 +4979,10 @@ async fn a_slow_view_loses_no_notification_and_ends_with_its_words() {
         reached,
         "the host did not write what the view, the channel and the reader hold within the bound"
     );
-    page.state(3, shown).await;
+    assert!(
+        page.state_within(3, shown).await.is_some(),
+        "the view did not reach its first state within the bound"
+    );
     assert_eq!(
         page.states(3).len(),
         shown + 1,
@@ -4975,7 +4994,10 @@ async fn a_slow_view_loses_no_notification_and_ends_with_its_words() {
         joined.is_ok_and(|host| host.is_ok()),
         "the host did not finish writing within the bound once the view was let on"
     );
-    let ended = page.newest(3, |state| state["state"] == "ended").await;
+    let ended = page
+        .newest_within(3, |state| state["state"] == "ended")
+        .await
+        .expect("the view ended within the bound once the host's connection went");
     assert_eq!(ended["reason"], "The connection to this session ended.");
     let expected: Vec<String> = (0..SCREENS)
         .map(|number| format!("screen {number}"))
@@ -5189,7 +5211,10 @@ async fn a_flood_the_page_takes_slowly_keeps_the_hosts_order_and_holds_back_no_c
         link.push(PROJECTION_DELTA_EVENT, &flood(number)).await;
     }
     // The view is inside the first state of the flood, and holds nothing else.
-    page.state(3, first).await;
+    assert!(
+        page.state_within(3, first).await.is_some(),
+        "the view did not reach the first state of the flood within the bound"
+    );
     // The page takes states one at a time until a look has moved what the channel held into the
     // view's queue.
     let mut recorded = first + 1;
@@ -5198,7 +5223,10 @@ async fn a_flood_the_page_takes_slowly_keeps_the_hosts_order_and_holds_back_no_c
             break;
         }
         held.let_pass(1);
-        page.state(3, recorded).await;
+        assert!(
+            page.state_within(3, recorded).await.is_some(),
+            "the view did not publish the state {recorded} within the bound"
+        );
         recorded += 1;
     }
     assert!(
@@ -5210,7 +5238,10 @@ async fn a_flood_the_page_takes_slowly_keeps_the_hosts_order_and_holds_back_no_c
     // takes it, with the rest of the queue still waiting.
     page.resize(&view, 12, 3);
     held.let_pass(1);
-    page.state(3, recorded).await;
+    assert!(
+        page.state_within(3, recorded).await.is_some(),
+        "the view did not publish the state {recorded} within the bound"
+    );
     recorded += 1;
     let report = link.call_within(STATE_BOUND).await.expect(
         "the size report was not on the wire within the bound while the page still holds the view",
@@ -5245,7 +5276,10 @@ async fn a_flood_the_page_takes_slowly_keeps_the_hosts_order_and_holds_back_no_c
     .await;
     for _ in 0..PACED {
         held.let_pass(1);
-        page.state(3, recorded).await;
+        assert!(
+            page.state_within(3, recorded).await.is_some(),
+            "the view did not publish the state {recorded} within the bound"
+        );
         recorded += 1;
     }
     drop(held);
