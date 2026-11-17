@@ -30,11 +30,12 @@
 //! The endpoint publishes nothing. A [`HostServices`] has no publisher, so a host's configuration
 //! cannot turn a publication on, and the dispatcher takes none.
 //!
-//! The table of hosts changes at the call, in the order of the calls. The relay map follows it: a
-//! change that alters a host's relays starts one task that sets the map equal to the table, and the
-//! caller waits for that task. A caller that stops waiting leaves the task to finish, and a task
-//! that runs late sets the map to the table as it then stands, so an earlier introduction never
-//! puts back what a later `forget` took out.
+//! The table of hosts changes at the call, in the order of the calls. The relay map follows it: an
+//! introduction that alters a host's relays, and every `forget`, starts one task that sets the map
+//! equal to the table, and the caller waits for that task. A caller that stops waiting leaves the
+//! task to finish, and a task that runs late sets the map to the table as it then stands, so an
+//! earlier introduction never puts back what a later `forget` took out. A closed endpoint refuses
+//! every change of its map, so the map follows the table only while the endpoint is open.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -330,13 +331,17 @@ impl DeviceEndpoint {
     /// The call always sets the map and waits for it, whether or not the removed entry names a
     /// relay. An introduction whose caller stopped waiting can leave the map with a relay that the
     /// table no longer names, while its own task has not run. The task of this call takes its turn
-    /// after any task that read the table before the removal, so when the call returns the map holds
-    /// no relay that the table lacks. The cost is one turn of the map's lock for each call, also
-    /// for a host that the table does not hold.
+    /// after any task that read the table before the removal, so while the endpoint is open, when
+    /// the call returns the map holds no relay that the table lacks. A closed endpoint refuses
+    /// every change of its map and keeps the relays it had. The cost is one turn of the map's lock
+    /// for each call, also for a host that the table does not hold.
     ///
     /// # Errors
     ///
-    /// Returns [`TransportError::Configuration`] when `identity` is not a public key.
+    /// Returns [`TransportError::Configuration`] when `identity` is not a public key, and
+    /// [`TransportError::Bind`] when the task that sets the map did not complete. The entry is
+    /// removed before that task starts, so the host is out of the table when the second is
+    /// returned.
     pub async fn forget(&self, identity: &EndpointKey) -> Result<()> {
         let identity = endpoint_id(identity)?;
         self.shared.table().hosts.remove(&identity);
@@ -679,6 +684,44 @@ mod tests {
         task.await;
         assert_eq!(device.relay_urls(), BTreeSet::from([relay]));
         device.close().await;
+    }
+
+    /// KR-REQ-10.02: an introduction on a closed endpoint is refused and leaves the table as it
+    /// was. The table is read here, in the module's own test, because a closed endpoint has no
+    /// lookup registry to ask and refuses every change of its relay map.
+    #[tokio::test]
+    async fn an_introduction_on_a_closed_endpoint_is_refused_and_the_table_does_not_take_the_host()
+    {
+        let identity = TransportIdentityKeyPair::generate().expect("a transport identity");
+        let device = DeviceEndpoint::bind(
+            &EndpointConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("an address")),
+                ..EndpointConfig::default()
+            },
+            &identity,
+        )
+        .await
+        .expect("the device's endpoint");
+        device.close().await;
+        let services = HostServices::paired(
+            &EndpointConfig {
+                relay_urls: vec!["https://127.0.0.1:9".parse().expect("a relay URL")],
+                ..EndpointConfig::default()
+            },
+            &key(),
+        )
+        .expect("a paired host");
+        let host = services.identity;
+
+        let refused = device.introduce(services).await;
+        assert!(
+            matches!(&refused, Err(TransportError::Bind(reason)) if reason.contains("closed")),
+            "{refused:?}"
+        );
+        assert!(
+            !device.shared.table().hosts.contains_key(&host),
+            "the refused introduction put the host in the table"
+        );
     }
 
     /// KR-REQ-10.02: the device's endpoint takes its relays and lookups from hosts alone, so a
