@@ -293,14 +293,17 @@ export function failureAlternatives(
 }
 
 /**
- * The endings after which the host has consumed or ended the invitation, whatever the person is
- * offered next: the owner declined this device, the owner withdrew the invitation, and the host
- * stopped it for too many wrong codes.
+ * The endings after which the host has consumed or ended the invitation, or after which the person
+ * is sent to a new one, whatever the person is offered next: the owner declined this device, the
+ * owner withdrew the invitation, the host stopped it for too many wrong codes, the host consumed
+ * it because it still lists this device, and this device already holds a pairing with the host.
  */
 const INVITATION_ENDED: ReadonlySet<PairingFailure['kind']> = new Set([
   'declined',
   'withdrawn',
-  'host_tries_used'
+  'host_tries_used',
+  'host_still_lists_device',
+  'already_paired'
 ])
 
 /**

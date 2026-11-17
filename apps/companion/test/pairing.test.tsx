@@ -199,6 +199,16 @@ describe('pairing with a host', () => {
     ['an owner who declined this device', { kind: 'declined', tries_left: 3 }, 'Done'],
     ['an owner who withdrew the invitation', { kind: 'withdrawn', tries_left: 3 }, 'Done'],
     [
+      'a host that consumed the invitation because it still lists this device',
+      { kind: 'host_still_lists_device', tries_left: 3 },
+      'Done'
+    ],
+    [
+      'a device that already holds a pairing with the host',
+      { kind: 'already_paired', tries_left: 3 },
+      'Done'
+    ],
+    [
       'a host that ended the invitation for too many wrong codes',
       { kind: 'host_tries_used', tries_left: 3 },
       'Enter a new code'
