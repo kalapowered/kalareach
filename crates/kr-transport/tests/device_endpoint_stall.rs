@@ -1,15 +1,28 @@
 //! A relay that stops taking data, and a host on another relay beside it.
 //!
-//! The device's one endpoint has one relay actor for all of its relay clients, and that actor takes
-//! a datagram for one relay only while no send of its own is pending. This case tries to make that
-//! happen: several hosts, each with 32 connections that each carry a sender, sit on one relay that
-//! stops reading, and a host on a healthy relay is asked a small question every 100 milliseconds
-//! before, during and after. That is a stress load, above what the product shows a host using. It
-//! prints what it measured and asserts conditions alone: the healthy host's connection stays open
-//! and every question is answered. It asserts no time.
+//! The device's one endpoint has one relay actor for all of its relay clients. In the transport
+//! library's 1.4.1 release that actor takes a datagram for one relay only while no send of its own
+//! is pending, so a relay that stops reading can hold the sends to every relay. This file holds two
+//! cases of that. Both put several hosts on one relay that stops reading, each with 32 connections
+//! that each carry a sender, and ask a host on a healthy relay a small question every 100
+//! milliseconds. That is a stress load, above what the product shows a host using.
 //!
-//! It is outside the default suite: it runs for minutes and is a figure to be read, so it is
-//! asked for by name with `--ignored --nocapture`.
+//! The first stops the relay once and asks the healthy host before the stop, during it and after
+//! the relay resumes. It fails unless every question is answered, the healthy host's connection
+//! stays open, each answer takes less than [`LIMIT_MS`], and the run filled the stopped relay's
+//! queue, which the library's own line about a datagram dropped for a full queue shows. The limit
+//! is a bound of this test: it has room above what the library's changed relay transport gives and
+//! is far below what the release's hold gives.
+//!
+//! The second stops the relay three times for ten seconds, each time after the connections have had
+//! thirty seconds to come back to a steady send. It fails unless the hosts on the stopped relay keep
+//! every connection, each of them is answered again within [`RECOVERY`] after each resume, every
+//! question to them is answered, and the healthy host stays under the limit through every stop. It
+//! prints how many datagrams the relay actor dropped for the stopped relay's queue in each stop, and
+//! asserts no count of them: a short stop can end before the queue is full.
+//!
+//! Both are outside the default suite: each runs for minutes, so they are asked for by name with
+//! `--ignored --nocapture`, which prints what they measured.
 
 mod support;
 
@@ -35,8 +48,31 @@ const PATIENCE: Duration = Duration::from_secs(60);
 /// The healthy host is asked one question this often. This is the case's first timed window.
 const INTERVAL: Duration = Duration::from_millis(100);
 
-/// The limit that a question's round trip is held to, in milliseconds.
+/// The limit that a question's round trip to the healthy host is held to, in milliseconds. It is a
+/// bound of these cases and not a figure of the product.
 const LIMIT_MS: u64 = 2000;
+
+/// How often the recovery case asks each host on the relay that stops.
+const HOST_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How many times the recovery case stops the relay, and for how long each time: less than a
+/// connection's idle time-out of 30 seconds and less than the library's send time-out of 15 seconds.
+const STOPS: usize = 3;
+const STOP_FOR: Duration = Duration::from_secs(10);
+
+/// How long the relay passes traffic between one resume and the next stop, once every host on it
+/// has been answered again. It is long enough for the connections to come back to a steady send
+/// before the next stop: stops that follow each other sooner can leave a connection whose probes
+/// back off past the idle time-out, which the released library does too.
+const SETTLE: Duration = Duration::from_secs(30);
+
+/// The longest that a host on the relay that resumed may take to answer a question again: the
+/// recovery case fails when one takes longer.
+const RECOVERY: Duration = Duration::from_secs(5);
+
+/// The healthy host's questions before the first stop and after the last resume of the recovery
+/// case.
+const FRAME: usize = 100;
 
 /// How often the case looks at a count that no future announces.
 const LOOK: Duration = Duration::from_millis(50);
@@ -64,6 +100,9 @@ enum Line {
     Dialling,
     /// A relay client of the endpoint connected.
     Connected,
+    /// The relay actor dropped a datagram because the queue of the relay client that it was for
+    /// was full.
+    Dropped,
 }
 
 /// One kept line: when it came, the span of the endpoint and the URL of the relay client that it
@@ -126,7 +165,15 @@ impl tracing::field::Visit for Words {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         match field.name() {
             "message" => self.message = format!("{value:?}"),
-            "url" => self.url = format!("{value:?}").trim_matches('"').to_owned(),
+            "url" => {
+                // A span writes the URL as text; a line writes it as `RelayUrl("...")`.
+                let text = format!("{value:?}");
+                let url = text
+                    .strip_prefix("RelayUrl(")
+                    .and_then(|rest| rest.strip_suffix(')'))
+                    .unwrap_or(&text);
+                self.url = url.trim_matches('"').to_owned();
+            }
             _ => {}
         }
     }
@@ -162,10 +209,14 @@ impl tracing::Subscriber for Capture {
         if metadata.is_span() {
             return matches!(metadata.name(), "endpoint" | "relay-actor" | "active-relay");
         }
-        (metadata
+        let relay_transport = metadata
             .target()
-            .starts_with("iroh::socket::transports::relay")
-            && *metadata.level() <= tracing::Level::DEBUG)
+            .starts_with("iroh::socket::transports::relay");
+        // A line at the trace level is kept only when it names the relay client by its `url`, which
+        // is how the library words a dropped datagram.
+        (relay_transport
+            && (*metadata.level() <= tracing::Level::DEBUG
+                || metadata.fields().field("url").is_some()))
             || metadata.target() == "iroh::_events::relay::connected"
     }
     fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
@@ -208,6 +259,8 @@ impl tracing::Subscriber for Capture {
             || words.message.contains("Dropping datagrams to send")
         {
             Line::Dialling
+        } else if words.message.contains("queue full") {
+            Line::Dropped
         } else {
             return;
         };
@@ -235,7 +288,7 @@ impl tracing::Subscriber for Capture {
             .lines
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if lines.len() < 100_000 {
+        if lines.len() < 1_000_000 {
             lines.push(Logged {
                 when: Instant::now(),
                 endpoint,
@@ -304,10 +357,11 @@ fn events_line(seen: &Seen, endpoint: u64, identity: &str, relay: &RelayUrl) -> 
     let kept = seen.of(endpoint, relay);
     let count = |wanted: Line| kept.iter().filter(|logged| logged.line == wanted).count();
     format!(
-        "EVENTS endpoint {identity} (span {endpoint}) relay {relay}: lost {}, dialling {}, connected {}",
+        "EVENTS endpoint {identity} (span {endpoint}) relay {relay}: lost {}, dialling {}, connected {}, dropped for a full queue {}",
         count(Line::Lost),
         count(Line::Dialling),
         count(Line::Connected),
+        count(Line::Dropped),
     )
 }
 
@@ -456,121 +510,278 @@ fn figure(phase: &str, rows: &[(usize, Duration)], total: usize) -> String {
     )
 }
 
-/// One arrangement: `hosts` hosts with [`CONNECTIONS_PER_HOST`] connections each on the relay that
-/// stops. Returns the lines it printed, and the three outcomes.
-async fn arrangement(hosts: usize) -> (Vec<String>, bool, usize, Option<String>) {
-    let seen = capture();
-    let connections = hosts * CONNECTIONS_PER_HOST;
-    let (healthy, stopping) = (LocalRelay::spawn().await, LocalRelay::spawn().await);
-    let front = RelayFront::stalling(&stopping);
-    let a = Responder::on(&healthy, 1).await;
-    let mut stalled = Vec::new();
-    for index in 0..hosts {
-        stalled.push(Responder::on(&stopping, 10 + u8::try_from(index).expect("few hosts")).await);
-    }
+/// The bytes that the device's connections to the hosts on the relay that stops have handed to the
+/// endpoint so far: what the device offered that relay's path.
+fn offered(held: &[Connection]) -> u64 {
+    held.iter()
+        .map(|connection| connection.stats().udp_tx.bytes)
+        .sum()
+}
 
-    let keys = DeviceKeys::generate().expect("device keys");
-    seen.expect_the_device();
-    let device = DeviceEndpoint::bind(
-        &EndpointConfig {
-            bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
-            relay_ca_roots: [&healthy, &stopping]
-                .iter()
-                .flat_map(|relay| relay.ca_roots.iter().cloned())
-                .collect(),
-            ..EndpointConfig::default()
-        },
-        &keys.transport,
-    )
-    .await
-    .expect("the device's endpoint");
-    let me = device.endpoint().id().fmt_short().to_string();
-    let device_span = seen.the_device();
-    let view = |relay: &RelayUrl| EndpointConfig {
-        relay_urls: vec![relay.clone()],
-        ..EndpointConfig::default()
-    };
-    let view_a = view(&healthy.url);
-    let view_b = view(&front.url);
-    device
-        .introduce(HostServices::paired(&view_a, a.side.keys.transport.public()).expect("host A"))
-        .await
-        .expect("host A");
-    for host in &stalled {
-        device
-            .introduce(
-                HostServices::paired(&view_b, host.side.keys.transport.public()).expect("a host"),
-            )
-            .await
-            .expect("a host");
-    }
+/// How many datagrams the relay actor of the device's endpoint dropped for the full queue of the
+/// relay client of `relay` between `from` and `to`.
+fn dropped(seen: &Seen, endpoint: u64, relay: &RelayUrl, from: Instant, to: Instant) -> usize {
+    seen.of(endpoint, relay)
+        .iter()
+        .filter(|logged| logged.line == Line::Dropped && logged.when >= from && logged.when <= to)
+        .count()
+}
 
-    let to_a = connect(&device, &view_a, &a).await;
-    let sent = Arc::new(AtomicUsize::new(0));
-    let mut senders = Vec::new();
-    for host in &stalled {
-        let dials = (0..CONNECTIONS_PER_HOST).map(|_| connect(&device, &view_b, host));
-        for connection in futures::future::join_all(dials).await {
-            senders.push(tokio::spawn(send_loop(connection, Arc::clone(&sent))));
+/// The answers of one host's questions that took longer than the limit, the questions that got
+/// none, and the longest answer.
+fn tally(outcomes: &[(Instant, Result<Duration, String>)]) -> (usize, usize, Duration) {
+    let (mut over, mut none, mut longest) = (0, 0, Duration::ZERO);
+    for (_, outcome) in outcomes {
+        match outcome {
+            Ok(rtt) => {
+                over += usize::from(rtt.as_millis() > u128::from(LIMIT_MS));
+                longest = longest.max(*rtt);
+            }
+            Err(_) => none += 1,
         }
     }
-    until("every sender's first stream", || {
-        sent.load(Ordering::SeqCst) == connections
-    })
-    .await;
+    (over, none, longest)
+}
+
+/// One question every `interval` to one connection, each on a task of its own, until
+/// [`Asker::finish`].
+struct Asker {
+    slots: Arc<Mutex<Vec<Outcome>>>,
+    stop: Arc<AtomicBool>,
+    task: JoinHandle<()>,
+}
+
+impl Asker {
+    fn start(connection: &Connection, interval: Duration) -> Self {
+        let slots: Arc<Mutex<Vec<Outcome>>> = Arc::default();
+        let stop = Arc::new(AtomicBool::new(false));
+        let task = {
+            let (slots, stop, connection) =
+                (Arc::clone(&slots), Arc::clone(&stop), connection.clone());
+            tokio::spawn(async move {
+                let mut tasks = Vec::new();
+                let mut tick = tokio::time::interval(interval);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                while !stop.load(Ordering::SeqCst) {
+                    tick.tick().await;
+                    tasks.push(spawn_question(connection.clone(), &slots));
+                }
+                for task in tasks {
+                    let _ = task.await;
+                }
+            })
+        };
+        Self { slots, stop, task }
+    }
+
+    fn started(&self) -> usize {
+        started(&self.slots)
+    }
+
+    /// When the first question answered at or after `at` was answered, if any was.
+    fn first_answer_after(&self, at: Instant) -> Option<Instant> {
+        self.slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .flatten()
+            .filter_map(|(started, outcome)| outcome.as_ref().ok().map(|rtt| *started + *rtt))
+            .filter(|answered| *answered >= at)
+            .min()
+    }
+
+    /// Stops asking, waits for every question to end, and returns when each was asked and how it
+    /// ended, in the order they were asked.
+    async fn finish(self) -> Vec<(Instant, Result<Duration, String>)> {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = self.task.await;
+        self.slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|slot| slot.clone().expect("every question ended"))
+            .collect()
+    }
+}
+
+/// What one arrangement holds alive: the two relays, the front before the one that stops, the
+/// hosts, the device's endpoint and the connections that the device keeps to them.
+struct World {
+    front: RelayFront,
+    _a: Responder,
+    _stalled: Vec<Responder>,
+    device: DeviceEndpoint,
+    device_span: u64,
+    /// The device's short identity, for the printout.
+    me: String,
+    to_a: Connection,
+    /// Every connection to a host on the relay that stops: the senders' and the probes'.
+    held: Vec<Connection>,
+    /// One more connection to each host on the relay that stops, kept for questions; empty when the
+    /// arrangement asks none.
+    probes: Vec<Connection>,
+    /// When each of `held` closed and why, by its index in `held`, in the order they closed.
+    closes: Arc<Mutex<Vec<(usize, Instant, String)>>>,
+    senders: Vec<JoinHandle<()>>,
+    watchers: Vec<JoinHandle<()>>,
+    _relays: (LocalRelay, LocalRelay),
+}
+
+impl World {
+    /// Starts one host on a healthy relay and `hosts` hosts on the relay that stops, connects the
+    /// device to each, gives [`CONNECTIONS_PER_HOST`] connections of every host on the relay that
+    /// stops a sender, and returns once each sender has finished its first stream.
+    async fn start(hosts: usize, probes: bool) -> Self {
+        let seen = capture();
+        let connections = hosts * CONNECTIONS_PER_HOST;
+        let (healthy, stopping) = (LocalRelay::spawn().await, LocalRelay::spawn().await);
+        let front = RelayFront::stalling(&stopping);
+        let a = Responder::on(&healthy, 1).await;
+        let mut stalled = Vec::new();
+        for index in 0..hosts {
+            stalled
+                .push(Responder::on(&stopping, 10 + u8::try_from(index).expect("few hosts")).await);
+        }
+
+        let keys = DeviceKeys::generate().expect("device keys");
+        seen.expect_the_device();
+        let device = DeviceEndpoint::bind(
+            &EndpointConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
+                relay_ca_roots: [&healthy, &stopping]
+                    .iter()
+                    .flat_map(|relay| relay.ca_roots.iter().cloned())
+                    .collect(),
+                ..EndpointConfig::default()
+            },
+            &keys.transport,
+        )
+        .await
+        .expect("the device's endpoint");
+        let me = device.endpoint().id().fmt_short().to_string();
+        let device_span = seen.the_device();
+        let view = |relay: &RelayUrl| EndpointConfig {
+            relay_urls: vec![relay.clone()],
+            ..EndpointConfig::default()
+        };
+        let view_a = view(&healthy.url);
+        let view_b = view(&front.url);
+        device
+            .introduce(
+                HostServices::paired(&view_a, a.side.keys.transport.public()).expect("host A"),
+            )
+            .await
+            .expect("host A");
+        for host in &stalled {
+            device
+                .introduce(
+                    HostServices::paired(&view_b, host.side.keys.transport.public())
+                        .expect("a host"),
+                )
+                .await
+                .expect("a host");
+        }
+
+        let to_a = connect(&device, &view_a, &a).await;
+        let sent = Arc::new(AtomicUsize::new(0));
+        let (mut held, mut kept, mut senders) = (Vec::new(), Vec::new(), Vec::new());
+        for host in &stalled {
+            let dials = (0..CONNECTIONS_PER_HOST).map(|_| connect(&device, &view_b, host));
+            for connection in futures::future::join_all(dials).await {
+                held.push(connection.clone());
+                senders.push(tokio::spawn(send_loop(connection, Arc::clone(&sent))));
+            }
+            if probes {
+                let probe = connect(&device, &view_b, host).await;
+                held.push(probe.clone());
+                kept.push(probe);
+            }
+        }
+        until("every sender's first stream", || {
+            sent.load(Ordering::SeqCst) == connections
+        })
+        .await;
+        let closes: Arc<Mutex<Vec<(usize, Instant, String)>>> = Arc::default();
+        let watchers = held
+            .iter()
+            .enumerate()
+            .map(|(index, connection)| {
+                let (connection, closes) = (connection.clone(), Arc::clone(&closes));
+                tokio::spawn(async move {
+                    let reason = connection.closed().await.to_string();
+                    closes.lock().unwrap_or_else(PoisonError::into_inner).push((
+                        index,
+                        Instant::now(),
+                        reason,
+                    ));
+                })
+            })
+            .collect();
+        Self {
+            front,
+            _a: a,
+            _stalled: stalled,
+            device,
+            device_span,
+            me,
+            to_a,
+            held,
+            probes: kept,
+            closes,
+            senders,
+            watchers,
+            _relays: (healthy, stopping),
+        }
+    }
+
+    /// Ends every sender and watcher and closes the device's endpoint.
+    async fn close(self) {
+        for task in self.senders.iter().chain(&self.watchers) {
+            task.abort();
+        }
+        self.device.close().await;
+    }
+}
+
+/// One arrangement: `hosts` hosts with [`CONNECTIONS_PER_HOST`] connections each on the relay that
+/// stops. Returns the lines it printed, and the conditions it failed.
+async fn arrangement(hosts: usize) -> (Vec<String>, Vec<String>) {
+    let seen = capture();
+    let connections = hosts * CONNECTIONS_PER_HOST;
+    let world = World::start(hosts, false).await;
+    let (front, me) = (&world.front, world.me.as_str());
 
     // The questions, one every INTERVAL, each on a task of its own.
-    let slots: Arc<Mutex<Vec<Outcome>>> = Arc::default();
-    let stop = Arc::new(AtomicBool::new(false));
-    let asking = {
-        let (slots, stop, to_a) = (Arc::clone(&slots), Arc::clone(&stop), to_a.clone());
-        tokio::spawn(async move {
-            let mut tasks = Vec::new();
-            let mut tick = tokio::time::interval(INTERVAL);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            while !stop.load(Ordering::SeqCst) {
-                tick.tick().await;
-                tasks.push(spawn_question(to_a.clone(), &slots));
-            }
-            for task in tasks {
-                let _ = task.await;
-            }
-        })
-    };
-
-    let metrics = &device.endpoint().metrics().socket;
-    let first = started(&slots);
+    let asking = Asker::start(&world.to_a, INTERVAL);
+    let metrics = &world.device.endpoint().metrics().socket;
+    let first = asking.started();
     until("the questions before the stop", || {
-        started(&slots) >= first + BEFORE
+        asking.started() >= first + BEFORE
     })
     .await;
     let (relay_before, front_before) = (metrics.send_relay.get(), front.read_from_device());
+    let offered_before = offered(&world.held);
     front.stall();
     let switched = Instant::now();
-    let switch_index = started(&slots);
+    let switch_index = asking.started();
     until("the questions during the stop", || {
-        started(&slots) >= switch_index + DURING
+        asking.started() >= switch_index + DURING
     })
     .await;
     let (relay_after, front_after) = (metrics.send_relay.get(), front.read_from_device());
+    let offered_after = offered(&world.held);
+    let resumed = Instant::now();
     front.resume();
-    let resume_index = started(&slots);
+    let resume_index = asking.started();
     until("the questions after the resume", || {
-        started(&slots) >= resume_index + AFTER
+        asking.started() >= resume_index + AFTER
     })
     .await;
-    stop.store(true, Ordering::SeqCst);
-    let _ = asking.await;
-    for sender in &senders {
+    let outcomes = asking.finish().await;
+    for sender in &world.senders {
         sender.abort();
     }
 
-    let outcomes: Vec<(Instant, Result<Duration, String>)> = slots
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .iter()
-        .map(|slot| slot.clone().expect("every question ended"))
-        .collect();
     let phase = |from: usize, count: usize| -> Vec<(usize, Result<Duration, String>)> {
         (from..(from + count).min(outcomes.len()))
             .map(|index| (index, outcomes[index].1.clone()))
@@ -583,7 +794,7 @@ async fn arrangement(hosts: usize) -> (Vec<String>, bool, usize, Option<String>)
     ];
     let mut lines = vec![format!("ARRANGEMENT K={hosts} N={connections}")];
     let mut worst: Option<(usize, Duration, &'static str)> = None;
-    let mut unanswered = 0;
+    let (mut over, mut unanswered) = (0, 0);
     for (name, rows) in &phases {
         let answered: Vec<(usize, Duration)> = rows
             .iter()
@@ -593,9 +804,10 @@ async fn arrangement(hosts: usize) -> (Vec<String>, bool, usize, Option<String>)
         lines.push(figure(name, &answered, rows.len()));
         for (index, outcome) in rows {
             let started_at = outcomes[*index].0;
-            let state = actor_state(seen, device_span, &front.url, switched, started_at);
+            let state = actor_state(seen, world.device_span, &front.url, switched, started_at);
             match outcome {
                 Ok(rtt) if rtt.as_millis() > u128::from(LIMIT_MS) => {
+                    over += 1;
                     lines.push(format!(
                         "OVER {LIMIT_MS} ms: request {index} in {name} took {} ms, relay actor {state} (endpoint {me}, relay {})",
                         rtt.as_millis(),
@@ -613,35 +825,266 @@ async fn arrangement(hosts: usize) -> (Vec<String>, bool, usize, Option<String>)
             }
         }
     }
-    let closed = to_a.close_reason().map(|reason| reason.to_string());
+    let closed = world.to_a.close_reason().map(|reason| reason.to_string());
+    let filled = dropped(seen, world.device_span, &front.url, switched, resumed);
     lines.push(format!(
-        "COUNTERS relay_conns_closed {}, send_relay {} B (stop {} B), front accepted {}, read from device {} B (stop {} B)",
+        "COUNTERS relay_conns_closed {}, send_relay {} B (stop {} B), front accepted {}, read from device {} B (stop {} B), handed to the endpoint by the connections to the stopped relay's hosts (stop {} B)",
         metrics.relay_conns_closed.get(),
         metrics.send_relay.get(),
         relay_after - relay_before,
         front.accepted(),
         front.read_from_device(),
         front_after - front_before,
+        offered_after - offered_before,
     ));
-    lines.push(events_line(seen, device_span, &me, &front.url));
+    lines.push(events_line(seen, world.device_span, me, &front.url));
     match worst {
-        None => {
-            lines.push(format!("LIMIT {LIMIT_MS} ms: HELD"));
-            lines.push(format!(
-                "QUEUE: the queue stayed unfull: no question passed the limit; the device made {} B for the relay after the stop and the front read {} B",
-                relay_after - relay_before,
-                front_after - front_before
-            ));
-        }
         Some((index, rtt, state)) => lines.push(format!(
-            "LIMIT {LIMIT_MS} ms: PASSED BY {} ms AT REQUEST {index} WHILE {state} (K={hosts}, N={connections})",
+            "LIMIT {LIMIT_MS} ms: PASSED BY {} ms AT REQUEST {index} WHILE {state} (K={hosts}, N={connections}); {over} answers took longer, {unanswered} questions had none",
             rtt.as_millis() - u128::from(LIMIT_MS)
         )),
+        None if unanswered > 0 => lines.push(format!(
+            "LIMIT {LIMIT_MS} ms: NOT SHOWN, {unanswered} questions had no answer (K={hosts}, N={connections})"
+        )),
+        None => lines.push(format!("LIMIT {LIMIT_MS} ms: HELD")),
     }
+    lines.push(if filled > 0 {
+        format!(
+            "QUEUE: filled: the device's relay actor dropped {filled} datagrams for the stopped relay's full queue during the stop; the connections to its hosts handed the endpoint {} B and the front read {} B",
+            offered_after - offered_before,
+            front_after - front_before
+        )
+    } else {
+        format!(
+            "QUEUE: not shown filled: the device's relay actor logged no datagram dropped for the stopped relay's queue during the stop; the connections to its hosts handed the endpoint {} B and the front read {} B",
+            offered_after - offered_before,
+            front_after - front_before
+        )
+    });
     lines.push(format!("UNANSWERED: {unanswered}"));
     lines.push(format!("A CLOSED: {}", closed.as_deref().unwrap_or("none")));
-    device.close().await;
-    (lines, closed.is_none(), unanswered, closed)
+
+    let mut failures = Vec::new();
+    if let Some(reason) = &closed {
+        failures.push(format!(
+            "K={hosts}: the healthy host's connection closed: {reason}"
+        ));
+    }
+    if unanswered != 0 {
+        failures.push(format!(
+            "K={hosts}: {unanswered} questions of the healthy host were not answered"
+        ));
+    }
+    if over + unanswered != 0 {
+        failures.push(format!(
+            "K={hosts}: the healthy host was not answered within the limit of {LIMIT_MS} ms: {over} answers took longer and {unanswered} questions had none"
+        ));
+    }
+    if filled == 0 {
+        failures.push(format!(
+            "K={hosts}: the run did not fill the stopped relay's queue: no datagram was dropped for it during the stop"
+        ));
+    }
+    world.close().await;
+    (lines, failures)
+}
+
+/// The recovery arrangement: `hosts` hosts with [`CONNECTIONS_PER_HOST`] connections each, and one
+/// more connection each for questions, on the relay that stops `stops` times for `stop_for`, with a
+/// resume between and `settle` of traffic after each answer. Returns the lines it printed, and the
+/// conditions it failed.
+async fn recovery(
+    hosts: usize,
+    stops: usize,
+    stop_for: Duration,
+    settle: Duration,
+) -> (Vec<String>, Vec<String>) {
+    let seen = capture();
+    let world = World::start(hosts, true).await;
+    let (front, me) = (&world.front, world.me.as_str());
+    let healthy = Asker::start(&world.to_a, INTERVAL);
+    let asking: Vec<Asker> = world
+        .probes
+        .iter()
+        .map(|probe| Asker::start(probe, HOST_INTERVAL))
+        .collect();
+    let first = healthy.started();
+    until("the questions before the first stop", || {
+        healthy.started() >= first + FRAME
+    })
+    .await;
+
+    let mut lines = vec![format!(
+        "ARRANGEMENT RECOVERY K={hosts} N={}: {stops} stops of {stop_for:?}, {settle:?} apart, every host answered again within {RECOVERY:?} of each resume",
+        world.held.len()
+    )];
+    let mut failures = Vec::new();
+    let mut windows: Vec<(Instant, Instant)> = Vec::new();
+    for stop in 1..=stops {
+        front.stall();
+        let switched = Instant::now();
+        tokio::time::sleep(stop_for).await;
+        let resumed = Instant::now();
+        front.resume();
+        windows.push((switched, resumed));
+        let deadline = resumed + RECOVERY * 2;
+        while Instant::now() < deadline
+            && !asking
+                .iter()
+                .all(|asker| asker.first_answer_after(resumed).is_some())
+        {
+            tokio::time::sleep(LOOK).await;
+        }
+        let filled = dropped(seen, world.device_span, &front.url, switched, resumed);
+        lines.push(format!(
+            "STOP {stop}: the relay stood still {} ms; the device's relay actor dropped {filled} datagrams for its queue",
+            (resumed - switched).as_millis()
+        ));
+        for (index, asker) in asking.iter().enumerate() {
+            let host = index + 1;
+            match asker.first_answer_after(resumed) {
+                Some(answered) if answered - resumed <= RECOVERY => lines.push(format!(
+                    "RECOVERY stop {stop} host {host}: answered again {} ms after the resume",
+                    (answered - resumed).as_millis()
+                )),
+                Some(answered) => {
+                    lines.push(format!(
+                        "RECOVERY stop {stop} host {host}: answered again {} ms after the resume, past the bound",
+                        (answered - resumed).as_millis()
+                    ));
+                    failures.push(format!(
+                        "stop {stop}: host {host} was answered again {} ms after the resume, later than {RECOVERY:?}",
+                        (answered - resumed).as_millis()
+                    ));
+                }
+                None => {
+                    lines.push(format!(
+                        "RECOVERY stop {stop} host {host}: no answer within {:?} of the resume",
+                        RECOVERY * 2
+                    ));
+                    failures.push(format!(
+                        "stop {stop}: host {host} was not answered again within {:?} of the resume",
+                        RECOVERY * 2
+                    ));
+                }
+            }
+        }
+        tokio::time::sleep(settle).await;
+    }
+    let before_last = healthy.started();
+    until("the questions after the last resume", || {
+        healthy.started() >= before_last + FRAME
+    })
+    .await;
+
+    let a_outcomes = healthy.finish().await;
+    let (over, none, longest) = tally(&a_outcomes);
+    lines.push(format!(
+        "FIGURE healthy host through every stop: questions {}, longest {} ms, over {LIMIT_MS} ms {over}, unanswered {none}",
+        a_outcomes.len(),
+        longest.as_millis()
+    ));
+    let closed = world.to_a.close_reason().map(|reason| reason.to_string());
+    if let Some(reason) = &closed {
+        failures.push(format!("the healthy host's connection closed: {reason}"));
+    }
+    if none != 0 {
+        failures.push(format!(
+            "{none} questions of the healthy host were not answered"
+        ));
+    }
+    if over + none != 0 {
+        failures.push(format!(
+            "the healthy host was not answered within the limit of {LIMIT_MS} ms: {over} answers took longer and {none} questions had none"
+        ));
+    }
+    for (index, asker) in asking.into_iter().enumerate() {
+        let outcomes = asker.finish().await;
+        let (_, none, longest) = tally(&outcomes);
+        lines.push(format!(
+            "FIGURE host {} on the stopped relay: questions {}, unanswered {none}, longest {} ms",
+            index + 1,
+            outcomes.len(),
+            longest.as_millis()
+        ));
+        if none != 0 {
+            failures.push(format!(
+                "{none} questions of host {} on the stopped relay were not answered",
+                index + 1
+            ));
+        }
+    }
+    let closed_held: Vec<String> = world
+        .held
+        .iter()
+        .filter_map(|connection| connection.close_reason().map(|reason| reason.to_string()))
+        .collect();
+    let per_host = world.held.len() / hosts;
+    let first_stop = windows[0].0;
+    let mut closes = world
+        .closes
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    closes.sort_by_key(|(_, when, _)| *when);
+    for (index, when, reason) in &closes {
+        let kind = if index % per_host == CONNECTIONS_PER_HOST {
+            "question connection"
+        } else {
+            "sender"
+        };
+        // The last stop that began before the close, and where the close fell against it.
+        let place = windows
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, (switched, _))| switched <= when)
+            .map_or_else(
+                || "before stop 1".to_owned(),
+                |(number, (switched, resumed))| {
+                    if when <= resumed {
+                        format!(
+                            "during stop {}, {} ms after it began",
+                            number + 1,
+                            when.duration_since(*switched).as_millis()
+                        )
+                    } else {
+                        format!(
+                            "{} ms after resume {}, {} ms after stop {} began",
+                            when.duration_since(*resumed).as_millis(),
+                            number + 1,
+                            when.duration_since(*switched).as_millis(),
+                            number + 1
+                        )
+                    }
+                },
+            );
+        lines.push(format!(
+            "CLOSED connection {index} (host {}, {kind}) {} ms after stop 1 began: {place}: {reason}",
+            index / per_host + 1,
+            when.duration_since(first_stop).as_millis()
+        ));
+    }
+    lines.push(format!(
+        "CONNECTIONS to the hosts on the stopped relay: {} held, {} closed{}",
+        world.held.len(),
+        closed_held.len(),
+        closed_held
+            .first()
+            .map_or(String::new(), |reason| format!(", the first: {reason}"))
+    ));
+    if !closed_held.is_empty() {
+        failures.push(format!(
+            "{} of {} connections to the hosts on the stopped relay closed, the first: {}",
+            closed_held.len(),
+            world.held.len(),
+            closed_held[0]
+        ));
+    }
+    lines.push(events_line(seen, world.device_span, me, &front.url));
+    lines.push(format!("A CLOSED: {}", closed.as_deref().unwrap_or("none")));
+    world.close().await;
+    (lines, failures)
 }
 
 /// The case that tries to fill the queue of a relay that has stopped: K = 3 hosts and then K = 6,
@@ -650,27 +1093,35 @@ async fn arrangement(hosts: usize) -> (Vec<String>, bool, usize, Option<String>)
 /// 100 ms throughout. The figures and the outcome lines are printed first; then the conditions are
 /// asserted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "a figure to be read, run by name: --ignored --nocapture"]
+#[ignore = "runs for minutes: asked for by name with --ignored --nocapture"]
 async fn a_relay_that_stops_taking_data_does_not_hold_a_host_on_another_relay() {
     let host = support::conditions::Host::read();
     let mut conditions = host.lines();
     let mut every_line = Vec::new();
     let mut failures = Vec::new();
     for hosts in [3, 6] {
-        let (lines, open, unanswered, closed) = arrangement(hosts).await;
+        let (lines, broken) = arrangement(hosts).await;
         every_line.extend(lines);
-        if !open {
-            failures.push(format!(
-                "K={hosts}: the healthy host's connection closed: {closed:?}"
-            ));
-        }
-        if unanswered != 0 {
-            failures.push(format!(
-                "K={hosts}: {unanswered} questions were not answered"
-            ));
-        }
+        failures.extend(broken);
     }
     conditions.extend(every_line);
     support::conditions::report("the healthy host beside a relay that stops", &conditions);
-    assert!(failures.is_empty(), "{failures:?}");
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// The case that follows a relay through repeated stops: K = 3 hosts with 32 connections each on the
+/// relay, which stops [`STOPS`] times for [`STOP_FOR`], each time less than a connection's idle
+/// time-out, with [`SETTLE`] of traffic after each resume. The hosts on it keep every connection and
+/// are answered again after each resume; the host on the healthy relay stays under the limit
+/// throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "runs for minutes: asked for by name with --ignored --nocapture"]
+async fn the_hosts_of_a_relay_that_stops_and_resumes_keep_their_connections_and_are_answered_again()
+{
+    let host = support::conditions::Host::read();
+    let mut conditions = host.lines();
+    let (lines, failures) = recovery(3, STOPS, STOP_FOR, SETTLE).await;
+    conditions.extend(lines);
+    support::conditions::report("the hosts of a relay that stops and resumes", &conditions);
+    assert!(failures.is_empty(), "{failures:#?}");
 }
