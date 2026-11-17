@@ -2094,3 +2094,320 @@ async fn an_invitation_that_did_not_end_for_a_listed_device_has_no_existing_memb
     assert!(view.existing.is_none(), "a withdrawn invitation");
     host.stop().await;
 }
+
+use kr_ipc::client::LocalClient;
+use kr_protocol::ids::EnvironmentId;
+use kr_protocol::invitation::InviteEntry;
+use kr_protocol::pairing::{QrPayload, RendezvousOrigin};
+use kr_protocol::preauth::{PairStatusParams, PairStatusResult};
+use net_support::room::CodeCandidate;
+
+/// Issues a code invitation at the host's default origin, once the owner device has confirmed it.
+async fn invite_code(
+    environment: EnvironmentId,
+    client: &mut LocalClient,
+    owner: &DeviceKeys,
+) -> PairInviteResult {
+    let grant = rights();
+    calls::confirm_subject(
+        environment,
+        client,
+        ConfirmationSubject::IssueInvitation {
+            mode: InviteModeKind::Code,
+            rendezvous_origin: Nullable::null(),
+            grant_kind: InviteGrantKind::SessionInvitation,
+            proposed_grant: grant.clone(),
+        },
+        &Signer::OwnerDevice(owner),
+    )
+    .await
+    .expect("answered");
+    calls::mutate(
+        environment,
+        client,
+        Method::PairInvite,
+        &PairInviteParams {
+            mode: InviteMode::Code {
+                rendezvous_origin: Nullable::null(),
+            },
+            grant_kind: InviteGrantKind::SessionInvitation,
+            proposed_grant: grant,
+        },
+    )
+    .await
+    .expect("a code invitation")
+}
+
+/// The origin and the code that a code invitation's answer shows.
+fn code_of(invited: &PairInviteResult) -> (RendezvousOrigin, String) {
+    let InviteEntry::Code {
+        rendezvous_origin,
+        qr_text,
+        ..
+    } = &invited.entry
+    else {
+        panic!("a code invitation is offered as a code");
+    };
+    let QrPayload::Code(payload) = QrPayload::from_text(qr_text.as_str()).expect("a payload")
+    else {
+        panic!("a code invitation's QR is a code payload");
+    };
+    (rendezvous_origin.clone(), payload.code.as_str().to_owned())
+}
+
+/// A candidate that proved the code through the room and handed the host its bundle, and whose
+/// `pair.finish` the case sends. The device holds nothing of the host.
+async fn code_candidate<'a>(
+    host: &Host,
+    phone: &'a Device,
+    client: &mut LocalClient,
+    owner: &DeviceKeys,
+) -> (PairInviteResult, CodeCandidate<'a>) {
+    let invited = invite_code(host.environment_id, client, owner).await;
+    let (origin, code) = code_of(&invited);
+    let mut candidate = within(
+        "the room admitting the candidate",
+        BOUND,
+        CodeCandidate::start(&host.room, phone.candidate(), &origin, &code),
+    )
+    .await
+    .expect("admitted");
+    within("the host's proof of the code", BOUND, candidate.confirm())
+        .await
+        .expect("the host proved the code");
+    within("the bundle", BOUND, candidate.send_bundle())
+        .await
+        .expect("the host took the bundle");
+    (invited, candidate)
+}
+
+/// KR-REQ-10.08: as for a direct invitation, a device the host still lists that pairs again
+/// through a code reaches the host's answer and is refused at `pair.finish`, after the code and
+/// the endpoint were proved and before the owner is shown a candidate. The invitation ends for that
+/// reason, the owner is shown the host's own record of the device, and the record is as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_device_the_host_still_lists_is_refused_at_the_code_finish_and_the_owner_is_shown_its_record()
+ {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let phone = Device::create().await;
+    let first = pair_with(&host, &phone, &owner, rights()).await;
+    let listed = row_of(&host, first.device_id);
+    let mut client = host.client().await;
+    let (invited, mut candidate) = code_candidate(&host, &phone, &mut client, &owner).await;
+
+    let finished = within("the finish", BOUND, candidate.try_finish()).await;
+    assert!(
+        finished.outcome.is_err(),
+        "the host refuses the finish of a device it lists"
+    );
+    assert_eq!(
+        refusal_code(finished.outcome.as_ref().expect_err("refused")),
+        "PAIRING_ENDPOINT_PAIRED"
+    );
+
+    let status = calls::owner_status(&mut client, invited.invitation_id)
+        .await
+        .expect("the owner's view");
+    assert_eq!(
+        status.status,
+        PairStatus::Consumed {
+            reason: PairingConsumedReason::EndpointPaired
+        },
+        "the invitation ended for the device that is listed"
+    );
+    let view = status.owner.0.expect("an owner view");
+    assert!(
+        view.candidate.0.is_none(),
+        "the owner is shown no candidate: the refusal precedes the owner's prompt"
+    );
+    let existing = view
+        .existing
+        .as_ref()
+        .expect("the view names the record the host lists");
+    assert_eq!(
+        existing.device_name.as_str(),
+        first_name(&host, first.device_id),
+        "the name is the host's record's"
+    );
+    assert_eq!(existing.paired_at_ms, first.paired_at_ms);
+    assert_eq!(
+        row_of(&host, first.device_id),
+        listed,
+        "the listed record is as it was"
+    );
+    assert_eq!(
+        host.network()
+            .devices()
+            .rows_for_endpoint(&endpoint_of(&phone))
+            .expect("readable")
+            .len(),
+        1,
+        "no row was added"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-10.08: the host's refusal of a device it lists through a code is the same whether the
+/// finish is the first or a repeat, on the same connection or on a new one, as when the device never
+/// read the first answer; the invitation's status says the same thing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_repeated_finish_of_a_listed_device_gets_the_first_refusals_code() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let phone = Device::create().await;
+    pair_with(&host, &phone, &owner, rights()).await;
+    let mut client = host.client().await;
+    let (invited, mut candidate) = code_candidate(&host, &phone, &mut client, &owner).await;
+
+    let mut first = within("the finish", BOUND, candidate.try_finish()).await;
+    assert!(first.outcome.is_err(), "the host refuses the finish");
+    let first_code = refusal_code(first.outcome.as_ref().expect_err("refused"));
+    assert_eq!(first_code, "PAIRING_ENDPOINT_PAIRED");
+
+    // The same request again on the same connection.
+    let same = within(
+        "the repeat on the same connection",
+        BOUND,
+        candidate.finish_over(&mut first.session),
+    )
+    .await;
+    assert!(same.is_err(), "the repeat is refused");
+    assert_eq!(
+        refusal_code(same.as_ref().expect_err("refused")),
+        first_code
+    );
+
+    // And on a new connection of the same device.
+    let mut fresh = within(
+        "the repeat on a new connection",
+        BOUND,
+        candidate.try_finish(),
+    )
+    .await;
+    assert!(
+        fresh.outcome.is_err(),
+        "the repeat on a new connection is refused"
+    );
+    assert_eq!(
+        refusal_code(fresh.outcome.as_ref().expect_err("refused")),
+        first_code
+    );
+
+    // The candidate reads the same thing from the invitation's status.
+    let status: Result<PairStatusResult, _> = within(
+        "the status",
+        BOUND,
+        fresh.session.call(
+            Method::PairStatus,
+            &PairStatusParams {
+                invitation_id: invited.invitation_id,
+            },
+        ),
+    )
+    .await;
+    assert!(status.is_ok(), "the host answers the candidate's status");
+    assert_eq!(
+        status.expect("read above").status,
+        PairStatus::Consumed {
+            reason: PairingConsumedReason::EndpointPaired
+        }
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-10.08: a device the host lists is told so; the person removes the device at the host with
+/// an owner device that reaches it, and the next invitation then gives the device a record under a
+/// new identifier while the revoked one stays as it was and stays refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn after_the_owner_removes_a_listed_device_a_new_invitation_pairs_it_under_a_new_identifier()
+{
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let phone = Device::create().await;
+    let first = pair_with(&host, &phone, &owner, rights()).await;
+    let mut client = host.client().await;
+    let invited = calls::invite_direct(
+        host.environment_id,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &rights(),
+        &Signer::OwnerDevice(&owner),
+    )
+    .await
+    .expect("an invitation");
+    let refused = within(
+        "the redemption",
+        BOUND,
+        calls::try_redeem(&phone.candidate(), &invited),
+    )
+    .await;
+    assert!(
+        refused.outcome.is_err(),
+        "the host refuses a device it lists"
+    );
+    assert_eq!(
+        refusal_code(refused.outcome.as_ref().expect_err("refused")),
+        "PAIRING_ENDPOINT_PAIRED"
+    );
+
+    let barrier = within(
+        "the revocation",
+        BOUND,
+        host.network().revoke_device(first.device_id),
+    )
+    .await
+    .expect("the owner removes the device");
+    assert!(barrier.holds(), "{barrier:?}");
+    let revoked = row_of(&host, first.device_id);
+
+    let second = within(
+        "the second pairing",
+        BOUND,
+        pair_with(&host, &phone, &owner, rights()),
+    )
+    .await;
+    assert_the_device_is_paired_again(&host, &phone, &first, &revoked, &second).await;
+    host.stop().await;
+}
+
+/// KR-REQ-10.08: a record whose grant ran out, and whose end no one has read or recorded, is found
+/// at the binding and recorded there, and the device pairs again under a new identifier. Nothing
+/// connected since the grant ran out, so the end is not on record when the second pairing starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_grant_that_ran_out_unread_is_recorded_at_the_binding_and_the_device_pairs_again() {
+    let (moved, clocks) = Moved::new();
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start_on_clocks(&owner, clocks).await;
+    let phone = Device::create().await;
+    let first = pair_with(&host, &phone, &owner, rights()).await;
+    moved.past_the_grant();
+    let path = host.registry_database();
+    assert!(
+        !expired(&path, first.device_id),
+        "the end of the grant is not on record before the second pairing"
+    );
+    let unread = row_of(&host, first.device_id);
+
+    let second = within(
+        "the second pairing",
+        BOUND,
+        pair_with(&host, &phone, &owner, grant_past_the_moved_clocks()),
+    )
+    .await;
+    assert!(
+        expired(&path, first.device_id),
+        "the end of the grant is on record"
+    );
+    assert_ne!(row_of(&host, first.device_id), unread);
+    assert_eq!(
+        host.network()
+            .devices()
+            .record_for_endpoint(&endpoint_of(&phone))
+            .expect("readable")
+            .map(|record| record.device_id),
+        Some(second.device_id),
+        "the endpoint identity reads the record that stands"
+    );
+    host.stop().await;
+}

@@ -2248,3 +2248,108 @@ fn a_record_whose_end_the_host_cannot_prove_counts_as_live_until_it_is_revoked()
     .expect("a new invitation commits once the record is revoked");
     assert_eq!(live_rows_of(&path, &harness), 1);
 }
+
+/// KR-REQ-10.08: the binding asks the host whether it lists a device by the endpoint identity, and a
+/// grant that ran out, with its end on no record yet, is recorded by the lifetimes' own path: the
+/// device is found unlisted, whoever waits on the end is told once, and the signal that the set of
+/// paired devices changed is raised. A raw write of the mark tells nobody and raises nothing.
+#[test]
+fn the_binding_records_a_grant_that_ran_out_unread_through_the_lifetimes_and_finds_the_device_unlisted()
+ {
+    use futures_util::FutureExt;
+
+    let temp = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.sqlite3");
+    let clock = ManualClock::new();
+    let (directory, rows) = open_with(&path, &clock);
+    let harness = Harness::new(rows.clone());
+    let listed = expiring_squatter(&harness, kr_ipc::now_ms().get().saturating_sub(60_000));
+    directory
+        .commit(&listed)
+        .expect("the host lists the device");
+    let told = Arc::new(Mutex::new(Vec::new()));
+    rows.lifetimes().pending_expiry().on_recorded({
+        let told = Arc::clone(&told);
+        move |device_id| told.lock().expect("the list").push(device_id)
+    });
+    // The commit raised the signal. Read it, so that what is read next is the binding's own.
+    let changed = directory.changed();
+    let _ = changed.notified().now_or_never();
+    assert!(
+        changed.notified().now_or_never().is_none(),
+        "nothing has raised the signal since the commit"
+    );
+    let record = directory
+        .record_for_device(listed.device_id)
+        .expect("readable")
+        .expect("the listed record");
+    assert!(
+        record.expired_at_ms.is_none() && record.revoked_at_ms.is_none(),
+        "nothing has marked the record: {record:?}"
+    );
+
+    let standing = rows.listed_device(&listed.endpoint_id);
+    assert!(
+        matches!(standing, Ok(None)),
+        "the grant ran out, so the host lists no device for the endpoint: {standing:?}"
+    );
+    assert_eq!(
+        *told.lock().expect("the list"),
+        vec![listed.device_id],
+        "whoever waits on the end was told once"
+    );
+    assert!(
+        changed.notified().now_or_never().is_some(),
+        "the signal that the set of paired devices changed was raised"
+    );
+    assert!(
+        directory
+            .record_for_device(listed.device_id)
+            .expect("readable")
+            .is_some_and(|old| old.expired_at_ms.is_some()),
+        "the end of the grant is on record"
+    );
+
+    let again = rows.listed_device(&listed.endpoint_id);
+    assert!(matches!(again, Ok(None)), "{again:?}");
+    assert_eq!(
+        told.lock().expect("the list").len(),
+        1,
+        "the end already on record tells nobody again"
+    );
+}
+
+/// KR-REQ-10.08: while the grant of the host's record stands, the binding names that record, and
+/// nothing is recorded or told.
+#[test]
+fn the_binding_names_the_listed_record_while_its_grant_stands() {
+    let temp = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.sqlite3");
+    let clock = ManualClock::new();
+    let (directory, rows) = open_with(&path, &clock);
+    let harness = Harness::new(rows.clone());
+    let listed = expiring_squatter(&harness, kr_ipc::now_ms().get() + 60_000);
+    directory
+        .commit(&listed)
+        .expect("the host lists the device");
+    let told = Arc::new(Mutex::new(Vec::new()));
+    rows.lifetimes().pending_expiry().on_recorded({
+        let told = Arc::clone(&told);
+        move |device_id| told.lock().expect("the list").push(device_id)
+    });
+
+    let standing = rows.listed_device(&listed.endpoint_id);
+    assert!(
+        matches!(standing, Ok(Some(device_id)) if device_id == listed.device_id),
+        "the host lists the record: {standing:?}"
+    );
+    assert!(
+        told.lock().expect("the list").is_empty(),
+        "no end was recorded"
+    );
+    let record = directory
+        .record_for_device(listed.device_id)
+        .expect("readable")
+        .expect("the listed record");
+    assert!(record.expired_at_ms.is_none() && record.revoked_at_ms.is_none());
+}
