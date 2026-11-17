@@ -6194,8 +6194,11 @@ impl WorkerService {
     /// dispatch boundary that was in place when the writer asked.
     ///
     /// The writer asks from a frame it is not allowed to write, which is after the gate changed,
-    /// and a mutation that checked before the change may still be pushing its attachment: the
-    /// withdrawal that ran now would not see it. It holds no lock while it waits.
+    /// and a mutation that checked before the change may still be applying its attach: the
+    /// withdrawal waits for that hold, so the attach ends as applied and the withdrawal then takes
+    /// its attachment back. A withdrawal that ran now would set the latch under the attach, which
+    /// the push would refuse after its marker, with an `Unknown` receipt. It holds no lock while
+    /// it waits.
     async fn withdraw_after_the_hold(&self, connection_id: ConnectionId) {
         let after = self.dispatch.releases();
         #[cfg(feature = "testing")]
@@ -8251,8 +8254,10 @@ impl WorkerService {
         self.check_validated_revision(caller)?;
         self.check_local_dispatch(&state.facts, method, caller)?;
         // A connection that a restriction withdrew stays open, but it holds no place in the
-        // registry any more, so no later withdrawal would find an attachment it made: it attaches
-        // on a new connection.
+        // registry any more: it attaches on a new connection. It is refused here, before the
+        // journal accepts the action, so that a refused attach makes no marker, no resize of the
+        // session and no receipt. The push of an attachment would refuse it too, but only after
+        // all three.
         if method == Method::SessionAttach && state.withdrawn.is_set() {
             return Err(withdrawn_connection_refusal());
         }
