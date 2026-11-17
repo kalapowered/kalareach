@@ -177,6 +177,16 @@ fn out_of_reach() -> (FailureKind, Vec<String>) {
     (FailureKind::HostUnreachable, Vec::new())
 }
 
+/// The failure of the service itself, which names no path, with the device's wait.
+fn a_fault(wait: u64) -> (FailureKind, Vec<String>) {
+    (
+        FailureKind::RelayFault {
+            retry_after_seconds: wait,
+        },
+        Vec::new(),
+    )
+}
+
 /// Whether a lost dial was told the lack of capacity with its paths, whatever the wait.
 fn is_no_capacity(told: &(FailureKind, Vec<String>)) -> bool {
     matches!(told.0, FailureKind::RelayCapacity { .. }) && told.1 == no_capacity(0).1
@@ -199,8 +209,14 @@ struct OnItsWay {
 
 impl OnItsWay {
     async fn start(second: Result<AdmissionAnswer>, started: u64) -> Self {
+        Self::start_script(vec![unable(None), second], started).await
+    }
+
+    /// The same, with the service's answers given whole: the first at 0 s, the second to the
+    /// request made at `started`, and any later ones to the requests after it.
+    async fn start_script(script: Vec<Result<AdmissionAnswer>>, started: u64) -> Self {
         let clock = AdmissionClock::default();
-        let (service, gate) = Scripted::gated_script(vec![unable(None), second]);
+        let (service, gate) = Scripted::gated_script(script);
         let admissions =
             scripted_admissions(Arc::clone(&service), &clock).waiting(Duration::from_millis(20));
         let (host, relays) = (key(0x11), network(&[MANAGED]));
@@ -246,10 +262,28 @@ impl OnItsWay {
         reported_as(self.admissions.refusal(&self.relays, &self.host))
     }
 
-    /// Lets the second request end with the answer it was given, and waits until the cache has it.
+    /// Lets the request that is on its way (the latest one made) end with the answer it was given,
+    /// and waits until the cache has it.
     async fn the_request_ends(&self) {
         self.gate.notify_one();
-        self.service.answered_to(2).await;
+        self.service.answered_to(self.service.asks()).await;
+    }
+}
+
+/// A service whose first request's task panics, and which answers every later one that it is
+/// unable.
+#[derive(Debug)]
+struct PanicsFirst {
+    asked: AtomicUsize,
+}
+
+impl PairingAdmissionService for PanicsFirst {
+    fn admit<'a>(&'a self, _request: &'a AdmissionRequest) -> ServiceFuture<'a, AdmissionAnswer> {
+        let nth = self.asked.fetch_add(1, Ordering::SeqCst) + 1;
+        Box::pin(async move {
+            assert!(nth > 1, "the task of the first request panics");
+            unable(None)
+        })
     }
 }
 
@@ -374,52 +408,136 @@ async fn kr_req_17_48_with_no_request_on_its_way_the_answer_stops_when_it_is_no_
     assert_eq!(service.asks(), 1, "nothing asked again");
 }
 
-/// KR-REQ-17.48: a request that never ends keeps the old answer standing only to its own bound, the
-/// http client's twenty seconds and one more, and no longer. The request is made at 52, so the answer
-/// stands at 72 and not at 73 or after, and a lost dial then is told what it is told with no answer.
+/// KR-REQ-10.54, KR-REQ-17.40, KR-REQ-17.48: a request that is alive keeps the old answer standing
+/// for as long as it is alive, however long that is on the clock, and no second request starts
+/// beside it. The request is made at 52 and is not answered: a dial lost at 62, 72, 73, 80 and 3,600
+/// is told the lack of capacity, and the dial that starts at each of them asks nothing (the service
+/// has been asked twice, in all).
 #[tokio::test]
-async fn kr_req_17_48_a_request_that_never_ends_keeps_the_answer_only_to_its_bound() {
+async fn kr_req_17_48_a_request_that_is_alive_keeps_the_answer_standing_and_no_second_one_starts() {
     let mut order = OnItsWay::start(no_answer(), 52).await;
-    for second in [62, 72] {
-        assert_eq!(
-            order.at(second).lost_dial(),
-            no_capacity(0),
-            "at {second} s"
-        );
-    }
-    for second in [73, 80, 3_600] {
-        assert_eq!(
-            order.at(second).lost_dial(),
-            out_of_reach(),
-            "at {second} s"
-        );
-    }
-}
-
-/// KR-REQ-17.48: a request that never ends stops the next ask only to its own bound, so that a task
-/// that died cannot stop every later ask for the entry, and it does stop it until then, so that no
-/// second request goes beside one that may be alive. The request is made at 52: a dial at 62 and one
-/// at 72 ask nothing, and the dial at 73 asks again and, as any request that is made after the
-/// answer's keep time, drops the answer that had stopped.
-#[tokio::test]
-async fn kr_req_17_48_a_request_that_never_ends_stops_the_next_ask_only_to_its_bound() {
-    let mut order = OnItsWay::start(no_answer(), 52).await;
-    for second in [62, 72] {
+    for second in [62, 72, 73, 80, 3_600] {
         order.at(second).dial().await;
         assert_eq!(
             order.service.asks(),
             2,
-            "at {second} s the request is still on its way"
+            "at {second} s no second request starts"
+        );
+        assert_eq!(
+            order.lost_dial(),
+            no_capacity(0),
+            "at {second} s a lost dial is told the capacity"
         );
     }
+}
 
-    order.at(73).dial().await;
+/// KR-REQ-10.54, KR-REQ-17.40, KR-REQ-17.48: when a process that was not polled resumes (a phone
+/// suspended the application while a request was open), the keep time has passed on the clock, and
+/// a dial reads the cache before the request's task runs: it is told the lack of capacity, the dial
+/// that starts asks nothing, and when the task runs and fails, the explanation goes on to the next
+/// ask time. The request is made at 52; the clock is at 90 at the resume; the request fails then,
+/// and the device asks again at 110.
+#[tokio::test]
+async fn kr_req_17_48_a_dial_that_reads_the_cache_at_the_resume_is_told_the_capacity() {
+    let mut order = OnItsWay::start(no_answer(), 52).await;
     assert_eq!(
-        order.service.asks(),
-        3,
-        "at its bound the request no longer stops the next ask"
+        order.at(90).lost_dial(),
+        no_capacity(0),
+        "the dial reads the cache before the request's task runs"
     );
-    assert_eq!(order.lost_dial(), out_of_reach());
+    order.dial().await;
+    assert_eq!(order.service.asks(), 2, "the dial that starts asks nothing");
+
+    order.the_request_ends().await;
+    assert_eq!(order.lost_dial(), no_capacity(20), "after the failure");
+    assert_eq!(order.at(109).lost_dial(), no_capacity(1));
+    assert_eq!(order.at(110).lost_dial(), out_of_reach(), "the device asks");
+}
+
+/// KR-REQ-17.48: a request whose task panicked is finished, so its mark does not stay: the next dial
+/// asks, and the answer to that request is kept.
+#[tokio::test]
+async fn kr_req_17_48_a_request_whose_task_panicked_does_not_stop_the_next_ask() {
+    let clock = AdmissionClock::default();
+    let service = Arc::new(PanicsFirst {
+        asked: AtomicUsize::new(0),
+    });
+    let origin = GatewayOrigin::new("https://reach.kala.to").expect("an origin");
+    let admissions = PairingAdmissions::new(Arc::clone(&service) as _, &origin)
+        .expect("admissions")
+        .on_clock(clock.clone());
+    let (host, relays) = (key(0x11), network(&[MANAGED]));
+
+    admissions.before_dial(&relays, &host, key(0x22)).await;
+    assert_eq!(service.asked.load(Ordering::SeqCst), 1);
+    assert!(admissions.refusal(&relays, &host).is_none());
+
+    admissions.before_dial(&relays, &host, key(0x22)).await;
+    assert_eq!(
+        service.asked.load(Ordering::SeqCst),
+        2,
+        "the next dial asks"
+    );
+    assert_eq!(handed_on(&admissions.refusal(&relays, &host)), Some(20));
+}
+
+/// KR-REQ-17.48: when a request's task has ended, the next dial that is due asks, and the answers
+/// are applied in the order of the requests. The answer at 0 s is kept to 60; the request at 52
+/// fails at 55, so the device asks again at 75 and the answer stands to 75; a dial at 74 asks
+/// nothing; the dial at 75 asks, and as the answer has stopped it is dropped; the answer to that
+/// request, with another list, is what a lost dial is told after it, with the ten minutes that the
+/// third ask leaves before another.
+#[tokio::test]
+async fn kr_req_17_48_when_a_request_ends_the_next_dial_asks_and_the_answers_are_applied_in_order()
+{
+    let other = || vec!["Another way that the service named.".to_owned()];
+    let later = Ok(AdmissionAnswer::Unavailable {
+        message: "Managed capacity is not available now.".to_owned(),
+        alternatives: other(),
+        retry_after_seconds: Some(90),
+    });
+    let mut order = OnItsWay::start_script(vec![unable(None), no_answer(), later], 52).await;
+
+    order.at(55).the_request_ends().await;
+    assert_eq!(order.lost_dial(), no_capacity(20), "the failure lifts it");
+    order.at(74).dial().await;
+    assert_eq!(order.service.asks(), 2, "the device does not ask yet");
+
+    order.at(75).dial().await;
+    assert_eq!(order.service.asks(), 3, "the request has ended: it asks");
+    assert_eq!(
+        order.lost_dial(),
+        out_of_reach(),
+        "the answer that had stopped is dropped as the request is made"
+    );
+    order.the_request_ends().await;
+    assert_eq!(
+        order.lost_dial(),
+        (
+            FailureKind::RelayCapacity {
+                retry_after_seconds: 600
+            },
+            other()
+        ),
+        "the answer of the last request is the one that stands, with the wait of the third ask's window"
+    );
+}
+
+/// KR-REQ-17.48: a failure of the service itself stands as the lack of capacity does while the next
+/// request is on its way, and is lifted by that request's failure. The answer at 0 s names no path
+/// and is kept to 60; the request at 52 fails at 90.
+#[tokio::test]
+async fn kr_req_17_48_a_fault_of_the_service_stands_while_the_next_request_is_on_its_way() {
+    let fault = Ok(AdmissionAnswer::Faulted {
+        code: ErrorCode::ResourceUnavailable,
+        retry_after_seconds: None,
+    });
+    let mut order = OnItsWay::start_script(vec![fault, no_answer()], 52).await;
+    for second in [59, 62, 90] {
+        assert_eq!(order.at(second).lost_dial(), a_fault(0), "at {second} s");
+    }
+    order.the_request_ends().await;
+    assert_eq!(order.lost_dial(), a_fault(20), "after the failure");
 }
 
 /// KR-REQ-10.54, KR-REQ-17.40, KR-REQ-17.48: a request that fails a few milliseconds after the http
