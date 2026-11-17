@@ -1053,3 +1053,75 @@ fn a_registry_at_17_is_refused_as_a_version_no_release_wrote() {
         "the refused file's schema is unchanged"
     );
 }
+
+/// Leaves the registry file a build wrote at `version` as the most fragile file the daemon can be
+/// handed: in rollback-journal mode, which the daemon's open would change, and without one of the
+/// registry's tables, which the daemon's open would make again.
+fn registry_that_a_write_would_change(path: &Path, version: i64) {
+    registry_left_at(path, version, false);
+    let connection = rusqlite::Connection::open(path).expect("the registry opens");
+    let mode: String = connection
+        .query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))
+        .expect("the journal mode");
+    assert_eq!(mode, "delete", "the file is put in rollback-journal mode");
+    connection
+        .execute_batch("DROP TABLE utc_floors;")
+        .expect("a table goes");
+    drop(connection);
+    assert_no_side_file(path);
+    let bytes = std::fs::read(path).expect("the file");
+    assert_eq!(
+        (bytes[18], bytes[19]),
+        (1, 1),
+        "the file's header says rollback-journal mode"
+    );
+}
+
+fn assert_no_side_file(path: &Path) {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut beside = path.as_os_str().to_owned();
+        beside.push(suffix);
+        assert!(
+            !Path::new(&beside).exists(),
+            "{} is left beside the registry",
+            Path::new(&beside).display()
+        );
+    }
+}
+
+/// A registry that records `version`, which this build neither reads nor brings forward, is
+/// refused with `words`, and the refusal writes nothing: the file's bytes are what they were, the
+/// journal mode is not changed, the missing table is not made and no side file is left.
+fn assert_refused_before_any_write(version: i64, words: &str) {
+    let temp = tempfile::tempdir().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.db");
+    registry_that_a_write_would_change(&path, version);
+    let before = std::fs::read(&path).expect("the file");
+    let error = match open_registry(&path) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("a registry at {version} is refused"),
+    };
+    assert!(error.contains(words), "{error}");
+    assert_eq!(
+        std::fs::read(&path).expect("the file"),
+        before,
+        "the refused file's bytes are as they were"
+    );
+    assert_no_side_file(&path);
+}
+
+/// The refusal of a registry at 17 comes before anything is written in it.
+#[test]
+fn a_registry_at_17_is_refused_before_any_write() {
+    assert_refused_before_any_write(17, "no release wrote");
+}
+
+/// The refusal of a registry above the versions this build reads comes before anything is
+/// written in it.
+#[test]
+fn a_registry_above_the_versions_this_build_reads_is_refused_before_any_write() {
+    assert_refused_before_any_write(
+        kr_controller::registry::READS_THROUGH_SCHEMA_VERSION + 1,
+        "this build reads versions",
+    );
+}
