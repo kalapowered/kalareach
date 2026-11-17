@@ -3458,6 +3458,47 @@ mod tests {
         assert_eq!(contract.trust(), WallClockTrust::Unresolved);
     }
 
+    /// KR-REQ-09.18: a step back is measured at the later of the two readings of the continuous
+    /// clock. The wall clock is put back five and a tenth seconds and the look is held up for a
+    /// fifth of a second, inside the bracket: measured at the earlier reading it is four and nine
+    /// tenths, inside the tolerance.
+    #[test]
+    fn a_step_back_is_measured_at_the_later_reading_of_the_continuous_clock() {
+        let held = Holdup::new(Duration::from_millis(200), false);
+        let contract = held.contract(None);
+        held.pass(Duration::from_secs(60));
+        contract.observe();
+        held.pass(Duration::from_secs(60));
+        held.wall.set(held.wall.now_ms().get() - 5_100);
+        held.arm(0, 1);
+        assert!(contract.observe().rolled_back);
+    }
+
+    /// KR-REQ-09.18: the mark a look leaves is taken at the earlier of the two readings of the
+    /// continuous clock. The look is held up for a fifth of a second after its wall clock was read,
+    /// inside the bracket; the wall clock is then put back five and a tenth seconds, a little over a
+    /// second later. A mark taken at the later reading would be short by the fifth of a second and
+    /// would show four and nine tenths.
+    #[test]
+    fn the_mark_is_taken_at_the_earlier_reading_of_the_continuous_clock() {
+        let held = Holdup::new(Duration::from_millis(200), true);
+        let contract = held.contract(None);
+        held.pass(Duration::from_secs(30));
+        contract.observe();
+        held.pass(Duration::from_secs(30));
+        held.arm(0, 1);
+        assert!(
+            !contract.observe().rolled_back,
+            "the held-up look is trusted"
+        );
+        held.pass(Duration::from_millis(800));
+        held.wall.set(held.wall.now_ms().get() - 5_100);
+        assert!(
+            contract.observe().rolled_back,
+            "the step back is found against the mark of the earlier reading"
+        );
+    }
+
     /// KR-REQ-09.18: the sample a contract begins with is not ahead of the clocks by a pause in it.
     #[test]
     fn a_pause_inside_the_first_sample_is_no_rollback_at_the_first_look() {
