@@ -329,11 +329,15 @@ struct ExecutionPermit {
 /// One plugin action that a binding admitted and that nothing has sent or given up yet.
 ///
 /// The binder's count of a binding's open work reads it: a binding that is due to end stays until
-/// its admitted actions are sent, because the repeat asks the binding's grants and a binding that
+/// its admitted actions have gone, because the repeat asks the binding's grants and a binding that
 /// is gone has none to ask. It is counted from the token's spend and it stops counting when it is
-/// dropped, which the permit's holder does by sending the action ([`TakenAction::submitted`]), by
-/// giving it up, or by losing it. An approval is counted by the resource it settles and never by
-/// this, so a request is not counted twice.
+/// dropped. Until the permit is taken it is the permit's. Then it stays with the work that can
+/// still ask the repeat or make the call: the thread that makes the transport's call holds it
+/// ([`TakenAction::open_work`]) until its work has ended, whether its call returned, its repeat
+/// refused the action, or it never started, so a deadline that stops the caller's wait does not
+/// end the count. It is also dropped when the permit is given up or lost before any call. An
+/// approval is counted by the resource it settles and never by this, so a request is not counted
+/// twice.
 #[derive(Debug)]
 pub(crate) struct OpenAction {
     count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -463,8 +467,9 @@ pub struct AdmittedAgainst {
 /// A component that stops being answerable, and a capability whose evidence lapses, say whether
 /// rich work would work from now on. A revocation or a fault ends them without ending what the
 /// broker already admitted, which finishes: so the first admission asks them and no later ask does.
-/// A package grant is authority, which a narrower installation removes at once: every ask asks the
-/// grants a plugin action's admission required, and an action whose grant is gone is refused
+/// A package grant is authority, which a narrower installation removes at once: from the token's
+/// spend on, every ask asks the grants a plugin action's admission required (the first ask has no
+/// set yet, and the spend asks the action's grant), and an action whose grant is gone is refused
 /// there, with nothing sent.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Ask<'a> {
@@ -1032,11 +1037,17 @@ impl TakenAction {
         (std::sync::Arc::clone(&self.dispatch), self.request.clone())
     }
 
+    /// Hands the count of this action as open work to the thread that makes the transport's call,
+    /// which holds it until its work has ended. Returns `None` once handed.
+    pub(crate) fn open_work(&mut self) -> Option<OpenAction> {
+        self.open.take()
+    }
+
     /// The transport took the action: what follows is the wait for what the upstream did.
     #[must_use]
     pub fn submitted(self, pending: PendingTransmission) -> ActionInFlight {
-        // The action is sent: the binding's grants were asked for the last time before the call,
-        // and nothing about the binding needs to outlive it any more.
+        // The count stops here for a caller that made the call itself and kept it. One that gave
+        // it to the thread that makes the call holds none, and that thread ends it.
         drop(self.open);
         ActionInFlight {
             pending,
@@ -2643,8 +2654,9 @@ impl crate::broker::BrokerState {
     ///
     /// Returns [`BrokerError::PreconditionFailed`] while rich work is fenced or suspended,
     /// [`BrokerError::StaleBinding`] when the binding moved, [`BrokerError::UnknownSubject`] for an
-    /// instance this broker no longer holds, [`BrokerError::Grant`] for a package grant that was
-    /// removed, and the refusal of the component, the capability or the deadline that stopped it.
+    /// instance this broker no longer holds or, for a plugin action, a binding that is gone,
+    /// [`BrokerError::Grant`] for a package grant that was removed, and the refusal of the
+    /// component, the capability or the deadline that stopped it.
     pub(crate) fn checks(
         &self,
         against: &AdmittedAgainst,
