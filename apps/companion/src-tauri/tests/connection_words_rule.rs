@@ -163,7 +163,7 @@ struct Exception {
 
 /// Every place outside `HOME` that reads a code or words or handles a refused connection, and why it
 /// does not decide what a connection that was not opened means.
-const EXCEPTIONS: [Exception; 61] = [
+const EXCEPTIONS: [Exception; 62] = [
     Exception {
         file: "account/mod.rs",
         function: "usage",
@@ -541,6 +541,13 @@ const EXCEPTIONS: [Exception; 61] = [
         needle: COMPARED,
         lines: 1,
         reason: "the refusal of an input lease request, answered on a connection that is open; it decides nothing about a connection that was not opened",
+    },
+    Exception {
+        file: "terminal/view.rs",
+        function: "lane_opened",
+        needle: COMPARED,
+        lines: 1,
+        reason: "the refusal of the question whether the host takes an input stream, answered on a connection that is open: it says that the host takes none; it decides nothing about a connection that was not opened",
     },
     Exception {
         file: "terminal/view.rs",
