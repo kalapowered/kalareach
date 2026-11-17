@@ -234,6 +234,13 @@ impl OnItsWay {
         self
     }
 
+    /// A dial to the host that starts now, as the candidate's link makes one.
+    async fn dial(&self) {
+        self.admissions
+            .before_dial(&self.relays, &self.host, key(0x22))
+            .await;
+    }
+
     /// What a dial that is lost now is reported as.
     fn lost_dial(&self) -> (FailureKind, Vec<String>) {
         reported_as(self.admissions.refusal(&self.relays, &self.host))
@@ -387,6 +394,32 @@ async fn kr_req_17_48_a_request_that_never_ends_keeps_the_answer_only_to_its_bou
             "at {second} s"
         );
     }
+}
+
+/// KR-REQ-17.48: a request that never ends stops the next ask only to its own bound, so that a task
+/// that died cannot stop every later ask for the entry, and it does stop it until then, so that no
+/// second request goes beside one that may be alive. The request is made at 52: a dial at 62 and one
+/// at 72 ask nothing, and the dial at 73 asks again and, as any request that is made after the
+/// answer's keep time, drops the answer that had stopped.
+#[tokio::test]
+async fn kr_req_17_48_a_request_that_never_ends_stops_the_next_ask_only_to_its_bound() {
+    let mut order = OnItsWay::start(no_answer(), 52).await;
+    for second in [62, 72] {
+        order.at(second).dial().await;
+        assert_eq!(
+            order.service.asks(),
+            2,
+            "at {second} s the request is still on its way"
+        );
+    }
+
+    order.at(73).dial().await;
+    assert_eq!(
+        order.service.asks(),
+        3,
+        "at its bound the request no longer stops the next ask"
+    );
+    assert_eq!(order.lost_dial(), out_of_reach());
 }
 
 /// KR-REQ-10.54, KR-REQ-17.40, KR-REQ-17.48: a request that fails a few milliseconds after the http
