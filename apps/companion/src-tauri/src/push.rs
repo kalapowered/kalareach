@@ -693,8 +693,8 @@ struct State {
     /// writes nothing, and a host paired again is claimed afresh.
     running: BTreeMap<DeviceId, u64>,
     /// What ends the run that holds each host, by the run's number: the person forgetting the host
-    /// calls it, and the run's task is dropped where it waits, with the connection to the host and
-    /// the hold on its endpoint it owns.
+    /// calls it, and the run's task is dropped where it waits, with the connection to the host it
+    /// owns.
     cancels: BTreeMap<DeviceId, (u64, Arc<tokio::sync::Notify>)>,
     /// The hosts whose person has just chosen to turn notifications on: the one thing that may put
     /// the system's permission question in front of them. A run takes its host out when it reaches
@@ -1316,8 +1316,8 @@ impl PushDesk {
         {
             let mut state = lock(&self.state);
             state.running.remove(&host);
-            // The run may be waiting on the host for an answer that never comes, holding the
-            // connection and the endpoint with it: it is ended where it waits.
+            // The run may be waiting on the host for an answer that never comes, holding its
+            // connection to the host: it is ended where it waits.
             if let Some((_, cancel)) = state.cancels.remove(&host) {
                 cancel.notify_one();
             }
@@ -2024,8 +2024,8 @@ impl PushDesk {
     }
 
     /// The second half: the host is told. The receivers hold the host's key first (the keys are
-    /// filed before any hold on the host's endpoint is taken: filing is the platform's, and no other
-    /// host waits behind it), then the host is reached, then the gateway issues the credential, and
+    /// filed before the host is reached: filing is the platform's, and no connection to the host
+    /// is open while it runs), then the host is reached, then the gateway issues the credential, and
     /// the registration carries it with the person's choice of previews. The full sequence also
     /// tells the host which preview key this phone holds.
     ///
@@ -2174,7 +2174,7 @@ impl PushDesk {
                 .await
                 .map_err(|stop| not_taken(stop, Step::PreviewKey))?;
         }
-        // The line is not needed any more, and the hold on the host's endpoint goes with it.
+        // The line is not needed any more, and its connection to the host goes with it.
         drop(line);
         Ok(())
     }
@@ -2764,8 +2764,8 @@ impl<R: tauri::Runtime> Native for PluginNative<R> {
 
 /// How long the phone waits for the host to answer one of the two changes. The host drops a
 /// request that is older than [`crate::commands::MUTATION_TTL`], and an answer later than that is
-/// not one; a host that keeps its connection and never answers must not keep the line, and the
-/// hold on the host's endpoint with it, for ever.
+/// not one; a host that keeps its connection and never answers must not keep the line, and its
+/// connection to the host, for ever.
 const ANSWER_WITHIN: Duration = Duration::from_secs(60);
 
 /// `call`, ended with a failure in words when the host has not answered within [`ANSWER_WITHIN`].
