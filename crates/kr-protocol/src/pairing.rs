@@ -2163,6 +2163,8 @@ pub enum PairingConsumedReason {
     AttemptsExhausted,
     /// The host restarted while the invitation was unfinished.
     HostRestarted,
+    /// The device that used the invitation is already paired with this host.
+    EndpointPaired,
 }
 
 /// A device's checkpoint of the latest backup generation it has seen.
