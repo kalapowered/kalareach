@@ -1325,7 +1325,7 @@ impl TimeContract {
         self.wall.now_ms().get()
     }
 
-    /// The earliest the wall clock can honestly read now, as [`Self::proven_wall_ms`] reads it, with
+    /// The earliest the wall clock can honestly read now, as `Self::proven_wall_ms` reads it, with
     /// no side effect: the mark is read under the contract's lock, the reading is not kept and the
     /// floor is not raised.
     #[must_use]
