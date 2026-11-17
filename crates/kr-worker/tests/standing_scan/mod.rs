@@ -16,8 +16,13 @@
 //! * a call through a function pointer or a closure that is passed in, a macro's expansion, or a
 //!   call to a name that no function of this crate declares (the standard library and other
 //!   crates);
-//! * what a guard is, beyond the two names it knows (a `let` that calls `session` or locks the
-//!   service's `dispatch`, and a parameter of the session's type);
+//! * what a guard is, beyond the names it knows: a `let` that calls `session` (SES), a `let` that
+//!   locks the service's `dispatch` or calls `try_boundary` (BAR), and a parameter of the
+//!   session's type (SES). `let Some(x) =` and `let Ok(x) =` bind `x`, with the initialiser after
+//!   the pattern, and a binding `_` holds nothing. It does not know a guard that any other
+//!   function returns, a pattern of another shape (`Some((x, y))`, a struct), or a guard that an
+//!   `if let`, a `while let` or a `match` arm binds for its own block (a `let` statement is
+//!   read, and the guard lives to the end of the block that holds it);
 //! * the body of an `allow`ed name;
 //! * the body of a callee that a counted name reaches. A counted call is counted and not followed,
 //!   so a second take or write inside `Broker::state`, `Questions::locked`, `lock_session` or
@@ -1089,16 +1094,20 @@ fn depths(text: &[char]) -> Vec<i32> {
 
 /// The domain a guard belongs to, from the text that makes it: a function's parameter of the
 /// session's type, or a `let` whose initialiser calls `session`, holds the session (SES); a `let`
-/// whose initialiser locks the service's `dispatch` holds the dispatch barrier (BAR).
+/// whose initialiser locks the service's `dispatch` or calls `try_boundary` (which returns the
+/// guard of that lock, or none) holds the dispatch barrier (BAR).
 fn domain_of(made: &[char], parameter: bool) -> Option<&'static str> {
     let words = idents(made);
     let names: Vec<&str> = words.iter().map(|(_, name)| name.as_str()).collect();
     if parameter {
         return names.contains(&"Session").then_some("SES");
     }
-    if calls(made).iter().any(|(_, name)| name == "session") {
+    let called = calls(made);
+    if called.iter().any(|(_, name)| name == "session") {
         Some("SES")
-    } else if names.contains(&"dispatch") && names.contains(&"lock") {
+    } else if called.iter().any(|(_, name)| name == "try_boundary")
+        || (names.contains(&"dispatch") && names.contains(&"lock"))
+    {
         Some("BAR")
     } else {
         None
@@ -1165,9 +1174,28 @@ fn parameters(signature: &[char]) -> Vec<String> {
     parts
 }
 
+/// The offset of the parenthesis that closes the one at `open`, before `limit`.
+fn closing(text: &[char], open: usize, limit: usize) -> Option<usize> {
+    let mut level = 0_i32;
+    for (offset, &c) in text.iter().enumerate().take(limit).skip(open) {
+        match c {
+            '(' => level += 1,
+            ')' => {
+                level -= 1;
+                if level == 0 {
+                    return Some(offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The domains of the guards that are live where `at` stands in the function `span`: the
 /// parameters of the session's type and the `let` bindings before `at` whose block is still open
-/// and that no `drop` ended.
+/// and that no `drop` ended. `let Some(x) =` and `let Ok(x) =` bind `x`, and the initialiser is
+/// the text after the pattern; a binding `_` holds nothing.
 fn live_guards(text: &[char], open_braces: &[i32], span: &Span, at: usize) -> BTreeSet<String> {
     let mut live = BTreeSet::new();
     for parameter in parameters(&text[span.at..span.open]) {
@@ -1187,17 +1215,50 @@ fn live_guards(text: &[char], open_braces: &[i32], span: &Span, at: usize) -> BT
             continue;
         }
         let start = span.open + word_at;
-        let named = match words.get(index + 1) {
-            Some((_, name)) if name == "mut" => words.get(index + 2),
-            other => other,
-        };
-        let Some((name_at, name)) = named else {
+        let mut next = index + 1;
+        if words.get(next).is_some_and(|(_, word)| word == "mut") {
+            next += 1;
+        }
+        let Some((name_at, name)) = words.get(next) else {
             continue;
         };
-        let name_end = span.open + name_at + name.len();
+        let mut name = name.as_str();
+        // Where the initialiser starts: after the name, or after the pattern of `Some(name)` and
+        // `Ok(name)`, which bind the name inside the parentheses.
+        let mut initialiser = span.open + name_at + name.len();
+        if matches!(name, "Some" | "Ok")
+            && let Some(open) = text[initialiser..at]
+                .iter()
+                .position(|c| !c.is_whitespace())
+            && text[initialiser + open] == '('
+        {
+            let open = initialiser + open;
+            let Some(close) = closing(text, open, at) else {
+                continue;
+            };
+            let mut inner = next + 1;
+            while words
+                .get(inner)
+                .is_some_and(|(_, word)| word == "mut" || word == "ref")
+            {
+                inner += 1;
+            }
+            let Some((inner_at, inner_name)) = words.get(inner) else {
+                continue;
+            };
+            if span.open + inner_at > close {
+                continue;
+            }
+            name = inner_name.as_str();
+            initialiser = close + 1;
+        }
+        // A binding `_` drops its value at once.
+        if name == "_" {
+            continue;
+        }
         let mut nesting = 0_i32;
         let mut end = None;
-        for (offset, &c) in text.iter().enumerate().take(at).skip(name_end) {
+        for (offset, &c) in text.iter().enumerate().take(at).skip(initialiser) {
             match c {
                 '(' | '[' | '{' => nesting += 1,
                 ')' | ']' | '}' => nesting -= 1,
@@ -1213,7 +1274,7 @@ fn live_guards(text: &[char], open_braces: &[i32], span: &Span, at: usize) -> BT
             .iter()
             .all(|depth| *depth >= open_braces[start]);
         if still_open
-            && let Some(domain) = domain_of(&outside_braces(&text[name_end..end]), false)
+            && let Some(domain) = domain_of(&outside_braces(&text[initialiser..end]), false)
             && !dropped(text, end, at, name)
         {
             live.insert(domain.to_owned());

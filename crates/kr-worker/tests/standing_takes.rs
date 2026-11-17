@@ -23,9 +23,11 @@
 //! is not pure, a take in a helper that no row declares or that a listed body calls (the time
 //! contract's lock function, the attachment list's check), a take in a function that a `calls` row
 //! reaches (the journal's count, the fence driver's detach, the input domain's fence, the
-//! questions' store's read, the binder's count of open work), a new caller of a piece, a check
-//! made with the wrong guard held, a call that hands on the wrong session or the wrong record, and
-//! a call that is gone. Two cases plant a reading kept under the contract's lock in the proven or
+//! questions' store's read, the binder's count of open work), a new caller of a piece (in the
+//! service's file or in a child module of it), a check made with the wrong guard held, a caller
+//! that lets the dispatch barrier go or binds it to `_` before it calls the first admission or the
+//! prepared path's second pass, a call that hands on the wrong session or the wrong record, and a
+//! call that is gone. Two cases plant a reading kept under the contract's lock in the proven or
 //! the wall reader; the take that they find is the lock of the helper that keeps the reading
 //! (`wall_reading`), so their finding names that helper and not the call that reaches it.
 
@@ -79,6 +81,7 @@ const TIME: &str = "crates/kr-worker/src/action/time.rs";
 const GATE: &str = "crates/kr-worker/src/local_gate.rs";
 const SERVICE: &str = "crates/kr-worker/src/service.rs";
 const PIECES: &str = "crates/kr-worker/src/service/standing.rs";
+const OVERTAKE: &str = "crates/kr-worker/src/service/overtake.rs";
 
 #[test]
 fn a_take_planted_in_the_pure_wall_reader_is_reported() {
@@ -383,9 +386,8 @@ fn a_broker_take_planted_in_the_decisions_check_is_reported() {
 
 #[test]
 fn a_second_caller_of_the_first_admission_is_reported() {
-    // The first admission runs inside the barrier that its caller takes with `try_boundary`, which
-    // the reader does not know as a guard, so its `held` rows read no barrier: the `caller` row is
-    // what keeps a call from a function that takes none out.
+    // The first admission runs inside the barrier that its caller takes with `try_boundary`: its
+    // `only` row lets no other function call it, and a function that does fails the row.
     let found = planted(
         SERVICE,
         "    fn receipted(",
@@ -409,6 +411,101 @@ fn a_second_caller_of_the_prepared_paths_second_pass_is_reported() {
     only_finding(
         &found,
         "service.rs rogue calls continue_prepared 1 time(s) and no row lists the caller",
+    );
+}
+
+#[test]
+fn a_caller_of_the_first_admission_in_a_child_module_of_the_service_is_reported() {
+    // A child module can call the service's private methods, and a `caller` row reads only the
+    // file that it names: the `only` row reads every file of the crate.
+    let found = planted(
+        PIECES,
+        "    /// Starts a pass of the standing function in `mode`.\n",
+        "    fn rogue(&self) {\n        let _ = self.receipted();\n    }\n\n    /// Starts a pass of the standing function in `mode`.\n",
+    );
+    only_finding(
+        &found,
+        "service/standing.rs rogue calls receipted 1 time(s) and no row lists the caller",
+    );
+}
+
+#[test]
+fn a_caller_of_the_prepared_paths_second_pass_in_a_child_module_of_the_service_is_reported() {
+    let found = planted(
+        OVERTAKE,
+        "impl Overtaking {\n",
+        "impl Overtaking {\n    fn rogue(&self) {\n        let _ = self.continue_prepared();\n    }\n\n",
+    );
+    only_finding(
+        &found,
+        "service/overtake.rs rogue calls continue_prepared 1 time(s) and no row lists the caller",
+    );
+}
+
+#[test]
+fn a_new_caller_of_the_accepts_hold_is_reported() {
+    let found = planted(
+        SERVICE,
+        "    fn dispatch_accepted(",
+        "    fn rogue(&self) {\n        let _ = self.admit_and_dispatch();\n    }\n\n    fn dispatch_accepted(",
+    );
+    only_finding(
+        &found,
+        "service.rs rogue calls admit_and_dispatch 1 time(s) and no row lists the caller",
+    );
+}
+
+#[test]
+fn the_barrier_let_go_in_the_prepared_paths_caller_is_reported() {
+    // `prepared_once` takes the barrier with `try_boundary` and calls the second pass while it
+    // holds it: a `drop` of that guard before the call leaves the pass without the barrier.
+    let found = planted(
+        SERVICE,
+        "            return Self::after_a_failed_try(state);\n        };\n        off_the_executor(|| {",
+        "            return Self::after_a_failed_try(state);\n        };\n        drop(_barrier);\n        off_the_executor(|| {",
+    );
+    only_finding(
+        &found,
+        "service.rs prepared_once calls continue_prepared holding {} and its held row says {\"BAR\"}",
+    );
+}
+
+#[test]
+fn the_barrier_bound_to_nothing_in_the_first_admissions_caller_is_reported() {
+    // `let Some(_) =` drops the guard at once, so the first admission runs without the barrier.
+    let found = planted(
+        SERVICE,
+        "        let Some(_barrier) = self.try_boundary() else {\n            return if ends_work {",
+        "        let Some(_) = self.try_boundary() else {\n            return if ends_work {",
+    );
+    only_finding(
+        &found,
+        "service.rs receipt_once calls receipted holding {} and its held row says {\"BAR\"}",
+    );
+}
+
+#[test]
+fn a_take_of_the_dispatch_lock_planted_in_the_first_admission_is_reported() {
+    // The first admission runs inside the barrier that its caller holds, so a take of the lock in
+    // its own body would wait on itself: each of its `held` rows fails with the guard live.
+    let found = planted(
+        SERVICE,
+        "        let actor_id = caller.actor_id.clone();\n        self.wait_inside_boundary();\n",
+        "        let actor_id = caller.actor_id.clone();\n        let _barrier = self.dispatch.lock();\n        self.wait_inside_boundary();\n",
+    );
+    let held = |callee: &str, live: &str, row: &str| {
+        format!(
+            "crates/kr-worker/src/service.rs receipted calls {callee} holding {live} and its held row says {row}"
+        )
+    };
+    assert_eq!(
+        found,
+        [
+            held("authority", "{\"BAR\"}", "{}"),
+            held("envelope", "{\"BAR\", \"SES\"}", "{\"SES\"}"),
+            held("limits", "{\"BAR\"}", "{}"),
+            held("admit_and_dispatch", "{\"BAR\"}", "{}"),
+        ]
     );
 }
 
