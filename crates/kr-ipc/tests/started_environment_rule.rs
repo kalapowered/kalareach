@@ -114,7 +114,23 @@ const KEPT: &[(&str, &str)] = &[
     ("tests/e2e/m1b/tests/checkpoint.rs", NAMES_ONLY),
     (
         "tests/perf/tests/stress.rs",
-        "its in-process daemon can be given an environment only through the controller's testing feature, which this package's manifest does not enable",
+        "its in-process daemon can be given an environment only through the controller's testing feature, which this package's manifest does not enable; removed when the package enables that feature",
+    ),
+];
+
+/// The sources whose daemon runs in the test's own process, starts a real worker, and is not given
+/// an environment of its own, as the file and the reason. The program of such a source takes the
+/// test program's environment for the sessions it starts. Each stands until its package enables the
+/// controller's `testing` feature, which gives a daemon its environment; the entry is then removed
+/// and the daemon is given what the helper makes.
+const IN_PROCESS_WITHOUT_ENVIRONMENT: &[(&str, &str)] = &[
+    (
+        "tests/faults/tests/kills.rs",
+        "the processes this source starts itself clear the environment and set a home of the tree's own, and its daemon has no host environment of its own",
+    ),
+    (
+        "tests/perf/tests/stress.rs",
+        "the measurement is of a daemon built without the testing hooks",
     ),
 ];
 
@@ -354,4 +370,26 @@ fn the_reading_passes_a_start_that_gives_one_and_words_that_are_not_a_start() {
     ] {
         assert!(offence(text).is_none(), "{text}");
     }
+}
+
+#[test]
+fn a_source_listed_as_giving_its_daemon_no_environment_still_starts_one_and_gives_it_none() {
+    let sources = test_sources();
+    let stale: Vec<String> = IN_PROCESS_WITHOUT_ENVIRONMENT
+        .iter()
+        .filter(|(listed, _)| {
+            !sources.iter().any(|(file, text)| {
+                file == listed
+                    && text.contains("Controller::start(")
+                    && !text.contains("set_host_environment")
+            })
+        })
+        .map(|(file, reason)| format!("{file} ({reason})"))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "a source listed as one whose in-process daemon has no host environment of its own no \
+         longer starts a daemon, or now gives it one, and is removed from the list:\n{}",
+        stale.join("\n")
+    );
 }
