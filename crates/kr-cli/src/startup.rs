@@ -1454,8 +1454,11 @@ async fn start_by_task(
             // A daemon answered, whichever start it came from. The request is withdrawn, so no
             // starter the Task Scheduler runs later acts on it; one that took it already is past
             // the reach of this.
-            let _ = kr_ipc::starter::withdraw_claim(environment, asked.request);
-            return Ok((client, Some(started)));
+            let withdrawn = kr_ipc::starter::withdraw_claim(environment, asked.request);
+            return Ok((
+                client,
+                launched_after_the_answer(withdrawn, started, launched),
+            ));
         }
         Err(last) => last,
     };
@@ -1467,6 +1470,25 @@ async fn start_by_task(
         &log,
         launched,
     ))
+}
+
+/// What this command launched where a daemon answered after it left its request for the task's
+/// starter and withdrew it: a request that no starter took was never acted on, so the daemon that
+/// answers is not one this command started, and it launched nothing. A request a starter took, or
+/// whose taking cannot be told, may have started the daemon that answers, and stays a launch.
+#[cfg(windows)]
+pub(crate) fn launched_after_the_answer(
+    withdrawn: std::result::Result<kr_ipc::starter::Withdrawal, kr_ipc::IpcError>,
+    started: Started,
+    launched: &AtomicBool,
+) -> Option<Started> {
+    match withdrawn {
+        Ok(kr_ipc::starter::Withdrawal::Withdrawn) => {
+            launched.store(false, Ordering::SeqCst);
+            None
+        }
+        Ok(kr_ipc::starter::Withdrawal::Taken) | Err(_) => Some(started),
+    }
 }
 
 /// The log a daemon the standalone start runs writes to, opened once and checked.
@@ -3279,6 +3301,41 @@ mod tests {
     #[test]
     fn the_starter_writes_the_log_this_command_reads() {
         assert_eq!(kr_controller::supervision::windows::DAEMON_LOG, LOG_FILE);
+    }
+
+    /// KR-REQ-07.12: where a daemon answers after this command left its request for the task's
+    /// starter, the request is a launch unless it was withdrawn before any starter took it; a
+    /// request that was withdrawn is no launch, and the flag that says a requested daemon may still
+    /// start is cleared with it.
+    #[cfg(windows)]
+    #[test]
+    fn a_withdrawn_task_request_is_no_launch_where_a_daemon_answers() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let started = Started {
+            pid: None,
+            start: ControllerStartup::Standalone,
+            manager: None,
+        };
+        let launched = AtomicBool::new(true);
+        let withdrawn = Ok(kr_ipc::starter::Withdrawal::Withdrawn);
+        assert!(launched_after_the_answer(withdrawn, started, &launched).is_none());
+        assert!(
+            !launched.load(Ordering::SeqCst),
+            "no requested daemon may still start"
+        );
+        for taken in [
+            Ok(kr_ipc::starter::Withdrawal::Taken),
+            Err(kr_ipc::IpcError::io(
+                "read",
+                std::path::Path::new("claim"),
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            )),
+        ] {
+            let launched = AtomicBool::new(true);
+            assert!(launched_after_the_answer(taken, started, &launched).is_some());
+            assert!(launched.load(Ordering::SeqCst));
+        }
     }
 
     /// KR-REQ-07.12: a failure after a run the Task Scheduler confirmed says it was asked to run
