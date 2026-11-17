@@ -170,6 +170,8 @@ pub struct InvitationRecord {
     pub deadline_monotonic_ms: u64,
     /// The boot this deadline belongs to.
     pub boot_identity: BootIdentity,
+    /// The device an invitation was refused for, when it was refused for one.
+    pub refused_for: Option<DeviceId>,
 }
 
 /// Where an invitation is in its life.

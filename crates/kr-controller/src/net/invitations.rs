@@ -62,7 +62,9 @@ use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
 use rusqlite::{Connection, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 
-use super::devices::{DeviceDirectory, DeviceRecord, insert_record, unreadable_row};
+use super::devices::{
+    DeviceDirectory, DeviceRecord, claim_endpoint, insert_record, unreadable_row,
+};
 use super::lifetimes::GrantLifetimes;
 use crate::error::{ControllerError, Result};
 
@@ -150,6 +152,15 @@ pub fn prepare(directory: &DeviceDirectory) -> Result<()> {
                  );",
             )
             .map_err(ControllerError::registry)?;
+        // Forward-only, and applied to tables that already exist: the device that answered a
+        // confirmation, so that a spend stands only while that device's record does, and the
+        // device a refused invitation was refused for.
+        add_column(transaction, "owner_confirmations", "signer_device_id BLOB")?;
+        add_column(
+            transaction,
+            "pairing_invitations",
+            "refused_for_device BLOB",
+        )?;
         if !had_owner_table && holds_owner_device(transaction)? {
             transaction
                 .execute(
@@ -161,6 +172,16 @@ pub fn prepare(directory: &DeviceDirectory) -> Result<()> {
         }
         Ok(())
     })
+}
+
+/// Adds one column to a table, unless it is already there: a duplicate is the ordinary case on
+/// every start after the first.
+fn add_column(connection: &Connection, table: &str, definition: &str) -> Result<()> {
+    match connection.execute(&format!("ALTER TABLE {table} ADD COLUMN {definition}"), []) {
+        Ok(_) => Ok(()),
+        Err(error) if error.to_string().contains("duplicate column name") => Ok(()),
+        Err(error) => Err(ControllerError::registry(error)),
+    }
 }
 
 /// Returns true when the device table holds a device with an owner grant, live or revoked.
@@ -732,6 +753,7 @@ impl InvitationRows {
         proof: &OwnerConfirmationProof,
         action: &PairingAction,
         now: TimestampMs,
+        signer_device: Option<DeviceId>,
         admission: &dyn Fn() -> Result<()>,
     ) -> Result<TimestampMs> {
         let request = encode(&proof.request)?;
@@ -750,8 +772,9 @@ impl InvitationRows {
                 .execute(
                     "INSERT INTO owner_confirmations (
                          confirmation_id, action, action_digest, request, channel, signer_key_id,
-                         answered_at_ms, answered_by, proof, consumed_at_ms, consumed_by
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL)
+                         answered_at_ms, answered_by, proof, consumed_at_ms, consumed_by,
+                         signer_device_id
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, ?10)
                      ON CONFLICT (confirmation_id) DO NOTHING",
                     params![
                         confirmation_id.get().as_bytes().as_slice(),
@@ -763,6 +786,7 @@ impl InvitationRows {
                         to_sql(now.get()),
                         action.actor.as_str(),
                         stored_proof,
+                        signer_device.map(|device| device.get().as_bytes().to_vec()),
                     ],
                 )
                 .map_err(ControllerError::registry)?;
@@ -817,6 +841,7 @@ impl InvitationRows {
                 effect,
                 now,
                 terminal,
+                AcceptanceRow::Optional,
             )
         });
         self.lifetimes.settle();
@@ -911,6 +936,7 @@ impl InvitationStore for InvitationRows {
                 &effect,
                 terms.issued_at_ms,
                 TerminalStanding::Bootstrap,
+                AcceptanceRow::Optional,
             )
         });
         self.lifetimes.settle();
@@ -966,24 +992,37 @@ impl InvitationStore for InvitationRows {
         let action = self
             .admission
             .action_for(&ActionSubject::Confirmed(commitment.invitation_id));
-        let committed = self.directory.transaction(|transaction| {
-            self.admission.check()?;
-            let outcome = commit_pairing(
-                transaction,
-                &self.lifetimes,
-                &self.refusal,
-                expected,
-                next,
-                commitment,
-            )?;
-            // The pairing is the confirmation's effect: recorded with it, and only when it is
-            // written.
-            if outcome == TransitionOutcome::Written
-                && let Some(action) = &action
-            {
-                claim_effect(transaction, action)?;
-            }
-            Ok(outcome)
+        // Before the transaction, with the directory's connection not held: the end of a grant
+        // that ran out is written through the lifetimes' own path, so whoever waits on it is told
+        // once, and the transaction then finds the record's mark on record.
+        let standing = self
+            .directory
+            .rows_for_endpoint(&commitment.client_keys.transport)
+            .and_then(|rows| {
+                rows.iter()
+                    .filter(|row| row.is_paired())
+                    .try_for_each(|row| self.lifetimes.paired_standing(row).map(|_| ()))
+            });
+        let committed = standing.and_then(|()| {
+            self.directory.transaction(|transaction| {
+                self.admission.check()?;
+                let outcome = commit_pairing(
+                    transaction,
+                    &self.lifetimes,
+                    &self.refusal,
+                    expected,
+                    next,
+                    commitment,
+                )?;
+                // The pairing is the confirmation's effect: recorded with it, and only when it is
+                // written.
+                if outcome == TransitionOutcome::Written
+                    && let Some(action) = &action
+                {
+                    claim_effect(transaction, action)?;
+                }
+                Ok(outcome)
+            })
         });
         self.lifetimes.settle();
         if action.is_some() && matches!(committed, Ok(TransitionOutcome::Written)) {
@@ -1089,9 +1128,16 @@ fn commit_pairing(
         });
     }
 
+    // Every refusal stands before the spend, so no transaction that wrote the spend returns one:
+    // the endpoint identity's rows decide whether the device can be added at all, and a
+    // replacement waits for the withdrawal that ended the earlier record to finish its barrier.
+    // Nothing is written but the end of a grant that ran out, which is a fact that stays.
+    let record = device_record(commitment).map_err(ControllerError::registry)?;
+    let claim = claim_endpoint(transaction, Some(lifetimes), &record.endpoint_id)?
+        .map_err(|claimed| claimed.into_error_until(Some(&open_until(row.terms.issued_at_ms))))?;
     // The confirmation is spent, and its signer's authority read, before the candidate's own row
     // exists: a candidate presenting the signer's key must not be what makes that signer look like
-    // an owner device.
+    // an owner device. It is spent only while the record that answered it stands.
     consume(
         transaction,
         lifetimes,
@@ -1100,9 +1146,9 @@ fn commit_pairing(
         &format!("pair.confirm {}", commitment.invitation_id),
         commitment.committed_at_ms,
         TerminalStanding::Bootstrap,
+        AcceptanceRow::Required,
     )?;
-    let record = device_record(commitment).map_err(ControllerError::registry)?;
-    insert_record(transaction, &record)?;
+    insert_record(transaction, &record, &claim)?;
     transaction
         .execute(
             "INSERT INTO pairing_commitments (invitation_id, commitment) VALUES (?1, ?2)",
@@ -1166,6 +1212,43 @@ fn commit_pairing(
         .map_err(ControllerError::registry)?;
     write_record(transaction, next)?;
     Ok(TransitionOutcome::Written)
+}
+
+/// The moment an invitation stays open until, as the person who issued it reads a moment: the
+/// date and time in UTC, in the form the command line shows every moment in (`2026-01-01 00:00:00
+/// UTC`).
+fn open_until(issued_at_ms: TimestampMs) -> String {
+    utc_moment(
+        issued_at_ms
+            .get()
+            .saturating_add(kr_protocol::pairing::INVITATION_LIFETIME_MS),
+    )
+}
+
+/// A moment in UTC milliseconds as `YYYY-MM-DD HH:MM:SS UTC`.
+fn utc_moment(milliseconds: u64) -> String {
+    let seconds = milliseconds / 1000;
+    let of_day = seconds % 86_400;
+    // The civil date of a day count since 1970-01-01, by the days-from-civil algorithm's inverse.
+    let days = i64::try_from(seconds / 86_400).unwrap_or(i64::MAX / 2) + 719_468;
+    let era = days.div_euclid(146_097);
+    let of_era = days.rem_euclid(146_097);
+    let year_of_era = (of_era - of_era / 1_460 + of_era / 36_524 - of_era / 146_096) / 365;
+    let day_of_year = of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} UTC",
+        of_day / 3_600,
+        of_day % 3_600 / 60,
+        of_day % 60
+    )
 }
 
 /// Records `action` inside the caller's transaction, unless its identifier already has a record.
@@ -1390,6 +1473,48 @@ pub enum TerminalStanding {
     },
 }
 
+/// Whether the confirmation a consumption spends must already have an acceptance row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AcceptanceRow {
+    /// A pairing's commit: the confirmation was answered through this host, so its row exists, and
+    /// for the two device channels it names the device whose record answered.
+    Required,
+    /// Every other consumption: a proof nobody completed through this host is written whole.
+    Optional,
+}
+
+/// The device whose record answered a pairing's confirmation, read from the acceptance row.
+///
+/// A confirmation with no acceptance row is refused for every channel. A row of one of the two
+/// device channels must name the device that answered; the terminal's row names none by design,
+/// because its signer is the bootstrap key.
+fn answering_device(
+    transaction: &Connection,
+    proof: &OwnerConfirmationProof,
+) -> Result<Option<DeviceId>> {
+    let lapsed = |detail: &str| ControllerError::Refused {
+        code: ErrorCode::OwnerConfirmationRequired,
+        detail: detail.to_owned(),
+    };
+    let row = transaction
+        .query_row(
+            "SELECT signer_device_id FROM owner_confirmations WHERE confirmation_id = ?1",
+            params![proof.request.confirmation_id.get().as_bytes().as_slice()],
+            |row| row.get::<_, Option<Vec<u8>>>(0),
+        )
+        .optional()
+        .map_err(ControllerError::registry)?
+        .ok_or_else(|| lapsed("no owner confirmation was answered for this pairing"))?;
+    match proof.channel {
+        ConfirmationChannel::OwnerDevicePresence | ConfirmationChannel::PairedOwnerDevice => row
+            .map(|bytes| uuid(Some(&bytes)).map(DeviceId::new))
+            .transpose()?
+            .map(Some)
+            .ok_or_else(|| lapsed("the device that answered this confirmation is not recorded")),
+        _ => Ok(None),
+    }
+}
+
 /// Records a confirmation's consumption inside the caller's transaction.
 ///
 /// The row is written whole when `complete` never recorded the answer, so the acceptance record
@@ -1405,8 +1530,13 @@ pub(super) fn consume(
     effect: &str,
     now: TimestampMs,
     terminal: TerminalStanding,
+    acceptance: AcceptanceRow,
 ) -> Result<()> {
-    signer_still_authorised(transaction, lifetimes, refusal, proof, terminal)?;
+    let bound_to = match acceptance {
+        AcceptanceRow::Optional => None,
+        AcceptanceRow::Required => answering_device(transaction, proof)?,
+    };
+    signer_still_authorised(transaction, lifetimes, refusal, proof, terminal, bound_to)?;
     destination_still_held(transaction, proof)?;
     let request = encode(&proof.request)?;
     let action = text_of(&proof.request.action)?;
@@ -1458,6 +1588,7 @@ fn signer_still_authorised(
     refusal: &crate::grants::RemoteRefusal,
     proof: &OwnerConfirmationProof,
     terminal: TerminalStanding,
+    bound_to: Option<DeviceId>,
 ) -> Result<()> {
     let lapsed = |detail: &str| ControllerError::Refused {
         code: ErrorCode::OwnerConfirmationRequired,
@@ -1541,20 +1672,21 @@ fn signer_still_authorised(
                 });
                 signed
                     && uuid(Some(device_id)).is_ok_and(|device_id| {
-                        decode::<Grant>(grant).is_ok_and(|grant| {
-                            if !(grant.permits(ActionRight::HostManage)
-                                && lifetimes.in_force_now(DeviceId::new(device_id), &grant))
-                            {
-                                return false;
-                            }
-                            match refusal.standing_of(Some(&grant)) {
-                                Some(refused) => {
-                                    removed.get_or_insert(refused);
-                                    false
+                        bound_to.is_none_or(|bound| bound == DeviceId::new(device_id))
+                            && decode::<Grant>(grant).is_ok_and(|grant| {
+                                if !(grant.permits(ActionRight::HostManage)
+                                    && lifetimes.in_force_now(DeviceId::new(device_id), &grant))
+                                {
+                                    return false;
                                 }
-                                None => true,
-                            }
-                        })
+                                match refusal.standing_of(Some(&grant)) {
+                                    Some(refused) => {
+                                        removed.get_or_insert(refused);
+                                        false
+                                    }
+                                    None => true,
+                                }
+                            })
                     })
             });
             if !standing {
@@ -1684,6 +1816,7 @@ struct RawRow {
     issuing_ingress: String,
     issued_at_ms: i64,
     confirmation_id: Vec<u8>,
+    refused_for_device: Option<Vec<u8>>,
 }
 
 fn read_row(
@@ -1695,7 +1828,7 @@ fn read_row(
             "SELECT invitation_id, mode, locator, rendezvous_origin, state, locked_attempt,
                     consumed_reason, failed_confirmations, deadline_monotonic_ms, boot_identity,
                     grant_kind, proposed_grant, issuing_actor, issuing_ingress, issued_at_ms,
-                    confirmation_id
+                    confirmation_id, refused_for_device
              FROM pairing_invitations WHERE invitation_id = ?1",
             params![invitation_id.get().as_bytes().as_slice()],
             |row| {
@@ -1716,6 +1849,7 @@ fn read_row(
                     issuing_ingress: row.get(13)?,
                     issued_at_ms: row.get(14)?,
                     confirmation_id: row.get(15)?,
+                    refused_for_device: row.get(16)?,
                 })
             },
         )
@@ -1764,6 +1898,11 @@ fn decode_record(raw: &RawRow) -> Result<InvitationRecord> {
             <[u8; 32]>::try_from(raw.boot_identity.as_slice())
                 .map_err(|_| ControllerError::registry("a boot identity is 32 bytes"))?,
         ),
+        refused_for: raw
+            .refused_for_device
+            .as_deref()
+            .map(|bytes| uuid(Some(bytes)).map(DeviceId::new))
+            .transpose()?,
     })
 }
 
@@ -1868,7 +2007,8 @@ fn write_record(connection: &Connection, record: &InvitationRecord) -> Result<()
         .execute(
             "UPDATE pairing_invitations
              SET locator = ?2, state = ?3, locked_attempt = ?4, consumed_reason = ?5,
-                 failed_confirmations = ?6, deadline_monotonic_ms = ?7, boot_identity = ?8
+                 failed_confirmations = ?6, deadline_monotonic_ms = ?7, boot_identity = ?8,
+                 refused_for_device = ?9
              WHERE invitation_id = ?1",
             params![
                 record.invitation_id.get().as_bytes().as_slice(),
@@ -1879,6 +2019,9 @@ fn write_record(connection: &Connection, record: &InvitationRecord) -> Result<()
                 i64::from(record.failed_confirmations),
                 to_sql(record.deadline_monotonic_ms),
                 record.boot_identity.0.as_slice(),
+                record
+                    .refused_for
+                    .map(|device| device.get().as_bytes().to_vec()),
             ],
         )
         .map_err(ControllerError::registry)?;
@@ -2015,6 +2158,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_moment_is_shown_as_the_command_line_shows_it() {
+        assert_eq!(utc_moment(1_767_225_600_000), "2026-01-01 00:00:00 UTC");
+        assert_eq!(
+            utc_moment(1_767_312_000_000 + 3_723_000),
+            "2026-01-02 01:02:03 UTC"
+        );
+        // A leap day, and the last second of a year.
+        assert_eq!(utc_moment(1_709_251_199_000), "2024-02-29 23:59:59 UTC");
+        assert_eq!(utc_moment(1_798_761_599_000), "2026-12-31 23:59:59 UTC");
+    }
+
+    #[test]
     fn a_consumed_reason_is_stored_under_its_protocol_name() {
         assert_eq!(
             text_of(&PairingConsumedReason::HostRestarted).expect("a name"),
@@ -2023,6 +2178,10 @@ mod tests {
         assert_eq!(
             from_text::<PairingConsumedReason>("attempts_exhausted").expect("a reason"),
             PairingConsumedReason::AttemptsExhausted
+        );
+        assert_eq!(
+            text_of(&PairingConsumedReason::EndpointPaired).expect("a name"),
+            "endpoint_paired"
         );
         assert!(from_text::<PairingConsumedReason>("forgotten").is_err());
         assert_eq!(

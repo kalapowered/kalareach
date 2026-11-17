@@ -54,6 +54,56 @@ pub struct HostRecords {
     pub clock: Arc<ClockTrust>,
 }
 
+/// The columns of `network_devices`, in the order a new file's table is made and a rebuilt table is
+/// made again.
+///
+/// The endpoint identity is not unique here: a record that ended keeps its row and its own device
+/// id, and the one unique rule over the endpoint identity is the index [`create_devices_indexes`] makes.
+const DEVICE_COLUMNS: &str = "device_id BLOB PRIMARY KEY NOT NULL,
+     endpoint_id BLOB NOT NULL,
+     device_key_revision INTEGER NOT NULL,
+     authorisation_key BLOB NOT NULL,
+     device_name TEXT NOT NULL,
+     platform TEXT NOT NULL,
+     grant_id BLOB NOT NULL,
+     grant BLOB NOT NULL,
+     paired_at_ms INTEGER NOT NULL,
+     revoked_at_ms INTEGER,
+     expired_at_ms INTEGER,
+     committed_invitation_id BLOB,
+     notification_preview BLOB,
+     stored_envelope_key BLOB";
+
+/// The statement that makes `network_devices`. `guard` is `"IF NOT EXISTS "` for a file's own open and
+/// empty for the rebuild, which makes the table anew: both give SQLite the same text to keep.
+fn create_devices_table(guard: &str) -> String {
+    format!("CREATE TABLE {guard}network_devices ({DEVICE_COLUMNS});")
+}
+
+/// The trigger that keeps a device's authorisation key as it was paired.
+fn create_devices_key_trigger(guard: &str) -> String {
+    format!(
+        "CREATE TRIGGER {guard}network_devices_authorisation_key_fixed
+             BEFORE UPDATE OF authorisation_key ON network_devices
+             WHEN NEW.authorisation_key IS NOT OLD.authorisation_key
+         BEGIN
+             SELECT RAISE(ABORT, 'a device''s authorisation key is fixed for its identity');
+         END;"
+    )
+}
+
+/// The indexes of `network_devices`: the plain lookup by endpoint identity, and the rule that an
+/// endpoint identity has at most one record that has neither been revoked nor expired.
+fn create_devices_indexes(guard: &str) -> String {
+    format!(
+        "CREATE INDEX {guard}network_devices_endpoint
+             ON network_devices (endpoint_id);
+         CREATE UNIQUE INDEX {guard}network_devices_live_endpoint
+             ON network_devices (endpoint_id)
+             WHERE revoked_at_ms IS NULL AND expired_at_ms IS NULL;"
+    )
+}
+
 /// Expiry records this host owes its own directory.
 ///
 /// A grant's expiry is written down where it is observed, and a write can fail: a full disk, a
@@ -124,6 +174,16 @@ impl PendingExpiry {
                 ),
             }
         }
+    }
+
+    /// The moment one device's expiry is owed at, when it is owed and not written yet.
+    #[must_use]
+    pub fn owed_at(&self, device_id: DeviceId) -> Option<TimestampMs> {
+        self.owed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&device_id)
+            .copied()
     }
 
     /// Whether one device's expiry is owed to the record and not written yet.
@@ -574,29 +634,13 @@ impl DeviceDirectory {
 
     fn migrate(&self) -> Result<()> {
         self.with(|connection| {
+            connection.execute_batch(&format!(
+                "{} {}",
+                create_devices_table("IF NOT EXISTS "),
+                create_devices_key_trigger("IF NOT EXISTS ")
+            ))?;
             connection.execute_batch(
-                "CREATE TABLE IF NOT EXISTS network_devices (
-                     device_id BLOB PRIMARY KEY NOT NULL,
-                     endpoint_id BLOB NOT NULL UNIQUE,
-                     device_key_revision INTEGER NOT NULL,
-                     authorisation_key BLOB NOT NULL,
-                     device_name TEXT NOT NULL,
-                     platform TEXT NOT NULL,
-                     grant_id BLOB NOT NULL,
-                     grant BLOB NOT NULL,
-                     paired_at_ms INTEGER NOT NULL,
-                     revoked_at_ms INTEGER,
-                     expired_at_ms INTEGER
-                 );
-                 CREATE INDEX IF NOT EXISTS network_devices_endpoint
-                     ON network_devices (endpoint_id);
-                 CREATE TRIGGER IF NOT EXISTS network_devices_authorisation_key_fixed
-                     BEFORE UPDATE OF authorisation_key ON network_devices
-                     WHEN NEW.authorisation_key IS NOT OLD.authorisation_key
-                 BEGIN
-                     SELECT RAISE(ABORT, 'a device''s authorisation key is fixed for its identity');
-                 END;
-                 CREATE TABLE IF NOT EXISTS network_actions (
+                "CREATE TABLE IF NOT EXISTS network_actions (
                      actor_id TEXT NOT NULL,
                      action_id BLOB NOT NULL,
                      session_id BLOB,
@@ -642,6 +686,10 @@ impl DeviceDirectory {
         ] {
             self.add_column("network_devices", column)?;
         }
+        // After the columns: an index whose `WHERE` names a column the table lacks fails the batch.
+        self.with(|connection| {
+            connection.execute_batch(&create_devices_indexes("IF NOT EXISTS "))
+        })?;
         // The one record of this host's wall clock ([`ClockTrust`]): the decision, the anchor the
         // mark is projected from, what the owner confirmed and the two holds.
         for column in [
@@ -711,7 +759,7 @@ impl DeviceDirectory {
     ///
     /// SQLite has no conditional `ADD COLUMN`, and a duplicate is the ordinary case on every start
     /// after the first, so that one failure is the success case and anything else is not.
-    fn add_column(&self, table: &str, definition: &str) -> Result<()> {
+    pub(super) fn add_column(&self, table: &str, definition: &str) -> Result<()> {
         let statement = format!("ALTER TABLE {table} ADD COLUMN {definition}");
         let outcome = self.with(|connection| connection.execute(&statement, []));
         match outcome {
@@ -811,9 +859,15 @@ impl DeviceDirectory {
     /// # Errors
     ///
     /// Returns an error when the row cannot be written, including when this endpoint already has a
-    /// record: an endpoint identity belongs to one device.
+    /// record that has neither been revoked nor expired: an endpoint identity has one such record.
+    /// A record that has ended stays beside the new one, under its own device id.
     pub fn commit(&self, record: &DeviceRecord) -> Result<()> {
-        self.transaction(|transaction| insert_record(transaction, record))?;
+        self.transaction(|transaction| {
+            // No clock is read here, so every record that has not ended counts as standing.
+            let claim = claim_endpoint(transaction, None, &record.endpoint_id)?
+                .map_err(ClaimRefusal::into_error)?;
+            insert_record(transaction, record, &claim)
+        })?;
         self.note_change();
         Ok(())
     }
@@ -829,7 +883,8 @@ impl DeviceDirectory {
         self.changed.notify_one();
     }
 
-    /// Returns the record of one endpoint, paired or revoked.
+    /// Returns the record of one endpoint: the one that has neither been revoked nor expired when
+    /// there is one, and the newest ended one otherwise.
     ///
     /// # Errors
     ///
@@ -843,13 +898,26 @@ impl DeviceDirectory {
                             device_name, platform, grant, paired_at_ms, revoked_at_ms,
                             expired_at_ms, committed_invitation_id, notification_preview,
                             stored_envelope_key
-                     FROM network_devices WHERE endpoint_id = ?1",
+                     FROM network_devices WHERE endpoint_id = ?1
+                     ORDER BY (revoked_at_ms IS NULL AND expired_at_ms IS NULL) DESC,
+                              paired_at_ms DESC, device_id DESC
+                     LIMIT 1",
                     params![bytes],
                     |row| Ok(read_record(row)),
                 )
                 .optional()
         })?
         .transpose()
+    }
+
+    /// Returns every record of one endpoint identity, the one that has not ended first and then
+    /// the ended ones, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a row cannot be read.
+    pub fn rows_for_endpoint(&self, endpoint_id: &EndpointKey) -> Result<Vec<DeviceRecord>> {
+        self.with(|connection| Ok(endpoint_rows(connection, endpoint_id)))?
     }
 
     /// Decides one declaration of a device's keys and records what it ended as, in one step.
@@ -1034,15 +1102,8 @@ impl DeviceDirectory {
     ///
     /// Returns an error when the row cannot be written.
     pub fn record_expiry(&self, device_id: DeviceId, now_ms: TimestampMs) -> Result<()> {
-        let bytes = device_id.get().as_bytes().to_vec();
-        let changed = self.with(|connection| {
-            connection.execute(
-                "UPDATE network_devices SET expired_at_ms = ?2
-                 WHERE device_id = ?1 AND expired_at_ms IS NULL",
-                params![bytes, i64::try_from(now_ms.get()).unwrap_or(i64::MAX)],
-            )
-        })?;
-        if changed > 0 {
+        let changed = self.with(|connection| Ok(write_expiry(connection, device_id, now_ms)))??;
+        if changed {
             self.note_change();
         }
         Ok(())
@@ -1594,7 +1655,7 @@ impl DeviceDirectory {
         else {
             return Ok(PreviewKeyOutcome::NotPaired);
         };
-        if record.revoked_at_ms.is_some() {
+        if !record.is_paired() {
             return Ok(PreviewKeyOutcome::NotPaired);
         }
         if record.device_key_revision == revision
@@ -1613,7 +1674,7 @@ impl DeviceDirectory {
                 "UPDATE network_devices
                  SET notification_preview = ?2,
                      device_key_revision = ?3
-                 WHERE device_id = ?1 AND revoked_at_ms IS NULL
+                 WHERE device_id = ?1 AND revoked_at_ms IS NULL AND expired_at_ms IS NULL
                    AND device_key_revision < ?3",
                 params![
                     bytes,
@@ -1684,9 +1745,19 @@ pub(crate) fn establish_clock_in(
 ///
 /// # Errors
 ///
-/// Returns an error when the row cannot be written, including when this endpoint already has a
-/// record: an endpoint identity belongs to one device.
-pub(crate) fn insert_record(connection: &Connection, record: &DeviceRecord) -> Result<()> {
+/// Returns an error when the row cannot be written, when `claim` is not the claim of this record's
+/// endpoint identity, and when this endpoint already has a record that has neither been revoked
+/// nor expired.
+pub(crate) fn insert_record(
+    connection: &Connection,
+    record: &DeviceRecord,
+    claim: &Claim,
+) -> Result<()> {
+    if claim.endpoint != record.endpoint_id {
+        return Err(ControllerError::registry(
+            "a device record is inserted only under the claim of its own endpoint identity",
+        ));
+    }
     let grant = kr_cbor::to_canonical_vec(&record.grant)
         .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
     let platform = platform_text(record.platform)?;
@@ -1719,6 +1790,240 @@ pub(crate) fn insert_record(connection: &Connection, record: &DeviceRecord) -> R
         )
         .map(|_| ())
         .map_err(ControllerError::registry)
+}
+
+/// What a device endpoint's rows decide about a new record, made before anything is spent.
+///
+/// An endpoint identity has at most one record that has neither been revoked nor expired, and the
+/// store's partial unique index holds that rule for every writer. This claim is the one path that
+/// decides it for a commit: it reads the endpoint's rows, writes the end of a grant that is due and
+/// not on record, and refuses a record that stands. [`insert_record`] takes the claim, so no
+/// record is inserted without one.
+#[derive(Debug)]
+pub(crate) struct Claim {
+    endpoint: EndpointKey,
+}
+
+/// Why an endpoint identity cannot take a new record now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClaimRefusal {
+    /// A record of the endpoint identity has neither been revoked nor expired, or this host cannot
+    /// prove that it has.
+    Live,
+    /// The earlier record's withdrawal of access has not finished.
+    Barrier,
+}
+
+impl ClaimRefusal {
+    /// The refusal as the controller gives it, with the words a person reads.
+    pub(crate) fn into_error(self) -> ControllerError {
+        self.into_error_until(None)
+    }
+
+    /// As [`Self::into_error`], naming the moment a pairing's invitation stays open until when the
+    /// refusal is that pairing's.
+    pub(crate) fn into_error_until(self, open_until: Option<&str>) -> ControllerError {
+        match self {
+            Self::Live => ControllerError::PermissionDenied {
+                detail: "This host still lists this device as paired. Remove the device from \
+                         this host first, then pair it again."
+                    .to_owned(),
+            },
+            Self::Barrier => ControllerError::Refused {
+                code: ErrorCode::ResourceUnavailable,
+                detail: match open_until {
+                    Some(time) => format!(
+                        "This host is still finishing an earlier withdrawal of access, so it \
+                         cannot add this device yet. Ask for a new confirmation in a minute; this \
+                         invitation stays open until {time}."
+                    ),
+                    None => "This host is still finishing an earlier withdrawal of access, so it \
+                             cannot add this device yet. Ask for a new confirmation in a minute."
+                        .to_owned(),
+                },
+            },
+        }
+    }
+}
+
+/// Every record of one endpoint identity, the one that has neither ended by a mark nor expired
+/// first, then the others newest first.
+fn endpoint_rows(connection: &Connection, endpoint_id: &EndpointKey) -> Result<Vec<DeviceRecord>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT device_id, endpoint_id, device_key_revision, authorisation_key,
+                    device_name, platform, grant, paired_at_ms, revoked_at_ms,
+                    expired_at_ms, committed_invitation_id, notification_preview,
+                    stored_envelope_key
+             FROM network_devices WHERE endpoint_id = ?1
+             ORDER BY (revoked_at_ms IS NULL AND expired_at_ms IS NULL) DESC,
+                      paired_at_ms DESC, device_id DESC",
+        )
+        .map_err(ControllerError::registry)?;
+    let rows = statement
+        .query_map(params![endpoint_id.as_bytes().as_slice()], |row| {
+            Ok(read_record(row))
+        })
+        .map_err(ControllerError::registry)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(ControllerError::registry)?;
+    rows.into_iter().collect()
+}
+
+/// Decides, on `connection`'s open transaction, whether `endpoint` can take a new record.
+///
+/// A record that carries a revoked or an expired mark has ended. A record whose grant never
+/// expires stands. A record without a mark whose grant `lifetimes` finds in force stands. One
+/// whose grant ran out and is owed its mark gets the mark now, at the moment it was first seen to
+/// have run out, and has ended. Any other record without a mark stands: this host writes no end it
+/// cannot prove, as a host whose clock is not trusted cannot prove one. `lifetimes` is `None`
+/// where no clock is read, and every record without a mark stands then.
+///
+/// A replacement, as against the first record of an endpoint identity, is refused while the
+/// withdrawal that ended the earlier record still owes its barrier. Nothing is written but the
+/// mark of a grant that ran out, which is a fact that stays.
+///
+/// # Errors
+///
+/// Returns an error when a row cannot be read or a mark cannot be written.
+pub(crate) fn claim_endpoint(
+    connection: &Connection,
+    lifetimes: Option<&super::lifetimes::GrantLifetimes>,
+    endpoint: &EndpointKey,
+) -> Result<std::result::Result<Claim, ClaimRefusal>> {
+    let rows = endpoint_rows(connection, endpoint)?;
+    let mut replaces = false;
+    for row in &rows {
+        let standing = if !row.is_paired() {
+            false
+        } else if matches!(row.grant.expiry, kr_protocol::grant::GrantExpiry::Never) {
+            true
+        } else if let Some(lifetimes) = lifetimes {
+            if lifetimes.in_force_now(row.device_id, &row.grant) {
+                true
+            } else if let Some(owed_at) = lifetimes.owed_expiry_at(row.device_id) {
+                write_expiry(connection, row.device_id, owed_at)?;
+                false
+            } else {
+                true
+            }
+        } else {
+            true
+        };
+        if standing {
+            return Ok(Err(ClaimRefusal::Live));
+        }
+        replaces = true;
+    }
+    if replaces && withdrawal_is_owed(connection)? {
+        return Ok(Err(ClaimRefusal::Barrier));
+    }
+    Ok(Ok(Claim {
+        endpoint: *endpoint,
+    }))
+}
+
+/// Writes the end of one device's grant, once: the first moment recorded stays. Returns whether it
+/// wrote.
+fn write_expiry(connection: &Connection, device_id: DeviceId, at: TimestampMs) -> Result<bool> {
+    let changed = connection
+        .execute(
+            "UPDATE network_devices SET expired_at_ms = ?2
+             WHERE device_id = ?1 AND expired_at_ms IS NULL",
+            params![
+                device_id.get().as_bytes().as_slice(),
+                i64::try_from(at.get()).unwrap_or(i64::MAX)
+            ],
+        )
+        .map_err(ControllerError::registry)?;
+    Ok(changed > 0)
+}
+
+/// Whether a withdrawal of authority that this file recorded has not finished its barrier: the
+/// environment owes a fence, or the grant store holds a debt of one.
+///
+/// The two marks are written by the withdrawal and cleared by the barrier that settles it, so
+/// "ended and nothing owed" means the work of the withdrawal finished. A file that has never run a
+/// withdrawal has neither table and owes nothing.
+fn withdrawal_is_owed(connection: &Connection) -> Result<bool> {
+    let table_has = |table: &str, column: &str| -> Result<bool> {
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                params![table, column],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count > 0)
+            .map_err(ControllerError::registry)
+    };
+    if table_has("environment", "fence_owed_revision")? {
+        let owed: i64 = connection
+            .query_row(
+                "SELECT COALESCE(MAX(fence_owed_revision), 0) FROM environment",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        if owed > 0 {
+            return Ok(true);
+        }
+    }
+    if table_has("fence_debt", "debt_id")? {
+        let debts: i64 = connection
+            .query_row("SELECT COUNT(*) FROM fence_debt", [], |row| row.get(0))
+            .map_err(ControllerError::registry)?;
+        if debts > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Rebuilds `network_devices` of a registry that records an earlier schema version, so that an
+/// endpoint identity is no longer unique in the table and the rule is the partial unique index.
+///
+/// The rows are carried across as they are, column for column. It runs inside the caller's
+/// transaction, which holds the version's write with it, and does nothing for a registry whose
+/// file has no device table (a registry in memory has no other writer).
+///
+/// SQLite's documented order for a rebuild is to make the new table, copy, drop the old table and
+/// then rename the new one. This renames the old table first, which is safe while no trigger, view
+/// or foreign key names `network_devices` other than the one this makes again: switch to the
+/// documented order when one does.
+///
+/// This goes in the first release after every install has opened the registry at the version that
+/// rebuilt it.
+///
+/// # Errors
+///
+/// Returns the first statement that fails, which leaves the caller to roll back.
+pub(crate) fn rebuild_for_one_live_record_per_endpoint(
+    connection: &Connection,
+) -> rusqlite::Result<()> {
+    let present: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'network_devices'",
+        [],
+        |row| row.get(0),
+    )?;
+    if present == 0 {
+        return Ok(());
+    }
+    let names: Vec<&str> = DEVICE_COLUMNS
+        .split(',')
+        .filter_map(|column| column.split_whitespace().next())
+        .collect();
+    let names = names.join(", ");
+    connection.execute_batch(&format!(
+        "ALTER TABLE network_devices RENAME TO network_devices_superseded;
+         {create_table}
+         INSERT INTO network_devices ({names}) SELECT {names} FROM network_devices_superseded;
+         DROP TABLE network_devices_superseded;
+         {create_trigger}
+         {create_indexes}",
+        create_table = create_devices_table(""),
+        create_trigger = create_devices_key_trigger(""),
+        create_indexes = create_devices_indexes(""),
+    ))
 }
 
 impl PairedDirectory for DeviceDirectory {
@@ -2064,8 +2369,27 @@ mod tests {
         assert_eq!(grant_id_of(&stored), device.grant.grant_id);
     }
 
+    /// The raw statement a writer that skips every product path would run.
+    fn insert_raw(directory: &DeviceDirectory, device: &DeviceRecord) -> Result<()> {
+        directory.with(|connection| {
+            connection.execute(
+                "INSERT INTO network_devices (
+                     device_id, endpoint_id, device_key_revision, authorisation_key, device_name,
+                     platform, grant_id, grant, paired_at_ms
+                 ) VALUES (?1, ?2, 1, ?3, 'a phone', 'android', ?4, x'', 1)",
+                params![
+                    device.device_id.get().as_bytes().as_slice(),
+                    device.endpoint_id.as_bytes().as_slice(),
+                    device.authorisation.as_bytes().as_slice(),
+                    device.grant.grant_id.get().as_bytes().as_slice(),
+                ],
+            )
+        })?;
+        Ok(())
+    }
+
     #[test]
-    fn one_endpoint_identity_belongs_to_one_device() {
+    fn one_live_record_belongs_to_one_endpoint_identity() {
         let directory = DeviceDirectory::in_memory().expect("a directory");
         let first = record(1);
         directory.commit(&first).expect("the row is written");
@@ -2073,8 +2397,64 @@ mod tests {
         second.endpoint_id = first.endpoint_id;
         assert!(
             directory.commit(&second).is_err(),
-            "a second device cannot claim an endpoint that already has a record"
+            "a second device cannot claim an endpoint whose record has not ended"
         );
+        assert!(
+            insert_raw(&directory, &second).is_err(),
+            "the index refuses a second live record whatever path inserts it"
+        );
+        assert_eq!(
+            directory
+                .rows_for_endpoint(&first.endpoint_id)
+                .expect("readable")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_ended_record_does_not_hold_its_endpoint_identity() {
+        for ended in ["revoked", "expired"] {
+            let directory = DeviceDirectory::in_memory().expect("a directory");
+            let first = record(1);
+            directory.commit(&first).expect("the row is written");
+            match ended {
+                "revoked" => assert!(
+                    directory
+                        .revoke(first.device_id, TimestampMs::new(5_000))
+                        .expect("revoked")
+                ),
+                _ => directory
+                    .record_expiry(first.device_id, TimestampMs::new(5_000))
+                    .expect("expired"),
+            }
+            let mut second = record(2);
+            second.endpoint_id = first.endpoint_id;
+            directory
+                .commit(&second)
+                .unwrap_or_else(|error| panic!("{ended}: a new record is committed: {error}"));
+            let peer = directory
+                .paired_peer(&first.endpoint_id)
+                .unwrap_or_else(|| panic!("{ended}: the endpoint is paired again"));
+            assert_eq!(peer.device_id, second.device_id, "{ended}");
+            assert!(
+                directory
+                    .record_for_device(first.device_id)
+                    .expect("readable")
+                    .is_some_and(|old| !old.is_paired()),
+                "{ended}: the ended record stays under its own device id"
+            );
+            assert!(
+                insert_raw(&directory, &record(3)).is_ok(),
+                "an unrelated endpoint is unaffected"
+            );
+            let mut third = record(4);
+            third.endpoint_id = first.endpoint_id;
+            assert!(
+                directory.commit(&third).is_err(),
+                "{ended}: the new record now holds the endpoint identity"
+            );
+        }
     }
 
     /// The four keys `device` declares, with the two further ones taken from `byte`.

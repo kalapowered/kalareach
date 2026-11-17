@@ -340,6 +340,12 @@ impl GrantLifetimes {
         false
     }
 
+    /// The moment a paired device's expiry is owed at, when it is owed and not written yet.
+    #[must_use]
+    pub(crate) fn owed_expiry_at(&self, device_id: DeviceId) -> Option<TimestampMs> {
+        self.pending_expiry.owed_at(device_id)
+    }
+
     /// Returns what a stored grant's lifetime is in this boot, anchoring it the first time anything
     /// asks, as a paired device's is.
     ///
