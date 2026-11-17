@@ -535,7 +535,7 @@ async fn a_prepare_that_waits_when_the_stop_comes_is_answered_in_the_stops_words
     daemon
         .controller
         .handover
-        .resume(Some(attempt))
+        .resume(Some(attempt), || Ok(()))
         .expect("the control attempt ends");
 
     // A create is under way, so the prepare waits; the stop comes while it does.
