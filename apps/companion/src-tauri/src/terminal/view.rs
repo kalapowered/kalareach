@@ -935,7 +935,7 @@ struct View {
     /// launch's number for the lane.
     holds: BTreeMap<RequestId, u32>,
     next_launch: u32,
-    /// Why the input lane could not be opened or ended, when it did.
+    /// Why the input lane could not be opened, when it did not open.
     lane_lost: Option<String>,
     target: ActionTarget,
     session_id: SessionId,
@@ -1906,9 +1906,6 @@ impl View {
                 // reach, is served as any other word of the lane. The connection's end reaches the
                 // loop through the session's own notifications.
                 self.lane = None;
-                // Whatever ended it, a key typed now is refused for an ended stream, which is what
-                // the lane is, and never for one that is not open yet.
-                self.lane_lost = Some("its input stream ended".to_owned());
                 // Whatever ended it, a view that holds the lease ends control: no key can be
                 // written under it any more, the keys of a new stream need a new epoch, and the
                 // lease's epoch is given back.
