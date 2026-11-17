@@ -19,8 +19,10 @@
 //! the one finding that names the place: a write in a function that may make none, each of the
 //! time contract's writers called from a pure reader or from the gate's standing comparison, a
 //! write in a helper that no row declares, in a helper that a listed body calls (the time
-//! contract's lock function; the question that checks a resolvable request), a name allowed for
-//! one body and called by another, and a new caller of a time-contract writer.
+//! contract's lock function; the question that checks a resolvable request), a write in a function
+//! that a `calls` row reaches (the journal's count of outstanding actions, the fence driver's
+//! detach, the input domain's fence), a name allowed for one body and called by another, and a new
+//! caller of a time-contract writer.
 
 #[path = "standing_scan/mod.rs"]
 mod scan;
