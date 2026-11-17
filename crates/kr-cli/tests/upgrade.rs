@@ -665,6 +665,39 @@ fn configure_the_host(host: &Host, address: Option<&str>, suite: bool) {
 }
 
 impl Updated {
+    /// Puts the registry back to the version the release before writes, over this build's tables,
+    /// so that a rollback to that release can be made.
+    ///
+    /// This build raised the registry past what the release before reads, so a rollback to it is
+    /// refused (`a_rollback_to_the_release_before_is_refused_for_the_registry_it_cannot_read`) and
+    /// no host that was updated can go back. A case whose subject is another store, and what the
+    /// release before makes of it, needs the rollback to go on, and the registry is not what it
+    /// asks about: it holds a registry as the earlier release's own tables name it, which is how
+    /// the registry's own cases leave a file at an earlier version. The daemon of this build stays
+    /// as it is until the rollback stops it, and the release before opens the file at the version
+    /// it writes.
+    fn puts_the_registry_back_for_the_release_before(&self) {
+        let registry = self
+            .one
+            .manifest
+            .stores
+            .iter()
+            .find(|store| store.store == "registry")
+            .expect("the release before lists its registry");
+        let connection =
+            rusqlite::Connection::open(self.host.tree.environment().registry_database())
+                .expect("the registry opens");
+        connection
+            .busy_timeout(Duration::from_secs(30))
+            .expect("waits for the daemon's writes");
+        connection
+            .execute(
+                "UPDATE schema_version SET version = ?1",
+                [i64::from(registry.version)],
+            )
+            .expect("the registry takes the version the release before writes");
+    }
+
     async fn new() -> Self {
         Self::start(Setup::default()).await
     }
@@ -1398,6 +1431,7 @@ async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_f
     // A session of this release: the older release's daemon does not retain its level.
     let (display, session_now) = host.new_session(&updated.kr_now());
     let worker_now = host.worker_process(session_now);
+    updated.puts_the_registry_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -1489,6 +1523,96 @@ async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_f
 /// A worker clears the application when its session closes, so the journal is written the way a
 /// worker that did not would write it, through the worker's own journal, once the session's worker
 /// has ended.
+/// What the registry file holds that a refused rollback must leave as it is: its version, the text
+/// of every table and index, and every device row.
+fn registry_as_it_stands(host: &Host) -> (i64, Vec<String>, Vec<Vec<rusqlite::types::Value>>) {
+    let connection = rusqlite::Connection::open_with_flags(
+        host.tree.environment().registry_database(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("the registry opens");
+    connection
+        .busy_timeout(Duration::from_secs(30))
+        .expect("waits for the daemon's writes");
+    let version = connection
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .expect("a version");
+    let schema = connection
+        .prepare("SELECT COALESCE(sql, name) FROM sqlite_master ORDER BY type, name")
+        .expect("the schema")
+        .query_map([], |row| row.get(0))
+        .expect("rows")
+        .collect::<Result<_, _>>()
+        .expect("every row");
+    let mut statement = connection
+        .prepare("SELECT * FROM network_devices ORDER BY device_id")
+        .expect("the device rows");
+    let columns = statement.column_count();
+    let devices = statement
+        .query_map([], |row| {
+            (0..columns).map(|column| row.get(column)).collect()
+        })
+        .expect("rows")
+        .collect::<Result<_, _>>()
+        .expect("every row");
+    (version, schema, devices)
+}
+
+/// This release writes the registry at a version that the release before does not read. A host
+/// that was updated cannot go back to it: the update check reads the registry's version, refuses
+/// the switch before it stops anything, and names the store and the versions the release before
+/// reads. The refusal changes nothing: the registry is as it was, the current release is still
+/// this one, and its daemon serves.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_to_the_release_before_is_refused_for_the_registry_it_cannot_read() {
+    let updated = Updated::new().await;
+    let host = &updated.host;
+    let before = registry_as_it_stands(host);
+    assert_eq!(
+        before.0,
+        kr_controller::registry::SCHEMA_VERSION,
+        "the update brought the registry to the version this release writes"
+    );
+
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the rollback is refused: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains("was not made")
+            && message.contains("no store was brought forward")
+            && message.contains("registry")
+            && message.contains(&format!(
+                "schema version {}",
+                kr_controller::registry::SCHEMA_VERSION
+            ))
+            && message.contains("reads versions"),
+        "the refusal names the registry, its version and what the release before reads: {said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(updated.two.name().clone()),
+        "nothing was switched"
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", updated.two.name()),
+        "the daemon of this release serves"
+    );
+    assert_eq!(
+        registry_as_it_stands(host),
+        before,
+        "the refusal leaves the registry as it was"
+    );
+    updated.the_worker_is_as_it_was().await;
+    host.close(&updated.kr_before(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_closed_session_naming_an_application_is_read_by_the_release_before_after_a_rollback() {
     let updated = Updated::new().await;
@@ -1551,6 +1675,7 @@ async fn a_closed_session_naming_an_application_is_read_by_the_release_before_af
 
     // And the release before's daemon reads the same journal after the rollback: the summary row
     // keeps the shape it reads, so the session shows as it did, with its shell and directory.
+    updated.puts_the_registry_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -1689,6 +1814,7 @@ async fn a_rollback_that_would_lift_an_organisations_adapter_list_is_refused_unt
     let (organisation_id, store) =
         enrolled_with_a_policy(&updated, Some(&["kalareach/codex"])).await;
 
+    updated.puts_the_registry_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -1771,6 +1897,7 @@ async fn a_rollback_goes_on_while_an_applied_policy_states_no_list_and_leaves_it
     let host = &updated.host;
     let (_, store) = enrolled_with_a_policy(&updated, None).await;
 
+    updated.puts_the_registry_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -1800,6 +1927,7 @@ async fn a_rollback_to_a_release_that_reads_the_organisation_store_goes_on_with_
     let host = &updated.host;
     let (_, store) = enrolled_with_a_policy(&updated, Some(&["kalareach/codex"])).await;
 
+    updated.puts_the_registry_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -2916,6 +3044,7 @@ async fn a_kept_answer_and_its_record_of_sends_are_sent_and_discarded_together_b
     // The host goes back to the release before: only its own session is live, so the rollback goes
     // on. Its `kr` reads the answer this release wrote, sends it to its own worker, and discards
     // the answer and the record of the send.
+    updated.puts_the_registry_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -3381,6 +3510,7 @@ async fn a_rollback_leaves_the_plugin_host_of_this_release_for_the_release_befor
     assert_runs_the_host_of(&this_host, updated.two.name());
 
     // The session of this release holds the rollback.
+    updated.puts_the_registry_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -3528,6 +3658,7 @@ async fn a_rollback_leaves_the_delivery_journal_at_version_11_and_the_release_be
 
     // The rollback starts the release before's daemon, which opens the journal at version 11,
     // reads the generation this release wrote and writes the next ones.
+    updated.puts_the_registry_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -3766,6 +3897,7 @@ async fn the_release_before_reads_the_journal_of_a_command_session_this_release_
 
     // The rollback goes on beside the release before's own session, and that release's `kr` reads
     // the closed session whole.
+    updated.puts_the_registry_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -3856,6 +3988,7 @@ async fn a_rollback_leaves_the_record_of_when_output_was_produced_and_the_releas
         times.display()
     );
 
+    updated.puts_the_registry_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -3997,6 +4130,7 @@ async fn a_rollback_from_a_daemon_of_a_later_public_major_goes_on_beside_the_ses
     updated.the_worker_is_as_it_was().await;
 
     let host = &updated.host;
+    updated.puts_the_registry_back_for_the_release_before();
     let (output, said) = host.kr_json_with(
         &[(LATER_MAJOR_VARIABLE, std::ffi::OsStr::new("2"))],
         &["host", "rollback", "--json"],
@@ -4208,6 +4342,7 @@ async fn a_stored_apply_node_is_admitted_across_an_update_and_a_rollback() {
     let updated = prepared.update().await;
     run("evt-after-the-update").await;
 
+    updated.puts_the_registry_back_for_the_release_before();
     let (output, said) = updated.host.kr_json(&["host", "rollback", "--json"]);
     assert!(
         output.status.success(),
@@ -4290,6 +4425,7 @@ async fn a_rollback_leaves_the_record_of_a_restored_policy_and_an_update_again_w
     assert_eq!(held.owed, vec![owed], "and kept the list");
     let written = std::fs::read(&file).expect("the record reads");
 
+    updated.puts_the_registry_back_for_the_release_before();
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -4754,6 +4890,7 @@ async fn a_report_store_the_release_before_keeps_too_is_kept_across_a_rollback_a
 
     // Back to the release before: it reads the result this release wrote, reads the rows of the
     // store of reports, and records a run of its own with a row beside them.
+    updated.puts_the_registry_back_for_the_release_before();
     let (output, said) = updated.host.kr_json(&["host", "rollback", "--json"]);
     assert!(
         output.status.success(),
