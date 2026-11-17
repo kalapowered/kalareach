@@ -658,6 +658,20 @@ pub struct WorkerService {
     /// compiled away in every shipped build.
     #[cfg(feature = "testing")]
     withdrawal_gap_stall: crate::testing::Stall,
+    /// A stop in the end of a connection, right after it has taken the attachments it still owns,
+    /// which this host's own tests arm to have a statement's sweep meet a connection whose list is
+    /// empty and whose detaches are not made yet. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    attachments_taken_stall: crate::testing::Stall,
+    /// A stop in the handler of a statement of what the local owner may do, right after the gate has
+    /// changed and the authority lock is let go, which this host's own tests arm to have another
+    /// statement arrive in between. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    after_the_gate_change_stall: crate::testing::Stall,
+    /// How many withdrawals are about to wait, or are waiting, for the attention fence's own lock,
+    /// which this host's own tests read. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    unbinds_waiting: std::sync::atomic::AtomicUsize,
     /// A stop in a mutation inside the dispatch boundary and the session, after the lease and the
     /// deadline were checked and before the marker is committed, which this host's own tests arm to
     /// have a lease end in between. It is compiled away in every shipped build.
@@ -1388,6 +1402,12 @@ impl WorkerService {
             connection_end_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             withdrawal_gap_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            attachments_taken_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            after_the_gate_change_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            unbinds_waiting: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "testing")]
             after_the_deadline_check_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
@@ -2469,6 +2489,47 @@ impl WorkerService {
         std::sync::mpsc::Sender<()>,
     ) {
         self.connection_end_stall.arm()
+    }
+
+    /// Stops the next statement of what the local owner may do right after the gate has changed
+    /// and the authority lock is let go, for this host's own tests.
+    ///
+    /// Returns the end that says the statement has arrived, and the end that lets it go. The stop
+    /// fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_a_statement_after_the_gate_changes(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.after_the_gate_change_stall.arm()
+    }
+
+    /// Stops the next connection that ends right after it has taken the attachments it still owns,
+    /// for this host's own tests.
+    ///
+    /// Returns the end that says the connection has arrived, and the end that lets it go. The stop
+    /// fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_a_connection_after_its_attachments_are_taken(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.attachments_taken_stall.arm()
+    }
+
+    /// How many withdrawals are about to wait, or are waiting, for the attention fence's own lock,
+    /// for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn unbinds_waiting_for_tests(&self) -> usize {
+        self.unbinds_waiting
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// How many times an answer to a statement of what the local owner may do has found a detach
@@ -4331,6 +4392,8 @@ impl WorkerService {
         #[cfg(feature = "testing")]
         self.connection_end_stall.stand();
         let attachments = state.facts.take_attachments();
+        #[cfg(feature = "testing")]
+        self.attachments_taken_stall.stand();
         // Counted until each is detached, here or by the service's own pass, so that a statement's
         // acknowledgement does not go out while a detach under the earlier statement is owed.
         self.withdrawals_running
@@ -5862,6 +5925,8 @@ impl WorkerService {
             };
             self.gate.apply(generation, access)
         };
+        #[cfg(feature = "testing")]
+        self.after_the_gate_change_stall.stand();
         // Counted once the gate has changed, before anything waits: the hold of the dispatch
         // boundary that is in place now is the last one that can have checked a local request
         // under the earlier statement, so it is the one the acknowledgement waits for.
@@ -6587,6 +6652,8 @@ impl WorkerService {
         }
         // And from the privacy fence, when it was the connection the fence speaks through: an
         // acknowledgement or a named generation from it no longer counts.
+        #[cfg(feature = "testing")]
+        let _waiting = WaitingCount::begin(&self.unbinds_waiting);
         self.attention_fence.ended(connection_id);
     }
 
