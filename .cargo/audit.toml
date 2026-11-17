@@ -38,15 +38,6 @@ ignore = [
     # compiles. The advisory reports no defect. Remove this once the lock no longer carries
     # proc-macro-error.
     "RUSTSEC-2024-0370",
-    # The unic crates 0.9.0 are unmaintained. They are the Unicode identifier tables urlpattern 0.3
-    # reads when the companion application parses the URL patterns in its capability files
-    # (tauri-utils). The advisories report no defect. Remove these once the lock carries no unic
-    # crate.
-    "RUSTSEC-2025-0075", # unic-char-range
-    "RUSTSEC-2025-0080", # unic-common
-    "RUSTSEC-2025-0081", # unic-char-property
-    "RUSTSEC-2025-0098", # unic-ucd-version
-    "RUSTSEC-2025-0100", # unic-ucd-ident
     # zip 8.6.0 has eight advisories about reading an archive that an attacker made. Its one user
     # here is the build script of libsodium-sys-stable, which for a Windows (MSVC) target unpacks
     # libsodium's prebuilt libraries from an archive on libsodium's download host. The crate does
