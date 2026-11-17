@@ -7433,6 +7433,12 @@ async fn release_of_the_epoch_within_the_bound(
         .call_within(AFTER_BARRIER)
         .await
         .expect("the lease was given back within the bound");
+    names_the_epoch_and_no_position(&release, epoch);
+    release
+}
+
+/// That `release` gives back the lease of `epoch` and names no position.
+fn names_the_epoch_and_no_position(release: &scripted_worker::Call, epoch: u64) {
     assert_eq!(release.method, Method::InputRelease.to_string());
     assert_eq!(
         release.params::<InputReleaseParams>().epoch.get(),
@@ -7440,11 +7446,10 @@ async fn release_of_the_epoch_within_the_bound(
         "the epoch that the host granted is the one given back"
     );
     assert_eq!(
-        position(&release),
+        position(release),
         None,
         "no stream is left to name a position on"
     );
-    release
 }
 
 /// The page was never shown the view as controlling.
@@ -7694,7 +7699,13 @@ async fn a_view_that_holds_the_lease_ends_control_when_the_host_finishes_its_inp
         ended["control"]["ended"], "Control ended: this view's input stream ended.",
         "the stream's words, whole"
     );
-    let release = release_of_the_epoch_within_the_bound(&mut link, lease.epoch).await;
+    let given_back = link.call_within(AFTER_BARRIER).await;
+    assert!(
+        given_back.is_some(),
+        "a lane that ends over a session that stands gives the lease back: no release reached the link"
+    );
+    let release = given_back.expect("a release, as asserted");
+    names_the_epoch_and_no_position(&release, lease.epoch);
     assert_eq!(
         page.app
             .state::<companion_tauri::terminal::TerminalViews>()
