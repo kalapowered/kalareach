@@ -490,3 +490,19 @@ fn a_row_that_repeats_the_key_of_an_earlier_row_is_refused() {
         assert!(refused.is_err(), "{text}");
     }
 }
+
+#[test]
+fn a_name_that_a_body_allows_and_declares_a_target_for_is_reported() {
+    // The follow skips an allowed name, so a `calls` row beside an `allow` row would read nothing.
+    let text = format!(
+        "{}\nallow {SERVICE} check_local_standing check_bound\n",
+        include_str!("standing_takes.txt")
+    );
+    let found = scan::violations(&scan::tree(), &scan::parse(&text), TAKES);
+    assert!(
+        found.iter().any(|line| line.contains(&format!(
+            "allow {SERVICE} check_local_standing check_bound and calls {SERVICE} check_local_standing check_bound"
+        ))),
+        "{found:?}"
+    );
+}
