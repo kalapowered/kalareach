@@ -68,6 +68,9 @@ const ENDED_BY_ENCODING: &str =
 const ENDED_BY_LOST_LEASE: &str =
     "Control ended: another view took it, or the program changed how it reads keys.";
 
+/// Why control ended when the view's input stream ended while the view held the lease.
+const ENDED_BY_STREAM: &str = "Control ended: this view's input stream ended.";
+
 /// Why a view did not take an input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refused {
@@ -566,12 +569,26 @@ impl Lease {
     /// Returns whether control changed; a lease that is not held changes nothing, and a take in
     /// flight is left to the session's answer.
     pub fn unsupported(&mut self) -> bool {
+        self.end_held(ENDED_BY_ENCODING)
+    }
+
+    /// The view's input stream ended while the view held the lease. Control ends as a refused write
+    /// ends it, and the lease is given back, once: the keys of a new stream need a new epoch, which
+    /// the next take acquires. Returns whether control changed; a lease that is not held changes
+    /// nothing.
+    pub fn stream_ended(&mut self) -> bool {
+        self.end_held(ENDED_BY_STREAM)
+    }
+
+    /// Ends control for `why`: the view stops wanting it, writes nothing more, and gives back the
+    /// lease it holds, once.
+    fn end_held(&mut self, why: &str) -> bool {
         let Some(held) = self.held.take() else {
             return false;
         };
         self.wanted = false;
         self.owed.push_back(held.epoch);
-        self.ended = Some(ENDED_BY_ENCODING.to_owned());
+        self.ended = Some(why.to_owned());
         true
     }
 
@@ -964,6 +981,24 @@ mod tests {
         assert!(lease.releases_wait(), "sent once more");
         lease.answered(RequestId::new(31), refusal(ErrorCode::PermissionDenied));
         assert!(!lease.releases_wait(), "refused, so answered");
+    }
+
+    /// The end of the view's input stream ends control and gives the epoch back, once, with words
+    /// of its own; a lease that is not held changes nothing.
+    #[test]
+    fn the_end_of_the_input_stream_ends_control_and_gives_the_epoch_back() {
+        let mut lease = holding();
+        assert!(lease.stream_ended());
+        let control = lease.control();
+        assert_eq!(control.state, ControlState::Watching);
+        assert_eq!(
+            control.ended.as_deref(),
+            Some("Control ended: this view's input stream ended.")
+        );
+        assert_eq!(lease.owed(), Some(Owed::Release(InputLeaseEpoch::new(5))));
+        assert_eq!(lease.owed(), None, "given back once");
+        assert!(lease.write(1).is_err());
+        assert!(!lease.stream_ended(), "nothing held, nothing changes");
     }
 
     #[test]

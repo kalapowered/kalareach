@@ -1861,6 +1861,11 @@ impl View {
                     EndCause::Reset | EndCause::Breach(_) | EndCause::Uncertain(_)
                 ) {
                     self.lane_lost = Some("its input stream ended".to_owned());
+                    // A view that holds the lease ends control: the keys of a new stream need a new
+                    // epoch, and the lease's epoch is given back.
+                    if self.lease.stream_ended() {
+                        self.control_changed();
+                    }
                 }
                 None
             }

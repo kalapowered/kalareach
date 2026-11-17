@@ -6940,3 +6940,56 @@ async fn a_launch_after_a_refused_release_is_sent_and_not_told_that_a_release_wa
         .expect("joins")
         .expect("the launch was installed");
 }
+
+/// A view that holds the lease when its input stream ends ends control, in words of its own for the
+/// page, and gives the lease's epoch back: the release goes on the control stream, names no
+/// position (the stream is gone), and names the epoch the view held. `how` is what the host does
+/// to end the stream.
+async fn control_ends_with_the_stream(how: impl FnOnce(&ScriptedHost)) {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    how(&host);
+    let ended = page
+        .newest_within(3, |state| control(state) == (1, "watching".to_owned()))
+        .await
+        .expect("the end of the stream ended control within the bound");
+    assert_eq!(
+        ended["control"]["ended"], "Control ended: this view's input stream ended.",
+        "the view's sentence for an ended stream, whole"
+    );
+    let release = link
+        .call_within(AFTER_BARRIER)
+        .await
+        .expect("the epoch was given back within the bound");
+    assert_eq!(release.method, Method::InputRelease.to_string());
+    assert_eq!(position(&release), None, "the stream is gone: no position");
+    assert_eq!(
+        release.params::<InputReleaseParams>().epoch.get(),
+        lease.epoch,
+        "the release names the epoch the view held"
+    );
+    assert_eq!(
+        code(
+            &page
+                .text(&view, 1, "late")
+                .expect_err("an input of the ended take")
+        ),
+        "LEASE_LOST"
+    );
+}
+
+/// The host resets the input stream while the view holds the lease.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_view_that_holds_the_lease_ends_control_when_the_host_resets_its_input_stream() {
+    control_ends_with_the_stream(|host| host.script.say(Out::Reset)).await;
+}
+
+/// The host breaks the stream's contract (it accepts a frame that was never written), the lane
+/// resets the stream, and the view that holds the lease ends control.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_view_that_holds_the_lease_ends_control_when_the_host_breaks_the_streams_contract() {
+    control_ends_with_the_stream(|host| host.script.accept(1, 5)).await;
+}
