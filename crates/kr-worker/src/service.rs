@@ -619,6 +619,22 @@ pub struct WorkerService {
     /// preparation for as long as they need. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     preparation_stall: crate::testing::Stall,
+    /// A stop in the withdrawal of local connections, after it has seen one connection's attachment
+    /// list empty and before it looks at that connection's delivery slot, which this host's own
+    /// tests arm to have the connection attach and subscribe in between. It is compiled away in
+    /// every shipped build.
+    #[cfg(feature = "testing")]
+    withdrawal_look_stall: crate::testing::Stall,
+    /// A stop in the start of a delivery, once it has taken its connection's delivery slot and
+    /// before it takes the connection registry, which this host's own tests arm to hold the two
+    /// locks of a delivery's start apart. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    delivery_slot_stall: crate::testing::Stall,
+    /// A stop at the end of the start of a delivery, after it has let go of the slot and the
+    /// registry, which this host's own tests arm to learn that the start has finished. It is
+    /// compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    delivery_end_stall: crate::testing::Stall,
     /// How long, in milliseconds, an admitted operation has to reach its upstream, which this
     /// host's own tests shorten to reach the deadline without waiting out the shipped one. It is
     /// compiled away in every shipped build.
@@ -1277,6 +1293,12 @@ impl WorkerService {
             fence_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             preparation_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            withdrawal_look_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            delivery_slot_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            delivery_end_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             upstream_deadline_ms: std::sync::atomic::AtomicU64::new(
                 u64::try_from(UPSTREAM_SUBMIT_DEADLINE.as_millis()).unwrap_or(u64::MAX),
@@ -2224,6 +2246,55 @@ impl WorkerService {
         std::sync::mpsc::Sender<()>,
     ) {
         self.fence_stall.arm()
+    }
+
+    /// Stops the next withdrawal of local connections after it has seen a connection's attachment
+    /// list empty and before it looks at that connection's delivery slot, for this host's own
+    /// tests.
+    ///
+    /// Returns the end that says the withdrawal has arrived, and the end that lets it go. The stop
+    /// fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_withdrawal_after_an_empty_look(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.withdrawal_look_stall.arm()
+    }
+
+    /// Stops the next start of a delivery once it has taken its connection's delivery slot and
+    /// before it takes the connection registry, for this host's own tests.
+    ///
+    /// Returns the end that says the start has arrived, and the end that lets it go. The stop
+    /// fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_delivery_after_its_slot(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.delivery_slot_stall.arm()
+    }
+
+    /// Stops the next start of a delivery at its end, after it has let go of the slot and the
+    /// registry, for this host's own tests.
+    ///
+    /// Returns the end that says the start has finished, and the end that lets it go. The stop
+    /// fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_delivery_at_the_end_of_its_start(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.delivery_end_stall.arm()
     }
 
     /// Sets how long an admitted operation has to reach its upstream before the worker records an
@@ -3934,12 +4005,16 @@ impl WorkerService {
                 // waiting for this loop to come back round. Installing the handle and deciding
                 // whether the task may start happen under the registration's own lock, so a
                 // withdrawal either finds the handle and aborts the task, or arrives first and the
-                // permit is never sent.
+                // permit is never sent. The slot is held while the registry is taken, so nothing
+                // may hold the registry while it waits for a slot: the withdrawal of local
+                // connections copies what it needs and lets the registry go first.
                 let still_admitted = {
                     let mut held = registration
                         .delivery
                         .lock()
                         .expect("the delivery slot is not poisoned");
+                    #[cfg(feature = "testing")]
+                    self.delivery_slot_stall.stand();
                     let admitted = self
                         .admitted
                         .lock()
@@ -3950,6 +4025,8 @@ impl WorkerService {
                     }
                     admitted
                 };
+                #[cfg(feature = "testing")]
+                self.delivery_end_stall.stand();
                 // The permit is sent now, or, where a test holds this delivery back, kept until the
                 // delivery is replaced.
                 #[cfg(feature = "testing")]
@@ -5549,15 +5626,26 @@ impl WorkerService {
 
     /// Withdraws every local connection that holds an attachment or a subscription.
     ///
-    /// The authority lock is not held: a withdrawal takes each connection's writer.
+    /// The authority lock is not held: a withdrawal takes each connection's writer. The connection
+    /// registry is let go before any connection's lists or delivery slot are looked at, because a
+    /// delivery's start takes a slot and then the registry, the other way round.
     fn withdraw_local_connections(&self) {
-        let holding: Vec<ConnectionId> = self
+        let connections: Vec<(ConnectionId, Registration)> = self
             .admitted
             .lock()
             .expect("the connection registry is not poisoned")
             .iter()
-            .filter(|(_, registration)| registration.local_and_holding())
-            .map(|(connection_id, _)| *connection_id)
+            .map(|(connection_id, registration)| (*connection_id, registration.clone()))
+            .collect();
+        let holding: Vec<ConnectionId> = connections
+            .into_iter()
+            .filter(|(_, registration)| {
+                registration.local_and_holding(|| {
+                    #[cfg(feature = "testing")]
+                    self.withdrawal_look_stall.stand();
+                })
+            })
+            .map(|(connection_id, _)| connection_id)
             .collect();
         for connection_id in holding {
             self.withdraw(connection_id);
@@ -12250,21 +12338,32 @@ struct Registration {
 impl Registration {
     /// Whether this is a local connection that holds something a restriction of the local owner's
     /// access has to take back: an attachment, or a delivery.
-    fn local_and_holding(&self) -> bool {
-        self.writable
+    ///
+    /// The lists and the slot are shared with the connection's own, so this reads what the
+    /// connection holds now. `after_an_empty_list` runs between the look at the attachments, which
+    /// holds nothing when it runs, and the look at the delivery slot.
+    fn local_and_holding(&self, after_an_empty_list: impl FnOnce()) -> bool {
+        if !self
+            .writable
             .local
             .as_ref()
             .is_some_and(|local| local.is_local())
-            && (!self
-                .attachments
-                .lock()
-                .expect("the attachment list is not poisoned")
-                .is_empty()
-                || self
-                    .delivery
-                    .lock()
-                    .expect("the delivery slot is not poisoned")
-                    .is_some())
+        {
+            return false;
+        }
+        let attached = !self
+            .attachments
+            .lock()
+            .expect("the attachment list is not poisoned")
+            .is_empty();
+        if attached {
+            return true;
+        }
+        after_an_empty_list();
+        self.delivery
+            .lock()
+            .expect("the delivery slot is not poisoned")
+            .is_some()
     }
 }
 

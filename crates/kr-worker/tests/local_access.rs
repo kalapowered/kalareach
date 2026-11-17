@@ -977,3 +977,170 @@ async fn a_method_the_worker_does_not_serve_is_refused_as_unlisted() {
     assert_eq!(mutation.message, kr_protocol::local::METHOD_NOT_REACHABLE);
     world.close();
 }
+
+/// Runs `work` as a task and waits for its end on a thread of the blocking pool, until `deadline`.
+///
+/// While a path of the worker is held, or stuck, the runtime's own timers are not a wait to rely
+/// on, so the wait is a thread that does not belong to the runtime's workers. Returns what `work`
+/// gave, or nothing when it had not ended by `deadline`.
+async fn ends_by<T: Send + 'static>(
+    deadline: std::time::Instant,
+    work: impl std::future::Future<Output = T> + Send + 'static,
+) -> Option<T> {
+    let (done, ended) = std::sync::mpsc::channel();
+    tokio::spawn(async move {
+        let _ = done.send(work.await);
+    });
+    tokio::task::spawn_blocking(move || {
+        ended
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .ok()
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Whether `condition` holds by `deadline`, looked at on a thread of the blocking pool.
+async fn holds_by(
+    deadline: std::time::Instant,
+    condition: impl Fn() -> bool + Send + 'static,
+) -> bool {
+    tokio::task::spawn_blocking(move || {
+        while !condition() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// What the meeting of a withdrawal and a delivery's start came to.
+struct Meeting {
+    withdrawal_ended: bool,
+    delivery_ended: bool,
+    withdrawn: bool,
+}
+
+/// One connection that attaches and subscribes between a withdrawal's look at its empty attachment
+/// list and its look at its delivery slot, and whose delivery's start holds that slot while it
+/// waits for the connection registry.
+///
+/// Returns what the schedule came to, or the step that did not happen.
+async fn the_meeting_of_a_withdrawal_and_a_delivery_start() -> Result<Meeting, &'static str> {
+    let world = Arc::new(world("sleep 30", true).await);
+    let mut window = world.window().await;
+    let mut daemon = world.authority(1).await;
+    tell(&mut daemon, open(1)).await;
+    world
+        .read(&mut window)
+        .await
+        .expect("the window is served under an open host");
+
+    let (withdrawal_arrived, withdrawal_go) = world.service.stall_withdrawal_after_an_empty_look();
+    let (slot_arrived, slot_go) = world.service.stall_delivery_after_its_slot();
+    let (end_arrived, end_go) = world.service.stall_delivery_at_the_end_of_its_start();
+    // The end of the start is only watched: nothing holds it.
+    drop(end_go);
+    let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+
+    // The host takes access away with a lease that is still valid, so the window is served again
+    // under it. The worker withdraws what the window holds, and stops after its look at the
+    // window's empty list.
+    let lease = world.machine.lease(2, FAR_MS, FAR_MS);
+    let (told, told_end) = std::sync::mpsc::channel();
+    tokio::spawn(async move {
+        tell(&mut daemon, lease).await;
+        let _ = told.send(());
+    });
+    if ends_by(deadline, async move { withdrawal_arrived.await.is_ok() }).await != Some(true) {
+        return Err("the withdrawal never reached its look at the window's empty list");
+    }
+
+    // While it stands there, the window attaches and subscribes, and the delivery's start takes
+    // the window's slot.
+    let attached = Arc::clone(&world);
+    let subscribed = ends_by(deadline, async move {
+        let attachment = attached.attach(&mut window).await;
+        attached.subscribe(&mut window, attachment).await;
+        window
+    })
+    .await;
+    let Some(window) = subscribed else {
+        return Err("the window did not attach and subscribe");
+    };
+    if ends_by(deadline, async move { slot_arrived.await.is_ok() }).await != Some(true) {
+        return Err("the delivery's start never took the window's slot");
+    }
+
+    withdrawal_go.send(()).expect("lets the withdrawal go");
+    slot_go.send(()).expect("lets the delivery's start go");
+
+    // Both have to end. Where they wait for each other, neither does.
+    let withdrawal_ended = tokio::task::spawn_blocking(move || {
+        told_end
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .is_ok()
+    })
+    .await
+    .unwrap_or(false);
+    let delivery_ended =
+        ends_by(deadline, async move { end_arrived.await.is_ok() }).await == Some(true);
+    let held = Arc::clone(&world);
+    let withdrawn = holds_by(deadline, move || held.holds_nothing()).await;
+    if withdrawal_ended && delivery_ended && withdrawn {
+        drop(window);
+        world.close();
+    }
+    Ok(Meeting {
+        withdrawal_ended,
+        delivery_ended,
+        withdrawn,
+    })
+}
+
+/// KR-REQ-17.54: a withdrawal of the local owner's connections and the start of a delivery on one
+/// of them do not wait for each other.
+///
+/// The host takes access away from the local owner with a lease that is still valid. The worker
+/// has looked at a window that holds nothing when the window attaches and subscribes, and the
+/// start of its delivery holds the window's delivery slot while it waits for the connection
+/// registry. The withdrawal goes on to the slot, and has to find the window holding a delivery and
+/// withdraw it. A withdrawal that held the registry while it waited for the slot would wait for a
+/// delivery that waits for the registry, and the worker would stop answering.
+///
+/// The two paths run on the runtime's threads, and what the test waits on is a thread of its own,
+/// with a deadline. Where they do wait for each other their threads never come back, so the
+/// runtime is let go of without waiting for them.
+#[test]
+fn a_withdrawal_and_a_delivery_start_on_one_connection_both_end() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(the_meeting_of_a_withdrawal_and_a_delivery_start())
+    }));
+    runtime.shutdown_background();
+    let meeting = match outcome {
+        Ok(Ok(meeting)) => meeting,
+        Ok(Err(step)) => panic!("the schedule did not come about: {step}"),
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    assert!(
+        meeting.withdrawal_ended && meeting.delivery_ended,
+        "the withdrawal and the delivery's start did not both end (withdrawal ended: {}, \
+         delivery's start ended: {}): each waits for the lock the other holds",
+        meeting.withdrawal_ended,
+        meeting.delivery_ended,
+    );
+    assert!(
+        meeting.withdrawn,
+        "the window that held a delivery was not withdrawn"
+    );
+}
