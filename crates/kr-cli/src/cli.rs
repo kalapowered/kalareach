@@ -1416,13 +1416,17 @@ pub enum HostCommand {
     /// command cannot tell), or a holder that did not answer gave way to a daemon, with nothing
     /// stopped or started. Exit 3: the host is not set up for the restart, the daemon's launch
     /// differs from this command's start, the daemon could not be reached, or the request could not
-    /// be made (nothing was stopped in each of these); or the start could not be set up after the
-    /// stop (the message says which). Exit 8: the refusal inside a session, or a refusal of the stop
-    /// request that says it was not allowed. Exit 1: every other failure, among them a daemon or a
+    /// be made (nothing was stopped in each of these); or the start could not be set up (after the
+    /// stop, or where no daemon ran, or where a holder gave way; the message says which). Exit 8:
+    /// the refusal inside a session, or the daemon's refusal of the host read or of the stop
+    /// request, in the daemon's own words. Exit 1: every other failure, among them a daemon or a
     /// holder that does not answer, a daemon of another build, a start that failed after the stop,
     /// a daemon that answers and cannot be shown to serve, and an interrupt; the message says what
-    /// was stopped and what was started. With `--json`, `stop`, `pid`, `unsettled`, `started`,
-    /// `serving` and `launched` carry the result.
+    /// was stopped and what was started. With `--json`, a result where a control daemon answers
+    /// carries `stop`, `pid`, `unsettled`, `started`, `serving` and `launched`; a failure carries
+    /// `ok` false, `code`, `message` and `exit_code` beside `stop`, `pid`, `unsettled` and a null
+    /// `started`, and no `serving` or `launched`, and the refusal inside a session carries no
+    /// `started` either.
     ///
     /// The command proves that the daemon which answers is the one it started by the process that
     /// daemon states and, where it read the generation of the daemon that it stopped, a newer
