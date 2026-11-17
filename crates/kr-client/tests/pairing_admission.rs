@@ -643,12 +643,13 @@ async fn kr_req_17_48_a_fault_of_the_service_stands_while_the_next_request_is_on
     assert_eq!(order.lost_dial(), a_fault(20), "after the failure");
 }
 
-/// KR-REQ-10.54, KR-REQ-17.40, KR-REQ-17.48: a request that fails a few milliseconds after the http
-/// client's twenty seconds finds the old answer still standing and lifts it, so that a lost dial is
-/// told the lack of capacity at every moment from the request's start to the time the device asks
-/// again. The request is made at 52, fails at 72.003, and the device asks again at 92.003.
+/// KR-REQ-10.54, KR-REQ-17.40, KR-REQ-17.48: a request that fails some seconds after it was made, at
+/// a time later than the one the answer was kept to, finds the old answer still standing and lifts
+/// it, so that a lost dial is told the lack of capacity at every moment from the request's start to
+/// the time the device asks again. The answer is kept to 60; the request is made at 52, fails at
+/// 72.003, and the device asks again at 92.003.
 #[tokio::test]
-async fn kr_req_17_48_a_request_that_fails_just_after_the_http_deadline_leaves_no_gap() {
+async fn kr_req_17_48_a_request_that_fails_some_seconds_after_it_was_made_leaves_no_gap() {
     let mut order = OnItsWay::start(no_answer(), 52).await;
     for second in [52, 59, 60, 62, 65, 71, 72] {
         assert_eq!(
@@ -660,7 +661,7 @@ async fn kr_req_17_48_a_request_that_fails_just_after_the_http_deadline_leaves_n
     assert_eq!(
         order.at_ms(72_003).lost_dial(),
         no_capacity(0),
-        "just after the deadline, with the request still on its way"
+        "past the time the answer was kept to, with the request still on its way"
     );
 
     order.the_request_ends().await;
