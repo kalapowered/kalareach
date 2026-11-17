@@ -5411,6 +5411,54 @@ async fn a_key_answered_before_the_view_read_its_acceptance_does_not_stop_the_de
     );
 }
 
+/// A key that the worker could not say it took ends the lane, whose end the held view has not read:
+/// a close that the view serves first still writes the detach whole, as the key has its answer and
+/// the lane writes nothing more. The release that stands behind the key is never written, since the
+/// lane ends before its turn; the case gives the lane's writer the time of a quiet to read the
+/// refusal that is already on the connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_close_before_the_view_read_the_end_of_its_lane_still_writes_the_detach() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let mut lease = WorkerLease::at(4);
+    let (view, mut link) =
+        controlling(&page, &mut worker, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    page.text(&view, 1, "a").expect("the key is taken");
+    let key = link.expect(Method::InputWrite).await;
+    page.release(&view, 2);
+    page.newest(3, |state| control(state) == (2, "watching".to_owned()))
+        .await;
+    link.push("session.resync", &resync_marker(60)).await;
+    let _subscribe = link.expect(Method::EventsSubscribe).await;
+    let first = page.states(3).len();
+    let held = Held::new(&page.gate);
+    link.restart_stream();
+    screen(&mut link, 2, 60, vec![row(0, "one"), row(1, "two")], 0).await;
+    // The view is inside the first state it published after the marker, and takes nothing.
+    page.state(3, first).await;
+    link.refuse_with(&key, ErrorCode::OutcomeUnknown, "no word of it")
+        .await;
+    assert!(
+        link.quiet_for(QUIET).await,
+        "the release behind the key is not written: the lane ended before its turn"
+    );
+    page.app
+        .state::<companion_tauri::terminal::TerminalViews>()
+        .closer(&view)();
+    drop(held);
+    page.held_becomes(0).await;
+    let sent = link.closed().await;
+    assert_eq!(
+        methods(&sent)
+            .iter()
+            .filter(|method| **method == "session.detach")
+            .count(),
+        1,
+        "the detach was written whole: {:?}",
+        methods(&sent)
+    );
+}
+
 /// A key that the worker answered, whose acceptance the view has read from the lane and set aside
 /// behind an update that it serves first, does not keep a close that is served meanwhile from
 /// writing the detach whole. The view is held inside the state of a first update; a second update

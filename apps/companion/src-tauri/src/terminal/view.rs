@@ -2221,14 +2221,16 @@ impl View {
     /// Writes the detach whole, behind the typing the lane holds.
     ///
     /// On a link that carries the typing as requests it is queued behind the keys, and only where
-    /// the lane has no key queued or in flight, in any epoch, which the lane says: the view waits
-    /// for the detach to be written, and nothing stands between the lane's writer and it. Where a
-    /// key that the host has not answered holds the writer, nothing is queued, and the
-    /// connection's end, which the worker detaches on, is what ends the attachment. On a link
-    /// with a stream of its own the detach waits for the lane to say the host has the typing, which
-    /// the lane bounds. Whatever it waits for, the view reads and drops what the session says
-    /// meanwhile, so that the session's reader, which waits for room in its channel while the view
-    /// does not read, is never what the wait waits for.
+    /// the lane says it has no key queued or in flight, in any epoch, which a lane that has ended
+    /// says always: the view waits for the detach to be written. No key stands between the lane's
+    /// writer and it, but a request queued among the keys, a release or a launch, can, and each
+    /// has the lane's bound of 30 seconds for its own write. Where a key that the host has not
+    /// answered holds the writer, nothing is queued, and the connection's end, which the worker
+    /// detaches on, is what ends the attachment. On a link with a stream of its own the detach
+    /// waits for the lane to say the host has the typing, which the lane bounds. Whatever it waits
+    /// for, the view reads and drops what the session says meanwhile, so that the session's reader,
+    /// which waits for room in its channel while the view does not read, is never what the wait
+    /// waits for.
     async fn detach(&mut self) {
         let attachment_id = self.attachment.attachment_id;
         let params = move |after_input| SessionDetachParams {
