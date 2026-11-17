@@ -469,6 +469,11 @@ fn as_the_table_says(text: &str, ground: &Ground, temporary: &Path) -> String {
 /// this time is not waiting for a program: it is stood at, and says so.
 const CASE_BOUND: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// How long the helper that a case starts in a process of its own is given. It is shorter than the
+/// case's, so that a helper that does not end fails with its own message and the case that started
+/// it, which waits for it to exit, fails on that and not on its own bound.
+const CHILD_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// How long a case that only reads text is given.
 const TEXT_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -526,59 +531,73 @@ fn a_call_folder_in_slash_tmp_is_replaced_by_its_id_once() {
 /// it was, and at the profile question no record is written.
 #[test]
 fn the_install_says_what_the_table_says_for_every_way_that_the_walk_makes() {
-    let temporary = std::env::temp_dir();
-    for stand in stands() {
-        if stand.way == "not_prepared" || stand.way == "wait_failed" {
-            continue;
-        }
-        for dry_run in [true, false] {
-            let ground = ground();
-            let name = format!(
-                "{} {} ({}), dry run {dry_run}",
-                question_name(stand.question),
-                stand.way,
-                stand.state
-            );
-            let program = if stand.way == "not_started" {
-                ground.root.join("not-there")
-            } else {
-                a_program_that(&ground.root, &stand.body)
-            };
-            let before = held_under(&ground.home);
-            let said = the_install_says(&ground, stand.question, &program, &host_paths(), dry_run)
-                .unwrap_or_else(|| panic!("{name}: the install went on"));
-            assert_eq!(
-                as_the_table_says(&said, &ground, &temporary),
-                cell(stand.question, stand.way),
-                "{name}"
-            );
-            assert_eq!(held_under(&ground.home), before, "{name}: the home changed");
-            // The profile question ends the install before the record is held; the other two end it
-            // at the profile that they were asked about, after the record names the file, so the
-            // record is only held to be absent where no file was named.
-            assert!(
-                stand.question != Question::Profiles || !ground.state.join("state").exists(),
-                "{name}: a record was written"
-            );
-        }
-    }
+    within(
+        "the_install_says_what_the_table_says_for_every_way_that_the_walk_makes",
+        CASE_BOUND,
+        || {
+            let temporary = std::env::temp_dir();
+            for stand in stands() {
+                if stand.way == "not_prepared" || stand.way == "wait_failed" {
+                    continue;
+                }
+                for dry_run in [true, false] {
+                    let ground = ground();
+                    let name = format!(
+                        "{} {} ({}), dry run {dry_run}",
+                        question_name(stand.question),
+                        stand.way,
+                        stand.state
+                    );
+                    let program = if stand.way == "not_started" {
+                        ground.root.join("not-there")
+                    } else {
+                        a_program_that(&ground.root, &stand.body)
+                    };
+                    let before = held_under(&ground.home);
+                    let said =
+                        the_install_says(&ground, stand.question, &program, &host_paths(), dry_run)
+                            .unwrap_or_else(|| panic!("{name}: the install went on"));
+                    assert_eq!(
+                        as_the_table_says(&said, &ground, &temporary),
+                        cell(stand.question, stand.way),
+                        "{name}"
+                    );
+                    assert_eq!(held_under(&ground.home), before, "{name}: the home changed");
+                    // The profile question ends the install before the record is held; the other two end it
+                    // at the profile that they were asked about, after the record names the file, so the
+                    // record is only held to be absent where no file was named.
+                    assert!(
+                        stand.question != Question::Profiles
+                            || !ground.state.join("state").exists(),
+                        "{name}: a record was written"
+                    );
+                }
+            }
+        },
+    );
 }
 
 /// An answer that is used at every question is nothing to say: the install goes on, and the table
 /// says so.
 #[test]
 fn an_answer_that_is_used_at_every_question_is_nothing_to_say() {
-    let ground = ground();
-    let program = a_program_that(&ground.root, &the_right_answers(&ground.home));
-    for question in QUESTIONS {
-        assert_eq!(
-            the_install_says(&ground, question, &program, &host_paths(), true),
-            None,
-            "{}",
-            question_name(question)
-        );
-        assert_eq!(cell(question, "used"), NOTHING);
-    }
+    within(
+        "an_answer_that_is_used_at_every_question_is_nothing_to_say",
+        CASE_BOUND,
+        || {
+            let ground = ground();
+            let program = a_program_that(&ground.root, &the_right_answers(&ground.home));
+            for question in QUESTIONS {
+                assert_eq!(
+                    the_install_says(&ground, question, &program, &host_paths(), true),
+                    None,
+                    "{}",
+                    question_name(question)
+                );
+                assert_eq!(cell(question, "used"), NOTHING);
+            }
+        },
+    );
 }
 
 /// Every way of every question is made by a stand-in, or is named in `NOT_MADE` with its reason.
@@ -616,43 +635,45 @@ fn every_way_of_every_question_is_made_by_the_walk_or_named() {
 #[test]
 #[ignore = "run in a process of its own by a_call_that_this_host_cannot_make_says_the_path_and_the_error"]
 fn the_install_in_a_process_of_its_own() {
-    let (Some(root), Some(named)) = (
-        std::env::var_os("KR_WALK_ROOT").map(PathBuf::from),
-        std::env::var("KR_WALK_QUESTION").ok(),
-    ) else {
-        return;
-    };
-    let question = QUESTIONS
-        .into_iter()
-        .find(|question| question_name(*question) == named)
-        .expect("a question of the table");
-    if std::env::var_os("KR_WALK_REAP").is_some() {
-        // A thread that takes the end of every child of this process, as a program that waits for
-        // any child does. This host's wait for its program then finds no such child (`ECHILD`),
-        // which is the way that a wait for a child that this host started can fail. Nothing else
-        // runs in this process, so no other child is taken.
-        std::thread::spawn(|| {
-            loop {
-                if rustix::process::wait(rustix::process::WaitOptions::empty()).is_err() {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+    within("the_install_in_a_process_of_its_own", CHILD_BOUND, || {
+        let (Some(root), Some(named)) = (
+            std::env::var_os("KR_WALK_ROOT").map(PathBuf::from),
+            std::env::var("KR_WALK_QUESTION").ok(),
+        ) else {
+            return;
+        };
+        let question = QUESTIONS
+            .into_iter()
+            .find(|question| question_name(*question) == named)
+            .expect("a question of the table");
+        if std::env::var_os("KR_WALK_REAP").is_some() {
+            // A thread that takes the end of every child of this process, as a program that waits for
+            // any child does. This host's wait for its program then finds no such child (`ECHILD`),
+            // which is the way that a wait for a child that this host started can fail. Nothing else
+            // runs in this process, so no other child is taken.
+            std::thread::spawn(|| {
+                loop {
+                    if rustix::process::wait(rustix::process::WaitOptions::empty()).is_err() {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
                 }
-            }
-        });
-    }
-    let ground = Ground {
-        _root: tempfile::tempdir_in(&root).expect("a directory"),
-        root: root.clone(),
-        home: root.join("home"),
-        state: root.join("state"),
-    };
-    let (runtime_root, state_root) = (root.join("host-runtime"), root.join("host-state"));
-    std::fs::create_dir_all(&runtime_root).expect("a runtime root");
-    std::fs::create_dir_all(&state_root).expect("a state root");
-    let paths = HostPaths::new(runtime_root, state_root).expect("roots");
-    let dry_run = std::env::var("KR_WALK_DRY").is_ok_and(|mode| mode == "1");
-    let said = the_install_says(&ground, question, &root.join("pwsh"), &paths, dry_run)
-        .unwrap_or_default();
-    std::fs::write(root.join("said.txt"), said).expect("writes what was said");
+            });
+        }
+        let ground = Ground {
+            _root: tempfile::tempdir_in(&root).expect("a directory"),
+            root: root.clone(),
+            home: root.join("home"),
+            state: root.join("state"),
+        };
+        let (runtime_root, state_root) = (root.join("host-runtime"), root.join("host-state"));
+        std::fs::create_dir_all(&runtime_root).expect("a runtime root");
+        std::fs::create_dir_all(&state_root).expect("a state root");
+        let paths = HostPaths::new(runtime_root, state_root).expect("roots");
+        let dry_run = std::env::var("KR_WALK_DRY").is_ok_and(|mode| mode == "1");
+        let said = the_install_says(&ground, question, &root.join("pwsh"), &paths, dry_run)
+            .unwrap_or_default();
+        std::fs::write(root.join("said.txt"), said).expect("writes what was said");
+    });
 }
 
 /// What the install says and leaves where this host cannot make a call: the failure of this host, the
@@ -674,71 +695,78 @@ fn the_install_in_a_process_of_its_own() {
 /// the run could.
 #[test]
 fn a_call_that_this_host_cannot_make_says_the_path_and_the_error() {
-    for stand in stands()
-        .into_iter()
-        .filter(|stand| stand.way == "not_prepared" || stand.way == "wait_failed")
-    {
-        for dry_run in [true, false] {
-            let ground = ground();
-            let name = format!(
-                "{} {}, dry run {dry_run}",
-                question_name(stand.question),
-                stand.way
-            );
-            let body = if stand.way == "wait_failed" {
-                format!("sleep 1\n{}", the_right_answers(&ground.home))
-            } else {
-                stand.body.clone()
-            };
-            let program = a_program_that(&ground.root, &body);
-            assert!(program.is_file());
-            let temporary = ground.root.join("not-a-folder");
-            let mut run =
-                std::process::Command::new(std::env::current_exe().expect("this program"));
-            if stand.way == "wait_failed" {
-                run.env("KR_WALK_REAP", "1");
-            } else {
-                std::fs::write(&temporary, "").expect("a file");
-                run.env("TMPDIR", &temporary);
+    within(
+        "a_call_that_this_host_cannot_make_says_the_path_and_the_error",
+        CASE_BOUND,
+        || {
+            for stand in stands()
+                .into_iter()
+                .filter(|stand| stand.way == "not_prepared" || stand.way == "wait_failed")
+            {
+                for dry_run in [true, false] {
+                    let ground = ground();
+                    let name = format!(
+                        "{} {}, dry run {dry_run}",
+                        question_name(stand.question),
+                        stand.way
+                    );
+                    let body = if stand.way == "wait_failed" {
+                        format!("sleep 1\n{}", the_right_answers(&ground.home))
+                    } else {
+                        stand.body.clone()
+                    };
+                    let program = a_program_that(&ground.root, &body);
+                    assert!(program.is_file());
+                    let temporary = ground.root.join("not-a-folder");
+                    let mut run =
+                        std::process::Command::new(std::env::current_exe().expect("this program"));
+                    if stand.way == "wait_failed" {
+                        run.env("KR_WALK_REAP", "1");
+                    } else {
+                        std::fs::write(&temporary, "").expect("a file");
+                        run.env("TMPDIR", &temporary);
+                    }
+                    let before = held_under(&ground.home);
+                    let ran = run
+                        .args([
+                            "--exact",
+                            "shell::tests::question_table::the_install_in_a_process_of_its_own",
+                            "--ignored",
+                            "--test-threads=1",
+                        ])
+                        .env("KR_WALK_ROOT", &ground.root)
+                        .env("KR_WALK_QUESTION", question_name(stand.question))
+                        .env("KR_WALK_DRY", if dry_run { "1" } else { "0" })
+                        .stdin(std::process::Stdio::null())
+                        .output()
+                        .expect("starts this test program");
+                    assert!(
+                        ran.status.success(),
+                        "{name}: {}",
+                        String::from_utf8_lossy(&ran.stdout)
+                    );
+                    let said = std::fs::read_to_string(ground.root.join("said.txt"))
+                        .expect("what was said");
+                    let temporary = if stand.way == "wait_failed" {
+                        std::env::temp_dir()
+                    } else {
+                        temporary
+                    };
+                    assert_eq!(
+                        as_the_table_says(&said, &ground, &temporary),
+                        cell(stand.question, stand.way),
+                        "{name}"
+                    );
+                    assert_eq!(held_under(&ground.home), before, "{name}: the home changed");
+                    assert!(
+                        stand.question != Question::Profiles
+                            || !ground.state.join("state").exists(),
+                        "{name}: a record was written"
+                    );
+                }
             }
-            let before = held_under(&ground.home);
-            let ran = run
-                .args([
-                    "--exact",
-                    "shell::tests::question_table::the_install_in_a_process_of_its_own",
-                    "--ignored",
-                    "--test-threads=1",
-                ])
-                .env("KR_WALK_ROOT", &ground.root)
-                .env("KR_WALK_QUESTION", question_name(stand.question))
-                .env("KR_WALK_DRY", if dry_run { "1" } else { "0" })
-                .stdin(std::process::Stdio::null())
-                .output()
-                .expect("starts this test program");
-            assert!(
-                ran.status.success(),
-                "{name}: {}",
-                String::from_utf8_lossy(&ran.stdout)
-            );
-            let said =
-                std::fs::read_to_string(ground.root.join("said.txt")).expect("what was said");
-            let temporary = if stand.way == "wait_failed" {
-                std::env::temp_dir()
-            } else {
-                temporary
-            };
-            assert_eq!(
-                as_the_table_says(&said, &ground, &temporary),
-                cell(stand.question, stand.way),
-                "{name}"
-            );
-            assert_eq!(held_under(&ground.home), before, "{name}: the home changed");
-            assert!(
-                stand.question != Question::Profiles || !ground.state.join("state").exists(),
-                "{name}: a record was written"
-            );
-        }
-    }
+        },
+    );
 }
 
 /// A PowerShell profile that the same run wrote before keeps its entry where the question about a
@@ -747,55 +775,67 @@ fn a_call_that_this_host_cannot_make_says_the_path_and_the_error() {
 /// at the check of the second, the way's own text in the table with the second profile's name.
 #[test]
 fn a_profile_that_the_same_run_wrote_before_a_failed_question_keeps_its_entry() {
-    let temporary = std::env::temp_dir();
-    for stand in stands()
-        .into_iter()
-        .filter(|stand| stand.question == Question::Check)
-        .filter(|stand| !["not_started", "wait_failed", "not_prepared"].contains(&stand.way))
-    {
-        let ground = ground();
-        let name = format!("check {} ({})", stand.way, stand.state);
-        let checks = ground.root.join("checks");
-        let verified = format!(
-            "n=$(cat '{0}' 2>/dev/null || echo 0); echo $((n + 1)) > '{0}'; \
+    within(
+        "a_profile_that_the_same_run_wrote_before_a_failed_question_keeps_its_entry",
+        CASE_BOUND,
+        || {
+            let temporary = std::env::temp_dir();
+            for stand in stands()
+                .into_iter()
+                .filter(|stand| stand.question == Question::Check)
+                .filter(|stand| {
+                    !["not_started", "wait_failed", "not_prepared"].contains(&stand.way)
+                })
+            {
+                let ground = ground();
+                let name = format!("check {} ({})", stand.way, stand.state);
+                let checks = ground.root.join("checks");
+                let verified = format!(
+                    "n=$(cat '{0}' 2>/dev/null || echo 0); echo $((n + 1)) > '{0}'; \
              if [ \"$n\" = 0 ]; then printf kr-verified; else {1}; fi",
-            checks.display(),
-            stand.body
-        );
-        let body = the_right_answers(&ground.home);
-        assert!(body.contains("printf kr-verified"), "{name}");
-        let program = a_program_that(&ground.root, &body.replace("printf kr-verified", &verified));
-        let layout = HomeLayout {
-            home: ground.home.clone(),
-            zdotdir: None,
-            xdg_config_home: None,
-            powershell: Some(startup::PowerShell::plain(program)),
-        };
-        let record = EntryRecord::in_state_directory(&ground.state.join("state"));
-        let package = a_package_that_is_never_started(ShellKind::PowerShell);
-        let said = install(&package, &layout, &record, &host_paths(), false, false)
-            .expect_err(&name)
-            .to_string();
-        assert_eq!(
-            as_the_table_says(&said, &ground, &temporary),
-            cell(Question::Check, stand.way).replace(PROFILE, "/home/person/host-profile.ps1"),
-            "{name}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&checks).expect("the checks that were asked"),
-            "2\n",
-            "{name}: the first profile's check passed and the second's failed"
-        );
-        let first = std::fs::read_to_string(ground.home.join("profile.ps1")).expect("reads");
-        assert!(
-            first.contains("# >>> KalaReach shell integration >>>") && first.contains("$x = 1\n"),
-            "{name}: the first profile keeps its entry and its text: {first:?}"
-        );
-        assert!(
-            !ground.home.join("host-profile.ps1").exists(),
-            "{name}: the second profile was written"
-        );
-    }
+                    checks.display(),
+                    stand.body
+                );
+                let body = the_right_answers(&ground.home);
+                assert!(body.contains("printf kr-verified"), "{name}");
+                let program =
+                    a_program_that(&ground.root, &body.replace("printf kr-verified", &verified));
+                let layout = HomeLayout {
+                    home: ground.home.clone(),
+                    zdotdir: None,
+                    xdg_config_home: None,
+                    powershell: Some(startup::PowerShell::plain(program)),
+                };
+                let record = EntryRecord::in_state_directory(&ground.state.join("state"));
+                let package = a_package_that_is_never_started(ShellKind::PowerShell);
+                let said = install(&package, &layout, &record, &host_paths(), false, false)
+                    .expect_err(&name)
+                    .to_string();
+                assert_eq!(
+                    as_the_table_says(&said, &ground, &temporary),
+                    cell(Question::Check, stand.way)
+                        .replace(PROFILE, "/home/person/host-profile.ps1"),
+                    "{name}"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&checks).expect("the checks that were asked"),
+                    "2\n",
+                    "{name}: the first profile's check passed and the second's failed"
+                );
+                let first =
+                    std::fs::read_to_string(ground.home.join("profile.ps1")).expect("reads");
+                assert!(
+                    first.contains("# >>> KalaReach shell integration >>>")
+                        && first.contains("$x = 1\n"),
+                    "{name}: the first profile keeps its entry and its text: {first:?}"
+                );
+                assert!(
+                    !ground.home.join("host-profile.ps1").exists(),
+                    "{name}: the second profile was written"
+                );
+            }
+        },
+    );
 }
 
 /// An answer in which PowerShell refuses the profile by name is an answer that was used: at the
@@ -803,36 +843,43 @@ fn a_profile_that_the_same_run_wrote_before_a_failed_question_keeps_its_entry() 
 /// is none of the table's rows for that question, and the home is as it was.
 #[test]
 fn an_answer_that_refuses_the_profile_by_name_is_used_and_is_none_of_the_tables_rows() {
-    let temporary = std::env::temp_dir();
-    for question in [Question::Placement, Question::Check] {
-        for dry_run in [true, false] {
-            let ground = ground();
-            let name = format!("{}, dry run {dry_run}", question_name(question));
-            let program = a_program_that(
-                &ground.root,
-                "printf 'kr-refused statement-shares-the-line'",
-            );
-            let before = held_under(&ground.home);
-            let said = the_install_says(&ground, question, &program, &host_paths(), dry_run)
-                .unwrap_or_else(|| panic!("{name}: the install went on"));
-            let refused = format!(
-                "{PROFILE}: {}",
-                crate::shown::startup_refusal(&Refusal::StatementSharesTheLine)
-            );
-            assert_eq!(
-                as_the_table_says(&said, &ground, &temporary),
-                refused,
-                "{name}"
-            );
-            let key = format!("question={} ", question_name(question));
-            assert!(
-                TABLE
-                    .lines()
-                    .filter(|line| line.starts_with(&key))
-                    .all(|line| !line.ends_with(&refused)),
-                "{name}: the refusal is one of the table's rows"
-            );
-            assert_eq!(held_under(&ground.home), before, "{name}: the home changed");
-        }
-    }
+    within(
+        "an_answer_that_refuses_the_profile_by_name_is_used_and_is_none_of_the_tables_rows",
+        CASE_BOUND,
+        || {
+            let temporary = std::env::temp_dir();
+            for question in [Question::Placement, Question::Check] {
+                for dry_run in [true, false] {
+                    let ground = ground();
+                    let name = format!("{}, dry run {dry_run}", question_name(question));
+                    let program = a_program_that(
+                        &ground.root,
+                        "printf 'kr-refused statement-shares-the-line'",
+                    );
+                    let before = held_under(&ground.home);
+                    let said =
+                        the_install_says(&ground, question, &program, &host_paths(), dry_run)
+                            .unwrap_or_else(|| panic!("{name}: the install went on"));
+                    let refused = format!(
+                        "{PROFILE}: {}",
+                        crate::shown::startup_refusal(&Refusal::StatementSharesTheLine)
+                    );
+                    assert_eq!(
+                        as_the_table_says(&said, &ground, &temporary),
+                        refused,
+                        "{name}"
+                    );
+                    let key = format!("question={} ", question_name(question));
+                    assert!(
+                        TABLE
+                            .lines()
+                            .filter(|line| line.starts_with(&key))
+                            .all(|line| !line.ends_with(&refused)),
+                        "{name}: the refusal is one of the table's rows"
+                    );
+                    assert_eq!(held_under(&ground.home), before, "{name}: the home changed");
+                }
+            }
+        },
+    );
 }
