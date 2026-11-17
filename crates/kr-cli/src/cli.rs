@@ -1411,18 +1411,18 @@ pub enum HostCommand {
     /// sessions take their search path, home, user name, language, time zone, temporary folder
     /// and locale from it; a service manager gives its own.
     ///
-    /// Exit 0: the old daemon ended or none ran, and a control daemon answers (the result says
-    /// whether this command started it, whether another daemon serves the environment, or that
-    /// this command cannot tell), or a holder that did not answer gave way to a daemon, with
-    /// nothing stopped or started. Exit 1: the start failed after the stop (the message says so
-    /// and that no session was stopped), a daemon that answers is of the stopped generation,
-    /// states no process or gives no whole answer in 30 seconds, the old daemon had not ended
-    /// after 30 seconds, a holder does not answer, a daemon of another build takes no stop
-    /// request, or an interrupt. Exit 3: no start can be made or the daemon's launch differs from
-    /// it (nothing was stopped), or the start could not be set up after the stop (the message
-    /// says which). Exit 8: the refusal inside a session, or a refusal of the stop request that
-    /// says it was not allowed. With `--json`, `stop`, `pid`, `unsettled`, `started`, `serving`
-    /// and `launched` carry the result.
+    /// Exit 0: a control daemon answers after the old one ended or where none ran (the result says
+    /// whether this command started it, whether another daemon serves the environment, or that this
+    /// command cannot tell), or a holder that did not answer gave way to a daemon, with nothing
+    /// stopped or started. Exit 3: the host is not set up for the restart, the daemon's launch
+    /// differs from this command's start, the daemon could not be reached, or the request could not
+    /// be made (nothing was stopped in each of these); or the start could not be set up after the
+    /// stop (the message says which). Exit 8: the refusal inside a session, or a refusal of the stop
+    /// request that says it was not allowed. Exit 1: every other failure, among them a daemon or a
+    /// holder that does not answer, a daemon of another build, a start that failed after the stop,
+    /// a daemon that answers and cannot be shown to serve, and an interrupt; the message says what
+    /// was stopped and what was started. With `--json`, `stop`, `pid`, `unsettled`, `started`,
+    /// `serving` and `launched` carry the result.
     ///
     /// The command proves that the daemon which answers is the one it started by the process that
     /// daemon states, with a generation newer than the daemon that was stopped. A daemon that does
