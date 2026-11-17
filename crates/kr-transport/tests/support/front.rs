@@ -50,13 +50,15 @@ pub const CHUNK: usize = 16 * 1024;
 /// inherit: a few KiB, so that a stalled front takes almost nothing of what the device sends and
 /// the device's queue for the relay fills.
 ///
-/// A buffer this small also leaves a window of about one segment after a stop. The sockets of a
-/// case on Linux showed what follows: the device's side of the connection sends one segment on
-/// each round of its persist timer, so the bytes that the stop held back drain at about ten KB a
-/// second, or slower, for tens of seconds after the resume, and nothing a host sends in that
-/// time reaches the relay. A case that needs the hosts of the stopped relay answered again soon
-/// after the resume gives the front no buffer of its own (`None`), which leaves the system's
-/// default.
+/// A buffer this small can also hold the device's side of a connection back after a resume. After
+/// some stops, the window that the front offers once it reads again is smaller than one segment
+/// of the device's side. In the traces of this buffer on Linux, every stop that held the device's
+/// side back had such a window, and every stop that did not had a window of at least one segment.
+/// In those traces the device's side then sent one window-sized piece on each round of its persist
+/// timer, so the bytes that the stop held back drained at about ten KB a second, or slower, for
+/// tens of seconds, and what the device sent to the relay through the front waited that long. A
+/// case that needs the hosts of the stopped relay answered again soon after the resume gives the
+/// front no buffer of its own (`None`), which leaves the system's default.
 pub const STALLED_RECEIVE_BUFFER: u32 = 4096;
 
 impl RelayFront {
@@ -225,11 +227,16 @@ impl RelayFront {
     /// Stops a stalling front after the pass that is under way in each direction: a read that is
     /// ready at the switch can still be taken and its chunk written, and that write can end after
     /// the switch.
-    pub fn stall(&self) {
+    ///
+    /// Returns how many bytes the front had read from the device, counted right after the switch.
+    /// Only a read that was under way at the switch can add to it afterwards: one chunk of at most
+    /// [`CHUNK`] bytes on each connection.
+    pub fn stall(&self) -> u64 {
         self.switch
             .as_ref()
             .expect("a stalling front")
             .send_replace(true);
+        self.read_from_device()
     }
 
     /// Lets a stalling front pass bytes and connections again.
