@@ -320,22 +320,20 @@ impl DeviceEndpoint {
     /// host names leaves the map. Nothing else changes: a connection to the host stays open until
     /// whoever holds it closes it.
     ///
+    /// The call always sets the map and waits for it, whether or not the removed entry names a
+    /// relay. An introduction whose caller stopped waiting can leave the map with a relay that the
+    /// table no longer names, while its own task has not run. The task of this call takes its turn
+    /// after any task that read the table before the removal, so when the call returns the map holds
+    /// no relay that the table lacks. The cost is one turn of the map's lock for each call, also
+    /// for a host that the table does not hold.
+    ///
     /// # Errors
     ///
     /// Returns [`TransportError::Configuration`] when `identity` is not a public key.
     pub async fn forget(&self, identity: &EndpointKey) -> Result<()> {
         let identity = endpoint_id(identity)?;
-        let had_relays = self
-            .shared
-            .table()
-            .hosts
-            .remove(&identity)
-            .is_some_and(|host| !host.services.relays.is_empty());
-        if had_relays {
-            self.set_the_map().await
-        } else {
-            Ok(())
-        }
+        self.shared.table().hosts.remove(&identity);
+        self.set_the_map().await
     }
 
     /// Closes the endpoint.
