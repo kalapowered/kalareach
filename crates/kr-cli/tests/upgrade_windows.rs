@@ -9,9 +9,9 @@
 //! The session's worker is then a worker of the release before, beside a daemon of this one.
 //!
 //! The release before, run in place as it is here, keeps no store and holds nothing on its release:
-//! a Windows host keeps a store only when it was installed with `kr host install`, and this host
-//! was not. So what this shows is the daemon's handover and the adoption of a worker of an older
-//! level, not the hold of a release by a worker of the release before.
+//! a Windows host keeps a store only when it was installed with `kr host install`, and the release
+//! before was not installed here. So what this shows is the daemon's handover and the adoption of a
+//! worker of an older level, not the hold of a release by a worker of the release before.
 //!
 //! The release before is whatever `retained/<level>/RELEASE` of the retained surface names. A commit
 //! that is not there, or a build of it that fails, fails the suite: nothing here skips. The suite is

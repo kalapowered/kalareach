@@ -276,9 +276,10 @@ pub const AGENT_INSTANCES_READ: &str = "agent.instances/1";
 
 /// The capability a worker states when it serves `shell.launch.surface`.
 ///
-/// A control daemon and a client on the same machine ask the read only of a worker that states
-/// this: a worker of an earlier release has no row for the method and would refuse it as it
-/// refuses a method it does not serve, which reads as a missing right.
+/// A client on the same machine asks the read only of a worker that states this, as a daemon of an
+/// earlier release did: a worker of an earlier release has no row for the method and would refuse
+/// it as it refuses a method it does not serve, which reads as a missing right. This release's
+/// daemon forwards the read to every worker, because every worker of a level it retains states it.
 pub const SHELL_LAUNCH_SURFACE_READ: &str = "shell.launch.surface/1";
 
 /// The capability a worker states when it serves the input lane: the window and its credit, the
