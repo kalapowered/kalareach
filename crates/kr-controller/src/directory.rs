@@ -469,10 +469,10 @@ mod tests {
         directory.ending(session_id).map(|read| read.session)
     }
 
-    /// A worker admitted after a start left it out takes the entry of its own descriptor out of the
-    /// quarantine and no other: a second descriptor of the same session that names another key, a
-    /// descriptor of another session with the same key, and a file that could not be read all stay
-    /// counted.
+    /// A worker admitted after a start left it out takes the entries of its own descriptors out of
+    /// the quarantine, every one of them, and no other: a second descriptor of the same session that
+    /// names another key, a descriptor of another session with the same key, and a file that could
+    /// not be read all stay counted.
     #[test]
     fn an_admitted_worker_leaves_the_quarantine_and_the_descriptors_still_out_stay_in_it() {
         let host = kr_ipc::testing::TempHost::create();
@@ -493,6 +493,7 @@ mod tests {
                     Some(AuthorisationKey::from_bytes([8; 32])),
                     "another key for the session",
                 ),
+                out(session_id, Some(key), "a copy of its descriptor failed too"),
                 out(other, Some(key), "another session"),
                 out(SessionId::new(Uuid::NIL), None, "unreadable"),
             ],

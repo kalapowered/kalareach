@@ -2301,14 +2301,9 @@ async fn workers_check(
     )
 }
 
-/// Lets go of a worker's boundary, waits until the presentation that waited there has been decided
-/// and its task has ended, and says whether the next read of the worker's session is served.
-async fn let_go_and_read(
-    host: &Host,
-    client: &mut kr_ipc::client::LocalClient,
-    worker: &Worker,
-    held: net_support::worker::HeldBoundary,
-) -> bool {
+/// Lets go of a worker's boundary and waits until the presentation that waited there has been
+/// decided and its task has ended: the next look at the worker takes the answer.
+async fn let_go_and_wait(host: &Host, worker: &Worker, held: net_support::worker::HeldBoundary) {
     held.release();
     until(
         Duration::from_secs(10),
@@ -2326,6 +2321,16 @@ async fn let_go_and_read(
         },
     )
     .await;
+}
+
+/// As [`let_go_and_wait`], and says whether the next read of the worker's session is served.
+async fn let_go_and_read(
+    host: &Host,
+    client: &mut kr_ipc::client::LocalClient,
+    worker: &Worker,
+    held: net_support::worker::HeldBoundary,
+) -> bool {
+    let_go_and_wait(host, worker, held).await;
     read_is_served(client, worker.session_id).await
 }
 
@@ -2452,6 +2457,99 @@ async fn an_unreadable_descriptor_stays_in_the_doctors_count_after_the_workers_a
         after_the_second.2.is_some(),
         "the warning stands for the descriptor that is still out"
     );
+}
+
+/// What a paired device's attach to `session_id` came to on its link: the attachment, or the
+/// host's refusal.
+async fn device_attach(
+    link: &kr_client::Session,
+    host: &Host,
+    session_id: SessionId,
+) -> kr_client::Result<kr_protocol::attachment::SessionAttachResult> {
+    use kr_protocol::attachment::{AttachMode, AttachmentCapability, SessionAttachParams};
+    use kr_protocol::envelope::{ActionTarget, ParamsValue};
+    use kr_protocol::scalars::DurationMs;
+
+    link.mutate(
+        Method::SessionAttach,
+        ActionTarget {
+            environment_id: host.environment_id,
+            session_id: Nullable::some(session_id),
+            session_epoch: Nullable::some(SessionEpoch::V1),
+            application_instance_id: Nullable::null(),
+            agent_binding_revision: Nullable::null(),
+        },
+        None,
+        &ParamsValue::empty(),
+        &SessionAttachParams {
+            session_id,
+            mode: AttachMode::Semantic,
+            claim_geometry: false,
+            dimensions: Nullable::null(),
+            terminal_profile_id: Nullable::null(),
+            requested: [AttachmentCapability::ObserveTerminal]
+                .into_iter()
+                .collect(),
+        },
+        DurationMs::new(120_000),
+    )
+    .await?
+    .to_typed()
+}
+
+/// KR-REQ-09.12, KR-ACC-022: a paired device cannot open a session whose worker a start left out,
+/// and its link's next try adopts the worker and opens it once the worker is free.
+///
+/// A daemon starts again while the worker's boundary is held, so the start leaves the worker out. A
+/// device that is paired with the restarted daemon asks to attach to the session and is refused
+/// with the words the host gives for a session it does not serve. The boundary is let go, and the
+/// presentation that waited is decided. The device's next attach reaches the worker and is
+/// answered by it: the session lost nothing, and the worker holds the attachment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_paired_devices_link_is_refused_while_the_worker_is_out_and_adopts_it_when_it_is_free() {
+    let Adopted {
+        host,
+        owner,
+        workers,
+    } = Adopted::start(1).await;
+    let worker = &workers[0];
+    let session_id = worker.session_id;
+    let held = worker.hold_the_dispatch_boundary().await;
+    let stopped = host.shut_down().await;
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+    let device = net_support::Device::create().await;
+    let record = net_support::pair_with(
+        &host,
+        &device,
+        &owner,
+        net_support::proposal(&[kr_protocol::rights::ActionRight::SessionView]),
+    )
+    .await;
+    let link = net_support::connect(&host, &device, &record).await;
+
+    let refused = device_attach(&link, &host, session_id)
+        .await
+        .expect_err("a worker that is out cannot be attached to");
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::UnknownSession,
+        "the device is told that the host serves no such session: {refused}"
+    );
+    assert_eq!(worker.attachments(), 0, "nothing reached the worker");
+
+    let_go_and_wait(&host, worker, held).await;
+    device_attach(&link, &host, session_id)
+        .await
+        .expect("the link's next try adopts the worker and opens the session");
+    assert_eq!(
+        worker.attachments(),
+        1,
+        "the worker holds the device's attachment"
+    );
+    drop(link);
+    host.stop().await;
+    drop(workers);
 }
 
 /// KR-REQ-09.12, KR-ACC-022: a closure while a presentation waits at a held boundary ends the
