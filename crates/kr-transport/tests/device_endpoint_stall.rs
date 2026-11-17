@@ -22,18 +22,17 @@
 //! The second stops the relay three times for five seconds. It asks each connection to the hosts on
 //! the stopped relay a small question every half second. The first stop follows about ten seconds
 //! after the connections are made, once the healthy host has been asked its first hundred
-//! questions, and each later stop follows only once every one of those connections has answered a
-//! question that was asked after the last resume. After a stop that fails, the next stop starts at
-//! the deadline of that wait (twice [`RECOVERY`]), not once every connection has answered. After
-//! each switch the case waits until every pump of the front waits at the gate, and it judges the
-//! stop by the questions that were asked from then until the resume. It fails unless every
-//! connection stays open, each is answered again within [`RECOVERY`] after each resume, every
-//! question to them is answered, every pump waits at the gate within [`STAND`] of each switch, at
-//! least one question is asked in each stop's window, none of the questions asked in a window is
-//! answered before the relay resumes, and the healthy host stays under the limit through every
-//! stop. The windows are judged once every question has ended. It prints how many datagrams the
-//! relay actor dropped for the stopped relay's queue in each stop and outside the stops, and
-//! asserts no count of them: a short stop can end before the queue is full.
+//! questions. Each later stop follows once every one of those connections has answered a question
+//! that was asked after the last resume, or, if one has not answered by twice [`RECOVERY`] after
+//! that resume, at that time. After each switch the case waits until every pump of the front waits
+//! at the gate, and it judges the stop by the questions that were asked from then until the resume.
+//! It fails unless every connection stays open, each is answered again within [`RECOVERY`] after
+//! each resume, every question to them is answered, every pump waits at the gate within [`STAND`]
+//! of each switch, at least one question is asked in each stop's window, none of the questions
+//! asked in a window is answered before the relay resumes, and the healthy host stays under the
+//! limit through every stop. The windows are judged once every question has ended. It prints how
+//! many datagrams the relay actor dropped for the stopped relay's queue in each stop and outside
+//! the stops, and asserts no count of them: a short stop can end before the queue is full.
 //!
 //! Both are outside the default suite: each runs for minutes, so they are asked for by name with
 //! `--ignored --nocapture`, which prints what they measured. They run with one test thread
