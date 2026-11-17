@@ -314,6 +314,16 @@ pub(super) async fn run(
         }
     };
     let networked = opened.link.session().transport().stream_opener().is_some();
+    // A view that was granted no right to type takes no control: a take made while it opened is
+    // refused before the page shows anything of it, and the view opens no input stream.
+    if !opened
+        .attached
+        .attachment
+        .granted
+        .contains(&AttachmentCapability::Input)
+    {
+        lease.without_typing_right();
+    }
     let mut view = View {
         link: opened.link,
         events: opened.events,
@@ -358,7 +368,9 @@ pub(super) async fn run(
     #[cfg(feature = "testing")]
     view.probe.publish_session(view.link.session());
     view.publish_state();
-    view.open_lane();
+    if view.lease.has_typing_right() {
+        view.open_lane();
+    }
     let ended = view.serve(&mut commands).await;
     view.end_launches();
     if let Some(reason) = ended.reason {
