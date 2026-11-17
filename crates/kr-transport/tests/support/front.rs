@@ -14,7 +14,7 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -240,14 +240,25 @@ impl RelayFront {
         self.read_from_device()
     }
 
-    /// Lets a stalling front pass bytes and connections again.
-    pub fn resume(&self) {
-        self.stop.as_ref().expect("a stalling front").set(false);
+    /// Lets a stalling front pass bytes and connections again. Returns the front's instant of the
+    /// resume, taken before the switch changes: no pump passes the gate earlier.
+    pub fn resume(&self) -> Instant {
+        self.stop.as_ref().expect("a stalling front").set(false)
     }
 
     /// Waits until every pump of the front waits at the gate, for at most `bound`, and returns an
     /// error with its own words when one does not. It blocks on a thread of its own and is bounded
-    /// by the clock of the operating system, not by a timer of the caller's runtime.
+    /// by the clock of the operating system, not by a timer of the caller's runtime. The bound
+    /// starts when that thread starts to wait: it does not bound the thread's dispatch or the
+    /// caller's next poll, and a pump that misses it is not necessarily stuck, since a loaded host
+    /// can delay a pump past it.
+    ///
+    /// On success it returns the front's instant of the confirmation. The front took it in the
+    /// hold of the lock in which the last pump went to the gate, or at the switch if every pump
+    /// already waited, so it does not depend on when the blocking thread or the caller runs: a
+    /// byte that the device sends after that instant cannot cross the front before the resume.
+    /// A front that is not stopped has no stop to confirm: it returns at once with the instant of
+    /// the call.
     ///
     /// What it shows: once it returns, no pump takes another read or writes another chunk before
     /// the next resume, so a byte that the device sends after it returns cannot cross the front. A
@@ -257,9 +268,8 @@ impl RelayFront {
     /// it does not cover: a connection that is accepted during the stop waits at the gate in
     /// `carry`, before it has a pump, so it has nothing to confirm; and bytes that crossed the
     /// front before the pumps stood can still be answered afterwards by the relay, though the
-    /// answer cannot come back until the resume. A front that is not stopped has no stop to
-    /// confirm, so this returns at once.
-    pub async fn confirm_stopped(&self, bound: Duration) -> Result<(), String> {
+    /// answer cannot come back until the resume.
+    pub async fn confirm_stopped(&self, bound: Duration) -> Result<Instant, String> {
         let stop = Arc::clone(self.stop.as_ref().expect("a stalling front"));
         tokio::task::spawn_blocking(move || stop.wait_until_standing(bound))
             .await
@@ -385,6 +395,22 @@ struct StopState {
     stopped: bool,
     /// How many pumps run and do not wait at the gate.
     running: usize,
+    /// When the stop was confirmed: the instant at which the front was stopped and no pump ran
+    /// outside the gate. None while that does not hold.
+    confirmed: Option<Instant>,
+}
+
+impl StopState {
+    /// Takes the confirmed stop's instant, or clears it, after `stopped` or `running` changed. It
+    /// is called in the hold of the lock that made the change, by the part where the event
+    /// happens: the instant is that of the event, whenever a caller learns of it.
+    fn note(&mut self) {
+        if self.stopped && self.running == 0 {
+            self.confirmed.get_or_insert_with(Instant::now);
+        } else {
+            self.confirmed = None;
+        }
+    }
 }
 
 impl Stop {
@@ -395,6 +421,7 @@ impl Stop {
             state: Mutex::new(StopState {
                 stopped: false,
                 running: 0,
+                confirmed: None,
             }),
             changed: Condvar::new(),
         });
@@ -406,14 +433,22 @@ impl Stop {
     }
 
     /// Stops or resumes the front: the flag and the switch change under one hold of the lock.
-    fn set(&self, stopped: bool) {
+    /// Returns the instant of the change, taken in that hold before the switch changes, so no pump
+    /// passes the gate earlier than the instant of a resume.
+    fn set(&self, stopped: bool) -> Instant {
         let mut state = self.lock();
+        let at = Instant::now();
         state.stopped = stopped;
+        state.note();
         self.switch.send_replace(stopped);
+        at
     }
 
     /// Waits while the front is stopped and a pump runs outside the gate, for at most `bound`.
-    fn wait_until_standing(&self, bound: Duration) -> Result<(), String> {
+    /// Returns the instant at which the stop was confirmed, which a pump took in the hold of the
+    /// lock in which it went to the gate; a front that is not stopped has none, and the instant is
+    /// then that of the call.
+    fn wait_until_standing(&self, bound: Duration) -> Result<Instant, String> {
         let (state, waited) = self
             .changed
             .wait_timeout_while(self.lock(), bound, |state| {
@@ -426,7 +461,7 @@ impl Stop {
                 state.running
             ))
         } else {
-            Ok(())
+            Ok(state.confirmed.unwrap_or_else(Instant::now))
         }
     }
 }
@@ -440,7 +475,11 @@ struct Stand {
 
 impl Stand {
     fn new(stop: &Arc<Stop>) -> Self {
-        stop.lock().running += 1;
+        {
+            let mut state = stop.lock();
+            state.running += 1;
+            state.note();
+        }
         Self {
             stop: Arc::clone(stop),
             waiting: false,
@@ -472,6 +511,7 @@ impl Stand {
             if !self.waiting {
                 self.waiting = true;
                 state.running -= 1;
+                state.note();
                 self.stop.changed.notify_all();
             }
             false
@@ -479,6 +519,7 @@ impl Stand {
             if self.waiting {
                 self.waiting = false;
                 state.running += 1;
+                state.note();
             }
             true
         }
@@ -488,7 +529,9 @@ impl Stand {
 impl Drop for Stand {
     fn drop(&mut self) {
         if !self.waiting {
-            self.stop.lock().running -= 1;
+            let mut state = self.stop.lock();
+            state.running -= 1;
+            state.note();
             self.stop.changed.notify_all();
         }
     }
