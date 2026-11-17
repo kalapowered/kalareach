@@ -882,8 +882,10 @@ impl Controller {
                 .number(quarantined as u64)
                 .stated(" quarantined"),
             (quarantined > 0).then_some(
-                "A quarantined descriptor is never used. Remove it once its session is known to \
-                 be gone.",
+                "A worker that was busy when the daemon started returns when the next read of its \
+                 session, the session list, a local caller's prompt or a device's link looks for \
+                 it. A descriptor that is still counted after that is never used: remove it once \
+                 its session is known to be gone.",
             ),
         ));
         // One acceptance, one reading, and every configuration line below comes from it. The
