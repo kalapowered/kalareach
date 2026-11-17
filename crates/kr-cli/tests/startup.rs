@@ -5825,6 +5825,13 @@ fn kr_host_stop_is_refused_inside_a_session_and_goes_on_where_a_worker_cannot_sa
         assert_eq!(refused["ok"], false, "{refused}");
         assert_eq!(refused["code"], "PERMISSION_DENIED", "{refused}");
         assert_eq!(stop_of(&refused), "not_asked", "{refused}");
+        assert_eq!(
+            refused["message"],
+            format!(
+                "PERMISSION_DENIED: kr host stop runs outside a KalaReach session, and {variable} is set here. {WHERE_TO_RUN} Nothing was stopped. Sessions and local attachments go on while no daemon runs."
+            ),
+            "{variable}"
+        );
     }
     assert_eq!(host.running(), vec![daemon], "the daemon was not stopped");
 
@@ -5847,8 +5854,13 @@ fn kr_host_stop_is_refused_inside_a_session_and_goes_on_where_a_worker_cannot_sa
         terminal.shown("done-8").await;
     });
     let typed = std::fs::read_to_string(&said).expect("the command's output");
-    assert!(typed.contains("inside session"), "{typed}");
-    assert!(typed.contains("Nothing was stopped"), "{typed}");
+    assert_eq!(
+        typed,
+        format!(
+            "kr: kr host stop runs outside a KalaReach session, and this process is inside session {session_id}. {WHERE_TO_RUN} Nothing was stopped. Sessions and local attachments go on while no daemon runs.\n"
+        ),
+        "the worker's word refused it"
+    );
     assert_eq!(host.running(), vec![daemon], "the daemon was not stopped");
     assert!(host.answers());
 
@@ -7691,6 +7703,29 @@ fn a_daemon_that_does_not_answer_host_info_is_a_holder_that_is_silent_and_no_sto
     assert!(attempts(&host).is_empty(), "no record stands");
     daemon.let_go();
     daemon.end();
+}
+
+/// KR-REQ-07.12 (a hello that is not answered): something accepts the connection at the endpoint
+/// and never answers the hello, and no process holds the environment. The command gives up at its
+/// bound and asks nothing; it does not say that no daemon runs, which it would for an endpoint that
+/// nothing listens at.
+#[test]
+fn a_listener_that_never_answers_the_hello_is_not_an_environment_with_no_daemon() {
+    let host = Standalone::create();
+    let mut silent = SilentListener::bind(&host);
+    let output = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
+    let said = document(&output, "kr host stop");
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    assert_eq!(said["ok"], false, "{said}");
+    assert_eq!(stop_of(&said), "not_asked", "{said}");
+    let message = said["message"].as_str().expect("a message");
+    assert!(
+        message.contains("accepted the connection and did not answer within 10 seconds"),
+        "{message}"
+    );
+    assert!(message.contains("No stop was requested"), "{message}");
+    assert!(attempts(&host).is_empty(), "no record stands");
+    silent.end();
 }
 
 /// KR-REQ-07.12 (a lock that could not be looked at): a daemon that closes the connection with no
