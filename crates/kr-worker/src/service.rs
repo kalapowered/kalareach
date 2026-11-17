@@ -647,9 +647,9 @@ pub struct WorkerService {
     /// compiled away in every shipped build.
     #[cfg(feature = "testing")]
     delivery_end_stall: crate::testing::Stall,
-    /// A stop in a mutation inside the dispatch boundary, after the check that decides whether the
-    /// host's current statement of what its local owner may do lets it be dispatched and before it
-    /// takes the session, which this host's own tests arm to have a statement arrive in between. It
+    /// A stop in a mutation inside the dispatch boundary, after the checks that decide whether the
+    /// host's current statement of what its local owner may do, and the withdrawal of its
+    /// connection, let it be dispatched and before it takes the session, which this host's own tests arm to have a statement arrive in between. It
     /// is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     after_the_dispatch_check_stall: crate::testing::Stall,
@@ -8161,8 +8161,6 @@ impl WorkerService {
         // the window check below and everything after it reads the end as it stands now. The count
         // it is compared with is the one the request was admitted at, read before the check.
         let allowed = self.check_local_dispatch(&state.facts, method, caller)?;
-        #[cfg(feature = "testing")]
-        self.after_the_dispatch_check_stall.stand();
         let relaid = caller
             .gate_restrictions
             .and_then(|admitted| Self::bound_by_lease(caller, allowed, admitted));
@@ -8177,6 +8175,8 @@ impl WorkerService {
                     .to_owned(),
             });
         }
+        #[cfg(feature = "testing")]
+        self.after_the_dispatch_check_stall.stand();
         let digest = kr_protocol::digest::mutation_digest(mutation, &actor_id)
             .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
 
