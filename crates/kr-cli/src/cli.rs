@@ -1425,11 +1425,11 @@ pub enum HostCommand {
     /// `serving` and `launched` carry the result.
     ///
     /// The command proves that the daemon which answers is the one it started by the process that
-    /// daemon states, with a generation newer than the daemon that was stopped. A daemon that does
-    /// not state its process cannot be told from the one that was started: the command fails and
-    /// says so. Where the start names no process (the scheduled task, a service manager that does
-    /// not say), or the generation of the daemon that was stopped was not read, the command says
-    /// what it read and what it asked, and does not call the daemon its own start. Where the
+    /// daemon states and, where it read the generation of the daemon that it stopped, a newer
+    /// generation. A daemon that does not state its process cannot be told from the one that was
+    /// started: the command fails and says so. Where the start names no process (the scheduled
+    /// task, a service manager that does not say), the command says what it read and what it
+    /// asked, and does not call the daemon its own start. Where the
     /// exchange with the daemon does not complete, the command starts nothing more, waits up to
     /// 30 seconds for a whole one, and says what it could not read. On macOS, a `launchctl
     /// kickstart` that does not answer in time is reported with the line that the requested
