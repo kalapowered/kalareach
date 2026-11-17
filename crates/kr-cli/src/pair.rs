@@ -1285,8 +1285,8 @@ fn describe_status(
                     crate::shown::utc_moment(existing.paired_at_ms.get())
                 ),
                 None => stdout_line!(
-                    "The device that used this invitation is already paired with this host. Remove \
-                     that pairing, then issue a new invitation."
+                    "The device that used this invitation was paired with this host, and that \
+                     pairing has ended. Issue a new invitation to pair it again."
                 ),
             },
         );
@@ -1307,7 +1307,7 @@ const fn ended_because(reason: PairingConsumedReason) -> &'static str {
         PairingConsumedReason::Cancelled => "the invitation was withdrawn",
         PairingConsumedReason::AttemptsExhausted => "too many wrong codes were tried",
         PairingConsumedReason::HostRestarted => "the host restarted before it finished",
-        PairingConsumedReason::EndpointPaired => "the device is already paired with this host",
+        PairingConsumedReason::EndpointPaired => "the device was already paired with this host",
     }
 }
 
@@ -1670,8 +1670,9 @@ mod tests {
     }
 
     /// KR-REQ-10.08: the issuing view of an invitation that ended because the device is already
-    /// paired says which pairing stands, from the host's own record of it, and says it plainly
-    /// where the view carries no record.
+    /// paired says which pairing stands, from the host's own record of it, and where the view
+    /// carries no record, because the pairing was removed or ran out, says that it has ended and
+    /// names no pairing to remove.
     #[test]
     fn an_invitation_that_ended_for_a_listed_device_says_which_pairing_stands() {
         use crate::output::planted::planted;
@@ -1693,15 +1694,19 @@ mod tests {
         };
         let shown = said(&bare);
         assert!(
-            shown.contains("ended: the device is already paired with this host."),
+            shown.contains("ended: the device was already paired with this host."),
             "{shown}"
         );
         assert!(
             shown.contains(
-                "The device that used this invitation is already paired with this host. Remove that \
-                 pairing, then issue a new invitation."
+                "The device that used this invitation was paired with this host, and that pairing \
+                 has ended. Issue a new invitation to pair it again."
             ),
             "{shown}"
+        );
+        assert!(
+            !shown.contains("Remove that pairing"),
+            "no pairing is named that the view does not give: {shown}"
         );
         let mut recorded = planted::<PairStatusResult>()
             .into_iter()

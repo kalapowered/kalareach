@@ -570,7 +570,9 @@ impl InvitationRows {
     }
 
     /// Returns the pairing this host holds for `device_id`, from its own record of the device: the
-    /// name and the date it recorded, whatever any later candidate presented.
+    /// name and the date it recorded, whatever any later candidate presented, and only while that
+    /// record is in force. A record that was removed or whose grant ended is no longer a pairing
+    /// the host holds, so it gives none.
     ///
     /// # Errors
     ///
@@ -583,6 +585,7 @@ impl InvitationRows {
             .directory
             .record_for_device(device_id)
             .map_err(store_error)?
+            .filter(DeviceRecord::is_paired)
             .map(|record| ExistingPairing {
                 device_name: record.device_name,
                 paired_at_ms: record.paired_at_ms,

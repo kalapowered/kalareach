@@ -2255,6 +2255,131 @@ async fn another_device_presenting_the_invitation_that_ended_for_a_listed_device
     host.stop().await;
 }
 
+/// The owner's view of the invitation that the host refused a listed device on, with the member that
+/// names the record the host holds.
+async fn existing_after_the_refusal(
+    client: &mut kr_ipc::client::LocalClient,
+    invited: &PairInviteResult,
+) -> Option<kr_protocol::invitation::ExistingPairing> {
+    let status = calls::owner_status(client, invited.invitation_id)
+        .await
+        .expect("the owner's view");
+    assert_eq!(
+        status.status,
+        PairStatus::Consumed {
+            reason: PairingConsumedReason::EndpointPaired
+        },
+        "the invitation ended for the device that is listed"
+    );
+    status.owner.0.expect("an owner view").existing
+}
+
+/// KR-REQ-10.08: the owner's view names the record that the refusal named only while that record is
+/// in force. While it is, the view gives its name and date; after the owner removed it, the invitation
+/// still reads as ended for a listed device and the view gives no record, so it names no pairing that
+/// is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_owners_view_gives_no_record_after_the_owner_removed_the_record_it_named() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let phone = Device::create().await;
+    let first = pair_with(&host, &phone, &owner, rights()).await;
+    let mut client = host.client().await;
+    let invited = calls::invite_direct(
+        host.environment_id,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &rights(),
+        &Signer::OwnerDevice(&owner),
+    )
+    .await
+    .expect("an invitation");
+    let refused = within(
+        "the redemption",
+        BOUND,
+        calls::try_redeem(&phone.candidate(), &invited),
+    )
+    .await;
+    assert_eq!(
+        refusal_code(refused.outcome.as_ref().expect_err("refused")),
+        "PAIRING_ENDPOINT_PAIRED"
+    );
+    let standing = existing_after_the_refusal(&mut client, &invited)
+        .await
+        .expect("the record is in force: the view names it");
+    assert_eq!(
+        standing.device_name.as_str(),
+        first_name(&host, first.device_id)
+    );
+
+    let barrier = within(
+        "the revocation",
+        BOUND,
+        host.network().revoke_device(first.device_id),
+    )
+    .await
+    .expect("the owner removes the device");
+    assert!(barrier.holds(), "{barrier:?}");
+    assert!(
+        existing_after_the_refusal(&mut client, &invited)
+            .await
+            .is_none(),
+        "the record was removed: the view names no pairing"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-10.08: the same for a record whose grant ran out after the refusal: the end is on the record
+/// (the mark the lifetimes write), and the view gives no record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_owners_view_gives_no_record_after_the_record_it_named_ran_out() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let phone = Device::create().await;
+    let first = pair_with(&host, &phone, &owner, rights()).await;
+    let mut client = host.client().await;
+    let invited = calls::invite_direct(
+        host.environment_id,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &rights(),
+        &Signer::OwnerDevice(&owner),
+    )
+    .await
+    .expect("an invitation");
+    let refused = within(
+        "the redemption",
+        BOUND,
+        calls::try_redeem(&phone.candidate(), &invited),
+    )
+    .await;
+    assert_eq!(
+        refusal_code(refused.outcome.as_ref().expect_err("refused")),
+        "PAIRING_ENDPOINT_PAIRED"
+    );
+    assert!(
+        existing_after_the_refusal(&mut client, &invited)
+            .await
+            .is_some(),
+        "the record is in force: the view names it"
+    );
+
+    let changed = registry(&host)
+        .execute(
+            "UPDATE network_devices SET expired_at_ms = paired_at_ms + 1 WHERE device_id = ?1",
+            [first.device_id.get().as_bytes().as_slice()],
+        )
+        .expect("the end of the grant is recorded");
+    assert_eq!(changed, 1, "one record ended");
+    assert!(
+        existing_after_the_refusal(&mut client, &invited)
+            .await
+            .is_none(),
+        "the record ran out: the view names no pairing"
+    );
+    host.stop().await;
+}
+
 /// KR-REQ-10.08: the view of an invitation that did not end because the device is listed carries no
 /// `existing` member, so a reader of the earlier shape reads it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
