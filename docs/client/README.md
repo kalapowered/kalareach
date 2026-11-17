@@ -939,25 +939,26 @@ Results are cached per relay and host. Admissions are stored until 30 seconds be
 
 If the first dial attempt of a route fails with `host_unreachable`, and the relay for that route has a cached negative admission, the dial error for the route is changed to `relay_capacity`. This indicates that the managed relay does not have capacity for the device to pair, but other paths such as the host's own network or a direct invitation may still work. Only the first dial attempt of the direct and code routes asks whether the relay refused for lack of capacity, not subsequent failures.
 
-Each host is reached through the relay and discovery services its own configuration names, with one
-dialling endpoint for each set of services. A key holds one endpoint on a relay at a time, so two
-configurations that share a relay are never open together, and binding one closes the other. An
-attempt holds its host's endpoint from its first dial to its end, an owner's review holds its
-host's while it runs, and a push registration that the person asked for holds its host's while its
-connection is open. Nothing else the device does closes a held endpoint, and a connection that
-would have to is refused until the hold ends. A visit, a look in the background at a host that is
-not the one in use (`HostLink::visit_paired`), leaves the host in use's relay to it: a visit to a
-host whose services (its relays and address lookups) differ from the host in use's and share a relay
-with them is refused as a connection lost, whether or not the host in use's endpoint is open at that
-moment. Which host is in use is asked when the visit's turn at the pool comes. A visit's refusal can
-be asked for beforehand (`HostLink::would_refuse_visit`), which binds and holds nothing; the hold
-decides when the visit connects.
+Every host is reached through one dialling endpoint. `EndpointPool` binds it at the first request
+with the device's one transport key, an empty relay map and no relay or discovery service of its own.
+A host enters the endpoint when the device first dials it. Its Pkarr resolver and DNS origin are
+registered under the host's endpoint identity, and an address lookup is asked about the identity of
+the host that owns it and about no other. For a paired host (`HostLink::connect_paired_transport`)
+the host's relays go into the relay map at that first dial, so the map holds the relays of the hosts
+the run has dialled and no others. A host that a pairing invitation names (`HostLink::dial`) enters
+with its lookups only: its relays stay out of the map until the pairing completes and the device
+dials the host as a paired host. Dialling a host again with the same services changes nothing, and a
+changed configuration for the same identity replaces what that identity had.
 
-A visit that needs its endpoint to stay open holds it as a visit (`HostLink::visit_hold`), as a
-push registration that a look started does while its connection is open. That hold stops other
-visits and nothing the person does: choosing a host on the same relay, an owner's review and a
-pairing attempt close the endpoint, the visit's connection ends, and the background work that made
-it starts again at its next look. A hold that is not a visit's stops every request, visits included.
+A key holds one endpoint on a relay at a time, and with one endpoint for every host that holds by
+construction. No request for one host refuses, closes or restarts the connection of another, and a
+pairing attempt, an owner's review, a visit and a push registration neither hold the endpoint nor
+wait for one another. `HostLink::forget_host` takes a host the person forgot out of the endpoint:
+its lookups, and each relay that no other host names. A connection to that host that is open stays
+open until whoever holds it closes it. The pool closes its endpoint only when `EndpointPool::close`
+is called and when the run ends. `close` waits until the endpoint has finished closing, so that no
+second endpoint holds the key beside it, and the next request binds a new endpoint and introduces
+its host again.
 
 The verification value is computed here, from the transcript, and grouped `f3c1 46fd` by the
 function the host and the command line use. The device shows it only once the host's answer to
@@ -1483,9 +1484,8 @@ for it and counts under account login; the companion's lease desk builds its cli
 signed in on the device.
 
 `organisation::LeaseKeeper` uses it. It presents the lease to the host with `membership.present` as
-the first thing on a connection made through `HostLink::connect_paired` or `HostLink::visit_paired`
-(a visit to a host that is not the one in use), because the host refuses a
-device whose grant answers to an organisation every other method until it holds a lease, and no
+the first thing on a connection made through `HostLink::connect_paired`, a visit's included, because
+the host refuses a device whose grant answers to an organisation every other method until it holds a lease, and no
 lease survives a host's restart. The application's own connection to the host keeps the lease: it
 asks again on the interval the service advises, held between one and five minutes, so a renewal
 reaches the host before the lease it replaces ends. A lease signed by a key revision the keeper has
@@ -1526,8 +1526,8 @@ arrives after the account changed is not presented (`LeaseStop::AccountChanged`)
 that begins after a sign-out does not begin (`SignIn`).
 
 Every connection to such a host belongs to the sign-in in force when it was opened, and the link
-binds it: `IrohLink` makes each connection to a paired host through `connect_paired_transport` or
-`visit_paired_transport`, and passes the dial to `MembershipPresenter::bind`. The main connection,
+binds it: `IrohLink` makes each connection to a paired host through `connect_paired_transport` and passes
+the dial to `MembershipPresenter::bind`. The main connection,
 a visit, a session link, a terminal view, the owner watcher's session and a push run's line are
 all connections of that kind, and each ends at once when the account signs out, another account
 signs in, or the same account signs in again; none is opened while no account is signed in (an account store that cannot be read is told as `Unreachable`, whose words name the organisation's service though the cause is on the device). The
