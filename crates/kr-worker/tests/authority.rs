@@ -60,10 +60,12 @@ fn build() -> BuildId {
 }
 
 /// How long one case of this suite is given, from its set-up to its last assertion. The whole suite
-/// takes about five seconds on a quiet machine, and the slowest run of one case seen took forty. The
-/// longest single wait that a case makes is `LIVENESS_DEADLINE`, two minutes, and a wait that ends by
-/// its own limit says so in its own message, so this bound is longer than any one of them: a case
-/// that has not ended in it is stood at, and says so.
+/// takes about five seconds on a quiet machine, and once took 39 seconds at a load of about 100.
+/// `LIVENESS_DEADLINE`, two minutes, is the longest wait that has a limit of its own, and a wait that
+/// ends by its own limit says so in its own message, so this bound is longer than any one of them.
+/// The two counted waits of `presentation_keeps_trying_through_mutations` have no total by design,
+/// and this bound is their guard against a hang: a case that has not ended in it is stood at, and
+/// says so.
 const CASE_BOUND: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Runs `body` on a thread of its own and waits for it for up to `CASE_BOUND`. A body that panics
@@ -2301,7 +2303,8 @@ async fn await_state(what: &str, mut ready: impl FnMut() -> bool) {
 /// Waits until `done` holds, and fails with `what` when `count` has not advanced for `WAIT`: each
 /// advance starts the time again, so that a count that goes on advancing never fails the wait, and
 /// a count that stops does after one `WAIT`. It is for a state that is reached by steps, where a
-/// total of time would be a promise about speed that nothing makes.
+/// total of time would be a promise about speed that nothing makes, so the bound of the case
+/// (`CASE_BOUND`) is the only total on it.
 async fn await_progress(
     what: &str,
     mut count: impl FnMut() -> u64,
