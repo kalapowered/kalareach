@@ -411,4 +411,95 @@ mod tests {
             "reading removed nothing"
         );
     }
+
+    /// A stop's record keeps its bytes, and a record of that form is read as it was.
+    #[test]
+    fn a_stops_record_keeps_its_bytes_and_a_record_of_that_form_is_read() {
+        let process = ProcessStartIdentity::new(
+            4242,
+            kr_protocol::identity::ProcessStartSource::LinuxProcStat,
+            99,
+        );
+        let daemon = ProcessStartIdentity::new(
+            77,
+            kr_protocol::identity::ProcessStartSource::MacosProcBsdInfo,
+            5,
+        );
+        for (command, phase, daemon, bytes) in [
+            (
+                Command::Stop,
+                Phase::Asking,
+                None,
+                r#"{"command":"stop","phase":"asking","process":{"pid":"4242","source":"linux_proc_stat","start_value":"99"},"at_ms":1700000000000,"daemon":null}"#,
+            ),
+            (
+                Command::Stop,
+                Phase::Told,
+                Some(daemon.clone()),
+                r#"{"command":"stop","phase":"told","process":{"pid":"4242","source":"linux_proc_stat","start_value":"99"},"at_ms":1700000000000,"daemon":{"pid":"77","source":"macos_proc_bsd_info","start_value":"5"}}"#,
+            ),
+        ] {
+            let attempt = Attempt {
+                command,
+                phase,
+                process: process.clone(),
+                at_ms: 1_700_000_000_000,
+                daemon,
+            };
+            assert_eq!(
+                String::from_utf8(serde_json::to_vec(&attempt).expect("encodes")).expect("text"),
+                bytes
+            );
+            let host = temp();
+            let environment = host.environment();
+            let directory = directory(&environment);
+            kr_ipc::paths::create_private_directory(&directory).expect("the directory");
+            kr_ipc::paths::write_owner_only_file(
+                &directory.join("an-old-record"),
+                bytes.as_bytes(),
+            )
+            .expect("writes");
+            let read = recorded(&environment);
+            assert_eq!(read.len(), 1, "a record of the old form is read");
+            assert_eq!(read[0].attempt, attempt);
+        }
+    }
+
+    /// A file whose command or phase is a value this release does not know is read as none, and
+    /// neither a command's read nor a daemon's clean-up removes it: what any release does with the
+    /// file of a command that it does not have.
+    #[test]
+    fn a_record_of_a_value_this_release_does_not_know_is_none_and_nothing_removes_it() {
+        let host = temp();
+        let environment = host.environment();
+        let directory = directory(&environment);
+        kr_ipc::paths::create_private_directory(&directory).expect("the directory");
+        let process = r#"{"pid":"4242","source":"linux_proc_stat","start_value":"99"}"#;
+        for (name, command, phase) in [
+            ("another-command", "hibernate", "told"),
+            ("another-phase", "stop", "sleeping"),
+            // The control: the same shape with values that this release has.
+            ("a-known-one", "stop", "told"),
+        ] {
+            let text = format!(
+                r#"{{"command":"{command}","phase":"{phase}","process":{process},"at_ms":1,"daemon":null}}"#
+            );
+            kr_ipc::paths::write_owner_only_file(&directory.join(name), text.as_bytes())
+                .expect("writes");
+        }
+        assert_eq!(
+            recorded(&environment).len(),
+            1,
+            "only the record of known values is read"
+        );
+        assert_eq!(
+            remove_those_that_stop_another_daemon(&environment, &another(1)),
+            1,
+            "the clean-up removes the one it read"
+        );
+        for name in ["another-command", "another-phase"] {
+            assert!(directory.join(name).exists(), "{name} stands");
+        }
+        assert!(!directory.join("a-known-one").exists());
+    }
 }
