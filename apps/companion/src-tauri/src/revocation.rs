@@ -758,13 +758,30 @@ impl Revocations {
         readings
     }
 
-    /// What the screen is shown. Every host is asked, and so is every feed.
+    /// The readings of the hosts that this computer still holds a record of. A host that the person
+    /// forgot while it was being asked is left out, whatever its visit found. A list of records that
+    /// cannot be read leaves every reading as it is: it is not an empty list.
+    fn still_paired(&self, readings: Vec<Reading>) -> Vec<Reading> {
+        readings
+            .into_iter()
+            .filter(|reading| match &reading.host {
+                Host::Local(_) => true,
+                Host::Paired(host) => self
+                    .device
+                    .is_paired_with(host.host_device_id)
+                    .unwrap_or(true),
+            })
+            .collect()
+    }
+
+    /// What the screen is shown. Every host is asked, and so is every feed, and the records are
+    /// looked at once more when the asking is over: a host forgotten meanwhile is not shown.
     pub async fn view(&self, context: &Context) -> RevocationView {
         let began = context
             .settings
             .as_ref()
             .map(|settings| settings.requests().look_begins());
-        let readings = self.read(self.hosts(context), context).await;
+        let readings = self.still_paired(self.read(self.hosts(context), context).await);
         let mut told = Vec::new();
         let mut requested = Vec::new();
         let hosts = readings
