@@ -8055,6 +8055,8 @@ fn a_restart_that_waits_for_the_daemon_that_holds_the_environment_writes_no_reco
         .expect("takes the lock");
     let mut old = a_process_named_kr_controller(&host, "old");
     let mut successor = a_process_named_kr_controller(&host, "successor");
+    let mut replacement = a_process_named_kr_controller(&host, "replacement");
+    let mut answering = a_process_named_kr_controller(&host, "answering");
     std::fs::write(&lock, format!("{}\n", old.id())).expect("names the old daemon");
     let mut first = TestDaemon::serve_generation(
         &host,
@@ -8083,22 +8085,156 @@ fn a_restart_that_waits_for_the_daemon_that_holds_the_environment_writes_no_reco
         );
         std::thread::sleep(Duration::from_millis(100));
     }
-    let mut second =
-        TestDaemon::serve_generation(&host, "kr-controller/9.9.9", OnStop::Refuse, true, 2);
+    // The successor is replaced during the wait: another process holds the lock now, and the daemon
+    // that answers states a third process, which neither the earlier reading of the lock nor a later
+    // one names.
+    successor.kill().expect("ends the successor");
+    successor.wait().expect("collects it");
+    std::fs::write(&lock, format!("{}\n", replacement.id())).expect("names the replacement");
+    let mut second = TestDaemon::serve_generation(
+        &host,
+        "kr-controller/9.9.9",
+        OnStop::AnswerAndStay(answering.id()),
+        true,
+        2,
+    );
     let output = running.finish("kr host restart");
     let said = document(&output, "kr host restart");
     assert_eq!(output.status.code(), Some(0), "{said}");
     assert_eq!(stop_of(&said), "ended", "{said}");
     assert_eq!(
         said["serving"].as_u64(),
-        Some(u64::from(successor.id())),
+        Some(u64::from(answering.id())),
+        "the process that the answering daemon states: {said}"
+    );
+    assert_eq!(said["launched"], Value::Null, "{said}");
+    assert!(attempts(&host).is_empty(), "no record stands");
+    let _ = replacement.kill();
+    let _ = replacement.wait();
+    let _ = answering.kill();
+    let _ = answering.wait();
+    drop(held);
+    first.end();
+    second.end();
+}
+
+/// A listener on the tree's controller endpoint that accepts connections and answers none, as a
+/// daemon that is starting does, and counts them.
+struct SilentListener {
+    accepted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    over: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    socket: PathBuf,
+}
+
+impl SilentListener {
+    fn bind(host: &Standalone) -> Self {
+        let endpoint = host
+            .tree
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint");
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let over = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (counted, ended) = (accepted.clone(), over.clone());
+        let runtime = runtime();
+        let listener = {
+            let _inside = runtime.enter();
+            kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint")
+        };
+        let socket = PathBuf::from(endpoint.as_text());
+        let thread = std::thread::spawn(move || {
+            runtime.block_on(async move {
+                // Every connection stays open and unread, so its hello is never answered.
+                let mut kept = Vec::new();
+                while !ended.load(std::sync::atomic::Ordering::SeqCst) {
+                    if let Ok(Ok((connection, _peer))) =
+                        tokio::time::timeout(Duration::from_millis(100), listener.accept()).await
+                    {
+                        kept.push(connection);
+                        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            });
+        });
+        Self {
+            accepted,
+            over,
+            thread: Some(thread),
+            socket,
+        }
+    }
+
+    /// Waits until `count` connections have been accepted.
+    fn until_it_accepted(&self, count: usize) {
+        let started = Instant::now();
+        while self.accepted.load(std::sync::atomic::Ordering::SeqCst) < count {
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "the silent listener accepted fewer than {count} connections"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Stops listening, so that the endpoint is vacant again.
+    fn end(&mut self) {
+        self.over.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
+/// KR-REQ-07.12 (a holder that does not answer and then does): the daemon that holds the
+/// environment accepts the connection and does not answer, so the restart asks and starts nothing
+/// and waits for it, and a daemon answers after the wait began. The result names the process that
+/// the daemon on the connection that answered states, which is no process that the lock file
+/// names. The wait began when the listener accepted the second connection, the first being the
+/// look before it.
+#[test]
+fn a_restart_that_waits_for_a_holder_names_the_process_the_answering_daemon_states() {
+    let host = Standalone::create();
+    host.run_the_daemon_as_the_started_process();
+    host.select_standalone();
+    let lock = host.tree.environment().singleton_lock();
+    let held = kr_controller::singleton::SingletonLock::hold(&lock, host.tree.environment_id())
+        .expect("takes the lock");
+    let mut holder = a_process_named_kr_controller(&host, "holder");
+    let mut answering = a_process_named_kr_controller(&host, "answering");
+    std::fs::write(&lock, format!("{}\n", holder.id())).expect("names the holder");
+    let mut silent = SilentListener::bind(&host);
+    let running = start(host.kr(&["--json", "host", "restart"]));
+    silent.until_it_accepted(2);
+    silent.end();
+    let mut daemon = TestDaemon::serve_generation(
+        &host,
+        "kr-controller/9.9.9",
+        OnStop::AnswerAndStay(answering.id()),
+        true,
+        2,
+    );
+    let output = running.finish("kr host restart");
+    let said = document(&output, "kr host restart");
+    assert_eq!(output.status.code(), Some(0), "{said}");
+    assert_eq!(stop_of(&said), "not_asked", "{said}");
+    assert_eq!(
+        said["serving"].as_u64(),
+        Some(u64::from(answering.id())),
+        "the process that the answering daemon states, not the lock file's: {said}"
+    );
+    assert_eq!(
+        said["pid"].as_u64(),
+        Some(u64::from(answering.id())),
         "{said}"
     );
     assert_eq!(said["launched"], Value::Null, "{said}");
     assert!(attempts(&host).is_empty(), "no record stands");
-    let _ = successor.kill();
-    let _ = successor.wait();
+    let _ = holder.kill();
+    let _ = holder.wait();
+    let _ = answering.kill();
+    let _ = answering.wait();
     drop(held);
-    first.end();
-    second.end();
+    daemon.end();
 }
