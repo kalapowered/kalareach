@@ -3057,6 +3057,105 @@ async fn kr_req_09_05_a_reply_after_the_deadline_to_a_package_action_is_kept_as_
     );
 }
 
+/// KR-REQ-23.30 and KR-REQ-11.28: the cancellation a package declares, which the host carries out
+/// itself, is held to the package's grant until its call. The grant is withdrawn by a narrower
+/// installation while the call waits for the thread that makes it, with the binding's revision
+/// where it was: nothing reaches the upstream, the receipt says refused and the caller is told
+/// `PERMISSION_DENIED`. The control, a component fault, disables the binding's rich capabilities
+/// and lets the admitted cancellation finish: it reaches the upstream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_23_30_a_declared_cancellation_whose_grant_is_withdrawn_before_its_call_is_refused_there()
+ {
+    for withdrawn in [true, false] {
+        let host = host().await;
+        register(&host, None);
+        record_evidence(
+            &host,
+            "agent.cancel",
+            CapabilityRevision::new(1),
+            kr_protocol::broker::InstanceCapabilityState::QualifiedAvailable,
+        );
+        let refused = host
+            .service
+            .broker()
+            .register_actions(binding(), &[cancel_declaration()])
+            .expect("the action is registered");
+        assert!(refused.is_empty(), "{refused:?}");
+        let transport = real_transport_with(&host, upstream_rich_cancelling()).await;
+        transport
+            .owner
+            .set_acknowledgement_deadline(std::time::Duration::from_millis(20));
+        host.service
+            .broker()
+            .set_turn(
+                instance(),
+                Some(kr_protocol::ids::AgentTurnId::new("turn-1").expect("valid")),
+            )
+            .expect("a turn is running");
+        let mut client = cli(&host).await;
+        let window_id = client.action_window().action_window_id.clone();
+        let mutation =
+            plugin_invocation(&host, 50, window_id, "turn.cancel", Nullable::null(), b"{}");
+        let action_id = mutation.action_id;
+
+        let (arrived, release) = host.service.broker().pause_before_submit();
+        let sending = tokio::spawn(async move {
+            let outcome = send(&mut client, mutation).await;
+            (outcome, client)
+        });
+        tokio::task::spawn_blocking(move || arrived.recv_timeout(LIVENESS_DEADLINE))
+            .await
+            .expect("the wait ends")
+            .expect("the call reaches the thread that makes the transport's call");
+        if withdrawn {
+            host.service
+                .broker()
+                .withdraw_grant(binding(), BrokerGrant::UpstreamAction)
+                .expect("the installation narrows");
+        } else {
+            host.service
+                .broker()
+                .disable_rich(binding(), "the component faulted");
+        }
+        release.send(()).expect("the call is let go");
+
+        let (outcome, mut client) = sending.await.expect("the mutation is answered");
+        if withdrawn {
+            let Outcome::Error(error) = outcome else {
+                panic!("a cancellation whose grant was withdrawn was carried: {outcome:?}");
+            };
+            assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+            assert_eq!(
+                receipt(&mut client, action_id).await.state,
+                ReceiptState::Refused
+            );
+            assert!(
+                !transport
+                    .read
+                    .lock()
+                    .expect("the record is not poisoned")
+                    .contains("turn/interrupt"),
+                "nothing reached the upstream"
+            );
+        } else {
+            let id = transport.identifier_of(1).await;
+            assert!(
+                transport
+                    .read
+                    .lock()
+                    .expect("the record is not poisoned")
+                    .contains("turn/interrupt"),
+                "a fault lets what was admitted finish: the cancellation reached the upstream"
+            );
+            transport
+                .says(&format!(r#"{{"id":{id},"result":{{}}}}"#))
+                .await
+                .expect("the reply is carried");
+            until_receipt(&mut client, action_id, ReceiptState::Applied).await;
+        }
+    }
+}
+
 /// KR-REQ-09.05: a connection that has ended carries no evidence: a reply the upstream wrote
 /// before the connection went is not read afterwards, and the receipt stays unknown.
 ///
