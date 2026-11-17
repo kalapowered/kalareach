@@ -4809,7 +4809,7 @@ fn writing_the_next_versions() -> Vec<ReleaseStore> {
 }
 
 /// The stores of a release that reads the registry and the configuration document no further than
-/// it writes them: the release before this one lists them so.
+/// it writes them.
 fn not_reading_through() -> Vec<ReleaseStore> {
     release_stores()
         .into_iter()

@@ -3314,10 +3314,12 @@ moment its grant reaches back to, in any state, and one its grant names however 
 while it is open, so a device whose grant keeps no history and names no question sees none. Asking
 for one question outside that scope is refused rather than answered empty. The daemon passes the
 worker's answer on as the worker gave it (an error in it is held to the rule for what a device is
-told of a failure), and sends a question read with a scope only to a worker
-that says, in its answer to the daemon's hello, that it holds one to it: a worker of an earlier
-build answered with every question it held, so a device's question read to one is refused as
-`UNSUPPORTED_CAPABILITY` before anything reaches it. The agent reads name their session inside the
+told of a failure), and sends every question read with the history scope of the device's grant, to
+every worker: every worker of a level this release retains holds a question read to its scope and
+states so in its answer to the daemon's hello. A daemon of an earlier release sent a question read
+with a scope only to a worker that stated it, because a worker of an earlier build answered with
+every question it held, and refused a device's question read to one as `UNSUPPORTED_CAPABILITY`
+before anything reached it. The agent reads name their session inside the
 subject they read, and that session is the one the grant is checked against and the read is routed
 to. `agent.snapshot` and `agent.approval.inspect` carry retained content, so each goes to the worker
 with the history scope of the device's grant, and the worker holds the answer to it through the
