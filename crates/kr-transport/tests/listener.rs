@@ -1351,3 +1351,157 @@ async fn a_stream_is_revoked_before_the_handler_lets_go_of_it_where_the_task_is_
     assert!(handle.is_revoked(), "the stream stays revoked");
     listener.shutdown().await;
 }
+
+/// What a directory answers the handshake's second read of a peer's record with, after it answered
+/// the first read with the record the peer was paired under.
+#[derive(Clone, Copy, Debug)]
+enum SecondRead {
+    /// The same record: nothing changed while the handshake waited.
+    Same,
+    /// A record of another device that took the same endpoint identity.
+    Replaced(PairedPeer),
+    /// No record: it was withdrawn.
+    Withdrawn,
+}
+
+/// A host whose directory answers the first read of a peer's record with one record and every
+/// later read as `second` says, which is a record that ended and was replaced while a handshake
+/// waited for its proof.
+#[derive(Debug)]
+struct ReplacedWhileWaiting {
+    first: PairedPeer,
+    second: SecondRead,
+    /// How many times the handshake read the directory for the peer.
+    reads: AtomicUsize,
+    /// How many connections reached the handler.
+    served: AtomicUsize,
+}
+
+impl PairedDirectory for ReplacedWhileWaiting {
+    fn paired_peer(&self, endpoint_id: &EndpointKey) -> Option<PairedPeer> {
+        if endpoint_id != &self.first.endpoint_id {
+            return None;
+        }
+        if self.reads.fetch_add(1, Ordering::AcqRel) == 0 {
+            return Some(self.first);
+        }
+        match self.second {
+            SecondRead::Same => Some(self.first),
+            SecondRead::Replaced(record) => Some(record),
+            SecondRead::Withdrawn => None,
+        }
+    }
+}
+
+impl HostHandler for ReplacedWhileWaiting {
+    fn principal_for(&self, device_id: &DeviceId) -> ActorId {
+        kr_transport::listener::device_principal(device_id)
+    }
+
+    fn authority_revision(&self) -> AuthorityRevision {
+        AuthorityRevision::default()
+    }
+
+    fn pairing_surface(&self) -> Option<Arc<dyn PairingSurface>> {
+        None
+    }
+
+    fn serve(self: Arc<Self>, mut session: AuthorisedSession) -> BoxFuture<'static, ()> {
+        Box::pin(async move {
+            self.served.fetch_add(1, Ordering::AcqRel);
+            while session.control.recv().await.is_some() {}
+        })
+    }
+}
+
+/// KR-REQ-10.08: a handshake that began under a record is not admitted under the record that
+/// replaced it. The directory answers the handshake's first read of the peer with the record the
+/// peer was paired under, and its second read, as late as the exchange allows, with a record of
+/// another device that took the same endpoint identity, or with none. The handshake is refused with
+/// the words the host says for each, and no connection reaches the handler. The control, where the
+/// two reads agree, is served.
+#[tokio::test]
+async fn a_handshake_whose_record_is_replaced_while_it_waits_is_refused_and_no_connection_is_registered()
+ {
+    for (replaced, withdrawn, refusal) in [
+        (
+            true,
+            false,
+            Some("the paired record changed during the handshake"),
+        ),
+        (
+            false,
+            true,
+            Some("the paired record was withdrawn during the handshake"),
+        ),
+        (false, false, None),
+    ] {
+        let (host, client) = paired_pair().await;
+        // The record of another device that took the peer's endpoint identity and key.
+        let mut replacement = client.record;
+        replacement.device_id = DeviceId::new(Uuid::from_bytes([0x77; 16]));
+        let second = if replaced {
+            SecondRead::Replaced(replacement)
+        } else if withdrawn {
+            SecondRead::Withdrawn
+        } else {
+            SecondRead::Same
+        };
+        let handler = Arc::new(ReplacedWhileWaiting {
+            first: client.record,
+            second,
+            reads: AtomicUsize::new(0),
+            served: AtomicUsize::new(0),
+        });
+        let config = ListenerConfig::new(
+            EndpointConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
+                ..EndpointConfig::default()
+            },
+            epochs(),
+            ControllerGeneration::new(1),
+        );
+        let listener = register(
+            config,
+            Arc::clone(&host.identity),
+            &host.keys.transport,
+            Arc::clone(&handler),
+        )
+        .await
+        .expect("a listener");
+        let connection = client
+            .endpoint
+            .connect(listener_addr(&listener), ALPN)
+            .await
+            .expect("a connection");
+        let outcome = handshake::connect(&connection, &client.identity, &host.record).await;
+        match refusal {
+            Some(words) => {
+                let error = outcome.err().expect("the handshake is refused");
+                let (kr_transport::error::TransportError::Handshake(error)
+                | kr_transport::error::TransportError::Refused(error)) = error
+                else {
+                    panic!("the refusal is the host's own words, not {error}");
+                };
+                assert_eq!(error.code, ErrorCode::PermissionDenied, "{second:?}");
+                assert_eq!(error.message, words, "{second:?}");
+                assert!(
+                    handler.reads.load(Ordering::Acquire) >= 2,
+                    "the refusal comes from the second read: {second:?}"
+                );
+                assert_eq!(
+                    handler.served.load(Ordering::Acquire),
+                    0,
+                    "no connection reached the handler: {second:?}"
+                );
+            }
+            None => {
+                let authorised = outcome.expect("an unchanged record is admitted");
+                wait_until(|| handler.served.load(Ordering::Acquire) == 1).await;
+                drop(authorised);
+            }
+        }
+        connection.close(0u32.into(), b"done");
+        listener.shutdown().await;
+    }
+}
