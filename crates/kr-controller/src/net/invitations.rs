@@ -1490,29 +1490,36 @@ pub(super) struct Standing {
 }
 
 /// Whether the confirmation a consumption spends must already have an acceptance row.
+///
+/// An acceptance row that exists is always read and held to: a confirmation that an owner device's
+/// record answered is spent only while that record stands, whatever consumes it. The two
+/// variants differ only in what a missing row means.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AcceptanceRow {
     /// A pairing's commit: the confirmation was answered through this host, so its row exists, and
-    /// for the two device channels it names the device whose record answered.
+    /// a missing row is refused.
     Required,
-    /// Every other consumption: a proof nobody completed through this host is written whole.
+    /// Every other consumption: a proof nobody completed through this host is written whole, so a
+    /// missing row is not a refusal.
     Optional,
 }
 
-/// The device whose record answered a pairing's confirmation, read from the acceptance row.
+/// The device whose record answered a confirmation, read from its acceptance row.
 ///
-/// A confirmation with no acceptance row is refused for every channel. A row of one of the two
-/// device channels must name the device that answered; the terminal's row names none by design,
-/// because its signer is the bootstrap key.
+/// A row of one of the two device channels names the device that answered, and a pairing's commit
+/// refuses a row that names none; the terminal's row names none by design, because its signer is
+/// the bootstrap key. A confirmation with no row is refused when the consumption requires one, and
+/// has no answering record to be bound to otherwise.
 fn answering_device(
     transaction: &Connection,
     proof: &OwnerConfirmationProof,
+    acceptance: AcceptanceRow,
 ) -> Result<Option<DeviceId>> {
     let lapsed = |detail: &str| ControllerError::Refused {
         code: ErrorCode::OwnerConfirmationRequired,
         detail: detail.to_owned(),
     };
-    let row = transaction
+    let Some(row) = transaction
         .query_row(
             "SELECT signer_device_id FROM owner_confirmations WHERE confirmation_id = ?1",
             params![proof.request.confirmation_id.get().as_bytes().as_slice()],
@@ -1520,13 +1527,25 @@ fn answering_device(
         )
         .optional()
         .map_err(ControllerError::registry)?
-        .ok_or_else(|| lapsed("no owner confirmation was answered for this pairing"))?;
+    else {
+        return match acceptance {
+            AcceptanceRow::Required => Err(lapsed(
+                "no owner confirmation was answered for this pairing",
+            )),
+            AcceptanceRow::Optional => Ok(None),
+        };
+    };
     match proof.channel {
-        ConfirmationChannel::OwnerDevicePresence | ConfirmationChannel::PairedOwnerDevice => row
-            .map(|bytes| uuid(Some(&bytes)).map(DeviceId::new))
-            .transpose()?
-            .map(Some)
-            .ok_or_else(|| lapsed("the device that answered this confirmation is not recorded")),
+        ConfirmationChannel::OwnerDevicePresence | ConfirmationChannel::PairedOwnerDevice => {
+            match (row, acceptance) {
+                (Some(bytes), _) => Ok(Some(DeviceId::new(uuid(Some(&bytes))?))),
+                (None, AcceptanceRow::Required) => Err(lapsed(
+                    "the device that answered this confirmation is not recorded",
+                )),
+                // A row that names no device binds nothing.
+                (None, AcceptanceRow::Optional) => Ok(None),
+            }
+        }
         _ => Ok(None),
     }
 }
@@ -1535,9 +1554,11 @@ fn answering_device(
 ///
 /// The row is written whole when `complete` never recorded the answer, so the acceptance record
 /// holds every confirmation an effect consumed. A confirmation some effect already consumed is
-/// refused: one ceremony authorises one action. The signer's authority and the keys of the device
-/// the confirmation names are read in this transaction, so the record and the standing it rests on
-/// are one step.
+/// refused: one ceremony authorises one action. The record that answered the confirmation, when
+/// its row exists, is the only record whose standing counts, so a record that merely holds the same
+/// key does not spend its answer. The signer's authority and the keys of the device the
+/// confirmation names are read in this transaction, so the record and the standing it rests on are
+/// one step.
 pub(super) fn consume(
     transaction: &Connection,
     lifetimes: &GrantLifetimes,
@@ -1547,10 +1568,7 @@ pub(super) fn consume(
     now: TimestampMs,
     standing: Standing,
 ) -> Result<()> {
-    let bound_to = match standing.acceptance {
-        AcceptanceRow::Optional => None,
-        AcceptanceRow::Required => answering_device(transaction, proof)?,
-    };
+    let bound_to = answering_device(transaction, proof, standing.acceptance)?;
     signer_still_authorised(
         transaction,
         lifetimes,
