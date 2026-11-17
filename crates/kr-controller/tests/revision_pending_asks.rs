@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use kr_controller::registry::LaunchPhase;
 use kr_controller::service::{Controller, DEBT_PASS_INTERVAL};
+use kr_protocol::hostinfo::{DoctorStatus, HostDoctorResult};
 use kr_protocol::ids::{ActorId, SessionEpoch, SessionId};
 use kr_protocol::local::ControllerConnectionRole;
 use kr_protocol::method::Method;
@@ -2274,6 +2275,183 @@ async fn the_answer_of_a_presentation_that_outlived_its_look_is_used_when_the_bo
     );
     host.stop().await;
     drop(workers);
+}
+
+/// What the doctor says of the workers: the check's status, the line that counts them, and its
+/// remedy.
+async fn workers_check(
+    client: &mut kr_ipc::client::LocalClient,
+) -> (DoctorStatus, String, Option<String>) {
+    let result: HostDoctorResult = client
+        .request(Method::HostDoctor, &())
+        .await
+        .expect("the daemon answers")
+        .expect("host.doctor is served on the local socket")
+        .to_typed()
+        .expect("a result of the declared shape");
+    let check = result
+        .checks
+        .iter()
+        .find(|check| check.id() == "workers")
+        .expect("the doctor reports the workers");
+    (
+        check.status,
+        check.detail().to_owned(),
+        check.remedy().map(str::to_owned),
+    )
+}
+
+/// Lets go of a worker's boundary, waits until the presentation that waited there has been decided
+/// and its task has ended, and says whether the next read of the worker's session is served.
+async fn let_go_and_read(
+    host: &Host,
+    client: &mut kr_ipc::client::LocalClient,
+    worker: &Worker,
+    held: net_support::worker::HeldBoundary,
+) -> bool {
+    held.release();
+    until(
+        Duration::from_secs(10),
+        "the worker's decision of the presentation that waited",
+        || worker.service.presentations_waiting_for_tests() == 0,
+    )
+    .await;
+    until(
+        Duration::from_secs(10),
+        "the end of the task of the presentation",
+        || {
+            !host
+                .controller()
+                .presentation_in_flight_for_tests(worker.session_id)
+        },
+    )
+    .await;
+    read_is_served(client, worker.session_id).await
+}
+
+/// What the doctor says of the workers after a daemon starts while two workers' boundaries are held,
+/// and after a read has adopted each of them in turn: the three readings, each the check's status,
+/// its count line and its remedy. With `unreadable`, a descriptor file that cannot be read lies in
+/// the descriptor directory through all of it.
+async fn doctor_readings_across_two_late_adoptions(
+    unreadable: bool,
+) -> [(DoctorStatus, String, Option<String>); 3] {
+    let Adopted {
+        host,
+        owner: _,
+        workers,
+    } = Adopted::start(2).await;
+    let mut held = Vec::new();
+    for worker in &workers {
+        held.push(worker.hold_the_dispatch_boundary().await);
+    }
+    let stopped = host.shut_down().await;
+    if unreadable {
+        std::fs::write(
+            stopped
+                .tree()
+                .environment()
+                .descriptors_dir()
+                .join("unreadable.kr"),
+            b"not a descriptor",
+        )
+        .expect("the unreadable descriptor is written");
+    }
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+    let mut held = held.into_iter();
+    let mut client = host.client().await;
+
+    let at_the_start = workers_check(&mut client).await;
+    let first = let_go_and_read(
+        &host,
+        &mut client,
+        &workers[0],
+        held.next().expect("a hold for the first worker"),
+    )
+    .await;
+    assert!(
+        first,
+        "the read of the first worker's session reaches it once its boundary is let go"
+    );
+    let after_the_first = workers_check(&mut client).await;
+    let second = let_go_and_read(
+        &host,
+        &mut client,
+        &workers[1],
+        held.next().expect("a hold for the second worker"),
+    )
+    .await;
+    assert!(
+        second,
+        "the read of the second worker's session reaches it once its boundary is let go"
+    );
+    let after_the_second = workers_check(&mut client).await;
+    host.stop().await;
+    drop(workers);
+    [at_the_start, after_the_first, after_the_second]
+}
+
+/// KR-REQ-09.12, KR-ACC-022: after a worker that a start left out has been adopted by a later look,
+/// the doctor's count of quarantined workers holds only the workers that are still out.
+///
+/// A daemon starts again while two workers' boundaries are held, so the start leaves both out and
+/// the doctor counts both. The first boundary is let go and a read adopts that worker: the count is
+/// one, for the worker that is still out, and its warning and remedy stand. The second is let go and
+/// adopted in the same way, and the count is zero, with no warning and no remedy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_doctor_counts_only_the_workers_that_are_still_out_after_a_late_adoption() {
+    let [at_the_start, after_the_first, after_the_second] =
+        doctor_readings_across_two_late_adoptions(false).await;
+    assert_eq!(
+        at_the_start.1, "0 verified, 2 quarantined",
+        "the start left both workers out"
+    );
+    assert_eq!(at_the_start.0, DoctorStatus::Warning);
+    assert!(at_the_start.2.is_some(), "the warning names what to do");
+    assert_eq!(
+        after_the_first.1, "1 verified, 1 quarantined",
+        "the adopted worker leaves the count and the one still out stays in it"
+    );
+    assert_eq!(after_the_first.0, DoctorStatus::Warning);
+    assert!(after_the_first.2.is_some(), "a worker is still out");
+    assert_eq!(
+        after_the_second.1, "2 verified, 0 quarantined",
+        "both workers are adopted and none is counted as out"
+    );
+    assert_eq!(after_the_second.0, DoctorStatus::Ok);
+    assert_eq!(
+        after_the_second.2, None,
+        "no worker is out, so there is nothing to remove"
+    );
+}
+
+/// KR-REQ-09.12, KR-ACC-022: a descriptor that could not be read stays in the doctor's count while
+/// the workers a start left out are adopted one after the other.
+///
+/// The case is the one above with an unreadable file in the descriptor directory: it is out at the
+/// start and still out when both workers have been adopted, and the warning stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_unreadable_descriptor_stays_in_the_doctors_count_after_the_workers_are_adopted() {
+    let [at_the_start, after_the_first, after_the_second] =
+        doctor_readings_across_two_late_adoptions(true).await;
+    assert_eq!(
+        at_the_start.1, "0 verified, 3 quarantined",
+        "the start left both workers and the unreadable descriptor out"
+    );
+    assert_eq!(
+        after_the_first.1, "1 verified, 2 quarantined",
+        "the adopted worker leaves the count and the unreadable descriptor does not"
+    );
+    assert_eq!(
+        after_the_second.1, "2 verified, 1 quarantined",
+        "the unreadable descriptor is still counted when both workers are adopted"
+    );
+    assert_eq!(after_the_second.0, DoctorStatus::Warning);
+    assert!(
+        after_the_second.2.is_some(),
+        "the warning stands for the descriptor that is still out"
+    );
 }
 
 /// KR-REQ-09.12, KR-ACC-022: a closure while a presentation waits at a held boundary ends the

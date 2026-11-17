@@ -27,7 +27,7 @@ use kr_protocol::identity::BootIdentity;
 use kr_protocol::ids::{BuildId, ControllerGeneration, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::retained::Level;
-use kr_protocol::scalars::Nullable;
+use kr_protocol::scalars::{AuthorisationKey, Nullable};
 use kr_protocol::session::{SessionReadParams, SessionReadResult, SessionState, SessionSummary};
 use kr_protocol::worker::WorkerDescriptor;
 
@@ -59,6 +59,9 @@ pub struct KnownWorker {
 pub struct Quarantined {
     /// The session the descriptor claimed.
     pub session_id: SessionId,
+    /// The worker key the descriptor named, which with the session says which worker it describes:
+    /// none for a file that could not be read.
+    pub worker_public_key: Option<AuthorisationKey>,
     /// Why it was refused.
     pub reason: String,
 }
@@ -128,6 +131,7 @@ impl Directory {
                 Err(reason) => {
                     directory.quarantined.push(Quarantined {
                         session_id: SessionId::new(kr_protocol::scalars::Uuid::NIL),
+                        worker_public_key: None,
                         reason: format!("{}: {reason}", entry.path.display()),
                     });
                     continue;
@@ -141,6 +145,7 @@ impl Directory {
             else {
                 directory.quarantined.push(Quarantined {
                     session_id: descriptor.session_id,
+                    worker_public_key: Some(descriptor.worker_public_key.clone()),
                     reason: "no registry row records this session".to_owned(),
                 });
                 continue;
@@ -148,6 +153,7 @@ impl Directory {
             if row.public_key != descriptor.worker_public_key {
                 directory.quarantined.push(Quarantined {
                     session_id: descriptor.session_id,
+                    worker_public_key: Some(descriptor.worker_public_key.clone()),
                     reason: "the descriptor's key is not the one the rendezvous established"
                         .to_owned(),
                 });
@@ -163,6 +169,7 @@ impl Directory {
             {
                 directory.quarantined.push(Quarantined {
                     session_id: descriptor.session_id,
+                    worker_public_key: Some(descriptor.worker_public_key.clone()),
                     reason: "the reservation this worker was started for is fenced".to_owned(),
                 });
                 continue;
@@ -180,6 +187,7 @@ impl Directory {
                 }
                 Err(reason) => directory.quarantined.push(Quarantined {
                     session_id: descriptor.session_id,
+                    worker_public_key: Some(descriptor.worker_public_key.clone()),
                     reason,
                 }),
             }
@@ -200,8 +208,19 @@ impl Directory {
     /// ready report. A worker found at a start or recovered later is asked for its description as
     /// it is admitted (`describe`), and may be admitted without one; its answer to a close this
     /// daemon passes on describes the session then ([`Self::accepted_close`]).
+    ///
+    /// A worker that a start left out and that is admitted later is no longer quarantined: the
+    /// entries of the descriptors that name it go, so that what the directory reports as
+    /// quarantined is only what is still out. A worker is named by its session and its key, and a
+    /// session can have more than one descriptor at a time, since a file name's hexadecimal digits
+    /// may be either case and a stale or planted file can carry another key: a descriptor that
+    /// names the same session with another key, or that could not be read, stays.
     pub fn insert(&mut self, worker: KnownWorker, described: Option<SessionSummary>) {
         let session_id = worker.descriptor.session_id;
+        let key = &worker.descriptor.worker_public_key;
+        self.quarantined.retain(|out| {
+            out.session_id != session_id || out.worker_public_key.as_ref() != Some(key)
+        });
         self.verified.insert(session_id, worker);
         let mut heard = Heard::default();
         if let Some(described) = &described {
@@ -386,7 +405,7 @@ mod tests {
     };
     use kr_protocol::worker::WorkerDescriptor;
 
-    use super::{Directory, KnownWorker};
+    use super::{Directory, KnownWorker, Quarantined};
 
     /// A verified worker of `session_id`, on an endpoint of `host`.
     fn worker(host: &kr_ipc::testing::TempHost, session_id: SessionId) -> KnownWorker {
@@ -448,6 +467,51 @@ mod tests {
     /// What the directory answers a read that meets the worker on its way out with.
     fn ending(directory: &Directory, session_id: SessionId) -> Option<SessionSummary> {
         directory.ending(session_id).map(|read| read.session)
+    }
+
+    /// A worker admitted after a start left it out takes the entry of its own descriptor out of the
+    /// quarantine and no other: a second descriptor of the same session that names another key, a
+    /// descriptor of another session with the same key, and a file that could not be read all stay
+    /// counted.
+    #[test]
+    fn an_admitted_worker_leaves_the_quarantine_and_the_descriptors_still_out_stay_in_it() {
+        let host = kr_ipc::testing::TempHost::create();
+        let session_id = SessionId::new(Uuid::from_bytes([1; 16]));
+        let other = SessionId::new(Uuid::from_bytes([2; 16]));
+        let admitted = worker(&host, session_id);
+        let key = admitted.descriptor.worker_public_key.clone();
+        let out = |session_id, worker_public_key, reason: &str| Quarantined {
+            session_id,
+            worker_public_key,
+            reason: reason.to_owned(),
+        };
+        let mut directory = Directory {
+            quarantined: vec![
+                out(session_id, Some(key.clone()), "its challenge failed"),
+                out(
+                    session_id,
+                    Some(AuthorisationKey::from_bytes([8; 32])),
+                    "another key for the session",
+                ),
+                out(other, Some(key), "another session"),
+                out(SessionId::new(Uuid::NIL), None, "unreadable"),
+            ],
+            ..Directory::default()
+        };
+        directory.insert(admitted, None);
+        let still_out: Vec<&str> = directory
+            .quarantined
+            .iter()
+            .map(|out| out.reason.as_str())
+            .collect();
+        assert_eq!(
+            still_out,
+            [
+                "another key for the session",
+                "another session",
+                "unreadable"
+            ]
+        );
     }
 
     /// A description of another session is not kept as this one's, whichever way it arrives:
