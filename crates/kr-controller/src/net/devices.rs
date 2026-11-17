@@ -2457,6 +2457,53 @@ mod tests {
         }
     }
 
+    /// A late write of the ended pairing, addressed to the device identifier it had, reaches
+    /// neither the ended row nor the record that took its endpoint identity: a preview-key update
+    /// is refused for a record that was revoked and for one whose grant ran out, it is not asked
+    /// to be admitted, and both rows stay as they were.
+    #[test]
+    fn a_late_preview_key_update_under_an_ended_identifier_reaches_no_row() {
+        for ended in ["revoked", "expired"] {
+            let directory = DeviceDirectory::in_memory().expect("a directory");
+            let first = record(1);
+            directory.commit(&first).expect("the row is written");
+            match ended {
+                "revoked" => assert!(
+                    directory
+                        .revoke(first.device_id, TimestampMs::new(5_000))
+                        .expect("revoked")
+                ),
+                _ => directory
+                    .record_expiry(first.device_id, TimestampMs::new(5_000))
+                    .expect("expired"),
+            }
+            let mut second = record(2);
+            second.endpoint_id = first.endpoint_id;
+            directory
+                .commit(&second)
+                .expect("a new record is committed");
+            let read = |record: &DeviceRecord| {
+                directory
+                    .record_for_device(record.device_id)
+                    .expect("readable")
+                    .expect("a row")
+            };
+            let (old_row, new_row) = (read(&first), read(&second));
+
+            let outcome = directory
+                .update_preview_key(
+                    first.device_id,
+                    NotificationPreviewKey::from_bytes([42; 32]),
+                    DeviceKeyRevision::new(2),
+                    || panic!("{ended}: a late write of an ended record is not admitted"),
+                )
+                .expect("a refusal is an outcome");
+            assert_eq!(outcome, PreviewKeyOutcome::NotPaired, "{ended}");
+            assert_eq!(read(&first), old_row, "{ended}: the ended row is as it was");
+            assert_eq!(read(&second), new_row, "{ended}: the new row is as it was");
+        }
+    }
+
     /// Lifetimes over `directory` on a continuous clock a case moves, and that clock.
     fn lifetimes_over(
         directory: &std::sync::Arc<DeviceDirectory>,
@@ -3253,6 +3300,21 @@ mod tests {
         }
 
         let directory = DeviceDirectory::open(&path).expect("the upgraded directory");
+        // The bare open gives the file the rule that an endpoint identity has one record that has
+        // not ended, which a device pairing again rests on, whatever shape the table was made in.
+        let rule: String = Connection::open(&path)
+            .expect("the file opens")
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'network_devices_live_endpoint'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the file holds the rule");
+        assert!(
+            rule.contains("UNIQUE")
+                && rule.contains("revoked_at_ms IS NULL AND expired_at_ms IS NULL"),
+            "the rule is a unique index over the records that have not ended: {rule}"
+        );
         let read = directory
             .record_for_device(device.device_id)
             .expect("read")
