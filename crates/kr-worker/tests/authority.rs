@@ -59,8 +59,15 @@ fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
 }
 
+/// The program of the session that a host serves, in every case that does not give its own. It
+/// outlives every wait of a case: the worker closes a session whose program has ended, so a case
+/// that is still working when the program ends, on a machine that is slow enough, finds the session
+/// closed and fails at its next request. The program is ended with its terminal when the host is
+/// let go, and at the latest when the test program ends.
+const SESSION_PROGRAM: &str = "sleep 3600";
+
 async fn host(generation: u64) -> Host {
-    host_producing(generation, "sleep 30").await
+    host_producing(generation, SESSION_PROGRAM).await
 }
 
 async fn host_producing(generation: u64, script: &str) -> Host {
@@ -2102,10 +2109,7 @@ fn a_living_presentation_keeps_trying_through_mutations_and_is_decided_when_they
 }
 
 async fn presentation_keeps_trying_through_mutations() {
-    // The session's command outlives every wait of the case: the worker closes a session whose
-    // command has ended, and the clients' attaches would then fail. The program's exit ends it at
-    // the latest.
-    let host = host_producing(1, "sleep 3600").await;
+    let host = host(1).await;
     let service = &host.service;
     let boundary = Held::boundary(&host).await;
     let first = service.presentation_tries_for_tests();
@@ -2294,7 +2298,7 @@ async fn host_ready_apart(attention_journal: bool) -> Host {
         .build()
         .expect("a runtime for the host");
     let mut host = runtime
-        .spawn(host_built(1, "sleep 30", attention_journal))
+        .spawn(host_built(1, SESSION_PROGRAM, attention_journal))
         .await
         .expect("the host starts");
     host._apart = HostRuntime(Some(runtime));
