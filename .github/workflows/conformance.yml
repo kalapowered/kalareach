@@ -72,6 +72,13 @@ jobs:
         timeout-minutes: 3
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
+      # The runner fetches the action that keeps the evidence when the first step that calls it
+      # starts. This call fetches it now, with the job's other downloads, and keeps nothing.
+      - name: Load the action that keeps the evidence
+        uses: ./.github/actions/keep-evidence
+        with:
+          only-load: "true"
+
       - name: Install the pinned toolchain
         timeout-minutes: 5
         run: |
@@ -235,6 +242,13 @@ jobs:
       - name: Check out
         timeout-minutes: 3
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # The runner fetches the action that keeps the evidence when the first step that calls it
+      # starts. This call fetches it now, with the job's other downloads, and keeps nothing.
+      - name: Load the action that keeps the evidence
+        uses: ./.github/actions/keep-evidence
+        with:
+          only-load: "true"
 
       # The disk as the image arrives and what takes the room on it, and from here to the last
       # report the lowest free space, sampled every two seconds. The report below is one step of
@@ -493,6 +507,13 @@ jobs:
       - name: Check out
         timeout-minutes: 5
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # The runner fetches the action that keeps the evidence when the first step that calls it
+      # starts. This call fetches it now, with the job's other downloads, and keeps nothing.
+      - name: Load the action that keeps the evidence
+        uses: ./.github/actions/keep-evidence
+        with:
+          only-load: "true"
 
       # The drives as the job starts and, in the step after the report, as it ends. The hosted
       # Windows runner's figures for the workspace drive are not documented, and the run that filled
