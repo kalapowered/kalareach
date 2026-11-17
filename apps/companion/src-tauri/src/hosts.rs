@@ -77,7 +77,8 @@ pub async fn use_host<R: Runtime>(app: &AppHandle<R>, host: PairedHost) -> Resul
 /// application that ends in it, leaves nothing else of the forgetting undone, and the host is not
 /// left in the endpoint. The only thing that waits for the endpoint is the command's return. The
 /// endpoint's forget waits for the introduction of its own host, if a visit or a look is making
-/// one, and then takes the host out, so a visit or a look that began before the forget does not put
+/// one, and for the device lock and the transport's turn at the relay map, which all hosts share.
+/// It then takes the host out, so a visit or a look that began before the forget does not put
 /// the host back, and one that reaches the endpoint after it is refused. When that takes long the
 /// host is already gone from the list and the connection event has been sent: only the command's
 /// answer is late.
