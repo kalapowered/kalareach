@@ -340,6 +340,21 @@ pub struct PairOwnerView {
     pub approval: Nullable<PairingApproval>,
     /// The security event, once the pairing committed.
     pub event: Nullable<PairingSecurityEvent>,
+    /// The pairing the host still lists for the device that used the invitation, when the
+    /// invitation ended because of it. Absent from every other view, so the view of any other
+    /// invitation is as it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub existing: Option<ExistingPairing>,
+}
+
+/// The pairing a host lists for a device, from the host's own record of it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExistingPairing {
+    /// The name the host recorded for the device when it paired.
+    pub device_name: DeviceName,
+    /// When the device paired, in UTC milliseconds.
+    pub paired_at_ms: TimestampMs,
 }
 
 /// One completed pairing, as the host's retained security outbox holds it.

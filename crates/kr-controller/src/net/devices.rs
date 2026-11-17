@@ -1802,8 +1802,8 @@ pub(crate) struct Claim {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ClaimRefusal {
     /// A record of the endpoint identity has neither been revoked nor expired, or this host cannot
-    /// prove that it has.
-    Live,
+    /// prove that it has. It names that record, from the read that decided the refusal.
+    Live(DeviceId),
     /// The earlier record's withdrawal of access has not finished.
     Barrier,
 }
@@ -1818,7 +1818,7 @@ impl ClaimRefusal {
     /// refusal is that pairing's.
     pub(crate) fn into_error_until(self, open_until: Option<&str>) -> ControllerError {
         match self {
-            Self::Live => ControllerError::PermissionDenied {
+            Self::Live(_) => ControllerError::PermissionDenied {
                 detail: "This host still lists this device as paired. Remove the device from \
                          this host first, then pair it again."
                     .to_owned(),
@@ -1905,7 +1905,7 @@ pub(crate) fn claim_endpoint(
             true
         };
         if standing {
-            return Ok(Err(ClaimRefusal::Live));
+            return Ok(Err(ClaimRefusal::Live(row.device_id)));
         }
         replaces = true;
     }

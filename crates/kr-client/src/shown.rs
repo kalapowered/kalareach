@@ -542,6 +542,9 @@ impl Shown {
             }
             Failure::AuthenticationFailed => Self::said("the pairing could not be authenticated"),
             Failure::Expired => Self::said("the invitation expired"),
+            Failure::EndpointPaired { .. } => {
+                Self::said("the host still lists this device as paired")
+            }
             Failure::Consumed { .. } => Self::said("the invitation is no longer open"),
             Failure::AlreadyCommitted => Self::said("the invitation was already committed"),
             Failure::EarlyData => Self::said("a pairing mutation cannot arrive in early data"),

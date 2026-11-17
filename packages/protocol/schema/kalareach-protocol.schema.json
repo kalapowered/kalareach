@@ -16490,6 +16490,11 @@
           "type": "string"
         },
         {
+          "const": "PAIRING_ENDPOINT_PAIRED",
+          "description": "The device that used the invitation is still listed as paired by this host. The host refuses the pairing, the invitation ends, and a new pairing needs the listed pairing removed first.",
+          "type": "string"
+        },
+        {
           "const": "RENDEZVOUS_UNAVAILABLE",
           "description": "The configured rendezvous service could not be reached or has no capacity.",
           "type": "string"
@@ -17136,6 +17141,25 @@
         "exit_status",
         "stopped",
         "detail"
+      ],
+      "type": "object"
+    },
+    "ExistingPairing": {
+      "additionalProperties": false,
+      "description": "The pairing a host lists for a device, from the host's own record of it.",
+      "properties": {
+        "device_name": {
+          "$ref": "#/$defs/DeviceName",
+          "description": "The name the host recorded for the device when it paired."
+        },
+        "paired_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the device paired, in UTC milliseconds."
+        }
+      },
+      "required": [
+        "device_name",
+        "paired_at_ms"
       ],
       "type": "object"
     },
@@ -26719,6 +26743,17 @@
             }
           ],
           "description": "The security event, once the pairing committed."
+        },
+        "existing": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExistingPairing"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The pairing the host still lists for the device that used the invitation, when the\ninvitation ended because of it. Absent from every other view, so the view of any other\ninvitation is as it was."
         },
         "grant_kind": {
           "$ref": "#/$defs/InviteGrantKind",

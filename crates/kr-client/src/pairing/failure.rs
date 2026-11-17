@@ -69,6 +69,9 @@ pub enum FailureKind {
     HostMismatch,
     /// This device is already paired with the host the invitation is for.
     AlreadyPaired,
+    /// The host still lists this device as paired, so it refused the pairing: its record of the
+    /// device has to be removed on the host first.
+    HostStillListsDevice,
     /// What was read is not a KalaReach invitation.
     NotAnInvitation,
     /// The invitation is of a version this release does not read.
@@ -127,6 +130,7 @@ impl Said for FailureKind {
             Self::RelayFault { .. } => "RelayFault",
             Self::HostMismatch => "HostMismatch",
             Self::AlreadyPaired => "AlreadyPaired",
+            Self::HostStillListsDevice => "HostStillListsDevice",
             Self::NotAnInvitation => "NotAnInvitation",
             Self::NewerInvitation => "NewerInvitation",
             Self::NothingToPaste => "NothingToPaste",
@@ -315,6 +319,7 @@ pub fn refused_by_host(code: ErrorCode, direct: bool) -> FailureKind {
         ErrorCode::PairingAuthFailed => FailureKind::NotAuthenticated,
         ErrorCode::PairingAttemptsExhausted if !direct => FailureKind::HostTriesUsed,
         ErrorCode::PairingExpired => FailureKind::Expired,
+        ErrorCode::PairingEndpointPaired => FailureKind::HostStillListsDevice,
         _ => FailureKind::DidNotFinish,
     }
 }
@@ -328,7 +333,7 @@ pub const fn consumed(reason: PairingConsumedReason) -> FailureKind {
         PairingConsumedReason::Cancelled => FailureKind::Withdrawn,
         PairingConsumedReason::AttemptsExhausted => FailureKind::HostTriesUsed,
         PairingConsumedReason::HostRestarted => FailureKind::HostRestarted,
-        PairingConsumedReason::EndpointPaired => FailureKind::DidNotFinish,
+        PairingConsumedReason::EndpointPaired => FailureKind::HostStillListsDevice,
     }
 }
 
@@ -370,6 +375,27 @@ mod tests {
         );
     }
 
+    /// KR-REQ-10.08: a host that still lists the device refuses its pairing, and the device reads
+    /// the same kind from the refusal's code and from the invitation's reason, in either mode. The
+    /// device's own check that it holds a record of the host stays its own kind.
+    #[test]
+    fn a_host_that_still_lists_the_device_is_one_kind_from_its_code_and_from_its_reason() {
+        for direct in [false, true] {
+            assert_eq!(
+                refused_by_host(ErrorCode::PairingEndpointPaired, direct),
+                FailureKind::HostStillListsDevice
+            );
+        }
+        assert_eq!(
+            consumed(PairingConsumedReason::EndpointPaired),
+            FailureKind::HostStillListsDevice
+        );
+        assert_ne!(
+            FailureKind::HostStillListsDevice,
+            FailureKind::AlreadyPaired
+        );
+    }
+
     /// An interface reads a kind by its name, so each kind is sent under the name it has always had,
     /// whatever it holds.
     #[test]
@@ -404,6 +430,7 @@ mod tests {
             ),
             (FailureKind::HostMismatch, "host_mismatch"),
             (FailureKind::AlreadyPaired, "already_paired"),
+            (FailureKind::HostStillListsDevice, "host_still_lists_device"),
             (FailureKind::NotAnInvitation, "not_an_invitation"),
             (FailureKind::NewerInvitation, "newer_invitation"),
             (FailureKind::NothingToPaste, "nothing_to_paste"),
@@ -413,7 +440,7 @@ mod tests {
             (FailureKind::StoreFailed, "store_failed"),
             (FailureKind::ApprovalUnknown, "approval_unknown"),
         ];
-        assert_eq!(kinds.len(), 27);
+        assert_eq!(kinds.len(), 28);
         for (kind, name) in kinds {
             let sent = serde_json::to_value(PairingFailure::new(kind, "a kind")).expect("ok");
             assert_eq!(sent["kind"], serde_json::json!(name), "{name}");

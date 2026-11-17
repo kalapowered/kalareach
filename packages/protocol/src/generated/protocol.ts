@@ -487,6 +487,7 @@ export type BackupEnableCause =
         | 'PAIRING_REJECTED'
         | 'PAIRING_AUTH_FAILED'
         | 'PAIRING_ATTEMPTS_EXHAUSTED'
+        | 'PAIRING_ENDPOINT_PAIRED'
         | 'RENDEZVOUS_UNAVAILABLE'
         | 'RENDEZVOUS_CONFIG_ERROR'
         | 'UNKNOWN_SESSION'
@@ -600,6 +601,7 @@ export type BackupEnableResult =
               | 'PAIRING_REJECTED'
               | 'PAIRING_AUTH_FAILED'
               | 'PAIRING_ATTEMPTS_EXHAUSTED'
+              | 'PAIRING_ENDPOINT_PAIRED'
               | 'RENDEZVOUS_UNAVAILABLE'
               | 'RENDEZVOUS_CONFIG_ERROR'
               | 'UNKNOWN_SESSION'
@@ -2371,6 +2373,7 @@ export type RendezvousMessage =
           | 'PAIRING_REJECTED'
           | 'PAIRING_AUTH_FAILED'
           | 'PAIRING_ATTEMPTS_EXHAUSTED'
+          | 'PAIRING_ENDPOINT_PAIRED'
           | 'RENDEZVOUS_UNAVAILABLE'
           | 'RENDEZVOUS_CONFIG_ERROR'
           | 'UNKNOWN_SESSION'
@@ -3675,6 +3678,7 @@ export interface ProtocolError {
     | 'PAIRING_REJECTED'
     | 'PAIRING_AUTH_FAILED'
     | 'PAIRING_ATTEMPTS_EXHAUSTED'
+    | 'PAIRING_ENDPOINT_PAIRED'
     | 'RENDEZVOUS_UNAVAILABLE'
     | 'RENDEZVOUS_CONFIG_ERROR'
     | 'UNKNOWN_SESSION'
@@ -18775,6 +18779,7 @@ export interface ProtocolError1 {
     | 'PAIRING_REJECTED'
     | 'PAIRING_AUTH_FAILED'
     | 'PAIRING_ATTEMPTS_EXHAUSTED'
+    | 'PAIRING_ENDPOINT_PAIRED'
     | 'RENDEZVOUS_UNAVAILABLE'
     | 'RENDEZVOUS_CONFIG_ERROR'
     | 'UNKNOWN_SESSION'
@@ -22115,6 +22120,12 @@ export interface PairOwnerView {
    */
   event: PairingSecurityEvent1 | null
   /**
+   * The pairing the host still lists for the device that used the invitation, when the
+   * invitation ended because of it. Absent from every other view, so the view of any other
+   * invitation is as it was.
+   */
+  existing?: ExistingPairing | null
+  /**
    * Which rules the proposed grant was checked against.
    */
   grant_kind: 'personal_owner' | 'session_invitation'
@@ -22220,6 +22231,19 @@ export interface PairingSecurityEvent1 {
    * The value both devices displayed.
    */
   verification_value: string
+}
+/**
+ * The pairing a host lists for a device, from the host's own record of it.
+ */
+export interface ExistingPairing {
+  /**
+   * The name the host recorded for the device when it paired.
+   */
+  device_name: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  paired_at_ms: string
 }
 /**
  * The complete proposed grant.

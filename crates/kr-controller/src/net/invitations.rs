@@ -50,7 +50,9 @@ use kr_protocol::grant::Grant;
 use kr_protocol::ids::{
     ActionId, ActorId, AttemptId, ConfirmationId, DeviceId, InvitationId, PairingEventSequence,
 };
-use kr_protocol::invitation::{InviteGrantKind, InviteModeKind, PairingSecurityEvent};
+use kr_protocol::invitation::{
+    ExistingPairing, InviteGrantKind, InviteModeKind, PairingSecurityEvent,
+};
 use kr_protocol::method::Method;
 use kr_protocol::pairing::{
     ClientBundle, ConfirmationChannel, DevicePublicKeys, KeyPurpose, Locator,
@@ -58,12 +60,12 @@ use kr_protocol::pairing::{
     RendezvousOrigin, SensitiveAction,
 };
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
+use kr_protocol::scalars::{Digest256, EndpointKey, Nullable, TimestampMs, Uuid};
 use rusqlite::{Connection, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 
 use super::devices::{
-    DeviceDirectory, DeviceRecord, claim_endpoint, insert_record, unreadable_row,
+    ClaimRefusal, DeviceDirectory, DeviceRecord, claim_endpoint, insert_record, unreadable_row,
 };
 use super::lifetimes::GrantLifetimes;
 use crate::error::{ControllerError, Result};
@@ -515,6 +517,58 @@ impl InvitationRows {
             issue: None,
             admission: WriteAdmission::default(),
         }
+    }
+
+    /// Returns the device record that this host lists as paired for `endpoint`, or `None` when
+    /// every record of it has ended.
+    ///
+    /// A grant that ran out and is owed its end gets the end written first, through the lifetimes'
+    /// own path and outside any transaction, as the commit does it, so whoever waits on it is told
+    /// once. The rows are then read again: a record that carries an end has ended, and a record
+    /// that does not is listed, whether its grant is in force, this host cannot decide it, or the
+    /// end found could not be written yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the rows cannot be read or an end found cannot be recorded.
+    pub fn listed_device(&self, endpoint: &EndpointKey) -> kr_pairing::Result<Option<DeviceId>> {
+        self.directory
+            .rows_for_endpoint(endpoint)
+            .and_then(|rows| {
+                rows.iter()
+                    .filter(|row| row.is_paired())
+                    .try_for_each(|row| self.lifetimes.paired_standing(row).map(|_| ()))
+            })
+            .map_err(store_error)?;
+        self.lifetimes.settle();
+        let rows = self
+            .directory
+            .rows_for_endpoint(endpoint)
+            .map_err(store_error)?;
+        Ok(rows
+            .iter()
+            .find(|row| row.is_paired())
+            .map(|row| row.device_id))
+    }
+
+    /// Returns the pairing this host holds for `device_id`, from its own record of the device: the
+    /// name and the date it recorded, whatever any later candidate presented.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record cannot be read.
+    pub fn existing_pairing(
+        &self,
+        device_id: DeviceId,
+    ) -> kr_pairing::Result<Option<ExistingPairing>> {
+        Ok(self
+            .directory
+            .record_for_device(device_id)
+            .map_err(store_error)?
+            .map(|record| ExistingPairing {
+                device_name: record.device_name,
+                paired_at_ms: record.paired_at_ms,
+            }))
     }
 
     /// Returns a handle that issues one invitation under these terms, for the action given, with an
@@ -1163,14 +1217,22 @@ fn commit_pairing(
     // replacement waits for the withdrawal that ended the earlier record to finish its barrier.
     // Nothing is written but the end of a grant that ran out, which is a fact that stays.
     let record = device_record(commitment).map_err(ControllerError::registry)?;
-    let claim =
-        claim_endpoint(transaction, Some(lifetimes), &record.endpoint_id)?.map_err(|claimed| {
-            claimed.into_error_until(
+    let claim = match claim_endpoint(transaction, Some(lifetimes), &record.endpoint_id)? {
+        Ok(claim) => claim,
+        // The device is still listed: the refusal ends the invitation, and nothing was written.
+        Err(ClaimRefusal::Live(device_id)) => {
+            return Ok(TransitionOutcome::Refused(
+                kr_pairing::PairingError::EndpointPaired { device_id },
+            ));
+        }
+        Err(claimed) => {
+            return Err(claimed.into_error_until(
                 advertised
                     .map(|expires_at_ms| utc_moment(expires_at_ms.get()))
                     .as_deref(),
-            )
-        })?;
+            ));
+        }
+    };
     // The confirmation is spent, and its signer's authority read, before the candidate's own row
     // exists: a candidate presenting the signer's key must not be what makes that signer look like
     // an owner device. It is spent only while the record that answered it stands.

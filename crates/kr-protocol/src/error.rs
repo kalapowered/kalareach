@@ -113,6 +113,10 @@ error_codes! {
          retried automatically.";
     PairingAttemptsExhausted => "PAIRING_ATTEMPTS_EXHAUSTED", NoRetry,
         "The invitation consumed its failed-confirmation allowance.";
+    PairingEndpointPaired => "PAIRING_ENDPOINT_PAIRED", NoRetry,
+        "The device that used the invitation is still listed as paired by this host. The host \
+         refuses the pairing, the invitation ends, and a new pairing needs the listed pairing \
+         removed first.";
     RendezvousUnavailable => "RENDEZVOUS_UNAVAILABLE", Transient,
         "The configured rendezvous service could not be reached or has no capacity.";
     RendezvousConfigError => "RENDEZVOUS_CONFIG_ERROR", ConfigurationChange,

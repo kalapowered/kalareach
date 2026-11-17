@@ -28,8 +28,8 @@ use kr_pairing::host::{
     OwnerContext, cancel_unfinished_invitations,
 };
 use kr_pairing::platform::{
-    InvitationState, InvitationStore, LocatorRecord, PairingCommitment, TestClient,
-    TestClientBudgetStore, TestClock, TestLivePeer, TestRendezvousHost,
+    InvitationRecord, InvitationState, InvitationStore, LocatorRecord, PairingCommitment,
+    TestClient, TestClientBudgetStore, TestClock, TestLivePeer, TestRendezvousHost,
 };
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::error::ErrorCode;
@@ -963,8 +963,8 @@ fn a_commit_that_cannot_write_the_device_writes_nothing() {
 }
 
 /// A record of the candidate's endpoint identity that has neither been revoked nor expired refuses
-/// the commit before anything is spent: the refusal is a permission refusal and no store failure,
-/// the confirmation stays unspent, and the invitation is as it was.
+/// the commit before anything is spent: the refusal names the listed record and is no store failure,
+/// the confirmation stays unspent, and the invitation is consumed for the listed device.
 #[test]
 fn a_live_record_of_the_endpoint_refuses_the_commit_before_the_spend() {
     let temp = tempfile::TempDir::new().expect("a directory on the internal disk");
@@ -973,9 +973,8 @@ fn a_live_record_of_the_endpoint_refuses_the_commit_before_the_spend() {
     let harness = Harness::new(rows.clone());
     let mut host = harness.issue();
     bind(&harness, &mut host);
-    directory
-        .commit(&squatter(&harness))
-        .expect("the other device");
+    let listed = squatter(&harness);
+    directory.commit(&listed).expect("the other device");
 
     let spent_before = spent_confirmations(&path);
     let invitation_id = host.invitation_id();
@@ -984,21 +983,7 @@ fn a_live_record_of_the_endpoint_refuses_the_commit_before_the_spend() {
         .expect("readable")
         .expect("a record");
     let attempt = approve(&harness, &mut host);
-    assert!(
-        matches!(
-            &attempt,
-            Err(PairingError::Refused { code, reason })
-                if *code == ErrorCode::PermissionDenied && reason.contains("still lists this device")
-        ),
-        "{attempt:?}"
-    );
-    assert_eq!(
-        rows.load(invitation_id)
-            .expect("readable")
-            .expect("a record"),
-        before,
-        "the invitation is not consumed"
-    );
+    assert_the_live_refusal(&rows, invitation_id, &before, &attempt, listed.device_id);
     assert_eq!(
         spent_confirmations(&path),
         spent_before,
@@ -1913,15 +1898,43 @@ fn expiring_squatter(
     record
 }
 
-/// The refusal a live record of the endpoint identity gives a commit, in its words.
-fn assert_the_live_refusal(attempt: &Result<PairingCommitment, PairingError>) {
+/// The refusal a live record of the endpoint identity gives a commit: the refusal names the record
+/// the host lists, and the invitation is consumed for it, with that record named. Nothing else of
+/// the invitation's record moved.
+fn assert_the_live_refusal(
+    rows: &InvitationRows,
+    invitation_id: kr_protocol::ids::InvitationId,
+    before: &InvitationRecord,
+    attempt: &Result<PairingCommitment, PairingError>,
+    listed: DeviceId,
+) {
     assert!(
         matches!(
             attempt,
-            Err(PairingError::Refused { code, reason })
-                if *code == ErrorCode::PermissionDenied && reason.contains("still lists this device")
+            Err(PairingError::EndpointPaired { device_id }) if *device_id == listed
         ),
         "{attempt:?}"
+    );
+    let after = rows
+        .load(invitation_id)
+        .expect("readable")
+        .expect("a record");
+    assert_eq!(
+        after.state,
+        InvitationState::Consumed {
+            reason: PairingConsumedReason::EndpointPaired
+        },
+        "the invitation is consumed for the listed device"
+    );
+    assert_eq!(after.refused_for, Some(listed));
+    assert_eq!(
+        InvitationRecord {
+            state: before.state,
+            refused_for: None,
+            ..after
+        },
+        *before,
+        "nothing else of the record moved"
     );
 }
 
@@ -1955,7 +1968,9 @@ fn two_commitments_for_one_endpoint_identity_leave_one_live_record_and_spend_not
     let mut second = harness.issue();
     bind(&harness, &mut second);
 
-    approve(&harness, &mut first).expect("the first commitment commits");
+    let listed = approve(&harness, &mut first)
+        .expect("the first commitment commits")
+        .device_id;
     let spent_before = spent_confirmations(&path);
     let invitation_id = second.invitation_id();
     let before = rows
@@ -1968,14 +1983,7 @@ fn two_commitments_for_one_endpoint_identity_leave_one_live_record_and_spend_not
         Answered::ByTheOwnerDevice,
         &harness.identities_of(18, 19),
     );
-    assert_the_live_refusal(&attempt);
-    assert_eq!(
-        rows.load(invitation_id)
-            .expect("readable")
-            .expect("a record"),
-        before,
-        "the second invitation is not consumed"
-    );
+    assert_the_live_refusal(&rows, invitation_id, &before, &attempt, listed);
     assert_eq!(
         spent_confirmations(&path),
         spent_before,
@@ -2021,14 +2029,8 @@ fn a_record_that_the_owner_revokes_lets_a_new_invitation_commit_under_a_new_iden
         .load(invitation_id)
         .expect("readable")
         .expect("a record");
-    assert_the_live_refusal(&approve(&harness, &mut refused));
-    assert_eq!(
-        rows.load(invitation_id)
-            .expect("readable")
-            .expect("a record"),
-        before,
-        "the invitation is not consumed"
-    );
+    let attempt = approve(&harness, &mut refused);
+    assert_the_live_refusal(&rows, invitation_id, &before, &attempt, listed.device_id);
     assert_eq!(spent_confirmations(&path), spent_before);
 
     assert!(
@@ -2213,14 +2215,8 @@ fn a_record_whose_end_the_host_cannot_prove_counts_as_live_until_it_is_revoked()
         .load(invitation_id)
         .expect("readable")
         .expect("a record");
-    assert_the_live_refusal(&approve(&harness, &mut refused));
-    assert_eq!(
-        rows.load(invitation_id)
-            .expect("readable")
-            .expect("a record"),
-        before,
-        "the invitation is not consumed"
-    );
+    let attempt = approve(&harness, &mut refused);
+    assert_the_live_refusal(&rows, invitation_id, &before, &attempt, listed.device_id);
     assert_eq!(
         spent_confirmations(&path),
         spent_before,

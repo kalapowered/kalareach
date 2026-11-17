@@ -331,6 +331,9 @@ pub const fn entry(code: ErrorCode) -> Entry {
         | ErrorCode::PairingRejected
         | ErrorCode::PairingAuthFailed
         | ErrorCode::PairingAttemptsExhausted => (Step::Stop, UserAction::PairAgain),
+        // A second pairing cannot work while the host lists the device, and nothing on this device
+        // changes that: the host's owner removes the pairing first.
+        ErrorCode::PairingEndpointPaired => (Step::Stop, UserAction::Nothing),
         ErrorCode::RendezvousConfigError => (Step::Stop, UserAction::FixConfiguration),
         ErrorCode::InputIncompatible => (Step::Stop, UserAction::Update),
         ErrorCode::HostNotConfigured => (Step::Stop, UserAction::FixConfiguration),
@@ -611,6 +614,18 @@ mod tests {
         );
         assert_eq!(decision.recovery, Recovery::NewSnapshot);
         assert_eq!(decision.action, UserAction::Resync);
+    }
+
+    /// KR-REQ-10.08: a pairing the host refuses because it still lists the device is not retried
+    /// and names nothing the person can do on the device: pairing again is what fails.
+    #[test]
+    fn a_pairing_the_host_refuses_for_a_listed_device_stops_and_offers_no_remedy() {
+        let decision = decision(
+            Failure::new(ErrorCode::PairingEndpointPaired),
+            RequestClass::IdempotentRead,
+        );
+        assert_eq!(decision.recovery, Recovery::Stop);
+        assert_eq!(decision.action, UserAction::Nothing);
     }
 
     /// KR-REQ-23.57: authentication and schema failures are never retried; each names a

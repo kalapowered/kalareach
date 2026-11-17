@@ -223,6 +223,7 @@ fn every_required_error_code_is_defined_with_a_stable_string() {
         "PAIRING_REJECTED",
         "PAIRING_AUTH_FAILED",
         "PAIRING_ATTEMPTS_EXHAUSTED",
+        "PAIRING_ENDPOINT_PAIRED",
         "RENDEZVOUS_UNAVAILABLE",
         "RENDEZVOUS_CONFIG_ERROR",
         "UNKNOWN_SESSION",

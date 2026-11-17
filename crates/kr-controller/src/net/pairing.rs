@@ -43,9 +43,10 @@ use kr_protocol::ids::{
     ActionId, ActorId, AttemptId, AuthorityRevision, DeviceId, GrantId, InvitationId,
 };
 use kr_protocol::invitation::{
-    InviteEntry, InviteGrantKind, InviteMode, InviteModeKind, PairCancelParams, PairCandidateView,
-    PairConfirmParams, PairConfirmResult, PairInviteParams, PairInviteResult, PairOwnerView,
-    PairingApproval, QrText, RendezvousMessage, default_rendezvous_origin, issuance_digest,
+    ExistingPairing, InviteEntry, InviteGrantKind, InviteMode, InviteModeKind, PairCancelParams,
+    PairCandidateView, PairConfirmParams, PairConfirmResult, PairInviteParams, PairInviteResult,
+    PairOwnerView, PairingApproval, QrText, RendezvousMessage, default_rendezvous_origin,
+    issuance_digest,
 };
 use kr_protocol::pairing::{
     BundleDirection, BundleMessageType, CodeQrPayload, DevicePublicKeys, MAX_CONFIRMATION_FAILURES,
@@ -1067,6 +1068,10 @@ impl PairingHost {
                 PairStatus::AwaitingApproval { .. } => offered.bound()?,
                 _ => None,
             };
+            let refused_for = match &offered.mode {
+                OpenMode::Direct(invitation) => invitation.record().refused_for,
+                OpenMode::Code(offer) => offer.invitation.record().refused_for,
+            };
             let view = PairOwnerView {
                 mode,
                 rendezvous_origin: origin.map_or_else(Nullable::null, Nullable::some),
@@ -1080,6 +1085,7 @@ impl PairingHost {
                     .as_ref()
                     .map_or_else(Nullable::null, |bound| Nullable::some(bound.approval)),
                 event: Nullable::null(),
+                existing: self.existing_of(refused_for)?,
             };
             return Ok(PairStatusResult {
                 status,
@@ -1088,6 +1094,15 @@ impl PairingHost {
         }
         drop(open);
         self.recorded_status(caller, params.invitation_id)
+    }
+
+    /// The pairing this host lists for the device an invitation was refused for, from its own
+    /// record of that device, or `None` for an invitation that was not refused for one.
+    fn existing_of(&self, refused_for: Option<DeviceId>) -> Result<Option<ExistingPairing>> {
+        let Some(device_id) = refused_for else {
+            return Ok(None);
+        };
+        self.rows.existing_pairing(device_id).map_err(refusal)
     }
 
     /// Answers the issuing owner from the durable record, once the invitation object is gone.
@@ -1147,6 +1162,7 @@ impl PairingHost {
                 .rows
                 .event_for(invitation_id)?
                 .map_or_else(Nullable::null, Nullable::some),
+            existing: self.existing_of(row.record.refused_for)?,
         };
         Ok(PairStatusResult {
             status,
@@ -1412,6 +1428,17 @@ impl PairingHost {
             .invitation
             .finish(request, peer as &dyn LivePeer)
             .map_err(protocol_refusal)?;
+        // After the code proof and the endpoint proof, and before the owner is shown a candidate:
+        // a device that this host still lists as paired is refused, and the invitation ends.
+        if let Some(device_id) = self
+            .rows
+            .listed_device(peer.endpoint_id())
+            .map_err(protocol_refusal)?
+        {
+            return Err(protocol_refusal(
+                offer.invitation.refuse_endpoint_paired(device_id),
+            ));
+        }
         let answer = PairFinishResult {
             attempt_id: locked.attempt_id,
             verification_value: locked.verification_value.clone(),
@@ -1658,9 +1685,24 @@ impl PairingHost {
                 Ok(PairRedeemResult::Challenge(Box::new(challenge)))
             }
             PairRedeemParams::Direct(proof) => {
+                // A redemption that repeats one that already locked the candidate is answered as
+                // it was, and is not asked about the endpoint again.
+                let first = invitation.record().state == InvitationState::Open;
                 let candidate = invitation
                     .redeem(proof, peer.endpoint_id(), peer as &dyn LivePeer)
                     .map_err(protocol_refusal)?;
+                // After both proofs, and before the owner is shown a candidate: a device that this
+                // host still lists as paired is refused, and the invitation ends.
+                if first
+                    && let Some(device_id) = self
+                        .rows
+                        .listed_device(peer.endpoint_id())
+                        .map_err(protocol_refusal)?
+                {
+                    return Err(protocol_refusal(
+                        invitation.refuse_endpoint_paired(device_id),
+                    ));
+                }
                 Ok(PairRedeemResult::Locked {
                     attempt_id: candidate.attempt_id,
                     verification_value: candidate.verification_value.clone(),

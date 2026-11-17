@@ -492,6 +492,19 @@ async fn until_challenged(
     }
 }
 
+/// What a candidate's redemption of a direct invitation came to: its connection and surface, the
+/// redemption it sent, and the host's answer to it.
+pub struct Redeemed {
+    /// The candidate's connection to the host.
+    pub connection: iroh::endpoint::Connection,
+    /// The unpaired surface the candidate reached on it.
+    pub candidate: CandidateConnection,
+    /// The redemption that was sent, so a candidate can send it again.
+    pub request: PairRedeemParams,
+    /// The verification value the host locked the candidate with, or what the host refused.
+    pub outcome: std::result::Result<String, TransportError>,
+}
+
 /// Redeems a direct invitation as `device`, over the unpaired surface an unpaired endpoint reaches.
 ///
 /// Returns the candidate's connection, which it asks about its pairing on afterwards.
@@ -499,6 +512,14 @@ pub async fn redeem(
     device: &Candidate<'_>,
     invited: &PairInviteResult,
 ) -> (iroh::endpoint::Connection, CandidateConnection, String) {
+    let redeemed = try_redeem(device, invited).await;
+    let value = redeemed.outcome.expect("the host accepts the redemption");
+    (redeemed.connection, redeemed.candidate, value)
+}
+
+/// As [`redeem`], keeping the host's answer to the redemption, which is a refusal when the host
+/// refuses the candidate.
+pub async fn try_redeem(device: &Candidate<'_>, invited: &PairInviteResult) -> Redeemed {
     let payload = direct_payload(invited);
     let (connection, mut candidate, challenge) = until_challenged(device, &payload).await;
     let PairRedeemResult::Challenge(challenge) = challenge else {
@@ -513,20 +534,24 @@ pub async fn redeem(
         &live_host,
     )
     .expect("a redemption proof");
-    let locked: PairRedeemResult = candidate
-        .call(
-            Method::PairRedeem,
-            &PairRedeemParams::Direct(Box::new(proof)),
-        )
-        .await
-        .expect("the host accepts the redemption");
-    let PairRedeemResult::Locked {
-        verification_value, ..
-    } = locked
-    else {
-        panic!("a redemption locks the invitation");
-    };
-    (connection, candidate, verification_value)
+    let request = PairRedeemParams::Direct(Box::new(proof));
+    let locked: std::result::Result<PairRedeemResult, TransportError> =
+        candidate.call(Method::PairRedeem, &request).await;
+    let outcome = locked.map(|locked| {
+        let PairRedeemResult::Locked {
+            verification_value, ..
+        } = locked
+        else {
+            panic!("a redemption locks the invitation");
+        };
+        verification_value
+    });
+    Redeemed {
+        connection,
+        candidate,
+        request,
+        outcome,
+    }
 }
 
 /// Reads the owner's view of one invitation.

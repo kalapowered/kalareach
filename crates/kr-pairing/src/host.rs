@@ -1035,12 +1035,26 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
                 Ok(commitment)
             }
             Ok(TransitionOutcome::Stale(current)) => Err(self.adopt_stale(current)),
-            // Refused before anything was written: the invitation is as it was.
+            // Refused before anything was written. The invitation is as it was, except for a device
+            // that the host still lists: that ends the invitation for that reason.
+            Ok(TransitionOutcome::Refused(PairingError::EndpointPaired { device_id })) => {
+                Err(self.refuse_endpoint_paired(device_id))
+            }
             Ok(TransitionOutcome::Refused(refusal)) => Err(refusal),
             Err(error) => {
                 self.fenced = true;
                 Err(error)
             }
+        }
+    }
+
+    /// Consumes the invitation because the device that used it is still listed as paired by this
+    /// host, and records which device record the host lists. Returns the refusal to give, or the
+    /// failure of the write when the invitation could not be consumed.
+    pub fn refuse_endpoint_paired(&mut self, device_id: DeviceId) -> PairingError {
+        match self.consume_refusing(PairingConsumedReason::EndpointPaired, Some(device_id)) {
+            Ok(()) => PairingError::EndpointPaired { device_id },
+            Err(error) => error,
         }
     }
 
@@ -1370,12 +1384,22 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
     }
 
     fn consume(&mut self, reason: PairingConsumedReason) -> Result<()> {
+        self.consume_refusing(reason, None)
+    }
+
+    /// Consumes the invitation for `reason`, with the device record that the host refused it for.
+    fn consume_refusing(
+        &mut self,
+        reason: PairingConsumedReason,
+        refused_for: Option<DeviceId>,
+    ) -> Result<()> {
         if !matches!(
             self.record.state,
             InvitationState::Consumed { .. } | InvitationState::Committed
         ) {
             let mut record = self.record.clone();
             record.state = InvitationState::Consumed { reason };
+            record.refused_for = refused_for;
             self.persist(record)?;
         }
         self.attempts.clear();

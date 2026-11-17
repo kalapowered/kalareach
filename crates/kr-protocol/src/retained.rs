@@ -398,6 +398,14 @@ pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
                  shim: the public contract may change with a level move until public 1.0 freezes \
                  at the first client release (`docs/releases/packages.md`).",
         },
+        Compatible {
+            at: "ErrorCode#const:PAIRING_ENDPOINT_PAIRED",
+            reason: "A code that only the host's pairing surface reports, to a device that is \
+                 pairing. A worker is never a party to a pairing, so no frame of the retained \
+                 level carries the code in either direction and no worker of that level is sent \
+                 it. The only reader of the code is a pairing client, which reads an unknown \
+                 code as a lost connection, and no client was released, so there is no shim.",
+        },
     ],
 )
 .with_public_majors(include_str!("../retained/0.78/PUBLIC_MAJORS"))];

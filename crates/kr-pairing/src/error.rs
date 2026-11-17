@@ -181,6 +181,17 @@ pub enum PairingError {
         reason: String,
     },
 
+    /// The device that used the invitation is still listed as paired by this host, so the host
+    /// does not pair it again. The invitation ends for that reason.
+    #[error(
+        "This host still lists this device as paired. Remove the device from this host first, \
+         then pair it again."
+    )]
+    EndpointPaired {
+        /// The device record the host lists for the endpoint.
+        device_id: kr_protocol::ids::DeviceId,
+    },
+
     /// A cryptographic operation failed.
     #[error(transparent)]
     Crypto(#[from] kr_crypto::CryptoError),
@@ -219,6 +230,12 @@ impl PairingError {
             | Self::Consumed {
                 reason: PairingConsumedReason::AttemptsExhausted,
             } => ErrorCode::PairingAttemptsExhausted,
+            // The same code from the refusal and from every repeat of the request that finds the
+            // invitation consumed for it, so a device whose answer was lost reads the same thing.
+            Self::EndpointPaired { .. }
+            | Self::Consumed {
+                reason: PairingConsumedReason::EndpointPaired,
+            } => ErrorCode::PairingEndpointPaired,
             Self::Consumed { .. } | Self::CandidateLocked | Self::AlreadyCommitted => {
                 ErrorCode::PairingRejected
             }

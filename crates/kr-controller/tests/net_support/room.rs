@@ -666,6 +666,17 @@ pub enum Stopped {
     Local(ErrorCode),
 }
 
+/// What a candidate's `pair.finish` came to: the connection and surface it holds, and the host's
+/// answer.
+pub struct Finished {
+    /// The candidate's connection to the host.
+    pub connection: iroh::endpoint::Connection,
+    /// The unpaired surface the candidate reached on it.
+    pub session: CandidateConnection,
+    /// The host's answer to the finish.
+    pub outcome: Result<PairFinishResult, kr_transport::TransportError>,
+}
+
 /// One candidate running a short-code attempt through the room.
 pub struct CodeCandidate<'a> {
     device: Candidate<'a>,
@@ -850,6 +861,14 @@ impl<'a> CodeCandidate<'a> {
         CandidateConnection,
         PairFinishResult,
     ) {
+        let finished = self.try_finish().await;
+        let result = finished.outcome.expect("the host binds the transcript");
+        (finished.connection, finished.session, result)
+    }
+
+    /// As [`Self::finish`], keeping what the host answered to the finish, which is a refusal when
+    /// the host refuses the candidate, and the connection and surface the candidate holds.
+    pub async fn try_finish(&mut self) -> Finished {
         let host = self
             .host_bundle
             .as_ref()
@@ -868,6 +887,26 @@ impl<'a> CodeCandidate<'a> {
         let mut session = handshake::connect_unpaired(&connection, self.device.identity)
             .await
             .expect("an unpaired connection");
+        let outcome = self.finish_over(&mut session).await;
+        Finished {
+            connection,
+            session,
+            outcome,
+        }
+    }
+
+    /// Sends one `pair.finish` of this candidate over `session`, as a candidate does that repeats
+    /// a request whose answer it did not read.
+    pub async fn finish_over(
+        &mut self,
+        session: &mut CandidateConnection,
+    ) -> Result<PairFinishResult, kr_transport::TransportError> {
+        let host = self
+            .host_bundle
+            .as_ref()
+            .expect("the host's bundle was opened")
+            .bundle
+            .clone();
         let request = self
             .client
             .finish_request(
@@ -876,11 +915,7 @@ impl<'a> CodeCandidate<'a> {
                 &self.clock,
             )
             .expect("a finish request");
-        let finished: PairFinishResult = session
-            .call(Method::PairFinish, &request)
-            .await
-            .expect("the host binds the transcript");
-        (connection, session, finished)
+        session.call(Method::PairFinish, &request).await
     }
 
     /// Returns the value this candidate displays once both bundles are exchanged.
