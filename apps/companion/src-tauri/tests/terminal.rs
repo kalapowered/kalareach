@@ -48,6 +48,10 @@ const QUIET: Duration = Duration::from_millis(300);
 /// its own assertion. The states of a correct view come within a fraction of a second.
 const STATE_BOUND: Duration = Duration::from_secs(10);
 
+/// How long a case that writes more than the view, the channel and the reader hold gives the reader
+/// to read what is on the connection before it lets a held view take a first look.
+const READER_SETTLES: Duration = Duration::from_secs(2);
+
 /// The page: an application with the view's commands, and every state each channel was sent.
 struct Page {
     app: tauri::App<MockRuntime>,
@@ -310,6 +314,17 @@ impl Page {
         self.app
             .state::<companion_tauri::terminal::TerminalViews>()
             .held()
+    }
+
+    /// Whether the views reach none held within [`CLOSE_BOUND`], once a close was asked for.
+    async fn held_within_the_close_bound(&self) -> bool {
+        tokio::time::timeout(CLOSE_BOUND, async {
+            while self.held() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok()
     }
 
     async fn held_becomes(&self, views: usize) {
@@ -5215,6 +5230,14 @@ async fn a_flood_the_page_takes_slowly_keeps_the_hosts_order_and_holds_back_no_c
         page.state_within(3, first).await.is_some(),
         "the view did not reach the first state of the flood within the bound"
     );
+    // Nothing on the wire or in the page shows that the session's reader has read all 258
+    // notifications and waits for room in the channel, so the case gives it the time of a settle:
+    // a late reader would make the first look take less than the channel, and the assertion below
+    // fails the case, which is a correct view's failure only if the reader took more than that.
+    assert!(
+        link.quiet_for(READER_SETTLES).await,
+        "nothing goes to the worker while the view is held"
+    );
     // The page takes states one at a time until a look has moved what the channel held into the
     // view's queue.
     let mut recorded = first + 1;
@@ -6134,6 +6157,94 @@ async fn a_refusal_that_states_what_was_accepted_moves_the_count_an_ending_names
         .await
         .expect("the release went within the bound");
     assert_eq!(position(&release), Some((1, 2)));
+}
+
+/// The host's acceptance that the view has taken from its lane into its own queue and not served
+/// is counted by the close before the detach names the typing the host has. The view is held inside
+/// the state of a first update; the host accepts two of three frames and a second update reaches the
+/// session's channel; when the view is let on, one look takes the second update and then the
+/// acceptance, serves the update, and is held inside its state: the acceptance is in the view's
+/// queue, not the lane's, when the close is served. The host never reaches the barrier, so the
+/// detach names what the close counted: the two frames. The case gives the lane's reader `QUIET`
+/// to read the acceptance before the view is let on: a late reader leaves the acceptance in the
+/// lane's queue, where the close's second drain reads it, and the case still passes.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_close_names_the_acceptance_that_the_view_heard_and_had_not_served() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, mut link) = paired_controlling(
+        &page,
+        &mut host,
+        3,
+        &Frame::live((10, 2), (10, 2), 0),
+        &mut lease,
+    )
+    .await;
+    three_keys_the_host_has_read(&page, &view, &host).await;
+    let first = page.states(3).len();
+    let held = Held::new(&page.gate);
+    link.push(
+        PROJECTION_DELTA_EVENT,
+        &delta(1, 40, 52, 10, 2, 0, vec![row(1, "one")]),
+    )
+    .await;
+    // The view is inside the state of the first update, and takes nothing.
+    assert!(
+        page.state_within(3, first).await.is_some(),
+        "the view did not reach the state of the first update within the bound"
+    );
+    link.push(
+        PROJECTION_DELTA_EVENT,
+        &delta(1, 52, 64, 10, 2, 0, vec![row(1, "two")]),
+    )
+    .await;
+    host.script.accept(1, 1);
+    assert!(
+        link.call_within(QUIET).await.is_none(),
+        "nothing goes to the worker while the view is held"
+    );
+    held.let_pass(1);
+    // The view took the second update ahead of the acceptance, and is inside the update's state.
+    assert!(
+        page.state_within(3, first + 1).await.is_some(),
+        "the view did not reach the state of the second update within the bound"
+    );
+    page.app
+        .state::<companion_tauri::terminal::TerminalViews>()
+        .closer(&view)();
+    drop(held);
+    assert!(
+        page.held_within_the_close_bound().await,
+        "the close ended the view within the bound"
+    );
+    let detaches = detaches_written(&host);
+    assert_eq!(detaches.len(), 1, "the detach is written once");
+    let barrier = detaches[0]
+        .after_input
+        .clone()
+        .expect("the detach names a position");
+    assert_eq!(
+        (barrier.epoch.get(), barrier.count.get()),
+        (1, 2),
+        "the detach names the two frames the host accepted"
+    );
+    let _ = link.closed().await;
+}
+
+/// The detaches that the host's connection took whole, as the host would read them.
+fn detaches_written(host: &ScriptedHost) -> Vec<SessionDetachParams> {
+    host.written()
+        .into_iter()
+        .filter_map(|frame| match frame {
+            kr_protocol::envelope::ControlFrame::Mutation(mutation)
+                if mutation.method.to_string() == Method::SessionDetach.to_string() =>
+            {
+                mutation.params.to_typed().ok()
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// The close's detach is written whole, once, naming what the host accepted, and that counts what the
