@@ -413,9 +413,13 @@ async fn a_replacement_waits_for_the_barrier_and_a_first_pairing_does_not() {
 
     // The confirmation that was refused does not work again: its challenge was consumed in memory
     // before the store was asked, and the answer is not kept for a second try.
-    let status = calls::owner_status(&mut again.client, again.invitation_id)
-        .await
-        .expect("the owner's view");
+    let status = calls::owner_status(&mut again.client, again.invitation_id).await;
+    assert!(
+        status.is_ok(),
+        "the refused confirmation does not fence the owner's handle, so its view answers: {:?}",
+        status.as_ref().err()
+    );
+    let status = status.expect("the owner's view");
     let approval = status
         .owner
         .0

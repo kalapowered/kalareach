@@ -2219,7 +2219,15 @@ fn a_record_whose_end_the_host_cannot_prove_counts_as_live_until_it_is_revoked()
         .load(invitation_id)
         .expect("readable")
         .expect("a record");
-    assert_the_live_refusal(&approve(&harness, &mut refused));
+    let attempt = approve(&harness, &mut refused);
+    assert!(
+        matches!(
+            &attempt,
+            Err(PairingError::Refused { code, reason })
+                if *code == ErrorCode::PermissionDenied && reason.contains("still lists this device")
+        ),
+        "a record whose end cannot be proved still holds the endpoint identity, so the commit is refused: {attempt:?}"
+    );
     assert_eq!(
         rows.load(invitation_id)
             .expect("readable")
