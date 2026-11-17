@@ -393,6 +393,38 @@ fn has_table(connection: &Connection, table: &str) -> Result<bool> {
         .map_err(ControllerError::registry)
 }
 
+/// The schema version a registry records, by a read that writes nothing: `None` when it has no
+/// version table or the table holds no row.
+fn recorded_schema_version(connection: &Connection) -> Result<Option<i64>> {
+    if !has_table(connection, "schema_version")? {
+        return Ok(None);
+    }
+    connection
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .optional()
+        .map_err(ControllerError::registry)
+}
+
+/// Whether this build reads a registry that records `version` as it is or brings it forward.
+/// Version 17 is neither: no release wrote it.
+fn is_read_or_brought_forward(version: i64) -> bool {
+    (OLDEST_SCHEMA_VERSION..=READS_THROUGH_SCHEMA_VERSION).contains(&version) && version != 17
+}
+
+/// The refusal of a registry that records `version`, which this build neither reads nor brings
+/// forward.
+fn unreadable_version(version: i64) -> ControllerError {
+    let detail = if version == 17 {
+        "this registry is at schema version 17, which no release wrote".to_owned()
+    } else {
+        format!(
+            "this registry is at schema version {version}; this build reads versions \
+             {OLDEST_SCHEMA_VERSION} to {READS_THROUGH_SCHEMA_VERSION}"
+        )
+    };
+    ControllerError::RegistryUnavailable { detail }
+}
+
 /// The tables whose rows say what a registry's sessions are. Every schema version has had them, and
 /// a registry that has lost one is never brought forward, because opening it would make the table
 /// again, empty, and a registry that records no worker is the one answer a question about who may
@@ -920,6 +952,16 @@ impl Registry {
         environment_id: EnvironmentId,
         current_process: fn(&ProcessStartIdentity) -> CurrentProcess,
     ) -> Result<Self> {
+        // A file that records a version this build neither reads nor brings forward is refused
+        // before any write of the registry's own: not its journal mode, not a table it lacks, not
+        // a step. The engine may first recover a hot rollback journal or the frames of a
+        // write-ahead log, as it does at the first read of the open, which a read of the main file
+        // alone would see stale or torn.
+        if let Some(version) = recorded_schema_version(&connection)?
+            && !is_read_or_brought_forward(version)
+        {
+            return Err(unreadable_version(version));
+        }
         connection
             .pragma_update(None, "journal_mode", "WAL")
             .map_err(ControllerError::registry)?;
@@ -1000,19 +1042,14 @@ impl Registry {
         self.connection
             .execute_batch(CLOCK_CONTINUITY_SCHEMA)
             .map_err(ControllerError::registry)?;
-        let recorded: Option<i64> = self
-            .connection
-            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
-            .optional()
-            .map_err(ControllerError::registry)?;
+        let recorded = recorded_schema_version(&self.connection)?;
         // The other writers first and the version last: a file this brought to a version has all
-        // four writers at least at the shape that version stands for. A file past the version this
-        // build reads through is refused below as it is, without a table of theirs being made in
-        // it; a file an earlier build recorded at the current version before the others had opened
-        // it is not brought here, and each writer brings its own tables the next time it opens the
-        // file. A file at 17, which no release wrote, is refused below, and nothing is written in
-        // it first.
-        if recorded.is_none_or(|version| version < SCHEMA_VERSION && version != 17) {
+        // four writers at least at the shape that version stands for. A file at 17, which no
+        // release wrote, or past the version this build reads through was refused before
+        // anything was written in it, so none of this ran for it; a file an earlier build recorded
+        // at the current version before the others had opened it is not brought here, and each
+        // writer brings its own tables the next time it opens the file.
+        if recorded.is_none_or(|version| version < SCHEMA_VERSION) {
             self.bring_the_other_writers_forward()?;
         }
         match recorded {
@@ -1192,20 +1229,7 @@ impl Registry {
                 self.migrate_16_to_18()?;
             }
             Some(16) => self.migrate_16_to_18()?,
-            Some(17) => {
-                return Err(ControllerError::RegistryUnavailable {
-                    detail: "this registry is at schema version 17, which no release wrote"
-                        .to_owned(),
-                });
-            }
-            Some(version) => {
-                return Err(ControllerError::RegistryUnavailable {
-                    detail: format!(
-                        "this registry is at schema version {version}; this build reads versions \
-                         {OLDEST_SCHEMA_VERSION} to {READS_THROUGH_SCHEMA_VERSION}"
-                    ),
-                });
-            }
+            Some(version) => return Err(unreadable_version(version)),
         }
         self.connection
             .execute(
@@ -1651,7 +1675,8 @@ impl Registry {
     ///
     /// Version 17 is not written: a release that reads this registry through 17 reads the schema of
     /// 16, and this one is not that schema, so a build that reads only up to 17 refuses it. A file
-    /// at 17 is refused here, as a version no release wrote. A rollback to a release that reads
+    /// at 17 is refused as it is opened, before anything is written in it, as a version no release
+    /// wrote. A rollback to a release that reads
     /// through 16 or 17 is refused for a registry at this version.
     ///
     /// This migration, the rebuild it runs and the oldest-shape branch of the table's open go in
