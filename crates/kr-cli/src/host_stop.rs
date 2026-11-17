@@ -5025,6 +5025,65 @@ mod tests {
         }
     }
 
+    /// The request that `ask` writes for a stop is the one composed by hand with `launch_only`
+    /// false, whatever its identifiers: the same method, version, target, preconditions, window,
+    /// lifetime and parameters, read off a real connection.
+    #[tokio::test]
+    async fn the_request_a_stop_writes_is_the_one_composed_with_launch_only_false() {
+        use kr_ipc::client::LocalClient;
+        use kr_protocol::local::LocalClientKind;
+
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = temp.environment();
+        let id = environment.environment_id();
+        let endpoint = environment.controller_endpoint().expect("an endpoint");
+        let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
+        let daemon = tokio::spawn(async move {
+            let (mut reader, mut writer) = greet(&listener, id).await;
+            let ControlFrame::Mutation(request) = reader
+                .read_message::<ControlFrame>()
+                .await
+                .expect("the read request")
+            else {
+                panic!("the command writes a mutation");
+            };
+            writer
+                .write_message(&ControlFrame::Response(kr_protocol::envelope::Response {
+                    request_id: request.request_id.clone(),
+                    outcome: Outcome::Error(ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "refused for the case",
+                    )),
+                }))
+                .await
+                .expect("the refusal");
+            *request
+        });
+        let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, crate::build_id())
+            .await
+            .expect("connects");
+        let progress = Progress {
+            stage: AtomicU8::new(Stage::BeforeAsking as u8),
+            marker: Mutex::new(None),
+            environment_id: id,
+            earlier: Mutex::new(Vec::new()),
+        };
+        let mut composed = client
+            .compose(
+                Method::HostStop,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(id),
+                &HostStopParams { launch_only: false },
+            )
+            .await
+            .expect("composes");
+        let _ = ask(&mut client, id, true, &progress).await;
+        let written = daemon.await.expect("the daemon read the request");
+        composed.action_id = written.action_id.clone();
+        composed.request_id = written.request_id.clone();
+        assert_eq!(written, composed);
+    }
+
     /// A connection that the daemon closed is a closed connection, as the command reads the failure
     /// of the real client's compose.
     #[tokio::test]
