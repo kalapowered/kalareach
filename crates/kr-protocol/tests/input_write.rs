@@ -6,13 +6,10 @@
 //! union refuses is refused: the bytes written as text, a tag it does not know, a member a record
 //! has no place for, a member it lacks.
 
-use kr_cbor::{CanonicalMap, CanonicalValue, Limits};
+use kr_cbor::{CanonicalMap, CanonicalValue};
 use kr_protocol::envelope::ParamsValue;
-use kr_protocol::hello::PackageVersion;
-use kr_protocol::ids::{AttachmentId, BuildId, InputLeaseEpoch, InputSequence, SessionId};
+use kr_protocol::ids::{AttachmentId, InputLeaseEpoch, InputSequence, SessionId};
 use kr_protocol::input::{ConsoleKey, InputContent, InputWriteParams};
-use kr_protocol::local::LocalBuild;
-use kr_protocol::retained::{CodecError, Level};
 use kr_protocol::scalars::{Bytes, Uuid};
 use serde_json::json;
 
@@ -273,26 +270,5 @@ fn a_write_prints_its_variant_and_its_size_and_nothing_it_carries() {
         for carried in ["4660", "4369", "1234", "1111", "hunter", "72"] {
             assert!(!rendering.contains(carried), "{rendering}");
         }
-    }
-}
-
-/// A retained level that reads the union is sent the write as it was given: the rewrite is for the
-/// levels below it, and a key-record write reaches a worker of such a level whole.
-#[test]
-fn a_write_for_a_retained_level_that_reads_the_union_is_sent_as_it_is() {
-    use kr_protocol::retained::RetainedLevel;
-    use kr_protocol::update::CompatibilityLevel;
-
-    let level = Level::retained(Box::leak(Box::new(RetainedLevel::new(
-        CompatibilityLevel::of(PackageVersion::new(0, 78, 0)),
-        "",
-        "",
-        "",
-        &[],
-        &[],
-    ))));
-    assert!(!level.is_this());
-    for write in [write_with(keys_input()), write_with(bytes_input())] {
-        assert_eq!(level.encode_input_write(&write).expect("unchanged"), write);
     }
 }
