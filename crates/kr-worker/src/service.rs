@@ -720,6 +720,15 @@ pub struct WorkerService {
 struct DispatchBoundary {
     lock: Mutex<()>,
     released: tokio::sync::Notify,
+    /// A pause between the unlock and the wake of the next release, which this host's own tests
+    /// arm. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pause_after_unlock: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
 }
 
 impl DispatchBoundary {
@@ -727,6 +736,8 @@ impl DispatchBoundary {
         Self {
             lock: Mutex::new(()),
             released: tokio::sync::Notify::new(),
+            #[cfg(feature = "testing")]
+            pause_after_unlock: Mutex::new(None),
         }
     }
 
@@ -734,12 +745,9 @@ impl DispatchBoundary {
     fn lock(&self) -> std::sync::LockResult<DispatchGuard<'_>> {
         self.lock
             .lock()
-            .map(|guard| DispatchGuard::new(guard, &self.released))
+            .map(|guard| DispatchGuard::new(guard, self))
             .map_err(|poisoned| {
-                std::sync::PoisonError::new(DispatchGuard::new(
-                    poisoned.into_inner(),
-                    &self.released,
-                ))
+                std::sync::PoisonError::new(DispatchGuard::new(poisoned.into_inner(), self))
             })
     }
 
@@ -747,13 +755,11 @@ impl DispatchBoundary {
     fn try_lock(&self) -> std::sync::TryLockResult<DispatchGuard<'_>> {
         self.lock
             .try_lock()
-            .map(|guard| DispatchGuard::new(guard, &self.released))
+            .map(|guard| DispatchGuard::new(guard, self))
             .map_err(|refused| match refused {
-                std::sync::TryLockError::Poisoned(poisoned) => {
-                    std::sync::TryLockError::Poisoned(std::sync::PoisonError::new(
-                        DispatchGuard::new(poisoned.into_inner(), &self.released),
-                    ))
-                }
+                std::sync::TryLockError::Poisoned(poisoned) => std::sync::TryLockError::Poisoned(
+                    std::sync::PoisonError::new(DispatchGuard::new(poisoned.into_inner(), self)),
+                ),
                 std::sync::TryLockError::WouldBlock => std::sync::TryLockError::WouldBlock,
             })
     }
@@ -763,20 +769,35 @@ impl DispatchBoundary {
     fn released(&self) -> tokio::sync::futures::Notified<'_> {
         self.released.notified()
     }
+
+    /// Waits at the pause between the unlock and the wake, where one is armed. Compiled away in
+    /// every shipped build.
+    #[cfg(feature = "testing")]
+    fn wait_after_the_unlock(&self) {
+        let armed = self
+            .pause_after_unlock
+            .lock()
+            .expect("the pause is not poisoned")
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.recv();
+        }
+    }
 }
 
 /// The dispatch boundary, held. Letting go of it wakes the presentations waiting for it.
 #[derive(Debug)]
 pub struct DispatchGuard<'a> {
     guard: Option<std::sync::MutexGuard<'a, ()>>,
-    released: &'a tokio::sync::Notify,
+    boundary: &'a DispatchBoundary,
 }
 
 impl<'a> DispatchGuard<'a> {
-    const fn new(guard: std::sync::MutexGuard<'a, ()>, released: &'a tokio::sync::Notify) -> Self {
+    const fn new(guard: std::sync::MutexGuard<'a, ()>, boundary: &'a DispatchBoundary) -> Self {
         Self {
             guard: Some(guard),
-            released,
+            boundary,
         }
     }
 }
@@ -785,7 +806,9 @@ impl Drop for DispatchGuard<'_> {
     fn drop(&mut self) {
         // The lock goes first, so that a woken presentation finds it free.
         drop(self.guard.take());
-        self.released.notify_waiters();
+        #[cfg(feature = "testing")]
+        self.boundary.wait_after_the_unlock();
+        self.boundary.released.notify_waiters();
     }
 }
 
@@ -1782,6 +1805,31 @@ impl WorkerService {
         self.dispatch
             .lock()
             .expect("the dispatch barrier is not poisoned")
+    }
+
+    /// Stops the next release of the dispatch boundary between its unlock and its wake of the
+    /// requests that wait for it, for this host's own tests.
+    ///
+    /// Returns the end that says the release has reached the pause, with the boundary unlocked and
+    /// nothing woken, and the end that lets it go on to the wake. The pause fires once, for the
+    /// first release that reaches it, and holds the thread that drops the guard: a case drops the
+    /// guard it holds on a thread of its own, and does not wait for that thread on a thread of the
+    /// runtime.
+    #[cfg(feature = "testing")]
+    pub fn pause_after_the_boundary_is_unlocked(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (arrived, watch) = std::sync::mpsc::sync_channel(1);
+        let (release, go) = std::sync::mpsc::sync_channel(1);
+        *self
+            .dispatch
+            .pause_after_unlock
+            .lock()
+            .expect("the pause is not poisoned") = Some((arrived, go));
+        (watch, release)
     }
 
     /// Runs the fence this worker owes for a revision whose announcement it refused, as its own
