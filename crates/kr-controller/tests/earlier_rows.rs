@@ -1089,39 +1089,131 @@ fn assert_no_side_file(path: &Path) {
     }
 }
 
-/// A registry that records `version`, which this build neither reads nor brings forward, is
-/// refused with `words`, and the refusal writes nothing: the file's bytes are what they were, the
-/// journal mode is not changed, the missing table is not made and no side file is left.
-fn assert_refused_before_any_write(version: i64, words: &str) {
+/// What opening a registry that records a version this build neither reads nor brings forward
+/// leaves: the refusal's words, the file's bytes before and after, and the side files beside it.
+/// The cases below assert on it themselves.
+struct Refused {
+    words: String,
+    before: Vec<u8>,
+    after: Vec<u8>,
+    side_files: Vec<&'static str>,
+}
+
+/// Opens a registry that records `version`, which a write would change (a rollback-journal file
+/// with a table missing), and reports what the refusal left.
+fn open_refused(version: i64) -> Refused {
     let temp = tempfile::tempdir().expect("a directory on the internal disk");
     let path = temp.path().join("registry.db");
     registry_that_a_write_would_change(&path, version);
     let before = std::fs::read(&path).expect("the file");
-    let error = match open_registry(&path) {
+    let words = match open_registry(&path) {
         Err(error) => error.to_string(),
         Ok(_) => panic!("a registry at {version} is refused"),
     };
-    assert!(error.contains(words), "{error}");
-    assert_eq!(
-        std::fs::read(&path).expect("the file"),
+    let side_files = ["-wal", "-shm", "-journal"]
+        .into_iter()
+        .filter(|suffix| {
+            let mut beside = path.as_os_str().to_owned();
+            beside.push(suffix);
+            Path::new(&beside).exists()
+        })
+        .collect();
+    Refused {
+        words,
         before,
-        "the refused file's bytes are as they were"
-    );
-    assert_no_side_file(&path);
+        after: std::fs::read(&path).expect("the file"),
+        side_files,
+    }
 }
 
-/// The refusal of a registry at 17 comes before anything is written in it.
+/// The refusal of a registry at 17 comes before anything is written in it: the file's bytes are
+/// what they were, the journal mode is not changed, the missing table is not made and no side file
+/// is left.
 #[test]
 fn a_registry_at_17_is_refused_before_any_write() {
-    assert_refused_before_any_write(17, "no release wrote");
+    let refused = open_refused(17);
+    assert!(
+        refused.words.contains("no release wrote"),
+        "{}",
+        refused.words
+    );
+    assert_eq!(
+        refused.after, refused.before,
+        "the refused file's bytes are as they were"
+    );
+    assert!(refused.side_files.is_empty(), "{:?}", refused.side_files);
 }
 
 /// The refusal of a registry above the versions this build reads comes before anything is
 /// written in it.
 #[test]
 fn a_registry_above_the_versions_this_build_reads_is_refused_before_any_write() {
-    assert_refused_before_any_write(
-        kr_controller::registry::READS_THROUGH_SCHEMA_VERSION + 1,
-        "this build reads versions",
+    let refused = open_refused(kr_controller::registry::READS_THROUGH_SCHEMA_VERSION + 1);
+    assert!(
+        refused.words.contains("this build reads versions"),
+        "{}",
+        refused.words
+    );
+    assert_eq!(
+        refused.after, refused.before,
+        "the refused file's bytes are as they were"
+    );
+    assert!(refused.side_files.is_empty(), "{:?}", refused.side_files);
+}
+
+/// The refusal of a registry that records version 0, below the oldest this build reads, comes
+/// before anything is written in it.
+#[test]
+fn a_registry_at_0_is_refused_before_any_write() {
+    let refused = open_refused(0);
+    assert!(
+        refused.words.contains("this build reads versions"),
+        "{}",
+        refused.words
+    );
+    assert_eq!(
+        refused.after, refused.before,
+        "the refused file's bytes are as they were"
+    );
+    assert!(refused.side_files.is_empty(), "{:?}", refused.side_files);
+}
+
+/// A registry file whose version table exists and holds no row is opened as a new file is: the
+/// open makes the tables it lacks, writes the version this build writes, and leaves the file's
+/// schema equal to a new file's.
+#[test]
+fn a_registry_whose_version_table_is_empty_opens_as_a_new_file_does() {
+    let temp = tempfile::tempdir().expect("a directory on the internal disk");
+    let fresh = temp.path().join("fresh.db");
+    drop(open_registry(&fresh).expect("a new registry"));
+
+    let path = temp.path().join("registry.db");
+    drop(open_registry(&path).expect("a registry"));
+    rusqlite::Connection::open(&path)
+        .expect("the registry opens")
+        .execute_batch("DELETE FROM schema_version; DROP TABLE utc_floors;")
+        .expect("an empty version table and a table that is missing");
+    let rows: i64 = rusqlite::Connection::open(&path)
+        .expect("the registry opens")
+        .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
+        .expect("a count");
+    assert_eq!(rows, 0, "the version table holds no row");
+
+    let opened = open_registry(&path);
+    assert!(
+        opened.is_ok(),
+        "a file with an empty version table opens: {:?}",
+        opened.err()
+    );
+    drop(opened);
+    assert_eq!(
+        recorded_version(&path),
+        kr_controller::registry::SCHEMA_VERSION,
+        "the open writes the version this build writes"
+    );
+    assert_eq!(
+        schema_of(&path),
+        schema_of(&fresh),
+        "the open makes the tables the file lacked: its schema equals a new file's"
     );
 }
