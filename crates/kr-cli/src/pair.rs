@@ -1688,7 +1688,7 @@ mod tests {
                 .join("\n")
         };
         let bare = PairStatusResult {
-            status: ended,
+            status: ended.clone(),
             owner: kr_protocol::scalars::Nullable::null(),
         };
         let shown = said(&bare);
