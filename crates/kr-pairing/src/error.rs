@@ -346,4 +346,31 @@ mod tests {
         assert!(!rendered.contains("code"));
         assert!(!rendered.contains("origin"));
     }
+
+    /// KR-REQ-10.08: the refusal of a device the host still lists and every later request that finds
+    /// the invitation consumed for it report one code, which no other outcome reports.
+    #[test]
+    fn a_listed_device_is_refused_under_one_code_whether_the_request_is_the_first_or_a_repeat() {
+        let device_id =
+            kr_protocol::ids::DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16]));
+        assert_eq!(
+            PairingError::EndpointPaired { device_id }.code(),
+            ErrorCode::PairingEndpointPaired
+        );
+        assert_eq!(
+            PairingError::Consumed {
+                reason: PairingConsumedReason::EndpointPaired
+            }
+            .code(),
+            ErrorCode::PairingEndpointPaired,
+            "a repeat is not reported as a rejection"
+        );
+        assert_ne!(
+            PairingError::Consumed {
+                reason: PairingConsumedReason::Cancelled
+            }
+            .code(),
+            ErrorCode::PairingEndpointPaired
+        );
+    }
 }

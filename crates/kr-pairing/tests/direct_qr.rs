@@ -1299,3 +1299,66 @@ fn a_direct_invitation_that_names_a_current_approval_or_question_is_not_issued()
     assert!(harness.store.snapshot().is_empty(), "nothing was written");
     assert_eq!(harness.issue().record().state, InvitationState::Open);
 }
+
+/// KR-REQ-10.08: a commit that the host's store refuses because the device is still listed as
+/// paired ends the invitation for that reason, records which listed device the host named, and
+/// writes no commitment. The owner's repeated confirmation reads the same code.
+#[test]
+fn a_commit_refused_for_a_listed_device_consumes_the_invitation_and_a_repeat_reads_the_same_code() {
+    let harness = Harness::new();
+    let mut invitation = harness.issue();
+    let payload = harness.scan(&invitation);
+    let (candidate, _) = run_redemption(&harness, &mut invitation, &payload).expect("a redemption");
+    let keys_digest = client_keys_digest(&harness.client_keys.public_keys()).expect("a digest");
+    let locked = invitation.record().clone();
+    let listed = DeviceId::new(Uuid::from_bytes([0x61; 16]));
+
+    harness
+        .store
+        .refuse_next_write(PairingError::EndpointPaired { device_id: listed });
+    let refused = harness.confirm(&mut invitation, candidate.transcript_digest, keys_digest);
+    assert!(
+        matches!(
+            &refused,
+            Err(PairingError::EndpointPaired { device_id }) if *device_id == listed
+        ),
+        "the commit's refusal is returned: {refused:?}"
+    );
+    let ended = kr_pairing::platform::InvitationRecord {
+        state: InvitationState::Consumed {
+            reason: PairingConsumedReason::EndpointPaired,
+        },
+        refused_for: Some(listed),
+        ..locked
+    };
+    assert_eq!(
+        invitation.record(),
+        &ended,
+        "the invitation ended for the listed device and nothing else of it moved"
+    );
+    let stored = harness
+        .store
+        .snapshot()
+        .into_iter()
+        .find(|record| record.invitation_id == ended.invitation_id)
+        .expect("the invitation's record is stored");
+    assert_eq!(stored, ended, "the end is on the store");
+    assert!(
+        kr_pairing::platform::InvitationStore::commitment(&harness.store, ended.invitation_id)
+            .expect("readable")
+            .is_none(),
+        "no commitment was written"
+    );
+
+    let again = harness.confirm(&mut invitation, candidate.transcript_digest, keys_digest);
+    let first_code = refused.as_ref().expect_err("refused").code();
+    assert_eq!(
+        first_code,
+        kr_protocol::error::ErrorCode::PairingEndpointPaired
+    );
+    assert_eq!(
+        again.as_ref().expect_err("refused again").code(),
+        first_code,
+        "a repeat reads the first refusal's code: {again:?}"
+    );
+}
