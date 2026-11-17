@@ -788,6 +788,17 @@ impl Core {
             })
     }
 
+    /// Whether a frame is queued, or written and not answered, in any epoch.
+    fn keys_pending(&self) -> bool {
+        !self.charges.is_empty()
+            || self.epoch.as_ref().is_some_and(|epoch| {
+                epoch
+                    .queue
+                    .iter()
+                    .any(|entry| matches!(entry, Entry::Frame(_)))
+            })
+    }
+
     fn fits(epoch: &Epoch, older: (usize, usize), frames: usize, cost: usize) -> bool {
         epoch.frames_in_use + older.0 + frames <= MAX_LOCAL_INPUT_FRAMES
             && epoch.cost_in_use + older.1 + cost <= MAX_LOCAL_INPUT_BYTES
@@ -1728,6 +1739,17 @@ impl InputLane {
     #[must_use]
     pub fn sets(&self) -> Option<Sets> {
         self.shared.lock().epoch.as_ref().map(Epoch::sets)
+    }
+
+    /// Whether the lane still has a key to write or to wait for: a frame queued, or written and
+    /// not yet answered by the host, in any epoch. A key of an older epoch that is in flight counts,
+    /// because the writer of a local lane waits for its answer before it writes anything else, and
+    /// the lane says nothing when that answer comes; a queued frame that a new epoch's begin
+    /// dropped unsent does not. Requests queued among the keys ([`InputLane::after_keys`]) are not
+    /// keys.
+    #[must_use]
+    pub fn keys_pending(&self) -> bool {
+        self.shared.lock().keys_pending()
     }
 
     /// Whether a request that follows this lane's typing on a local connection asks for the count of
