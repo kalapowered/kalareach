@@ -2743,9 +2743,11 @@ mod terminal_catalogue {
             SensitiveAction::TrustRepositoryRoot,
             challenge.request.action_digest,
         ));
-        effect(environment, &mut client, &params)
-            .await
-            .expect("a proof with no earlier record is spent as it was");
+        let spent = effect(environment, &mut client, &params).await;
+        assert!(
+            spent.is_ok(),
+            "a proof with no earlier record is spent as it was: {spent:?}"
+        );
         assert_eq!(listed(environment, &mut client).await, ["development"]);
         host.stop().await;
     }
