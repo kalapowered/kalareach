@@ -6156,7 +6156,7 @@ fn position(release: &scripted_worker::Call) -> Option<(u64, u64)> {
         .map(|barrier| (barrier.epoch.get(), barrier.count.get()))
 }
 
-/// KR-REQ-07 (the input stream), release: a release whose barrier the host did not reach (the lane
+/// A release whose barrier the host did not reach (the lane
 /// waits two seconds for the host to accept the typing before it) goes at once, and names the typing
 /// that the host did accept, not what the view admitted: the first of three frames.
 #[tokio::test(flavor = "multi_thread")]
