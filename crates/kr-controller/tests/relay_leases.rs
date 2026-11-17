@@ -5296,40 +5296,11 @@ impl kr_client::pairing::link::HostLink for Counting {
         self.inner.connect_paired_transport(host, identity)
     }
 
-    fn visit_paired_transport<'a>(
+    fn forget_host<'a>(
         &'a self,
-        host: &'a kr_client::pairing::paired::PairedHost,
-        identity: &'a kr_transport::handshake::LocalIdentity,
-        in_use: &'a kr_client::pairing::link::HostInUse<'a>,
-    ) -> kr_client::pairing::BoxFuture<
-        'a,
-        Result<
-            Arc<dyn kr_client::transport::ControlTransport>,
-            kr_client::pairing::link::LinkError,
-        >,
-    > {
-        self.inner.visit_paired_transport(host, identity, in_use)
-    }
-
-    fn hold<'a>(
-        &'a self,
-        network: &'a kr_protocol::pairing::NetworkConfig,
-    ) -> kr_client::pairing::BoxFuture<
-        'a,
-        Result<kr_client::pairing::link::EndpointHold, kr_client::pairing::link::LinkError>,
-    > {
-        self.inner.hold(network)
-    }
-
-    fn visit_hold<'a>(
-        &'a self,
-        network: &'a kr_protocol::pairing::NetworkConfig,
-        in_use: &'a kr_client::pairing::link::HostInUse<'a>,
-    ) -> kr_client::pairing::BoxFuture<
-        'a,
-        Result<kr_client::pairing::link::EndpointHold, kr_client::pairing::link::LinkError>,
-    > {
-        self.inner.visit_hold(network, in_use)
+        host: &'a kr_protocol::scalars::EndpointKey,
+    ) -> kr_client::pairing::BoxFuture<'a, ()> {
+        self.inner.forget_host(host)
     }
 }
 

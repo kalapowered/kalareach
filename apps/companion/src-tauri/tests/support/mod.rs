@@ -1208,8 +1208,8 @@ type ChallengeChange = Arc<
 #[derive(Default)]
 struct LinkState {
     holding: bool,
-    /// Whether the connections the application makes for the host in use are held, and the visits
-    /// to the hosts it is not using are not.
+    /// Whether the connections the application makes for the host in use are held, and the ones a
+    /// test makes by [`as_a_visit`] are not.
     holding_own: bool,
     unreachable: bool,
     /// Whether a connection that is let through is ended as it is made, as a network that drops it
@@ -1270,8 +1270,6 @@ struct LinkState {
     /// connection, whoever was still waiting for them.
     answered: std::collections::BTreeMap<String, usize>,
     waiting: Vec<Option<tokio::sync::oneshot::Sender<()>>>,
-    /// The host in use each visit was made beside, in the order the visits were asked for.
-    visits: Vec<Option<kr_protocol::pairing::NetworkConfig>>,
 }
 
 impl LinkControl {
@@ -1286,7 +1284,7 @@ impl LinkControl {
     }
 
     /// Holds each connection the application makes for the host in use from now on, as it
-    /// reconnects, until the test releases it; a visit to a host is let through.
+    /// reconnects, until the test releases it; a connection made by [`as_a_visit`] is let through.
     pub fn hold_own(&self) {
         self.state.lock().expect("the record").holding_own = true;
     }
@@ -1351,12 +1349,6 @@ impl LinkControl {
     /// a connection that is closed: its first send or read fails.
     pub fn end_connections(&self, ending: bool) {
         self.state.lock().expect("the record").ending = ending;
-    }
-
-    /// The network configuration of the host in use that each visit was asked to leave alone, in
-    /// the order the visits were asked for, `None` for a visit made while no host was in use.
-    pub fn visits(&self) -> Vec<Option<kr_protocol::pairing::NetworkConfig>> {
-        self.state.lock().expect("the record").visits.clone()
     }
 
     /// Makes the host refuse every connection at admission with `code`, or stops that.
@@ -1848,6 +1840,18 @@ impl LinkControl {
     }
 }
 
+tokio::task_local! {
+    /// Set for the connection that a test asks for as a visit: a look at a host in the background,
+    /// which a hold on the application's own connections lets through.
+    static VISITING: ();
+}
+
+/// Runs `connection`, whose connection to a paired host is a visit's: [`LinkControl::hold_own`]
+/// does not hold it.
+pub async fn as_a_visit<F: std::future::Future>(connection: F) -> F::Output {
+    VISITING.scope((), connection).await
+}
+
 /// The phone's way to its host, with a test's control over the connections to a paired host.
 struct ControlledLink {
     own: Arc<dyn kr_client::pairing::link::HostLink>,
@@ -1855,13 +1859,11 @@ struct ControlledLink {
 }
 
 impl ControlledLink {
-    /// Lets a connection through as the control says, as a visit beside the host in use that
-    /// `visiting` names when it is `Some`.
+    /// Lets a connection through as the control says.
     async fn controlled(
         &self,
         host: &kr_client::pairing::paired::PairedHost,
         identity: &kr_transport::handshake::LocalIdentity,
-        visiting: Option<&kr_client::pairing::link::HostInUse<'_>>,
     ) -> Result<Arc<dyn kr_client::transport::ControlTransport>, kr_client::pairing::link::LinkError>
     {
         self.control
@@ -1869,10 +1871,8 @@ impl ControlledLink {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let held = {
             let mut state = self.control.state.lock().expect("the record");
-            if let Some(in_use) = visiting {
-                state.visits.push(in_use());
-            }
-            if state.holding || (state.holding_own && visiting.is_none()) {
+            let visiting = VISITING.try_with(|()| ()).is_ok();
+            if state.holding || (state.holding_own && !visiting) {
                 let (sender, receiver) = tokio::sync::oneshot::channel();
                 state.waiting.push(Some(sender));
                 Some(receiver)
@@ -1904,14 +1904,7 @@ impl ControlledLink {
                 "the host could not be reached".to_owned(),
             ));
         }
-        let transport = match visiting {
-            Some(in_use) => {
-                self.own
-                    .visit_paired_transport(host, identity, in_use)
-                    .await?
-            }
-            None => self.own.connect_paired_transport(host, identity).await?,
-        };
+        let transport = self.own.connect_paired_transport(host, identity).await?;
         if ending {
             transport.close();
         }
@@ -2367,22 +2360,7 @@ impl kr_client::pairing::link::HostLink for ControlledLink {
             kr_client::pairing::link::LinkError,
         >,
     > {
-        Box::pin(self.controlled(host, identity, None))
-    }
-
-    fn visit_paired_transport<'a>(
-        &'a self,
-        host: &'a kr_client::pairing::paired::PairedHost,
-        identity: &'a kr_transport::handshake::LocalIdentity,
-        in_use: &'a kr_client::pairing::link::HostInUse<'a>,
-    ) -> kr_client::pairing::BoxFuture<
-        'a,
-        Result<
-            Arc<dyn kr_client::transport::ControlTransport>,
-            kr_client::pairing::link::LinkError,
-        >,
-    > {
-        Box::pin(self.controlled(host, identity, Some(in_use)))
+        Box::pin(self.controlled(host, identity))
     }
 
     fn present_membership<'a>(
@@ -2425,25 +2403,11 @@ impl kr_client::pairing::link::HostLink for ControlledLink {
         })
     }
 
-    fn hold<'a>(
+    fn forget_host<'a>(
         &'a self,
-        network: &'a kr_protocol::pairing::NetworkConfig,
-    ) -> kr_client::pairing::BoxFuture<
-        'a,
-        Result<kr_client::pairing::link::EndpointHold, kr_client::pairing::link::LinkError>,
-    > {
-        self.own.hold(network)
-    }
-
-    fn visit_hold<'a>(
-        &'a self,
-        network: &'a kr_protocol::pairing::NetworkConfig,
-        in_use: &'a kr_client::pairing::link::HostInUse<'a>,
-    ) -> kr_client::pairing::BoxFuture<
-        'a,
-        Result<kr_client::pairing::link::EndpointHold, kr_client::pairing::link::LinkError>,
-    > {
-        self.own.visit_hold(network, in_use)
+        host: &'a kr_protocol::scalars::EndpointKey,
+    ) -> kr_client::pairing::BoxFuture<'a, ()> {
+        self.own.forget_host(host)
     }
 }
 
