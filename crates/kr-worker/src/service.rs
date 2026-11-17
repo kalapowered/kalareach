@@ -78,9 +78,12 @@ use crate::session::GrantedInput;
 use crate::session::Session;
 use crate::trace::Site;
 
+mod boundary;
 mod overtake;
 mod standing;
 
+use boundary::DispatchBoundary;
+pub use boundary::DispatchGuard;
 use standing::{Limited, Mode, ShownAtAdmission, Sweep};
 
 /// How often the worker replaces a live connection's action window.
@@ -734,84 +737,6 @@ pub struct WorkerService {
     /// tests arm. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     evidence_forgotten: Mutex<std::collections::BTreeSet<u64>>,
-}
-
-/// The dispatch boundary: a lock that says so when it is let go.
-///
-/// Every holder takes it as an ordinary lock and drops its guard as one. Letting go wakes the
-/// presentations that wait for it, so that each tries at once and none waits out its pause while
-/// the boundary stands free between two mutations.
-#[derive(Debug)]
-struct DispatchBoundary {
-    lock: Mutex<()>,
-    released: tokio::sync::Notify,
-}
-
-impl DispatchBoundary {
-    fn new() -> Self {
-        Self {
-            lock: Mutex::new(()),
-            released: tokio::sync::Notify::new(),
-        }
-    }
-
-    /// Takes the boundary, waiting for whoever holds it.
-    fn lock(&self) -> std::sync::LockResult<DispatchGuard<'_>> {
-        self.lock
-            .lock()
-            .map(|guard| DispatchGuard::new(guard, &self.released))
-            .map_err(|poisoned| {
-                std::sync::PoisonError::new(DispatchGuard::new(
-                    poisoned.into_inner(),
-                    &self.released,
-                ))
-            })
-    }
-
-    /// Takes the boundary if nobody holds it, and never waits.
-    fn try_lock(&self) -> std::sync::TryLockResult<DispatchGuard<'_>> {
-        self.lock
-            .try_lock()
-            .map(|guard| DispatchGuard::new(guard, &self.released))
-            .map_err(|refused| match refused {
-                std::sync::TryLockError::Poisoned(poisoned) => {
-                    std::sync::TryLockError::Poisoned(std::sync::PoisonError::new(
-                        DispatchGuard::new(poisoned.into_inner(), &self.released),
-                    ))
-                }
-                std::sync::TryLockError::WouldBlock => std::sync::TryLockError::WouldBlock,
-            })
-    }
-
-    /// Completes when the boundary is next let go. It is created before a try, so a release that
-    /// comes between the try and the wait is not missed.
-    fn released(&self) -> tokio::sync::futures::Notified<'_> {
-        self.released.notified()
-    }
-}
-
-/// The dispatch boundary, held. Letting go of it wakes the presentations waiting for it.
-#[derive(Debug)]
-pub struct DispatchGuard<'a> {
-    guard: Option<std::sync::MutexGuard<'a, ()>>,
-    released: &'a tokio::sync::Notify,
-}
-
-impl<'a> DispatchGuard<'a> {
-    const fn new(guard: std::sync::MutexGuard<'a, ()>, released: &'a tokio::sync::Notify) -> Self {
-        Self {
-            guard: Some(guard),
-            released,
-        }
-    }
-}
-
-impl Drop for DispatchGuard<'_> {
-    fn drop(&mut self) {
-        // The lock goes first, so that a woken presentation finds it free.
-        drop(self.guard.take());
-        self.released.notify_waiters();
-    }
 }
 
 /// What clean-ups of connections whose peers have gone owe to the service.
@@ -5365,7 +5290,7 @@ impl WorkerService {
         // A request that only ends work is not dropped for its peer's end: it waits for the
         // boundary for as long as that takes, and is carried out.
         let ends_work = Self::only_ends_work(method);
-        let Some(_barrier) = self.try_boundary() else {
+        let Some(barrier) = self.try_boundary() else {
             return if ends_work {
                 Tried::Held
             } else {
@@ -5384,7 +5309,7 @@ impl WorkerService {
             if !ends_work && state.peer_has_gone() {
                 return Tried::PeerGone;
             }
-            Tried::Done(self.receipted(state, mutation, method, entry, caller, freshness))
+            Tried::Done(self.receipted(state, mutation, method, entry, caller, freshness, &barrier))
         })
     }
 
@@ -5396,7 +5321,7 @@ impl WorkerService {
         state: &mut ConnectionState,
         ready: &mut Option<ReadyPreparation>,
     ) -> Tried<(PendingPreparation, Result<Answered>)> {
-        let Some(_barrier) = self.try_boundary() else {
+        let Some(barrier) = self.try_boundary() else {
             return Self::after_a_failed_try(state);
         };
         off_the_executor(|| {
@@ -5414,7 +5339,7 @@ impl WorkerService {
             } = ready
                 .take()
                 .expect("an action is held until it is finished");
-            let finished = self.continue_prepared(state, &pending, preparation);
+            let finished = self.continue_prepared(state, &pending, preparation, &barrier);
             Tried::Done((pending, finished))
         })
     }
@@ -6972,7 +6897,8 @@ impl WorkerService {
     }
 
     /// The second pass of an action that was accepted and prepared, inside the dispatch boundary,
-    /// which the caller holds.
+    /// which the caller holds: `barrier` is the caller's guard, borrowed so that this cannot be
+    /// called without the boundary.
     ///
     /// Everything the first pass checked is checked again, now, inside the boundary. First what
     /// the connection holds: the authority it was admitted under. Then the action's own receipt,
@@ -6991,6 +6917,7 @@ impl WorkerService {
         state: &mut ConnectionState,
         pending: &PendingPreparation,
         preparation: Made,
+        barrier: &DispatchGuard<'_>,
     ) -> Result<Answered> {
         let mutation = &pending.mutation;
         let caller = &pending.caller;
@@ -7075,6 +7002,7 @@ impl WorkerService {
             None,
             false,
             Some(preparation),
+            barrier,
         )
     }
 
@@ -7689,11 +7617,13 @@ impl WorkerService {
         }
     }
 
-    /// Admits a mutation and carries it out, inside the dispatch boundary, which the caller holds.
+    /// Admits a mutation and carries it out, inside the dispatch boundary, which the caller holds:
+    /// `barrier` is the caller's guard, borrowed so that this cannot be called without the boundary.
     ///
     /// Everything from here to the recorded outcome happens inside the barrier. The authority this
     /// request was admitted under cannot change underneath it, and two mutations cannot interleave
     /// their checks with each other's effects.
+    #[allow(clippy::too_many_arguments)]
     fn receipted(
         &self,
         state: &mut ConnectionState,
@@ -7702,6 +7632,7 @@ impl WorkerService {
         entry: &'static kr_protocol::authority::MethodEntry,
         caller: &Caller,
         freshness: Freshness,
+        barrier: &DispatchGuard<'_>,
     ) -> Result<Answered> {
         let actor_id = caller.actor_id.clone();
         self.wait_inside_boundary();
@@ -7715,7 +7646,7 @@ impl WorkerService {
         // after the revision it was validated under was replaced, and the barrier is where that has
         // to be caught: a revocation is complete for a worker when the worker has stopped being
         // able to act under what it removed.
-        let first = self.standing_pass(Mode::First);
+        let first = self.standing_pass(Mode::First, barrier);
         first.authority(&state.facts, caller, method)?;
         // The local owner's full check is the first admission's own work: it raises the host's
         // clock floor and owes its record. It stands at the place of the comparison that a pass
@@ -7833,13 +7764,14 @@ impl WorkerService {
             volatile_permitted,
             &submission,
             shown,
+            barrier,
         );
         state.binding = None;
         answered
     }
 
     /// Takes the session, admits the intent to the journal and dispatches the mutation, with the
-    /// session held from the first to the last.
+    /// session held from the first to the last, under the dispatch boundary that `barrier` holds.
     #[allow(clippy::too_many_arguments)]
     fn admit_and_dispatch(
         &self,
@@ -7852,6 +7784,7 @@ impl WorkerService {
         volatile_permitted: bool,
         submission: &crate::journal::Submission,
         shown: ShownAtAdmission,
+        barrier: &DispatchGuard<'_>,
     ) -> Result<Answered> {
         // From here the session is locked and stays locked. Admission, the final revalidation, the
         // dispatch marker, the effect and the recorded outcome are one serial boundary: nothing
@@ -7887,7 +7820,7 @@ impl WorkerService {
         // The uncertain outcome in the way is asked again under the hold that reaches the accept:
         // an earlier launch can settle as unknown while this request waited for the session. A
         // refusal here has written no receipt, as at the first admission.
-        self.standing_pass(Mode::Again).limits(
+        self.standing_pass(Mode::Again, barrier).limits(
             Some(&mut *session),
             caller,
             state,
@@ -7934,6 +7867,7 @@ impl WorkerService {
             accepted_at,
             volatile_permitted,
             None,
+            barrier,
         )
     }
 
@@ -7943,7 +7877,8 @@ impl WorkerService {
     /// A mutation whose effect needs something prepared outside the boundary comes here twice. The
     /// first time it has no preparation, finds it needs one and returns [`Answered::Prepare`] with
     /// its receipt still `accepted`; the second time, called with the preparation, it is
-    /// revalidated against the present, as any accepted intent is before its marker.
+    /// revalidated against the present, as any accepted intent is before its marker. It runs under
+    /// the dispatch boundary that `barrier` holds.
     #[allow(clippy::too_many_arguments)]
     fn dispatch_accepted(
         &self,
@@ -7958,6 +7893,7 @@ impl WorkerService {
         accepted_at: Option<u64>,
         volatile_permitted: bool,
         preparation: Option<Made>,
+        barrier: &DispatchGuard<'_>,
     ) -> Result<Answered> {
         let actor_id = caller.actor_id.clone();
         let second_pass = preparation.is_some();
@@ -7965,7 +7901,7 @@ impl WorkerService {
         // this is the last moment at which checking it still means something. Both calls ask in the
         // first mode: a refusal here is the admission's own, and the receipt's reason is chosen
         // from the error below, whichever call it was.
-        let pass = self.standing_pass(Mode::First);
+        let pass = self.standing_pass(Mode::First, barrier);
         let revalidated = pass
             .subject(&session, state, mutation, method, caller)
             // The deadline the host derived is the deadline it keeps, measured on the continuous
