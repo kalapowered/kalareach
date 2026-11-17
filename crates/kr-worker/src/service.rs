@@ -635,9 +635,9 @@ pub struct WorkerService {
     /// compiled away in every shipped build.
     #[cfg(feature = "testing")]
     delivery_end_stall: crate::testing::Stall,
-    /// A stop in a mutation inside the dispatch boundary, after the check that decides whether the
-    /// host's current statement of what its local owner may do lets it be dispatched and before it
-    /// takes the session, which this host's own tests arm to have a statement arrive in between. It
+    /// A stop in a mutation inside the dispatch boundary, after the checks that decide whether the
+    /// host's current statement of what its local owner may do, and the withdrawal of its
+    /// connection, let it be dispatched and before it takes the session, which this host's own tests arm to have a statement arrive in between. It
     /// is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     after_the_dispatch_check_stall: crate::testing::Stall,
@@ -7923,8 +7923,6 @@ impl WorkerService {
         // able to act under what it removed.
         self.check_validated_revision(caller)?;
         self.check_local_dispatch(&state.facts, method, caller)?;
-        #[cfg(feature = "testing")]
-        self.after_the_dispatch_check_stall.stand();
         // A connection that a restriction withdrew stays open, but it holds no place in the
         // registry any more, so no later withdrawal would find an attachment it made: it attaches
         // on a new connection.
@@ -7935,6 +7933,8 @@ impl WorkerService {
                     .to_owned(),
             });
         }
+        #[cfg(feature = "testing")]
+        self.after_the_dispatch_check_stall.stand();
         let digest = kr_protocol::digest::mutation_digest(mutation, &actor_id)
             .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
 
