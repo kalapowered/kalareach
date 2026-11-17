@@ -24,13 +24,15 @@
 //! after the connections are made, once the healthy host has been asked its first hundred
 //! questions, and each later stop follows only once every one of those connections has answered a
 //! question that was asked after the last resume. After a stop that fails, the next stop starts at
-//! the deadline of that wait (twice [`RECOVERY`]), not once every connection has answered. It
-//! fails unless every connection stays open, each is answered again within [`RECOVERY`] after each
-//! resume, every question to them is answered, no question that was asked [`SETTLE`] or longer
-//! after the stop began is answered before the relay resumes, and the healthy host stays under the
-//! limit through every stop. It prints how many datagrams the relay actor dropped for the stopped
-//! relay's queue in each stop and outside the stops, and asserts no count of them: a short stop
-//! can end before the queue is full.
+//! the deadline of that wait (twice [`RECOVERY`]), not once every connection has answered. After
+//! each switch the case waits until every pump of the front waits at the gate, and it judges the
+//! stop by the questions that were asked from then until the resume. It fails unless every
+//! connection stays open, each is answered again within [`RECOVERY`] after each resume, every
+//! question to them is answered, every pump waits at the gate within [`STAND`] of each switch, no
+//! question that was asked after every pump waited at the gate is answered before the relay
+//! resumes, and the healthy host stays under the limit through every stop. It prints how many
+//! datagrams the relay actor dropped for the stopped relay's queue in each stop and outside the
+//! stops, and asserts no count of them: a short stop can end before the queue is full.
 //!
 //! Both are outside the default suite: each runs for minutes, so they are asked for by name with
 //! `--ignored --nocapture`, which prints what they measured. They run with one test thread
@@ -79,10 +81,11 @@ const HOST_INTERVAL: Duration = Duration::from_millis(500);
 const STOPS: usize = 3;
 const STOP_FOR: Duration = Duration::from_secs(5);
 
-/// How long after a stop began a question must have been asked for the recovery case to hold the
-/// stop to it: a read of the front that was under way at the switch has ended by then, so a stopped
-/// front lets no answer to such a question through.
-const SETTLE: Duration = Duration::from_millis(500);
+/// The longest that the recovery case waits after a switch for every pump of the front to wait at
+/// the gate. A pump has at most one read and one write to finish, which takes milliseconds; a pump
+/// that still runs after this is stuck, and the case fails with a line of its own. It is shorter
+/// than a stop, so each stop keeps a window.
+const STAND: Duration = Duration::from_secs(3);
 
 /// The longest that a connection to a host on the relay that resumed may take to answer a question
 /// that was asked after the resume: the recovery case fails when one takes longer, and when one has
@@ -959,9 +962,9 @@ async fn arrangement(hosts: usize) -> (Vec<String>, Vec<String>) {
 /// The recovery arrangement: `hosts` hosts with [`CONNECTIONS_PER_HOST`] connections each on the
 /// relay that stops `stops` times for `stop_for`, a small question every [`HOST_INTERVAL`] on each of
 /// those connections, and the next stop only once every one of them has answered a question that
-/// was asked after the resume, or at the deadline of that wait. Each stop is checked: a question
-/// asked [`SETTLE`] or longer after it began must not be answered before the resume. Returns the
-/// lines it printed, and the conditions it failed.
+/// was asked after the resume, or at the deadline of that wait. Each stop is checked: no question
+/// that was asked after every pump of the front waited at the gate, and before the resume, may have
+/// been answered before the resume. Returns the lines it printed, and the conditions it failed.
 async fn recovery(hosts: usize, stops: usize, stop_for: Duration) -> (Vec<String>, Vec<String>) {
     let seen = capture();
     let world = World::start(hosts, Load::Questions).await;
@@ -994,10 +997,20 @@ async fn recovery(hosts: usize, stops: usize, stop_for: Duration) -> (Vec<String
     )];
     let mut failures = Vec::new();
     let mut windows: Vec<(Instant, Instant)> = Vec::new();
+    // When every pump of the front waited at the gate in each stop, or none if one did not.
+    let mut stood: Vec<Option<Instant>> = Vec::new();
     for stop in 1..=stops {
         front.stall();
         let switched = Instant::now();
-        tokio::time::sleep(stop_for).await;
+        // The stop is judged from the moment that every pump waits at the gate: no pause decides it.
+        match front.confirm_stopped(STAND).await {
+            Ok(()) => stood.push(Some(Instant::now())),
+            Err(reason) => {
+                failures.push(format!("stop {stop}: {reason}"));
+                stood.push(None);
+            }
+        }
+        tokio::time::sleep(stop_for.saturating_sub(switched.elapsed())).await;
         let resumed = Instant::now();
         front.resume();
         windows.push((switched, resumed));
@@ -1043,25 +1056,27 @@ async fn recovery(hosts: usize, stops: usize, stop_for: Duration) -> (Vec<String
             ));
         }
         // The stop's own effect. A stopped front passes no byte either way, so a question that was asked
-        // once the reads under way at the switch had ended gets no answer before the resume.
-        let (mut asked_in_stop, mut answered_early) = (0, 0);
-        for asker in &asking {
-            let (asked, early) = asker.asked_between(switched + SETTLE, resumed);
-            asked_in_stop += asked;
-            answered_early += early;
-        }
-        lines.push(format!(
-            "STOPPED stop {stop}: {answered_early} of {asked_in_stop} questions asked {SETTLE:?} or longer after the switch and before the resume were answered before the resume"
-        ));
-        if asked_in_stop == 0 {
-            failures.push(format!(
-                "stop {stop}: no question that was asked from {SETTLE:?} after the switch to the resume had ended, so the stop was not checked"
+        // once every pump waited at the gate gets no answer before the resume.
+        if let Some(stood) = stood[stop - 1] {
+            let (mut asked_in_stop, mut answered_early) = (0, 0);
+            for asker in &asking {
+                let (asked, early) = asker.asked_between(stood, resumed);
+                asked_in_stop += asked;
+                answered_early += early;
+            }
+            lines.push(format!(
+                "STOPPED stop {stop}: {answered_early} of {asked_in_stop} questions asked after every pump of the front waited at the gate and before the resume were answered before the resume"
             ));
-        }
-        if answered_early != 0 {
-            failures.push(format!(
-                "stop {stop}: {answered_early} of {asked_in_stop} questions asked {SETTLE:?} or longer after the switch were answered before the resume: the relay was not stopped"
-            ));
+            if asked_in_stop == 0 {
+                failures.push(format!(
+                    "stop {stop}: no question that was asked after every pump of the front waited at the gate had ended by the resume, so the stop was not checked"
+                ));
+            }
+            if answered_early != 0 {
+                failures.push(format!(
+                    "stop {stop}: {answered_early} of {asked_in_stop} questions asked after every pump of the front waited at the gate and before the resume were answered before the resume: the relay was not stopped"
+                ));
+            }
         }
     }
     let before_last = healthy.started();
