@@ -31,7 +31,7 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt as _, StreamExt as _};
 use kr_client::error::{ClientError, HostWord};
-use kr_client::input::{InputEvent, InputEvents, InputLane, InputRefusal, InputTarget};
+use kr_client::input::{EndCause, InputEvent, InputEvents, InputLane, InputRefusal, InputTarget};
 use kr_client::ordered::Ordered;
 use kr_client::projection::{Applied, Projection, decode, is_projection_event};
 use kr_client::session::{Session, Settled};
@@ -208,6 +208,8 @@ pub(super) struct Probe {
     /// How many ends of its input lane the view has served: the lane's own record says that it ended,
     /// and this says that the view read the end and acted on it.
     pub(super) lane_ends: Arc<AtomicUsize>,
+    /// How many releases of the lease the view has taken to send: the lease owed each one.
+    pub(super) releases_queued: Arc<AtomicUsize>,
     /// The view's session, once its link is open.
     pub(super) session: Arc<std::sync::Mutex<Option<Arc<Session>>>>,
     /// Whether the view's input lane has ended, as the lane records it, once the lane is open.
@@ -1452,6 +1454,10 @@ impl View {
             self.heard_in_flight = false;
         }
         while let Some(owed) = self.lease.owed() {
+            #[cfg(feature = "testing")]
+            if matches!(owed, Owed::Release(_)) {
+                self.probe.releases_queued.fetch_add(1, Ordering::Relaxed);
+            }
             let sent = match owed {
                 Owed::Acquire => {
                     // A take that finds no lane opens it first, and acquires once it is open, so
@@ -1902,7 +1908,7 @@ impl View {
                 None
             }
             InputEvent::LaunchReserved { .. } => None,
-            InputEvent::Ended { .. } => {
+            InputEvent::Ended { cause, .. } => {
                 // The lane's handle goes, which is what lets its events end, and the reader is kept
                 // and read to its end: what the lane says behind its end, the barriers it did not
                 // reach, is served as any other word of the lane. The connection's end reaches the
@@ -1910,8 +1916,13 @@ impl View {
                 self.lane = None;
                 // Whatever ended it, a view that holds the lease ends control: no key can be
                 // written under it any more, the keys of a new stream need a new epoch, and the
-                // lease's epoch is given back.
-                if self.lease.stream_ended() {
+                // lease's epoch is given back, except where the connection's end ended the lane: no
+                // release can reach the host then, and the host gives the lease back itself.
+                let changed = match cause {
+                    EndCause::Connection { .. } => self.lease.connection_ended(),
+                    _ => self.lease.stream_ended(),
+                };
+                if changed {
                     self.control_changed();
                 }
                 #[cfg(feature = "testing")]

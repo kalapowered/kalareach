@@ -316,6 +316,16 @@ impl TerminalViews {
             .map(|probe| probe.lane_ends.load(Ordering::Relaxed))
     }
 
+    /// How many releases of the lease a view has taken to send so far: one for each that its lease
+    /// owed. For a test of whether a view that lost its input stream gave the lease back.
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn releases_queued(&self, view: &str) -> Option<usize> {
+        self.probe(view)
+            .map(|probe| probe.releases_queued.load(Ordering::Relaxed))
+    }
+
     /// The last event sequence that the view's session has read from `stream`, whether or not the
     /// view has taken it, or none before the session has read any, for a view that has ended, or
     /// for one that was never open. The session's reader records it before it hands the event on.

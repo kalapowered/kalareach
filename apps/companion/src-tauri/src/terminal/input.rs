@@ -617,6 +617,20 @@ impl Lease {
         self.end_held(ENDED_BY_STREAM)
     }
 
+    /// The view's input stream ended by its connection's cause while the view held the lease.
+    /// Control ends as it does for any end of the stream, and nothing is given back: a release
+    /// cannot reach the host on a connection that is gone, and the host gives the lease back at the
+    /// connection's end. Returns whether control changed; a lease that is not held changes nothing.
+    pub fn connection_ended(&mut self) -> bool {
+        if self.held.is_none() {
+            return false;
+        }
+        self.held = None;
+        self.wanted = false;
+        self.ended = Some(ENDED_BY_STREAM.to_owned());
+        true
+    }
+
     /// The session granted the take's lease after the view's input stream ended, and nothing can be
     /// typed under it. The take ends as it is granted: the lease is given back, once, and the next
     /// take asks for a new stream. Returns whether control changed; a lease that is not held changes
