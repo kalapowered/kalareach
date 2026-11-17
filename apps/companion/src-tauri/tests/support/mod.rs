@@ -1667,6 +1667,12 @@ impl LinkControl {
         self.answers.notify_waiters();
     }
 
+    /// Whether a request is held before it is sent now, for a wait on a thread of its own while the
+    /// hold stands on the path that is waited on.
+    pub fn request_is_held(&self) -> bool {
+        self.state.lock().expect("the record").request_held
+    }
+
     /// Waits until a request is held before it is sent.
     pub async fn until_request_held(&self) {
         tokio::time::timeout(WATCHDOG, async {
