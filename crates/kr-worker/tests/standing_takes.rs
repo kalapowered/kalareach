@@ -304,9 +304,9 @@ fn the_first_admissions_limits_planted_under_a_session_of_its_own_is_reported() 
     assert_eq!(found.len(), 2, "{found:?}");
     assert!(
         found[0].contains(
-            "service.rs receipted calls limits holding {\"BAR\", \"SES\"} and its held row says {\"BAR\"}"
+            "service.rs receipted calls limits holding {\"SES\"} and its held row says {}"
         ) && found[1].contains(
-            "service.rs receipted calls admit_and_dispatch holding {\"BAR\", \"SES\"} and its held row says {\"BAR\"}"
+            "service.rs receipted calls admit_and_dispatch holding {\"SES\"} and its held row says {}"
         ),
         "{found:?}"
     );
@@ -382,17 +382,33 @@ fn a_broker_take_planted_in_the_decisions_check_is_reported() {
 }
 
 #[test]
-fn the_barrier_dropped_on_the_prepared_path_is_reported() {
-    // The prepared path takes the barrier and the session before the pass, as the first admission
-    // does; a barrier let go first would leave the pass asking under the session alone.
+fn a_second_caller_of_the_first_admission_is_reported() {
+    // The first admission runs inside the barrier that its caller takes with `try_boundary`, which
+    // the reader does not know as a guard, so its `held` rows read no barrier: the `caller` row is
+    // what keeps a call from a function that takes none out.
     let found = planted(
         SERVICE,
-        "        holding.held();\n        self.dispatch_accepted(\n            holding,\n            session,\n            state,\n            mutation,\n            method,\n            caller,\n            pending.deadline,",
-        "        holding.held();\n        drop(_barrier);\n        self.dispatch_accepted(\n            holding,\n            session,\n            state,\n            mutation,\n            method,\n            caller,\n            pending.deadline,",
+        "    fn receipted(",
+        "    fn rogue(&self) {\n        let _ = self.receipted();\n    }\n\n    fn receipted(",
     );
     only_finding(
         &found,
-        "service.rs continue_prepared calls dispatch_accepted holding {\"SES\"} and its held row says {\"BAR\", \"SES\"}",
+        "service.rs rogue calls receipted 1 time(s) and no row lists the caller",
+    );
+}
+
+#[test]
+fn a_second_caller_of_the_prepared_paths_second_pass_is_reported() {
+    // The same for the prepared path's second pass, which `prepared_once` calls under the barrier
+    // that it takes.
+    let found = planted(
+        SERVICE,
+        "    fn continue_prepared(",
+        "    fn rogue(&self) {\n        let _ = self.continue_prepared();\n    }\n\n    fn continue_prepared(",
+    );
+    only_finding(
+        &found,
+        "service.rs rogue calls continue_prepared 1 time(s) and no row lists the caller",
     );
 }
 
