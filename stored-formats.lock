@@ -858,7 +858,7 @@
     {
       "scope": "environment",
       "path": "host-attempts",
-      "reason": "the record that each attempt of a command that ends the control daemon keeps, one small JSON file named with the attempt's identity: the command, its phase, its process with that process's start identity, the time of the phase and the daemon it stops; a file that cannot be read or parsed is read as none, and a control daemon right after it has bound its endpoints removes every file that does not name it as the daemon to stop",
+      "reason": "the record that each attempt of a command that ends the control daemon keeps, one small JSON file named with the attempt's identity: the command (a stop or a restart), its phase (asking, told, starting or start failed), its process with that process's start identity, the time of the phase and the daemon it stops; a file that cannot be read or parsed is read as none, and a control daemon right after it has bound its endpoints removes every file that does not name it as the daemon to stop",
       "children": [],
       "opaque": true,
       "databases": false
