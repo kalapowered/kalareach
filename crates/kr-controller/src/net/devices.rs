@@ -2457,6 +2457,209 @@ mod tests {
         }
     }
 
+    /// Lifetimes over `directory` on a continuous clock a case moves, and that clock.
+    fn lifetimes_over(
+        directory: &std::sync::Arc<DeviceDirectory>,
+    ) -> (
+        kr_transport::clock::ManualClock,
+        super::super::lifetimes::GrantLifetimes,
+    ) {
+        let clock = kr_transport::clock::ManualClock::new();
+        let lifetimes = super::super::lifetimes::GrantLifetimes::new(
+            std::sync::Arc::clone(directory),
+            std::sync::Arc::new(clock.clone()),
+            std::sync::Arc::new(kr_ipc::clock::ManualSharedClock::new()),
+            kr_ipc::identity::boot_identity().expect("a boot identity"),
+            crate::service::WallClock::system(),
+            std::sync::Arc::new(crate::grants::policy::UtcFloor::default()),
+        );
+        (clock, lifetimes)
+    }
+
+    /// A record whose grant runs out a minute from now.
+    fn expiring(byte: u8) -> DeviceRecord {
+        let mut expiring = record(byte);
+        expiring.grant.expiry = GrantExpiry::At {
+            expires_at_ms: TimestampMs::new(kr_ipc::now_ms().get() + 60_000),
+        };
+        expiring
+    }
+
+    /// What a pairing's transaction does for `second`: claims its endpoint identity and inserts it.
+    fn replace(
+        directory: &DeviceDirectory,
+        lifetimes: Option<&super::super::lifetimes::GrantLifetimes>,
+        second: &DeviceRecord,
+    ) -> Result<()> {
+        directory.transaction(|transaction| {
+            let claim = claim_endpoint(transaction, lifetimes, &second.endpoint_id)?
+                .map_err(ClaimRefusal::into_error)?;
+            insert_record(transaction, second, &claim)
+        })
+    }
+
+    /// A grant that runs out after the commit read its record's standing, and before its
+    /// transaction: the claim finds the record due and writes its end in the transaction, so the
+    /// new record is inserted. The hook that waits on the end is told once, by the settle after
+    /// the commit and not before.
+    #[test]
+    fn a_grant_that_runs_out_inside_the_transaction_is_marked_in_it_and_told_once_after() {
+        let directory = std::sync::Arc::new(DeviceDirectory::in_memory().expect("a directory"));
+        let (clock, lifetimes) = lifetimes_over(&directory);
+        let told = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        lifetimes.pending_expiry().on_recorded({
+            let told = std::sync::Arc::clone(&told);
+            move |device_id| told.lock().expect("the list").push(device_id)
+        });
+        let first = expiring(1);
+        directory.commit(&first).expect("the row is written");
+        assert!(lifetimes.in_force(&first).expect("decided"), "anchored");
+        clock.advance(std::time::Duration::from_secs(61));
+
+        let mut second = record(2);
+        second.endpoint_id = first.endpoint_id;
+        replace(&directory, Some(&lifetimes), &second).expect("the end is found and written");
+        let ended = directory
+            .record_for_device(first.device_id)
+            .expect("readable")
+            .expect("the first record");
+        assert_eq!(
+            ended.expired_at_ms,
+            lifetimes.pending_expiry().owed_at(first.device_id),
+            "the mark is the moment the end was first seen"
+        );
+        assert!(ended.expired_at_ms.is_some());
+        assert!(told.lock().expect("the list").is_empty(), "not told yet");
+        lifetimes.settle();
+        assert_eq!(*told.lock().expect("the list"), vec![first.device_id]);
+        assert_eq!(lifetimes.pending_expiry().owed(), 0);
+        assert_eq!(
+            directory
+                .rows_for_endpoint(&first.endpoint_id)
+                .expect("readable")
+                .len(),
+            2
+        );
+    }
+
+    /// As the case above, with the withdrawal that ended an earlier record still owing its barrier:
+    /// the transaction takes back everything, the first record has no mark immediately after, and
+    /// the settle writes the mark that is owed.
+    #[test]
+    fn a_refused_claim_leaves_no_mark_and_the_settle_writes_the_one_owed() {
+        let directory = std::sync::Arc::new(DeviceDirectory::in_memory().expect("a directory"));
+        let (clock, lifetimes) = lifetimes_over(&directory);
+        let first = expiring(1);
+        directory.commit(&first).expect("the row is written");
+        assert!(lifetimes.in_force(&first).expect("decided"), "anchored");
+        directory
+            .with(|connection| {
+                connection.execute_batch(
+                    "CREATE TABLE fence_debt (debt_id TEXT PRIMARY KEY NOT NULL);
+                     INSERT INTO fence_debt (debt_id) VALUES ('an earlier withdrawal');",
+                )
+            })
+            .expect("a debt the barrier has not retired");
+        clock.advance(std::time::Duration::from_secs(61));
+
+        let mut second = record(2);
+        second.endpoint_id = first.endpoint_id;
+        let refused = replace(&directory, Some(&lifetimes), &second).expect_err("the barrier");
+        assert!(
+            matches!(
+                &refused,
+                ControllerError::Refused { code, .. } if *code == ErrorCode::ResourceUnavailable
+            ),
+            "{refused:?}"
+        );
+        let before = directory
+            .record_for_device(first.device_id)
+            .expect("readable")
+            .expect("the first record");
+        assert!(
+            before.expired_at_ms.is_none(),
+            "the transaction took the mark back: {before:?}"
+        );
+        let owed = lifetimes
+            .pending_expiry()
+            .owed_at(first.device_id)
+            .expect("the end is still owed");
+        lifetimes.settle();
+        let after = directory
+            .record_for_device(first.device_id)
+            .expect("readable")
+            .expect("the first record");
+        assert_eq!(after.expired_at_ms, Some(owed), "the settle wrote the mark");
+    }
+
+    /// A replacement waits for the withdrawal that ended the earlier record to finish its barrier,
+    /// by either mark of it; a first record of an endpoint identity does not, and a file that has
+    /// run no withdrawal owes nothing.
+    #[test]
+    fn only_a_replacement_waits_for_a_withdrawal_that_still_owes_its_barrier() {
+        let owed_by = |statement: &str| {
+            let directory = DeviceDirectory::in_memory().expect("a directory");
+            let first = record(1);
+            directory.commit(&first).expect("the row is written");
+            assert!(
+                directory
+                    .revoke(first.device_id, TimestampMs::new(5_000))
+                    .expect("revoked")
+            );
+            directory
+                .with(|connection| connection.execute_batch(statement))
+                .expect("the mark of the withdrawal");
+            (directory, first)
+        };
+        let mut again = record(2);
+        again.endpoint_id = record(1).endpoint_id;
+        let barrier = |directory: &DeviceDirectory, endpoint: &EndpointKey| {
+            directory
+                .transaction(|transaction| Ok(claim_endpoint(transaction, None, endpoint)?.err()))
+                .expect("the claim is read")
+        };
+
+        // A fence the environment owes.
+        let (directory, first) = owed_by(
+            "CREATE TABLE environment (environment_id BLOB, fence_owed_revision INTEGER NOT NULL \
+             DEFAULT 0); INSERT INTO environment VALUES (x'01', 4);",
+        );
+        assert_eq!(
+            barrier(&directory, &first.endpoint_id),
+            Some(ClaimRefusal::Barrier)
+        );
+        assert_eq!(
+            barrier(&directory, &record(9).endpoint_id),
+            None,
+            "a first record of another endpoint identity is not held"
+        );
+        directory
+            .with(|connection| {
+                connection.execute("UPDATE environment SET fence_owed_revision = 0", [])
+            })
+            .expect("the barrier settled");
+        assert_eq!(barrier(&directory, &first.endpoint_id), None);
+        replace(&directory, None, &again).expect("a replacement once nothing is owed");
+
+        // A debt the grant store holds, until its row is deleted.
+        let (directory, first) = owed_by(
+            "CREATE TABLE fence_debt (debt_id TEXT PRIMARY KEY NOT NULL); \
+             INSERT INTO fence_debt (debt_id) VALUES ('d');",
+        );
+        assert_eq!(
+            barrier(&directory, &first.endpoint_id),
+            Some(ClaimRefusal::Barrier)
+        );
+        directory
+            .with(|connection| connection.execute("DELETE FROM fence_debt", []))
+            .expect("the debt retired");
+        assert_eq!(barrier(&directory, &first.endpoint_id), None);
+
+        // A file with neither table has run no withdrawal.
+        let (directory, first) = owed_by("SELECT 1;");
+        assert_eq!(barrier(&directory, &first.endpoint_id), None);
+    }
+
     /// The four keys `device` declares, with the two further ones taken from `byte`.
     fn declared(device: &DeviceRecord, byte: u8) -> DevicePublicKeys {
         DevicePublicKeys {
