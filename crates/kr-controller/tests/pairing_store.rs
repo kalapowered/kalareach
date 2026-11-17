@@ -1040,7 +1040,7 @@ fn a_spent_confirmation_cannot_be_spent_again() {
                 subject: ActionSubject::Completed(approval.request.confirmation_id),
             },
             TimestampMs::new(10),
-            None,
+            harness.owner_device_id,
             &|| Ok(()),
         )
         .expect("answered");
@@ -1056,6 +1056,59 @@ fn a_spent_confirmation_cannot_be_spent_again() {
     assert!(
         rows.record_consumed(&approval.proof, "something else", TimestampMs::new(12))
             .is_err()
+    );
+}
+
+/// An owner device's confirmation is spent only while the record that answered it stands, so an
+/// acceptance row of a device channel that names no device is spent by no record, even one that
+/// holds the signer's key. A pairing's commit refuses the same row, so the row is refused
+/// whichever consumption asks.
+#[test]
+fn a_device_confirmation_whose_row_names_no_device_is_not_spent() {
+    let temp = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.sqlite3");
+    let (_, rows) = open(&path);
+    let harness = Harness::new(rows.clone());
+    assert!(
+        harness.owner_device_id.is_some(),
+        "a live owner device holds the signer's key"
+    );
+    let approval = harness.approval(
+        SensitiveAction::ChangeHostAuthority,
+        Digest256::from_bytes([2; 32]),
+        None,
+    );
+    rows.record_answered(
+        &approval.proof,
+        &PairingAction {
+            actor: ActorId::new("local:501").expect("a principal"),
+            action_id: ActionId::new(kr_ipc::new_uuid()),
+            digest: Digest256::from_bytes([4; 32]),
+            subject: ActionSubject::Completed(approval.request.confirmation_id),
+        },
+        TimestampMs::new(10),
+        None,
+        &|| Ok(()),
+    )
+    .expect("answered, naming no device");
+    let spent = rows.record_consumed(&approval.proof, "the clock", TimestampMs::new(11));
+    assert!(
+        matches!(
+            spent,
+            Err(kr_controller::error::ControllerError::Refused {
+                code: ErrorCode::OwnerConfirmationRequired,
+                ..
+            })
+        ),
+        "a row that names no device is refused as a confirmation to answer again: {spent:?}"
+    );
+    assert!(
+        rows.acceptance(approval.request.confirmation_id)
+            .expect("readable")
+            .expect("a record")
+            .consumed_at_ms
+            .is_none(),
+        "the refused spend left the row unspent"
     );
 }
 

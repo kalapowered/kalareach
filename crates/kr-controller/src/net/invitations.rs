@@ -1504,8 +1504,9 @@ pub(super) struct Standing {
 /// Whether the confirmation a consumption spends must already have an acceptance row.
 ///
 /// An acceptance row that exists is always read and held to: a confirmation that an owner device's
-/// record answered is spent only while that record stands, whatever consumes it. The two
-/// variants differ only in what a missing row means.
+/// record answered is spent only while that record stands, whatever consumes it, and a row of a
+/// device channel that names no device is spent by nobody. The two variants differ only in what a
+/// missing row means.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AcceptanceRow {
     /// A pairing's commit: the confirmation was answered through this host, so its row exists, and
@@ -1518,7 +1519,7 @@ pub(super) enum AcceptanceRow {
 
 /// The device whose record answered a confirmation, read from its acceptance row.
 ///
-/// A row of one of the two device channels names the device that answered, and a pairing's commit
+/// A row of one of the two device channels names the device that answered, and every consumption
 /// refuses a row that names none; the terminal's row names none by design, because its signer is
 /// the bootstrap key. A confirmation with no row is refused when the consumption requires one, and
 /// has no answering record to be bound to otherwise.
@@ -1549,13 +1550,11 @@ fn answering_device(
     };
     match proof.channel {
         ConfirmationChannel::OwnerDevicePresence | ConfirmationChannel::PairedOwnerDevice => {
-            match (row, acceptance) {
-                (Some(bytes), _) => Ok(Some(DeviceId::new(uuid(Some(&bytes))?))),
-                (None, AcceptanceRow::Required) => Err(lapsed(
+            match row {
+                Some(bytes) => Ok(Some(DeviceId::new(uuid(Some(&bytes))?))),
+                None => Err(lapsed(
                     "the device that answered this confirmation is not recorded",
                 )),
-                // A row that names no device binds nothing.
-                (None, AcceptanceRow::Optional) => Ok(None),
             }
         }
         _ => Ok(None),
