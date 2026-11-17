@@ -652,7 +652,7 @@ async fn a_worker_with_no_clock_floor_serves_no_lease() {
 /// only the statement does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_statement_that_takes_access_away_withdraws_what_a_local_connection_holds() {
-    let world = world("sleep 30", true).await;
+    let world = world("exec cat", true).await;
     let mut window = world.window().await;
     let mut daemon = world.authority(1).await;
     tell(&mut daemon, world.machine.lease(1, FAR_MS, FAR_MS)).await;
@@ -716,7 +716,7 @@ async fn a_lease_that_runs_out_ends_the_stream_the_worker_was_sending() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_mutation_inside_the_dispatch_boundary_when_the_host_restricts_its_owner_is_not_dispatched()
  {
-    let world = world("sleep 30", true).await;
+    let world = world("exec cat", true).await;
     let mut window = world.window().await;
     let mut daemon = world.authority(1).await;
     tell(&mut daemon, open(1)).await;
@@ -1031,8 +1031,11 @@ struct Meeting {
 /// waits for the connection registry.
 ///
 /// Returns what the schedule came to, or the step that did not happen.
+///
+/// The session's shell does not end by itself, so the session stays open for as long as the
+/// schedule's own deadline allows.
 async fn the_meeting_of_a_withdrawal_and_a_delivery_start() -> Result<Meeting, &'static str> {
-    let world = Arc::new(world("sleep 30", true).await);
+    let world = Arc::new(world("exec cat", true).await);
     let mut window = world.window().await;
     let mut daemon = world.authority(1).await;
     tell(&mut daemon, open(1)).await;
