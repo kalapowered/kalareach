@@ -4312,6 +4312,12 @@ async fn a_request_the_socket_cannot_take_before_its_time_runs_out_is_cut_off_an
 /// a frame that will never be finished, so the connection ends with it, as it does when the time
 /// cuts a frame: the session says that the connection ended, a later call is told so, and the peer
 /// acts on none of it.
+///
+/// The case needs a socket that takes part of a frame of 900,000 bytes from a peer that reads
+/// nothing, which a Unix socket does. A Windows named pipe does not: its write takes the whole slice
+/// it is offered, and a send without a limit offers the whole frame as one slice, so the frame goes
+/// whole there and the premise cannot be made. It is for Unix alone.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_send_dropped_inside_a_frame_ends_the_connection() {
     let tree = kr_ipc::testing::TempHost::create();
@@ -4341,9 +4347,11 @@ async fn a_send_dropped_inside_a_frame_ends_the_connection() {
             .is_ok(),
         "the session did not record the end of the connection after its frame was dropped part way"
     );
-    let read = session
-        .read::<_, SessionList>(Method::SessionList, &Empty {})
-        .await;
+    let read = bounded_send(
+        "a later call on a connection that ended",
+        session.read::<_, SessionList>(Method::SessionList, &Empty {}),
+    )
+    .await;
     assert!(
         matches!(read, Err(ClientError::ConnectionEnded)),
         "a later call is told that the connection ended: {read:?}"
@@ -4373,6 +4381,13 @@ async fn a_send_dropped_inside_a_frame_ends_the_connection() {
 /// the session's own record of the end has not been made yet. The call is not registered, nothing
 /// of it is on the book, and its caller is told what the session tells for an ended connection,
 /// not that what became of it is not known.
+///
+/// The case needs a socket that takes part of a frame of 900,000 bytes from a peer that reads
+/// nothing, which a Unix socket does. A Windows named pipe does not: its write takes the whole slice
+/// it is offered, and a send without a limit offers the whole frame as one slice, so the frame goes
+/// whole there, nothing is lost with the drop, and the next call waits behind it. It is for Unix
+/// alone.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_call_made_at_once_after_a_send_was_dropped_inside_a_frame_is_refused_as_not_sent() {
     let tree = kr_ipc::testing::TempHost::create();
@@ -4399,7 +4414,11 @@ async fn a_call_made_at_once_after_a_send_was_dropped_inside_a_frame_is_refused_
         waited.is_err(),
         "the frame does not fit the socket of a peer that reads nothing, so its send was still going when the caller stopped waiting"
     );
-    let refused = session.send(&second).await;
+    let refused = bounded_send(
+        "a call made after the writing side was lost",
+        session.send(&second),
+    )
+    .await;
     assert!(
         matches!(refused, Err(ClientError::ConnectionEnded)),
         "a call made after the writing side was lost is refused as not sent: {refused:?}"
