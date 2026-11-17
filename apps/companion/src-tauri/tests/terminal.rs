@@ -6756,3 +6756,56 @@ async fn a_release_waiting_for_its_barrier_when_the_lane_ends_goes_naming_the_ac
         "the release names the one frame the host accepted, not the four admitted"
     );
 }
+
+/// A launch that still waits for its barrier when the view ends was never sent, and is told so, not
+/// that its outcome is unknown. The close's own barrier wait, like the launch's, ends when the case
+/// ends it, after the page was told.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_launch_waiting_for_its_barrier_when_the_view_ends_is_not_started() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let deadlines = BarrierDeadlines::new();
+    let page = Page::over_bounded(&mut host, &deadlines);
+    let mut lease = WorkerLease::default();
+    let (view, link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    three_keys_the_host_has_read(&page, &view, &host).await;
+    let pressing = page.invoke_later(
+        "terminal_view_launch",
+        json!({ "view": view, "press": the_press() }),
+    );
+    barriers_taken(&page, &view, 1).await;
+    // The page's own close waits for the view to end, which needs the case's end of the barrier
+    // wait below: the case closes as a holder that cannot wait does.
+    page.app
+        .state::<companion_tauri::terminal::TerminalViews>()
+        .closer(&view)();
+    let told = tokio::time::timeout(STATE_BOUND, pressing)
+        .await
+        .expect("the page was told within the bound when the view ended")
+        .expect("joins")
+        .expect_err("the launch was not started");
+    assert_eq!(
+        code(&told),
+        "TERMINAL_UNAVAILABLE",
+        "a launch that was never sent is not an unknown outcome: {told}"
+    );
+    assert_eq!(
+        told["message"],
+        "The launch was not started: the session had not accepted all the typing before it."
+    );
+    barriers_taken(&page, &view, 2).await;
+    deadlines.expire_when_armed().await;
+    assert!(
+        page.held_within_the_close_bound().await,
+        "the close ended the view within the bound"
+    );
+    assert!(
+        !host.written().iter().any(|frame| matches!(
+            frame,
+            kr_protocol::envelope::ControlFrame::Mutation(mutation)
+                if mutation.method.to_string() == Method::ShellLaunch.to_string()
+        )),
+        "no launch was sent"
+    );
+    drop(link);
+}

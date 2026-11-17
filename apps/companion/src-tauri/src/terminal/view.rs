@@ -2063,14 +2063,17 @@ impl View {
         }
     }
 
-    /// Answers every launch still waiting when the view ends: the session may have installed it
-    /// before the link went, so it is not known to have failed.
+    /// Answers every launch still waiting when the view ends: the session may have installed one
+    /// that was sent before the link went, so it is not known to have failed. A launch that still
+    /// waits for the lane to have the typing before it was never sent, and is told so.
     fn end_launches(&mut self) {
-        for reply in std::mem::take(&mut self.launches).into_values() {
-            let _ = reply.send(Err(CommandError::stated(
-                ErrorCode::OutcomeUnknown,
-                LAUNCH_UNANSWERED,
-            )));
+        let unsent: Vec<RequestId> = self.endings.iter().map(|barred| barred.tag).collect();
+        for (request_id, reply) in std::mem::take(&mut self.launches) {
+            let _ = reply.send(Err(if unsent.contains(&request_id) {
+                CommandError::stated(ErrorCode::TerminalUnavailable, LAUNCH_NOT_STARTED)
+            } else {
+                CommandError::stated(ErrorCode::OutcomeUnknown, LAUNCH_UNANSWERED)
+            }));
         }
     }
 
