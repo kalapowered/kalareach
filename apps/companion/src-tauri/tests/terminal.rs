@@ -7446,3 +7446,26 @@ async fn an_acquire_answered_in_the_look_that_has_the_lanes_end_ends_control_wit
     );
     release_of_the_epoch_within_the_bound(&mut link, lease.epoch).await;
 }
+
+/// The host finishes its side of the input stream while the view holds the lease, which the lane
+/// reads as the end of the stream (it did not end by a reset, a breach or an unknown outcome): a key
+/// that the person types after the view served that end is refused for an ended stream, in the
+/// view's words for an input that did not reach the program, and not for a stream that is not open
+/// yet.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_after_the_host_finished_the_input_stream_is_refused_for_an_ended_stream() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, _link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    host.script.say(Out::Finish);
+    page.lane_ends_served(&view, 1).await;
+    let refused = page
+        .text(&view, 1, "a")
+        .expect_err("a key with no stream to write it on");
+    assert_eq!(
+        refused["message"], "That input did not reach the program: its input stream ended.",
+        "{refused}"
+    );
+}
