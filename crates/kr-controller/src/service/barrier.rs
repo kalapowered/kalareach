@@ -340,10 +340,11 @@ impl std::fmt::Debug for OwnBarrier {
 ///
 /// A host-wide revision removes every connection admitted before it, so a request whose own effect
 /// raised one has its own connection withdrawn by it and nothing else has gone wrong. Only
-/// [`Controller::barrier_proving`] makes one: from a barrier that captured at least one host-wide
-/// debt of the request's own and no host-wide debt of anyone else's, and carrying the revision that
-/// barrier set. The local door asks the revision to be the one still in force when it tells the
-/// answer ([`Controller::withdrawal_stands`]), so a later withdrawal of any kind withholds it.
+/// [`Controller::barrier_proving_reading`] makes one (the other callers of the barrier take it from
+/// there): from a barrier that captured at least one host-wide debt of the request's own and no
+/// host-wide debt of anyone else's, and carrying the revision that barrier set. The local door asks
+/// the revision to be the one still in force when it tells the answer
+/// ([`Controller::withdrawal_stands`]), so a later withdrawal of any kind withholds it.
 pub(crate) struct HostWithdrawal {
     debt: crate::grants::store::DebtId,
     revision: AuthorityRevision,
