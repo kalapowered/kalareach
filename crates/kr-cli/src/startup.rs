@@ -32,6 +32,7 @@
 //! second one from serving beside it.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use kr_client::shown;
@@ -105,6 +106,44 @@ impl Chosen {
             state: loaded.status.state,
             detail: loaded.status.detail.clone(),
             revision: loaded.revision(),
+        }
+    }
+
+    /// Why the document chooses no start, for a command that must start a daemon.
+    fn nothing_chosen(&self) -> Shown {
+        if self.state.is_a_problem() {
+            shown!(
+                "this environment's configuration document, {}, cannot be used ({}), so it \
+                 chooses no start for a control daemon: {}",
+                Shown::root(&self.document),
+                self.state.as_str(),
+                Shown::sentence(&self.detail)
+            )
+        } else {
+            Shown::said("this environment chooses no start for a control daemon")
+        }
+    }
+
+    /// What a person does where no start is chosen and a command must start a daemon: the choices
+    /// this platform has, or the start by hand.
+    fn choose_or_start_by_hand(&self) -> Shown {
+        if self.state.is_a_problem() {
+            return Shown::said(
+                "Put the document right and run kr host restart again, or run kr host stop and \
+                 start kr-controller yourself.",
+            );
+        }
+        if cfg!(unix) {
+            Shown::said(
+                "Choose one with kr host startup --set service or kr host startup --set \
+                 standalone and run kr host restart again, or run kr host stop and start \
+                 kr-controller yourself.",
+            )
+        } else {
+            Shown::said(
+                "Choose the standalone start with kr host startup --set standalone and run kr \
+                 host restart again, or run kr host stop and start kr-controller yourself.",
+            )
         }
     }
 
@@ -526,26 +565,55 @@ pub async fn open_or_start(
     paths: &HostPaths,
     environment: &KnownEnvironment,
 ) -> Result<(LocalClient, Option<Started>)> {
-    open_or_start_within(paths, environment, BOUNDS).await
+    open_or_start_within(paths, environment, BOUNDS, &AtomicBool::new(false)).await
+}
+
+/// [`open_or_start`] for a command that must tell a start that was never made from one that was
+/// made and not answered: `launched` is set when a daemon has been started, or the service manager
+/// or the scheduled task has been asked to start one, and stays unset where the start failed before.
+///
+/// # Errors
+///
+/// Returns what [`open_or_start`] returns.
+pub(crate) async fn open_or_start_telling(
+    paths: &HostPaths,
+    environment: &KnownEnvironment,
+    launched: &AtomicBool,
+) -> Result<(LocalClient, Option<Started>)> {
+    open_or_start_within(paths, environment, BOUNDS, launched).await
 }
 
 async fn open_or_start_within(
     paths: &HostPaths,
     environment: &KnownEnvironment,
     bounds: Bounds,
+    launched: &AtomicBool,
 ) -> Result<(LocalClient, Option<Started>)> {
     let endpoint = environment.paths.controller_endpoint()?;
     let error = match find(environment, &endpoint, bounds, &[]).await? {
         Found::Answering(client) => return Ok((ours(*client)?, None)),
         Found::Vacant(error) => error,
     };
+    start_vacant(paths, environment, &endpoint, &error, bounds, launched).await
+}
+
+/// The part of a start that follows the look, for `kr new` and `kr host restart` alike: nothing
+/// listens at the endpoint, so the start this environment chooses is made.
+async fn start_vacant(
+    paths: &HostPaths,
+    environment: &KnownEnvironment,
+    endpoint: &kr_ipc::paths::Endpoint,
+    error: &kr_ipc::IpcError,
+    bounds: Bounds,
+    launched: &AtomicBool,
+) -> Result<(LocalClient, Option<Started>)> {
     // The daemon beside this command serves the environment its roots name as this installation's
     // own, and no other, so for any other environment there is nothing to choose here.
     let installation = paths.open_environment_id()?;
     if environment.environment_id != installation {
         return Err(resolve::not_running(
             &environment.paths,
-            &error,
+            error,
             shown!(
                 "start the control daemon, kr-controller, for it; the standalone start serves this \
                  installation's own environment, {}, and no other",
@@ -556,19 +624,182 @@ async fn open_or_start_within(
     let chosen = Chosen::read(&environment.paths);
     match chosen.controller {
         Some(ControllerStartup::Standalone) => {
-            standalone(paths, &environment.paths, &endpoint, bounds).await
+            standalone(paths, &environment.paths, endpoint, bounds, launched).await
         }
         Some(ControllerStartup::Service) => {
             let (client, started) =
-                managed(&environment.paths, &endpoint, &error, bounds, &[]).await?;
+                managed(&environment.paths, endpoint, error, bounds, &[], launched).await?;
             Ok((ours(client)?, started))
         }
         None => Err(resolve::not_running(
             &environment.paths,
-            &error,
+            error,
             chosen.setup_action(),
         )),
     }
+}
+
+/// A start that cannot be made, found before anything was stopped.
+pub(crate) struct Unstartable {
+    /// What is wrong, in the start's own words.
+    pub(crate) why: Shown,
+    /// What a person does about it, where the start's own words do not say.
+    pub(crate) remedy: Option<Shown>,
+    /// Whether the setup is wrong, which no retry mends, and not a manager or a lock that could not
+    /// be asked.
+    pub(crate) not_set_up: bool,
+}
+
+/// What this environment's start needs before it makes anything, which `kr host restart` finds out
+/// before it stops anything: a start is chosen, and its program or its service definition is there.
+/// It starts nothing, writes nothing and holds nothing when it returns.
+///
+/// # Errors
+///
+/// Returns why no start can follow a stop.
+pub(crate) async fn preflight(
+    environment: &KnownEnvironment,
+) -> std::result::Result<ControllerStartup, Unstartable> {
+    let chosen = Chosen::read(&environment.paths);
+    let unusable = |error: CliError| Unstartable {
+        why: kr_client::shown::Said::said(&error),
+        remedy: None,
+        not_set_up: true,
+    };
+    match chosen.controller {
+        None => Err(Unstartable {
+            why: chosen.nothing_chosen(),
+            remedy: Some(chosen.choose_or_start_by_hand()),
+            not_set_up: true,
+        }),
+        Some(ControllerStartup::Standalone) => {
+            standalone_can_be_started(&environment.paths)
+                .await
+                .map_err(unusable)?;
+            can_write_where_a_start_writes(&environment.paths).map_err(unusable)?;
+            Ok(ControllerStartup::Standalone)
+        }
+        Some(ControllerStartup::Service) => {
+            service_is_set_up(&environment.paths).await?;
+            service_program_can_be_run().map_err(unusable)?;
+            can_write_where_a_start_writes(&environment.paths).map_err(unusable)?;
+            Ok(ControllerStartup::Service)
+        }
+    }
+}
+
+/// The directories and the log that every start makes and opens before it starts anything, as a
+/// start does it but without emptying a log that has grown too large: a start finds them unusable
+/// only after the stop.
+fn can_write_where_a_start_writes(environment: &EnvironmentPaths) -> Result<()> {
+    environment.create()?;
+    Log::check(&environment.state_dir().join(LOG_FILE))
+}
+
+/// This user can run the program at `program`, which a start finds out only when it starts it.
+#[cfg(unix)]
+fn can_be_run(program: &std::path::Path) -> Result<()> {
+    rustix::fs::access(program, rustix::fs::Access::EXEC_OK).map_err(|errno| {
+        CliError::HostUnavailable(shown!(
+            "the control daemon at {} cannot be run by this user: {}",
+            Shown::root(program),
+            Shown::io(&std::io::Error::from(errno))
+        ))
+    })
+}
+
+/// The standalone start has its program, and this user can run it. Held only for the look: the
+/// start itself takes its own hold.
+#[cfg(unix)]
+async fn standalone_can_be_started(_environment: &EnvironmentPaths) -> Result<()> {
+    let (program, _held) = standalone_program()?;
+    can_be_run(&program)
+}
+
+/// The service start's program is there, and this user can run it: the manager runs the program
+/// the definition names, which is the one this installation writes now.
+#[cfg(unix)]
+fn service_program_can_be_run() -> Result<()> {
+    let program = daemon_program()?;
+    if !program.is_file() {
+        return Err(CliError::HostUnavailable(shown!(
+            "the service start runs the control daemon at {}, and there is none there",
+            Shown::root(&program)
+        )));
+    }
+    can_be_run(&program)
+}
+
+/// The service start does not exist on this platform, so there is no program for it to run.
+#[cfg(not(unix))]
+fn service_program_can_be_run() -> Result<()> {
+    Ok(())
+}
+
+/// The standalone start's program is there and this user's scheduled task is the one this
+/// installation registers: the checks that the start makes after the stop otherwise. There is no
+/// mode bit to check on this platform. The task's definition is read as the start reads it, under
+/// the environment's service lock, which is given up at once.
+#[cfg(windows)]
+async fn standalone_can_be_started(environment: &EnvironmentPaths) -> Result<()> {
+    let program = standalone_program()?;
+    let checking = environment.clone();
+    tokio::task::spawn_blocking(move || windows::check_the_task(&checking, &program))
+        .await
+        .map_err(|error| {
+            CliError::Other(shown!(
+                "checking this user's scheduled task failed: {}",
+                Shown::task(&error)
+            ))
+        })?
+}
+
+/// The service definition is the one kr wrote, and the manager holds nothing else under its label.
+/// The environment's service lock that the check takes is given up at once, so that two restarts
+/// are not made to wait for each other.
+#[cfg(unix)]
+async fn service_is_set_up(environment: &EnvironmentPaths) -> std::result::Result<(), Unstartable> {
+    let checking = environment.clone();
+    match tokio::task::spawn_blocking(move || service_manager::verify(&checking)).await {
+        Ok(Ok(verified)) => {
+            drop(verified);
+            Ok(())
+        }
+        Ok(Err(service_manager::Refusal::NotSetUp(why))) => Err(Unstartable {
+            why,
+            remedy: None,
+            not_set_up: true,
+        }),
+        Ok(Err(
+            service_manager::Refusal::Failed(why) | service_manager::Refusal::NoAnswer(why),
+        )) => Err(Unstartable {
+            why: shown!("the service manager could not be asked: {}", why),
+            remedy: None,
+            not_set_up: false,
+        }),
+        Err(error) => Err(Unstartable {
+            why: shown!("asking the service manager failed: {}", Shown::task(&error)),
+            remedy: None,
+            not_set_up: false,
+        }),
+    }
+}
+
+/// This platform has no per-user service manager that this build writes definitions for.
+#[cfg(not(unix))]
+async fn service_is_set_up(
+    _environment: &EnvironmentPaths,
+) -> std::result::Result<(), Unstartable> {
+    Err(Unstartable {
+        why: Shown::said(
+            "this environment chooses the service start, which this platform does not have",
+        ),
+        remedy: Some(Shown::said(
+            "Choose the standalone start with kr host startup --set standalone and run kr host \
+             restart again, or run kr host stop and start kr-controller yourself.",
+        )),
+        not_set_up: true,
+    })
 }
 
 /// Whether a control daemon answers at an environment's endpoint, or nothing listens there.
@@ -622,7 +853,14 @@ pub async fn start_by_service(
     if let Found::Answering(_) = find(environment, &endpoint, BOUNDS, majors).await? {
         return Ok(None);
     }
-    let (_, started) = start_by_task(&environment.paths, &endpoint, BOUNDS, majors).await?;
+    let (_, started) = start_by_task(
+        &environment.paths,
+        &endpoint,
+        BOUNDS,
+        majors,
+        &AtomicBool::new(false),
+    )
+    .await?;
     Ok(started)
 }
 
@@ -647,7 +885,15 @@ pub async fn start_by_service(
         Found::Answering(_) => return Ok(None),
         Found::Vacant(error) => error,
     };
-    let (_, started) = managed(&environment.paths, &endpoint, &error, BOUNDS, majors).await?;
+    let (_, started) = managed(
+        &environment.paths,
+        &endpoint,
+        &error,
+        BOUNDS,
+        majors,
+        &AtomicBool::new(false),
+    )
+    .await?;
     Ok(started)
 }
 
@@ -716,7 +962,7 @@ pub(crate) fn nothing_listening(error: &kr_ipc::IpcError) -> bool {
 /// what is left of the deadline, and runs `between` after every attempt that failed.
 ///
 /// Returns the connection, or what the last attempt found.
-async fn answered_by(
+pub(crate) async fn answered_by(
     endpoint: &kr_ipc::paths::Endpoint,
     deadline: tokio::time::Instant,
     majors: &[u16],
@@ -828,6 +1074,21 @@ fn daemon_program_now() -> Result<(PathBuf, Option<kr_ipc::install::CurrentRelea
     }
 }
 
+/// The daemon program the standalone start runs now, with the hold that keeps its release on disk,
+/// where the program is there: what the start checks before it makes anything, and what a restart
+/// checks before it stops anything.
+#[cfg(unix)]
+fn standalone_program() -> Result<(PathBuf, Option<kr_ipc::install::CurrentRelease>)> {
+    let (program, held) = daemon_program_now()?;
+    if !program.is_file() {
+        return Err(CliError::HostUnavailable(shown!(
+            "the standalone start runs the control daemon at {}, and there is none there",
+            Shown::root(&program)
+        )));
+    }
+    Ok((program, held))
+}
+
 /// Starts the daemon detached from this command and waits for it to answer.
 ///
 /// It inherits this command's environment, as a daemon started by hand from the same shell does.
@@ -837,15 +1098,10 @@ async fn standalone(
     environment: &EnvironmentPaths,
     endpoint: &kr_ipc::paths::Endpoint,
     bounds: Bounds,
+    launched: &AtomicBool,
 ) -> Result<(LocalClient, Option<Started>)> {
     // Held until the daemon answers or the start fails; the daemon takes its own hold on starting.
-    let (program, _held) = daemon_program_now()?;
-    if !program.is_file() {
-        return Err(CliError::HostUnavailable(shown!(
-            "the standalone start runs the control daemon at {}, and there is none there",
-            Shown::root(&program)
-        )));
-    }
+    let (program, _held) = standalone_program()?;
     // The directories the daemon works and writes in. It creates them itself as well, and both are
     // the same idempotent creation.
     environment.create()?;
@@ -868,6 +1124,7 @@ async fn standalone(
                 Shown::io(&error)
             ))
         })?;
+    launched.store(true, Ordering::SeqCst);
     let started = Started {
         pid: Some(child.id()),
         start: ControllerStartup::Standalone,
@@ -886,7 +1143,12 @@ async fn standalone(
         Ok(client) => return Ok((ours(client)?, Some(started))),
         Err(last) => last,
     };
-    let state = child.try_wait().ok().flatten().map_or_else(
+    let ended = child.try_wait().ok().flatten();
+    if ended.is_some() {
+        // A process that was seen to end starts nothing, so no requested daemon may still come up.
+        launched.store(false, Ordering::SeqCst);
+    }
+    let state = ended.map_or_else(
         || Shown::said("it is still running"),
         |status| shown!("it has ended ({})", status),
     );
@@ -972,6 +1234,20 @@ fn last_line_said(line: &str) -> Shown {
     }
 }
 
+/// Notes, in `launched`, a start request that the manager was asked and did not answer in time:
+/// the requested daemon may still start. A manager that could not be asked, or that refused at
+/// once, was asked nothing that it may still be doing.
+#[cfg(unix)]
+fn asked_and_unanswered(
+    refusal: service_manager::Refusal,
+    launched: &AtomicBool,
+) -> service_manager::Refusal {
+    if refusal.may_still_start() {
+        launched.store(true, Ordering::SeqCst);
+    }
+    refusal
+}
+
 /// Asks this user's service manager to start the daemon from the definition kr wrote, and waits
 /// for it to answer.
 ///
@@ -986,14 +1262,17 @@ async fn managed(
     error: &kr_ipc::IpcError,
     bounds: Bounds,
     majors: &[u16],
+    launched: &AtomicBool,
 ) -> Result<(Listed, Option<Started>)> {
     let refused = |refusal| match refusal {
         service_manager::Refusal::NotSetUp(why) => resolve::not_running(environment, error, why),
-        service_manager::Refusal::Failed(why) => unanswered(shown!(
-            "the service manager did not start the control daemon for environment {}: {}",
-            environment.environment_id(),
-            why
-        )),
+        service_manager::Refusal::Failed(why) | service_manager::Refusal::NoAnswer(why) => {
+            unanswered(shown!(
+                "the service manager did not start the control daemon for environment {}: {}",
+                environment.environment_id(),
+                why
+            ))
+        }
     };
     let blocked = |error: tokio::task::JoinError| {
         CliError::Other(shown!(
@@ -1016,7 +1295,8 @@ async fn managed(
     let asked = tokio::task::spawn_blocking(move || verified.start())
         .await
         .map_err(blocked)?
-        .map_err(refused)?;
+        .map_err(|refusal| refused(asked_and_unanswered(refusal, launched)))?;
+    launched.store(true, Ordering::SeqCst);
     let started = Started {
         pid: asked.pid,
         start: ControllerStartup::Service,
@@ -1053,6 +1333,7 @@ async fn managed(
     error: &kr_ipc::IpcError,
     _bounds: Bounds,
     _majors: &[u16],
+    _launched: &AtomicBool,
 ) -> Result<(Listed, Option<Started>)> {
     Err(resolve::not_running(
         environment,
@@ -1062,6 +1343,21 @@ async fn managed(
              the control daemon, kr-controller, for it",
         ),
     ))
+}
+
+/// The daemon program the standalone start runs, where it is there: what the start checks before it
+/// makes anything, and what a restart checks before it stops anything.
+#[cfg(windows)]
+fn standalone_program() -> Result<PathBuf> {
+    let program = daemon_program()?;
+    if !program.is_file() {
+        return Err(CliError::HostUnavailable(shown!(
+            "the standalone start runs the control daemon at {}, and there is none there; install \
+             kr again, then run kr host startup --set standalone",
+            Shown::root(&program)
+        )));
+    }
+    Ok(program)
 }
 
 /// Has this user's scheduled task for the environment start the daemon, and waits for it to
@@ -1089,8 +1385,9 @@ async fn standalone(
     environment: &EnvironmentPaths,
     endpoint: &kr_ipc::paths::Endpoint,
     bounds: Bounds,
+    launched: &AtomicBool,
 ) -> Result<(LocalClient, Option<Started>)> {
-    let (client, started) = start_by_task(environment, endpoint, bounds, &[]).await?;
+    let (client, started) = start_by_task(environment, endpoint, bounds, &[], launched).await?;
     Ok((ours(client)?, started))
 }
 
@@ -1102,16 +1399,10 @@ async fn start_by_task(
     endpoint: &kr_ipc::paths::Endpoint,
     bounds: Bounds,
     majors: &[u16],
+    launched: &AtomicBool,
 ) -> Result<(Listed, Option<Started>)> {
     let deadline = tokio::time::Instant::now() + bounds.start;
-    let program = daemon_program()?;
-    if !program.is_file() {
-        return Err(CliError::HostUnavailable(shown!(
-            "the standalone start runs the control daemon at {}, and there is none there; install \
-             kr again, then run kr host startup --set standalone",
-            Shown::root(&program)
-        )));
-    }
+    let program = standalone_program()?;
     environment.create()?;
     // Checked, and emptied when it has grown too large, before the starter opens it: the daemon
     // appends to it.
@@ -1127,6 +1418,7 @@ async fn start_by_task(
                     Shown::task(&error)
                 ))
             })??;
+    launched.store(true, Ordering::SeqCst);
     let started = Started {
         pid: None,
         start: ControllerStartup::Standalone,
@@ -1232,16 +1524,25 @@ impl Log {
     /// a regular file whose list grants no account this host does not trust: the checks the
     /// starter makes when it opens the log for the daemon to append to.
     fn open(path: &std::path::Path) -> Result<Self> {
-        let file = kr_ipc::starter::open_log(path, kr_ipc::starter::LogAccess::ReadAndTruncate)
-            .map_err(|error| match error {
+        let file = Self::opened(path, kr_ipc::starter::LogAccess::ReadAndTruncate)?;
+        Self::from_file(file, path)
+    }
+
+    /// Whether the log can be opened as the start opens it for the daemon to append to, which
+    /// empties nothing and leaves nothing open.
+    fn check(path: &std::path::Path) -> Result<()> {
+        Self::opened(path, kr_ipc::starter::LogAccess::Append).map(drop)
+    }
+
+    fn opened(path: &std::path::Path, access: kr_ipc::starter::LogAccess) -> Result<std::fs::File> {
+        kr_ipc::starter::open_log(path, access).map_err(|error| match error {
             kr_ipc::IpcError::UntrustedFile { .. } => CliError::HostUnavailable(shown!(
                 "{} is not a file of this user's that only this user can read and write, so the \
-                 control daemon's output is not written to it; remove it and run kr new again",
+                 control daemon's output is not written to it; remove it and run the command again",
                 Shown::root(path)
             )),
             other => CliError::Ipc(other),
-        })?;
-        Self::from_file(file, path)
+        })
     }
 }
 
@@ -1254,6 +1555,16 @@ impl Log {
     /// FIFO left where the log belongs would hold the start open before its bound began. So what
     /// was opened is checked, rather than what the name was expected to be.
     fn open(path: &std::path::Path) -> Result<Self> {
+        Self::from_file(Self::opened(path)?, path)
+    }
+
+    /// Whether the log can be opened as the start opens it, which empties nothing and leaves
+    /// nothing open.
+    fn check(path: &std::path::Path) -> Result<()> {
+        Self::opened(path).map(drop)
+    }
+
+    fn opened(path: &std::path::Path) -> Result<std::fs::File> {
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 
         let failed = |error| CliError::Ipc(kr_ipc::IpcError::io("open", path, error));
@@ -1272,11 +1583,11 @@ impl Log {
         {
             return Err(CliError::HostUnavailable(shown!(
                 "{} is not a file of this user's that only this user can read and write, so the \
-                 control daemon's output is not written to it; remove it and run kr new again",
+                 control daemon's output is not written to it; remove it and run the command again",
                 Shown::root(path)
             )));
         }
-        Self::from_file(file, path)
+        Ok(file)
     }
 
     /// A handle a daemon writes its output through: the same open file, appended to.
@@ -1940,24 +2251,13 @@ mod windows {
         }
     }
 
-    /// Checks the environment's task, leaves a request to start the daemon for its starter, and
-    /// runs it, all under the environment's lock, which is let go before the command waits.
-    ///
-    /// The request lapses at `deadline`, when the command stops waiting: a starter that looks at
-    /// it later starts nothing for it. A run the Task Scheduler does not confirm has the request
-    /// withdrawn at once; when a starter took it first, or the withdrawal fails, the command waits
-    /// as for a run that was confirmed, and says afterwards that this one was not.
-    pub fn ask(
-        environment: &EnvironmentPaths,
-        program: &Path,
-        deadline: std::time::Instant,
-        bound: Duration,
-    ) -> Result<Asked> {
-        let definition = definition(environment, program)?;
+    /// Whether the environment's task is registered, is this environment's own and is the one this
+    /// installation registers, which is what the start needs of it. The caller holds the
+    /// environment's service lock.
+    fn check_standing(environment: &EnvironmentPaths, definition: &TaskDefinition) -> Result<()> {
         let environment_id = environment.environment_id();
         let name = task::name(environment_id);
-        let held = crate::service_manager::lock(environment)?;
-        match supervision::windows::standing(&definition) {
+        match supervision::windows::standing(definition) {
             Ok(Standing::Owned(differences)) if differences.is_empty() => {}
             Ok(Standing::Owned(differences)) => {
                 return Err(CliError::HostUnavailable(shown!(
@@ -1994,6 +2294,37 @@ mod windows {
                 )));
             }
         }
+        Ok(())
+    }
+
+    /// The check that the start makes of the task, made by `kr host restart` before it stops
+    /// anything: the environment's service lock is held for the check and given up at once.
+    pub fn check_the_task(environment: &EnvironmentPaths, program: &Path) -> Result<()> {
+        let definition = definition(environment, program)?;
+        let held = crate::service_manager::lock(environment)?;
+        let checked = check_standing(environment, &definition);
+        drop(held);
+        checked
+    }
+
+    /// Checks the environment's task, leaves a request to start the daemon for its starter, and
+    /// runs it, all under the environment's lock, which is let go before the command waits.
+    ///
+    /// The request lapses at `deadline`, when the command stops waiting: a starter that looks at
+    /// it later starts nothing for it. A run the Task Scheduler does not confirm has the request
+    /// withdrawn at once; when a starter took it first, or the withdrawal fails, the command waits
+    /// as for a run that was confirmed, and says afterwards that this one was not.
+    pub fn ask(
+        environment: &EnvironmentPaths,
+        program: &Path,
+        deadline: std::time::Instant,
+        bound: Duration,
+    ) -> Result<Asked> {
+        let definition = definition(environment, program)?;
+        let environment_id = environment.environment_id();
+        let name = task::name(environment_id);
+        let held = crate::service_manager::lock(environment)?;
+        check_standing(environment, &definition)?;
         let boot = kr_ipc::identity::boot_identity().map_err(CliError::Ipc)?;
         let request = kr_ipc::new_uuid();
         // The continuous clock is read before what is left of the wait is measured, so the time
@@ -2307,6 +2638,30 @@ mod tests {
         );
     }
 
+    /// A start request that the manager was asked and did not answer in time sets `launched`, for
+    /// the requested daemon may still start; one that the manager could not be asked, or refused
+    /// at once, sets nothing.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_manager_that_was_asked_and_did_not_answer_leaves_a_daemon_that_may_still_start() {
+        let not_asked = AtomicBool::new(false);
+        for refusal in [
+            service_manager::Refusal::Failed(Shown::said("the manager could not be asked")),
+            service_manager::Refusal::NotSetUp(Shown::said("the definition is not as written")),
+        ] {
+            let kept = asked_and_unanswered(refusal, &not_asked);
+            assert!(!kept.may_still_start());
+            assert!(!not_asked.load(Ordering::SeqCst), "{kept:?}");
+        }
+        let unanswered = AtomicBool::new(false);
+        let kept = asked_and_unanswered(
+            service_manager::Refusal::NoAnswer(Shown::said("the manager did not answer")),
+            &unanswered,
+        );
+        assert!(matches!(kept, service_manager::Refusal::NoAnswer(_)));
+        assert!(unanswered.load(Ordering::SeqCst));
+    }
+
     /// Something that accepts connections on an environment's endpoint and never says hello.
     #[cfg(unix)]
     struct Silent {
@@ -2391,6 +2746,7 @@ mod tests {
                 answer: Duration::from_millis(300),
                 start: Duration::from_secs(1),
             },
+            &AtomicBool::new(false),
         )
         .await
         else {

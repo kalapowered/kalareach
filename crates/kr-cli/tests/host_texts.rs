@@ -130,6 +130,10 @@ fn every_kr_host_command_a_text_names_exists() {
         known.contains(&"stop"),
         "kr host stop is a command: {known:?}"
     );
+    assert!(
+        known.contains(&"restart"),
+        "kr host restart is a command: {known:?}"
+    );
     let mut unknown = Vec::new();
     for (path, text) in texts() {
         for word in words_after(&text, "kr host ") {
