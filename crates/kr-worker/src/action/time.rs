@@ -1651,7 +1651,6 @@ impl TimeContract {
         if established.restated && !adopting {
             state.adopting = false;
             state.followed = established.count;
-            state.proofs = KeptProofs::default();
             return true;
         }
         let Attempt { narrow, held_up } = self.take();
