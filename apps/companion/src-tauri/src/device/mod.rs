@@ -200,9 +200,11 @@ fn failed(failure: &PairingFailure) -> CommandError {
     CommandError::local_failure(failure.to_string())
 }
 
-/// What a test puts a computer's own way of reaching a host behind: it is handed that way and
-/// returns the one the device uses.
-pub type LinkWrap = Box<dyn FnOnce(Arc<dyn HostLink>) -> Arc<dyn HostLink> + Send>;
+/// What a test puts a computer's own way of reaching a host behind: it is handed that way and the
+/// pool that way stands on, and returns the one the device uses. The pool is for a wrapper that
+/// observes it; a wrapper never replaces it.
+pub type LinkWrap =
+    Box<dyn FnOnce(Arc<dyn HostLink>, Arc<EndpointPool>) -> Arc<dyn HostLink> + Send>;
 
 /// What a device is made of besides its records: where its secrets live, how it opens a room,
 /// where its endpoints bind and the clock it counts on. The product's come from the platform
@@ -306,6 +308,7 @@ impl Device {
             Some(address) => pool.bound_to(address),
             None => pool,
         };
+        let pool = Arc::new(pool);
         let build = BuildId::new(format!("kalareach-companion/{}", env!("CARGO_PKG_VERSION")))
             .map_err(|error| CommandError::local_failure(error.to_string()))?;
         let pairing = Pairing {
@@ -319,7 +322,7 @@ impl Device {
             clock: parts.clock,
             room: parts.room,
             link: {
-                let link = IrohLink::new(Arc::new(pool));
+                let link = IrohLink::new(Arc::clone(&pool));
                 // A relay of the managed service carries a pairing only for a device it has been
                 // told to admit, so this computer asks it as it dials; a relay of any other
                 // service is never named to it.
@@ -348,7 +351,7 @@ impl Device {
                 };
                 let own: Arc<dyn HostLink> = Arc::new(link);
                 let own = match parts.link {
-                    Some(behind) => behind(own),
+                    Some(behind) => behind(own, Arc::clone(&pool)),
                     None => own,
                 };
                 // Every dial to a paired host takes a place from one budget first, whatever is
