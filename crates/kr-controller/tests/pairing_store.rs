@@ -1429,7 +1429,13 @@ fn a_host_with_no_owner_commits_only_its_first_owner() {
     owner_host.grant_kind = GrantKind::PersonalOwner;
     let mut invitation = owner_host.issue();
     bind(&owner_host, &mut invitation);
-    let commitment = approve(&owner_host, &mut invitation).expect("the first owner commits");
+    // The terminal's answer names no device, and the commit spends it all the same.
+    let committed = approve(&owner_host, &mut invitation);
+    assert!(
+        committed.is_ok(),
+        "the first owner commits on the terminal's answer, which names no device: {committed:?}"
+    );
+    let commitment = committed.expect("checked above");
     let event = rows
         .event_for(commitment.invitation_id)
         .expect("readable")
