@@ -579,31 +579,11 @@ async fn the_inboxes_of_the_other_paired_hosts_are_read_beside_the_one_in_use() 
         "{read}"
     );
 
-    // Every visit so far was made beside the host in use, which it leaves alone.
-    let in_use_network = first.network().network_config().expect("the configuration");
-    let visits = control.visits();
-    assert!(!visits.is_empty());
-    assert!(
-        visits
-            .iter()
-            .all(|beside| beside.as_ref() == Some(&in_use_network)),
-        "{visits:?}"
-    );
-
     // Choosing it takes it from the visits, and the host before it joins them.
     companion
         .call("hosts_use", json!({ "reference": other }))
         .expect("the host is chosen");
     let after = companion.call("inbox_hosts", json!({})).expect("a visit");
-    let now_in_use = second
-        .network()
-        .network_config()
-        .expect("the configuration");
-    assert_eq!(
-        control.visits().last().and_then(Option::as_ref),
-        Some(&now_in_use),
-        "the host chosen is the one left alone now"
-    );
     assert_eq!(after.as_array().map(Vec::len), Some(1), "{after}");
     assert_ne!(after[0]["reference"], other.as_str(), "{after}");
     assert_eq!(after[0]["state"], "read");
@@ -890,9 +870,10 @@ async fn a_pass_leaves_out_a_host_that_is_no_longer_one_of_the_others_when_it_en
 }
 
 /// KR-REQ-13.01: a host this computer owns is watched for what it wants confirmed, and the watcher
-/// visits it beside the host in use: it asks the link to leave the host in use's connection alone.
+/// visits it beside the host in use: the watcher asks for a connection to the owned host, and the
+/// host in use keeps answering.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_owner_watcher_visits_an_owned_host_beside_the_host_in_use() {
+async fn the_owner_watcher_visits_an_owned_host_beside_the_one_in_use() {
     let owner = DeviceKeys::generate().expect("keys");
     let first = Host::start(&owner).await;
     let second = Host::start(&owner).await;
@@ -901,23 +882,25 @@ async fn the_owner_watcher_visits_an_owned_host_beside_the_host_in_use() {
     pair(&phone, &first, &owner, &[ActionRight::SessionView]).await;
     let companion = &phone.companion;
     connection(companion, true).await;
+    let before = control.asked();
     support::record_owned(&companion.device(), &second, "second");
 
+    // The watcher asks for a connection to the owned host, which nothing about the host in use
+    // refuses.
     tokio::time::timeout(WATCHDOG, async {
-        while control.visits().is_empty() {
+        while control.asked() == before {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .expect("the watcher visits the owned host");
-    let in_use_network = first.network().network_config().expect("the configuration");
-    let visits = control.visits();
-    assert!(
-        visits
-            .iter()
-            .all(|beside| beside.as_ref() == Some(&in_use_network)),
-        "{visits:?}"
-    );
+    .expect("the watcher reaches for the owned host");
+
+    // The host in use is still connected and answers.
+    let state = connection(companion, true).await;
+    assert_eq!(state["connected"], true, "{state}");
+    companion
+        .call("session_list", every_session())
+        .expect("the host in use answers");
     first.stop().await;
     second.stop().await;
 }
