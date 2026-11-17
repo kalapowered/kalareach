@@ -735,6 +735,110 @@ fn keys_at(step: &str, indent: usize) -> Vec<String> {
         .collect()
 }
 
+/// The condition each evidence upload's first try runs under, by workflow, job and the first
+/// try's id. `None` is a first try with no condition of its own, which runs whenever its job does.
+/// A first try that is never true would skip both tries and leave a job's evidence unkept without
+/// any step failing, so the value of each one is held here, not only that it has one.
+const FIRST_TRIES: &[(&str, &str, &str, Option<&str>)] = &[
+    (
+        "core-ci.yml",
+        "rust",
+        "keep-the-deployment-legs-logs",
+        Some(
+            "${{ always() && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.deployment_legs)) }}",
+        ),
+    ),
+    (
+        "core-ci.yml",
+        "rust",
+        "keep-the-performance-evidence",
+        Some("${{ !cancelled() }}"),
+    ),
+    (
+        "core-ci.yml",
+        "windows",
+        "keep-the-test-evidence",
+        Some("${{ !cancelled() }}"),
+    ),
+    (
+        "core-ci.yml",
+        "shell-packages",
+        "publish-the-patch-sets-and-identity-records",
+        None,
+    ),
+    (
+        "core-ci.yml",
+        "android-app",
+        "keep-the-android-evidence",
+        Some("${{ !cancelled() }}"),
+    ),
+    (
+        "core-ci.yml",
+        "ios",
+        "keep-the-ios-evidence",
+        Some("${{ !cancelled() }}"),
+    ),
+    (
+        "core-ci.yml",
+        "companion",
+        "keep-the-end-to-end-evidence",
+        Some("${{ !cancelled() }}"),
+    ),
+    (
+        "core-ci.yml",
+        "macos",
+        "keep-the-test-evidence",
+        Some("${{ !cancelled() }}"),
+    ),
+    (
+        "core-ci.yml",
+        "macos-reference",
+        "keep-the-test-evidence",
+        Some("${{ !cancelled() }}"),
+    ),
+    (
+        "conformance.yml",
+        "linux",
+        "keep-the-result-and-the-evidence",
+        Some("${{ !cancelled() }}"),
+    ),
+    (
+        "conformance.yml",
+        "macos",
+        "keep-the-result-and-the-evidence",
+        Some("${{ !cancelled() }}"),
+    ),
+    (
+        "conformance.yml",
+        "windows",
+        "keep-the-result-and-the-evidence",
+        Some("${{ !cancelled() }}"),
+    ),
+    ("keep-evidence-test.yml", "first-try", "first", None),
+    ("keep-evidence-test.yml", "second-try", "first", None),
+    ("keep-evidence-test.yml", "both-fail", "first", None),
+];
+
+/// The commands of a step's `run: |` block: the lines under the key, as they are written without
+/// the indentation of the block, up to the next key or the end of the step. A line before the
+/// commands, between them or after them is one of them.
+fn commands_of(step: &str) -> Option<Vec<&str>> {
+    let (_, block) = step.split_once("\n        run: |\n")?;
+    let mut lines: Vec<&str> = block
+        .lines()
+        .take_while(|line| line.trim().is_empty() || line.starts_with("          "))
+        .collect();
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    Some(
+        lines
+            .into_iter()
+            .map(|line| line.strip_prefix("          ").unwrap_or(line))
+            .collect(),
+    )
+}
+
 /// KR-REQ-21.01, the second try of every evidence upload: the landing and conformance workflows
 /// keep a job's evidence by the upload action, and a name lookup or a connection that fails for
 /// a moment would fail a job whose every other step passed, hours of tests included. Each upload
@@ -745,8 +849,10 @@ fn keys_at(step: &str, indent: usize) -> Vec<String> {
 /// of that cannot drift: this holds the form of every one of them, in the two workflows and in
 /// the proof workflow that exercises it: the three steps in that order, the keys each one has and
 /// no other (so no `overwrite`, no retention, no second `continue-on-error`), the same full pin
-/// and the same inputs in both tries, the conditions, the pause's length, and a limit on all three
-/// steps or on none, equal on the two tries and long enough on the pause.
+/// and the same inputs in both tries, the condition of the first try as written for its site, the
+/// conditions of the pause and the second try that follow from it, the pause's whole command
+/// block (the warning and `sleep 60`, with no line before, between or after), and a limit on all
+/// three steps or on none, equal on the two tries and long enough on the pause.
 #[test]
 fn every_evidence_upload_has_a_second_try_after_a_pause_and_fails_the_job_when_both_fail() {
     let mut counted = Vec::new();
@@ -757,7 +863,7 @@ fn every_evidence_upload_has_a_second_try_after_a_pause_and_fails_the_job_when_b
     ] {
         let workflow = fs::read_to_string(repository().join(".github/workflows").join(file))
             .expect("a workflow");
-        let mut sites = 0;
+        let mut sites = 0_usize;
         for name in jobs_of(&workflow) {
             let steps = steps_of(&job(&workflow, &name));
             let uploads: Vec<usize> = (0..steps.len())
@@ -820,6 +926,20 @@ fn every_evidence_upload_has_a_second_try_after_a_pause_and_fails_the_job_when_b
                     "{here}: the id {id} is used twice in the job"
                 );
                 ids.push(id.clone());
+                let written: Vec<_> = FIRST_TRIES
+                    .iter()
+                    .filter(|site| site.0 == file && site.1 == name && site.2 == id)
+                    .collect();
+                assert_eq!(
+                    written.len(),
+                    1,
+                    "{here}: no condition is written for the first try {id} of this job"
+                );
+                assert_eq!(
+                    own_condition(first, 8),
+                    written[0].3.map(compact),
+                    "{here}: the first try's condition is not the one written for its site"
+                );
                 let uses = value_at(first, 8, "uses").expect("the first try is made by an action");
                 let (action, pin) = uses
                     .split_once('@')
@@ -861,13 +981,13 @@ fn every_evidence_upload_has_a_second_try_after_a_pause_and_fails_the_job_when_b
                     Some("bash"),
                     "{here}: the pause's shell"
                 );
-                let run: Vec<&str> = pause.trim_end().lines().rev().take(2).collect();
-                assert!(
-                    run[0].trim() == "sleep 60"
-                        && run[1]
-                            .trim()
-                            .starts_with("echo \"::warning title=Evidence not kept::"),
-                    "{here}: the pause is not a warning and then sleep 60: {run:?}"
+                assert_eq!(
+                    commands_of(pause),
+                    Some(vec![
+                        "echo \"::warning title=Evidence not kept::The first try failed. Trying once more in 60 seconds.\"",
+                        "sleep 60",
+                    ]),
+                    "{here}: the pause is not the warning and then sleep 60 and nothing else"
                 );
 
                 // The second try: the same action and the same inputs.
@@ -917,6 +1037,11 @@ fn every_evidence_upload_has_a_second_try_after_a_pause_and_fails_the_job_when_b
         }
         counted.push((file, sites, expected));
     }
+    assert_eq!(
+        FIRST_TRIES.len(),
+        counted.iter().map(|(_, sites, _)| sites).sum::<usize>(),
+        "the table of first conditions names every evidence upload with a second try and no other"
+    );
     for (file, sites, expected) in counted {
         assert_eq!(
             sites, expected,
