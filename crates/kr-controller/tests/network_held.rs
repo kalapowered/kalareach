@@ -11,6 +11,7 @@
 
 mod net_support;
 
+use kr_controller::service::net::devices::DeviceRecord;
 use kr_controller::sharing::ShareRequest;
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::error::ErrorCode;
@@ -26,8 +27,8 @@ use kr_protocol::sharing::{
     GrantSummary, OfferKey, RevocationResult, RoleSelection, SessionRole, ShareKey,
 };
 use net_support::{
-    Host, MovedWall, RawDevice, an_open_session, end_session, fail_session, on_the_host, recipient,
-    recipient_ending_in, share_with,
+    Device, Host, MovedWall, RawDevice, an_open_session, end_session, fail_session, on_the_host,
+    recipient, recipient_ending_in, share_with,
 };
 use std::time::Duration;
 
@@ -912,61 +913,179 @@ async fn kr_req_18_13_a_session_that_closes_leaves_an_invitation_that_ran_out_on
     host.stop().await;
 }
 
+/// How long the share of [`AnchoredShare`] lasts: a week, so that the rate allowance a reading
+/// credits less than the time that passes (a minute of a week) is wide enough for a machine that
+/// loses the processor for seconds between two steps of a case.
+const SHARE_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// A host whose continuous clock only the suite moves and whose wall clock runs with the machine's
+/// and is moved by the suite, a device connected to it, and a share over an open session that
+/// the device has been shown, so that the host has anchored the share's grant on the continuous
+/// clock while that clock is trusted.
+struct AnchoredShare {
+    host: Host,
+    continuous: kr_transport::clock::ManualClock,
+    wall: MovedWall,
+    device: Device,
+    record: DeviceRecord,
+    connection: RawDevice,
+    session: SessionId,
+    share: GrantCreateResult,
+}
+
+impl AnchoredShare {
+    async fn start() -> Self {
+        let owner = DeviceKeys::generate().expect("owner keys");
+        let continuous = kr_transport::clock::ManualClock::new();
+        let wall = MovedWall::new();
+        let mut clocks = wall.clocks();
+        clocks.continuous = std::sync::Arc::new(continuous.clone());
+        let host = Host::start_on_clocks(&owner, clocks).await;
+        // The device's own pairing outlasts the move the cases make.
+        let (device, record) =
+            recipient_ending_in(&host, &owner, SHARE_LIFETIME + SHARE_LIFETIME).await;
+        let connection = RawDevice::connect(&host, &device, &record).await;
+        let (session, _) = an_open_session(&host);
+        let share = share_with(
+            &host,
+            session,
+            record.device_id,
+            RoleSelection::plain(SessionRole::Viewer),
+            Some(u64::try_from(SHARE_LIFETIME.as_millis()).expect("a lifetime in milliseconds")),
+        )
+        .await
+        .expect("a long share is written");
+        // The device asks what is offered to it, and the host anchors the offer's grant on the
+        // continuous clock while that clock is trusted.
+        assert_eq!(all_of_it(&connection).await.offers.len(), 1);
+        Self {
+            host,
+            continuous,
+            wall,
+            device,
+            record,
+            connection,
+            session,
+            share,
+        }
+    }
+
+    /// Moves both clocks where no reader of the daemon reads: one that read between the two steps
+    /// would pair the continuous clock as it is with UTC as it was, and the host would keep that
+    /// as a clock that went backwards. UTC lags the continuous clock by `lag`, which a wall clock
+    /// may by up to the rate allowance and the tolerance.
+    fn move_both(&self, by: Duration, lag: Duration) {
+        kr_controller::testing::while_no_reader_of_the_clocks_reads(self.host.controller(), || {
+            self.continuous.advance(by);
+            self.wall.advance(by - lag);
+        });
+    }
+
+    /// Redeems the share's invitation on a connection of its own, which the host refuses as run
+    /// out and not as withdrawn. The connection the share was shown on is a window older than the
+    /// moves.
+    async fn redeem_is_refused_as_run_out(&self) {
+        let connection = RawDevice::connect(&self.host, &self.device, &self.record).await;
+        let refused = connection
+            .mutate(
+                Method::GrantRedeem,
+                ActionId::new(kr_ipc::new_uuid()),
+                on_the_host(&self.host),
+                &GrantRedeemParams {
+                    invitation_id: self.share.preview.invitation_id,
+                },
+            )
+            .await
+            .expect_err("an invitation that ran out is not redeemed");
+        assert!(refused.message.contains("expired"), "{refused:?}");
+        assert!(!refused.message.contains("withdrawn"), "{refused:?}");
+        connection.close();
+    }
+
+    async fn end(self) {
+        self.connection.close();
+        self.host.stop().await;
+    }
+}
+
 /// KR-REQ-18.13: the same for an invitation whose grant the host had anchored on the continuous
-/// clock while the clock was trusted, which then ran out there: the close finds the end and writes
-/// it down, and leaves the invitation, so the device is told it ran out.
+/// clock while the clock was trusted, which then ran out there while the floor stays before its
+/// expiry: the close finds the end and writes it down, and leaves the invitation, so the device is
+/// told it ran out. The continuous clock goes the length of the share on, which ends the anchor
+/// whenever it was taken. A reading credits the time moved less the rate allowance, and UTC lags
+/// it by more than the allowance and less than the tolerance beyond it, so the floor any reader
+/// raises stays before the invitation's expiry for as long as the machine's own clock has not run
+/// on by the lag, whichever reader takes it and whenever.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_18_13_a_close_writes_down_the_end_of_an_anchored_invitation_and_leaves_it() {
-    let owner = DeviceKeys::generate().expect("owner keys");
-    let continuous = kr_transport::clock::ManualClock::new();
-    let mut clocks = MovedWall::new().clocks();
-    clocks.continuous = std::sync::Arc::new(continuous.clone());
-    let host = Host::start_on_clocks(&owner, clocks).await;
-    let (device, record) = recipient(&host, &owner).await;
-    let connection = RawDevice::connect(&host, &device, &record).await;
-    let (session, _) = an_open_session(&host);
-    let short = share_with(
-        &host,
-        session,
-        record.device_id,
-        RoleSelection::plain(SessionRole::Viewer),
-        Some(60_000),
-    )
-    .await
-    .expect("a short share is written");
-    // The device asks what is offered to it, and the host anchors the offer's grant on the
-    // continuous clock while that clock is trusted.
-    assert_eq!(all_of_it(&connection).await.offers.len(), 1);
-    continuous.advance(Duration::from_secs(5 * 60));
+    const LAG: Duration = Duration::from_secs(40);
+    let moved = u64::try_from(SHARE_LIFETIME.as_millis()).expect("a span in milliseconds");
+    // A reading credits the time moved less the rate allowance, and a wall clock that lags by no
+    // more than that and the host's tolerance (five seconds) is not a clock that went back.
+    let credit_lost = moved - kr_ipc::clock::credited(moved);
+    assert!(
+        u64::try_from(LAG.as_millis()).expect("a lag in milliseconds") < credit_lost + 5_000,
+        "UTC lags by what a wall clock may"
+    );
+    let anchored = AnchoredShare::start().await;
+    anchored.move_both(SHARE_LIFETIME, LAG);
 
-    host.controller()
-        .retire(&closed(session))
+    anchored
+        .host
+        .controller()
+        .retire(&closed(anchored.session))
         .await
         .expect("the session closes");
 
-    let grants = host.controller().sharing().grants();
+    let grants = anchored.host.controller().sharing().grants();
     assert!(
         grants
-            .grant_expired_at(short.grant.grant_id)
+            .grant_expired_at(anchored.share.grant.grant_id)
             .expect("the end is read")
             .is_some(),
         "the close found the invitation's end and wrote it down"
     );
-    let refused = connection
-        .mutate(
-            Method::GrantRedeem,
-            ActionId::new(kr_ipc::new_uuid()),
-            on_the_host(&host),
-            &GrantRedeemParams {
-                invitation_id: short.preview.invitation_id,
-            },
-        )
+    anchored.redeem_is_refused_as_run_out().await;
+    anchored.end().await;
+}
+
+/// KR-REQ-18.13: an invitation whose expiry the host's floor has passed has ended by itself, and a
+/// close leaves it as it ended and writes no end for its grant: the floor on record proves the
+/// end, and a device that redeems the invitation is told it ran out and not that it was withdrawn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_18_13_a_close_writes_no_end_for_an_invitation_the_floor_has_passed() {
+    let anchored = AnchoredShare::start().await;
+    anchored.move_both(
+        SHARE_LIFETIME + Duration::from_secs(10),
+        Duration::from_secs(3),
+    );
+
+    anchored
+        .host
+        .controller()
+        .retire(&closed(anchored.session))
         .await
-        .expect_err("an invitation that ran out is not redeemed");
-    assert!(refused.message.contains("expired"), "{refused:?}");
-    assert!(!refused.message.contains("withdrawn"), "{refused:?}");
-    connection.close();
-    host.stop().await;
+        .expect("the session closes");
+
+    let ended = issued_over(&anchored.host, anchored.session).await;
+    assert_eq!(
+        ended
+            .iter()
+            .map(|summary| summary.state)
+            .collect::<Vec<_>>(),
+        [GrantState::Expired],
+        "{ended:?}"
+    );
+    let grants = anchored.host.controller().sharing().grants();
+    assert!(
+        grants
+            .grant_expired_at(anchored.share.grant.grant_id)
+            .expect("the end is read")
+            .is_none(),
+        "the floor proves the invitation's end, so the close wrote none for its grant"
+    );
+    anchored.redeem_is_refused_as_run_out().await;
+    anchored.end().await;
 }
 
 /// KR-REQ-18.13: a request that finds an invitation's end between the close's reading of it and
