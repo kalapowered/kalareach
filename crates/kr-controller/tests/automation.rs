@@ -24,6 +24,7 @@ use kr_controller::supervision::{LaunchOutcome, ServiceLaunch, WorkerLaunch, Wor
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
+use kr_ipc::testing::started_environment::StartedEnvironment;
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::automation::{
     NodeStatus, WorkflowActionKind, WorkflowDeadlines, WorkflowDefinition, WorkflowEnableParams,
@@ -412,6 +413,8 @@ async fn working_host_on_clocks(
     let controller = start_daemon_with(&environment, environment_id, clocks, supervisor, worker)
         .await
         .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
+    // Its sessions run a login shell: they are given a home inside the tree, not the person's.
+    controller.set_host_environment(StartedEnvironment::within(temp.root()).host_variables());
     let endpoint = environment.controller_endpoint().expect("an endpoint");
     let listener = Listener::bind(&endpoint).expect("binds the endpoint");
     let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
@@ -464,6 +467,7 @@ async fn working_host_apart_started_by(
     let supervisor = Box::new(Patient {
         inner: temp.supervisor(supervisor(&environment, &worker)),
     });
+    let started_environment = StartedEnvironment::within(temp.root());
     let (ready_sender, ready) = std::sync::mpsc::channel();
     let (stop, stopped) = std::sync::mpsc::channel::<()>();
     let thread = std::thread::spawn({
@@ -484,6 +488,7 @@ async fn working_host_apart_started_by(
                 )
                 .await
                 .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
+                controller.set_host_environment(started_environment.host_variables());
                 let endpoint = environment.controller_endpoint().expect("an endpoint");
                 let clients = tokio::spawn(
                     Arc::clone(&controller)
@@ -7270,7 +7275,23 @@ async fn working_host_with_suites_after(
     clocks: Clocks,
     before_the_daemon_starts: impl FnOnce(&Path),
 ) -> Host {
-    let temp = teardown::Tree::create();
+    working_host_with_suites_in(
+        teardown::Tree::create(),
+        suites,
+        clocks,
+        before_the_daemon_starts,
+    )
+    .await
+}
+
+/// [`working_host_with_suites_after`] on a tree the test made, for a suite whose command names a
+/// path inside it.
+async fn working_host_with_suites_in(
+    temp: teardown::Tree,
+    suites: &[(&str, &str, &[&str])],
+    clocks: Clocks,
+    before_the_daemon_starts: impl FnOnce(&Path),
+) -> Host {
     let worker = temp.root().join("kr-worker");
     kr_ipc::testing::place_and_start_once(&beside_this_test("kr-worker"), &worker, &["--version"]);
     let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
@@ -7752,6 +7773,65 @@ async fn a_suite_that_writes_only_its_declared_output_still_attests_the_version(
         .expect("the second run is recorded as indeterminate");
     assert!(result.derived_output_version.0.is_some());
     assert_eq!(result.tested_version.0, None, "it attests no version");
+    host.clients.abort();
+}
+
+/// A suite's session starts its shell as a login shell, which reads the startup files of the home
+/// it is given. The home is one the case made inside its own tree, so the person's profile is
+/// neither read nor run, and the search path names no folder of the person's home.
+///
+/// The suite writes what its shell has beside the case's tree, because a declared output of a
+/// suite is kept as a digest and a length and cannot be read back.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_suites_shell_has_a_home_inside_the_cases_own_tree() {
+    let temp = teardown::Tree::create();
+    let root = temp.root().to_path_buf();
+    let written = root.join("shell-environment");
+    let command = format!(
+        "printf '%s\\n%s\\n' \"$HOME\" \"$PATH\" > '{}'",
+        written.display()
+    );
+    let host = working_host_with_suites_in(
+        temp,
+        &[("environment", command.as_str(), &[])],
+        Clocks::system(),
+        |_| (),
+    )
+    .await;
+    let mut control = client(&host).await;
+    let workspace = adopted_workspace(&mut control, host.environment_id, host.work()).await;
+    let version = captured(&mut control, &host, workspace, 66).await;
+
+    let (run, receipt, _) = tests_run(&mut control, &host, 67, "environment", version).await;
+    assert_eq!(run.status, WorkflowRunStatus::Completed, "{run:?}");
+    assert_eq!(receipt.status, NodeStatus::Success, "{receipt:?}");
+    let text = std::fs::read_to_string(&written)
+        .unwrap_or_else(|error| panic!("the suite's shell wrote nothing: {error}"));
+    let mut lines = text.lines();
+    let home = Path::new(lines.next().expect("the home line"));
+    let search_path = lines.next().expect("the search path line");
+    assert!(
+        home.starts_with(&root),
+        "the shell's home {} is not inside the case's tree {}",
+        home.display(),
+        root.display()
+    );
+    // What the system adds to a login shell's search path is its own; the person's profile is what
+    // would put a folder of the account's home or of a removable volume on it.
+    let account_home = kr_ipc::paths::passwd_entry()
+        .and_then(|entry| entry.home)
+        .filter(|home| home != "/");
+    for folder in search_path.split(':') {
+        assert!(
+            !Path::new(folder).starts_with("/Volumes")
+                && account_home
+                    .as_deref()
+                    .is_none_or(|home| !Path::new(folder).starts_with(home)),
+            "the shell's search path holds {folder}, which the person's profile may have put \
+             there: {search_path}"
+        );
+    }
     host.clients.abort();
 }
 
