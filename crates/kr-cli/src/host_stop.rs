@@ -1015,13 +1015,23 @@ fn record_said(recorded: &attempt::Recorded, id: EnvironmentId) -> Shown {
 }
 
 /// What every message that no control daemon runs says of the attempts recorded for an
-/// environment: nothing where there is none, and otherwise a space and each record's words. It
-/// removes nothing.
+/// environment: nothing where there is none, and otherwise a space and each record's words. A
+/// restart's record of the start that it is making is its own, and the failure of that start does
+/// not say it. It removes nothing.
 #[must_use]
 pub fn records_said(environment: &EnvironmentPaths) -> Shown {
     let id = environment.environment_id();
+    let own = identity::current_process_start_identity();
     let said: Vec<Shown> = attempt::recorded(environment)
         .iter()
+        .filter(|recorded| {
+            let start = recorded.attempt.command == attempt::Command::Restart
+                && recorded.attempt.phase == attempt::Phase::Starting;
+            !(start
+                && own
+                    .as_ref()
+                    .is_ok_and(|own| *own == recorded.attempt.process))
+        })
         .map(|recorded| record_said(recorded, id))
         .collect();
     if said.is_empty() {
@@ -3696,6 +3706,62 @@ mod tests {
                 ),
             );
         }
+    }
+
+    /// What a message that no control daemon runs says of the records names no record that is the
+    /// command's own: a restart's record of the start that it is making is not said by the message
+    /// of that start's failure, and a record of another process, or of this process in another
+    /// phase, is.
+    #[test]
+    fn a_restarts_record_of_its_own_start_is_not_said_to_the_command_that_made_it() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = temp.environment();
+        let id = environment.environment_id();
+        let directory = environment.state_dir().join(attempt::DIRECTORY);
+        kr_ipc::paths::create_private_directory(&directory).expect("the directory");
+        let write = |file: &str, phase: attempt::Phase, process| {
+            let record = attempt::Attempt {
+                command: attempt::Command::Restart,
+                phase,
+                process,
+                at_ms: 1,
+                daemon: None,
+            };
+            kr_ipc::paths::write_owner_only_file(
+                &directory.join(file),
+                &serde_json::to_vec(&record).expect("encodes"),
+            )
+            .expect("writes the record");
+        };
+        let own = || identity::current_process_start_identity().expect("an identity");
+        write("its-own-start", attempt::Phase::Starting, own());
+        assert_eq!(
+            records_said(&environment).to_string(),
+            "",
+            "the record of the start that this command is making is its own"
+        );
+        write("its-own-stop", attempt::Phase::Told, own());
+        let pid = std::process::id();
+        let at = crate::shown::utc_moment(1);
+        assert_eq!(
+            records_said(&environment).to_string(),
+            format!(
+                " A kr host restart is under way for environment {id} (process {pid}, last recorded at {at}); wait for it."
+            ),
+            "this process's record in another phase is still said"
+        );
+        write(
+            "another-start",
+            attempt::Phase::Starting,
+            identity::ended_process_identity(pid),
+        );
+        let said = records_said(&environment).to_string();
+        assert!(
+            said.contains(&format!(
+                "The last record of a kr host restart (process {pid}) is at {at}: it was asking for a new control daemon for environment {id}."
+            )),
+            "another process's record of a start is said: {said}"
+        );
     }
 
     /// The text for a lock that could not be looked at takes what the request came to: after a stop

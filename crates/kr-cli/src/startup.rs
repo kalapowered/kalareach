@@ -652,7 +652,8 @@ pub(crate) struct Unstartable {
 
 /// What this environment's start needs before it makes anything, which `kr host restart` finds out
 /// before it stops anything: a start is chosen, and its program or its service definition is there.
-/// It starts nothing, writes nothing and holds nothing when it returns.
+/// It starts nothing and holds nothing when it returns. It makes the environment's directories and
+/// the log file where they are not there, as a start does, and writes nothing into them.
 ///
 /// # Errors
 ///
