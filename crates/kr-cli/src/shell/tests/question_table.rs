@@ -283,7 +283,7 @@ fn stands() -> Vec<Stand> {
         all.push(own("not_started", "is not there to be started", "exit 0"));
         all.push(own(
             "wait_failed",
-            "another thread of the process takes the program's end before this host's wait sees it, so the wait fails (a process of its own)",
+            "the run's process ignores SIGCHLD, so the system takes the program's end and the wait fails (a process of its own)",
             "exit 0",
         ));
         all.push(own(
@@ -660,7 +660,8 @@ fn the_install_in_a_process_of_its_own() {
                 reason = "a signal's disposition has no safe form in the standard library"
             )]
             // SAFETY: `SIG_IGN` is a disposition, not a handler function, so nothing runs in a
-            // signal context; the call has no other effect on this process.
+            // signal context. The call's effect is the one this helper wants: the system collects
+            // each child of this process, and each wait for one fails.
             let previous = unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
             assert_ne!(previous, libc::SIG_ERR, "SIGCHLD is set to be ignored");
         }

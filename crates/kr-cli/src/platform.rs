@@ -12,8 +12,12 @@
 //!   open of a terminal on macOS, `/dev/tty` included, and the wrapper the system-call library
 //!   gives it is unsafe only because it cannot see that the descriptors stay open.
 //!
-//! Every such call is wrapped once, here. Nothing else in this crate relaxes the workspace's rule
-//! against unsafe code, and each wrapper documents what makes its call sound.
+//! Every such call is wrapped once, here, and each wrapper documents what makes its call sound.
+//!
+//! Two product modules relax the workspace's rule against unsafe code: this one, and
+//! `windows::records`, which reads the console's input records on Windows. One unit-test helper,
+//! `shell::tests::question_table`, relaxes it for the process that it runs in. Nothing else in the
+//! library does, and each integration program under `tests/` that does gives its own reason.
 
 #![expect(
     unsafe_code,
