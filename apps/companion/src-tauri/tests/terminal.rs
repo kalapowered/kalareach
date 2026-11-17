@@ -6894,3 +6894,49 @@ async fn a_launch_behind_a_release_that_waits_is_not_started_and_the_release_goe
         "no launch is on the wire"
     );
 }
+
+/// After a release that the session refused no release waits, though the lane's epoch stays in its
+/// ending phase: a launch is sent, as one with no epoch is, with no position, and the page is not
+/// told that a release stands before it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_launch_after_a_refused_release_is_sent_and_not_told_that_a_release_waits() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    page.release(&view, 2);
+    let first = link.expect(Method::InputRelease).await;
+    link.refuse_with(&first, ErrorCode::PermissionDenied, "not yours")
+        .await;
+    let words = "The session did not confirm this view's release of control: not yours";
+    page.newest_within(3, |state| state["control"]["ended"] == words)
+        .await
+        .expect("the refusal was shown within the bound");
+    let mut pressing = page.invoke_later(
+        "terminal_view_launch",
+        json!({ "view": view, "press": the_press() }),
+    );
+    let launch = tokio::select! {
+        launch = link.expect(Method::ShellLaunch) => launch,
+        told = &mut pressing => {
+            panic!("the launch was answered to the page before it reached the wire: {told:?}")
+        }
+    };
+    let asked: kr_protocol::root::ShellLaunchParams = launch.params();
+    assert!(
+        asked.after_input.is_none(),
+        "no release waits, so the launch names no position"
+    );
+    let installed = kr_protocol::root::ShellLaunchResult {
+        fence_id: kr_protocol::root::FenceId::new(kr_ipc::new_uuid()),
+        prompt_generation: asked.expected_prompt_generation,
+        buffer_revision: kr_protocol::root::EditorBufferRevision::new(4),
+    };
+    link.answer(&launch, &installed).await;
+    tokio::time::timeout(AFTER_BARRIER, pressing)
+        .await
+        .expect("the page was told within the bound")
+        .expect("joins")
+        .expect("the launch was installed");
+}

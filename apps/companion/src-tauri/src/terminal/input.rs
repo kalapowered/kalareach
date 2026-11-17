@@ -404,6 +404,13 @@ impl Lease {
         }
     }
 
+    /// Whether a release waits for the session's answer: one owed, one sent and not answered, or
+    /// one that goes once more. A release that the session refused is answered, and waits no more.
+    #[must_use]
+    pub fn releases_wait(&self) -> bool {
+        !self.owed.is_empty() || !self.owed_again.is_empty() || !self.releasing.is_empty()
+    }
+
     /// Whether `request` is one of the lease's calls, whose answer is the lease's.
     #[must_use]
     pub fn owns(&self, request: RequestId) -> bool {
@@ -937,6 +944,26 @@ mod tests {
         assert!(!lease.epoch_ended(InputLeaseEpoch::new(5)));
         assert_eq!(lease.control().ended, None);
         assert_eq!(lease.owed(), Some(Owed::Release(InputLeaseEpoch::new(5))));
+    }
+
+    /// A release waits from the page's request until the session answers it, once more included,
+    /// whatever the answer is.
+    #[test]
+    fn a_release_waits_from_its_request_until_the_session_answers_it() {
+        let mut lease = holding();
+        assert!(!lease.releases_wait());
+        assert!(lease.request(2, false));
+        assert!(lease.releases_wait(), "owed");
+        let owed = lease.owed().expect("a release is owed");
+        lease.sent(owed, RequestId::new(30));
+        assert!(lease.releases_wait(), "sent");
+        assert!(!lease.answered(RequestId::new(30), refusal(ErrorCode::DraftConflict)));
+        assert!(lease.releases_wait(), "owed once more");
+        let owed = lease.owed().expect("the release goes once more");
+        lease.sent(owed, RequestId::new(31));
+        assert!(lease.releases_wait(), "sent once more");
+        lease.answered(RequestId::new(31), refusal(ErrorCode::PermissionDenied));
+        assert!(!lease.releases_wait(), "refused, so answered");
     }
 
     #[test]

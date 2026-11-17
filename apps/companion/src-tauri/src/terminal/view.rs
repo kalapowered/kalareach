@@ -2164,8 +2164,13 @@ impl View {
                 Ok(barrier) => barrier,
                 // A launch goes only where the lane has the typing before it counted: another
                 // launch's hold stands, or a release waits, and the launch is not sent. What stands
-                // is kept.
-                Err(InputRefusal::LaunchWaiting | InputRefusal::Ending) if launch.is_some() => {
+                // is kept. The lane's epoch stays in its ending phase after a release that the
+                // session refused, until its notice or a new take, though no release waits then:
+                // that launch goes as one with no epoch does.
+                Err(InputRefusal::LaunchWaiting) if launch.is_some() => {
+                    return Ok(Started::NotStarted(LAUNCH_BEHIND_ANOTHER));
+                }
+                Err(InputRefusal::Ending) if launch.is_some() && self.lease.releases_wait() => {
                     return Ok(Started::NotStarted(LAUNCH_BEHIND_ANOTHER));
                 }
                 Err(_) => {
