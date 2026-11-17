@@ -51,7 +51,7 @@ local one: the reader closes the connection and every waiting call is answered a
 a mutation and the frames that only a host's own endpoints exchange are such frames. The companion's
 terminal view reads through this one reader, so a host that sends one ends the view as lost, once.
 While the view opens, the person is told "the host sent a frame this application does not read".
-Once the view shows a screen, the person is told what is told of every lost link, that the
+Once the view is subscribed, the person is told what is told of every lost link, that the
 connection ended, with no cause.
 
 The same refusal answers a call whose own write fails after it arrived: the write fails because the
