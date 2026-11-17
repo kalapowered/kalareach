@@ -12,8 +12,9 @@
 //! It runs on a runtime of its own, as the proxy does, and dropping it closes its port.
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -36,8 +37,8 @@ pub struct RelayFront {
     pub ca_roots: Vec<Vec<u8>>,
     accepted: Arc<AtomicUsize>,
     refused: Arc<AtomicUsize>,
-    /// The switch of a stalling front, and what it has read from the device.
-    switch: Option<watch::Sender<bool>>,
+    /// The stop of a stalling front, and what it has read from the device.
+    stop: Option<Arc<Stop>>,
     from_device: Arc<AtomicU64>,
     runtime: Option<tokio::runtime::Runtime>,
 }
@@ -158,7 +159,7 @@ impl RelayFront {
             ca_roots,
             accepted,
             refused,
-            switch: None,
+            stop: None,
             from_device: Arc::new(AtomicU64::new(0)),
             runtime: Some(runtime),
         }
@@ -178,7 +179,7 @@ impl RelayFront {
     /// rest was never read, so no byte is lost.
     pub fn stalling(relay: &LocalRelay, receive_buffer: Option<u32>) -> Self {
         let upstream = authority(&relay.url);
-        let (switch, gate) = watch::channel(false);
+        let (stop, gate) = Stop::new();
         let accepted = Arc::new(AtomicUsize::new(0));
         let from_device = Arc::new(AtomicU64::new(0));
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -188,6 +189,7 @@ impl RelayFront {
             .expect("the front's runtime");
         let (found, finding) = std::sync::mpsc::channel();
         let (counting, counted) = (Arc::clone(&accepted), Arc::clone(&from_device));
+        let pumps = Arc::clone(&stop);
         runtime.spawn(async move {
             let socket = TcpSocket::new_v4().expect("a front socket");
             if let Some(bytes) = receive_buffer {
@@ -208,6 +210,7 @@ impl RelayFront {
                     client,
                     upstream.clone(),
                     gate.clone(),
+                    Arc::clone(&pumps),
                     Arc::clone(&counted),
                 ));
             }
@@ -218,7 +221,7 @@ impl RelayFront {
             ca_roots: relay.ca_roots.clone(),
             accepted,
             refused: Arc::new(AtomicUsize::new(0)),
-            switch: Some(switch),
+            stop: Some(stop),
             from_device,
             runtime: Some(runtime),
         }
@@ -232,19 +235,34 @@ impl RelayFront {
     /// Only a read that was under way at the switch can add to it afterwards: one chunk of at most
     /// [`CHUNK`] bytes on each connection.
     pub fn stall(&self) -> u64 {
-        self.switch
-            .as_ref()
-            .expect("a stalling front")
-            .send_replace(true);
+        self.stop.as_ref().expect("a stalling front").set(true);
         self.read_from_device()
     }
 
     /// Lets a stalling front pass bytes and connections again.
     pub fn resume(&self) {
-        self.switch
-            .as_ref()
-            .expect("a stalling front")
-            .send_replace(false);
+        self.stop.as_ref().expect("a stalling front").set(false);
+    }
+
+    /// Waits until every pump of the front waits at the gate, for at most `bound`, and returns an
+    /// error with its own words when one does not. It blocks on a thread of its own and is bounded
+    /// by the clock of the operating system, not by a timer of the caller's runtime.
+    ///
+    /// What it shows: once it returns, no pump takes another read or writes another chunk before
+    /// the next resume, so a byte that the device sends after it returns cannot cross the front. A
+    /// pump leaves the count only while the front is not stopped, in the same hold of a lock that
+    /// reads the stop, so the count cannot show a pump that is about to read. A pump that starts
+    /// after the switch (its connection was still being made to the relay) begins at the gate. What
+    /// it does not cover: a connection that is accepted during the stop waits at the gate in
+    /// `carry`, before it has a pump, so it has nothing to confirm; and bytes that crossed the
+    /// front before the pumps stood can still be answered afterwards by the relay, though the
+    /// answer cannot come back until the resume. A front that is not stopped has no stop to
+    /// confirm, so this returns at once.
+    pub async fn confirm_stopped(&self, bound: Duration) -> Result<(), String> {
+        let stop = Arc::clone(self.stop.as_ref().expect("a stalling front"));
+        tokio::task::spawn_blocking(move || stop.wait_until_standing(bound))
+            .await
+            .unwrap_or_else(|_| Err("the wait for the front's pumps ended abnormally".to_owned()))
     }
 
     /// How many bytes a stalling front has read from the device, which is what the device's relay
@@ -287,9 +305,11 @@ async fn carry(
     client: TcpStream,
     upstream: String,
     mut gate: watch::Receiver<bool>,
+    stop: Arc<Stop>,
     from_device: Arc<AtomicU64>,
 ) {
-    // A connection that is made while the front is stalled waits here, accepted and untouched.
+    // A connection that is made while the front is stalled waits here, accepted and untouched. It
+    // has no pump yet, so it has nothing for [`RelayFront::confirm_stopped`] to wait for.
     if gate.wait_for(|stalled| !*stalled).await.is_err() {
         return;
     }
@@ -299,24 +319,38 @@ async fn carry(
     let (client_read, client_write) = client.into_split();
     let (relay_read, relay_write) = relay.into_split();
     tokio::join!(
-        pump(client_read, relay_write, gate.clone(), Some(from_device)),
-        pump(relay_read, client_write, gate.clone(), None),
+        pump(
+            client_read,
+            relay_write,
+            gate.clone(),
+            Stand::new(&stop),
+            Some(from_device)
+        ),
+        pump(
+            relay_read,
+            client_write,
+            gate.clone(),
+            Stand::new(&stop),
+            None
+        ),
     );
 }
 
 /// Copies `from` to `to` a chunk at a time, and starts no pass while the front is stalled. The
 /// `select!` that races a read against the switch is not biased, so a read that is ready when the
 /// switch is made can win it and its chunk is then written after the switch; a read that the
-/// switch wins has taken nothing, so the stream continues intact on resume.
+/// switch wins has taken nothing, so the stream continues intact on resume. A pump that finds the
+/// front stalled waits at the gate and reports that to its [`Stand`].
 async fn pump(
     mut from: OwnedReadHalf,
     mut to: OwnedWriteHalf,
     mut gate: watch::Receiver<bool>,
+    mut stand: Stand,
     count: Option<Arc<AtomicU64>>,
 ) {
     let mut chunk = vec![0_u8; CHUNK];
     loop {
-        if gate.wait_for(|stalled| !*stalled).await.is_err() {
+        if !stand.at_gate(&mut gate).await {
             break;
         }
         let read = tokio::select! {
@@ -335,4 +369,126 @@ async fn pump(
         }
     }
     let _ = to.shutdown().await;
+}
+
+/// The switch of a stalling front, and which of its pumps wait at the gate.
+struct Stop {
+    switch: watch::Sender<bool>,
+    state: Mutex<StopState>,
+    changed: Condvar,
+}
+
+/// What the pumps of a stalling front have reported.
+struct StopState {
+    /// Whether the front is stopped. It changes together with the switch, under the lock.
+    stopped: bool,
+    /// How many pumps run and do not wait at the gate.
+    running: usize,
+}
+
+impl Stop {
+    fn new() -> (Arc<Self>, watch::Receiver<bool>) {
+        let (switch, gate) = watch::channel(false);
+        let stop = Arc::new(Self {
+            switch,
+            state: Mutex::new(StopState {
+                stopped: false,
+                running: 0,
+            }),
+            changed: Condvar::new(),
+        });
+        (stop, gate)
+    }
+
+    fn lock(&self) -> MutexGuard<'_, StopState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Stops or resumes the front: the flag and the switch change under one hold of the lock.
+    fn set(&self, stopped: bool) {
+        let mut state = self.lock();
+        state.stopped = stopped;
+        self.switch.send_replace(stopped);
+    }
+
+    /// Waits while the front is stopped and a pump runs outside the gate, for at most `bound`.
+    fn wait_until_standing(&self, bound: Duration) -> Result<(), String> {
+        let (state, waited) = self
+            .changed
+            .wait_timeout_while(self.lock(), bound, |state| {
+                state.stopped && state.running != 0
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        if waited.timed_out() {
+            Err(format!(
+                "{} pumps of the front did not wait at the gate within {bound:?} of the switch",
+                state.running
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// One pump's place in the count of the pumps that run outside the gate.
+struct Stand {
+    stop: Arc<Stop>,
+    /// Whether the pump is counted as waiting at the gate.
+    waiting: bool,
+}
+
+impl Stand {
+    fn new(stop: &Arc<Stop>) -> Self {
+        stop.lock().running += 1;
+        Self {
+            stop: Arc::clone(stop),
+            waiting: false,
+        }
+    }
+
+    /// Waits at the gate while the front is stopped. Returns false when the front is gone.
+    async fn at_gate(&mut self, gate: &mut watch::Receiver<bool>) -> bool {
+        loop {
+            // A pump that runs and sees no stop goes on without the lock: it stays counted.
+            if !self.waiting && !*gate.borrow() {
+                return true;
+            }
+            if self.may_go() {
+                return true;
+            }
+            if gate.wait_for(|stalled| !*stalled).await.is_err() {
+                return false;
+            }
+        }
+    }
+
+    /// Whether the pump may go on. It may not while the front is stopped, and it is then counted
+    /// as waiting. It leaves that count only here, in the hold of the lock that finds the front
+    /// not stopped.
+    fn may_go(&mut self) -> bool {
+        let mut state = self.stop.lock();
+        if state.stopped {
+            if !self.waiting {
+                self.waiting = true;
+                state.running -= 1;
+                self.stop.changed.notify_all();
+            }
+            false
+        } else {
+            if self.waiting {
+                self.waiting = false;
+                state.running += 1;
+            }
+            true
+        }
+    }
+}
+
+impl Drop for Stand {
+    fn drop(&mut self) {
+        if !self.waiting {
+            self.stop.lock().running -= 1;
+            self.stop.changed.notify_all();
+        }
+    }
 }
