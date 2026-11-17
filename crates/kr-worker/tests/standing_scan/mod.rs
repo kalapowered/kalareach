@@ -11,28 +11,56 @@
 //!
 //! What it does not see. It reads names and not types: where a name is declared by several
 //! functions, a `calls` row or an `allow` row says which definition a body calls, and the row is
-//! the author's reading of the receiver's type, not a proof. It does not see a call through a
-//! function pointer or a closure that is passed in, a macro's expansion, a call to a name that no
-//! function of this crate declares (the standard library and other crates), what a guard is beyond
-//! the two names it knows (a `let` that calls `session` or locks the service's `dispatch`, and a
-//! parameter of the session's type), or an `allow`ed name's body. A `calls` row reads every
-//! function of that name in the file it names, so a type that shares a name with another in that
-//! file is read together with it.
+//! the author's reading of the receiver's type, not a proof. It does not see:
+//!
+//! * a call through a function pointer or a closure that is passed in, a macro's expansion, or a
+//!   call to a name that no function of this crate declares (the standard library and other
+//!   crates);
+//! * what a guard is, beyond the two names it knows (a `let` that calls `session` or locks the
+//!   service's `dispatch`, and a parameter of the session's type);
+//! * the body of an `allow`ed name;
+//! * the body of a callee that a counted name reaches. A counted call is counted and not followed,
+//!   so a second take or write inside `Broker::state`, `Questions::locked`, `lock_session` or
+//!   `Session::state` is not seen by the roster that counts that name; the `site` row of the
+//!   counted call is the only record of what the callee does;
+//! * a `Drop` impl, which no call names: a take or a write in `InputGuard::drop` passes;
+//! * a write that is not a call of a listed name: an assignment, a compound assignment, or a store
+//!   through `borrow_mut`;
+//! * the body that follows a `fn(` type, which is taken for a function (see "What it can merge").
+//!
+//! A `calls` row reads every function of that name in the file it names, so a type that shares a
+//! name with another in that file is read together with it.
+//!
+//! What it can merge. Four steps of the reader take two things for one, with no failure:
+//!
+//! * a function is known by its file and name, so two functions of one name in one file are one
+//!   body: the read set, the `site` counts and a `calls` row cover both (`attested_thread` is
+//!   declared on `BridgeThreads` and on `Broker` in `broker/bridge.rs`, and the takes roster has
+//!   one `site ... attested_thread state 1` row for the two);
+//! * a `calls` key holds a set of files, so a wrong file beside the right one is never reported as
+//!   stale: it only adds that file's functions of the name to the read set;
+//! * an `outside` row matches its name in every file, so a second function of that name in another
+//!   file would be left unread as well (today `decidable` has one definition);
+//! * the word after any `fn` token is taken as a function's name, so a `fn(` type in a signature
+//!   (`f: fn(u8) -> u8`) renames the body that follows to `u8`, and a take in that body is
+//!   attributed to no function that is read.
 //!
 //! What it follows. A call from a function that the scan reads to a name that this crate declares
 //! once is followed: the callee's body is read, and so are the bodies that it calls in turn, and a
 //! counted call found in any of them needs its own `site` row. A call to a name that several
 //! functions declare is followed into the file that a `calls` row names. The scan therefore reads
-//! every helper that a listed body reaches, whether a row declares it or not. A name that this
-//! crate declares once and that is really a method of the standard library or of another crate
-//! needs an `allow` row, or the scan reads the crate's function of that name.
+//! every helper that a listed body reaches by such a name, whether a row declares it or not; a
+//! callee that a counted name reaches is not followed (see "What it does not see"). A name that
+//! this crate declares once and that is really a method of the standard library or of another
+//! crate needs an `allow` row, or the scan reads the crate's function of that name.
 //!
 //! The roster has these kinds of row, one to a line, with `#` for a comment. A kind that holds one
 //! value for a key (`site`, `caller` and `only`, `held`, `supplies`) refuses a second row for the
 //! same key, so that a later row never replaces an earlier one:
 //!
-//! * `scope <file> <function>`: a function whose body is read, and a name that is judged by that
-//!   row wherever it is called.
+//! * `scope <file> <function>`: a function that has to exist and whose body is read. The row seeds
+//!   the read set and judges no call: a call is judged by the boundary and the `site` rows in
+//!   every body that is read, scoped or followed, and a scoped body has no exemption.
 //! * `site <file> <function> <callee> <how many calls>`: the counted calls found in a function
 //!   that the scan reads, scoped or followed.
 //! * `outside <file> <function>`: a function that is declared and not read, and not followed,
