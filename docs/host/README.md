@@ -7439,11 +7439,10 @@ of process names. Each worker is verified by a fresh challenge. A descriptor tha
 quarantined and never spawned from. A descriptor whose reservation this host fenced is quarantined
 without a challenge: the fence says the worker is not to be reached again, and recovery leaves such
 a worker alone for the same reason. No worker is killed because the daemon restarted. A worker the
-registry records that did not answer at start is looked for again before a read, a device's link or
-a local caller's prompt says its session is unknown. A session's worker that is busy when the
-daemon starts is reached later in the same run: the next read of that session, the session list, a
-prompt or a device link looks for it again. Until then paired devices cannot open the session. The
-session loses nothing.
+registry records that did not answer at start, for example because it was busy, is looked for again
+by the next read of its session, the session list, a local caller's prompt or a device's link, and
+one of these adopts it once it is free. Until then paired devices cannot open the session and
+`kr doctor` counts it as quarantined. The session loses nothing.
 
 A worker accepts its current generation again only after a fresh challenge, which fences that
 generation's previous connection; it refuses a lower generation and requires a strictly higher one
