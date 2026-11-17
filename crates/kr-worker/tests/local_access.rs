@@ -1218,9 +1218,8 @@ struct Landing {
     attach_ended: bool,
     at_the_acknowledgement: Held,
     afterwards: Held,
-    /// Whether the attach's own answer, which came after the acknowledgement, is its receipt:
-    /// applied.
-    receipt_applied: bool,
+    /// What the session held before the attach.
+    before: Held,
 }
 
 /// One window whose attach has passed the dispatch boundary's check of the local owner's access
@@ -1243,12 +1242,13 @@ async fn the_meeting_of_an_attach_and_a_statement() -> Result<Landing, &'static 
         .await
         .expect("the window is served under an open host");
 
+    let before = held(&world);
     let (checked, go) = world.service.stall_a_mutation_after_its_dispatch_check();
     let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
 
     // The window attaches and claims a size of its own. Its attach passes the check under the
     // open host and stops before the session.
-    let (attach_ended, applied) = start_the_geometry_attach(&world, window);
+    let attach_ended = start_the_geometry_attach(&world, window);
     if ends_by(deadline, async move { checked.await.is_ok() }).await != Some(true) {
         return Err("the attach never passed the dispatch boundary's check");
     }
@@ -1318,14 +1318,13 @@ async fn the_meeting_of_an_attach_and_a_statement() -> Result<Landing, &'static 
         .expect("the record is not poisoned")
         .take()
         .expect("the acknowledgement was recorded");
-    let receipt_applied = is_set(&applied);
     drop(window);
     world.close();
     Ok(Landing {
         attach_ended,
         at_the_acknowledgement,
         afterwards,
-        receipt_applied,
+        before,
     })
 }
 
@@ -1368,9 +1367,9 @@ fn an_attach_checked_before_the_host_restricts_its_owner_does_not_land_after_the
         landing.afterwards, landing.at_the_acknowledgement,
         "the attach changed the session after the statement was acknowledged"
     );
-    assert!(
-        landing.receipt_applied,
-        "the attach's receipt does not say applied"
+    assert_ne!(
+        landing.at_the_acknowledgement.geometry, landing.before.geometry,
+        "the attach was not applied before the acknowledgement: its resize is missing"
     );
 }
 
@@ -1546,23 +1545,18 @@ fn a_connection_that_a_restriction_withdrew_does_not_attach_again_when_the_host_
 }
 
 /// Starts the window's attach, which claims the geometry with a size of its own, on a task, and
-/// returns the end that gives the window back when the attach has been answered, and the flag that
-/// says the answer was the attach's receipt, applied.
+/// returns the end that gives the window back when the attach has been answered or its connection
+/// has ended.
 fn start_the_geometry_attach(
     world: &World,
     window: LocalClient,
-) -> (
-    std::sync::mpsc::Receiver<LocalClient>,
-    Arc<std::sync::atomic::AtomicBool>,
-) {
+) -> std::sync::mpsc::Receiver<LocalClient> {
     let target = world.target();
     let params = geometry_attach_params(world.session_id);
-    let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let noted = Arc::clone(&applied);
     let (attach_done, attach_ended) = std::sync::mpsc::channel();
     tokio::spawn(async move {
         let mut window = window;
-        let answer = window
+        let _ = window
             .mutate(
                 Method::SessionAttach,
                 ActionId::new(kr_ipc::new_uuid()),
@@ -1570,12 +1564,9 @@ fn start_the_geometry_attach(
                 &params,
             )
             .await;
-        if matches!(answer, Ok(Ok(_))) {
-            noted.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
         let _ = attach_done.send(window);
     });
-    (attach_ended, applied)
+    attach_ended
 }
 
 /// The parameters of an attach that claims the geometry with a size of its own.
@@ -1622,7 +1613,7 @@ async fn the_second_statement_meets_a_pending_withdrawal(
     let (checked, go_attach) = world.service.stall_a_mutation_after_its_dispatch_check();
     let (at_the_hold, go_statement) = world.service.stall_a_statement_after_its_hold();
     let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
-    let (attach_ended, _applied) = start_the_geometry_attach(&world, window);
+    let attach_ended = start_the_geometry_attach(&world, window);
     if ends_by(deadline, async move { checked.await.is_ok() }).await != Some(true) {
         return Err("the attach never passed the dispatch boundary's check");
     }
@@ -1788,7 +1779,7 @@ async fn the_writer_withdraws_a_window_whose_attach_is_in_flight(
     let (_at_the_end, go_end) = world.service.stall_a_connection_at_its_end();
     let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
     let before = Arc::new(held(&world));
-    let (attach_ended, _applied) = start_the_geometry_attach(&world, window);
+    let attach_ended = start_the_geometry_attach(&world, window);
     if ends_by(deadline, async move { checked.await.is_ok() }).await != Some(true) {
         return Err("the second attach never passed the dispatch boundary's check");
     }
@@ -1988,7 +1979,7 @@ async fn the_requests_of_a_window_while_the_attach_of_another_is_held()
     world.subscribe(&mut first, attachment).await;
     let (checked, go_attach) = world.service.stall_a_mutation_after_its_dispatch_check();
     let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
-    let (attach_ended, _applied) = start_the_geometry_attach(&world, second);
+    let attach_ended = start_the_geometry_attach(&world, second);
     if ends_by(deadline, async move { checked.await.is_ok() }).await != Some(true) {
         return Err("the attach never passed the dispatch boundary's check");
     }
