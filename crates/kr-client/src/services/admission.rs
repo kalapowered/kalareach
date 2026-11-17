@@ -26,9 +26,21 @@
 //! count starts again ten minutes after the last request, which is when what that request got has
 //! ended. Until then a refusal from the service goes on explaining a failed dial, though the minute
 //! it is kept for has passed, because nothing asks again to renew it. It also goes on explaining
-//! one while the request that was made as it stood is on its way, for as long as an exchange with
-//! the service may take and a second more at most, so that a dial lost in that time is not told the
-//! host is out of reach for want of an answer that the request is about to confirm or replace.
+//! one for as long as the request that was made as it stood is alive, so that a dial lost in that
+//! time is not told the host is out of reach for want of an answer that the request is about to
+//! confirm or replace. So an answer explains a failed dial for its keep time, for as long as the
+//! cache will not ask again, and for as long as the request made under it is alive, and never
+//! after a newer answer has replaced it.
+//!
+//! A request is alive while its task has not finished: the entry holds the task, stored in the
+//! same locked step as the count and the time of the ask, so one request for an entry is alive at
+//! a time, in every order. The cache puts no bound of its own on a request, because a bound read
+//! from a clock is passed while a process that is not polled (a phone suspends the application
+//! with an exchange open) sees nothing end. An exchange with the service ends at its deadline once
+//! its task is polled (`HttpDeadlines::total`, twenty seconds as the product builds it), and a
+//! task that panicked or was dropped is finished, so a mark cannot stay for want of an end. A
+//! service whose future never ends keeps its request alive, and that stops every ask for the
+//! entry, as it does without this note.
 //!
 //! What a kept answer explains is one of two things, told apart by what the service named. An answer
 //! that names the paths that still work is exhausted capacity, and the list and the delay are kept
@@ -52,9 +64,9 @@ use kr_protocol::pairing::NetworkConfig;
 use kr_protocol::scalars::{EndpointKey, U64};
 use kr_protocol::service::GatewayOrigin;
 use serde::{Deserialize, Serialize};
+use tokio::task::AbortHandle;
 
 use super::alternatives::Alternatives;
-use super::http::DEFAULT_TOTAL_DEADLINE;
 use super::matrix::ReleaseGate;
 use super::relay::{ManagedRelayLeaseService, ServiceHttp, ServiceSigner};
 use super::{ServiceFuture, relay};
@@ -104,18 +116,6 @@ const KEEP_NOT_MANAGED: Duration = Duration::from_secs(10 * 60);
 
 /// How long every request stops for when the service says it does not serve them.
 const SUSPEND: Duration = Duration::from_secs(10 * 60);
-
-/// The longest a request that is on its way is believed to be: the longest an exchange with the
-/// service may take ([`DEFAULT_TOTAL_DEADLINE`], which the client of the managed service is built
-/// with), and a second more, for the time between the cache's reading of its clock and the start of
-/// the exchange. A request that fails at its deadline therefore fails while it is still believed to
-/// be on its way.
-///
-/// The bound exists because the mark that a request is on its way is cleared only by the request's
-/// own end, and a mark that is never cleared (a task that died, a service that never answers) must
-/// neither keep an answer standing for ever nor stop every later request for the entry. The one
-/// bound limits both.
-const REQUEST_BOUND: Duration = DEFAULT_TOTAL_DEADLINE.saturating_add(Duration::from_secs(1));
 
 /// What a device asks the service for.
 #[derive(Clone, PartialEq, Eq)]
@@ -390,7 +390,8 @@ enum Held {
     /// An admission is installed until then.
     Admitted { until: Instant },
     /// The service is unable, or failed on its side. `kept_until` is how long the answer explains
-    /// a failed dial, and `retry_at` is when a dial asks again; a request that fails moves `retry_at`
+    /// a failed dial of itself (a live request for the entry explains it too), and `retry_at` is
+    /// when a dial asks again; a request that fails moves `retry_at`
     /// later and lifts `kept_until` to it. `alternatives` is what the service named, with no entry
     /// for a fault; `retry_after_seconds` is the delay it named, as it named it, and `answered_at`
     /// is when the answer was read.
@@ -411,8 +412,10 @@ enum Held {
 #[derive(Clone, Debug)]
 struct Entry {
     held: Held,
-    /// Whether a request for this entry is on its way, one that was made at `asked_at`.
-    pending: bool,
+    /// The task of the request that was made at `asked_at`, while there is one. It is stored in
+    /// the locked step that counts the ask, and the request is alive while the task has not
+    /// finished.
+    request: Option<AbortHandle>,
     /// When it was last asked, if it has been.
     asked_at: Option<Instant>,
     /// How many times it has been asked since a dial last connected.
@@ -425,7 +428,7 @@ impl Entry {
     const fn new() -> Self {
         Self {
             held: Held::Nothing,
-            pending: false,
+            request: None,
             asked_at: None,
             asks: 0,
             in_doubt: false,
@@ -438,39 +441,39 @@ impl Entry {
             .is_some_and(|asked| now.saturating_duration_since(asked) >= ASK_WINDOW)
     }
 
+    /// Whether the request for this entry is alive: its task has not finished. A task that
+    /// panicked or was dropped is finished.
+    fn request_alive(&self) -> bool {
+        self.request
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+    }
+
     /// Whether the entry holds an answer that the service is unable and that still explains a
     /// failed dial: for as long as it is kept, for as long as the cache will not ask again (three
     /// requests with no connection, until the ten minutes after the last), because nothing renews it
-    /// while no request is made, and for as long as the request that was made while it stood is on
-    /// its way, to [`REQUEST_BOUND`] at most. That request decides what the entry holds next, and a
-    /// dial that is lost before then is told no less than the entry said a moment before. A request
-    /// that is made while the answer has stopped drops it, so what is kept, counted or awaited here
-    /// is an answer that stood when the last request was made.
+    /// while no request is made, and for as long as the request that was made while it stood is
+    /// alive. That request decides what the entry holds next, and a dial that is lost before then
+    /// is told no less than the entry said a moment before. A request that is made while the answer
+    /// has stopped drops it, so what is kept, counted or awaited here is an answer that stood when
+    /// the last request was made, and a newer answer replaces it as soon as it is read.
     fn answer_stands(&self, now: Instant) -> bool {
         match self.held {
             Held::Unavailable { kept_until, .. } => {
                 now < kept_until
                     || (self.asks >= MOST_ASKS && !self.window_passed(now))
-                    || self.request_on_its_way(now)
+                    || self.request_alive()
             }
             _ => false,
         }
     }
 
-    /// Whether a request is on its way that was made less than [`REQUEST_BOUND`] ago.
-    fn request_on_its_way(&self, now: Instant) -> bool {
-        self.pending
-            && self
-                .asked_at
-                .is_some_and(|asked| now.saturating_duration_since(asked) < REQUEST_BOUND)
-    }
-
-    /// Whether a dial that starts `now` asks for this entry again. A request that has not ended
-    /// within [`REQUEST_BOUND`] is taken to be lost, and does not stop the next one: the product's
-    /// exchange ends at its deadline, which is shorter, so two requests for one entry are never on
-    /// their way together.
+    /// Whether a dial that starts `now` asks for this entry again. Never while the request for it
+    /// is alive, so one request for an entry is on its way at a time, in every order. A service's
+    /// future that never ends keeps its request alive and stops the asks for the entry; every
+    /// exchange of the product ends at its deadline once its task is polled.
     fn asks_again(&self, now: Instant) -> bool {
-        if self.request_on_its_way(now) || (self.asks >= MOST_ASKS && !self.window_passed(now)) {
+        if self.request_alive() || (self.asks >= MOST_ASKS && !self.window_passed(now)) {
             return false;
         }
         match self.held {
@@ -617,43 +620,48 @@ impl PairingAdmissions {
                 relay: normalised(&relay),
                 host: *host,
             };
-            let asks = {
+            let request = AdmissionRequest {
+                host: *host,
+                candidate,
+                relay_url: relay,
+            };
+            let asked = {
                 let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
                 let suspended = state.suspended_until.is_some_and(|until| now < until);
                 let entry = state.entries.entry(key.clone()).or_insert_with(Entry::new);
-                let ask = !suspended && entry.asks_again(now);
-                if ask {
+                let mut asked = None;
+                if !suspended && entry.asks_again(now) {
                     // Only a word that stands as this request is made may outlive its failure. One
-                    // that has stopped is dropped now, so that neither the count of asks nor the time
-                    // the request is on its way brings it back.
+                    // that has stopped is dropped now, so that neither the count of asks nor the
+                    // request that is on its way brings it back.
                     if matches!(entry.held, Held::Unavailable { .. }) && !entry.answer_stands(now) {
                         entry.held = Held::Nothing;
                     }
                     if entry.window_passed(now) {
                         entry.asks = 0;
                     }
-                    entry.pending = true;
                     entry.asks += 1;
                     entry.asked_at = Some(now);
+                    // A task of its own, so that a deadline that ends this dial does not end the
+                    // request: its answer is kept for the next one. The task is started and stored
+                    // in this locked step (a spawn does not wait), with the count and the time of
+                    // the ask, so no dial finds the ask counted and its task not yet stored.
+                    let this = self.clone();
+                    let task = tokio::spawn({
+                        let key = key.clone();
+                        async move { this.ask(key, request).await }
+                    });
+                    entry.request = Some(task.abort_handle());
+                    asked = Some(task);
                 }
                 // A dial that starts is in doubt until one connects, whichever relay it addresses
                 // and whether or not it asks now.
                 if dialled.as_ref() == Some(&key) {
                     entry.in_doubt = true;
                 }
-                ask
+                asked
             };
-            if asks {
-                let this = self.clone();
-                let request = AdmissionRequest {
-                    host: *host,
-                    candidate,
-                    relay_url: relay,
-                };
-                // A task of its own, so that a deadline that ends this dial does not end the
-                // request: its answer is kept for the next one.
-                started.push(tokio::spawn(async move { this.ask(key, request).await }));
-            }
+            started.extend(asked);
         }
 
         if !started.is_empty() {
@@ -684,7 +692,6 @@ impl PairingAdmissions {
         let Some(entry) = state.entries.get_mut(&key) else {
             return;
         };
-        entry.pending = false;
         entry.held = match answer {
             Ok(AdmissionAnswer::Admitted {
                 expires_in_seconds, ..
@@ -756,7 +763,8 @@ impl PairingAdmissions {
     /// What the service's answer says a dial to `host` that failed was held back by, when it says
     /// anything and that answer still stands: no free capacity to admit this device through the
     /// relay the dial addresses, with the paths that still work, or a fault of the service itself,
-    /// each with the device's own wait until it asks the service again.
+    /// each with the device's own wait: what is left of the time that no ask is made until (0 when
+    /// it has passed, as it has while a request for the entry is alive past its retry time).
     ///
     /// It decides what a dial that failed is reported as: a managed relay that cannot admit a
     /// device is not a host that cannot be reached.
@@ -774,13 +782,15 @@ impl PairingAdmissions {
                 answered_at,
                 ..
             } if entry.answer_stands(now) => {
-                // What a person is told to wait is the device's own wait: what is left until it asks
-                // the service again (the retry time, which a failed request moves later, the end of
-                // the ask window when the asks are used up, the end of a stop of requests), whether
-                // or not the service named a delay, and never less than what is left of the delay
-                // it named. The answer is kept past its delay while the cache will not ask again,
-                // and every try before then fails in the same way. At most a day, by the cache's
-                // own cap on a delay.
+                // What a person is told to wait is the device's own wait: what is left of the latest
+                // of the times that no ask is made until (the retry time, which a failed request
+                // moves later, the end of the ask window when the asks are used up, the end of a
+                // stop of requests), whether or not the service named a delay, and never less than
+                // what is left of the delay it named. It is 0 once all of them have passed, as they
+                // have while a request for the entry is alive past its retry time: no ask is made
+                // while that request is alive, and the figure does not say so. The answer is kept
+                // past its delay while the cache will not ask again, and every try before then
+                // fails in the same way. At most a day, by the cache's own cap on a delay.
                 let asks_again = [
                     Some(*retry_at),
                     retry_after_seconds.map(|named| *answered_at + named_time(named)),
@@ -820,17 +830,23 @@ pub enum RelayRefusal {
     Capacity {
         /// The paths it named, each as it wrote it. At least one has text.
         alternatives: Alternatives,
-        /// The device's own wait: seconds from now until it asks the service again, and not less
-        /// than what remains of the delay the service named, when it named one. At most a day, by
-        /// the cache's own cap on a delay.
+        /// The device's own wait: the seconds from now to the latest of the retry time, the end of
+        /// the ask window when the asks are used up and the end of a stop of requests, and not
+        /// less than what remains of the delay the service named, when it named one. It is 0 once
+        /// those have passed, as they have while a request for the entry is alive past its retry
+        /// time, and no ask is made while that request is alive. At most a day, by the cache's own
+        /// cap on a delay.
         retry_after_seconds: u64,
     },
     /// The service failed on its side, and no capacity was refused. An answer that names no path,
     /// and a refusal in its envelope under a status of the 5xx class, are this.
     Fault {
-        /// The device's own wait: seconds from now until it asks the service again, and not less
-        /// than what remains of the delay the service named, when it named one. At most a day, by
-        /// the cache's own cap on a delay.
+        /// The device's own wait: the seconds from now to the latest of the retry time, the end of
+        /// the ask window when the asks are used up and the end of a stop of requests, and not
+        /// less than what remains of the delay the service named, when it named one. It is 0 once
+        /// those have passed, as they have while a request for the entry is alive past its retry
+        /// time, and no ask is made while that request is alive. At most a day, by the cache's own
+        /// cap on a delay.
         retry_after_seconds: u64,
     },
 }
@@ -869,16 +885,4 @@ fn kept_for(named: Option<u64>) -> Duration {
         .map(named_time)
         .unwrap_or_default()
         .max(KEEP_UNAVAILABLE)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The service's client gives an exchange at most [`DEFAULT_TOTAL_DEADLINE`], so a request that
-    /// is believed to be on its way for less than that would stop being believed before it ended.
-    #[test]
-    fn a_request_is_believed_to_be_on_its_way_for_longer_than_the_http_deadline() {
-        assert!(REQUEST_BOUND > DEFAULT_TOTAL_DEADLINE);
-    }
 }
