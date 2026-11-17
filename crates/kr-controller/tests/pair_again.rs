@@ -653,6 +653,121 @@ async fn an_answer_is_not_taken_once_its_record_ended_though_a_new_record_holds_
     host.stop().await;
 }
 
+/// KR-REQ-10.06: a proof that was answered once is spent only under the record that answered it,
+/// however often it is completed. The owner device answers the confirmation of issuing an
+/// invitation, its record is revoked and a record of another endpoint identity holds the same key.
+/// The same proof is then completed again, under a new action identifier, which the host accepts
+/// as a copy of the answer. The acceptance record still names the record that answered, so the
+/// invitation is refused and nothing is spent; the new record's own answer is taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_proof_completed_again_is_still_spent_only_under_the_record_that_answered_it() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let first = host.owner.clone().expect("the host's owner device");
+    let signer = Signer::OwnerDevice(&owner);
+    let mut client = host.client().await;
+    let invite = PairInviteParams {
+        mode: InviteMode::Direct,
+        grant_kind: InviteGrantKind::SessionInvitation,
+        proposed_grant: rights(),
+    };
+
+    let challenge = calls::request(
+        host.environment_id,
+        &mut client,
+        ConfirmationSubject::IssueInvitation {
+            mode: InviteModeKind::Direct,
+            rendezvous_origin: Nullable::null(),
+            grant_kind: InviteGrantKind::SessionInvitation,
+            proposed_grant: rights(),
+        },
+    )
+    .await
+    .expect("the host describes the invitation");
+    let (proof, presented) = calls::sign(&challenge.request, &signer);
+    calls::complete(host.environment_id, &mut client, proof.clone(), presented)
+        .await
+        .expect("the owner device answers");
+    assert_eq!(answers_of(&host, first.device_id), (1, 0));
+    let invitations = count(&host, "SELECT COUNT(*) FROM pairing_invitations");
+
+    let barrier = within(
+        "the revocation",
+        BOUND,
+        host.network().revoke_device(first.device_id),
+    )
+    .await
+    .expect("the owner device is revoked");
+    assert!(barrier.holds(), "{barrier:?}");
+    let mut second = first.clone();
+    second.device_id = DeviceId::new(kr_ipc::new_uuid());
+    second.endpoint_id = *DeviceKeys::generate().expect("keys").transport.public();
+    second.revoked_at_ms = None;
+    second.expired_at_ms = None;
+    host.network()
+        .devices()
+        .commit(&second)
+        .expect("a record that holds the key of the revoked one");
+
+    // The same proof again, under a new action identifier: accepted as a copy of the answer, and
+    // the record that answered stays the first.
+    calls::complete(host.environment_id, &mut client, proof, None)
+        .await
+        .expect("the same proof is completed again");
+    assert_eq!(
+        answers_of(&host, first.device_id),
+        (1, 0),
+        "the acceptance record still names the record that answered"
+    );
+    assert_eq!(answers_of(&host, second.device_id), (0, 0));
+
+    let refused = within(
+        "the invitation",
+        BOUND,
+        calls::mutate::<_, PairInviteResult>(
+            host.environment_id,
+            &mut client,
+            Method::PairInvite,
+            &invite,
+        ),
+    )
+    .await
+    .expect_err("the answer of the ended record is not spent under the record that holds its key");
+    assert_eq!(
+        refused.code,
+        ErrorCode::OwnerConfirmationRequired,
+        "{refused:?}"
+    );
+    assert!(
+        refused.message.contains("no longer holds"),
+        "the host says the authority behind the answer has gone: {refused:?}"
+    );
+    assert_eq!(
+        answers_of(&host, first.device_id),
+        (1, 0),
+        "nothing was spent"
+    );
+    assert_eq!(
+        count(&host, "SELECT COUNT(*) FROM pairing_invitations"),
+        invitations,
+        "no invitation was issued"
+    );
+
+    // Control: the new record answers for itself and is taken.
+    calls::invite_direct(
+        host.environment_id,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &rights(),
+        &signer,
+    )
+    .await
+    .expect("the new record's own answer is taken");
+    assert_eq!(answers_of(&host, second.device_id), (1, 1));
+    assert_eq!(answers_of(&host, first.device_id), (1, 0));
+    host.stop().await;
+}
+
 /// Every row of `table`, as stored.
 fn rows_of(host: &Host, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
     let connection = registry(host);
