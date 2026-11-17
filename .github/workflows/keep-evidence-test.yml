@@ -1,0 +1,135 @@
+name: keep-evidence-test
+
+# The test of `.github/actions/keep-evidence`, started by hand and by nothing else. Run it after a
+# change to that action or to the upload action it calls: every hosted job ends with that action,
+# and a job that cannot keep its evidence is red, so a fault in it shows only at the end of a long
+# job.
+#
+# A real outage of the artifact service cannot be made on request, so the second try is reached
+# through the one fault the action reads the same way: a path that holds nothing, with the rule
+# that a path that holds nothing fails the try. The first try fails on it, the pause follows, and
+# the files appear while the action waits.
+#
+# - first-try: the files exist, the first try keeps them, `tries` is 1.
+# - second-try: the files appear 20 seconds after the step starts, the first try fails, the second
+#   keeps them, `tries` is 2 and the run carries the notice that says so.
+# - both-fail: the files never appear, both tries fail and the action's step fails. The step lets
+#   its failure pass so that the job can read it: its outcome is `failure`.
+# - verdict: fails unless the three jobs passed.
+#
+# Each job keeps its artifact under a name of its own. The run's artifacts list holds the first
+# two and not the third.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  first-try:
+    name: the first try keeps the evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the action
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
+      - name: Write the evidence
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidence"
+          echo "kept by the first try" > "$RUNNER_TEMP/evidence/record.txt"
+
+      - name: Keep the evidence
+        id: keep
+        uses: ./.github/actions/keep-evidence
+        with:
+          name: keep-evidence-test-first-try
+          path: ${{ runner.temp }}/evidence
+          if-no-files-found: error
+
+      - name: Read which try kept it
+        env:
+          TRIES: ${{ steps.keep.outputs.tries }}
+        run: |
+          echo "tries: ${TRIES}"
+          test "${TRIES}" = 1
+
+  second-try:
+    name: the second try keeps the evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the action
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
+      - name: Write the evidence 20 seconds from now
+        run: |
+          late="$RUNNER_TEMP/late-evidence"
+          mkdir -p "$late"
+          # The first try starts at once and fails on the empty path, and the action then waits a
+          # minute: the file is there for the second try and not for the first.
+          (sleep 20; echo "kept by the second try" > "$late/record.txt") < /dev/null > /dev/null 2>&1 &
+          disown
+
+      - name: Keep the evidence
+        id: keep
+        uses: ./.github/actions/keep-evidence
+        with:
+          name: keep-evidence-test-second-try
+          path: ${{ runner.temp }}/late-evidence
+          if-no-files-found: error
+
+      - name: Read which try kept it
+        env:
+          TRIES: ${{ steps.keep.outputs.tries }}
+        run: |
+          echo "tries: ${TRIES}"
+          test "${TRIES}" = 2
+
+  both-fail:
+    name: the step fails when both tries fail
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the action
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
+      - name: Keep evidence that does not exist
+        id: keep
+        continue-on-error: true
+        uses: ./.github/actions/keep-evidence
+        with:
+          name: keep-evidence-test-both-fail
+          path: ${{ runner.temp }}/no-evidence
+          if-no-files-found: error
+
+      - name: Read how the step ended
+        env:
+          OUTCOME: ${{ steps.keep.outcome }}
+        run: |
+          echo "outcome of the action's step: ${OUTCOME}"
+          test "${OUTCOME}" = failure
+
+  verdict:
+    name: the three jobs passed
+    if: ${{ always() }}
+    needs: [first-try, second-try, both-fail]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Read the jobs' results
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: ${RESULTS}"
+          test "${RESULTS}" = "success success success"

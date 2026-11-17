@@ -1,0 +1,91 @@
+name: Keep a job's evidence
+description: >-
+  Uploads what a job leaves as its evidence, as the job's workflow artifact, and tries once more
+  when the first upload fails. Every hosted job ends with such an upload, and a name lookup or a
+  connection that fails for a moment would otherwise turn a job red whose every other step passed,
+  hours of tests included. The upload action does not retry a request that never reached the
+  service, so the second try is made here, after a pause of one minute.
+
+  The step still fails when both tries fail: the evidence is part of the result, and a job that
+  kept none of it has not passed. A rule of `if-no-files-found: error` fails both tries when the
+  path holds nothing, as it fails the one try without this action; `warn` and `ignore` pass at
+  the first try when the path holds nothing, and no second try is made. Both tries keep the
+  same name, so the second one starts from nothing only where the first did not reach the
+  service. An upload that failed after the service had made its artifact fails the second try
+  too, on the name, and the step fails with it.
+
+  Whether the step runs, and for how long, is the calling step's own `if` and `timeout-minutes`.
+  A timeout there covers both tries and the pause.
+
+inputs:
+  name:
+    description: The artifact's name. It must not be the name of another artifact of the run.
+    required: true
+  path:
+    description: A file, a directory or a wildcard pattern, or several of them on lines of their own.
+    required: true
+  if-no-files-found:
+    description: >-
+      What a try does when the path holds nothing: `warn`, `error` or `ignore`, as the upload
+      action reads it.
+    required: false
+    default: warn
+
+outputs:
+  tries:
+    description: "'1' when the first try kept the evidence, '2' when the second one did."
+    value: ${{ steps.first.outcome == 'success' && '1' || '2' }}
+
+runs:
+  using: composite
+  steps:
+    # The caller's condition has already decided that this action runs, so every step here stands
+    # under `always()` or `!cancelled()` and not under the default `success()`, which a job that
+    # is already red would never pass.
+    - name: Keep the evidence
+      id: first
+      if: ${{ always() }}
+      continue-on-error: true
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}
+        if-no-files-found: ${{ inputs.if-no-files-found }}
+
+    - name: Wait before the second try
+      if: ${{ !cancelled() && steps.first.outcome == 'failure' }}
+      shell: bash
+      env:
+        ARTIFACT_NAME: ${{ inputs.name }}
+      run: |
+        echo "::warning title=Evidence not kept::The first try to keep ${ARTIFACT_NAME} failed. Trying once more in 60 seconds."
+        sleep 60
+
+    - name: Keep the evidence, second try
+      id: second
+      if: ${{ !cancelled() && steps.first.outcome == 'failure' }}
+      continue-on-error: true
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}
+        if-no-files-found: ${{ inputs.if-no-files-found }}
+
+    - name: Say that the second try kept the evidence
+      if: ${{ always() && steps.first.outcome == 'failure' && steps.second.outcome == 'success' }}
+      shell: bash
+      env:
+        ARTIFACT_NAME: ${{ inputs.name }}
+      run: |
+        echo "::notice title=Evidence kept by the second try::${ARTIFACT_NAME} was kept by the second try, after the first one failed."
+
+    - name: Fail when both tries failed
+      if: ${{ always() && steps.first.outcome == 'failure' && steps.second.outcome != 'success' }}
+      shell: bash
+      env:
+        ARTIFACT_NAME: ${{ inputs.name }}
+        FIRST_TRY: ${{ steps.first.outcome }}
+        SECOND_TRY: ${{ steps.second.outcome }}
+      run: |
+        echo "::error title=Evidence not kept::${ARTIFACT_NAME} was not kept (first try: ${FIRST_TRY}, second try: ${SECOND_TRY}), and a job without its evidence has not passed."
+        exit 1
