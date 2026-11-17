@@ -635,6 +635,12 @@ pub struct WorkerService {
     /// compiled away in every shipped build.
     #[cfg(feature = "testing")]
     delivery_end_stall: crate::testing::Stall,
+    /// A stop in a mutation inside the dispatch boundary, after the check that decides whether the
+    /// host's current statement of what its local owner may do lets it be dispatched and before it
+    /// takes the session, which this host's own tests arm to have a statement arrive in between. It
+    /// is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    after_the_dispatch_check_stall: crate::testing::Stall,
     /// How long, in milliseconds, an admitted operation has to reach its upstream, which this
     /// host's own tests shorten to reach the deadline without waiting out the shipped one. It is
     /// compiled away in every shipped build.
@@ -1299,6 +1305,8 @@ impl WorkerService {
             delivery_slot_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             delivery_end_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            after_the_dispatch_check_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             upstream_deadline_ms: std::sync::atomic::AtomicU64::new(
                 u64::try_from(UPSTREAM_SUBMIT_DEADLINE.as_millis()).unwrap_or(u64::MAX),
@@ -2295,6 +2303,22 @@ impl WorkerService {
         std::sync::mpsc::Sender<()>,
     ) {
         self.delivery_end_stall.arm()
+    }
+
+    /// Stops the next mutation that passes the dispatch boundary's check of the local owner's
+    /// access, before it takes the session, for this host's own tests.
+    ///
+    /// Returns the end that says the mutation has arrived, and the end that lets it go. The stop
+    /// fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_a_mutation_after_its_dispatch_check(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.after_the_dispatch_check_stall.arm()
     }
 
     /// Sets how long an admitted operation has to reach its upstream before the worker records an
@@ -7670,6 +7694,8 @@ impl WorkerService {
         // able to act under what it removed.
         self.check_validated_revision(caller)?;
         self.check_local_dispatch(&state.facts, method, caller)?;
+        #[cfg(feature = "testing")]
+        self.after_the_dispatch_check_stall.stand();
         let digest = kr_protocol::digest::mutation_digest(mutation, &actor_id)
             .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
 

@@ -1156,3 +1156,182 @@ fn a_withdrawal_and_a_delivery_start_on_one_connection_both_end() {
         "the window that held a delivery was not withdrawn"
     );
 }
+
+/// What the session holds of attachments and geometry at one moment.
+#[derive(Debug, PartialEq)]
+struct Held {
+    attachments: Vec<AttachmentId>,
+    geometry: kr_protocol::attachment::GeometryState,
+}
+
+fn held(world: &World) -> Held {
+    let session = world.runtime.session();
+    Held {
+        attachments: session
+            .attachments()
+            .into_iter()
+            .map(|summary| summary.attachment_id)
+            .collect(),
+        geometry: session.geometry(),
+    }
+}
+
+/// What the meeting of an attach and a statement that takes access away came to.
+struct Landing {
+    attach_ended: bool,
+    at_the_acknowledgement: Held,
+    afterwards: Held,
+}
+
+/// One window whose attach has passed the dispatch boundary's check of the local owner's access
+/// and stands before the session, and a statement that takes access away and is acknowledged
+/// while it stands.
+///
+/// The attach claims the geometry with a size of its own, so it resizes the session and resets
+/// what every subscriber is shown. Returns what the session held when the statement was
+/// acknowledged, and what it holds once the attach has ended, or the step that did not happen.
+///
+/// The session's shell does not end by itself, so the session stays open for as long as the
+/// schedule's own deadline allows.
+async fn the_meeting_of_an_attach_and_a_statement() -> Result<Landing, &'static str> {
+    let world = Arc::new(world("exec cat", true).await);
+    let mut window = world.window().await;
+    let mut daemon = world.authority(1).await;
+    tell(&mut daemon, open(1)).await;
+    world
+        .read(&mut window)
+        .await
+        .expect("the window is served under an open host");
+
+    let (checked, go) = world.service.stall_a_mutation_after_its_dispatch_check();
+    let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+
+    // The window attaches and claims a size of its own. Its attach passes the check under the
+    // open host and stops before the session.
+    let target = world.target();
+    let session_id = world.session_id;
+    let (attach_done, attach_ended) = std::sync::mpsc::channel();
+    tokio::spawn(async move {
+        let mut requested = CanonicalSet::new();
+        requested.insert(AttachmentCapability::ObserveTerminal);
+        requested.insert(AttachmentCapability::Input);
+        requested.insert(AttachmentCapability::Geometry);
+        let _ = window
+            .mutate(
+                Method::SessionAttach,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &SessionAttachParams {
+                    session_id,
+                    mode: AttachMode::Terminal,
+                    claim_geometry: true,
+                    dimensions: Nullable::some(Dimensions::new(100, 30)),
+                    terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                    requested,
+                },
+            )
+            .await;
+        let _ = attach_done.send(window);
+    });
+    if ends_by(deadline, async move { checked.await.is_ok() }).await != Some(true) {
+        return Err("the attach never passed the dispatch boundary's check");
+    }
+
+    // The host takes access away with a lease that is still valid. What the session holds is
+    // read at the moment the daemon has its acknowledgement.
+    let lease = world.machine.lease(2, FAR_MS, FAR_MS);
+    let acknowledged: Arc<std::sync::Mutex<Option<Held>>> = Arc::default();
+    let at_the_acknowledgement = Arc::clone(&acknowledged);
+    let reader = Arc::clone(&world);
+    tokio::spawn(async move {
+        tell(&mut daemon, lease).await;
+        let seen = tokio::task::spawn_blocking(move || held(&reader))
+            .await
+            .expect("the session is read");
+        *at_the_acknowledgement
+            .lock()
+            .expect("the record is not poisoned") = Some(seen);
+        daemon
+    });
+    let waiting = Arc::clone(&acknowledged);
+    if !holds_by(deadline, move || {
+        waiting
+            .lock()
+            .expect("the record is not poisoned")
+            .is_some()
+    })
+    .await
+    {
+        return Err("the statement was never acknowledged");
+    }
+
+    go.send(()).expect("lets the attach go");
+    let window = tokio::task::spawn_blocking(move || {
+        attach_ended
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .ok()
+    })
+    .await
+    .ok()
+    .flatten();
+    let attach_ended = window.is_some();
+    let afterwards = {
+        let reader = Arc::clone(&world);
+        tokio::task::spawn_blocking(move || held(&reader))
+            .await
+            .expect("the session is read")
+    };
+    let at_the_acknowledgement = acknowledged
+        .lock()
+        .expect("the record is not poisoned")
+        .take()
+        .expect("the acknowledgement was recorded");
+    drop(window);
+    world.close();
+    Ok(Landing {
+        attach_ended,
+        at_the_acknowledgement,
+        afterwards,
+    })
+}
+
+/// KR-REQ-17.54: an attach that was checked before the host took its owner's access away does not
+/// land after the statement that did it has been acknowledged.
+///
+/// The attach has passed the dispatch boundary's check under the open host and stands before the
+/// session when the statement arrives. The attach claims the geometry, so landing resizes the
+/// session and resets what every subscriber is shown, and none of that can be taken back by
+/// withdrawing the window. Whatever the attach does to the session is done before the
+/// acknowledgement, and the statement's withdrawal then finds the attachment; nothing of it
+/// happens after.
+///
+/// The paths run on the runtime's threads, and what the test waits on is a thread of its own, with
+/// a deadline.
+#[test]
+fn an_attach_checked_before_the_host_restricts_its_owner_does_not_land_after_the_statement_is_acknowledged()
+ {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(the_meeting_of_an_attach_and_a_statement())
+    }));
+    runtime.shutdown_background();
+    let landing = match outcome {
+        Ok(Ok(landing)) => landing,
+        Ok(Err(step)) => panic!("the schedule did not come about: {step}"),
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    assert!(landing.attach_ended, "the attach did not end");
+    assert!(
+        landing.at_the_acknowledgement.attachments.is_empty(),
+        "the statement was acknowledged while the window's attachment was in the session: {:?}",
+        landing.at_the_acknowledgement
+    );
+    assert_eq!(
+        landing.afterwards, landing.at_the_acknowledgement,
+        "the attach changed the session after the statement was acknowledged"
+    );
+}
