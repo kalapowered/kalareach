@@ -1143,16 +1143,12 @@ async fn an_old_connection_is_served_nothing_under_the_record_that_replaced_its_
 }
 
 /// Revokes `first` as its owner does, through `device.revoke`, which withdraws every grant the
-/// device holds and waits for the withdrawal to finish its barrier, and pairs `device` again under
-/// `proposed`: what the cases below do once they have put something in the ended record's name.
-/// Returns the new record and what the revocation answered.
-async fn replaced_after_a_revocation(
+/// device holds and waits for the withdrawal to finish its barrier. Returns what the revocation
+/// answered.
+async fn revoked_by_its_owner(
     host: &Host,
-    device: &Device,
-    owner: &DeviceKeys,
     first: &DeviceRecord,
-    proposed: ProposedGrant,
-) -> (DeviceRecord, kr_protocol::sharing::RevocationResult) {
+) -> kr_protocol::sharing::RevocationResult {
     let mut client = host.client().await;
     let revoked: kr_protocol::sharing::RevocationResult = within(
         "the revocation",
@@ -1169,6 +1165,20 @@ async fn replaced_after_a_revocation(
     .await
     .expect("the device is revoked");
     assert!(revoked.barrier.holds(), "{:?}", revoked.barrier);
+    revoked
+}
+
+/// Revokes `first` as its owner does and pairs `device` again under `proposed`: what the cases
+/// below do once they have put something in the ended record's name. Returns the new record and
+/// what the revocation answered.
+async fn replaced_after_a_revocation(
+    host: &Host,
+    device: &Device,
+    owner: &DeviceKeys,
+    first: &DeviceRecord,
+    proposed: ProposedGrant,
+) -> (DeviceRecord, kr_protocol::sharing::RevocationResult) {
+    let revoked = revoked_by_its_owner(host, first).await;
     let second = within(
         "the second pairing",
         BOUND,
@@ -1265,7 +1275,28 @@ async fn the_answers_kept_for_the_ended_record_are_found_under_its_identifier_an
         "the worker holds a receipt for the old actor's action"
     );
 
-    let (second, _) = replaced_after_a_revocation(&host, &phone, &owner, &first, rights()).await;
+    // The revocation rejects the action that was not yet dispatched: the receipt's state, reason,
+    // revision, error and moment change, and nothing else of it does.
+    let _revoked = revoked_by_its_owner(&host, &first).await;
+    let after_revocation = worker_receipt(worker, &old_actor, action)
+        .expect("the worker still holds the receipt of the old actor after the revocation");
+    let mut as_held = receipt.expect("the receipt held before the revocation");
+    as_held.state = kr_protocol::receipt::ReceiptState::Rejected;
+    as_held.reason = Nullable::some(kr_protocol::receipt::RejectionReason::Revoked);
+    as_held.revision = after_revocation.revision;
+    as_held.error = after_revocation.error.clone();
+    as_held.updated_at_ms = after_revocation.updated_at_ms;
+    assert_eq!(
+        after_revocation, as_held,
+        "the revocation rejects the action and changes nothing else of the receipt"
+    );
+
+    let second = within(
+        "the second pairing",
+        BOUND,
+        pair_with(&host, &phone, &owner, rights()),
+    )
+    .await;
     let new_actor = kr_transport::listener::device_principal(&second.device_id);
 
     // The old identifier still finds the host's answer, the bytes it was given.
@@ -1279,20 +1310,12 @@ async fn the_answers_kept_for_the_ended_record_are_found_under_its_identifier_an
         ),
         "a retry under the old identifier is given the kept answer"
     );
-    // The old identifier still finds the worker's receipt, whole: the revocation rejected the action
-    // that was not yet dispatched (its state, reason, revision, error and moment), and everything
-    // else of the receipt is as it was.
-    let kept = worker_receipt(worker, &old_actor, action)
-        .expect("the worker still holds the receipt of the old actor");
-    let mut expected = receipt.expect("the receipt held before the replacement");
-    expected.state = kr_protocol::receipt::ReceiptState::Rejected;
-    expected.reason = Nullable::some(kr_protocol::receipt::RejectionReason::Revoked);
-    expected.revision = kept.revision;
-    expected.error = kept.error.clone();
-    expected.updated_at_ms = kept.updated_at_ms;
+    // The old identifier still finds the worker's receipt, whole, as the revocation left it: the
+    // replacement changes no field of it.
     assert_eq!(
-        kept, expected,
-        "the worker's receipt is the old actor's whole receipt, rejected by the revocation"
+        worker_receipt(worker, &old_actor, action),
+        Some(after_revocation),
+        "the worker's receipt of the old actor is unchanged by the replacement"
     );
     // The new identifier finds nothing in either store.
     assert_eq!(
