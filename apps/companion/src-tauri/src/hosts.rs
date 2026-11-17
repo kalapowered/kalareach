@@ -70,10 +70,12 @@ pub async fn use_host<R: Runtime>(app: &AppHandle<R>, host: PairedHost) -> Resul
 ///
 /// A local action. It reaches no host, so it works for one that no longer answers, among them one
 /// that revoked this computer. When `host` is the one in use its connection ends and none is in
-/// use until the person chooses another; any other host's connection is left as it is. The
-/// device's one endpoint then forgets the host: its address lookups and the relays that no other
-/// host names. That is the last step, and it runs to its end in a task of its own, so a command
-/// that stops waiting for it does not leave the host in the endpoint.
+/// use until the person chooses another; any other host's connection is left as it is. What the
+/// push desk and the inbox keep of the host goes with it. The device's one endpoint then forgets
+/// the host: its address lookups and the relays that no other host names. That is the last step,
+/// and it runs to its end in a task of its own, so a command that stops waiting for it, or an
+/// application that ends in it, leaves nothing else of the forgetting undone, and the host is not
+/// left in the endpoint. The only thing that waits for the endpoint is the command's return.
 ///
 /// # Errors
 ///
@@ -100,6 +102,12 @@ pub async fn forget_host<R: Runtime>(
     #[cfg(feature = "testing")]
     crate::told::tap(app, CONNECTION_EVENT, &now);
     let _ = app.emit(CONNECTION_EVENT, now);
+    // What is kept of a host's notifications goes with the host. The host's own destination stays
+    // until its owner removes this device: only the host revokes an authorisation it holds.
+    if let Some(desk) = state.push() {
+        desk.forgotten(host.host_device_id);
+    }
+    state.inbox().forgotten(host.host_device_id);
     let (link, endpoint) = (Arc::clone(&device.pairing().link), host.host_endpoint_id);
     // A task that panics has left nothing to wait for, and the person's forgetting has been done.
     let _ = tauri::async_runtime::spawn(async move { link.forget_host(&endpoint).await }).await;
