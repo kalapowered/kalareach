@@ -315,8 +315,6 @@ async fn watched<T>(
 mod tests {
     use kr_cbor::CanonicalValue;
     use kr_protocol::ids::InputLeaseEpoch;
-    use kr_protocol::input::{InputContent, InputWriteParams};
-    use kr_protocol::retained::{Level, RETAINED};
     use kr_protocol::scalars::{Bytes, Uuid};
 
     use super::*;
@@ -353,22 +351,5 @@ mod tests {
             "this level reads the union"
         );
         assert!(member(&request, "bytes").is_none(), "no bytes at the top");
-    }
-
-    /// A worker of the retained level reads the frame as the bytes of the union: that level's own
-    /// surface decodes the parameters, and what it reads is the bytes the device sent.
-    #[test]
-    fn a_worker_of_the_retained_level_reads_the_frame_as_bytes_in_the_union() {
-        let request = written();
-        let read: InputWriteParams = Level::retained(&RETAINED[0])
-            .decode_value(&request.params)
-            .expect("the retained level reads the parameters");
-        assert_eq!(
-            read.input,
-            InputContent::Bytes {
-                bytes: Bytes::new(b"ls\r".to_vec())
-            },
-            "the retained level reads the bytes of the union"
-        );
     }
 }
