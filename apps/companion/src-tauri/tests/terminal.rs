@@ -7914,11 +7914,17 @@ async fn a_view_whose_connection_went_with_output_unread_serves_it_and_gives_not
         expected,
         "every screen the worker sent is shown, in order"
     );
-    assert!(
-        page.states(3).iter().any(|state| {
+    let states = page.states(3);
+    let control_ended = states
+        .iter()
+        .find(|state| {
             state["state"] == "showing"
                 && state["control"]["ended"] == "Control ended: this view's input stream ended."
-        }),
-        "control ended with the stream's words"
+        })
+        .expect("control ended with the stream's words");
+    assert_eq!(
+        control(control_ended),
+        (1, "watching".to_owned()),
+        "the page is not left showing control on the connection that is gone"
     );
 }

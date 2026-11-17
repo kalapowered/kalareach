@@ -1088,6 +1088,35 @@ mod tests {
         assert!(lease.write(1).is_err());
     }
 
+    /// The end of the view's input stream by its connection's cause ends control with the words of
+    /// any end of the stream and gives nothing back: the lease is not held, so a later take asks for
+    /// a new one, and the view does not acquire on the connection that is gone; where no lease is
+    /// held, nothing changes.
+    #[test]
+    fn the_end_of_the_connection_ends_control_and_gives_nothing_back() {
+        let mut lease = Lease::default();
+        assert!(!lease.connection_ended(), "no lease is held");
+        let mut lease = holding();
+        assert!(lease.connection_ended());
+        let control = lease.control();
+        assert_eq!(control.state, ControlState::Watching);
+        assert_eq!(
+            control.ended.as_deref(),
+            Some("Control ended: this view's input stream ended.")
+        );
+        assert_eq!(lease.held_epoch(), None, "the lease is not held");
+        assert_eq!(lease.owed(), None, "nothing is given back, nothing asked");
+        assert!(lease.write(1).is_err());
+        assert!(!lease.connection_ended(), "nothing held, nothing changes");
+        assert!(lease.request(2, true));
+        assert_eq!(
+            lease.owed(),
+            Some(Owed::Acquire),
+            "a later take asks for a new lease and does not reuse the old one"
+        );
+        assert_eq!(lease.control().state, ControlState::Taking);
+    }
+
     /// A take that waits for a stream that did not open is refused with the stream's words, and the
     /// next take is asked for again; nothing is refused where no take waits.
     #[test]
