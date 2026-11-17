@@ -5832,6 +5832,24 @@ async fn a_paired_views_lane_opens_after_the_attach_and_its_keys_go_on_the_strea
 /// wait (the lane bounds that by two seconds) is over.
 const AFTER_BARRIER: Duration = Duration::from_secs(10);
 
+/// Waits, under [`AFTER_BARRIER`], until `view` has taken `count` barriers from its lane in all:
+/// the lane then has the launch's or the close's barrier, and what the host accepts from here on
+/// reaches the lane after the view's last look at it, so that only the wait for the barrier reads it.
+async fn barriers_taken(page: &Page, view: &str, count: usize) {
+    let views = page.app.state::<companion_tauri::terminal::TerminalViews>();
+    let reached = tokio::time::timeout(AFTER_BARRIER, async {
+        while views.barriers_taken(view).is_none_or(|taken| taken < count) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        reached.is_ok(),
+        "the view took {count} barriers within the bound: it took {:?}",
+        views.barriers_taken(view)
+    );
+}
+
 /// Three keys, `a`, `b` and `c`, taken by the view under the page's take 1 and read by the host, and
 /// none of them accepted: the lane's barrier for an ending that follows cannot be reached.
 async fn three_keys_the_host_has_read(page: &Page, view: &str, host: &ScriptedHost) {
@@ -6032,6 +6050,9 @@ async fn the_close_names_what_the_host_accepted_including_what_it_accepted_while
     page.app
         .state::<companion_tauri::terminal::TerminalViews>()
         .closer(&view)();
+    // The close has settled what the lane had and taken its barrier: the host's next acceptance
+    // reaches the lane while the close waits for the barrier, and only that wait reads it.
+    barriers_taken(&page, &view, 1).await;
     host.script.accept(1, 1);
     assert!(
         ended_within_the_close_bound(&page, &view).await,
@@ -6074,12 +6095,18 @@ async fn an_unreached_launch_is_not_sent_and_the_typing_behind_it_goes_in_order(
         "terminal_view_launch",
         json!({ "view": view, "press": the_press() }),
     );
+    // Typed once the launch has its barrier, so the lane holds the key behind it.
+    barriers_taken(&page, &view, 1).await;
+    page.text(&view, 1, "z").expect("the key is taken");
     assert!(
-        link.quiet_for(QUIET).await,
+        link.call_within(QUIET).await.is_none(),
         "the launch stands behind the typing: nothing of it is on the wire"
     );
-    // Typed after the press has taken its barrier, so the lane holds it behind the launch.
-    page.text(&view, 1, "z").expect("the key is taken");
+    assert_eq!(
+        host.script.frames().len(),
+        3,
+        "the key typed behind the launch is held and not written while the launch waits"
+    );
     let told = tokio::time::timeout(AFTER_BARRIER, &mut pressing)
         .await
         .expect("the page was told within the bound")

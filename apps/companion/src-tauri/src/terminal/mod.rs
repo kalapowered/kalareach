@@ -90,6 +90,8 @@ struct Held {
     ended: tokio::sync::watch::Receiver<bool>,
     /// The most items the view's queue of what it heard has held at one time.
     queue_peak: Arc<AtomicUsize>,
+    /// How many barriers the view has taken from its input lane.
+    barriers: Arc<AtomicUsize>,
 }
 
 /// The raw terminal views this application holds open.
@@ -197,6 +199,7 @@ impl TerminalViews {
         let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
         let (ending, ended) = tokio::sync::watch::channel(false);
         let queue_peak = Arc::new(AtomicUsize::new(0));
+        let barriers = Arc::new(AtomicUsize::new(0));
         // Held before the task starts, so a close that arrives at once finds it.
         self.lock().insert(
             id,
@@ -205,6 +208,7 @@ impl TerminalViews {
                 commands,
                 ended,
                 queue_peak: Arc::clone(&queue_peak),
+                barriers: Arc::clone(&barriers),
             },
         );
         let held = Arc::clone(&self.held);
@@ -216,7 +220,7 @@ impl TerminalViews {
                 Source::Over(transport) => view::Reach::Over(transport),
             };
             let cause = view::run(
-                reach, session_id, dimensions, receiver, &publish, queue_peak,
+                reach, session_id, dimensions, receiver, &publish, queue_peak, barriers,
             )
             .await;
             // Before the view is told over, so whoever waits for its end finds it done.
@@ -271,6 +275,19 @@ impl TerminalViews {
         self.lock()
             .get(&id)
             .map(|entry| entry.queue_peak.load(Ordering::Relaxed))
+    }
+
+    /// How many barriers a view has taken from its input lane so far: one for each request that
+    /// waits for a paired host to have the typing before it (a launch or a release), and one for
+    /// the close's detach. A barrier is counted once the lane has it, before the view waits for the
+    /// host to reach it. For a test of what the view does while it waits for a barrier.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn barriers_taken(&self, view: &str) -> Option<usize> {
+        let id = view.parse::<u64>().ok()?;
+        self.lock()
+            .get(&id)
+            .map(|entry| entry.barriers.load(Ordering::Relaxed))
     }
 
     /// Tells a view the page's grid is now `dimensions`. A view that has ended takes nothing.
@@ -481,6 +498,7 @@ mod tests {
                 commands,
                 ended,
                 queue_peak: Arc::default(),
+                barriers: Arc::default(),
             },
         );
         (views, receiver)

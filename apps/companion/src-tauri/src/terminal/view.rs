@@ -197,6 +197,7 @@ pub(super) async fn run(
     mut commands: UnboundedReceiver<Command>,
     publish: &Publish,
     queue_peak: Arc<AtomicUsize>,
+    barriers: Arc<AtomicUsize>,
 ) -> Cause {
     // The window's reports, which take the page's sizes and moves while the view is opening too, and
     // control of the program, which a take made while it opens asks for once it is attached.
@@ -308,6 +309,7 @@ pub(super) async fn run(
         heard_in_flight: false,
         heard: VecDeque::new(),
         queue_peak,
+        barriers,
         publish: publish.clone(),
     };
     view.publish_state();
@@ -909,6 +911,9 @@ struct View {
     /// The most items the queue has held at one time, which a test reads to see that the queue is
     /// bounded.
     queue_peak: Arc<AtomicUsize>,
+    /// How many barriers the view has taken from its lane, which a test reads to see where the
+    /// view waits.
+    barriers: Arc<AtomicUsize>,
     publish: Publish,
 }
 
@@ -2101,6 +2106,7 @@ impl View {
                     return Ok(Started::Sent(tag));
                 }
             };
+            self.barriers.fetch_add(1, Ordering::Relaxed);
             if launch.is_some() {
                 self.holds.insert(tag, launch.unwrap_or_default());
             }
@@ -2243,6 +2249,7 @@ impl View {
         if self.networked && placed {
             let barrier = self.lane.as_ref().and_then(|lane| lane.mark(None).ok());
             if let Some(barrier) = barrier {
+                self.barriers.fetch_add(1, Ordering::Relaxed);
                 // The detach names the barrier where the host has the typing before it, and where it
                 // does not, the typing it did accept, counting what it accepts while the close waits.
                 let reached = match self.lane_events.as_mut() {
