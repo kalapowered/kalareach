@@ -3048,7 +3048,9 @@ mod tests {
         const IN_THE_CHILD: &str = "KR_TEST_QUESTION_FOLDERS_IN_A_SPACED_TEMPORARY_FOLDER";
         const NAME: &str =
             "a_question_runs_in_folders_of_its_own_where_the_temporary_folder_holds_a_space";
-        const BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+        // The child places the program and starts it once, which may take up to 300 seconds on a
+        // first start, and then asks it questions of up to five seconds each.
+        const BOUND: std::time::Duration = std::time::Duration::from_secs(600);
         if std::env::var_os(IN_THE_CHILD).is_some() {
             a_question_runs_in_folders_of_its_own();
             return;
@@ -3073,8 +3075,9 @@ mod tests {
                 None if std::time::Instant::now() >= deadline => {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let output = std::fs::read_to_string(&said).unwrap_or_default();
                     panic!(
-                        "the case in a spaced temporary folder stood at, not ended within {BOUND:?}"
+                        "the case in a spaced temporary folder stood at, not ended within {BOUND:?}: {output}"
                     );
                 }
                 None => std::thread::sleep(std::time::Duration::from_millis(25)),
