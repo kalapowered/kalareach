@@ -7782,8 +7782,6 @@ async fn a_view_whose_connection_went_with_output_unread_serves_it_and_gives_not
     const SCREENS: u64 = 1 + 256 + 1;
     // Longer than the wait for the rest of the output that a release that cannot be sent starts.
     const PAUSE: Duration = Duration::from_secs(3);
-    // More than the lane's wait for the session's record of the end (two seconds).
-    const LANE_WAIT: Duration = Duration::from_secs(3);
     let mut worker = ScriptedWorker::start(Challenge::Answered);
     let page = Page::new(worker.paths());
     let mut lease = WorkerLease::at(4);
@@ -7853,10 +7851,9 @@ async fn a_view_whose_connection_went_with_output_unread_serves_it_and_gives_not
     );
     let mut recorded = shown + 2;
     page.lane_ends(&view).await;
-    // The lane records its end at once, and says it to the view only when its own wait for the
-    // session's record has passed: the page holds the view until then, so that the lane's end is
-    // ready when the view next looks.
-    tokio::time::sleep(LANE_WAIT).await;
+    // The lane waits for the session's record of the end, for its bound at most, and then records its
+    // end and says it to the view in one step: the lane's end is ready when the view next looks, and
+    // the page holds the view until then.
     assert_eq!(
         views.lane_ends_served(&view),
         Some(0),
