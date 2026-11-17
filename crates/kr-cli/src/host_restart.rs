@@ -390,6 +390,14 @@ impl Stopped {
         }
     }
 
+    /// What the stop came to, as the first sentence of a result that has no other opening: the
+    /// stop's words where the request could not be made or its outcome is not known, and that the
+    /// daemon was stopped where it took the stop.
+    fn sentence(&self, id: EnvironmentId) -> Shown {
+        self.opening(id)
+            .unwrap_or_else(|| shown!("{}.", self.clause(id)))
+    }
+
     /// The stop's words that open a sentence of the result: that the daemon was stopped where it
     /// took the stop, and that it ended where the request's outcome is not known.
     fn clause(&self, id: EnvironmentId) -> Shown {
@@ -694,10 +702,14 @@ async fn after_the_end(
     };
     let proved = match stopped.successor {
         // Another daemon holds the environment: nothing is started beside it.
-        Some(successor) => match wait_for_the_successor(environment, successor, progress).await {
-            Ok(proved) => Ok(proved),
-            Err(error) => return host_stop::failed(error, &facts, json),
-        },
+        Some(successor) => {
+            match wait_for_the_successor(environment, &stopped.sentence(id), successor, progress)
+                .await
+            {
+                Ok(proved) => Ok(proved),
+                Err(error) => return host_stop::failed(error, &facts, json),
+            }
+        }
         None => {
             // The start's side. The record is the command's own until a daemon that it started
             // answers. A request that could not be made let it go, and the start needs it again;
@@ -822,9 +834,10 @@ fn said_after_the_proof(
 /// Another daemon holds the environment after the one that was stopped ended: waits for it to
 /// answer, and starts nothing beside it. The process of the daemon that answers is read on the
 /// connection that answered; `successor`, the process the lock file named when the end was seen,
-/// is said only as that earlier reading.
+/// is said only as that earlier reading, after the stop's own words (`opening`).
 async fn wait_for_the_successor(
     environment: &KnownEnvironment,
+    opening: &Shown,
     successor: Option<u64>,
     progress: &Progress,
 ) -> std::result::Result<Proved, CliError> {
@@ -837,19 +850,25 @@ async fn wait_for_the_successor(
             launched: None,
             cut: false,
         }),
-        Err(last) => Err(successor_silent(id, successor, &last)),
+        Err(last) => Err(successor_silent(id, opening, successor, &last)),
     }
 }
 
-/// The restart's failure where another daemon holds the environment since the daemon that was
-/// stopped ended and does not answer within the start's bound: `last` is what the last reach said.
-fn successor_silent(id: EnvironmentId, successor: Option<u64>, last: &Shown) -> CliError {
+/// The restart's failure where another daemon held the environment after the daemon that was
+/// stopped ended and no daemon answers within the start's bound: the stop's own words (`opening`),
+/// what the command read of the successor when the end was seen, and what the last reach said.
+fn successor_silent(
+    id: EnvironmentId,
+    opening: &Shown,
+    successor: Option<u64>,
+    last: &Shown,
+) -> CliError {
     CliError::Unfinished {
         code: ErrorCode::EnvironmentUnavailable,
         message: shown!(
-            "A control daemon{} holds environment {} since the daemon that was stopped ended, and it \
-             did not answer within {} seconds: {}. No new daemon was started. Run kr host restart \
-             again once it answers.",
+            "{} After it ended, a control daemon{} held environment {}, and no control daemon \
+             answered within {} seconds: {}. No new daemon was started. Run kr host restart again.",
+            *opening,
             process_said(successor),
             id,
             startup::START_BOUND.as_secs(),
@@ -2451,9 +2470,10 @@ mod tests {
         );
     }
 
-    /// The restart's sentence for another daemon that holds the environment after the stopped
-    /// daemon ended and does not answer, with its exit, for a successor whose process is known and
-    /// for one whose process is not.
+    /// The restart's sentence for another daemon that held the environment after the stopped
+    /// daemon ended and no daemon answers, with its exit, for a successor whose process is known
+    /// and for one whose process is not, after each of the stop's three openings: the daemon took
+    /// the stop, the request could not be made, and its outcome is not known.
     #[test]
     fn the_restart_says_in_whole_that_a_successor_does_not_answer() {
         use kr_client::shown::Said as _;
@@ -2461,15 +2481,44 @@ mod tests {
         let (_temp, environment) = an_environment();
         let id = environment.environment_id;
         let last = Shown::said("the endpoint accepted the connection and did not answer");
-        for (successor, named) in [(Some(77), " (process 77)"), (None, "")] {
-            let failure = successor_silent(id, successor, &last);
-            assert_eq!(failure.exit_code(), 1);
-            assert_eq!(
-                failure.said().to_string(),
+        let stopped = |first: Option<&'static str>, unknown: Option<&'static str>| Stopped {
+            named: Some(4000),
+            pid: Some(4000),
+            unsettled: None,
+            successor: Some(None),
+            generation: Old::Unread,
+            first: first.map(Shown::said),
+            unknown: unknown.map(Shown::said),
+        };
+        for (stopped, opening) in [
+            (
+                stopped(None, None),
+                format!("Stopped the control daemon for environment {id} (process 4000)."),
+            ),
+            (
+                stopped(
+                    Some("the stop's words for a request that was not made."),
+                    None,
+                ),
+                "the stop's words for a request that was not made.".to_owned(),
+            ),
+            (
+                stopped(None, Some("the connection was cut")),
                 format!(
-                    "A control daemon{named} holds environment {id} since the daemon that was stopped ended, and it did not answer within 30 seconds: the endpoint accepted the connection and did not answer. No new daemon was started. Run kr host restart again once it answers."
-                )
-            );
+                    "The control daemon for environment {id} (process 4000) did not show whether it took the stop (the connection was cut), and it has ended."
+                ),
+            ),
+        ] {
+            for (successor, named) in [(Some(77), " (process 77)"), (None, "")] {
+                let failure = successor_silent(id, &stopped.sentence(id), successor, &last);
+                assert_eq!(failure.exit_code(), 1);
+                assert_eq!(
+                    failure.said().to_string(),
+                    format!(
+                        "{opening} After it ended, a control daemon{named} held environment {id}, and no control daemon answered within 30 seconds: the endpoint accepted the connection and did not answer. No new daemon was started. Run kr host restart again."
+                    )
+                );
+            }
         }
     }
 }
