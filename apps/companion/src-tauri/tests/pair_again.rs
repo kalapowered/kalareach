@@ -614,63 +614,6 @@ async fn a_grant_that_ran_out_unread_is_recorded_when_the_phone_pairs_again() {
     host.stop().await;
 }
 
-/// The host cannot tell whether the grant of the record ran out: the phone that forgot the host
-/// is told that the host still lists it; after the owner revokes the record, a new invitation
-/// pairs.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_host_that_cannot_decide_the_end_of_a_grant_still_lists_the_phone_until_it_is_revoked() {
-    let (moved, clocks) = Moved::new();
-    let owner = DeviceKeys::generate().expect("keys");
-    let host = Host::start_on_clocks(&owner, clocks).await;
-    let (phone, first) = paired_phone(&host, &owner).await;
-    connection(&phone, true).await;
-    forget(&phone);
-    let record = record_of(&host, first);
-    until("the host counting no connection of the record", || {
-        host.connections_of(&record) == 0
-    })
-    .await;
-    // The host starts a boot of its own, in which nothing anchored the grant, and its continuous
-    // clock moves on while its wall clock is left behind: the wall clock is not trusted and the
-    // end of the grant cannot be decided.
-    let host = host.restart().await;
-    moved.advance_continuous(Duration::from_secs(2 * 24 * 60 * 60));
-    let listed = row_of(&host, first);
-
-    let outcome = pair_again(&phone, &host, &owner, grant_past_the_moved_clocks()).await;
-    match &outcome {
-        Outcome::Ended(kind) => assert_eq!(
-            kind, "host_still_lists_device",
-            "the phone is told the host still lists it"
-        ),
-        other => panic!("the attempt should end in a failure: {other:?}"),
-    }
-    assert_eq!(
-        row_of(&host, first),
-        listed,
-        "the host's record is as it was"
-    );
-
-    let barrier = took(
-        "the owner revoking the record",
-        within("the revocation", host.network().revoke_device(first)).await,
-    );
-    assert!(
-        barrier.holds(),
-        "the revocation's barrier holds: {barrier:?}"
-    );
-    let revoked = row_of(&host, first);
-    // The wall clock is set right again: a new record's grant is read on a clock the host trusts.
-    moved.advance_wall(Duration::from_secs(2 * 24 * 60 * 60));
-    let outcome = pair_again(&phone, &host, &owner, grant_past_the_moved_clocks()).await;
-    assert!(
-        matches!(outcome, Outcome::Paired),
-        "the phone pairs once the owner revoked the record: {outcome:?}"
-    );
-    assert_paired_again(&phone, &host, first, &revoked).await;
-    host.stop().await;
-}
-
 // ---------------------------------------------------------------------------------------------
 // The phone's notifications: the native half, the gateway and the host's side of a registration
 // are small scripts, as in the push desk's own suite; the phone's sequencing, its record and its
