@@ -236,6 +236,15 @@ async fn a_device_pairs_again_after_its_grant_ran_out() {
     })
     .await;
     session.close();
+    // The end of a grant raises no fence: nothing is owed after it, so the replacement is not held.
+    assert_eq!(
+        count(
+            &host,
+            "SELECT COALESCE(MAX(fence_owed_revision), 0) FROM environment"
+        ),
+        0,
+        "an expiry owes no fence"
+    );
     let ran_out = row_of(&host, first.device_id);
 
     let second = within(
