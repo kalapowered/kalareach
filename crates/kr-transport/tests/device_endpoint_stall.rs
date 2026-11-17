@@ -9,8 +9,10 @@
 //!
 //! The first stops the relay once and asks the healthy host before the stop, during it and after
 //! the relay resumes. It fails unless every question is answered, the healthy host's connection
-//! stays open, each answer takes less than [`LIMIT_MS`], and the run filled the stopped relay's
-//! queue, which the library's own line about a datagram dropped for a full queue shows. The limit
+//! stays open, each answer takes less than [`LIMIT_MS`], the run filled the stopped relay's queue,
+//! which the library's own line about a datagram dropped for a full queue shows, and the stopped
+//! front read next to nothing from the device, so that the queue was filled by a relay that stopped
+//! and not by the load alone. The limit
 //! is a bound of this test: it has room above what the library's changed relay transport gives and
 //! is far below what the release's hold gives.
 //!
@@ -769,6 +771,7 @@ async fn arrangement(hosts: usize) -> (Vec<String>, Vec<String>) {
     })
     .await;
     let (relay_after, front_after) = (metrics.send_relay.get(), front.read_from_device());
+    let connections_at_end = front.accepted();
     let offered_after = offered(&world.held);
     let resumed = Instant::now();
     front.resume();
@@ -883,6 +886,17 @@ async fn arrangement(hosts: usize) -> (Vec<String>, Vec<String>) {
     if filled == 0 {
         failures.push(format!(
             "K={hosts}: the run did not fill the stopped relay's queue: no datagram was dropped for it during the stop"
+        ));
+    }
+    // The stop's own effect. A stopped front starts no read; a read that was under way at the switch can end after
+    // it, one of at most CHUNK bytes on each connection that reached the front, and the count can miss one more just
+    // before the switch. So a stopped front cannot read more than twice that, whatever the load. A run in which the
+    // relay never stopped reads megabytes, and the queue then fills by the load alone.
+    let read_while_stopped = front_after - front_before;
+    let at_most = 2 * connections_at_end as u64 * support::front::CHUNK as u64;
+    if read_while_stopped > at_most {
+        failures.push(format!(
+            "K={hosts}: the front read {read_while_stopped} B from the device while it was stopped, more than the {at_most} B that a stopped front can still take ({connections_at_end} connections): the relay was not stopped"
         ));
     }
     world.close().await;
