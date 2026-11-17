@@ -25,9 +25,10 @@
 //! reaches (the journal's count, the fence driver's detach, the input domain's fence, the
 //! questions' store's read, the binder's count of open work), a new caller of a piece (in the
 //! service's file or in a child module of it), a check made with the wrong guard held, a caller
-//! that lets the dispatch barrier go or binds it to `_` before it calls the first admission or the
-//! prepared path's second pass, a call that hands on the wrong session or the wrong record, and a
-//! call that is gone. Two cases plant a reading kept under the contract's lock in the proven or
+//! that takes the dispatch barrier in any form but the one that is read, lets it go, binds it to
+//! `_` or mentions it again before it calls the first admission or the prepared path's second
+//! pass, a call of an entry into the pass from a child module of the service, a call that hands on
+//! the wrong session or the wrong record, and a call that is gone. Two cases plant a reading kept under the contract's lock in the proven or
 //! the wall reader; the take that they find is the lock of the helper that keeps the reading
 //! (`wall_reading`), so their finding names that helper and not the call that reaches it.
 
@@ -519,6 +520,118 @@ fn a_new_caller_of_the_dispatch_of_an_accepted_action_is_reported() {
     only_finding(
         &found,
         "service.rs rogue calls dispatch_accepted 1 time(s) and no row lists the caller",
+    );
+}
+
+/// The take of the barrier in `receipt_once` (the first admission's caller) and in `prepared_once`
+/// (the prepared path's caller), as the source has them.
+const RECEIPT_TAKE: &str = "        let Some(_barrier) = self.try_boundary() else {\n            return if ends_work {\n                Tried::Held\n            } else {\n                Self::after_a_failed_try(state)\n            };\n        };\n";
+const PREPARED_TAKE: &str = "        let Some(_barrier) = self.try_boundary() else {\n            return Self::after_a_failed_try(state);\n        };\n";
+const PREPARED_NEXT: &str = "        off_the_executor(|| {";
+
+/// `receipt_once` with its take replaced by `take`: the one finding is that it calls the first
+/// admission with no barrier held.
+fn first_admission_without_the_barrier(take: &str) {
+    let found = planted(SERVICE, RECEIPT_TAKE, take);
+    only_finding(
+        &found,
+        "service.rs receipt_once calls receipted holding {} and its held row says {\"BAR\"}",
+    );
+}
+
+/// `prepared_once` with its take replaced by `take`: the one finding is that it calls the second
+/// pass with no barrier held.
+fn second_pass_without_the_barrier(take: &str) {
+    let before = format!("{PREPARED_TAKE}{PREPARED_NEXT}");
+    let after = format!("{take}{PREPARED_NEXT}");
+    let found = planted(SERVICE, &before, &after);
+    only_finding(
+        &found,
+        "service.rs prepared_once calls continue_prepared holding {} and its held row says {\"BAR\"}",
+    );
+}
+
+#[test]
+fn an_option_of_the_barrier_that_is_only_tested_is_reported() {
+    // The option is bound whole and the request goes on whether or not it holds the guard.
+    first_admission_without_the_barrier(
+        "        let _barrier = self.try_boundary();\n        if _barrier.is_none() && !ends_work {\n            return Self::after_a_failed_try(state);\n        }\n",
+    );
+}
+
+#[test]
+fn a_mapped_result_of_the_take_is_reported() {
+    // The guard is gone at the map: `_barrier` holds what the closure returns.
+    second_pass_without_the_barrier(
+        "        let Some(_barrier) = self.try_boundary().map(|_| ()) else {\n            return Self::after_a_failed_try(state);\n        };\n",
+    );
+}
+
+#[test]
+fn a_discarded_result_of_the_take_is_reported() {
+    second_pass_without_the_barrier("        let _barrier = drop(self.try_boundary());\n");
+}
+
+#[test]
+fn a_path_pattern_in_the_take_is_reported() {
+    // `Option::Some(_)` binds nothing, and the reader takes its first word for the binding.
+    first_admission_without_the_barrier(
+        &RECEIPT_TAKE.replace("let Some(_barrier)", "let Option::Some(_)"),
+    );
+}
+
+#[test]
+fn a_drop_with_a_type_argument_is_reported() {
+    // Any later mention of the guard's name ends it, whatever the spelling of the call.
+    second_pass_without_the_barrier(&format!(
+        "{PREPARED_TAKE}        drop::<DispatchGuard<'_>>(_barrier);\n"
+    ));
+}
+
+#[test]
+fn the_guard_moved_into_a_block_is_reported() {
+    second_pass_without_the_barrier(&format!(
+        "{PREPARED_TAKE}        {{\n            let _gone = _barrier;\n        }}\n"
+    ));
+}
+
+#[test]
+fn a_take_whose_guard_ends_with_its_if_let_is_reported() {
+    // The guard of an `if let` lives to the end of the block that follows it.
+    second_pass_without_the_barrier(
+        "        if let Some(_barrier) = self.try_boundary() {\n        } else {\n            return Self::after_a_failed_try(state);\n        };\n",
+    );
+}
+
+#[test]
+fn a_take_that_is_a_closure_never_called_is_reported() {
+    second_pass_without_the_barrier("        let _barrier = || self.try_boundary();\n");
+}
+
+#[test]
+fn a_caller_of_the_dispatch_of_an_accepted_action_in_a_child_module_is_reported() {
+    // An entry into the pass: its `only` rows read every file of the crate.
+    let found = planted(
+        OVERTAKE,
+        "impl Overtaking {\n",
+        "impl Overtaking {\n    fn rogue(&self) {\n        let _ = self.dispatch_accepted();\n    }\n\n",
+    );
+    only_finding(
+        &found,
+        "service/overtake.rs rogue calls dispatch_accepted 1 time(s) and no row lists the caller",
+    );
+}
+
+#[test]
+fn a_caller_of_the_standing_pass_in_a_child_module_is_reported() {
+    let found = planted(
+        OVERTAKE,
+        "impl Overtaking {\n",
+        "impl Overtaking {\n    fn rogue(&self) {\n        let _ = self.standing_pass(Mode::First);\n    }\n\n",
+    );
+    only_finding(
+        &found,
+        "service/overtake.rs rogue calls standing_pass 1 time(s) and no row lists the caller",
     );
 }
 
