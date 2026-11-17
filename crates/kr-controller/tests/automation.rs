@@ -5806,11 +5806,20 @@ async fn a_workflow_grant_whose_end_could_not_be_written_is_not_answered_as_expi
              BEGIN SELECT RAISE(ABORT, 'no room'); END;",
         )
         .expect("the fault is in place");
-    // Both clocks move where no reader of the daemon reads, and UTC lags the continuous clock by
-    // four seconds, which a wall clock may: it stays before the grant's expiry while the grant's
-    // anchor has run out. A reader that found UTC a minute behind would distrust the clock.
+    // The continuous clock goes one millisecond past the grant's anchor, the least that ends it,
+    // and UTC lags it by three seconds, which a wall clock may. Both move where no reader of the
+    // daemon reads: a reader between the two steps would find UTC a minute behind and distrust the
+    // clock. After the move, any reading at any time raises the host's floor to what the
+    // continuous time credits from the last anchor, which is `credited` of the time moved and
+    // falls short of it by the rate allowance, so the floor stays before the grant's expiry
+    // whichever reader takes it and whenever it does, and only the grant's anchor has run out.
+    const PAST_THE_ANCHOR_MS: u64 = 60_001;
+    assert!(
+        kr_ipc::clock::credited(PAST_THE_ANCHOR_MS) < 60_000,
+        "a reading's floor stays before the grant's expiry"
+    );
     kr_controller::testing::while_no_reader_of_the_clocks_reads(&host.controller, || {
-        continuous.advance(std::time::Duration::from_secs(61));
+        continuous.advance(std::time::Duration::from_millis(PAST_THE_ANCHOR_MS));
         wall.store(T + 57_000, Ordering::SeqCst);
     });
     let refused = grants
