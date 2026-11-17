@@ -176,10 +176,11 @@ async fn test_reports(
         )
         .await;
     let answered = match asked {
-        // A daemon of a release before this method does not list it, and refuses it as it refuses
-        // any method it does not list, as a grant without the right does. The same version is
-        // read once more, which asks for the same right: where that is answered, the daemon does
-        // not know the method; where it is refused too, the refusal is the grant's.
+        // A daemon of a release before this method does not list it (the first three releases of
+        // level 0.78 are of that kind), and refuses it as it refuses any method it does not list,
+        // as a grant without the right does. The same version is read once more, which asks for the
+        // same right: where that is answered, the daemon does not know the method; where it is
+        // refused too, the refusal is the grant's.
         Err(CliError::Refused(refusal)) if refusal.code == ErrorCode::PermissionDenied => {
             let params = ChangesetReadParams {
                 change_set_id: change_set,
