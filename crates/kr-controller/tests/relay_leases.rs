@@ -5292,7 +5292,7 @@ impl kr_client::pairing::link::HostLink for Counting {
 
     fn forget_host<'a>(
         &'a self,
-        host: &'a kr_protocol::scalars::EndpointKey,
+        host: &'a kr_client::pairing::paired::PairedHost,
     ) -> kr_client::pairing::BoxFuture<'a, ()> {
         self.inner.forget_host(host)
     }
@@ -5544,8 +5544,7 @@ async fn answers(session: &kr_client::Session, what: &str) {
 
 /// A device reaches two hosts of its owner that name one real relay and resolve through different
 /// services, and neither connection is cut for the other: the relay holds one client for the
-/// device's key, a session that was answering still answers after each step, and the endpoint that
-/// the pool closes is gone before the next one takes the key.
+/// device's key, and a session that was answering still answers after each step.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_owned_hosts_on_one_real_relay_with_other_services_are_both_reached_and_neither_is_cut()
 {
@@ -5594,7 +5593,11 @@ async fn two_owned_hosts_on_one_real_relay_with_other_services_are_both_reached_
         .expect("the first host is reached through the relay");
     answers(&held, "the first host answers").await;
     let key = pool
-        .endpoint(&a.network_config, &a.host_endpoint_id, Standing::Paired)
+        .endpoint(
+            &a.network_config,
+            &a.host_endpoint_id,
+            Standing::Paired(a.device_id),
+        )
         .await
         .expect("the device's endpoint")
         .id();
@@ -5643,8 +5646,8 @@ async fn two_owned_hosts_on_one_real_relay_with_other_services_are_both_reached_
         "the relay still holds one client"
     );
 
-    // The pool closes its endpoint and waits for it, so a request after it binds another that is
-    // never beside the first at the relay.
+    // The pool closes its endpoint and waits for it, and a request after it binds another that
+    // answers.
     drop((held, reached, again, beside));
     pool.close().await;
     let anew = link
