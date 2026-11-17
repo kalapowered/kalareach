@@ -6843,3 +6843,54 @@ async fn the_hosts_notice_that_the_held_epoch_ended_ends_control_and_tells_the_p
         "no release is sent for a lease that is not the view's any more"
     );
 }
+
+/// A launch asked while a release waits for its barrier is not started, in the ruled words: nothing
+/// of it is sent, and the release is not disturbed. The release's wait for its barrier ends when the
+/// case ends it, after the launch was told, and the release then goes naming what the host accepted
+/// (nothing of the three frames).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_launch_behind_a_release_that_waits_is_not_started_and_the_release_goes_on() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let deadlines = BarrierDeadlines::new();
+    let page = Page::over_bounded(&mut host, &deadlines);
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    three_keys_the_host_has_read(&page, &view, &host).await;
+    page.release(&view, 2);
+    // The release has its barrier, which the host has not reached and which stays unreached.
+    barriers_taken(&page, &view, 1).await;
+    let pressing = page.invoke_later(
+        "terminal_view_launch",
+        json!({ "view": view, "press": the_press() }),
+    );
+    let told = tokio::time::timeout(AFTER_BARRIER, pressing)
+        .await
+        .expect("the page was told within the bound")
+        .expect("joins")
+        .expect_err("the launch was not started");
+    assert_eq!(code(&told), "TERMINAL_UNAVAILABLE");
+    assert_eq!(
+        told["message"],
+        "The launch was not started: an earlier launch or release of this view stands before it."
+    );
+    assert!(
+        link.call_within(QUIET).await.is_none(),
+        "neither the launch nor the release is on the wire while the release's barrier stands"
+    );
+    deadlines.expire_when_armed().await;
+    let release = link
+        .call_within(AFTER_BARRIER)
+        .await
+        .expect("the release went within the bound once its barrier ran out");
+    assert_eq!(release.method, Method::InputRelease.to_string());
+    assert_eq!(
+        position(&release),
+        Some((1, 0)),
+        "the release names the typing the host accepted: none"
+    );
+    assert!(
+        link.call_within(QUIET).await.is_none(),
+        "no launch is on the wire"
+    );
+}
