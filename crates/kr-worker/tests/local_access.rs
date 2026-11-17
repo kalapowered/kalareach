@@ -1259,6 +1259,24 @@ async fn the_meeting_of_an_attach_and_a_statement() -> Result<Landing, &'static 
             .expect("the record is not poisoned") = Some(seen);
         daemon
     });
+    // The statement either is acknowledged at once, which leaves the attach standing before the
+    // session, or it waits for the hold that the attach is in. Either way the attach is let go
+    // now, and the acknowledgement is waited for after.
+    let waiting = Arc::clone(&acknowledged);
+    let service = Arc::clone(&world.service);
+    if !holds_by(deadline, move || {
+        waiting
+            .lock()
+            .expect("the record is not poisoned")
+            .is_some()
+            || service.statements_waiting_for_tests() > 0
+    })
+    .await
+    {
+        return Err("the statement was neither acknowledged nor waiting");
+    }
+
+    go.send(()).expect("lets the attach go");
     let waiting = Arc::clone(&acknowledged);
     if !holds_by(deadline, move || {
         waiting
@@ -1270,8 +1288,6 @@ async fn the_meeting_of_an_attach_and_a_statement() -> Result<Landing, &'static 
     {
         return Err("the statement was never acknowledged");
     }
-
-    go.send(()).expect("lets the attach go");
     let window = tokio::task::spawn_blocking(move || {
         attach_ended
             .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
