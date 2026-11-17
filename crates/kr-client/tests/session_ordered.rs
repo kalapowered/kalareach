@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kr_client::error::ClientError;
-use kr_client::input::{InputEvent, InputTarget};
+use kr_client::input::{EndCause, InputEvent, InputTarget};
 use kr_client::ordered::{Ended, Ordered, OrderedEvents};
 use kr_client::session::{ComposedMutation, Session};
 use kr_client::transport::{ControlTransport, StreamOpener, TransportFuture};
@@ -1242,4 +1242,60 @@ async fn a_frame_a_new_epoch_dropped_unsent_is_not_pending() {
         "a dropped frame, or a request that waits among the keys, is counted pending"
     );
     transport.unpark();
+}
+
+/// A key that the host answered with an outcome it cannot state ends the lane, and the charge that
+/// the end leaves is not a key that anything waits for: the lane writes nothing more.
+#[tokio::test]
+async fn a_lane_that_ended_on_a_key_of_unknown_outcome_has_no_key_pending() {
+    let (transport, _session, _events, lane, mut lane_events) = local_lane().await;
+    lane.try_send(b"a").expect("the lane takes a key");
+    let key = transport.written_at_least(1).await;
+    assert!(
+        lane.keys_pending(),
+        "a key the host has not answered is pending"
+    );
+    transport.feed(answer(
+        key,
+        Err(ProtocolError::new(
+            ErrorCode::OutcomeUnknown,
+            "no word of it",
+        )),
+    ));
+    match within(lane_events.recv()).await.expect("a lane event") {
+        InputEvent::Ended {
+            cause: EndCause::Uncertain(_),
+            ..
+        } => {}
+        _ => panic!("the lane's first event was not its end for an uncertain answer"),
+    }
+    assert!(
+        !lane.keys_pending(),
+        "a lane that ended after the key's answer still says a key is pending"
+    );
+}
+
+/// A key that has no answer when its connection ends is not pending either: the connection's end is
+/// the ending, and the lane writes nothing more.
+#[tokio::test]
+async fn a_lane_whose_connection_ended_under_a_key_has_no_key_pending() {
+    let (transport, _session, _events, lane, mut lane_events) = local_lane().await;
+    lane.try_send(b"a").expect("the lane takes a key");
+    transport.written_at_least(1).await;
+    assert!(
+        lane.keys_pending(),
+        "a key the host has not answered is pending"
+    );
+    transport.finish();
+    match within(lane_events.recv()).await.expect("a lane event") {
+        InputEvent::Ended {
+            cause: EndCause::Connection { .. },
+            ..
+        } => {}
+        _ => panic!("the lane's first event was not its end with the connection"),
+    }
+    assert!(
+        !lane.keys_pending(),
+        "a lane whose connection ended still says a key is pending"
+    );
 }

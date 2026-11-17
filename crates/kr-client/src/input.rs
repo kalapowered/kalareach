@@ -788,15 +788,21 @@ impl Core {
             })
     }
 
-    /// Whether a frame is queued, or written and not answered, in any epoch.
+    /// Whether a frame is queued, or written and not answered, in any epoch, on a lane that has
+    /// not ended. A lane that has ended has none: the end drops what was queued and the writer takes
+    /// no frame after it, so a charge the end leaves is for a frame that nothing waits for any more.
+    /// The host answered it with an outcome it could not state, which ends the lane, or the
+    /// connection ended with it. A frame held behind a network launch is not queued, and counts as
+    /// nothing.
     fn keys_pending(&self) -> bool {
-        !self.charges.is_empty()
-            || self.epoch.as_ref().is_some_and(|epoch| {
-                epoch
-                    .queue
-                    .iter()
-                    .any(|entry| matches!(entry, Entry::Frame(_)))
-            })
+        self.ended.is_none()
+            && (!self.charges.is_empty()
+                || self.epoch.as_ref().is_some_and(|epoch| {
+                    epoch
+                        .queue
+                        .iter()
+                        .any(|entry| matches!(entry, Entry::Frame(_)))
+                }))
     }
 
     fn fits(epoch: &Epoch, older: (usize, usize), frames: usize, cost: usize) -> bool {
@@ -1746,7 +1752,9 @@ impl InputLane {
     /// because the writer of a local lane waits for its answer before it writes anything else, and
     /// the lane says nothing when that answer comes; a queued frame that a new epoch's begin
     /// dropped unsent does not. Requests queued among the keys ([`InputLane::after_keys`]) are not
-    /// keys.
+    /// keys, and neither are frames held behind a network launch, which count as nothing. A lane
+    /// that has ended has no key: its writer writes nothing more, so whatever the charges still
+    /// say, nothing waits for a key's answer.
     #[must_use]
     pub fn keys_pending(&self) -> bool {
         self.shared.lock().keys_pending()
