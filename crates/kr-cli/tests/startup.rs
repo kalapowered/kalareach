@@ -5699,6 +5699,9 @@ fn kr_host_stop_is_refused_inside_a_session_and_goes_on_where_a_worker_cannot_sa
     assert!(host.running().is_empty());
 }
 
+/// What the guard says to do, which the restart's refusal repeats.
+const WHERE_TO_RUN: &str = "Run it in a terminal of this account that is not a KalaReach session, such as a terminal window that was not opened through the KalaReach profile, or an SSH login.";
+
 /// KR-REQ-07.58 (the guard, for `kr host restart`): the command refuses where the session variables
 /// are set, and where a live session's worker says the process is its own, with nothing asked of
 /// the daemon, which answers before and after. The worker's word is what the second form shows.
@@ -5713,14 +5716,12 @@ fn kr_host_restart_is_refused_inside_a_session_with_nothing_asked() {
         assert_eq!(output.status.code(), Some(8), "{variable}: {refused}");
         assert_eq!(refused["code"], "PERMISSION_DENIED", "{refused}");
         assert_eq!(stop_of(&refused), "not_asked", "{refused}");
-        let message = refused["message"].as_str().expect("a message");
-        assert!(
-            message.contains("kr host restart runs outside a KalaReach session"),
-            "{message}"
-        );
-        assert!(
-            message.ends_with("Sessions and local attachments go on through a restart."),
-            "{message}"
+        assert_eq!(
+            refused["message"],
+            format!(
+                "kr host restart runs outside a KalaReach session, and {variable} is set here. {WHERE_TO_RUN} Nothing was stopped. Sessions and local attachments go on through a restart."
+            ),
+            "{variable}"
         );
     }
     let said = host.tree.root().join("typed-restart.out");
@@ -5740,9 +5741,12 @@ fn kr_host_restart_is_refused_inside_a_session_with_nothing_asked() {
         terminal.shown("done-8").await;
     });
     let typed = std::fs::read_to_string(&said).expect("the command's output");
-    assert!(
-        typed.contains("this process is inside session"),
-        "the worker's word refused it: {typed}"
+    assert_eq!(
+        typed,
+        format!(
+            "kr: kr host restart runs outside a KalaReach session, and this process is inside session {session_id}. {WHERE_TO_RUN} Nothing was stopped. Sessions and local attachments go on through a restart.\n"
+        ),
+        "the worker's word refused it"
     );
     assert_eq!(
         host.running(),
@@ -6100,17 +6104,13 @@ fn kr_host_restart_refuses_a_daemon_whose_launch_the_start_does_not_give_and_sto
     assert_eq!(output.status.code(), Some(3), "{refused}");
     assert_eq!(refused["code"], "HOST_NOT_CONFIGURED", "{refused}");
     assert_eq!(stop_of(&refused), "not_asked", "{refused}");
-    let message = refused["message"].as_str().expect("a message");
-    assert!(
-        message.contains("was started with the argument --secret-store file"),
-        "{message}"
+    assert_eq!(
+        refused["message"],
+        format!(
+            "The control daemon for environment {} was started with the argument --secret-store file, and kr host restart starts it without them. Its device keys are in the file store, and a daemon started without --secret-store file looks for them in the platform store and does not start. Nothing was stopped. Run kr host stop and start kr-controller yourself the way it was started.",
+            host.tree.environment().environment_id()
+        )
     );
-    assert!(
-        message.contains("looks for them in the platform store and does not start"),
-        "{message}"
-    );
-    assert!(message.contains("Nothing was stopped."), "{message}");
-    assert!(!message.contains("kr new"), "{message}");
     assert_eq!(host.running(), vec![daemon], "the same daemon runs");
     assert!(host.answers(), "the same daemon answers");
     assert!(attempts(&host).is_empty(), "no record was made");
@@ -6130,6 +6130,37 @@ fn kr_host_restart_refuses_a_daemon_whose_launch_the_start_does_not_give_and_sto
         "ended",
         "the stop still ends it: {stopped}"
     );
+}
+
+/// KR-REQ-07.12 (a record that cannot be written): where the place of the attempts' records holds a
+/// file, the restart says in whole that it could not record its attempt, asks the daemon for no
+/// stop and starts nothing, and the daemon stays. Linux alone: the Mac's platform store makes the
+/// harness's daemon a launch difference, which refuses first.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn kr_host_restart_says_that_it_could_not_record_its_attempt_and_asks_for_no_stop() {
+    let (host, _session_id, daemon) = a_host_with_a_session_run_as_started();
+    let place = host
+        .tree
+        .environment()
+        .state_dir()
+        .join(kr_controller::attempt::DIRECTORY);
+    std::fs::write(&place, "a file where the records' directory belongs").expect("the file");
+    let output = start(host.kr(&["--json", "host", "restart"])).finish("kr host restart");
+    let refused = failure_of(&output, "kr host restart");
+    assert_eq!(output.status.code(), Some(1), "{refused}");
+    assert_eq!(stop_of(&refused), "not_asked", "{refused}");
+    let message = refused["message"].as_str().expect("a message");
+    assert!(
+        message.starts_with("kr host restart could not record its attempt: "),
+        "{message}"
+    );
+    assert!(
+        message.ends_with(". No stop was requested and no start was made."),
+        "{message}"
+    );
+    assert_eq!(host.running(), vec![daemon], "the same daemon runs");
+    assert!(host.answers(), "the same daemon answers");
 }
 
 /// KR-REQ-07.12 (two stops at once): one daemon has ended, and each command says something true.
@@ -7769,6 +7800,14 @@ fn a_restart_whose_stop_has_no_answer_says_so_and_then_what_the_start_did() {
         "the stop's words for an unknown outcome, then what the start did: {out}"
     );
     assert!(!out.contains("Stopped the control daemon"), "{out}");
+    let asked = format!(
+        "Asked the control daemon for environment {} to stop. It waits up to 10 seconds for session creates under way, and an interrupt does not cancel the stop.",
+        host.tree.environment().environment_id()
+    );
+    assert!(
+        said.lines().any(|line| line == asked),
+        "the line that says the stop was asked: {said}"
+    );
     assert!(
         out.trim_end()
             .ends_with(
