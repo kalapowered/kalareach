@@ -71,6 +71,10 @@ const ENDED_BY_LOST_LEASE: &str =
 /// Why control ended when the view's input stream ended while the view held the lease.
 const ENDED_BY_STREAM: &str = "Control ended: this view's input stream ended.";
 
+/// Why a take was refused when the view's input stream did not open.
+const NOT_TAKEN_BY_STREAM: &str =
+    "This view could not take control: its input stream did not open. Take control again to retry.";
+
 /// Why a view did not take an input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refused {
@@ -405,6 +409,12 @@ impl Lease {
                     .insert(request, Release { epoch, again: true });
             }
         }
+    }
+
+    /// The view's input stream did not open, and the take in force waits for it: the take is
+    /// refused, and the next take asks for the stream again. Returns whether control changed.
+    pub fn stream_refused(&mut self) -> bool {
+        self.refused(NOT_TAKEN_BY_STREAM.to_owned())
     }
 
     /// Whether a release waits for the session's answer: one owed, one sent and not answered, or
@@ -999,6 +1009,33 @@ mod tests {
         assert_eq!(lease.owed(), None, "given back once");
         assert!(lease.write(1).is_err());
         assert!(!lease.stream_ended(), "nothing held, nothing changes");
+    }
+
+    /// A take that waits for a stream that did not open is refused with the stream's words, and the
+    /// next take is asked for again; nothing is refused where no take waits.
+    #[test]
+    fn a_take_that_waits_for_a_stream_that_did_not_open_is_refused_and_the_next_take_asks_again() {
+        let mut lease = Lease::default();
+        assert!(!lease.stream_refused(), "no take waits");
+        assert!(lease.request(1, true));
+        assert_eq!(lease.owed(), Some(Owed::Acquire));
+        assert!(lease.stream_refused());
+        let control = lease.control();
+        assert_eq!(control.state, ControlState::Watching);
+        assert_eq!(
+            control.ended.as_deref(),
+            Some(
+                "This view could not take control: its input stream did not open. Take control again to retry."
+            )
+        );
+        assert_eq!(lease.owed(), None, "nothing is owed for a refused take");
+        assert!(lease.request(2, true));
+        assert_eq!(
+            lease.control().ended,
+            None,
+            "the next take clears the words"
+        );
+        assert_eq!(lease.owed(), Some(Owed::Acquire));
     }
 
     #[test]

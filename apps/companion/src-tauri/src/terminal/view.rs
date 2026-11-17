@@ -320,6 +320,8 @@ pub(super) async fn run(
         networked,
         states_input_lane: opened.states_input_lane,
         lane: None,
+        opening: false,
+        no_stream: false,
         lane_events: None,
         lane_epoch: None,
         requests: FuturesUnordered::new(),
@@ -893,6 +895,11 @@ struct View {
     states_input_lane: bool,
     /// The session's input lane, once it is open.
     lane: Option<InputLane>,
+    /// Whether the lane is being opened: a take that finds no lane joins the opening.
+    opening: bool,
+    /// Whether the host stated, by its typed code, that it takes no input stream: it takes none for
+    /// the view's life, and a take acquires with no lane.
+    no_stream: bool,
     lane_events: Option<InputEvents>,
     /// The lease epoch the lane has begun.
     lane_epoch: Option<InputLeaseEpoch>,
@@ -1424,6 +1431,15 @@ impl View {
         while let Some(owed) = self.lease.owed() {
             let sent = match owed {
                 Owed::Acquire => {
+                    // A take that finds no lane opens it first, and acquires once it is open, so
+                    // that no key is taken before there is a stream to write it on; a take during
+                    // an opening joins it. A host that takes no stream is acquired from with none.
+                    if self.lane.is_none() && !self.no_stream {
+                        if !self.opening {
+                            self.open_lane();
+                        }
+                        break;
+                    }
                     // An immediate takeover: whoever holds the lease loses it, without being asked.
                     let params = InputAcquireParams {
                         session_id: self.session_id,
@@ -1778,6 +1794,7 @@ impl View {
     /// Starts the opening of the input lane, which a paired host answers once it has opened its
     /// stream: a call of the loop's set, which no command awaits.
     fn open_lane(&mut self) {
+        self.opening = true;
         let target = InputTarget::new(
             self.target.environment_id,
             self.session_id,
@@ -1798,16 +1815,32 @@ impl View {
 
     /// The lane's opening ended: the lane is there to type on, or the words say why it is not.
     fn lane_opened(&mut self, opened: Result<InputLane, ClientError>) -> Option<Ending> {
+        self.opening = false;
         match opened {
             Ok(lane) => {
                 #[cfg(feature = "testing")]
                 self.probe.publish_lane(&lane);
+                // What the lane that ended said behind its end is read before the new lane's words.
+                if let Some(ended) = self.lane_events.as_mut() {
+                    let mut left = Vec::new();
+                    while let Some(event) = ended.try_recv() {
+                        left.push(Heard::Lane(Some(event)));
+                    }
+                    self.queue(left);
+                }
                 self.lane_events = lane.events();
                 self.lane = Some(lane);
+                self.lane_lost = None;
                 self.sync_epoch();
             }
             Err(failed) => {
+                self.no_stream = failed.code() == ErrorCode::UnsupportedCapability;
                 self.lane_lost = Some(format!("its input stream could not be opened: {failed}"));
+                // A take that waits for the stream is refused; a host that takes none lets it
+                // acquire with no lane.
+                if !self.no_stream && self.lease.stream_refused() {
+                    self.control_changed();
+                }
             }
         }
         None
