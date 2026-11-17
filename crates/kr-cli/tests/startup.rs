@@ -6278,6 +6278,15 @@ fn kr_host_restart_refuses_a_daemon_whose_launch_the_start_does_not_give_and_sto
     assert_eq!(host.running(), vec![daemon], "the same daemon runs");
     assert!(host.answers(), "the same daemon answers");
     assert!(attempts(&host).is_empty(), "no record was made");
+    // Without `--json`, the launch alone is what was asked, and no line on standard error says
+    // that the daemon was asked to stop.
+    let output = start(host.kr(&["host", "restart"])).finish("kr host restart");
+    assert_eq!(output.status.code(), Some(3));
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(said.contains("Nothing was stopped."), "{said}");
+    assert!(!said.contains("Asked the control daemon"), "{said}");
+    assert_eq!(host.running(), vec![daemon], "the same daemon runs");
+    assert!(attempts(&host).is_empty(), "no record was made");
     let stopped = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
     let stopped = document(&stopped, "kr host stop");
     assert_eq!(
