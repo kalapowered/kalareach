@@ -985,7 +985,9 @@ function PairedHosts({
                 <p className="small">
                   Forget {host.name}? This phone stops listing it and stops reaching it. The host
                   keeps any access it still gives this phone until you remove the phone there.
-                  {host.owner ? ' This phone also stops confirming requests from it.' : ''}
+                  {host.owner
+                    ? ` This phone also stops confirming requests from it. This phone can pair with ${host.name} again only after its pairing there is removed or has run out, and another owner device confirms the new pairing. If this phone is the only owner device of ${host.name}, nothing can confirm that: add another owner device first.`
+                    : ''}
                 </p>
                 <div className="row wrap">
                   <Button data-wraps

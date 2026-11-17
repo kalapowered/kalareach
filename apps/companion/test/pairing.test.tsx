@@ -12,6 +12,7 @@ import userEvent from '@testing-library/user-event'
 import { App } from '../src/App'
 import { AppProvider, type Place } from '../src/app/state'
 import { fakeHost, type FakeHostControls } from '../src/host/fake'
+import { MobileApp } from '../src/mobile/MobileApp'
 import type { AttemptState, ConfirmationRequest, PairingFailure, WaitlessKind } from '../src/host/port'
 import { failureWords } from '../src/pairing/words'
 import { heardIn, readAloud, regionsOf, shown } from './live-regions'
@@ -713,6 +714,61 @@ describe('pairing with a host', () => {
     if (sentence === null) return
     expect(readAloud(sentence)).toBe('Codes go through 2001 colon db8 colon colon 1')
     expect(regionsOf(document.body).flatMap(heardIn)).toEqual(['Codes now go through 2001 colon db8 colon colon 1.'])
+  })
+})
+
+/** The sentences of the question that asks whether to forget a paired host, as the person reads them. */
+const FORGET_SENTENCES = (name: string): string =>
+  `Forget ${name}? This phone stops listing it and stops reaching it. The host keeps any access it still gives this phone until you remove the phone there.`
+const OWNER_SENTENCE = ' This phone also stops confirming requests from it.'
+// The ruled warning, word for word, with the host's name in both places.
+const PAIR_AGAIN_WARNING = (name: string): string =>
+  ` This phone can pair with ${name} again only after its pairing there is removed or has run out, and another owner device confirms the new pairing. If this phone is the only owner device of ${name}, nothing can confirm that: add another owner device first.`
+
+describe('forgetting a paired host', () => {
+  async function ask(owner: boolean, name: string): Promise<HTMLElement> {
+    // Forgetting a host is offered where a phone lists its hosts: the Hosts screen.
+    const { port, controls } = fakeHost()
+    render(
+      <AppProvider port={port}>
+        <MobileApp surface="ios" />
+      </AppProvider>
+    )
+    await userEvent.click(await screen.findByRole('button', { name: 'Hosts' }))
+    await screen.findByRole('heading', { name: 'Pair with a host' })
+    act(() => {
+      controls.setPairing({
+        hosts: [
+          { reference: 'ref', in_use: false, name, owner, authority: owner ? 'manage the host as an owner' : 'view sessions', grant_expires_at_ms: null, in_contact: true }
+        ]
+      })
+    })
+    await userEvent.click(await screen.findByTestId('forget-host'))
+    return await screen.findByTestId('forget-host-ask')
+  }
+
+  // C-comp-4: an owner device is told what forgetting a host does to pairing with it again.
+  it('tells the owner device when it can pair with the host again, in the same paragraph', async () => {
+    const question = await ask(true, 'studio')
+    const paragraph = within(question).getByText(/^Forget studio\?/)
+    expect(paragraph.tagName).toBe('P')
+    expect(paragraph.textContent).toBe(
+      FORGET_SENTENCES('studio') + OWNER_SENTENCE + PAIR_AGAIN_WARNING('studio')
+    )
+  })
+
+  it('leaves the paragraph as it was for a host that this phone does not own', async () => {
+    const question = await ask(false, 'build box')
+    expect(within(question).getByText(/^Forget build box\?/).textContent).toBe(FORGET_SENTENCES('build box'))
+  })
+
+  it('keeps the two buttons, their order, the group and its name', async () => {
+    const question = await ask(true, 'studio')
+    expect(question).toHaveAttribute('role', 'group')
+    expect(question).toHaveAccessibleName('Forget studio')
+    expect(within(question).getAllByRole('button').map((button) => button.textContent)).toEqual(['Keep it', 'Forget'])
+    expect(within(question).getByTestId('keep-host')).toHaveTextContent('Keep it')
+    expect(within(question).getByTestId('forget-host-confirm')).toHaveTextContent('Forget')
   })
 })
 
