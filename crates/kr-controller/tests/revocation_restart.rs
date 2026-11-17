@@ -524,6 +524,12 @@ async fn arrange_until_an_answer_holds(
             workers,
         } = Adopted::start(1).await;
         let session_id = workers[0].session_id;
+        if behind {
+            // A pass of the daemon asks a worker that stands pending. One that falls after the worker
+            // fenced the earlier revision and before the second revocation is announced
+            // acknowledges that revision, and the announcement then has nothing owed to read from it.
+            host.controller().hold_the_pass_asks_for_tests(true);
+        }
         let mut paired = Paired::default();
         let aim = match by {
             Revoked::Grant | Revoked::Device => {
