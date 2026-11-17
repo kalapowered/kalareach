@@ -20,13 +20,14 @@
 //! gives.
 //!
 //! The second stops the relay three times for five seconds. It asks each connection to the hosts on
-//! the stopped relay a small question every half second, and it makes the next stop only once every
-//! one of those connections has answered a question that was asked after the last resume. It fails
-//! unless every connection stays open, each is answered again within [`RECOVERY`] after each
-//! resume, every question to them is answered, and the healthy host stays under the limit through
-//! every stop. It prints how many datagrams the relay actor dropped for the stopped relay's queue
-//! in each stop and outside the stops, and asserts no count of them: a short stop can end before
-//! the queue is full.
+//! the stopped relay a small question every half second. The first stop follows about ten seconds
+//! after the connections are made, once the healthy host has answered its first hundred questions,
+//! and each later stop follows only once every one of those connections has answered a question
+//! that was asked after the last resume. It fails unless every connection stays open, each is
+//! answered again within [`RECOVERY`] after each resume, every question to them is answered, and
+//! the healthy host stays under the limit through every stop. It prints how many datagrams the
+//! relay actor dropped for the stopped relay's queue in each stop and outside the stops, and
+//! asserts no count of them: a short stop can end before the queue is full.
 //!
 //! Both are outside the default suite: each runs for minutes, so they are asked for by name with
 //! `--ignored --nocapture`, which prints what they measured. They run with one test thread
@@ -64,7 +65,10 @@ const LIMIT_MS: u64 = 2000;
 const LIMIT: Duration = Duration::from_millis(LIMIT_MS);
 
 /// How often the recovery case asks each connection to a host on the relay that stops: a load that
-/// does not keep that relay's queue full.
+/// does not keep that relay's queue full. A host that hears nothing from the device for its idle
+/// time-out of 30 seconds closes the connection. Each probe interval can exceed the one before by a
+/// capped step, so that takes every probe in about thirty seconds to be lost; a load that keeps the
+/// relay's queue full can drop them, and this case's load does not keep it full.
 const HOST_INTERVAL: Duration = Duration::from_millis(500);
 
 /// How many times the recovery case stops the relay, and for how long each time: less than a
