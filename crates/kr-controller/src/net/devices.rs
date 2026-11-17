@@ -2656,7 +2656,11 @@ mod tests {
 
         let mut second = record(2);
         second.endpoint_id = first.endpoint_id;
-        replace(&directory, Some(&lifetimes), &second).expect("the end is found and written");
+        let replaced = replace(&directory, Some(&lifetimes), &second);
+        assert!(
+            replaced.is_ok(),
+            "the end is found and written inside the transaction, so the new record is inserted: {replaced:?}"
+        );
         let ended = directory
             .record_for_device(first.device_id)
             .expect("readable")
