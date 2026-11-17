@@ -14,7 +14,7 @@ use kr_service_stand_in::{Moment, serve, signed_release_matrix};
 use serde_json::{Value, json};
 
 fn release() -> PackageVersion {
-    PackageVersion::new(0, 78, 0)
+    PackageVersion::new(0, 79, 0)
 }
 
 fn tier(id: &str, compatible: bool, highest: &str) -> Value {
@@ -65,7 +65,7 @@ async fn publishing(matrix: &Value, key: &AuthorisationKeyPair) -> kr_service_st
 #[tokio::test]
 async fn a_release_the_compatible_tier_serves_is_supported() {
     let key = AuthorisationKeyPair::generate().expect("a key pair");
-    let served = publishing(&matrix("4", "0.78.99", "0.78.99"), &key).await;
+    let served = publishing(&matrix("4", "0.79.99", "0.79.99"), &key).await;
     assert_eq!(
         check(&served, &key).await,
         Ok(Supported {
@@ -82,7 +82,7 @@ async fn a_release_the_compatible_tier_serves_is_supported() {
 #[tokio::test]
 async fn a_release_only_a_later_tier_serves_is_supported_and_says_so() {
     let key = AuthorisationKeyPair::generate().expect("a key pair");
-    let served = publishing(&matrix("4", "0.77.99", "0.78.99"), &key).await;
+    let served = publishing(&matrix("4", "0.78.99", "0.79.99"), &key).await;
     assert_eq!(
         check(&served, &key).await,
         Ok(Supported {
@@ -99,7 +99,7 @@ async fn a_release_only_a_later_tier_serves_is_supported_and_says_so() {
 #[tokio::test]
 async fn a_release_in_no_tier_is_refused() {
     let key = AuthorisationKeyPair::generate().expect("a key pair");
-    let served = publishing(&matrix("4", "0.77.99", "0.77.99"), &key).await;
+    let served = publishing(&matrix("4", "0.78.99", "0.78.99"), &key).await;
     let refused = check(&served, &key).await.expect_err("a refusal");
     assert_eq!(refused, Unsupported::OutsideEveryTier { revision: 4 });
     assert_eq!(refused.exit_code(), 1);
@@ -111,7 +111,7 @@ async fn a_release_in_no_tier_is_refused() {
 async fn a_matrix_signed_by_another_key_is_refused() {
     let key = AuthorisationKeyPair::generate().expect("a key pair");
     let stranger = AuthorisationKeyPair::generate().expect("a key pair");
-    let served = publishing(&matrix("4", "0.78.99", "0.78.99"), &stranger).await;
+    let served = publishing(&matrix("4", "0.79.99", "0.79.99"), &stranger).await;
     let refused = check(&served, &key).await.expect_err("a refusal");
     assert_eq!(refused, Unsupported::NotVerified(Refusal::Signature));
     assert_eq!(refused.exit_code(), 1);
@@ -122,7 +122,7 @@ async fn a_matrix_signed_by_another_key_is_refused() {
 #[tokio::test]
 async fn a_matrix_below_the_first_revision_the_build_reads_is_refused() {
     let key = AuthorisationKeyPair::generate().expect("a key pair");
-    let served = publishing(&matrix("4", "0.78.99", "0.78.99"), &key).await;
+    let served = publishing(&matrix("4", "0.79.99", "0.79.99"), &key).await;
     let origin = GatewayOrigin::new(served.origin()).expect("a loopback origin");
     let http = HttpService::new(origin.clone()).expect("a transport");
     let reads_from_five = Pins::of(vec![*key.public()]).from_revision(5);

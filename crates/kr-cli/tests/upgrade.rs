@@ -1946,8 +1946,9 @@ fn rows_this_release_records_of_a_session_s_work() -> Vec<(String, String)> {
 /// updated host's daemon over the network, as a phone is, meets the worker of the release before
 /// through the new daemon. The daemon lists the session, reads it, its description, and its
 /// attention inbox at the worker's level, which holds a notification that worker recorded after
-/// rows of kinds only this release writes, and closes it for the device, answering with what the
-/// worker answered; the worker is the process it was throughout.
+/// the rows of an agent turn that ended and a command that failed, and so an item for each of
+/// them, and it reads the launch surface the worker serves, and closes the session for the device,
+/// answering with what the worker answered; the worker is the process it was throughout.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_device_at_the_door_of_the_updated_host_meets_the_worker_of_the_release_before() {
     use kr_protocol::describe::{SessionDescribeParams, SessionDescribeResult};
@@ -2003,11 +2004,10 @@ async fn a_device_at_the_door_of_the_updated_host_meets_the_worker_of_the_releas
     assert_eq!(described.session_id, session_id, "{described:?}");
 
     // The attention inbox the daemon keeps for the session, built from what the worker reported.
-    // The worker's journal then holds what a worker of this release records of a session's own
-    // work, which the worker of the release before reads as host events of kinds it does not know,
-    // and a notification as that release records it, after them. The inbox gains the notification
-    // and nothing for the work, and has no gap: the page of the worker of the release before
-    // carries no member this release added, and the rows it carries are read through.
+    // The worker's journal then holds what a worker records of a session's own work, and a
+    // notification after it. The worker of the release before reports all of it, so the inbox
+    // gains the notification and an item for the turn that ended and for the command that failed,
+    // and has no gap.
     let notices = |inbox: &kr_protocol::attention::AttentionReadResult| {
         inbox
             .items
@@ -2038,28 +2038,30 @@ async fn a_device_at_the_door_of_the_updated_host_meets_the_worker_of_the_releas
     )
     .await;
     assert!(attention.gaps.is_empty(), "{attention:?}");
-    assert!(
-        attention.items.iter().all(|item| !matches!(
-            item.rule,
-            kr_protocol::attention::AttentionRule::ReviewReady
-                | kr_protocol::attention::AttentionRule::CommandFailed
-        )),
-        "the work this release records is no item of a worker that does not report it: {attention:?}"
-    );
+    for rule in [
+        kr_protocol::attention::AttentionRule::ReviewReady,
+        kr_protocol::attention::AttentionRule::CommandFailed,
+    ] {
+        assert!(
+            attention.items.iter().any(|item| item.rule == rule),
+            "the work the worker records is an item of the inbox, as that worker reports it: {rule:?} in {attention:?}"
+        );
+    }
 
-    // The launch surface is read of the worker, and the worker of the release before has no row for
-    // it: it would refuse it as it refuses any method it does not serve, which reads as a missing
-    // right. It states what it serves, so the daemon refuses the read itself and sends it nothing,
-    // and the device is told the host does not serve the read. The read goes on a connection of its
-    // own, as a phone's session screen does, because a connection that reads from a worker ends
-    // with the worker's session.
+    // The launch surface is read of the worker, which serves it and states that it does, so the
+    // daemon forwards the read and the device is given the surface. The read goes on a connection
+    // of its own, as a phone's session screen does, because a connection that reads from a worker
+    // ends with the worker's session.
     let screen = door.connect_again().await;
-    assert_eq!(
-        screen
-            .read_launch_surface(session_id)
-            .await
-            .expect("the read is answered"),
-        kr_client::LaunchSurfaceRead::NotServed
+    assert!(
+        matches!(
+            screen
+                .read_launch_surface(session_id)
+                .await
+                .expect("the read is answered"),
+            kr_client::LaunchSurfaceRead::Served(_)
+        ),
+        "the worker of the release before serves the launch surface"
     );
     screen.close();
 
@@ -2113,40 +2115,6 @@ async fn a_device_at_the_door_of_the_updated_host_meets_the_worker_of_the_releas
     )
     .await;
     assert!(closed.closure.0.is_some(), "{closed:?}");
-}
-
-/// KR-REQ-13.11, KR-REQ-26.06: a device of this release that meets a host still on the release
-/// before is told that the host does not serve the launch surface, and is not told it lacks a right.
-/// That daemon does not list the method and refuses it as it refuses any method it does not list,
-/// `PERMISSION_DENIED`; the client asks for what the same right reads, which is answered, and asks
-/// again, which is refused as before.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_device_of_this_release_is_told_the_host_before_it_does_not_serve_the_launch_surface() {
-    let prepared = Updated::prepare(Setup {
-        network: true,
-        ..Setup::default()
-    })
-    .await;
-    let host = &prepared.host;
-    let door = door::Door::pair_the_first_owner(
-        &host
-            .tree
-            .environment()
-            .controller_endpoint()
-            .expect("an endpoint"),
-        host.tree.environment_id(),
-    )
-    .await;
-
-    let read = door
-        .session
-        .read_launch_surface(prepared.session_id)
-        .await
-        .expect("a host that does not serve the read is not one that refuses the device");
-    assert_eq!(read, kr_client::LaunchSurfaceRead::NotServed);
-    drop(door);
-    host.close(&prepared.kr_before(), &prepared.display);
-    host.worker_ended(&prepared.worker).await;
 }
 
 /// KR-REQ-09.10, KR-REQ-26.06, KR-REQ-20.23: a mutation a paired device makes, which the daemon of
@@ -2228,21 +2196,18 @@ async fn a_mutation_of_a_paired_device_is_performed_by_the_worker_of_the_release
 }
 
 /// KR-REQ-26.06, KR-REQ-08.53, KR-REQ-20.23: a device paired with the updated host types into the
-/// session of the release before through the new daemon. Its bytes are written in the shape that
-/// worker reads and the session's shell runs them; its console key records are refused by the
-/// daemon, by name, because that worker has no counterpart for them, and the shell runs nothing of
-/// them. The refused write spends no sequence number: the next bytes write takes it.
+/// session of the release before through the new daemon. That worker reads the same input as this
+/// build's, so the daemon gives it a bytes write as it is and a write of console key records as it
+/// is, and the session's shell runs the line of each, in the order the writes were numbered.
 ///
 /// Each line the shell runs makes a file named by an arithmetic expansion the typed text does not
 /// contain, so a file shows that the line was run and not that it was typed. The files are waited
 /// for while the session is live, which is when the worker forwards what it accepted.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_paired_device_types_bytes_into_the_session_of_the_release_before_and_its_key_records_are_refused()
- {
+async fn a_paired_device_types_bytes_and_key_records_into_the_session_of_the_release_before() {
     use kr_protocol::attachment::{
         AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
     };
-    use kr_protocol::error::ErrorCode;
     use kr_protocol::ids::{InputLeaseEpoch, InputSequence};
     use kr_protocol::input::{
         ConsoleKey, InputAcquireParams, InputAcquireResult, InputContent, InputWriteParams,
@@ -2339,38 +2304,38 @@ async fn a_paired_device_types_bytes_into_the_session_of_the_release_before_and_
         .await
         .expect("the worker of the release before takes the bytes of a paired device");
 
-    // Key records spelling a line the shell must not run. The refusal is the daemon's: a worker of
-    // the release before would answer with an invalid argument.
-    let keys = format!(": > '{}'/refused-$((6*7))\n", marks.display())
+    // Key records spelling a line the shell has to run: the characters, then the Enter key.
+    let key = |virtual_key: u16, unicode: u16| ConsoleKey {
+        virtual_key,
+        scan_code: 0,
+        unicode,
+        key_down: true,
+        control_keys: 0,
+        repeat: 1,
+    };
+    let mut keys: Vec<ConsoleKey> = format!(": > '{}'/keys-$((6*7))", marks.display())
         .chars()
-        .map(|character| ConsoleKey {
-            virtual_key: 0,
-            scan_code: 0,
-            unicode: u16::try_from(u32::from(character)).expect("a basic plane character"),
-            key_down: true,
-            control_keys: 0,
-            repeat: 1,
+        .map(|character| {
+            key(
+                0,
+                u16::try_from(u32::from(character)).expect("a basic plane character"),
+            )
         })
         .collect();
-    let refused = owner
+    keys.push(key(0x0d, 0x0d));
+    owner
         .session
         .write_input(&write(1, InputContent::ConsoleKeys { keys }))
         .await
-        .expect_err("the daemon has no way to give key records to that worker");
-    assert_eq!(
-        refused.code(),
-        ErrorCode::UnsupportedCapability,
-        "{refused}"
-    );
+        .expect("the worker of the release before takes the key records of a paired device");
     owner
         .session
-        .write_input(&write(1, typed("after")))
+        .write_input(&write(2, typed("after")))
         .await
-        .expect("the refused write spent no sequence number");
+        .expect("the write after the key records takes the next sequence number");
 
-    // The shell ran the lines it was given, in order: the file of the line after the refusal is
-    // there, so a line of the refused records, which came before it, has been run if it ever was.
-    for name in ["kept-42", "after-42"] {
+    // The shell ran the lines it was given, in order.
+    for name in ["kept-42", "keys-42", "after-42"] {
         let file = marks.join(name);
         until(
             &format!("the shell to run the line that makes {name}"),
@@ -2378,10 +2343,6 @@ async fn a_paired_device_types_bytes_into_the_session_of_the_release_before_and_
         )
         .await;
     }
-    assert!(
-        !marks.join("refused-42").exists(),
-        "the shell ran nothing of the refused key records"
-    );
 
     updated.the_worker_is_as_it_was().await;
     host.close(&updated.kr_now(), &updated.display);
@@ -2855,12 +2816,11 @@ async fn the_contact_server_of_this_release_asks_the_worker_of_the_release_befor
 }
 
 /// KR-REQ-11.63, KR-REQ-26.10: a kept answer's record of sends, written beside the answer by this
-/// release, is left behind by the release before, which lists the kept answers alone. That release
-/// reads the answer this release writes and sends it; it discards the answer and leaves the record,
-/// which names no answer, is ignored, and is swept by this release's next reading of the kept
-/// answers, after the update again.
+/// release, is known to the release before. That release reads the answer this release writes and
+/// sends it, and discards the answer and the record of the send together, so after the update
+/// again nothing of either is left to read.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_record_of_sends_the_release_before_leaves_beside_a_sent_answer_is_swept_after_the_update_again()
+async fn a_kept_answer_and_its_record_of_sends_are_sent_and_discarded_together_by_the_release_before()
  {
     use kr_client::answers::{ANSWER_FORMAT, AnswerDraft, AnswerDrafts, Leave, WRITTEN};
 
@@ -2954,8 +2914,8 @@ async fn a_record_of_sends_the_release_before_leaves_beside_a_sent_answer_is_swe
     assert!(answer_file.is_file() && record_file.is_file());
 
     // The host goes back to the release before: only its own session is live, so the rollback goes
-    // on. Its `kr` reads the answer this release wrote, sends it to its own worker, discards the
-    // answer, and leaves the record, which it does not list.
+    // on. Its `kr` reads the answer this release wrote, sends it to its own worker, and discards
+    // the answer and the record of the send.
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -2979,12 +2939,11 @@ async fn a_record_of_sends_the_release_before_leaves_beside_a_sent_answer_is_swe
         "that release discards the answer it sent"
     );
     assert!(
-        record_file.is_file(),
-        "and leaves the record, which it does not list"
+        !record_file.exists(),
+        "and the record of the send, which it lists with the answer"
     );
 
-    // Forward again. This release's reading of the kept answers sweeps the record, which names no
-    // answer, before it reads any worker.
+    // Forward again: there is nothing left of the answer to read.
     let archive = host.scratch("archives").join("two-again.tar.gz");
     updated.two.archive(&archive);
     let (output, said) = host.kr_json(&[
@@ -3000,10 +2959,6 @@ async fn a_record_of_sends_the_release_before_leaves_beside_a_sent_answer_is_swe
         "the update again goes on: {said} {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        record_file.is_file(),
-        "an update alone does not read the kept answers"
-    );
     let drafts = host.run(&updated.kr_now(), &["--json", "question", "drafts"]);
     assert!(
         drafts.status.success(),
@@ -3013,8 +2968,8 @@ async fn a_record_of_sends_the_release_before_leaves_beside_a_sent_answer_is_swe
     let drafts: serde_json::Value = serde_json::from_slice(&drafts.stdout).expect("a document");
     assert_eq!(drafts["drafts"], json!([]), "{drafts}");
     assert!(
-        !record_file.exists(),
-        "the record that named no answer was swept"
+        !answer_file.exists() && !record_file.exists(),
+        "the update again left neither file"
     );
 
     // The question lives as long as the process that asked it, which is this one's client.
@@ -3542,9 +3497,9 @@ async fn privacy_on_and_off(host: &Host) {
     }
 }
 
-/// KR-REQ-26.10, KR-REQ-26.08: the update brings the delivery journal to version 11 and keeps what
-/// it holds; this release writes it; and after a rollback the release before opens it at 11,
-/// writes it too, and the file still says 11. The privacy generation is what the suite can see of
+/// KR-REQ-26.10, KR-REQ-26.08: the release before already writes the delivery journal at version
+/// 11, so the update leaves it at 11 and keeps what it holds; this release writes it; and after a
+/// rollback the release before opens it at 11, writes it too, and the file still says 11. The privacy generation is what the suite can see of
 /// the journal: no `kr` command reads a notification. Each daemon writes it from the privacy
 /// record it keeps, so the case shows the open, the write and the version, and not the content of
 /// a notification.
@@ -3553,18 +3508,18 @@ async fn a_rollback_leaves_the_delivery_journal_at_version_11_and_the_release_be
     let prepared = Updated::prepare(Setup::default()).await;
     let host = &prepared.host;
 
-    // The release before writes the journal at version 10: two turns of privacy mode are
+    // The release before writes the journal at version 11: two turns of privacy mode are
     // generation 2.
     privacy_on_and_off(host).await;
-    assert_eq!(delivery_journal_of(host), (10, 2));
+    assert_eq!(delivery_journal_of(host), (11, 2));
 
-    // The update brings it to 11 and keeps the generation.
+    // The update leaves it at 11 and keeps the generation.
     let updated = prepared.update().await;
     let host = &updated.host;
     assert_eq!(
         delivery_journal_of(host),
         (11, 2),
-        "the update brought the journal to version 11 and kept what it held"
+        "the update left the journal at version 11 and kept what it held"
     );
 
     // This release writes it.
@@ -3749,11 +3704,11 @@ async fn a_share_with_the_live_screen_of_the_session_of_the_release_before_is_is
 /// KR-REQ-26.10, KR-REQ-26.08: a rollback to the release before reads every session archived under
 /// this release. The journal of a closed session whose root was a command holds the session's
 /// summary in the form the release before reads, so the shell and the directory it recorded are
-/// what that release shows; the word that says the root was a command is kept in a
-/// row of its own, which that release does not read. The host events this release records for an
-/// agent turn that ended and a command that failed are in the same journal: this release raised
-/// an item for each while the session was live, and after the rollback the release before lists
-/// them, with no gap, and serves what it reads of them.
+/// what that release shows; the word that says the root was a command is kept in a row of its
+/// own. The host events this release records for an agent turn that ended and a command that
+/// failed are in the same journal: this release raised an item for each while the session was
+/// live, and after the rollback the release before lists them, with no gap, and serves the words
+/// of each.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_release_before_reads_the_journal_of_a_command_session_this_release_wrote() {
     let updated = Updated::new().await;
@@ -3837,8 +3792,8 @@ async fn the_release_before_reads_the_journal_of_a_command_session_this_release_
         "the directory the journal recorded is shown, not a summary rebuilt from the closure: {read}"
     );
 
-    // The release before's daemon lists what this release raised from the rows it does not know,
-    // with no gap, and serves what it reads of them: the line of identifiers, then the words.
+    // The release before's daemon lists what this release raised from the rows, with no gap, and
+    // serves the words of each, which follow the line of identifiers the row carries.
     let inbox = until(
         "the daemon of the release before to list the work this release raised",
         || async {
@@ -3859,12 +3814,14 @@ async fn the_release_before_reads_the_journal_of_a_command_session_this_release_
             .and_then(|item| item.summary.0.clone())
             .unwrap_or_default()
     };
-    assert!(
-        words(kr_protocol::attention::AttentionRule::ReviewReady).starts_with("turn-1\n"),
+    assert_eq!(
+        words(kr_protocol::attention::AttentionRule::ReviewReady),
+        "An agent turn finished.",
         "{inbox:?}"
     );
-    assert!(
-        words(kr_protocol::attention::AttentionRule::CommandFailed).starts_with("3\n"),
+    assert_eq!(
+        words(kr_protocol::attention::AttentionRule::CommandFailed),
+        "A command exited with status 3.",
         "{inbox:?}"
     );
 
@@ -4267,13 +4224,13 @@ async fn a_stored_apply_node_is_admitted_across_an_update_and_a_rollback() {
 }
 
 /// KR-REQ-26.10, KR-REQ-26.08, KR-REQ-24.15: the record that a restored policy waits for the person
-/// at the machine is a store of its own that the release before does not name. A host that reads it
+/// at the machine is a store of its own that the release before names too. A host that reads it
 /// refuses an owner device for the wait. A rollback to the release before is not refused, and it
-/// leaves the record where it was, unread: the release before serves the same device, which is the
-/// loss the guide states. An update again finds the record, and the host waits again, refusing the
-/// device and with the record rewritten to name the policy it holds, and the moment the restore was
-/// found and the list of what the wait owes kept, until the person at the machine has revoked what
-/// the list names and confirms.
+/// leaves the record where it was: the release before reads it and refuses the same device for the
+/// wait, so the wait holds across the rollback. An update again finds the record, and the host
+/// waits again, refusing the device and with the record as the rollback left it, naming the policy
+/// the host holds, and the moment the restore was found and the list of what the wait owes kept,
+/// until the person at the machine has revoked what the list names and confirms.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_leaves_the_record_of_a_restored_policy_and_an_update_again_waits_on_it() {
     use kr_controller::grants::restored::{self, Found, Record};
@@ -4350,9 +4307,16 @@ async fn a_rollback_leaves_the_record_of_a_restored_policy_and_an_update_again_w
         written,
         "the release before leaves the record alone"
     );
-    door.is_served_again()
+    let refusal = door
+        .is_served_again()
         .await
-        .expect("the release before does not read the record, and serves the device");
+        .expect_err("the release before reads the record too and refuses the device for the wait");
+    assert!(
+        refusal
+            .to_string()
+            .contains("restored from an earlier state"),
+        "refused for the restored policy by the release before: {refusal}"
+    );
 
     let archive = host.scratch("archives").join("two-again.tar.gz");
     updated.two.archive(&archive);
@@ -4520,21 +4484,19 @@ async fn a_host_read<P: serde::Serialize + ?Sized, T: kr_protocol::wire::WireMes
 }
 
 /// KR-REQ-25.06, KR-REQ-26.10, KR-REQ-26.08: what this release reads out of a suite's reports lives
-/// in a store of its own, which the release before ignores, so a rollback loses nothing it protected
-/// and an update brings the reports back.
+/// in a store of its own, which the release before keeps too, so a rollback loses nothing it
+/// protected and an update brings the reports back.
 ///
-/// The release before runs the suite (its result carries the declared output's reference and no
-/// report), this release runs it again (a result and a report row), the release before reads that
-/// result and its evidence as it reads any, refuses the method that reads reports as a method it
-/// does not list, and records a run of its own with no row; this release then serves the one row,
-/// bound to the run it came from. A `kr` of this release tells that daemon from a lost right.
+/// The release before runs the suite (a result and a report row), this release runs it again (a
+/// second result and a second row, bound to its own run), the release before reads both results
+/// and both rows, records a run of its own with a row, and this release then serves the rows of
+/// all three runs.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_report_store_the_release_before_ignores_is_kept_across_a_rollback_and_an_update() {
+async fn a_report_store_the_release_before_keeps_too_is_kept_across_a_rollback_and_an_update() {
     use kr_protocol::automation::{
         WorkflowEnableParams, WorkflowInstallParams, WorkflowRunParams, WorkflowRunResult,
     };
     use kr_protocol::changeset::{ChangesetReadParams, ChangesetReadResult, VersionRef};
-    use kr_protocol::error::ErrorCode;
     use kr_protocol::ids::{ChangeSetId, ChangeSetVersion};
     use kr_protocol::scalars::Uuid;
     use kr_protocol::test_report::{ReportReading, TestReportsParams, TestReportsResult};
@@ -4694,13 +4656,39 @@ async fn a_report_store_the_release_before_ignores_is_kept_across_a_rollback_and
         }
     };
 
-    // The release before: a result, and a method it does not list.
+    // The release before: a result, and a report row bound to that run.
+    let environment = prepared.host.tree.environment();
+    let reports_store = environment
+        .state_dir()
+        .join(kr_controller::test_reports::TEST_REPORTS_RECORD);
+    let reports_held = || {
+        rusqlite::Connection::open_with_flags(
+            &reports_store,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("the store of reports opens beside the daemon")
+        .query_row("SELECT count(*) FROM test_reports", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("the rows are counted")
+    };
     run("evt-before-the-update").await;
-    assert_eq!(read().await.results.len(), 1);
-    let refused = reports()
-        .await
-        .expect_err("the release before lists no such method");
-    assert_eq!(refused.code, ErrorCode::PermissionDenied);
+    let before_the_update = read().await;
+    assert_eq!(before_the_update.results.len(), 1);
+    let first = before_the_update.results[0].materialisation_id;
+    assert_eq!(
+        reports_held(),
+        1,
+        "one row, of the run the release before made"
+    );
+    let answered = reports().await.expect("the release before reads reports");
+    assert!(
+        answered
+            .reports
+            .iter()
+            .any(|report| report.materialisation_id == first),
+        "{answered:?}"
+    );
 
     // This release: a copy of the change-set store as it stands with the first run in it, then a
     // result and the report beside it, bound to that run.
@@ -4708,9 +4696,6 @@ async fn a_report_store_the_release_before_ignores_is_kept_across_a_rollback_and
     let environment = updated.host.tree.environment();
     let changesets_store = kr_changeset::service::ChangeSetService::root_of(&environment)
         .join(kr_changeset::store::STORE_FILE_NAME);
-    let reports_store = environment
-        .state_dir()
-        .join(kr_controller::test_reports::TEST_REPORTS_RECORD);
     let copy_before_the_second_run = updated
         .host
         .scratch("stores")
@@ -4725,27 +4710,23 @@ async fn a_report_store_the_release_before_ignores_is_kept_across_a_rollback_and
         [copy_before_the_second_run.to_str().expect("a path")],
     )
     .expect("a consistent copy of the store");
-    let reports_held = || {
-        rusqlite::Connection::open_with_flags(
-            &reports_store,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .expect("the store of reports opens beside the daemon")
-        .query_row("SELECT count(*) FROM test_reports", [], |row| {
-            row.get::<_, i64>(0)
-        })
-        .expect("the rows are counted")
-    };
     run("evt-after-the-update").await;
     let after_the_update = read().await;
     assert_eq!(after_the_update.results.len(), 2);
     let second = after_the_update.results[1].materialisation_id;
-    assert_eq!(reports_held(), 1, "one row, of the run this release made");
+    assert_eq!(
+        reports_held(),
+        2,
+        "a row for each run, the second made by this release"
+    );
     let answered = reports().await.expect("this release reads reports");
-    let [report] = &answered.reports[..] else {
-        panic!("one report, of the run this release made: {answered:?}");
+    let Some(report) = answered
+        .reports
+        .iter()
+        .find(|report| report.materialisation_id == second)
+    else {
+        panic!("the report of the run this release made: {answered:?}");
     };
-    assert_eq!(report.materialisation_id, second);
     assert!(
         matches!(&report.reading, ReportReading::Parsed { totals, .. }
             if totals.tests.get() == 2 && totals.failed.get() == 1),
@@ -4771,8 +4752,8 @@ async fn a_report_store_the_release_before_ignores_is_kept_across_a_rollback_and
     );
     assert!(!printed.contains("passes"), "{printed}");
 
-    // Back to the release before: it reads the result this release wrote as it reads any, ignores
-    // the store of reports, and records a run of its own with no row.
+    // Back to the release before: it reads the result this release wrote, reads the rows of the
+    // store of reports, and records a run of its own with a row beside them.
     let (output, said) = updated.host.kr_json(&["host", "rollback", "--json"]);
     assert!(
         output.status.success(),
@@ -4793,32 +4774,22 @@ async fn a_report_store_the_release_before_ignores_is_kept_across_a_rollback_and
     assert_eq!(read().await.results.len(), 3);
     assert_eq!(
         reports_held(),
-        1,
-        "the release before left the store of reports as it was"
+        3,
+        "the release before wrote the row of its own run beside the two it found"
     );
-    assert_eq!(
-        reports()
-            .await
-            .expect_err("the release before still lists no such method")
-            .code,
-        ErrorCode::PermissionDenied
+    let answered = reports()
+        .await
+        .expect("the release before reads the rows this release kept");
+    assert!(
+        answered
+            .reports
+            .iter()
+            .any(|report| report.materialisation_id == second),
+        "{answered:?}"
     );
-    // The `kr` of this release asks again with a read the release before lists, which is answered,
-    // so what it says is that the daemon is too old and not that a right is missing.
-    let refused = updated.host.run(
-        &updated.kr_now(),
-        &["changeset", "test-reports", &change_set, "--json"],
-    );
-    assert!(!refused.status.success());
-    let said = format!(
-        "{}{}",
-        String::from_utf8_lossy(&refused.stdout),
-        String::from_utf8_lossy(&refused.stderr)
-    );
-    assert!(said.contains("does not read test reports"), "{said}");
 
-    // Forward again: the store the release before left alone serves the one report of the run it
-    // was written for, and none for the runs the release before made.
+    // Forward again: the store serves the report of the run this release made, and the rows of
+    // the runs of the release before are kept.
     let archive = updated.host.scratch("archives").join("two-again.tar.gz");
     updated.two.archive(&archive);
     let (output, said) = updated.host.kr_json(&[
@@ -4840,10 +4811,18 @@ async fn a_report_store_the_release_before_ignores_is_kept_across_a_rollback_and
         "the daemon is of the new release again"
     );
     let again = reports().await.expect("this release reads reports again");
-    let [report] = &again.reports[..] else {
-        panic!("the one report is served again: {again:?}");
-    };
-    assert_eq!(report.materialisation_id, second);
+    assert!(
+        again
+            .reports
+            .iter()
+            .any(|report| report.materialisation_id == second),
+        "the report of the run this release made is served again: {again:?}"
+    );
+    assert_eq!(
+        reports_held(),
+        3,
+        "the store of reports is as the rollback left it"
+    );
     let three = read().await;
     assert_eq!(
         three.results.len(),
@@ -4853,8 +4832,9 @@ async fn a_report_store_the_release_before_ignores_is_kept_across_a_rollback_and
     assert_eq!(three.results[1], after_the_update.results[1]);
 
     // The change-set store is put back as it was before the second run, with the daemon stopped and
-    // the store of reports kept: the report now names a run the store holds no result for. It is
-    // not served, and the daemon lets it go when it opens.
+    // the store of reports kept: two of its rows now name a run the store holds no result for.
+    // They are not served, and the daemon lets them go when it opens; the row of the first run,
+    // which the store still holds, stays.
     assert!(
         updated.host.stop_the_daemon().await,
         "no daemon serves the host"
@@ -4864,7 +4844,7 @@ async fn a_report_store_the_release_before_ignores_is_kept_across_a_rollback_and
     for beside in ["changesets.sqlite-wal", "changesets.sqlite-shm"] {
         let _ = std::fs::remove_file(changesets_store.with_file_name(beside));
     }
-    assert_eq!(reports_held(), 1, "the store of reports is kept");
+    assert_eq!(reports_held(), 3, "the store of reports is kept");
     let controller = updated.host.store.stable(Program::Controller);
     updated.host.start_daemon(&controller).await;
     assert_eq!(
@@ -4873,11 +4853,18 @@ async fn a_report_store_the_release_before_ignores_is_kept_across_a_rollback_and
         "the store is the older copy: the two runs made after it was taken are gone"
     );
     let restored = reports().await.expect("this release reads reports");
-    assert!(restored.reports.is_empty(), "{restored:?}");
+    assert!(
+        !restored.reports.is_empty()
+            && restored
+                .reports
+                .iter()
+                .all(|report| report.materialisation_id == first),
+        "only the report of the run the store holds is served: {restored:?}"
+    );
     assert_eq!(
         reports_held(),
-        0,
-        "the report of a run no one holds is let go"
+        1,
+        "the reports of runs no one holds are let go"
     );
     drop(owner);
 }

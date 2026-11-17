@@ -27,7 +27,7 @@ Since running sessions continue to use the worker process that started them, it 
 <!-- retained-levels:begin -->
 | Level | Release | Built |
 | --- | --- | --- |
-| 0.77 | 0.77.0+b8c5badcd5c9 | 2026-10-26T06:51:28+02:00 |
+| 0.78 | 0.78.0+8b8bf980bed4 | 2026-11-17T02:14:52+02:00 |
 <!-- retained-levels:end -->
 
 The day a release was built is the committer date of its commit.
@@ -77,6 +77,8 @@ A release that raises the compatibility level retains the level of the release b
 3. Then record the rules the surface reads from the release's tree: `KR_RELEASE_TREE=<tree> cargo test -p kr-cli --test retained_surface -- --ignored record_the_rules_of_the_surface`. That writes `sources.json`, `limits.json`, and `vectors.json`.
 4. Also record the exchange with a worker of that release, with `TMPDIR` set to a neutral directory, by running `KR_RECORD_FRAMES=1 cargo test -p kr-cli --features upgrade-suite --test upgrade the_frames_ -- --nocapture` and extracting the text between the `FRAMES-JSON-BEGIN` and `FRAMES-JSON-END` lines as `frames.json`. Record the frames of that release's plugin host the same way, with `KR_RECORD_PLUGIN_HOST_FRAMES=1 cargo test -p kr-cli --features upgrade-suite --test upgrade the_frames_of_the_plugin_host_of_the_release_before -- --nocapture`, and extract the text between the `PLUGIN-HOST-FRAMES-JSON-BEGIN` and `PLUGIN-HOST-FRAMES-JSON-END` lines as `plugin-host-frames.json`. The upgrade suite builds the release the record names and runs its real programs, so both recordings come from that release. The plugin host record names the release it was made from, and a test holds it equal to `RELEASE`: when the record moves to a later release of the level, make both recordings again.
 5. Search the tree for code that says it goes once no retained level is below some level, and remove what this cut makes unneeded, in a commit of its own.
+
+   The search has two more duties. Search the guides, the comments and the upgrade suite for statements and cases about what "the release before" lacks (a method it does not list, a store it does not name, a record it ignores, a version it writes): the release before is now the release of the level the cut retains, so each one is true or false of that release by its own source, and a false one is rewritten to what that release does or removed when its whole subject was the difference. Then run the whole upgrade suite on the cut commit, with its rollback cases, and read every case that fails against this rule before the commit is judged: the suite builds the release the new record names, so only it shows these.
 6. In the commit after the cut, record the files that are not kept within `retained/`, as described in the next section.
 
 ### Recordings beside the tests
