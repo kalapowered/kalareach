@@ -2507,6 +2507,23 @@ async fn device_attach(
     .to_typed()
 }
 
+/// What the host answered to a device's attach, as the code of its refusal: `None` when it
+/// attached, `Some(code)` when the host refused. A failure that is no answer of the host (a failed
+/// transport, a link that ended) ends the case here, at an expect of its own, before any assertion.
+fn the_hosts_answer(
+    attached: kr_client::Result<kr_protocol::attachment::SessionAttachResult>,
+) -> Option<kr_protocol::error::ErrorCode> {
+    attached
+        .map(|_| None)
+        .or_else(|error| match error {
+            kr_client::ClientError::Host(error) | kr_client::ClientError::Refused { error, .. } => {
+                Ok(Some(error.code))
+            }
+            other => Err(other),
+        })
+        .expect("the attach reached the host and was answered")
+}
+
 /// KR-REQ-09.12, KR-ACC-022: a paired device cannot open a session whose worker a start left out,
 /// and its link's next try adopts the worker and opens it once the worker is free.
 ///
@@ -2538,26 +2555,20 @@ async fn a_paired_devices_link_is_refused_while_the_worker_is_out_and_adopts_it_
     .await;
     let link = net_support::connect(&host, &device, &record).await;
 
-    let refused = device_attach(&link, &host, session_id)
-        .await
-        .expect_err("a worker that is out cannot be attached to");
+    let refused = the_hosts_answer(device_attach(&link, &host, session_id).await);
     assert_eq!(
-        refused.code(),
-        kr_protocol::error::ErrorCode::UnknownSession,
-        "the device is told that the host serves no such session: {refused}"
+        refused,
+        Some(kr_protocol::error::ErrorCode::UnknownSession),
+        "the device is told that the host serves no such session: the host answered {refused:?}"
     );
     assert_eq!(worker.attachments(), 0, "nothing reached the worker");
 
     let_go_and_wait(&host, worker, held).await;
-    let adopted = device_attach(&link, &host, session_id).await;
-    if let Err(error) = &adopted {
-        assert_ne!(
-            error.code(),
-            kr_protocol::error::ErrorCode::UnknownSession,
-            "the link's next try is refused as a session the host does not serve: {error}"
-        );
-    }
-    adopted.expect("the link's second attach is answered");
+    let adopted = the_hosts_answer(device_attach(&link, &host, session_id).await);
+    assert_eq!(
+        adopted, None,
+        "the link's next try adopts the worker and opens the session: the host answered {adopted:?}"
+    );
     assert_eq!(
         worker.attachments(),
         1,
