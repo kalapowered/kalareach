@@ -2854,7 +2854,7 @@ async fn a_lost_lease_ends_control_and_says_so() {
     assert_eq!(control(&ended), (1, "watching".to_owned()));
     assert_eq!(
         ended["control"]["ended"],
-        "Control ended: another view took it, or the program changed how it reads keys."
+        "Control ended: another view took it, the program changed how it reads keys, or this view's right to type ended."
     );
     let refused = page_view
         .text(&view, 1, "q")
@@ -6191,7 +6191,8 @@ async fn a_lease_refusal_on_the_input_stream_ends_control_and_tells_the_page_why
         .as_str()
         .expect("words of the end");
     assert_eq!(
-        words, "Control ended: another view took it, or the program changed how it reads keys.",
+        words,
+        "Control ended: another view took it, the program changed how it reads keys, or this view's right to type ended.",
         "the sentence for a lost lease"
     );
     assert_eq!(
@@ -6852,8 +6853,8 @@ async fn the_hosts_notice_that_the_held_epoch_ended_ends_control_and_tells_the_p
         .expect("the notice ended control within the bound");
     assert_eq!(
         ended["control"]["ended"],
-        "Control ended: another view took it, or the program changed how it reads keys.",
-        "the sentence for a lost lease"
+        "Control ended: another view took it, the program changed how it reads keys, or this view's right to type ended.",
+        "the sentence for a lease that ended, whole: it names the three causes"
     );
     assert_eq!(
         code(
@@ -7467,5 +7468,46 @@ async fn a_key_after_the_host_finished_the_input_stream_is_refused_for_an_ended_
     assert_eq!(
         refused["message"], "That input did not reach the program: its input stream ended.",
         "{refused}"
+    );
+}
+
+/// The right to type that control rested on ended: the host sends the same notice as for a takeover,
+/// and the page is told in the one sentence that names every cause, whole. The view's stream stays
+/// open, so the person's next take is sent, and the host's own refusal, which says that the grant no
+/// longer carries the typing right, is what the page shows for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_notice_after_the_right_to_type_ended_tells_the_page_and_the_next_take_is_refused_by_the_host()
+ {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    host.script.epoch_ended(1, 0);
+    let ended = page
+        .newest_within(3, |state| control(state) == (1, "watching".to_owned()))
+        .await
+        .expect("the notice ended control within the bound");
+    assert_eq!(
+        ended["control"]["ended"],
+        "Control ended: another view took it, the program changed how it reads keys, or this view's right to type ended.",
+        "the sentence for a lease that ended, whole"
+    );
+    page.take(&view, 2);
+    let acquire = acquire_within_the_bound(&mut link).await;
+    link.refuse_with(
+        &acquire,
+        ErrorCode::PermissionDenied,
+        "this grant does not carry terminal.input",
+    )
+    .await;
+    let refused = page
+        .newest_within(3, |state| control(state) == (2, "watching".to_owned()))
+        .await
+        .expect("the host's refusal was shown within the bound");
+    assert_eq!(
+        refused["control"]["ended"],
+        "This view cannot take control: this grant does not carry terminal.input",
+        "the host's words for the refused take"
     );
 }

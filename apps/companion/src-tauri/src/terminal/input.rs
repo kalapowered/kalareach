@@ -64,9 +64,8 @@ const ENDED_BY_ENCODING: &str =
     "Control ended: the program now reads keys in a form this view cannot send.";
 
 /// Why control ended when the session said the lease was lost, at a refused write or at the notice
-/// that the epoch ended.
-const ENDED_BY_LOST_LEASE: &str =
-    "Control ended: another view took it, or the program changed how it reads keys.";
+/// that the epoch ended: the notice names no cause, and these are the three it can have.
+const ENDED_BY_LOST_LEASE: &str = "Control ended: another view took it, the program changed how it reads keys, or this view's right to type ended.";
 
 /// Why control ended when the view's input stream ended while the view held the lease.
 const ENDED_BY_STREAM: &str = "Control ended: this view's input stream ended.";
@@ -636,8 +635,8 @@ impl Lease {
         true
     }
 
-    /// The session says the lease of `epoch` is over: another view took it, or the program changed
-    /// how it reads keys. Control ends as a refused write for a lost lease ends it, and nothing is
+    /// The session says the lease of `epoch` is over: another view took it, the program changed how
+    /// it reads keys, or the right to type behind it ended. Control ends as a refused write for a lost lease ends it, and nothing is
     /// given back, since the lease is not the view's any more. Returns whether control changed: a
     /// lease that is not held at `epoch` changes nothing, as the view's own release, which took the
     /// lease out of the view's hands before the session's notice, or an older epoch's notice.
@@ -962,7 +961,9 @@ mod tests {
         assert_eq!(control.state, ControlState::Watching);
         assert_eq!(
             control.ended.as_deref(),
-            Some("Control ended: another view took it, or the program changed how it reads keys.")
+            Some(
+                "Control ended: another view took it, the program changed how it reads keys, or this view's right to type ended."
+            )
         );
         assert_eq!(lease.owed(), None);
         assert!(lease.write(1).is_err());
@@ -985,7 +986,9 @@ mod tests {
         assert_eq!(control.state, ControlState::Watching);
         assert_eq!(
             control.ended.as_deref(),
-            Some("Control ended: another view took it, or the program changed how it reads keys.")
+            Some(
+                "Control ended: another view took it, the program changed how it reads keys, or this view's right to type ended."
+            )
         );
         assert_eq!(
             lease.owed(),
