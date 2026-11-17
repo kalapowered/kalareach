@@ -59,6 +59,44 @@ const LOOK_EVERY: Duration = Duration::from_millis(50);
 /// What a refusal says of the sessions meanwhile, for a command that stops the daemon.
 const SESSIONS_GO_ON: &str = "Sessions and local attachments go on while no daemon runs.";
 
+/// The command that runs: what a text says of it, of what it did not request and of the sessions
+/// meanwhile, and the command that an attempt's record names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Which {
+    /// `kr host stop`.
+    Stop,
+}
+
+impl Which {
+    /// The command as a person types it.
+    const fn command(self) -> &'static str {
+        match self {
+            Self::Stop => "kr host stop",
+        }
+    }
+
+    /// The command as the record of an attempt names it.
+    const fn attempt(self) -> attempt::Command {
+        match self {
+            Self::Stop => attempt::Command::Stop,
+        }
+    }
+
+    /// What a refusal of the guard says of the sessions meanwhile.
+    const fn sessions(self) -> &'static str {
+        match self {
+            Self::Stop => SESSIONS_GO_ON,
+        }
+    }
+
+    /// What a text says where the command ended before it asked the daemon for anything.
+    const fn nothing_asked(self) -> &'static str {
+        match self {
+            Self::Stop => "No stop was requested.",
+        }
+    }
+}
+
 /// What this command knows of whether the daemon was asked, for `--json`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Knows {
@@ -263,7 +301,7 @@ pub async fn run(paths: &HostPaths, json: bool) -> Result<Completion> {
         environment_id: environment.environment_id,
         earlier: Mutex::new(Vec::new()),
     };
-    let work = stop(paths, &environment, json, &progress);
+    let work = stop(Which::Stop, paths, &environment, json, &progress);
     tokio::pin!(work);
     loop {
         tokio::select! {
@@ -644,6 +682,7 @@ fn said_at_the_start(start: &Start, lock: impl FnOnce() -> Lock) -> Said<AtStart
 
 /// The command, from the guard to the daemon's end.
 async fn stop(
+    which: Which,
     host: &HostPaths,
     environment: &KnownEnvironment,
     json: bool,
@@ -653,8 +692,8 @@ async fn stop(
     let none = Facts::none(Vec::new());
     if let Err(error) = crate::bind::require_outside_to_end_a_daemon(
         &crate::build_id(),
-        "kr host stop",
-        SESSIONS_GO_ON,
+        which.command(),
+        which.sessions(),
     )
     .await
     {
@@ -677,6 +716,7 @@ async fn stop(
         Reached::Answered(listed) => {
             let Listed::Ours(client) = *listed else {
                 return Ok(at_the_start(
+                    which,
                     &Start::OtherMajor,
                     environment,
                     &none,
@@ -685,9 +725,10 @@ async fn stop(
                     startup::ANSWER_BOUND,
                 ));
             };
-            Ok(stop_the_daemon(host, environment, *client, json, progress, &earlier).await)
+            Ok(stop_the_daemon(which, host, environment, *client, json, progress, &earlier).await)
         }
         Reached::Silent => Ok(at_the_start(
+            which,
             &Start::Silent,
             environment,
             &none,
@@ -696,6 +737,7 @@ async fn stop(
             startup::ANSWER_BOUND,
         )),
         Reached::Refused(error) if startup::nothing_listening(&error) => Ok(at_the_start(
+            which,
             &Start::NothingListening,
             environment,
             &none,
@@ -713,10 +755,12 @@ async fn stop(
                 tokio::time::Instant::now() + END_BOUND,
             )
             .await;
-            Ok(match ended_by(before, environment, &none, json, &earlier) {
-                Ok(completion) => completion,
-                Err(cause) => failed(unreached(id, &error, cause), &none, json),
-            })
+            Ok(
+                match ended_by(which, before, environment, &none, json, &earlier) {
+                    Ok(completion) => completion,
+                    Err(cause) => failed(unreached(which, id, &error, cause), &none, json),
+                },
+            )
         }
     }
 }
@@ -868,48 +912,53 @@ fn no_daemon_said(environment: &KnownEnvironment) -> Shown {
 }
 
 /// The words where something accepted the connection and did not answer within `bound`.
-fn silent_said(id: EnvironmentId, bound: Duration) -> Shown {
+fn silent_said(which: Which, id: EnvironmentId, bound: Duration) -> Shown {
     shown!(
         "the control daemon listening for environment {} accepted the connection and did not answer \
-         within {} seconds. No stop was requested. Run kr host stop again in a moment.",
+         within {} seconds. {} Run {} again in a moment.",
         id,
-        bound.as_secs()
+        bound.as_secs(),
+        which.nothing_asked(),
+        which.command()
     )
 }
 
 /// The words where a daemon holds the environment and does not answer, so it may be starting or
 /// stopping.
-fn holds_and_is_silent_said(environment: &KnownEnvironment) -> Shown {
+fn holds_and_is_silent_said(which: Which, environment: &KnownEnvironment) -> Shown {
     shown!(
         "A control daemon holds environment {} and does not answer, so it may be starting or \
-         stopping. No stop was requested. Run kr host stop again in a moment. {}",
+         stopping. {} Run {} again in a moment. {}",
         environment.environment_id,
+        which.nothing_asked(),
+        which.command(),
         how_to_end_the_holder(&environment.paths)
     )
 }
 
 /// The words where the environment's lock could not be read at the start.
-fn lock_unreadable_said(id: EnvironmentId, why: &Shown) -> Shown {
+fn lock_unreadable_said(which: Which, id: EnvironmentId, why: &Shown) -> Shown {
     shown!(
-        "whether a control daemon holds environment {} could not be read: {}. No stop was \
-         requested.",
+        "whether a control daemon holds environment {} could not be read: {}. {}",
         id,
-        *why
+        *why,
+        which.nothing_asked()
     )
 }
 
 /// The words where the daemon at the endpoint states another public major than this command.
-fn other_major_said(id: EnvironmentId) -> Shown {
+fn other_major_said(which: Which, id: EnvironmentId) -> Shown {
     shown!(
-        "the control daemon for environment {} states another public major than this command does. \
-         No stop was requested.",
-        id
+        "the control daemon for environment {} states another public major than this command does. {}",
+        id,
+        which.nothing_asked()
     )
 }
 
 /// Ends the command at its start, where the first reach of the endpoint shows what it does, by
 /// the decision of [`said_at_the_start`]. The lock is read only where the decision needs it.
 fn at_the_start(
+    which: Which,
     start: &Start,
     environment: &KnownEnvironment,
     none: &Facts,
@@ -920,11 +969,11 @@ fn at_the_start(
     let id = environment.environment_id;
     let said = said_at_the_start(start, || Lock::of(lock_held(&environment.paths)));
     let message = match said.sentence {
-        AtStart::OtherMajor => other_major_said(id),
+        AtStart::OtherMajor => other_major_said(which, id),
         AtStart::NoDaemon => no_daemon_said(environment),
-        AtStart::HoldsAndSilent => holds_and_is_silent_said(environment),
-        AtStart::Silent => silent_said(id, bound),
-        AtStart::LockUnreadable(why) => lock_unreadable_said(id, &why),
+        AtStart::HoldsAndSilent => holds_and_is_silent_said(which, environment),
+        AtStart::Silent => silent_said(which, id, bound),
+        AtStart::LockUnreadable(why) => lock_unreadable_said(which, id, &why),
     };
     conclude(said.exit, message, none, json, earlier)
 }
@@ -1172,6 +1221,7 @@ fn process_waited_for(holder: Option<&ProcessStartIdentity>, answered: Option<u6
 
 /// A daemon answered the hello: asks it to stop, and waits for it to end.
 async fn stop_the_daemon(
+    which: Which,
     host: &HostPaths,
     environment: &KnownEnvironment,
     mut client: LocalClient,
@@ -1200,11 +1250,12 @@ async fn stop_the_daemon(
                 tokio::time::Instant::now() + END_BOUND,
             )
             .await;
-            return unmade_ended(before, &error, id, environment, &none, json, earlier);
+            return unmade_ended(which, before, &error, id, environment, &none, json, earlier);
         }
         Ok(Err(error)) => return failed(error, &none, json),
         Err(_) => {
             return at_the_start(
+                which,
                 &Start::Silent,
                 environment,
                 &none,
@@ -1217,13 +1268,15 @@ async fn stop_the_daemon(
     // Who holds the environment, and which process that is, before anything is asked: a process
     // that has ended and not been collected is read as gone, and its number may be reused.
     let holder = lock_holder(&environment.paths);
-    let marker = match Marker::begin(&environment.paths, attempt::Command::Stop, holder.clone()) {
+    let marker = match Marker::begin(&environment.paths, which.attempt(), holder.clone()) {
         Ok(marker) => marker,
         Err(error) => {
             return failed(
                 CliError::Other(shown!(
-                    "kr host stop could not record its attempt: {}. No stop was requested.",
-                    Shown::ipc(&error)
+                    "{} could not record its attempt: {}. {}",
+                    which.command(),
+                    Shown::ipc(&error),
+                    which.nothing_asked()
                 )),
                 &none,
                 json,
@@ -1268,7 +1321,7 @@ async fn stop_the_daemon(
                 deadline,
             )
             .await;
-            return unmade_ended(before, &error, id, environment, &none, json, earlier);
+            return unmade_ended(which, before, &error, id, environment, &none, json, earlier);
         }
         Asked::Refused(error) => {
             // Nothing was taken, so an interrupt from here on has nothing to say but that.
@@ -1295,6 +1348,7 @@ async fn stop_the_daemon(
     let ended = wait_for_the_end(&operations, old, END_BOUND).await;
     let said = said_after_the_request(ended, &request);
     let message = words_after_the_request(
+        which,
         &said.sentence,
         &request,
         &environment.paths,
@@ -1354,6 +1408,7 @@ fn gone_said(
 /// [`said_after_the_request`] decided. The process of the daemon that was asked is named where it
 /// is known (`old`).
 fn words_after_the_request(
+    which: Which,
     sentence: &AfterRequest,
     request: &Request,
     environment: &EnvironmentPaths,
@@ -1376,33 +1431,35 @@ fn words_after_the_request(
             };
             not_ended(environment, id, &what, old)
         }
-        AfterRequest::NotShown => not_shown(id, not_known),
-        AfterRequest::StillHeld => still_held(environment, id),
-        AfterRequest::HeldNotShown => held_not_shown(id, not_known),
-        AfterRequest::Unlooked(why) => unlooked(id, not_known, why),
+        AfterRequest::NotShown => not_shown(which, id, not_known),
+        AfterRequest::StillHeld => still_held(which, environment, id),
+        AfterRequest::HeldNotShown => held_not_shown(which, id, not_known),
+        AfterRequest::Unlooked(why) => unlooked(which, id, not_known, why),
     }
 }
 
 /// The words where the lock was free and the last look showed neither that the daemon runs nor
 /// that it had gone.
-fn not_shown(id: EnvironmentId, not_known: Option<&Shown>) -> Shown {
+fn not_shown(which: Which, id: EnvironmentId, not_known: Option<&Shown>) -> Shown {
     match not_known {
         None => shown!(
             "The control daemon for environment {} was told to stop. After {} seconds the lock was \
              free, and the last look at the endpoint showed neither that the daemon still runs nor \
-             that it had gone, so the command could not confirm the end. Run kr host stop again in \
+             that it had gone, so the command could not confirm the end. Run {} again in \
              a moment; it looks again.",
             id,
-            END_BOUND.as_secs()
+            END_BOUND.as_secs(),
+            which.command()
         ),
         Some(failure) => shown!(
             "The control daemon for environment {} did not show whether it took the stop ({}). \
              After {} seconds the lock was free, and the last look at the endpoint showed neither \
              that the daemon still runs nor that it had gone, so the command could not confirm the \
-             end. Run kr host stop again in a moment; it looks again.",
+             end. Run {} again in a moment; it looks again.",
             id,
             *failure,
-            END_BOUND.as_secs()
+            END_BOUND.as_secs(),
+            which.command()
         ),
     }
 }
@@ -1412,7 +1469,11 @@ fn not_shown(id: EnvironmentId, not_known: Option<&Shown>) -> Shown {
 /// was accepted, and with the unmade request's failure (exit 3) where a daemon answered, where the
 /// failure is this side's own, and where the connect found nothing listening and no lock is held.
 /// The read of `host.info` and the compose of the stop request end here.
+// One argument for each fact its arms read: the command, the decision, the failure, the environment,
+// the result so far, the output form and the records.
+#[allow(clippy::too_many_arguments)]
 fn unmade_ended(
+    which: Which,
     before: Before,
     error: &kr_ipc::IpcError,
     id: EnvironmentId,
@@ -1421,30 +1482,41 @@ fn unmade_ended(
     json: bool,
     earlier: &Earlier,
 ) -> Completion {
-    match ended_by(before, environment, none, json, earlier) {
+    match ended_by(which, before, environment, none, json, earlier) {
         Ok(completion) => completion,
-        Err(cause) => failed(unmade_request(id, &Shown::ipc(error), cause), none, json),
+        Err(cause) => failed(
+            unmade_request(which, id, &Shown::ipc(error), cause),
+            none,
+            json,
+        ),
     }
 }
 
 /// The failure of a greeting that could not be completed: that the daemon could not be reached
 /// and that no stop was requested. A daemon's reply or this side's own fault makes it, and the
 /// words are the failure's own.
-fn unreached(id: EnvironmentId, error: &kr_ipc::IpcError, _cause: Unmade) -> CliError {
+fn unreached(
+    which: Which,
+    id: EnvironmentId,
+    error: &kr_ipc::IpcError,
+    _cause: Unmade,
+) -> CliError {
     CliError::HostUnavailable(shown!(
-        "the control daemon for environment {} could not be reached: {}. No stop was requested.",
+        "the control daemon for environment {} could not be reached: {}. {}",
         id,
-        Shown::ipc(error)
+        Shown::ipc(error),
+        which.nothing_asked()
     ))
 }
 
 /// The failure of a request that could not be made: what was not made and that the stop was not
 /// asked. A daemon's answer, this side's own fault or a connect that found nothing listening makes
 /// it, and the words are the failure's own; `Unmade` says which.
-fn unmade_request(id: EnvironmentId, why: &Shown, _cause: Unmade) -> CliError {
+fn unmade_request(which: Which, id: EnvironmentId, why: &Shown, _cause: Unmade) -> CliError {
     CliError::HostUnavailable(shown!(
-        "kr host stop could not make its request for the control daemon of environment {}: {}. \
+        "{} could not make its request for the control daemon of environment {}: {}. \
          Nothing was sent, and nothing was stopped.",
+        which.command(),
         id,
         *why
     ))
@@ -1675,6 +1747,7 @@ async fn host_info_failed(
 /// It gives the cause where the failure keeps its own words (exit 3): a daemon answered, the
 /// failure is this side's own, or the connect found nothing listening and no lock is held.
 fn ended_by(
+    which: Which,
     before: Before,
     environment: &KnownEnvironment,
     none: &Facts,
@@ -1695,14 +1768,14 @@ fn ended_by(
         }
         BeforeRequest::HoldsAndSilent => Ok(conclude(
             said.exit,
-            holds_and_is_silent_said(environment),
+            holds_and_is_silent_said(which, environment),
             none,
             json,
             earlier,
         )),
         BeforeRequest::Silent => Ok(conclude(
             said.exit,
-            silent_said(id, END_BOUND),
+            silent_said(which, id, END_BOUND),
             none,
             json,
             earlier,
@@ -1897,23 +1970,25 @@ fn not_ended(
 /// holds it: the process of the daemon asked could not be read, and no look showed that daemon
 /// answering. The holder can be the daemon that was told, a daemon that is starting, or another
 /// command's brief look, so the words say only that the end is not confirmed.
-fn held_not_shown(id: EnvironmentId, not_known: Option<&Shown>) -> Shown {
+fn held_not_shown(which: Which, id: EnvironmentId, not_known: Option<&Shown>) -> Shown {
     match not_known {
         None => shown!(
             "The control daemon for environment {} was told to stop. After {} seconds the \
              environment was still held, and the command could not show what holds it, so it \
-             could not confirm the end. Run kr host stop again in a moment; it looks again.",
+             could not confirm the end. Run {} again in a moment; it looks again.",
             id,
-            END_BOUND.as_secs()
+            END_BOUND.as_secs(),
+            which.command()
         ),
         Some(failure) => shown!(
             "The control daemon for environment {} did not show whether it took the stop ({}). \
              After {} seconds the environment was still held, and the command could not show \
-             what holds it, so it could not confirm the end. Run kr host stop again in a \
+             what holds it, so it could not confirm the end. Run {} again in a \
              moment; it looks again.",
             id,
             *failure,
-            END_BOUND.as_secs()
+            END_BOUND.as_secs(),
+            which.command()
         ),
     }
 }
@@ -1922,13 +1997,14 @@ fn held_not_shown(id: EnvironmentId, not_known: Option<&Shown>) -> Shown {
 /// ended: what is said is that the process has gone and that something holds the environment which
 /// is not shown to be a control daemon. It does not say that the daemon ended: the daemon ended only
 /// where the lock is free or another control daemon holds it.
-fn still_held(environment: &EnvironmentPaths, id: EnvironmentId) -> Shown {
+fn still_held(which: Which, environment: &EnvironmentPaths, id: EnvironmentId) -> Shown {
     shown!(
         "The process of the control daemon for environment {} has gone, and something that is not \
-         shown to be a control daemon still holds the environment after {} seconds. Run kr host \
-         stop again in a moment. {}",
+         shown to be a control daemon still holds the environment after {} seconds. Run {} \
+         again in a moment. {}",
         id,
         END_BOUND.as_secs(),
+        which.command(),
         how_to_end_the_holder(environment)
     )
 }
@@ -1936,23 +2012,25 @@ fn still_held(environment: &EnvironmentPaths, id: EnvironmentId) -> Shown {
 /// The environment's lock could not be looked at, so that nothing is known of whether the daemon
 /// has ended. `not_known` is what the request's failure said where whether the daemon took the
 /// stop is not known; where it took it, the text says that it was told.
-fn unlooked(id: EnvironmentId, not_known: Option<&Shown>, why: &Shown) -> Shown {
+fn unlooked(which: Which, id: EnvironmentId, not_known: Option<&Shown>, why: &Shown) -> Shown {
     match not_known {
         None => shown!(
             "The control daemon for environment {} was told to stop, and whether it has ended could \
-             not be read after {} seconds: {}. Run kr host stop again in a moment.",
+             not be read after {} seconds: {}. Run {} again in a moment.",
             id,
             END_BOUND.as_secs(),
-            *why
+            *why,
+            which.command()
         ),
         Some(failure) => shown!(
             "The control daemon for environment {} did not show whether it took the stop ({}), and \
-             whether it has ended could not be read after {} seconds: {}. Run kr host stop again in \
+             whether it has ended could not be read after {} seconds: {}. Run {} again in \
              a moment.",
             id,
             *failure,
             END_BOUND.as_secs(),
-            *why
+            *why,
+            which.command()
         ),
     }
 }
@@ -2827,7 +2905,7 @@ mod tests {
             "{said}"
         );
         assert!(!said.contains("wait again"), "{said}");
-        let held = still_held(&environment, id).to_string();
+        let held = still_held(Which::Stop, &environment, id).to_string();
         assert!(
             held.contains(
                 "has gone, and something that is not shown to be a control daemon still holds the environment after 30 seconds"
@@ -2982,13 +3060,13 @@ mod tests {
         let temp = kr_ipc::testing::TempHost::create();
         let id = temp.environment().environment_id();
         let why = Shown::said("the lock file could not be opened");
-        let told = unlooked(id, None, &why).to_string();
+        let told = unlooked(Which::Stop, id, None, &why).to_string();
         assert!(
             told.contains("was told to stop, and whether it has ended could not be read after 30 seconds: the lock file could not be opened. Run kr host stop again in a moment."),
             "{told}"
         );
         let failure = Shown::said("the connection was cut");
-        let unknown = unlooked(id, Some(&failure), &why).to_string();
+        let unknown = unlooked(Which::Stop, id, Some(&failure), &why).to_string();
         assert!(
             unknown.contains("did not show whether it took the stop (the connection was cut), and whether it has ended could not be read after 30 seconds: the lock file could not be opened. Run kr host stop again in a moment."),
             "{unknown}"
@@ -3267,7 +3345,15 @@ mod tests {
             Request::MaybeAsked(failure.clone())
         });
         let said = said_after_the_request(End::NotEnded(why, None), &request);
-        words_after_the_request(&said.sentence, &request, environment, id, old, None)
+        words_after_the_request(
+            Which::Stop,
+            &said.sentence,
+            &request,
+            environment,
+            id,
+            old,
+            None,
+        )
     }
 
     /// How a wait came out, in words a failed assertion shows.
@@ -4064,7 +4150,16 @@ mod tests {
             assert_eq!(before_said(&before), "silent, nothing accepted", "{kind:?}");
             assert_eq!(supplied.start.elapsed(), END_BOUND, "{kind:?}");
             // The lock is held at the end: a daemon holds the environment and does not answer.
-            match unmade_ended(before, &gone, id, &environment, &none, true, &earlier) {
+            match unmade_ended(
+                Which::Stop,
+                before,
+                &gone,
+                id,
+                &environment,
+                &none,
+                true,
+                &earlier,
+            ) {
                 Completion::Reported(error) => {
                     assert_eq!(error.exit_code(), 1, "{kind:?}");
                     assert_eq!(
@@ -4099,6 +4194,7 @@ mod tests {
         let earlier = Earlier::read(&environment.paths);
         let none = Facts::none(Vec::new());
         match ended_by(
+            Which::Stop,
             Before::Silent { accepted: true },
             &environment,
             &none,
@@ -4159,7 +4255,12 @@ mod tests {
         )
         .await;
         assert_eq!(before_said(&before), "answers");
-        let error = unmade_request(id, &Shown::ipc(&fault), Unmade::Answered(an_answer()));
+        let error = unmade_request(
+            Which::Stop,
+            id,
+            &Shown::ipc(&fault),
+            Unmade::Answered(an_answer()),
+        );
         assert_eq!(error.exit_code(), 3);
         assert!(
             error
@@ -4253,7 +4354,16 @@ mod tests {
             the_deadline(),
         )
         .await;
-        match unmade_ended(before, &closed, id, &environment, &none, true, &earlier) {
+        match unmade_ended(
+            Which::Stop,
+            before,
+            &closed,
+            id,
+            &environment,
+            &none,
+            true,
+            &earlier,
+        ) {
             Completion::Reported(error) => {
                 assert_eq!(error.exit_code(), 1);
                 let said = error.to_string();
@@ -4278,7 +4388,16 @@ mod tests {
             the_deadline(),
         )
         .await;
-        match unmade_ended(before, &fault, id, &environment, &none, true, &earlier) {
+        match unmade_ended(
+            Which::Stop,
+            before,
+            &fault,
+            id,
+            &environment,
+            &none,
+            true,
+            &earlier,
+        ) {
             Completion::Reported(error) => {
                 assert_eq!(error.exit_code(), 3);
                 assert!(
@@ -4399,8 +4518,8 @@ mod tests {
         for fault in own_faults() {
             let why = Shown::ipc(&fault);
             for error in [
-                unmade_request(id, &why, Unmade::OwnFault),
-                unreached(id, &fault, Unmade::OwnFault),
+                unmade_request(Which::Stop, id, &why, Unmade::OwnFault),
+                unreached(Which::Stop, id, &fault, Unmade::OwnFault),
             ] {
                 assert_eq!(error.exit_code(), 3, "{fault}");
                 let said = error.to_string();
@@ -4439,7 +4558,16 @@ mod tests {
                 the_deadline(),
             )
             .await;
-            match unmade_ended(before, &fault, id, &environment, &none, true, &earlier) {
+            match unmade_ended(
+                Which::Stop,
+                before,
+                &fault,
+                id,
+                &environment,
+                &none,
+                true,
+                &earlier,
+            ) {
                 Completion::Reported(error) => {
                     assert_eq!(error.exit_code(), 3, "{fault}");
                     let said = error.to_string();
@@ -4563,8 +4691,15 @@ mod tests {
                 assert_eq!(said(&ended), "not ended, held, not shown", "{look:?}");
                 let said = said_after_the_request(ended, &request);
                 assert_eq!((said.exit, said.stop.word()), (Exit::Unfinished, stop));
-                let words =
-                    words_after_the_request(&said.sentence, &request, &paths, id, None, None);
+                let words = words_after_the_request(
+                    Which::Stop,
+                    &said.sentence,
+                    &request,
+                    &paths,
+                    id,
+                    None,
+                    None,
+                );
                 let error = Exit::Unfinished
                     .failure(words)
                     .expect("a failure that the command reports");
@@ -4696,7 +4831,16 @@ mod tests {
         .await;
         assert_eq!(before_said(&before), "silent");
         assert_eq!(supplied.start.elapsed(), END_BOUND);
-        match unmade_ended(before, &closed, id, &environment, &none, true, &earlier) {
+        match unmade_ended(
+            Which::Stop,
+            before,
+            &closed,
+            id,
+            &environment,
+            &none,
+            true,
+            &earlier,
+        ) {
             Completion::Reported(error) => {
                 assert_eq!(error.exit_code(), 1);
                 assert!(
@@ -5637,7 +5781,16 @@ mod tests {
             the_deadline(),
         )
         .await;
-        match unmade_ended(before, &closed, id, &environment, &none, true, &earlier) {
+        match unmade_ended(
+            Which::Stop,
+            before,
+            &closed,
+            id,
+            &environment,
+            &none,
+            true,
+            &earlier,
+        ) {
             Completion::Reported(error) => {
                 assert_eq!(error.exit_code(), 3);
                 assert_eq!(
@@ -5780,6 +5933,7 @@ mod tests {
         let earlier = Earlier::read(&environment.paths);
         let none = Facts::none(Vec::new());
         let reported = |before: Before, error: &kr_ipc::IpcError| match unmade_ended(
+            Which::Stop,
             before,
             error,
             id,
@@ -7274,6 +7428,7 @@ mod tests {
                 let said = said_after_the_request(end, &request);
                 let old = (round.process != Process::NoIdentity).then(asked_process);
                 let text = words_after_the_request(
+                    Which::Stop,
                     &said.sentence,
                     &request,
                     &environment,
@@ -7775,7 +7930,7 @@ mod tests {
             assert_eq!(code_of(exit), code);
         }
         let id = an_environment();
-        let error = unmade_request(id, &Shown::said("a failure"), Unmade::OwnFault);
+        let error = unmade_request(Which::Stop, id, &Shown::said("a failure"), Unmade::OwnFault);
         assert_eq!(error.exit_code(), code_of(Exit::Unavailable));
     }
 
