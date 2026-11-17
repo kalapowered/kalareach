@@ -1179,6 +1179,8 @@ pub async fn phone_paired_with(host: &Host, owner: &DeviceKeys, rights: &[Action
 pub struct LinkControl {
     /// How many connections to a paired host were asked for.
     asked: std::sync::atomic::AtomicUsize,
+    /// The pool that the connections of the device this governs stand on.
+    pool: Mutex<Option<Arc<kr_client::pairing::link::EndpointPool>>>,
     state: Mutex<LinkState>,
     /// Told each time a connection has presented its lease.
     presentations: tokio::sync::Notify,
@@ -1297,6 +1299,26 @@ impl LinkControl {
     /// How many connections have been asked for, held ones included.
     pub fn asked(&self) -> usize {
         self.asked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The relays in the device's one endpoint's relay map now, as the pool the connections stand
+    /// on holds them: none before the device has dialled a host.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the control governs no device.
+    pub async fn relay_urls(&self) -> std::collections::BTreeSet<String> {
+        let pool = self
+            .pool
+            .lock()
+            .expect("the record")
+            .clone()
+            .expect("the control governs a device");
+        pool.relay_urls()
+            .await
+            .into_iter()
+            .map(|url| url.to_string())
+            .collect()
     }
 
     /// How many connections are held now.
@@ -2414,7 +2436,8 @@ impl kr_client::pairing::link::HostLink for ControlledLink {
 /// `parts`, with the connections to a paired host governed by `control`.
 pub fn govern(parts: &mut Parts, control: &Arc<LinkControl>) {
     let control = Arc::clone(control);
-    parts.link = Some(Box::new(move |own| {
+    parts.link = Some(Box::new(move |own, pool| {
+        *control.pool.lock().expect("the record") = Some(pool);
         Arc::new(ControlledLink { own, control }) as Arc<dyn kr_client::pairing::link::HostLink>
     }));
 }
