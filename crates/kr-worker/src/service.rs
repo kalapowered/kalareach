@@ -1737,8 +1737,7 @@ impl WorkerService {
     /// The guard is taken on the calling thread and has to be dropped on it.
     #[cfg(feature = "testing")]
     pub fn hold_the_dispatch_boundary(&self) -> DispatchGuard<'_> {
-        self.dispatch
-            .lock()
+        self.take_boundary()
             .expect("the dispatch barrier is not poisoned")
     }
 
@@ -1746,11 +1745,10 @@ impl WorkerService {
     /// maintenance does on its next tick, for this host's own tests.
     #[cfg(feature = "testing")]
     pub fn fence_what_is_owed_for_tests(&self) {
-        let _barrier = self
-            .dispatch
-            .lock()
+        let barrier = self
+            .take_boundary()
             .expect("the dispatch barrier is not poisoned");
-        self.fence_what_is_owed();
+        self.fence_what_is_owed(&barrier);
     }
 
     /// How many controller connections this worker has answered the hello of so far, for this
@@ -2504,8 +2502,7 @@ impl WorkerService {
             .load(std::sync::atomic::Ordering::SeqCst)
         {
             return Some(
-                self.dispatch
-                    .lock()
+                self.take_boundary()
                     .expect("the dispatch barrier is not poisoned"),
             );
         }
@@ -2518,8 +2515,7 @@ impl WorkerService {
                 *armed = None;
                 drop(armed);
                 Some(
-                    self.dispatch
-                        .lock()
+                    self.take_boundary()
                         .expect("the dispatch barrier is not poisoned"),
                 )
             }
@@ -2804,8 +2800,7 @@ impl WorkerService {
             let service = Arc::clone(&self);
             let _ = tokio::task::spawn_blocking(move || {
                 let _barrier = service
-                    .dispatch
-                    .lock()
+                    .take_boundary()
                     .expect("the dispatch barrier is not poisoned");
                 for (attachment_id, epoch) in ended {
                     service.runtime.session().fence_granted_input(
@@ -2948,15 +2943,14 @@ impl WorkerService {
             // puts the revalidation a discontinuity owes *before* the host serves a mutation,
             // and this barrier is what "before" means here: a mutation either sees the
             // revalidation completed or waits for it.
-            let _barrier = self
-                .dispatch
-                .lock()
+            let barrier = self
+                .take_boundary()
                 .expect("the dispatch barrier is not poisoned");
-            self.revalidate_time();
+            self.revalidate_time(&barrier);
             // A revocation this worker was told about while it was dispatching something. The
             // announcement was refused rather than queued, and this is what makes the fence
             // happen anyway: the daemon's next announcement finds it done.
-            self.fence_what_is_owed();
+            self.fence_what_is_owed(&barrier);
             // One look at the session, and the lock released before anything else asks for
             // it. Collection records its own failure, so nothing here needs the lock a second
             // time to say that it failed.
@@ -3097,8 +3091,7 @@ impl WorkerService {
     pub fn recover_storage_now(&self) {
         {
             let _barrier = self
-                .dispatch
-                .lock()
+                .take_boundary()
                 .expect("the dispatch barrier is not poisoned");
             self.runtime.session().recover_journal();
         }
@@ -3142,7 +3135,7 @@ impl WorkerService {
     /// suspend-aware continuous clock its deadline was set on. A window that is not is retired
     /// here, so the next request presenting it finds it gone rather than being decided against a
     /// clock that moved.
-    fn revalidate_time(&self) {
+    fn revalidate_time(&self, _barrier: &DispatchGuard<'_>) {
         let found = self.runtime.session().observe_time();
         if !found.any() {
             return;
@@ -5227,7 +5220,7 @@ impl WorkerService {
 
     /// Takes the dispatch boundary when nobody holds it, and never waits.
     fn try_boundary(&self) -> Option<DispatchGuard<'_>> {
-        match self.dispatch.try_lock() {
+        match self.try_take_boundary() {
             Ok(barrier) => Some(barrier),
             Err(std::sync::TryLockError::WouldBlock) => None,
             Err(std::sync::TryLockError::Poisoned(_)) => {
@@ -5269,7 +5262,7 @@ impl WorkerService {
         nonce: &Nonce256,
         token: &kr_protocol::worker::ControllerGenerationToken,
     ) -> Tried<ControlFrame> {
-        let Some(_barrier) = self.try_boundary() else {
+        let Some(barrier) = self.try_boundary() else {
             #[cfg(feature = "testing")]
             self.presentation_tries
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -5287,7 +5280,7 @@ impl WorkerService {
             if state.peer_has_gone() {
                 return Tried::PeerGone;
             }
-            Tried::Done(self.accept_generation(state, nonce, token))
+            Tried::Done(self.accept_generation(state, nonce, token, &barrier))
         })
     }
 
@@ -5365,6 +5358,7 @@ impl WorkerService {
         state: &mut ConnectionState,
         nonce: &Nonce256,
         token: &kr_protocol::worker::ControllerGenerationToken,
+        _barrier: &DispatchGuard<'_>,
     ) -> ControlFrame {
         // One lock for the whole decision. Reading the accepted generation, checking the token
         // against it and installing the new generation with the connection that presented it
@@ -5674,7 +5668,7 @@ impl WorkerService {
         }
         #[cfg(feature = "testing")]
         let _held_by_a_test = self.hold_the_boundary_for_this_announcement();
-        let Ok(_barrier) = self.dispatch.try_lock() else {
+        let Ok(barrier) = self.try_take_boundary() else {
             #[cfg(feature = "testing")]
             self.refused_for_the_boundary
                 .send_modify(|refusals| *refusals += 1);
@@ -5746,7 +5740,7 @@ impl WorkerService {
             }
         };
         let reach = joined.applied_by_a_worker_at(held, notice.revision);
-        if let Err(error) = self.fence(notice.revision, reach) {
+        if let Err(error) = self.fence(notice.revision, reach, &barrier) {
             // The acknowledgement is what the daemon waits on before it calls a revocation
             // complete. Reporting success while the fence did not finish would answer it wrongly;
             // what the pass did name is in the journal under this revision, so the next
@@ -5806,6 +5800,7 @@ impl WorkerService {
         &self,
         revision: kr_protocol::ids::AuthorityRevision,
         reach: &kr_protocol::worker::RevisionReach,
+        _barrier: &DispatchGuard<'_>,
     ) -> Result<()> {
         let ran_at = kr_ipc::now_ms();
         // Which controller this host answers to, because what a *previous* one collected is not
@@ -5880,7 +5875,7 @@ impl WorkerService {
     ///
     /// The caller holds the dispatch boundary. A failure is left recorded rather than reported: the
     /// revision stays owed, and the next tick tries again.
-    fn fence_what_is_owed(&self) {
+    fn fence_what_is_owed(&self, barrier: &DispatchGuard<'_>) {
         let owed = {
             let held = self.runtime.input().lock().revision();
             let authority = self
@@ -5898,7 +5893,7 @@ impl WorkerService {
             // this worker has not fenced: one that does not join up with what it has fenced is
             // the whole host's.
             let reach = owed.reach.applied_by_a_worker_at(held, owed.revision);
-            let _ = self.fence(owed.revision, reach);
+            let _ = self.fence(owed.revision, reach, barrier);
         }
     }
 
@@ -6914,7 +6909,7 @@ impl WorkerService {
 
     /// The second pass of an action that was accepted and prepared, inside the dispatch boundary,
     /// which the caller holds: `barrier` is the caller's guard, borrowed so that this cannot be
-    /// called without the boundary.
+    /// called without a boundary, and checked first to be the guard of this service's own.
     ///
     /// Everything the first pass checked is checked again, now, inside the boundary. First what
     /// the connection holds: the authority it was admitted under. Then the action's own receipt,
@@ -6935,6 +6930,10 @@ impl WorkerService {
         preparation: Made,
         barrier: &DispatchGuard<'_>,
     ) -> Result<Answered> {
+        assert!(
+            barrier.is_of(&self.dispatch),
+            "the dispatch barrier is the one of this service"
+        );
         let mutation = &pending.mutation;
         let caller = &pending.caller;
         let method = mutation.method.method().ok_or_else(|| {
@@ -6943,7 +6942,7 @@ impl WorkerService {
             )
         })?;
         self.wait_inside_boundary();
-        self.revalidate_time();
+        self.revalidate_time(barrier);
         if let Err(error) = self.check_authority(&state.facts) {
             return Err(self.reject_accepted(
                 caller,
@@ -7634,7 +7633,8 @@ impl WorkerService {
     }
 
     /// Admits a mutation and carries it out, inside the dispatch boundary, which the caller holds:
-    /// `barrier` is the caller's guard, borrowed so that this cannot be called without the boundary.
+    /// `barrier` is the caller's guard, borrowed so that this cannot be called without a boundary,
+    /// and checked first to be the guard of this service's own.
     ///
     /// Everything from here to the recorded outcome happens inside the barrier. The authority this
     /// request was admitted under cannot change underneath it, and two mutations cannot interleave
@@ -7650,12 +7650,16 @@ impl WorkerService {
         freshness: Freshness,
         barrier: &DispatchGuard<'_>,
     ) -> Result<Answered> {
+        assert!(
+            barrier.is_of(&self.dispatch),
+            "the dispatch barrier is the one of this service"
+        );
         let actor_id = caller.actor_id.clone();
         self.wait_inside_boundary();
         // Section 9's time contract, before anything whose answer depends on an expiry. A wake, a
         // reboot or a step of the wall clock is revalidated here, on this mutation's own way
         // through, rather than left for a maintenance tick that may be a minute away.
-        self.revalidate_time();
+        self.revalidate_time(barrier);
         // Inside the barrier, and before anything durable: an action the daemon validated under an
         // authority revision this worker has since installed past is an action whose authority has
         // been withdrawn. The daemon takes its lease before it forwards, but a request can arrive

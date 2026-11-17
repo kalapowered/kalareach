@@ -157,17 +157,23 @@ only settled_utc_ms crates/kr-worker/src/local_gate.rs check 1
 # The guards held where a call is made, from the text before it: `SES` is the session that a
 # function is given or takes before the call. A binding `_` holds nothing, and a `let` that `if`,
 # `while` or `&&` precedes is not read.
-# The dispatch barrier has no row: the compiler holds it. The first admission, the prepared path,
-# the accept's hold, the dispatch after it and the pass take a borrow of the barrier's guard as a
-# parameter, the pass keeps it, and only the module that holds the boundary can make a guard, so a
-# caller that does not hold the barrier does not compile. What the compiler does not say is who
-# calls these private methods: an `only` row, not a `caller` row, keeps a call from any other
-# function out. A `caller` row reads only the file that it names, and a function of a child module
-# of the service can call these private methods; an `only` row reads every file of this crate's
-# `src`, so a second caller in any file fails it.
+# The compiler holds the dispatch barrier's guard. The first admission, the prepared path, the
+# accept's hold, the dispatch after it and the pass take a borrow of a guard as a parameter, the
+# pass keeps it, and only the module that holds the boundary can make a guard or take a boundary,
+# so a caller that holds no guard does not compile. The compiler does not say whose boundary the
+# guard holds (the two entries check that when they run) or who calls these private methods: an
+# `only` row, not a `caller` row, keeps a call from any other function out. A `caller` row reads
+# only the file that it names, and a function of a child module of the service can call these
+# private methods; an `only` row reads every file of this crate's `src`, so a second caller in any
+# file fails it.
+# The reader adds one narrow reading of the barrier, `TAKE`: a call of `take_boundary` or
+# `try_take_boundary` before a `held` row's call, in the same function, bound or not, dropped or
+# not. A row that says `none` refuses it, so no second take stands under the held barrier (it would
+# wait on itself), and refuses a session held there: the two rows of the entries' callers say so.
 # The first admission asks the authority and the limits under no guard that the reader sees, the
 # envelope under a session of its own, and takes the session for the limits itself.
 only receipted crates/kr-worker/src/service.rs receipt_once 1
+held crates/kr-worker/src/service.rs receipt_once receipted none
 only admit_and_dispatch crates/kr-worker/src/service.rs receipted 1
 held crates/kr-worker/src/service.rs receipted authority none
 held crates/kr-worker/src/service.rs receipted envelope SES
@@ -241,6 +247,7 @@ site crates/kr-worker/src/broker/bridge.rs attested_thread state 1
 only dispatch_accepted crates/kr-worker/src/service.rs admit_and_dispatch 1
 only dispatch_accepted crates/kr-worker/src/service.rs continue_prepared 1
 only continue_prepared crates/kr-worker/src/service.rs prepared_once 1
+held crates/kr-worker/src/service.rs prepared_once continue_prepared none
 held crates/kr-worker/src/service.rs continue_prepared dispatch_accepted SES
 supplies crates/kr-worker/src/service.rs admit_and_dispatch dispatch_accepted 1 session
 supplies crates/kr-worker/src/service.rs continue_prepared dispatch_accepted 1 session
