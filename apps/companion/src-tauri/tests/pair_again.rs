@@ -44,8 +44,8 @@ use support::{Phone, WATCHDOG, phone_paired_with};
 /// What happened to a phone's attempt to pair again.
 #[derive(Debug)]
 enum Outcome {
-    /// A command of the page's refused the attempt before it began: the command and its refusal.
-    Refused(&'static str, Value),
+    /// A command of the page's refused the attempt before it began.
+    Refused(Value),
     /// The attempt ended in a failure of this kind.
     Ended(String),
     /// The attempt ended in a pairing.
@@ -207,13 +207,12 @@ async fn attempt_in(phone: &Phone, states: &[&str]) -> Value {
     let end = Instant::now() + WATCHDOG;
     loop {
         let view = phone.companion.call("pairing_view", json!({}));
-        if let Ok(view) = &view {
-            if states
+        if let Ok(view) = &view
+            && states
                 .iter()
                 .any(|wanted| view["state"]["state"] == *wanted)
-            {
-                return view["state"].clone();
-            }
+        {
+            return view["state"].clone();
         }
         assert!(
             Instant::now() < end,
@@ -276,10 +275,10 @@ async fn attempt(
     phone.paste.copy(qr_text.as_str(), false);
     let id = invited.invitation_id;
     if let Err(error) = phone.companion.call("pairing_paste", json!({})) {
-        return (Outcome::Refused("pairing_paste", error), id);
+        return (Outcome::Refused(error), id);
     }
     if let Err(error) = phone.companion.call("pairing_start_read", json!({})) {
-        return (Outcome::Refused("pairing_start_read", error), id);
+        return (Outcome::Refused(error), id);
     }
     let reached = attempt_in(phone, &["awaiting_approval", "paired", "ended"]).await;
     if reached["state"] != "awaiting_approval" {
@@ -420,7 +419,7 @@ async fn a_phone_that_forgot_a_host_that_still_lists_it_is_told_so() {
     let (control, unused) = attempt(&phone, &host, &owner, viewer()).await;
     let stopped = match &control {
         Outcome::Ended(kind) => kind.as_str(),
-        Outcome::Refused(_, error) => error["kind"].as_str().unwrap_or("<no kind>"),
+        Outcome::Refused(error) => error["kind"].as_str().unwrap_or("<no kind>"),
         Outcome::Paired => "paired",
     };
     assert_eq!(
