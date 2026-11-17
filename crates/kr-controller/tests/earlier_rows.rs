@@ -691,3 +691,270 @@ fn kr_req_10_51_a_retained_earlier_answer_goes_back_unchanged_and_names_nothing_
         }
     }
 }
+
+/// The device table as a registry at schema version 16 held it: an endpoint identity unique for
+/// ever. `oldest` leaves out the five columns that were added to it later.
+fn earlier_device_table(oldest: bool) -> String {
+    let later = if oldest {
+        ""
+    } else {
+        ", expired_at_ms INTEGER, committed_invitation_id BLOB, notification_preview BLOB,
+           stored_envelope_key BLOB"
+    };
+    format!(
+        "CREATE TABLE network_devices (
+             device_id BLOB PRIMARY KEY NOT NULL,
+             endpoint_id BLOB NOT NULL UNIQUE,
+             device_key_revision INTEGER NOT NULL,
+             authorisation_key BLOB NOT NULL,
+             device_name TEXT NOT NULL,
+             platform TEXT NOT NULL,
+             grant_id BLOB NOT NULL,
+             grant BLOB NOT NULL,
+             paired_at_ms INTEGER NOT NULL,
+             revoked_at_ms INTEGER{later}
+         );
+         CREATE INDEX network_devices_endpoint ON network_devices (endpoint_id);
+         CREATE TRIGGER network_devices_authorisation_key_fixed
+             BEFORE UPDATE OF authorisation_key ON network_devices
+             WHEN NEW.authorisation_key IS NOT OLD.authorisation_key
+         BEGIN
+             SELECT RAISE(ABORT, 'a device''s authorisation key is fixed for its identity');
+         END;"
+    )
+}
+
+/// Makes the registry file a build that wrote schema version `version` left: a registry as this
+/// build makes it, with its device table put back to the earlier shape and two rows in it, a live
+/// one for endpoint `0x31` and a revoked one for endpoint `0x32`, each holding the earlier grant.
+fn registry_left_at(path: &Path, version: i64, oldest: bool) {
+    let environment = kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([7; 16]));
+    drop(kr_controller::registry::Registry::open(path, environment).expect("a registry"));
+    let grant = earlier("network_devices.grant").empty;
+    let connection = rusqlite::Connection::open(path).expect("the registry opens");
+    connection
+        .execute_batch("DROP INDEX network_devices_live_endpoint; DROP TABLE network_devices;")
+        .expect("the table goes");
+    connection
+        .execute_batch(&earlier_device_table(oldest))
+        .expect("the earlier table");
+    for (device, endpoint, revoked) in [(0xa1_u8, 0x31_u8, None), (0xa2, 0x32, Some(5_i64))] {
+        connection
+            .execute(
+                "INSERT INTO network_devices (device_id, endpoint_id, device_key_revision,
+                     authorisation_key, device_name, platform, grant_id, grant, paired_at_ms,
+                     revoked_at_ms)
+                 VALUES (?1, ?2, 1, ?3, 'a phone', 'android', ?4, ?5, 1, ?6)",
+                rusqlite::params![
+                    [device; 16].as_slice(),
+                    [endpoint; 32].as_slice(),
+                    [endpoint.wrapping_add(1); 32].as_slice(),
+                    [device; 16].as_slice(),
+                    grant,
+                    revoked,
+                ],
+            )
+            .expect("an earlier row");
+    }
+    connection
+        .execute("UPDATE schema_version SET version = ?1", [version])
+        .expect("the version");
+}
+
+fn recorded_version(path: &Path) -> i64 {
+    rusqlite::Connection::open(path)
+        .expect("the registry opens")
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .expect("a version")
+}
+
+/// What the file says of `network_devices` and what hangs on it, in a fixed order.
+fn device_schema(path: &Path) -> Vec<(String, String, String)> {
+    let connection = rusqlite::Connection::open(path).expect("the registry opens");
+    let mut statement = connection
+        .prepare(
+            "SELECT type, name, COALESCE(sql, '') FROM sqlite_master
+             WHERE tbl_name LIKE 'network_devices%' ORDER BY type, name",
+        )
+        .expect("the schema");
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("rows")
+        .collect::<Result<_, _>>()
+        .expect("every row")
+}
+
+fn open_registry(path: &Path) -> kr_controller::error::Result<kr_controller::registry::Registry> {
+    let environment = kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([7; 16]));
+    kr_controller::registry::Registry::open(path, environment)
+}
+
+/// A registry at schema version 16, with the device table as it was, is brought to the version
+/// this build writes in one step: both rows read back as they were, the key stays fixed, the
+/// endpoint identity of a revoked row is free for a new record and that of a live row is not, and
+/// the file's schema equals a new file's.
+#[test]
+fn a_registry_at_16_is_rebuilt_so_an_ended_endpoint_identity_is_free() {
+    for oldest in [false, true] {
+        let temp = tempfile::tempdir().expect("a directory on the internal disk");
+        let path = temp.path().join("registry.db");
+        registry_left_at(&path, 16, oldest);
+        drop(open_registry(&path).expect("brought forward"));
+        assert_eq!(
+            recorded_version(&path),
+            kr_controller::registry::SCHEMA_VERSION,
+            "oldest shape {oldest}"
+        );
+        let connection = rusqlite::Connection::open(&path).expect("the registry opens");
+        let rows: Vec<(Vec<u8>, Vec<u8>, Option<i64>, Vec<u8>)> = connection
+            .prepare(
+                "SELECT device_id, endpoint_id, revoked_at_ms, grant FROM network_devices
+                 ORDER BY device_id",
+            )
+            .expect("a read")
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .expect("rows")
+            .collect::<Result<_, _>>()
+            .expect("every row");
+        let grant = earlier("network_devices.grant").empty;
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    [0xa1; 16].to_vec(),
+                    [0x31; 32].to_vec(),
+                    None,
+                    grant.clone()
+                ),
+                ([0xa2; 16].to_vec(), [0x32; 32].to_vec(), Some(5), grant),
+            ],
+            "oldest shape {oldest}: every row is carried across unchanged"
+        );
+        assert!(
+            connection
+                .execute("UPDATE network_devices SET authorisation_key = x'00'", [])
+                .is_err(),
+            "the key of a device stays fixed after the rebuild"
+        );
+        let insert = |device: u8, endpoint: u8| {
+            connection.execute(
+                "INSERT INTO network_devices (device_id, endpoint_id, device_key_revision,
+                     authorisation_key, device_name, platform, grant_id, grant, paired_at_ms)
+                 VALUES (?1, ?2, 1, x'01', 'a phone', 'android', ?1, x'', 2)",
+                rusqlite::params![[device; 16].as_slice(), [endpoint; 32].as_slice()],
+            )
+        };
+        assert!(
+            insert(0xb1, 0x31).is_err(),
+            "a live row still holds its endpoint identity"
+        );
+        assert!(insert(0xb2, 0x32).is_ok(), "a revoked row does not");
+        assert!(
+            device_schema(&path)
+                .iter()
+                .all(|(_, name, _)| name != "network_devices_superseded"),
+            "no half of the rebuild is left behind"
+        );
+        // The migrated file's schema equals a new file's.
+        let fresh = temp.path().join("fresh.db");
+        drop(open_registry(&fresh).expect("a new registry"));
+        assert_eq!(
+            device_schema(&path),
+            device_schema(&fresh),
+            "oldest shape {oldest}"
+        );
+    }
+}
+
+/// A second open of a migrated registry changes nothing, and a registry at 18 is not rebuilt.
+#[test]
+fn a_registry_that_was_brought_forward_is_not_rebuilt_again() {
+    let temp = tempfile::tempdir().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.db");
+    registry_left_at(&path, 16, false);
+    drop(open_registry(&path).expect("brought forward"));
+    let (schema, count): (_, i64) = (
+        device_schema(&path),
+        rusqlite::Connection::open(&path)
+            .expect("the registry opens")
+            .query_row("SELECT COUNT(*) FROM network_devices", [], |row| row.get(0))
+            .expect("a count"),
+    );
+    drop(open_registry(&path).expect("opened again"));
+    assert_eq!(device_schema(&path), schema);
+    assert_eq!(
+        rusqlite::Connection::open(&path)
+            .expect("the registry opens")
+            .query_row("SELECT COUNT(*) FROM network_devices", [], |row| row.get(0))
+            .ok(),
+        Some(count)
+    );
+}
+
+/// A rebuild that fails after it began leaves the file at its version, with the table it had and
+/// every row in it, and the next open, once the fault is gone, brings it forward.
+#[test]
+fn a_rebuild_that_fails_leaves_the_registry_as_it_was() {
+    let temp = tempfile::tempdir().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.db");
+    registry_left_at(&path, 16, false);
+    // The last statement of the rebuild makes an index of the table under this name, after the
+    // rows were copied and the old table dropped: another table already holds the name.
+    {
+        let connection = rusqlite::Connection::open(&path).expect("the registry opens");
+        connection
+            .execute_batch(
+                "DROP INDEX network_devices_endpoint;
+                 CREATE TABLE in_the_way (endpoint BLOB);
+                 CREATE INDEX network_devices_endpoint ON in_the_way (endpoint);",
+            )
+            .expect("the fault");
+    }
+    let before = device_schema(&path);
+    assert!(open_registry(&path).is_err(), "the registry does not open");
+    assert_eq!(recorded_version(&path), 16, "the version was not written");
+    let after = device_schema(&path);
+    assert!(
+        after.iter().any(|(_, name, sql)| name == "network_devices"
+            && sql.contains("endpoint_id BLOB NOT NULL UNIQUE")),
+        "the earlier table is intact: {after:?}"
+    );
+    assert!(
+        after
+            .iter()
+            .all(|(_, name, _)| name != "network_devices_superseded"),
+        "the renamed table is not left behind"
+    );
+    assert_eq!(
+        rusqlite::Connection::open(&path)
+            .expect("the registry opens")
+            .query_row("SELECT COUNT(*) FROM network_devices", [], |row| row
+                .get::<_, i64>(0))
+            .ok(),
+        Some(2),
+        "both rows are still there"
+    );
+    let _ = before;
+    rusqlite::Connection::open(&path)
+        .expect("the registry opens")
+        .execute_batch("DROP INDEX network_devices_endpoint; DROP TABLE in_the_way;")
+        .expect("the fault goes");
+    drop(open_registry(&path).expect("brought forward once the fault is gone"));
+    assert_eq!(
+        recorded_version(&path),
+        kr_controller::registry::SCHEMA_VERSION
+    );
+}
+
+/// No release wrote schema version 17, so a registry that records it is refused as such.
+#[test]
+fn a_registry_at_17_is_refused_as_a_version_no_release_wrote() {
+    let temp = tempfile::tempdir().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.db");
+    registry_left_at(&path, 17, false);
+    let error = open_registry(&path).err().expect("refused").to_string();
+    assert!(error.contains("schema version 17"), "{error}");
+    assert_eq!(recorded_version(&path), 17, "nothing was changed");
+}
