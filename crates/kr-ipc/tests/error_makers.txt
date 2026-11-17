@@ -27,6 +27,7 @@ crates/kr-cli/src/startup.rs | Log::open | Io | 1 | own | own | - | agrees
 crates/kr-cli/src/startup.rs | Log::output | Io | 1 | own | own | - | agrees
 crates/kr-cli/src/startup.rs | nothing_listening | Socket | 1 | macro | pattern | - | -   # a matches! on the failure; no value is made
 crates/kr-client/src/chunks.rs | LocalCarrier::exchange | Frame | 1 | macro | pattern | - | -   # a matches! in a guard; no value is made
+crates/kr-client/src/ipc.rs | says_the_peer_has_gone | PeerClosed | 1 | macro | pattern | - | -   # a matches! on a write failure; no value is made
 crates/kr-client/src/pairing/clock.rs | write_record | Io | 1 | own | own | - | agrees
 crates/kr-controller/src/attempt.rs | Marker::write | Io | 1 | own | own | - | agrees
 crates/kr-controller/src/net/proxy.rs | WorkerProxy::call | UnexpectedMessage | 1 | arrived | reply | - | agrees
