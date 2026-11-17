@@ -895,8 +895,10 @@ mod tests {
         }
     }
 
-    fn a_kept() -> (tempfile::TempDir, Kept) {
-        let directory = tempfile::tempdir().expect("a directory");
+    /// A record's file in an owner-only directory, as the host's own state root is, so that the
+    /// record read back is not refused for the access list a plain temporary directory inherits.
+    fn a_kept() -> (kr_ipc::testing::PrivateTempDir, Kept) {
+        let directory = kr_ipc::testing::PrivateTempDir::create();
         let file = restored::file_beside(&directory.path().join("registry.sqlite"));
         (directory, Kept::new(file))
     }

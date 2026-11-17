@@ -619,8 +619,12 @@ mod tests {
             .collect()
     }
 
-    fn tree() -> (tempfile::TempDir, PathBuf) {
-        let directory = tempfile::tempdir().expect("a directory");
+    /// A record's file in an owner-only directory, as the host's own state root is: on Windows a
+    /// file takes the access list of its directory, and the reader refuses a list that names
+    /// another account, which a plain temporary directory inherits where the temporary folder's
+    /// list does.
+    fn tree() -> (kr_ipc::testing::PrivateTempDir, PathBuf) {
+        let directory = kr_ipc::testing::PrivateTempDir::create();
         let file = file_beside(&directory.path().join("registry.sqlite"));
         (directory, file)
     }
