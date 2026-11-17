@@ -492,6 +492,10 @@ struct Issuing {
     /// The action that issues it and the digest of that whole mutation, recorded with the
     /// invitation so a retry is recognised after a restart without anything secret being written.
     action: (ActionId, Digest256),
+    /// The moment the issued invitation advertises that it stays open until. It is read from the
+    /// clock once the invitation exists, which is later than the stamp of the issue in `terms`, so
+    /// it is carried here and not rebuilt from that stamp.
+    advertised: std::sync::OnceLock<TimestampMs>,
 }
 
 impl InvitationRows {
@@ -521,8 +525,21 @@ impl InvitationRows {
             directory: Arc::clone(&self.directory),
             lifetimes: Arc::clone(&self.lifetimes),
             refusal: Arc::clone(&self.refusal),
-            issue: Some(Arc::new(Issuing { terms, action })),
+            issue: Some(Arc::new(Issuing {
+                terms,
+                action,
+                advertised: std::sync::OnceLock::new(),
+            })),
             admission: WriteAdmission::default(),
+        }
+    }
+
+    /// Records the moment the invitation this handle issued advertises that it stays open until,
+    /// once, for the words a refused pairing gives the person who issued it. A handle that issues
+    /// nothing, and a second call, record nothing.
+    pub fn advertise(&self, expires_at_ms: TimestampMs) {
+        if let Some(issuing) = self.issue.as_deref() {
+            let _ = issuing.advertised.set(expires_at_ms);
         }
     }
 
@@ -996,6 +1013,10 @@ impl InvitationStore for InvitationRows {
         let action = self
             .admission
             .action_for(&ActionSubject::Confirmed(commitment.invitation_id));
+        let advertised = self
+            .issue
+            .as_deref()
+            .and_then(|issuing| issuing.advertised.get().copied());
         // Before the transaction, with the directory's connection not held: the end of a grant
         // that ran out is written through the lifetimes' own path, so whoever waits on it is told
         // once, and the transaction then finds the record's mark on record.
@@ -1017,6 +1038,7 @@ impl InvitationStore for InvitationRows {
                     expected,
                     next,
                     commitment,
+                    advertised,
                 )?;
                 // The pairing is the confirmation's effect: recorded with it, and only when it is
                 // written.
@@ -1096,6 +1118,9 @@ impl InvitationStore for InvitationRows {
 }
 
 /// Commits one pairing: everything section 10 writes together, or nothing.
+///
+/// `advertised` is the moment the invitation advertised that it stays open until, which the words
+/// of a refusal give to the person who issued it.
 fn commit_pairing(
     transaction: &Connection,
     lifetimes: &GrantLifetimes,
@@ -1103,6 +1128,7 @@ fn commit_pairing(
     expected: &InvitationRecord,
     next: &InvitationRecord,
     commitment: &PairingCommitment,
+    advertised: Option<TimestampMs>,
 ) -> Result<TransitionOutcome> {
     let current = read_record(transaction, expected.invitation_id)?
         .ok_or_else(|| ControllerError::registry("that invitation has no record"))?;
@@ -1137,8 +1163,14 @@ fn commit_pairing(
     // replacement waits for the withdrawal that ended the earlier record to finish its barrier.
     // Nothing is written but the end of a grant that ran out, which is a fact that stays.
     let record = device_record(commitment).map_err(ControllerError::registry)?;
-    let claim = claim_endpoint(transaction, Some(lifetimes), &record.endpoint_id)?
-        .map_err(|claimed| claimed.into_error_until(Some(&open_until(row.terms.issued_at_ms))))?;
+    let claim =
+        claim_endpoint(transaction, Some(lifetimes), &record.endpoint_id)?.map_err(|claimed| {
+            claimed.into_error_until(
+                advertised
+                    .map(|expires_at_ms| utc_moment(expires_at_ms.get()))
+                    .as_deref(),
+            )
+        })?;
     // The confirmation is spent, and its signer's authority read, before the candidate's own row
     // exists: a candidate presenting the signer's key must not be what makes that signer look like
     // an owner device. It is spent only while the record that answered it stands.
@@ -1220,41 +1252,21 @@ fn commit_pairing(
     Ok(TransitionOutcome::Written)
 }
 
-/// The moment an invitation stays open until, as the person who issued it reads a moment: the
-/// date and time in UTC, in the form the command line shows every moment in (`2026-01-01 00:00:00
-/// UTC`).
-fn open_until(issued_at_ms: TimestampMs) -> String {
-    utc_moment(
-        issued_at_ms
-            .get()
-            .saturating_add(kr_protocol::pairing::INVITATION_LIFETIME_MS),
-    )
-}
-
-/// A moment in UTC milliseconds as `YYYY-MM-DD HH:MM:SS UTC`.
+/// A moment in UTC milliseconds as a person reads it, `YYYY-MM-DD HH:MM:SS UTC`: the form the
+/// command line shows every moment in.
 fn utc_moment(milliseconds: u64) -> String {
-    let seconds = milliseconds / 1000;
-    let of_day = seconds % 86_400;
-    // The civil date of a day count since 1970-01-01, by the days-from-civil algorithm's inverse.
-    let days = i64::try_from(seconds / 86_400).unwrap_or(i64::MAX / 2) + 719_468;
-    let era = days.div_euclid(146_097);
-    let of_era = days.rem_euclid(146_097);
-    let year_of_era = (of_era - of_era / 1_460 + of_era / 36_524 - of_era / 146_096) / 365;
-    let day_of_year = of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let shifted_month = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
-    let month = if shifted_month < 10 {
-        shifted_month + 3
-    } else {
-        shifted_month - 9
-    };
-    let year = year_of_era + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} UTC",
-        of_day / 3_600,
-        of_day % 3_600 / 60,
-        of_day % 60
-    )
+    i64::try_from(milliseconds)
+        .ok()
+        .and_then(|milliseconds| jiff::Timestamp::from_millisecond(milliseconds).ok())
+        .map_or_else(
+            || "a time that cannot be shown".to_owned(),
+            |moment| {
+                moment
+                    .to_zoned(jiff::tz::TimeZone::UTC)
+                    .strftime("%Y-%m-%d %H:%M:%S UTC")
+                    .to_string()
+            },
+        )
 }
 
 /// Records `action` inside the caller's transaction, unless its identifier already has a record.
