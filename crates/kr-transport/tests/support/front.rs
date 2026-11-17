@@ -55,11 +55,12 @@ pub const CHUNK: usize = 16 * 1024;
 /// some stops, the window that the front offers once it reads again is smaller than one segment
 /// of the device's side. In the traces of this buffer on Linux, every stop that held the device's
 /// side back had such a window, and every stop that did not had a window of at least one segment.
-/// In those traces the device's side then sent one window-sized piece on each round of its persist
-/// timer, so the bytes that the stop held back drained at about ten KB a second, or slower, for
-/// tens of seconds, and what the device sent to the relay through the front waited that long. A
-/// case that needs the hosts of the stopped relay answered again soon after the resume gives the
-/// front no buffer of its own (`None`), which leaves the system's default.
+/// In those traces the bytes that the stop held back then left the device's side slowly or not at
+/// all: in two, one window-sized piece at a time, about ten KB a second or slower, for tens of
+/// seconds; in the other two, nothing for more than twenty seconds, until the relay closed the
+/// connection. What the device sent to the relay through the front waited that long. A case that
+/// needs the hosts of the stopped relay answered again soon after the resume gives the front no
+/// buffer of its own (`None`), which leaves the system's default.
 pub const STALLED_RECEIVE_BUFFER: u32 = 4096;
 
 impl RelayFront {
@@ -232,8 +233,8 @@ impl RelayFront {
     /// the switch.
     ///
     /// Returns how many bytes the front had read from the device, counted right after the switch.
-    /// Only a read that was under way at the switch can add to it afterwards: one chunk of at most
-    /// [`CHUNK`] bytes on each connection.
+    /// Only a read that was under way at the switch can add to it before the resume: one chunk of
+    /// at most [`CHUNK`] bytes on each connection.
     pub fn stall(&self) -> u64 {
         self.stop.as_ref().expect("a stalling front").set(true);
         self.read_from_device()
