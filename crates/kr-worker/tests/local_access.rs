@@ -1383,6 +1383,11 @@ fn an_attach_checked_before_the_host_restricts_its_owner_does_not_land_after_the
         landing.at_the_acknowledgement.geometry, landing.before.geometry,
         "the attach was not applied before the acknowledgement: its resize is missing"
     );
+    assert_eq!(
+        landing.at_the_acknowledgement.geometry.dimensions,
+        Dimensions::new(100, 30),
+        "the attach's claimed size was not applied before the acknowledgement"
+    );
 }
 
 /// Runs `work` on a runtime of its own, and lets the runtime go without waiting for the threads
@@ -1630,8 +1635,15 @@ async fn the_second_statement_meets_a_pending_withdrawal(
         return Err("the attach never passed the dispatch boundary's check");
     }
 
-    // The host closes it: the statement has changed the gate and waits for the hold.
-    let first = world.machine.lease(2, FAR_MS, FAR_MS);
+    // The host takes access away: the statement has changed the gate and waits for the hold. A
+    // newer daemon's presentation withdraws what a lease held, so for that variant the statement
+    // is a closed one, which a presentation leaves as it is: only the newer daemon's own first
+    // statement can then be answered with or without the sweep.
+    let first = if repeated {
+        world.machine.lease(2, FAR_MS, FAR_MS)
+    } else {
+        closed(2)
+    };
     let (acknowledged, _daemon_end) = start_the_statement(daemon, first);
     let waiting = Arc::clone(&world.service);
     let answered = Arc::clone(&acknowledged);
@@ -1999,8 +2011,9 @@ async fn the_requests_of_a_window_while_the_attach_of_another_is_held()
     let (acknowledged, daemon_end) = start_the_statement(daemon, closed(2));
     let waiting = Arc::clone(&world.service);
     let answered = Arc::clone(&acknowledged);
+    let nothing = Arc::clone(&world);
     if !holds_by(deadline, move || {
-        waiting.statements_waiting_for_tests() >= 2 || is_set(&answered)
+        waiting.statements_waiting_for_tests() >= 2 || is_set(&answered) || nothing.holds_nothing()
     })
     .await
     {
@@ -2312,6 +2325,18 @@ fn a_statement_is_not_acknowledged_while_the_end_of_a_connection_owes_a_detach()
 async fn a_hold_of_the_dispatch_boundary_is_counted_before_the_next_holder_has_the_boundary() {
     let world = Arc::new(world("exec cat", true).await);
     let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+    // The host's own maintenance takes the boundary too, and keeps out of the way for the case.
+    let (maintenance_held, maintenance_end) = std::sync::mpsc::channel();
+    let (release_maintenance, keep) = std::sync::mpsc::channel::<()>();
+    let keeper = Arc::clone(&world);
+    std::thread::spawn(move || {
+        let _maintenance = keeper.service.hold_maintenance();
+        let _ = maintenance_held.send(());
+        let _ = keep.recv();
+    });
+    received_by(deadline, maintenance_end)
+        .await
+        .expect("the maintenance pass was kept out");
     let first = world.service.hold_the_dispatch_boundary();
     let before = world.service.releases_of_the_dispatch_boundary_for_tests();
     let second = Arc::clone(&world);
@@ -2324,12 +2349,15 @@ async fn a_hold_of_the_dispatch_boundary_is_counted_before_the_next_holder_has_t
     let counted = received_by(deadline, seen_end)
         .await
         .expect("the second holder took the boundary");
-    // Another holder of the boundary (the host's own maintenance) may take it between the two, so
-    // the count is at least one more; a count that is not raised stays where it was.
-    assert!(
-        counted > before,
-        "the second holder had the boundary and the first hold was not counted: {counted} after {before}"
+    // Nobody else holds the boundary in between, so the count is exactly one more: a count that is
+    // not raised stays where it was, and one raised after the lock goes can be raised by a holder
+    // that comes between.
+    assert_eq!(
+        counted,
+        before + 1,
+        "the second holder had the boundary and the first hold was not counted once: {counted} after {before}"
     );
+    let _ = release_maintenance.send(());
     world.close();
 }
 
@@ -2780,5 +2808,125 @@ fn an_attach_that_lands_after_the_withdrawal_of_its_connection_leaves_nothing_in
     assert!(
         at_the_answer.attachments.is_empty(),
         "the further statement was answered while the attach's attachment was in the session: {at_the_answer:?}"
+    );
+}
+
+/// What a statement's sweep did to the requests of a second window while a withdrawal that it runs
+/// waited for a lock, on a runtime with one worker thread.
+struct OnOneThread {
+    answered_while_held: bool,
+    /// What the second window's read was answered, or nothing when it was not answered by the bound.
+    read: Option<Result<(), ProtocolError>>,
+    answered_after_the_release: bool,
+    holds_nothing_at_the_end: bool,
+}
+
+/// One window that holds an attachment, a second window that holds nothing, the attention fence's
+/// own lock held on a thread of its own (what a statement of a privacy transition holds across a
+/// read of the journal, and what a withdrawal's unbind waits for), and a statement that closes the
+/// host.
+///
+/// The second window's read is asked once the sweep of the statement waits for the lock. With one
+/// worker thread, a sweep that ran on that thread would stop every other connection's frames, the
+/// refusal of this read among them; the answer is looked for within a short bound that is the
+/// case's own, and the lock is let go before the case says what it found.
+async fn a_sweep_waits_for_a_lock_on_a_runtime_with_one_thread() -> Result<OnOneThread, &'static str>
+{
+    let world = Arc::new(world("exec cat", true).await);
+    let mut holder_window = world.window().await;
+    let mut second = world.window().await;
+    let mut daemon = world.authority(1).await;
+    tell(&mut daemon, open(1)).await;
+    let _attachment = world.attach(&mut holder_window).await;
+    world
+        .read(&mut second)
+        .await
+        .expect("the second window is served under an open host");
+    let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+
+    let (held, held_end) = std::sync::mpsc::channel();
+    let (let_go, go) = std::sync::mpsc::channel::<()>();
+    let holder = Arc::clone(&world);
+    std::thread::spawn(move || {
+        let _fence = holder.service.hold_the_attention_fence_for_tests();
+        let _ = held.send(());
+        let _ = go.recv();
+    });
+    if received_by(deadline, held_end).await.is_none() {
+        return Err("the attention fence's lock was never held");
+    }
+
+    // The statement closes the host. Its sweep withdraws the first window, and the withdrawal waits
+    // for the fence's lock.
+    let (acknowledged, daemon_end) = start_the_statement(daemon, closed(2));
+    let waiting = Arc::clone(&world.service);
+    let answered = Arc::clone(&acknowledged);
+    if !holds_by(deadline, move || {
+        waiting.unbinds_waiting_for_tests() > 0 || is_set(&answered)
+    })
+    .await
+    {
+        let _ = let_go.send(());
+        return Err("the sweep never reached the withdrawal's wait for the fence's lock");
+    }
+    let answered_while_held = is_set(&acknowledged);
+
+    // The second window asks for a read: the gate already refuses it, and the worker's one thread is
+    // there to say so.
+    let bound = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let asking = Arc::clone(&world);
+    let read = ends_by(bound, async move { asking.read(&mut second).await }).await;
+    let _ = let_go.send(());
+
+    let answered_after_the_release = received_by(deadline, daemon_end).await.is_some();
+    let nothing = Arc::clone(&world);
+    let holds_nothing_at_the_end = holds_by(deadline, move || nothing.holds_nothing()).await;
+    drop(holder_window);
+    world.close();
+    Ok(OnOneThread {
+        answered_while_held,
+        read,
+        answered_after_the_release,
+        holds_nothing_at_the_end,
+    })
+}
+
+/// KR-REQ-17.54: a statement's sweep and the writer's withdrawal run off the executor. A withdrawal
+/// waits for the attention fence's lock, which a privacy transition holds across a read of the
+/// journal; on a worker with one executor thread, a sweep that waited on that thread would stop the
+/// refusal that every other local connection is owed under the new statement.
+#[test]
+fn a_sweep_that_waits_for_a_lock_does_not_stop_the_refusals_of_the_other_windows() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(a_sweep_waits_for_a_lock_on_a_runtime_with_one_thread())
+    }));
+    runtime.shutdown_background();
+    let outcome = match outcome {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(step)) => panic!("the schedule did not come about: {step}"),
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
+    assert!(
+        !outcome.answered_while_held,
+        "the statement was acknowledged while its withdrawal waited for the fence's lock"
+    );
+    let read = outcome.read.expect(
+        "the second window's read was not answered within the bound while the sweep waited for a \
+         lock: the sweep stopped the worker's one thread",
+    );
+    let error = read.expect_err("a read is refused under the new statement");
+    assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+    assert!(
+        outcome.answered_after_the_release,
+        "the statement was not acknowledged after the lock was let go"
+    );
+    assert!(
+        outcome.holds_nothing_at_the_end,
+        "the first window still holds something after the acknowledgement"
     );
 }
