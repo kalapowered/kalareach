@@ -5798,6 +5798,8 @@ fn kr_host_restart_starts_a_daemon_where_none_runs_and_says_which() {
         Some(u64::from(host.one_daemon())),
         "the process this command started is the daemon that answers: {said}"
     );
+    assert_eq!(said["serving"], said["started"]["pid"], "{said}");
+    assert_eq!(said["launched"], said["started"], "{said}");
     assert!(host.answers(), "a daemon answers");
     assert_eq!(host.running().len(), 1, "one daemon runs");
     assert!(attempts(&host).is_empty(), "the command removed its record");
@@ -5834,6 +5836,8 @@ fn kr_host_restart_replaces_the_daemon_and_the_new_one_is_the_one_it_started() {
         Some(u64::from(new)),
         "{said}"
     );
+    assert_eq!(said["serving"].as_u64(), Some(u64::from(new)), "{said}");
+    assert_eq!(said["launched"], said["started"], "{said}");
     assert_eq!(host.running(), vec![new], "the old process has gone");
     assert!(host.answers(), "the new daemon answers");
     assert!(attempts(&host).is_empty(), "the command removed its record");
@@ -6931,6 +6935,10 @@ fn a_stop_with_no_answer_is_an_unknown_outcome_and_the_command_looks_at_the_lock
     assert!(output.status.success(), "{stopped}");
     assert_eq!(stop_of(&stopped), "ended", "{stopped}");
     assert!(stopped["pid"].is_null(), "{stopped}");
+    assert!(
+        stopped.get("serving").is_none() && stopped.get("launched").is_none(),
+        "the stop's result has no member of a restart's: {stopped}"
+    );
     daemon.end();
 }
 
@@ -7647,15 +7655,19 @@ fn a_restart_where_the_greeting_fails_because_the_daemon_is_ending_goes_on_to_st
     assert_eq!(output.status.code(), Some(0), "{said}");
     assert_eq!(said["ok"], true, "{said}");
     assert_eq!(stop_of(&said), "ended", "{said}");
+    // Nothing was read of the daemon that ended, so no stopped generation holds the answer: the
+    // result says what answers and what this command launched, and does not call it its own.
     assert_eq!(
-        said["started"]["start"], "standalone",
+        said["launched"]["start"], "standalone",
         "the restart started a daemon after the end: {said}"
     );
     assert_eq!(
-        said["started"]["pid"].as_u64(),
+        said["launched"]["pid"].as_u64(),
         Some(u64::from(host.one_daemon())),
         "the process this command started is the daemon that answers: {said}"
     );
+    assert_eq!(said["serving"], said["launched"]["pid"], "{said}");
+    assert_eq!(said["started"], Value::Null, "{said}");
     assert!(host.answers(), "a daemon answers");
     assert_eq!(host.running().len(), 1, "one daemon runs");
     assert!(

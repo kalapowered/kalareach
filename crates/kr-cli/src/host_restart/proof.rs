@@ -18,7 +18,7 @@ use kr_ipc::paths::HostPaths;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::ControllerGeneration;
 
-use super::{Answering, Proved, StartFailed, judge};
+use super::{Answering, Old, Proved, StartFailed, judge};
 use crate::error::{CliError, Result};
 use crate::host_stop::{self, Asked, LOOK_EVERY, Progress};
 use crate::resolve::KnownEnvironment;
@@ -150,7 +150,7 @@ pub(super) async fn answering<O: Operations>(
 /// Where the exchange on that connection is cut, nothing more is started: see [`after_a_cut`].
 pub(super) async fn prove<O: Operations>(
     operations: &O,
-    stopped: Option<ControllerGeneration>,
+    stopped: Old,
     bound: Duration,
 ) -> std::result::Result<Proved, StartFailed> {
     let launched = AtomicBool::new(false);
@@ -439,7 +439,12 @@ mod tests {
             vec![says(5, Some(100))],
             vec![at_once(None)],
         );
-        let proved = prove(&supplied, Some(ControllerGeneration::new(4)), BOUND).await;
+        let proved = prove(
+            &supplied,
+            Old::Generation(ControllerGeneration::new(4)),
+            BOUND,
+        )
+        .await;
         assert!(matches!(proved, Ok(Proved::Ours(ours)) if ours.pid == Some(100)));
         assert_eq!(
             supplied.calls(),
@@ -490,7 +495,12 @@ mod tests {
             vec![cut(), says(6, Some(100))],
             vec![at_once(None), at_once(Some(1))],
         );
-        let proved = prove(&supplied, Some(ControllerGeneration::new(4)), BOUND).await;
+        let proved = prove(
+            &supplied,
+            Old::Generation(ControllerGeneration::new(4)),
+            BOUND,
+        )
+        .await;
         assert!(matches!(proved, Ok(Proved::Ours(ours)) if ours.pid == Some(100)));
         assert_eq!(
             supplied.calls(),
@@ -518,7 +528,12 @@ mod tests {
             vec![cut(), says(6, Some(200))],
             vec![at_once(Some(1))],
         );
-        let proved = prove(&supplied, Some(ControllerGeneration::new(4)), BOUND).await;
+        let proved = prove(
+            &supplied,
+            Old::Generation(ControllerGeneration::new(4)),
+            BOUND,
+        )
+        .await;
         assert!(matches!(
             proved,
             Ok(Proved::Another {
@@ -545,8 +560,14 @@ mod tests {
             vec![cut(), says(4, Some(100))],
             vec![at_once(Some(1))],
         );
-        let (said, launched) =
-            failed_with(prove(&supplied, Some(ControllerGeneration::new(4)), BOUND).await);
+        let (said, launched) = failed_with(
+            prove(
+                &supplied,
+                Old::Generation(ControllerGeneration::new(4)),
+                BOUND,
+            )
+            .await,
+        );
         assert!(said.contains("generation that was told to stop"), "{said}");
         assert!(launched, "a daemon was started and did not prove itself");
     }
@@ -562,8 +583,14 @@ mod tests {
             vec![cut()],
             vec![at_once(None)],
         );
-        let (said, launched) =
-            failed_with(prove(&supplied, Some(ControllerGeneration::new(4)), BOUND).await);
+        let (said, launched) = failed_with(
+            prove(
+                &supplied,
+                Old::Generation(ControllerGeneration::new(4)),
+                BOUND,
+            )
+            .await,
+        );
         assert_eq!(
             said,
             "this command started a control daemon (process 100) but could not read which control \
@@ -607,8 +634,14 @@ mod tests {
                 vec![first],
                 vec![at_once(None)],
             );
-            let (said, launched) =
-                failed_with(prove(&supplied, Some(ControllerGeneration::new(4)), BOUND).await);
+            let (said, launched) = failed_with(
+                prove(
+                    &supplied,
+                    Old::Generation(ControllerGeneration::new(4)),
+                    BOUND,
+                )
+                .await,
+            );
             assert_eq!(
                 said,
                 "this command started a control daemon (process 100) but could not read which \
@@ -618,8 +651,14 @@ mod tests {
             assert!(!launched);
         }
         let supplied = Supplied::new(Duration::ZERO, None, vec![cut()], vec![at_once(None)]);
-        let (said, launched) =
-            failed_with(prove(&supplied, Some(ControllerGeneration::new(4)), BOUND).await);
+        let (said, launched) = failed_with(
+            prove(
+                &supplied,
+                Old::Generation(ControllerGeneration::new(4)),
+                BOUND,
+            )
+            .await,
+        );
         assert_eq!(
             said,
             "this command could not read which control daemon serves the environment, and no \
@@ -638,8 +677,14 @@ mod tests {
             manager: None,
         });
         let supplied = Supplied::new(Duration::ZERO, started, vec![cut()], vec![at_once(None)]);
-        let (said, _) =
-            failed_with(prove(&supplied, Some(ControllerGeneration::new(4)), BOUND).await);
+        let (said, _) = failed_with(
+            prove(
+                &supplied,
+                Old::Generation(ControllerGeneration::new(4)),
+                BOUND,
+            )
+            .await,
+        );
         assert_eq!(
             said,
             "this command started a control daemon but could not read which control daemon \
@@ -657,7 +702,12 @@ mod tests {
             vec![cut(), cut(), says(6, Some(100))],
             vec![at_once(Some(1)), at_once(Some(2))],
         );
-        let proved = prove(&supplied, Some(ControllerGeneration::new(4)), BOUND).await;
+        let proved = prove(
+            &supplied,
+            Old::Generation(ControllerGeneration::new(4)),
+            BOUND,
+        )
+        .await;
         assert!(matches!(proved, Ok(Proved::Ours(_))));
         assert_eq!(supplied.starts(), 1, "no second start");
         assert_eq!(supplied.count(|call| matches!(call, Call::Connect(_))), 2);
@@ -673,8 +723,14 @@ mod tests {
             vec![cut(), hangs()],
             vec![at_once(Some(1))],
         );
-        let (said, _) =
-            failed_with(prove(&supplied, Some(ControllerGeneration::new(4)), BOUND).await);
+        let (said, _) = failed_with(
+            prove(
+                &supplied,
+                Old::Generation(ControllerGeneration::new(4)),
+                BOUND,
+            )
+            .await,
+        );
         assert!(
             said.contains("no control daemon answered within 30 seconds"),
             "{said}"
@@ -693,7 +749,12 @@ mod tests {
             vec![cut(), says(6, Some(200))],
             vec![at_once(Some(1))],
         );
-        let proved = prove(&supplied, Some(ControllerGeneration::new(4)), BOUND).await;
+        let proved = prove(
+            &supplied,
+            Old::Generation(ControllerGeneration::new(4)),
+            BOUND,
+        )
+        .await;
         assert!(matches!(
             proved,
             Ok(Proved::Another {
