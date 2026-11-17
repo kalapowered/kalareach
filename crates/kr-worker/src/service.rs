@@ -663,6 +663,11 @@ pub struct WorkerService {
     /// empty and whose detaches are not made yet. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     attachments_taken_stall: crate::testing::Stall,
+    /// A stop in a stream's delivery task, once it has a frame in hand and before it writes it,
+    /// which this host's own tests arm to have the writer meet that frame later, under a statement
+    /// or a lease that has ended since. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    delivery_frame_stall: Arc<crate::testing::Stall>,
     /// A stop in the handler of a statement of what the local owner may do, right after the gate has
     /// changed and the authority lock is let go, which this host's own tests arm to have another
     /// statement arrive in between. It is compiled away in every shipped build.
@@ -1416,6 +1421,8 @@ impl WorkerService {
             withdrawal_gap_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             attachments_taken_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            delivery_frame_stall: Arc::new(crate::testing::Stall::default()),
             #[cfg(feature = "testing")]
             after_the_gate_change_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
@@ -2455,8 +2462,8 @@ impl WorkerService {
     }
 
     /// Stops the next mutation after its lease and its deadline were checked inside the session and
-    /// before its marker is committed, for this host's own tests. The session is let go while it
-    /// stands and taken again when it is let go.
+    /// before its marker is committed, for this host's own tests. The boundary and the session are
+    /// held while it stands, as they are on the way to the marker.
     ///
     /// Returns the end that says the mutation has arrived, and the end that lets it go. The stop
     /// fires once.
@@ -2533,6 +2540,22 @@ impl WorkerService {
         std::sync::mpsc::Sender<()>,
     ) {
         self.attachments_taken_stall.arm()
+    }
+
+    /// Stops the next frame a stream's delivery task has in hand before it writes it, for this
+    /// host's own tests.
+    ///
+    /// Returns the end that says the delivery has arrived, and the end that lets it go. The stop
+    /// fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_a_delivery_before_its_next_frame(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.delivery_frame_stall.arm()
     }
 
     /// How many withdrawals are about to wait, or are waiting, for the attention fence's own lock,
@@ -4043,6 +4066,8 @@ impl WorkerService {
                 let stream_id = state.stream_id.clone();
                 let restoration = state.restoration.take();
                 let runtime = Arc::clone(&self.runtime);
+                #[cfg(feature = "testing")]
+                let frame_stall = Arc::clone(&self.delivery_frame_stall);
                 let task = tokio::spawn(async move {
                     // Nothing before this line touches the connection. A permit that never arrives
                     // means the registration was withdrawn while this task was being created.
@@ -4093,6 +4118,8 @@ impl WorkerService {
                                 },
                             };
                             let delivered = delivery.len();
+                            #[cfg(feature = "testing")]
+                            frame_stall.stand();
                             let written = match delivery {
                                 OutputDelivery::Bytes { cursor, bytes } => {
                                     // Anything the screen already covered is dropped here rather than
@@ -8304,10 +8331,10 @@ impl WorkerService {
     /// its receipt still `accepted`; the second time, called with the preparation, it is
     /// revalidated against the present, as any accepted intent is before its marker.
     #[allow(clippy::too_many_arguments)]
-    fn dispatch_accepted<'a>(
-        &'a self,
+    fn dispatch_accepted(
+        &self,
         holding: crate::trace::Acquisition<'_>,
-        mut session: std::sync::MutexGuard<'a, Session>,
+        mut session: std::sync::MutexGuard<'_, Session>,
         state: &mut ConnectionState,
         mutation: &MutationRequest,
         method: Method,
@@ -8345,15 +8372,8 @@ impl WorkerService {
             // precondition the caller stated or a deadline this host accepted. For a mutation the
             // broker owns, what comes back is the admission itself.
             .and_then(|()| self.decidable(&session, mutation, method, caller, preparation));
-        // The stop lets the session go while it stands, so that the frames of a stream that the
-        // attach's own hold does not delay can reach their writer; the checks above were made
-        // under the lock, and the session is taken again before anything is pushed.
         #[cfg(feature = "testing")]
-        if self.after_the_deadline_check_stall.is_armed() {
-            drop(session);
-            self.after_the_deadline_check_stall.stand();
-            session = self.runtime.session();
-        }
+        self.after_the_deadline_check_stall.stand();
         let prepared = match revalidated {
             Ok(prepared) => prepared,
             Err(error) => {
