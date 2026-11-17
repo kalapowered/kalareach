@@ -49,6 +49,18 @@ const QUIET: Duration = Duration::from_millis(300);
 /// its own assertion. The states of a correct view come within a fraction of a second.
 const STATE_BOUND: Duration = Duration::from_secs(10);
 
+/// What a command of the page answered, once the case has given the word that the command waits
+/// for: the case ends at [`STATE_BOUND`], naming `what`, when the view does not answer.
+async fn answered(
+    handle: tokio::task::JoinHandle<Result<Value, Value>>,
+    what: &str,
+) -> Result<Value, Value> {
+    tokio::time::timeout(STATE_BOUND, handle)
+        .await
+        .unwrap_or_else(|_| panic!("{what} was not answered within the bound"))
+        .expect("joins")
+}
+
 /// The page: an application with the view's commands, and every state each channel was sent.
 struct Page {
     app: tauri::App<MockRuntime>,
@@ -215,12 +227,17 @@ impl Page {
                 .any(|(name, _)| *name == command),
             "{command} is a command the application registers"
         );
-        let window = &self.windows[page];
-        tokio::task::block_in_place(|| {
-            tauri::test::get_ipc_response(
-                window,
+        let window = self.windows[page].clone();
+        let name = command.to_owned();
+        // The call waits for the view's answer without a bound of its own: it runs on a thread of
+        // its own, so that a view that never answers fails the case at the bound with the command's
+        // name. The thread is left to the page's drop, which closes the views and so ends it.
+        let (done, answered) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let answer = tauri::test::get_ipc_response(
+                &window,
                 tauri::webview::InvokeRequest {
-                    cmd: command.into(),
+                    cmd: name,
                     callback: tauri::ipc::CallbackFn(0),
                     error: tauri::ipc::CallbackFn(1),
                     url: BUNDLE.parse().expect("the bundle's address"),
@@ -228,9 +245,12 @@ impl Page {
                     headers: Default::default(),
                     invoke_key: tauri::test::INVOKE_KEY.to_owned(),
                 },
-            )
-        })
-        .map(|answer| answer.deserialize().expect("an answer the page reads"))
+            );
+            let _ = done.send(answer);
+        });
+        tokio::task::block_in_place(|| answered.recv_timeout(STATE_BOUND))
+            .unwrap_or_else(|_| panic!("the command {command} was not answered within the bound"))
+            .map(|answer| answer.deserialize().expect("an answer the page reads"))
     }
 
     /// Calls a command that waits for the worker's answer, and returns at once with what it will
@@ -1575,7 +1595,7 @@ async fn a_close_during_the_opening_exchange_leaves_nothing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn every_close_returns_only_once_the_view_has_ended() {
     use std::sync::Condvar;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     for after_a_page_load in [false, true] {
         let mut worker = ScriptedWorker::start(Challenge::Answered);
@@ -1583,15 +1603,24 @@ async fn every_close_returns_only_once_the_view_has_ended() {
         // The view's first state is held inside its publication until the test opens the gate.
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let published = Arc::new(AtomicUsize::new(0));
+        let expired = Arc::new(AtomicBool::new(false));
         let publish: companion_tauri::terminal::Publish = {
             let gate = Arc::clone(&gate);
             let published = Arc::clone(&published);
+            let expired = Arc::clone(&expired);
             Arc::new(move |_state| {
                 published.fetch_add(1, Ordering::SeqCst);
                 let (open, opened) = &*gate;
                 let mut open = open.lock().expect("the gate");
                 while !*open {
-                    open = opened.wait(open).expect("the gate");
+                    let (next, waited) = opened.wait_timeout(open, WATCHDOG).expect("the gate");
+                    open = next;
+                    if waited.timed_out() {
+                        // A case that failed before it opened the gate: the view goes on, so that
+                        // the case ends with its own message and the program ends with it.
+                        expired.store(true, Ordering::SeqCst);
+                        *open = true;
+                    }
                 }
             })
         };
@@ -1633,6 +1662,10 @@ async fn every_close_returns_only_once_the_view_has_ended() {
             .await
             .expect("the second close returns")
             .expect("the second close");
+        assert!(
+            !expired.load(Ordering::SeqCst),
+            "the gate was not opened within the watchdog"
+        );
         assert_eq!(views.held(), 0);
         let sent = link.closed().await;
         assert_eq!(sent.len(), 1, "{sent:?}");
@@ -4502,7 +4535,9 @@ async fn a_view_reads_the_launch_surface_on_its_own_link() {
     assert_eq!(params.session_id, worker.session_id);
     let surface = a_surface_held_here(worker.session_id);
     link.answer(&asked, &surface).await;
-    let told = reading.await.expect("joins").expect("the surface is read");
+    let told = answered(reading, "the launch surface read")
+        .await
+        .expect("the surface is read");
     assert_eq!(told["state"], "served", "{told}");
     assert_eq!(
         told["surface"],
@@ -4540,7 +4575,9 @@ async fn a_worker_that_serves_the_launch_surface_and_refuses_it_is_not_taken_for
     let again = link.expect(Method::ShellLaunchSurface).await;
     link.answer(&again, &a_surface_held_here(worker.session_id))
         .await;
-    let told = reading.await.expect("joins").expect("served");
+    let told = answered(reading, "the launch surface read")
+        .await
+        .expect("served");
     assert_eq!(told["state"], "served", "{told}");
 }
 
@@ -4560,17 +4597,20 @@ async fn a_worker_that_does_not_serve_the_launch_surface_is_not_asked_or_is_told
         "an earlier release",
     )
     .await;
-    let told = reading.await.expect("joins").expect("an answer");
+    let told = answered(reading, "the launch surface read")
+        .await
+        .expect("an answer");
     assert_eq!(told, json!({ "state": "not_served" }));
 
     let mut silent = ScriptedWorker::start_not_stating_the_launch_surface();
     let page = Page::new(silent.paths());
     let (view, mut link) = panned(&page, &mut silent, 3, &reporting(Mouse::Sgr)).await;
-    let told = page
-        .invoke_later("terminal_view_launch_surface", json!({ "view": view }))
-        .await
-        .expect("joins")
-        .expect("an answer");
+    let told = answered(
+        page.invoke_later("terminal_view_launch_surface", json!({ "view": view })),
+        "the launch surface read",
+    )
+    .await
+    .expect("an answer");
     assert_eq!(told, json!({ "state": "not_served" }));
     // The next call on the link is the one the person's take makes: the read was not asked.
     page.take(&view, 1);
@@ -4807,7 +4847,7 @@ async fn the_detach_is_written_whole_before_the_connection_closes() {
     assert_eq!(sent[0].method, Method::SessionDetach.to_string());
     let detach: kr_protocol::attachment::SessionDetachParams = sent[0].params();
     assert!(detach.after_input.is_none());
-    let _ = pressing.await;
+    let _ = answered(pressing, "the launch press").await;
 }
 
 /// A launch stands behind the key before it: it is not on the wire until the worker has answered
@@ -5815,7 +5855,7 @@ async fn launch_answered(
         }
         Launched::Refused(refusal) => link.refuse_with(&launch, *refusal, "scripted").await,
     }
-    pressing.await.expect("joins")
+    answered(pressing, "the launch press").await
 }
 
 /// Launches whose results are definite, more of them than the session keeps unresolved actions
