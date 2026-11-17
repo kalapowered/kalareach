@@ -1860,6 +1860,9 @@ async fn a_rollback_that_would_lift_an_organisations_adapter_list_is_refused_unt
     );
     assert!(!store.exists(), "the list went with the enrolment");
 
+    // The refused rollback stopped the daemon of this release and started it again, which brought
+    // the registry forward again: it goes back to the version the release before writes once more.
+    updated.puts_the_registry_back_for_the_release_before();
     std::fs::write(host.store.root().join("installer"), "homebrew\n").expect("the installer file");
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
