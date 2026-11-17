@@ -258,14 +258,7 @@ async fn wait_for_the_holder(
         holder::Holder::Gone => {
             start_where_none_ran(host, environment, json, progress, past, begun).await
         }
-        holder::Holder::Silent => host_stop::failed(
-            CliError::Unfinished {
-                code: ErrorCode::EnvironmentUnavailable,
-                message: holder_silent_said(environment),
-            },
-            &begun.none,
-            json,
-        ),
+        holder::Holder::Silent => host_stop::failed(holder_silent(environment), &begun.none, json),
     }
 }
 
@@ -278,6 +271,24 @@ fn holder_answers_said(id: EnvironmentId, named: Option<u64>) -> Shown {
         id,
         process_said(named)
     )
+}
+
+/// The restart's failure where its record could not be written where no daemon ran: nothing was
+/// started.
+fn not_recorded_before_the_start(error: &kr_ipc::IpcError) -> CliError {
+    CliError::Other(shown!(
+        "kr host restart could not record its attempt: {}. No start was made.",
+        Shown::ipc(error)
+    ))
+}
+
+/// The restart's failure where a process holds the environment and neither answers nor lets go
+/// within the start's bound.
+fn holder_silent(environment: &KnownEnvironment) -> CliError {
+    CliError::Unfinished {
+        code: ErrorCode::EnvironmentUnavailable,
+        message: holder_silent_said(environment),
+    }
 }
 
 /// What the restart says where a process holds the environment and neither answers nor lets go
@@ -797,18 +808,24 @@ async fn wait_for_the_successor(
             launched: None,
             cut: false,
         }),
-        Err(last) => Err(CliError::Unfinished {
-            code: ErrorCode::EnvironmentUnavailable,
-            message: shown!(
-                "A control daemon{} holds environment {} since the daemon that was stopped ended, \
-                 and it did not answer within {} seconds: {}. No new daemon was started. Run kr \
-                 host restart again once it answers.",
-                process_said(successor),
-                id,
-                startup::START_BOUND.as_secs(),
-                last
-            ),
-        }),
+        Err(last) => Err(successor_silent(id, successor, &last)),
+    }
+}
+
+/// The restart's failure where another daemon holds the environment since the daemon that was
+/// stopped ended and does not answer within the start's bound: `last` is what the last reach said.
+fn successor_silent(id: EnvironmentId, successor: Option<u64>, last: &Shown) -> CliError {
+    CliError::Unfinished {
+        code: ErrorCode::EnvironmentUnavailable,
+        message: shown!(
+            "A control daemon{} holds environment {} since the daemon that was stopped ended, and it \
+             did not answer within {} seconds: {}. No new daemon was started. Run kr host restart \
+             again once it answers.",
+            process_said(successor),
+            id,
+            startup::START_BOUND.as_secs(),
+            *last
+        ),
     }
 }
 
@@ -825,14 +842,7 @@ async fn start_where_none_ran(
     let id = environment.environment_id;
     let none = begun.none.clone();
     if let Err(error) = begin_the_record(environment, None, progress) {
-        return host_stop::failed(
-            CliError::Other(shown!(
-                "kr host restart could not record its attempt: {}. No start was made.",
-                Shown::ipc(&error)
-            )),
-            &none,
-            json,
-        );
+        return host_stop::failed(not_recorded_before_the_start(&error), &none, json);
     }
     let result = start_and_prove(host, environment, Old::None, progress, past).await;
     match result {
@@ -2355,5 +2365,82 @@ mod tests {
                  answers (process 41). {asked}"
             )
         );
+    }
+
+    /// An environment for a case that reads no daemon.
+    fn an_environment() -> (kr_ipc::testing::TempHost, KnownEnvironment) {
+        let temp = kr_ipc::testing::TempHost::create();
+        let paths = temp.environment();
+        let environment = KnownEnvironment {
+            environment_id: paths.environment_id(),
+            paths,
+        };
+        (temp, environment)
+    }
+
+    /// The restart's sentence for a holder that neither answers nor lets go within the bound, with
+    /// its exit.
+    #[test]
+    fn the_restart_says_in_whole_that_a_holder_neither_answers_nor_lets_go() {
+        use kr_client::shown::Said as _;
+
+        let (_temp, environment) = an_environment();
+        let failure = holder_silent(&environment);
+        let how = if cfg!(windows) {
+            "If it stays like this, end the kr-controller.exe process of this installation in Task Manager."
+        } else {
+            "If it stays like this, end the process that holds the lock file."
+        };
+        assert_eq!(failure.exit_code(), 1);
+        assert_eq!(
+            failure.said().to_string(),
+            format!(
+                "A control daemon holds environment {} and does not answer, so it may be starting or stopping. No stop was requested. Run kr host restart again in a moment. {how} This command requested no stop and no start.",
+                environment.environment_id
+            )
+        );
+    }
+
+    /// The restart's sentence for a record that could not be written where no daemon ran, with
+    /// its exit.
+    #[test]
+    fn the_restart_says_in_whole_that_its_record_could_not_be_written_where_none_ran() {
+        use kr_client::shown::Said as _;
+
+        let error = kr_ipc::IpcError::socket(
+            "create",
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        let failure = not_recorded_before_the_start(&error);
+        assert_eq!(failure.exit_code(), 1);
+        assert_eq!(
+            failure.said().to_string(),
+            format!(
+                "kr host restart could not record its attempt: {}. No start was made.",
+                Shown::ipc(&error)
+            )
+        );
+    }
+
+    /// The restart's sentence for another daemon that holds the environment after the stopped
+    /// daemon ended and does not answer, with its exit, for a successor whose process is known and
+    /// for one whose process is not.
+    #[test]
+    fn the_restart_says_in_whole_that_a_successor_does_not_answer() {
+        use kr_client::shown::Said as _;
+
+        let (_temp, environment) = an_environment();
+        let id = environment.environment_id;
+        let last = Shown::said("the endpoint accepted the connection and did not answer");
+        for (successor, named) in [(Some(77), " (process 77)"), (None, "")] {
+            let failure = successor_silent(id, successor, &last);
+            assert_eq!(failure.exit_code(), 1);
+            assert_eq!(
+                failure.said().to_string(),
+                format!(
+                    "A control daemon{named} holds environment {id} since the daemon that was stopped ended, and it did not answer within 30 seconds: the endpoint accepted the connection and did not answer. No new daemon was started. Run kr host restart again once it answers."
+                )
+            );
+        }
     }
 }

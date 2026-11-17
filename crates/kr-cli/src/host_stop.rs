@@ -3708,6 +3708,293 @@ mod tests {
         }
     }
 
+    /// What the restart reports and exits with, in whole, for a result that is a failure.
+    fn reported_in_whole(completion: Completion) -> (u8, String) {
+        use kr_client::shown::Said as _;
+
+        match completion {
+            Completion::Reported(error) => (error.exit_code(), error.said().to_string()),
+            _ => panic!("a failure that the restart has reported"),
+        }
+    }
+
+    /// An environment for a case that reads no daemon.
+    fn an_environment_for_the_whole_texts() -> (kr_ipc::testing::TempHost, KnownEnvironment) {
+        let temp = kr_ipc::testing::TempHost::create();
+        let paths = temp.environment();
+        let environment = KnownEnvironment {
+            environment_id: paths.environment_id(),
+            paths,
+        };
+        (temp, environment)
+    }
+
+    /// What the restart says and exits with where its first reach of the endpoint shows `start`
+    /// and the lock reads as `lock`.
+    fn the_restart_at_the_start(start: &Start, lock: Lock) -> (KnownEnvironment, u8, String) {
+        let (_temp, environment) = an_environment_for_the_whole_texts();
+        let (code, said) = reported_in_whole(say_at_the_start(
+            Which::Restart,
+            said_at_the_start(start, || lock),
+            &environment,
+            &Facts::none(Vec::new()),
+            true,
+            &Earlier::read(&environment.paths),
+            startup::ANSWER_BOUND,
+        ));
+        (environment, code, said)
+    }
+
+    /// The restart's sentence for a daemon that states another public major.
+    #[test]
+    fn the_restart_says_in_whole_that_the_daemon_states_another_major() {
+        let (environment, code, said) = the_restart_at_the_start(&Start::OtherMajor, Lock::Free);
+        assert_eq!(code, 1);
+        assert_eq!(
+            said,
+            format!(
+                "the control daemon for environment {} states another public major than this command does. No stop was requested and no start was made.",
+                environment.environment_id
+            )
+        );
+    }
+
+    /// The restart's sentence for a lock that could not be read where nothing listens.
+    #[test]
+    fn the_restart_says_in_whole_that_the_lock_could_not_be_read() {
+        let (environment, code, said) = the_restart_at_the_start(
+            &Start::NothingListening,
+            Lock::Unreadable(Shown::said("the lock file could not be opened")),
+        );
+        assert_eq!(code, 1);
+        assert_eq!(
+            said,
+            format!(
+                "whether a control daemon holds environment {} could not be read: the lock file could not be opened. No stop was requested and no start was made.",
+                environment.environment_id
+            )
+        );
+    }
+
+    /// The restart's sentence for a daemon that accepts the connection and does not answer.
+    #[test]
+    fn the_restart_says_in_whole_that_the_daemon_accepted_the_connection_and_did_not_answer() {
+        let (environment, code, said) = the_restart_at_the_start(&Start::Silent, Lock::Free);
+        assert_eq!(code, 1);
+        assert_eq!(
+            said,
+            format!(
+                "the control daemon listening for environment {} accepted the connection and did not answer within 10 seconds. No stop was requested and no start was made. Run kr host restart again in a moment.",
+                environment.environment_id
+            )
+        );
+    }
+
+    /// The restart's sentence for a daemon that cannot be reached for a reason other than nothing
+    /// listening.
+    #[test]
+    fn the_restart_says_in_whole_that_the_daemon_could_not_be_reached() {
+        let (_temp, environment) = an_environment_for_the_whole_texts();
+        let id = environment.environment_id;
+        let error = kr_ipc::IpcError::socket(
+            "connect",
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        let (code, said) = {
+            use kr_client::shown::Said as _;
+            let failure = unreached(Which::Restart, id, &error, Unmade::OwnFault);
+            (failure.exit_code(), failure.said().to_string())
+        };
+        assert_eq!(code, 3);
+        assert_eq!(
+            said,
+            format!(
+                "the control daemon for environment {id} could not be reached: {}. No stop was requested and no start was made.",
+                Shown::ipc(&error)
+            )
+        );
+    }
+
+    /// The restart's sentence for a request that could not be composed.
+    #[test]
+    fn the_restart_says_in_whole_that_its_request_could_not_be_made() {
+        let (_temp, environment) = an_environment_for_the_whole_texts();
+        let id = environment.environment_id;
+        let failure = unmade_request(
+            Which::Restart,
+            id,
+            &Shown::said("the request could not be composed"),
+            Unmade::OwnFault,
+        );
+        use kr_client::shown::Said as _;
+        assert_eq!(failure.exit_code(), 3);
+        assert_eq!(
+            failure.said().to_string(),
+            format!(
+                "kr host restart could not make its request for the control daemon of environment {id}: the request could not be composed. Nothing was sent, and nothing was stopped."
+            )
+        );
+    }
+
+    /// The restart's sentence for a daemon of another build that takes no stop request.
+    #[test]
+    fn the_restart_says_in_whole_that_the_daemon_is_of_another_build_and_takes_no_stop() {
+        use kr_client::shown::Said as _;
+        let (_temp, environment) = an_environment_for_the_whole_texts();
+        let id = environment.environment_id;
+        let refusal = ProtocolError::new(ErrorCode::PermissionDenied, "refused for the case");
+        let failure = after_the_probe(id, refusal, Some(Ok(Ok(()))));
+        assert_eq!(failure.exit_code(), 1);
+        assert_eq!(
+            failure.said().to_string(),
+            format!(
+                "The control daemon of environment {id} is of another build and takes no stop request. Nothing was stopped. kr host update or kr host rollback switches this host to another release and replaces this daemon. Each checks the stores for that release before it switches, and starts this daemon again if it cannot switch."
+            )
+        );
+    }
+
+    /// The restart's sentence for a stop request that is refused with a check that is refused too.
+    #[test]
+    fn the_restart_says_in_whole_that_the_stop_and_the_check_were_refused() {
+        use kr_client::shown::Said as _;
+        let (_temp, environment) = an_environment_for_the_whole_texts();
+        let id = environment.environment_id;
+        let refusal = ProtocolError::new(ErrorCode::PermissionDenied, "refused for the case");
+        let probe = ProtocolError::new(ErrorCode::PermissionDenied, "the check was refused");
+        let failure = after_the_probe(id, refusal, Some(Ok(Err(probe.clone()))));
+        assert_eq!(failure.exit_code(), 8);
+        assert_eq!(
+            failure.said().to_string(),
+            format!(
+                "The control daemon of environment {id} takes no stop request or refuses it, and the check that tells which was refused too: {}. Nothing was stopped.",
+                Shown::protocol(&probe)
+            )
+        );
+    }
+
+    /// The restart's sentence for a stop request that is refused in the daemon's own words, and
+    /// for one whose check cannot be read: the refusal, as the daemon gave it.
+    #[test]
+    fn the_restart_says_in_its_own_words_what_the_daemon_refused() {
+        use kr_client::shown::Said as _;
+        let (_temp, environment) = an_environment_for_the_whole_texts();
+        let id = environment.environment_id;
+        let refusal = ProtocolError::new(ErrorCode::PermissionDenied, "refused for the case");
+        let own = CliError::Refused(refusal.clone());
+        for probe in [
+            None,
+            Some(Err(kr_ipc::IpcError::socket(
+                "read",
+                std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+            ))),
+        ] {
+            let failure = after_the_probe(id, refusal.clone(), probe);
+            assert_eq!(failure.exit_code(), own.exit_code());
+            assert_eq!(failure.said().to_string(), own.said().to_string());
+            assert!(
+                failure.said().to_string().contains("refused for the case"),
+                "{}",
+                failure.said()
+            );
+        }
+        let other = ProtocolError::new(ErrorCode::EnvironmentUnavailable, "the check says why");
+        let failure = after_the_probe(id, refusal, Some(Ok(Err(other.clone()))));
+        assert_eq!(
+            failure.exit_code(),
+            CliError::Refused(other.clone()).exit_code()
+        );
+        assert!(
+            failure.said().to_string().contains("the check says why"),
+            "{}",
+            failure.said()
+        );
+    }
+
+    /// What the restart says and exits with after a stop request that was written and a wait that
+    /// ended as `end`.
+    fn the_restart_after_the_request(
+        end: End,
+        request: &Request,
+    ) -> (KnownEnvironment, u8, String) {
+        let (_temp, environment) = an_environment_for_the_whole_texts();
+        let said = said_after_the_request(end, request);
+        let message = words_after_the_request(
+            Which::Restart,
+            &said.sentence,
+            request,
+            &environment.paths,
+            environment.environment_id,
+            None,
+            None,
+        );
+        let code = said
+            .exit
+            .failure(message.clone())
+            .map_or(0, |error| error.exit_code());
+        (environment, code, message.to_string())
+    }
+
+    /// The restart's sentence for a daemon that was told to stop and has not ended.
+    #[test]
+    fn the_restart_says_in_whole_that_the_daemon_has_not_ended() {
+        let (environment, code, said) =
+            the_restart_after_the_request(End::NotEnded(Why::Running, None), &Request::Told);
+        let id = environment.environment_id;
+        let ends_with = if cfg!(windows) {
+            "If it stays, end the kr-controller.exe process of this installation in Task Manager; the next daemon recovers as it does after a crash."
+        } else {
+            "If it stays, end the process that holds the lock file; the next daemon recovers as it does after a crash."
+        };
+        assert_eq!(code, 1);
+        assert_eq!(
+            said,
+            format!(
+                "The control daemon for environment {id} was told to stop and has not ended after 30 seconds. It may be finishing a write. {ends_with} Run kr host restart again once the old one has ended. This command requested no start."
+            )
+        );
+    }
+
+    /// The restart's sentence for a process that has gone while something else holds the
+    /// environment.
+    #[test]
+    fn the_restart_says_in_whole_that_something_else_still_holds_the_environment() {
+        let (environment, code, said) =
+            the_restart_after_the_request(End::NotEnded(Why::Held, None), &Request::Told);
+        let id = environment.environment_id;
+        let how = if cfg!(windows) {
+            "If it stays like this, end the kr-controller.exe process of this installation in Task Manager."
+        } else {
+            "If it stays like this, end the process that holds the lock file."
+        };
+        assert_eq!(code, 1);
+        assert_eq!(
+            said,
+            format!(
+                "The process of the control daemon for environment {id} has gone, and something that is not shown to be a control daemon still holds the environment after 30 seconds. Run kr host restart again in a moment. {how} This command requested no start."
+            )
+        );
+    }
+
+    /// The restart's sentence for a lock that could not be looked at after the request.
+    #[test]
+    fn the_restart_says_in_whole_that_the_lock_could_not_be_looked_at_after_the_request() {
+        let (environment, code, said) = the_restart_after_the_request(
+            End::NotEnded(
+                Why::Unlooked(Shown::said("the lock file could not be opened")),
+                None,
+            ),
+            &Request::Told,
+        );
+        let id = environment.environment_id;
+        assert_eq!(code, 1);
+        assert_eq!(
+            said,
+            format!(
+                "The control daemon for environment {id} was told to stop, and whether it has ended could not be read after 30 seconds: the lock file could not be opened. Run kr host restart again in a moment. This command requested no start."
+            )
+        );
+    }
+
     /// What a message that no control daemon runs says of the records names no record that is the
     /// command's own: a restart's record of the start that it is making is not said by the message
     /// of that start's failure, and a record of another process, or of this process in another
