@@ -1060,7 +1060,7 @@ fn ends_what_it_sends(_client: &mut kr_ipc::client::LocalClient) {
     not(unix),
     allow(
         dead_code,
-        reason = "the cases that end what the client sends are Unix's"
+        reason = "the cases that leave a client's frames unread, or end what it sends, are Unix's"
     )
 )]
 enum Client {
@@ -1131,6 +1131,8 @@ async fn kr_req_23_30_an_offer_whose_client_asked_about_it_and_then_went_is_reje
 /// The unreadable frame is found waiting when the loop comes back to its choice. The connection it
 /// ends is the one the reader would have ended, and the offer held behind it is settled with it
 /// and not dispatched on a connection that is over.
+// A Unix socket keeps a frame its client sent unread until it is read; a Windows pipe's runtime takes it into its own buffer first.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_an_offer_whose_client_sent_an_unreadable_frame_is_rejected_with_its_connection()
  {
@@ -1142,6 +1144,8 @@ async fn kr_req_23_30_an_offer_whose_client_sent_an_unreadable_frame_is_rejected
 ///
 /// The loop reads what was waiting and nothing else, so a client that sends no more and ends
 /// nothing does not keep the offer from being decided.
+// A Unix socket keeps a frame its client sent unread until it is read; a Windows pipe's runtime takes it into its own buffer first.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_an_offer_held_for_a_question_is_dispatched_when_its_client_stays() {
     an_offer_while_its_client(Client::AskedAndStayed).await;
