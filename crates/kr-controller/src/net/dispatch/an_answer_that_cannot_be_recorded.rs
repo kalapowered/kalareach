@@ -19,6 +19,10 @@ use crate::service::a_close_a_worker_never_answers as fake;
 /// KR-REQ-09.09: the project service performs `project.init` and records its answer in a second
 /// write. With the store refusing the write that records an answer, the owner is told the
 /// outcome is unknown, and the repository exists; with the store whole, the same request is answered.
+///
+/// A repository is made with Git, which a Windows host does not run: there the request is refused
+/// before anything is made, as the next case shows, and the rule is shown by the close below.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_project_action_performed_and_not_recorded_is_told_the_outcome_is_unknown() {
     let world = fake::fake_worker(None).await;
@@ -87,6 +91,62 @@ async fn a_project_action_performed_and_not_recorded_is_told_the_outcome_is_unkn
             answer.expect("with the store whole the repository is made and the answer given");
         }
     }
+    world.serving.abort();
+}
+
+/// KR-REQ-09.09: a platform that runs no Git refuses `project.init` before anything is made, with
+/// the word of a host that is not set up for the work, so no repository exists for an answer that
+/// is not kept to leave unknown.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_project_action_that_needs_git_is_refused_where_no_git_is_run() {
+    let world = fake::fake_worker(None).await;
+    let controller = &world.controller;
+    let (connection, _) = paired_connection(controller, 79, EVERY_RIGHT);
+    let parent = world._temp.root().join("repositories");
+    std::fs::create_dir(&parent).expect("a directory to make the repositories in");
+    let actor = ActorId::new("local:501").expect("an actor");
+    let mutation = mutation_of(
+        &world,
+        &connection,
+        Method::ProjectInit,
+        91,
+        ParamsValue::from_typed(&kr_protocol::project::ProjectInitParams {
+            destination: kr_protocol::project::DestinationRequest {
+                environment_id: world.environment_id,
+                parent: kr_protocol::project::DestinationParent::Host {
+                    path: parent.to_string_lossy().into_owned(),
+                },
+                name: "refused".to_owned(),
+            },
+            label: "refused".to_owned(),
+            initial_branch: Nullable::some("main".to_owned()),
+        })
+        .expect("encodes"),
+    );
+    let given = controller
+        .project()
+        .write(
+            &actor,
+            &mutation,
+            Method::ProjectInit,
+            || Ok(()),
+            || Ok(()),
+            None,
+        )
+        .await;
+    let told = given
+        .into_answer_for_test()
+        .expect_err("a platform that runs no Git refuses the request");
+    assert_eq!(told.code, ErrorCode::HostNotConfigured, "{told:?}");
+    assert!(
+        told.message.contains("Git is not run on this platform"),
+        "the word says why: {told:?}"
+    );
+    assert!(
+        !parent.join("refused").exists(),
+        "nothing was made before the refusal"
+    );
     world.serving.abort();
 }
 
