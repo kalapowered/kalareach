@@ -956,9 +956,14 @@ pairing attempt, an owner's review, a visit and a push registration neither hold
 wait for one another. `HostLink::forget_host` takes a host the person forgot out of the endpoint:
 its lookups, and each relay that no other host names. A connection to that host that is open stays
 open until whoever holds it closes it. The pool marks the forgotten pairing by the identity its host
-gave the device and refuses a dial under that pairing, so a visit that began before the forget does
-not put the host back, whenever it reaches the endpoint. A new pairing with the same host has an
-identity of its own and is not refused. The pool closes its endpoint only when `EndpointPool::close`
+gave the device and refuses a dial under that pairing. Each introduction of a host and each removal
+of one holds that host's own lock, which a dial takes before it decides, so the two never overlap: a
+visit that began before the forget either finishes its introduction first, and the forget then takes
+the host out, or waits for the forget and is refused. A caller that stops waiting leaves nothing
+behind that the forget does not remove. A forget waits for the introduction of its own host and for
+no other host. A new pairing with the same host has an identity of its own and is not refused, and
+the host stays in the endpoint until the last pairing that introduced it is forgotten. The pool
+closes its endpoint only when `EndpointPool::close`
 is called and when the run ends. `close` waits until the endpoint has finished closing, so that no
 second endpoint holds the key beside it, for a caller that awaits it to its end; a caller that drops
 it part way leaves the endpoint closing, and the next request binds another beside it. The next
