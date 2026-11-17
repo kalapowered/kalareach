@@ -5,10 +5,16 @@
 //! Separate endpoints of one identity that share a relay cannot promise that, because the relay
 //! deactivates the older connection of an identity that connects again.
 //!
-//! The transport library limits that, at the release that core takes: its one relay actor serves
-//! every relay of an endpoint and reads a datagram to send only while no send of its own is
-//! pending, so a relay that stops reading can hold the sends to every relay until the library's own
-//! time-outs end the hold.
+//! The build takes the transport library from the organisation's fork, at a revision that holds
+//! three changes of its relay transport. The released library, which holds none of them, has one
+//! relay actor for every relay of an endpoint, and it reads a datagram to send only while no send
+//! of its own is pending: one relay that is slow or stops reading can hold the relay traffic of the
+//! whole endpoint for longer than the library's own time-outs and longer than a connection's
+//! 30-second idle time-out, so it can delay a host's traffic on another relay and can also close
+//! that host's connection. With the fork's changes the stall case under `tests/` keeps a healthy
+//! host's answers under 2 seconds beside such a relay; it does not show a slow uplink, ordinary
+//! use or a real round trip, and a relay that stops again and again within seconds can still cost
+//! its own hosts some connections.
 //!
 //! The endpoint is built with no relay and no discovery service. It takes them one host at a time,
 //! when the device first dials that host:
