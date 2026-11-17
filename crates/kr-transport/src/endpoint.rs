@@ -28,8 +28,9 @@
 //! starts. The relay that the report prefers as home relay also keeps the device's endpoint
 //! identity registered while the endpoint is open. A relay client that is not the home relay ends,
 //! while it is connected, when the device has written no datagram to it for 60 seconds: that is
-//! its idle-close threshold, not a lifetime that a registration is promised, and at the release
-//! that core takes the close itself waits without a bound. While a client dials again, each
+//! its idle-close threshold, not a lifetime that a registration is promised, and the close itself
+//! waits without a bound in the released library and for at most 3 seconds in the fork's. While a
+//! client dials again, each
 //! 3-second flush of undeliverable datagrams restarts that timer and one dial can wait 10
 //! seconds, so a client whose dials take 3 seconds or more never ends on idleness: it dials
 //! again, without a limit on the tries. A change of the relay map does not stop it, since
